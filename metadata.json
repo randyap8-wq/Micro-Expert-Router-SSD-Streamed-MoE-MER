@@ -1,6 +1,0 @@
-{
-  "name": "Micro-Expert Router: SSD-Streamed MoE",
-  "description": "High-performance inference engine proof-of-concept utilizing io_uring for zero-copy Expert hot-swapping from NVMe storage.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["High-Performance Computing", "System Simulation", "Real-time Metrics"]
-}
