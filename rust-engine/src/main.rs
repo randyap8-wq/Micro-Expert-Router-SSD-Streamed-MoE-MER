@@ -1,6 +1,7 @@
 //! Micro-Expert-Router — MoE execution engine that hot-swaps experts from a
 //! PCIe-attached NVMe drive into pre-allocated, page-aligned RAM via
-//! io_uring + O_DIRECT.
+//! `O_DIRECT` `pread(2)` (dispatched off the Tokio runtime with
+//! `block_in_place`).
 //!
 //! See README.md at the repository root for architecture and design notes.
 
@@ -26,7 +27,7 @@ use crate::inference::expert_weight_bytes;
 use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
 use crate::router::{PredictiveLoader, TopKRouter};
 
-/// MoE execution engine that streams experts from NVMe via io_uring + O_DIRECT.
+/// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
 #[derive(Parser, Debug)]
 #[command(name = "micro-expert-router", version, about)]
 struct Cli {
@@ -65,6 +66,12 @@ enum Cmd {
         /// Default 2048.
         #[arg(long, default_value_t = 2048)]
         d_ff: usize,
+        /// Block alignment for `O_DIRECT` (4096 on most NVMe). The
+        /// generated file size (`expert_size`) must be a multiple of
+        /// this so the run path can read each expert with `O_DIRECT`
+        /// without `EINVAL`. Must match what `run` is invoked with.
+        #[arg(long, default_value_t = 4096)]
+        block_align: usize,
     },
 
     /// Run the token-generation simulation against the on-disk experts.
@@ -140,7 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             expert_size,
             d_model,
             d_ff,
-        } => cmd_gen_data(&data_dir, num_experts, expert_size, d_model, d_ff),
+            block_align,
+        } => cmd_gen_data(&data_dir, num_experts, expert_size, d_model, d_ff, block_align),
         Cmd::Run { .. } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -198,7 +206,23 @@ fn cmd_gen_data(
     expert_size: usize,
     d_model: usize,
     d_ff: usize,
+    block_align: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if block_align == 0 || !block_align.is_power_of_two() {
+        return Err(format!(
+            "--block-align ({block_align}) must be a positive power of two \
+             (4096 on most NVMe)."
+        )
+        .into());
+    }
+    if expert_size % block_align != 0 {
+        return Err(format!(
+            "--expert-size ({expert_size}) must be a multiple of --block-align \
+             ({block_align}) so the run path can read each expert with O_DIRECT \
+             without EINVAL."
+        )
+        .into());
+    }
     let weight_bytes = expert_weight_bytes(d_model, d_ff);
     if weight_bytes > expert_size {
         return Err(format!(
@@ -214,6 +238,7 @@ fn cmd_gen_data(
         expert_size_mib = expert_size as f64 / (1024.0 * 1024.0),
         d_model,
         d_ff,
+        block_align,
         weight_mib = weight_bytes as f64 / (1024.0 * 1024.0),
         "generating synthetic SwiGLU expert weights"
     );

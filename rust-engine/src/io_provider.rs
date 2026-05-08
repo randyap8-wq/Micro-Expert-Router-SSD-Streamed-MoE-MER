@@ -236,7 +236,7 @@ pub fn generate_synthetic_experts(
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
 
-    let weight_bytes = 3 * d_model * d_ff * 4;
+    let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
     if weight_bytes > expert_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -266,7 +266,7 @@ pub fn generate_synthetic_experts(
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15u64
             .wrapping_add((id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
 
-        let mut floats_remaining = 3 * d_model * d_ff;
+        let mut floats_remaining = crate::inference::expert_weight_count(d_model, d_ff);
         let mut buf = Vec::<u8>::with_capacity(chunk_floats * 4);
         while floats_remaining > 0 {
             let n = floats_remaining.min(chunk_floats);
