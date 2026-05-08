@@ -21,6 +21,7 @@ use parking_lot::RwLock;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::collections::HashMap;
 
 /// Picks the top-K experts for a given token. Distinct ids guaranteed.
 pub struct TopKRouter {
@@ -90,13 +91,39 @@ impl TopKRouter {
 
 /// First-order Markov predictor: P(next | last_expert).
 ///
-/// Transitions are stored as a flat `[num_experts][num_experts]` matrix of
-/// observation counts, smoothed with a small prior so unseen successors have
-/// non-zero probability and the predictor doesn't need a warm-up phase.
+/// Transitions are stored as a **sparse** per-row map of observation counts:
+/// `rows[from]` holds only the successor ids that have been observed at
+/// least once, plus a cached row total. A flat `[N x N]` dense matrix would
+/// allocate `O(N²)` u32 cells up front (~1 MiB at N=512, ~64 MiB at
+/// N=4096) regardless of how many distinct transitions we actually
+/// observe — sparse-by-row scales with the number of *visited* (from, to)
+/// pairs instead, which is the natural footprint of an MoE routing trace
+/// (each token activates only `k` experts so per-token only `k²` pairs
+/// are observed).
+///
+/// Probabilities are still smoothed with a Laplace prior `prior` per
+/// transition so unseen successors have non-zero probability and the
+/// predictor doesn't need a warm-up phase. The prior is applied
+/// implicitly: an absent map entry counts as `prior`, an entry with
+/// stored count `c` counts as `c + prior`, and the row's effective total
+/// is `total_observed[from] + num_experts * prior`.
+struct Row {
+    /// Observed counts beyond the prior; absent keys mean "0 observed".
+    counts: HashMap<u32, u32>,
+    /// Sum of `counts.values()` (i.e. observations beyond the prior).
+    total_observed: u64,
+}
+
+impl Row {
+    fn new() -> Self {
+        Self { counts: HashMap::new(), total_observed: 0 }
+    }
+}
+
 pub struct PredictiveLoader {
     num_experts: u32,
-    /// `counts[from * n + to]` = times we observed `to` immediately after `from`.
-    counts: RwLock<Vec<u32>>,
+    /// `rows[from]` — sparse counts of successors of `from`.
+    rows: RwLock<Vec<Row>>,
     /// Number of successors to suggest per call.
     fanout: usize,
     /// Probability threshold below which we don't bother prefetching.
@@ -109,9 +136,13 @@ pub struct PredictiveLoader {
 impl PredictiveLoader {
     pub fn new(num_experts: u32, fanout: usize, min_prob: f64, seed: u64) -> Self {
         let n = num_experts as usize;
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            rows.push(Row::new());
+        }
         Self {
             num_experts,
-            counts: RwLock::new(vec![1; n * n]), // smoothing prior of 1
+            rows: RwLock::new(rows),
             fanout,
             min_prob,
             prior: 1,
@@ -124,10 +155,18 @@ impl PredictiveLoader {
         if from >= self.num_experts || to >= self.num_experts {
             return;
         }
-        let n = self.num_experts as usize;
-        let idx = from as usize * n + to as usize;
-        let mut counts = self.counts.write();
-        counts[idx] = counts[idx].saturating_add(1);
+        let mut rows = self.rows.write();
+        let row = &mut rows[from as usize];
+        let entry = row.counts.entry(to).or_insert(0);
+        let new_count = entry.saturating_add(1);
+        // Only bump the row total when the cell didn't saturate; once a
+        // cell is pinned at u32::MAX, further observations stop counting,
+        // which matches the saturating semantics of the previous dense
+        // implementation.
+        if new_count != *entry {
+            row.total_observed = row.total_observed.saturating_add(1);
+            *entry = new_count;
+        }
     }
 
     /// Record a whole batch of activations from a single token's expert set.
@@ -140,27 +179,67 @@ impl PredictiveLoader {
         }
     }
 
+    /// Effective total for a row including the smoothing prior over all `n`
+    /// possible successors.
+    #[inline]
+    fn effective_total(&self, total_observed: u64) -> u64 {
+        total_observed + (self.num_experts as u64) * (self.prior as u64)
+    }
+
+    /// Probability of an *unobserved* successor (i.e. one that has never
+    /// fired from this `from`).
+    #[inline]
+    fn prior_prob(&self, total_observed: u64) -> f64 {
+        let total = self.effective_total(total_observed);
+        if total == 0 {
+            0.0
+        } else {
+            self.prior as f64 / total as f64
+        }
+    }
+
     /// Predict up to `fanout` successors for `from`, weighted by transition
     /// probability. Returns `(expert_id, p)` pairs sorted by descending `p`,
     /// filtered by `min_prob`.
     pub fn predict_next(&self, from: u32) -> Vec<(u32, f64)> {
-        if from >= self.num_experts {
+        if from >= self.num_experts || self.fanout == 0 {
             return Vec::new();
         }
         let n = self.num_experts as usize;
-        let counts = self.counts.read();
-        let row = &counts[(from as usize) * n..(from as usize + 1) * n];
-        let total: u64 = row.iter().map(|&c| c as u64).sum();
+        let rows = self.rows.read();
+        let row = &rows[from as usize];
+        let total = self.effective_total(row.total_observed);
         if total == 0 {
             return Vec::new();
         }
+        let total_f = total as f64;
+        let prior_f = self.prior as f64;
 
+        // Observed successors get their (count + prior) probability.
         let mut probs: Vec<(u32, f64)> = row
+            .counts
             .iter()
-            .enumerate()
-            .map(|(i, &c)| (i as u32, c as f64 / total as f64))
+            .map(|(&id, &c)| (id, (c as f64 + prior_f) / total_f))
             .filter(|&(_, p)| p >= self.min_prob)
             .collect();
+
+        // If the smoothing prior alone clears `min_prob` and we still have
+        // room in the fanout, fill in unseen successors (all tied at
+        // `prior_prob`). This matches the dense implementation's behaviour
+        // where every cell started at the prior. Iterate in id order for
+        // determinism.
+        let prior_p = prior_f / total_f;
+        if prior_p >= self.min_prob && probs.len() < self.fanout {
+            for id in 0..n as u32 {
+                if probs.len() >= self.fanout {
+                    break;
+                }
+                if !row.counts.contains_key(&id) {
+                    probs.push((id, prior_p));
+                }
+            }
+        }
+
         probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         probs.truncate(self.fanout);
         probs
@@ -170,17 +249,23 @@ impl PredictiveLoader {
     /// distribution (rather than a deterministic argmax). Useful when you
     /// want exploration in the prefetch policy.
     pub fn sample_next(&self, from: u32) -> Vec<u32> {
-        if from >= self.num_experts {
+        if from >= self.num_experts || self.fanout == 0 {
             return Vec::new();
         }
         let n = self.num_experts as usize;
-        let counts = self.counts.read();
-        let row: Vec<f64> = counts[(from as usize) * n..(from as usize + 1) * n]
-            .iter()
-            .map(|&c| c as f64)
-            .collect();
+        let rows = self.rows.read();
+        let row = &rows[from as usize];
 
-        let mut weights = row;
+        // Materialise the dense weight vector for this row only (one row,
+        // not the full N×N matrix). `prior` for unseen, `c + prior` for
+        // observed. Each call allocates `n` f64 — a bounded transient cost.
+        let prior_f = self.prior as f64;
+        let mut weights: Vec<f64> = vec![prior_f; n];
+        for (&id, &c) in &row.counts {
+            weights[id as usize] = c as f64 + prior_f;
+        }
+        drop(rows);
+
         let mut chosen = Vec::with_capacity(self.fanout);
         let mut rng = self.rng.lock();
         for _ in 0..self.fanout {
@@ -205,11 +290,8 @@ impl PredictiveLoader {
 
     /// Number of distinct (from, to) pairs we've observed beyond the prior.
     pub fn observations(&self) -> u64 {
-        let counts = self.counts.read();
-        counts
-            .iter()
-            .map(|&c| c.saturating_sub(self.prior) as u64)
-            .sum()
+        let rows = self.rows.read();
+        rows.iter().map(|r| r.total_observed).sum()
     }
 }
 
@@ -249,5 +331,43 @@ mod tests {
         // No real observations -> uniform prior gives p ~ 1/64, below 0.5.
         let preds = p.predict_next(0);
         assert!(preds.is_empty());
+    }
+
+    #[test]
+    fn predictor_falls_back_to_prior_when_threshold_is_low() {
+        // With N=8 and prior=1 every unobserved successor has p = 1/8 = 0.125.
+        // A min_prob of 0.05 must let those through so the prefetcher has
+        // candidates to issue during the cold-start phase, even with no
+        // observations recorded yet. This exercises the sparse loader's
+        // implicit-prior fill-in path.
+        let p = PredictiveLoader::new(8, 3, 0.05, 1);
+        let preds = p.predict_next(0);
+        assert_eq!(preds.len(), 3);
+        for (_, prob) in &preds {
+            assert!((prob - 1.0 / 8.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn predictor_observations_counts_only_real_transitions() {
+        // The dense implementation's prior used to inflate the apparent
+        // observation count; the sparse one must not. After zero observe
+        // calls the count is zero; after K calls it is exactly K.
+        let p = PredictiveLoader::new(16, 2, 0.0, 1);
+        assert_eq!(p.observations(), 0);
+        for _ in 0..5 {
+            p.observe(2, 7);
+        }
+        assert_eq!(p.observations(), 5);
+    }
+
+    #[test]
+    fn predictor_handles_zero_fanout() {
+        // A `--no-prefetch` ablation sets fanout to 0; the predictor must
+        // return an empty candidate set without iterating the row.
+        let p = PredictiveLoader::new(16, 0, 0.0, 1);
+        p.observe(0, 1);
+        assert!(p.predict_next(0).is_empty());
+        assert!(p.sample_next(0).is_empty());
     }
 }
