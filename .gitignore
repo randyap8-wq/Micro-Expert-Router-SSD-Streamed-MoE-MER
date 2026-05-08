@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Rust
+rust-engine/target/
+rust-engine/Cargo.lock
+data/
