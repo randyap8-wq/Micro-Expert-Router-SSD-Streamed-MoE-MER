@@ -105,17 +105,17 @@ pub struct PooledBuffer {
 impl PooledBuffer {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        self.buffer.as_ref().expect("buffer present").as_slice()
+        self.buffer.as_ref().expect("PooledBuffer must hold a buffer until Drop").as_slice()
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.buffer.as_mut().expect("buffer present").as_mut_slice()
+        self.buffer.as_mut().expect("PooledBuffer must hold a buffer until Drop").as_mut_slice()
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.buffer.as_ref().expect("buffer present").len()
+        self.buffer.as_ref().expect("PooledBuffer must hold a buffer until Drop").len()
     }
 }
 

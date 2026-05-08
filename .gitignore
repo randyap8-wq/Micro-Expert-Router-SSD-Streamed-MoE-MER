@@ -1,13 +1,9 @@
-node_modules/
-build/
-dist/
-coverage/
 .DS_Store
 *.log
-.env*
-!.env.example
 
 # Rust
 rust-engine/target/
 rust-engine/Cargo.lock
+
+# Generated synthetic expert files from `gen-data`
 data/

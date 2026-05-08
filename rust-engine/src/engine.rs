@@ -71,10 +71,12 @@ impl Engine {
             predictor,
             counters: Arc::new(Counters::default()),
             cycle_hist: parking_lot::Mutex::new(
-                Histogram::new_with_bounds(1, 60_000_000, 3).expect("hist"),
+                Histogram::new_with_bounds(1, 60_000_000, 3)
+                    .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
             ),
             io_hist: parking_lot::Mutex::new(
-                Histogram::new_with_bounds(1, 60_000_000, 3).expect("hist"),
+                Histogram::new_with_bounds(1, 60_000_000, 3)
+                    .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
             ),
             last_experts: parking_lot::Mutex::new(Vec::new()),
         }
