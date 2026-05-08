@@ -298,10 +298,6 @@ pub fn synth_hidden_state(token_idx: u64, d_model: usize, seed: u64) -> HiddenSt
 /// Run one expert's FFN on the hidden state. The buffer behind `resident`
 /// is the bytes that came directly off the SSD via `O_DIRECT`. Returns
 /// both the activation vector (for combining with other experts) and an
-/// [`InferenceOutput`] summary suitable for logging.
-/// Run one expert's FFN on the hidden state. The buffer behind `resident`
-/// is the bytes that came directly off the SSD via `O_DIRECT`. Returns
-/// both the activation vector (for combining with other experts) and an
 /// [`InferenceOutput`] summary suitable for logging, or an
 /// [`ExpertWeightsError`] if the resident buffer can't be reinterpreted
 /// as a valid SwiGLU weight blob (e.g. a truncated / corrupt file).
