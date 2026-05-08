@@ -3,8 +3,9 @@
 A Rust execution engine for **Mixture-of-Experts** models that keeps the
 router resident in RAM and **hot-swaps individual experts on demand** from a
 PCIe-attached NVMe drive into a pool of pre-allocated, page-aligned RAM
-buffers using **io_uring** with **`O_DIRECT`** (zero-copy, kernel-page-cache
-bypass). Each routed expert then **executes a real Mixtral / Llama-style
+buffers using **`O_DIRECT`** positional reads (`pread(2)` via
+`tokio::task::block_in_place`, kernel-page-cache bypass). Each routed
+expert then **executes a real Mixtral / Llama-style
 SwiGLU FFN forward pass** directly over the bytes that just arrived from the
 drive.
 
@@ -31,7 +32,8 @@ all `N` experts you have two options:
    prefetcher knows nothing about the routing pattern, you double-copy through
    the page cache, and you can't bypass the readahead heuristics.
 2. **Manage the cache yourself** — what this engine does. Open each expert as
-   its own file, read it through io_uring with `O_DIRECT` so the bytes go
+   its own file, read it with `O_DIRECT` `pread(2)` (dispatched off the
+   Tokio runtime via `block_in_place`) so the bytes go
    directly from the NVMe DMA engine into a page-aligned RAM buffer, and run
    a custom LRU + speculative prefetcher driven by the router's own
    activation history.
@@ -51,7 +53,7 @@ token → |  Router   | →  | Expert IDs   | →  | LRU Cache | →  | SwiGLU F
                                          +--------+---------+     │
                                                   ↓               │
                                          +------------------+     │ on Arc drop
-                                         |  io_uring read   |     │ (LRU evict
+                                         |  pread(2) read   |     │ (LRU evict
                                          |  O_DIRECT, no    |     │  or buffer
                                          |  page cache      |     │  release)
                                          +--------+---------+     │
@@ -100,7 +102,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. |
 | `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s. Hands out `PooledBuffer` RAII guards; dropping a guard returns the buffer to the free list and notifies waiters. This is the literal "pre-allocated RAM buffer" the spec asks for. |
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
-| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, submits async reads through `rio`. Includes a `gen-data` helper to create synthetic test files and a portable Unix fallback for development on macOS. |
+| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`). Includes a `gen-data` helper to create synthetic test files and a portable Unix fallback for development on macOS. |
 | `router` | `TopKRouter` (distinct top-K, weighted) and `PredictiveLoader` (first-order Markov over expert ids, learns online, smoothed with a uniform prior so predictions are immediately usable). |
 | `inference` | Real SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`) computed in scalar `f32` directly over the bytes streamed off NVMe. Reinterprets each pool buffer as three weight matrices (no copy). Replace with `tch`/`candle`/`cudarc` for SIMD / GPU. |
 | `engine` | Top-level orchestrator. Owns the router/predictor/cache/pool/storage, drives the per-token cycle, schedules prefetches, records HDR histograms. |
@@ -121,22 +123,31 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
   initialised to `1` (uniform prior). On every token transition we increment
   `counts[from][to]`. `predict_next` divides by the row total and filters by
   `min_prob`, so cold-start is graceful and learning is incremental.
-- **Pluggable I/O backend.** The hot path uses `rio` (small io_uring
-  wrapper). On non-Linux Unix (e.g. macOS dev boxes) it falls back to
-  `pread(2)` so the engine still runs end-to-end during development, with
-  the same logical pipeline.
+- **Pluggable I/O backend.** The hot path uses `tokio::task::block_in_place`
+  to dispatch a synchronous `pread(2)` (via `std::os::unix::fs::FileExt::read_at`)
+  on the current Tokio worker; the runtime donates that worker to blocking
+  work and other tasks are picked up by sibling workers. On non-Linux Unix
+  (e.g. macOS dev boxes) the same code path runs without `O_DIRECT` so the
+  engine still runs end-to-end during development.
 
-### "Why `rio` and not X?"
+### "Why `pread` + `block_in_place` and not io_uring?"
+
+Earlier drafts used the `rio` io_uring wrapper, but `rio 0.9.4` carries an
+unfixed use-after-free advisory and the crate is unmaintained, so the
+dependency was removed. The current backend is intentionally simple —
+positional `pread` is `O_DIRECT`-compatible, deep-queue-friendly on NVMe,
+and avoids touching the file offset so concurrent reads against the same
+fd are safe. Future `io_provider` upgrade paths:
 
 | Crate | Verdict for this workload |
 |---|---|
-| **`rio`** *(used here)* | Small, ergonomic, easy to drop into Tokio. **Unmaintained since 2021.** No registered fixed buffers, no SQPOLL toggle, no submission-queue size knob. Fine for a reference implementation. |
+| **`pread` + `block_in_place`** *(used here)* | Zero extra deps, works on every Unix, exercises the full `O_DIRECT` + page-aligned-buffer + LRU + prefetch logic. The compute and storage stay observably distinct in the per-token logs. |
 | **`tokio-uring`** | Best ergonomic fit if you live in Tokio. Single-threaded per ring, requires `#[tokio_uring::start]` instead of `#[tokio::main]` — would force a runtime restructuring. |
 | **`io-uring`** (raw, by tokio-rs) | The thinnest binding to the kernel ABI. Lets you use **registered (fixed) buffers** + **registered files**, which removes per-op address validation in the kernel — the single biggest win for sustained NVMe throughput. **This is what a production build of this engine would use.** |
 | **`glommio`** | Thread-per-core, polled io_uring. Made for NVMe-bound workloads (ScyllaDB heritage). For a pure expert-fetch service pinning workers to cores feeding local rings, glommio is arguably the *fastest* answer on Linux. Trade-off: incompatible with Tokio (it owns the runtime). |
 
 The clean separation between `io_provider` and the rest of the engine means
-swapping `rio` for `io-uring` or `glommio` is a self-contained change.
+swapping the backend for `io-uring` or `glommio` is a self-contained change.
 
 ---
 
@@ -144,7 +155,8 @@ swapping `rio` for `io-uring` or `glommio` is a self-contained change.
 
 ### Prerequisites
 
-- **Linux kernel ≥ 5.6** for io_uring support (5.10+ recommended).
+- **Linux kernel ≥ 3.0** is enough — the I/O path uses `pread(2)` with
+  `O_DIRECT`, not io_uring. No special kernel features are required.
 - **Rust 1.74+** (uses `clap 4`, edition 2021).
 - A real **block-device-backed filesystem** (ext4, xfs, btrfs on NVMe) for
   the `O_DIRECT` path. tmpfs / overlayfs / many FUSE mounts return `EINVAL`
@@ -416,14 +428,17 @@ Covers:
   engine runs the *expert FFN* of a sparse MoE; the rest of a real
   transformer (attention, RMSNorm, residual, embedding, lm-head) and a
   tokenizer are not yet wired in.
-- **`rio` is unmaintained.** A production deployment should switch to the
-  raw `io-uring` crate with **registered fixed buffers** and **registered
-  files** — the cleanest single throughput win available.
+- **Synchronous `pread` on a blocking-donated worker.** The current
+  backend uses `tokio::task::block_in_place` + `pread(2)`. A production
+  deployment should switch to the raw `io-uring` crate with **registered
+  fixed buffers** and **registered files** — the cleanest single
+  throughput win available.
 - **No NUMA pinning.** On multi-socket boxes you'd want one ring per NUMA
   node and to pin worker threads + buffers locally.
 - **No batched / vectored reads.** When two experts on the same token both
-  miss, we issue two SQEs; on a NVMe drive with deep queues that's already
-  efficient, but on slower devices you might want `readv`-style batching.
+  miss, we issue two independent `pread` calls; on a NVMe drive with deep
+  queues that's already efficient, but on slower devices you might want
+  `readv`-style batching (or io_uring submission batching).
 
 ## License
 

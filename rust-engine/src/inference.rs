@@ -45,7 +45,19 @@
 //! `&[f32]` is sound — `align_of::<f32>() == 4` and we always allocate at
 //! `≥ 4096`-byte alignment. See [`ExpertWeights::from_bytes`].
 
+// The on-disk layout is documented as little-endian `f32`; we reinterpret
+// the byte buffer as `&[f32]` in place, so the host's native endianness
+// must match. Refuse to compile on big-endian targets rather than
+// silently produce wrong weights.
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "inference module reinterprets on-disk little-endian f32 weights as \
+     &[f32] in place; this only works on little-endian targets. Add an \
+     explicit byte-swap conversion path before building for big-endian."
+);
+
 use crate::expert_cache::ExpertResident;
+use std::fmt;
 
 /// Hidden-state vector flowing through the FFN block (`d_model` floats).
 pub type HiddenState = Vec<f32>;
@@ -78,46 +90,103 @@ pub struct ExpertWeights<'a> {
 }
 
 /// Number of `f32` weights an expert with these dimensions occupies.
+///
+/// Uses `saturating_mul` so absurdly large CLI-provided shapes don't
+/// silently wrap in release mode — on overflow this returns
+/// `usize::MAX`, which makes every downstream size check (the buffer
+/// length comparison in [`ExpertWeights::from_bytes`], the
+/// `expert_size` validation in `cmd_gen_data` / `generate_synthetic_experts`,
+/// and the engine's startup check) reliably fail.
 #[inline]
 pub const fn expert_weight_count(d_model: usize, d_ff: usize) -> usize {
     // gate (d_ff * d_model) + up (d_ff * d_model) + down (d_model * d_ff)
-    3 * d_model * d_ff
+    let one = d_model.saturating_mul(d_ff);
+    one.saturating_mul(3)
 }
 
 /// Number of bytes an expert with these dimensions occupies on disk
-/// (one `f32` is 4 bytes).
+/// (one `f32` is 4 bytes). Saturates to `usize::MAX` on overflow; see
+/// [`expert_weight_count`].
 #[inline]
 pub const fn expert_weight_bytes(d_model: usize, d_ff: usize) -> usize {
-    expert_weight_count(d_model, d_ff) * 4
+    expert_weight_count(d_model, d_ff).saturating_mul(4)
 }
+
+/// Errors produced when reinterpreting a raw byte buffer as expert
+/// weights. These are the conditions that previously aborted the run
+/// via `assert!`; the run path now logs them and skips the offending
+/// expert instead of panicking on corrupt on-disk data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpertWeightsError {
+    /// The buffer is shorter than the SwiGLU weight blob requires.
+    BufferTooSmall {
+        have: usize,
+        need: usize,
+        d_model: usize,
+        d_ff: usize,
+    },
+    /// The buffer's start address is not aligned for `f32` access.
+    /// `BufferPool` always allocates page-aligned buffers, so this is
+    /// a contract violation rather than something a corrupt file can
+    /// trigger — but we surface it as an error rather than panicking.
+    Misaligned { addr: usize, required: usize },
+}
+
+impl fmt::Display for ExpertWeightsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExpertWeightsError::BufferTooSmall { have, need, d_model, d_ff } => write!(
+                f,
+                "expert buffer too small: have {have} bytes, need {need} for \
+                 d_model={d_model}, d_ff={d_ff}"
+            ),
+            ExpertWeightsError::Misaligned { addr, required } => write!(
+                f,
+                "expert buffer is not f32-aligned: addr=0x{addr:x}, required={required}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExpertWeightsError {}
 
 impl<'a> ExpertWeights<'a> {
     /// Reinterpret a page-aligned byte buffer as the three weight matrices.
     ///
-    /// `bytes` must be at least `expert_weight_bytes(d_model, d_ff)` long
-    /// and start at an address aligned to `align_of::<f32>()` (4 bytes).
-    /// `BufferPool` allocates with `≥ 4096`-byte alignment, so this always
-    /// holds in practice; we still assert it to keep the safety contract
-    /// local and obvious.
+    /// Returns [`ExpertWeightsError`] if `bytes` is shorter than
+    /// `expert_weight_bytes(d_model, d_ff)` or does not start at an
+    /// address aligned to `align_of::<f32>()` (4 bytes). `BufferPool`
+    /// allocates with `≥ 4096`-byte alignment, so the alignment branch
+    /// is defensive — but the size branch can fire on a truncated /
+    /// corrupt on-disk file, and surfacing it as a `Result` lets the
+    /// engine log and skip the expert instead of aborting the whole run.
     ///
     /// Any trailing bytes (e.g. padding so the file size is a multiple of
     /// `block_align` for `O_DIRECT`) are ignored.
-    pub fn from_bytes(bytes: &'a [u8], d_model: usize, d_ff: usize) -> Self {
+    pub fn from_bytes(
+        bytes: &'a [u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
         let need_floats = expert_weight_count(d_model, d_ff);
-        let need_bytes = need_floats * 4;
-        assert!(
-            bytes.len() >= need_bytes,
-            "expert buffer too small: have {} bytes, need {} for d_model={}, d_ff={}",
-            bytes.len(),
-            need_bytes,
-            d_model,
-            d_ff
-        );
+        let need_bytes = need_floats.saturating_mul(4);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
         // Buffers from `BufferPool` are page-aligned; `f32` only needs 4.
-        assert!(
-            (bytes.as_ptr() as usize) % std::mem::align_of::<f32>() == 0,
-            "expert buffer is not f32-aligned"
-        );
+        let required_align = std::mem::align_of::<f32>();
+        let addr = bytes.as_ptr() as usize;
+        if addr % required_align != 0 {
+            return Err(ExpertWeightsError::Misaligned {
+                addr,
+                required: required_align,
+            });
+        }
 
         // SAFETY:
         // * `bytes.as_ptr()` is non-null and verified above to be aligned
@@ -128,6 +197,10 @@ impl<'a> ExpertWeights<'a> {
         //   valid `f32` (NaN / subnormal / Inf are all well-defined values
         //   for the type system; whether the *model* tolerates them is
         //   `gen-data`'s responsibility, and it writes finite weights).
+        // * The on-disk layout is little-endian `f32`; the
+        //   `compile_error!` at the top of this module ensures the host
+        //   is also little-endian, so a byte-for-byte reinterpretation
+        //   is correct.
         // * The lifetime of the resulting `&[f32]` is tied to `bytes`, so
         //   the borrow checker prevents mutation while the view exists.
         let floats: &'a [f32] = unsafe {
@@ -141,7 +214,7 @@ impl<'a> ExpertWeights<'a> {
         let (up, rest) = rest.split_at(up_len);
         let (down, _trailing) = rest.split_at(down_len);
 
-        Self { d_model, d_ff, gate, up, down }
+        Ok(Self { d_model, d_ff, gate, up, down })
     }
 
     /// `down_proj · ( silu(gate_proj · x)  ⊙  (up_proj · x) )`
@@ -226,14 +299,20 @@ pub fn synth_hidden_state(token_idx: u64, d_model: usize, seed: u64) -> HiddenSt
 /// is the bytes that came directly off the SSD via `O_DIRECT`. Returns
 /// both the activation vector (for combining with other experts) and an
 /// [`InferenceOutput`] summary suitable for logging.
+/// Run one expert's FFN on the hidden state. The buffer behind `resident`
+/// is the bytes that came directly off the SSD via `O_DIRECT`. Returns
+/// both the activation vector (for combining with other experts) and an
+/// [`InferenceOutput`] summary suitable for logging, or an
+/// [`ExpertWeightsError`] if the resident buffer can't be reinterpreted
+/// as a valid SwiGLU weight blob (e.g. a truncated / corrupt file).
 pub fn run_inference(
     token_idx: u64,
     resident: &ExpertResident,
     x: &[f32],
     d_model: usize,
     d_ff: usize,
-) -> (InferenceOutput, HiddenState) {
-    let weights = ExpertWeights::from_bytes(resident.data(), d_model, d_ff);
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = ExpertWeights::from_bytes(resident.data(), d_model, d_ff)?;
     let y = weights.forward(x);
     let mut sum_sq = 0.0f64;
     for &v in &y {
@@ -252,10 +331,10 @@ pub fn run_inference(
         digest ^= bits;
         digest = digest.wrapping_mul(FNV_PRIME);
     }
-    (
+    Ok((
         InferenceOutput { expert_id: resident.id, digest, out_norm },
         y,
-    )
+    ))
 }
 
 /// Fold the top-K expert outputs together. Mixtral / Llama-MoE actually
@@ -306,7 +385,7 @@ mod tests {
         let d_model = 4;
         let d_ff = 8;
         let buf = make_weights_buffer(d_model, d_ff, 0.25);
-        let w = ExpertWeights::from_bytes(buf.as_slice(), d_model, d_ff);
+        let w = ExpertWeights::from_bytes(buf.as_slice(), d_model, d_ff).unwrap();
         assert_eq!(w.gate.len(), d_ff * d_model);
         assert_eq!(w.up.len(), d_ff * d_model);
         assert_eq!(w.down.len(), d_model * d_ff);
@@ -320,7 +399,7 @@ mod tests {
         let d_ff = 32;
         // Use small weights so silu*x*x stays in a well-behaved range.
         let buf = make_weights_buffer(d_model, d_ff, 0.05);
-        let w = ExpertWeights::from_bytes(buf.as_slice(), d_model, d_ff);
+        let w = ExpertWeights::from_bytes(buf.as_slice(), d_model, d_ff).unwrap();
         let x = synth_hidden_state(7, d_model, 1234);
         let y = w.forward(&x);
         assert_eq!(y.len(), d_model);
@@ -332,7 +411,7 @@ mod tests {
         let d_model = 8;
         let d_ff = 16;
         let buf = make_weights_buffer(d_model, d_ff, 0.1);
-        let w = ExpertWeights::from_bytes(buf.as_slice(), d_model, d_ff);
+        let w = ExpertWeights::from_bytes(buf.as_slice(), d_model, d_ff).unwrap();
         let x = synth_hidden_state(42, d_model, 99);
         let a = w.forward(&x);
         let b = w.forward(&x);
@@ -344,10 +423,41 @@ mod tests {
         let d_model = 4;
         let d_ff = 4;
         let buf = make_weights_buffer(d_model, d_ff, 0.0);
-        let w = ExpertWeights::from_bytes(buf.as_slice(), d_model, d_ff);
+        let w = ExpertWeights::from_bytes(buf.as_slice(), d_model, d_ff).unwrap();
         let x = synth_hidden_state(1, d_model, 1);
         let y = w.forward(&x);
         assert!(y.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn from_bytes_rejects_truncated_buffer() {
+        let d_model = 4;
+        let d_ff = 8;
+        let buf = make_weights_buffer(d_model, d_ff, 0.0);
+        let need = expert_weight_bytes(d_model, d_ff);
+        // Hand it a slice that is one f32 short of the requirement.
+        let truncated = &buf.as_slice()[..need - 4];
+        let err = ExpertWeights::from_bytes(truncated, d_model, d_ff)
+            .err()
+            .expect("expected an error from a truncated buffer");
+        match err {
+            ExpertWeightsError::BufferTooSmall { have, need: n, .. } => {
+                assert_eq!(have, need - 4);
+                assert_eq!(n, need);
+            }
+            other => panic!("expected BufferTooSmall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expert_weight_count_saturates_on_overflow() {
+        // d_model * d_ff would overflow usize on every supported target.
+        // saturating_mul must clamp to usize::MAX so downstream size
+        // checks (which compare against finite buffer lengths) reliably
+        // fail rather than silently wrap.
+        let huge = usize::MAX;
+        assert_eq!(expert_weight_count(huge, 2), usize::MAX);
+        assert_eq!(expert_weight_bytes(huge, 2), usize::MAX);
     }
 
     #[test]

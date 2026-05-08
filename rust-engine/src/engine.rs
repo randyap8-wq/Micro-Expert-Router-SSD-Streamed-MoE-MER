@@ -147,9 +147,23 @@ impl Engine {
         let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
         let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
         for r in &residents {
-            let (out, y) = run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff);
-            outputs.push(out);
-            per_expert_y.push(y);
+            match run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff) {
+                Ok((out, y)) => {
+                    outputs.push(out);
+                    per_expert_y.push(y);
+                }
+                Err(e) => {
+                    // The on-disk file is truncated / corrupt or violates
+                    // an alignment invariant. Log and skip this expert
+                    // rather than aborting the whole token cycle / run.
+                    warn!(
+                        token = token_idx,
+                        expert = r.id,
+                        error = %e,
+                        "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                    );
+                }
+            }
         }
         let combined = combine_outputs(&per_expert_y);
         let compute_us = compute_start.elapsed().as_micros() as u64;
