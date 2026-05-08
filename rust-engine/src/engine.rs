@@ -158,8 +158,10 @@ impl Engine {
                 .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
             residents[i] = Some(r);
         }
-        let residents: Vec<Arc<ExpertResident>> =
-            residents.into_iter().map(|r| r.expect("every routed expert must be resident")).collect();
+        let residents: Vec<Arc<ExpertResident>> = residents
+            .into_iter()
+            .map(|r| r.expect("internal invariant: every routed expert slot must be populated by either a hit or a completed miss fetch"))
+            .collect();
 
         // 2) Real expert FFN forward pass over weights streamed from SSD.
         //    `synth_hidden_state` mocks the residual-stream activation that
