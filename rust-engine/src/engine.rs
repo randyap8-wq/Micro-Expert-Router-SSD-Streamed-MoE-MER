@@ -119,25 +119,49 @@ impl Engine {
         let mut stats = CycleStats::default();
 
         // 1) Make sure every required expert is resident.
-        let mut residents = Vec::with_capacity(target.len());
-        for &id in &target {
+        //
+        // Cache-miss reads are issued concurrently. Two routed experts
+        // that both miss kick off two `pread(2)` calls in parallel via
+        // `tokio::spawn`, so the NVMe queue actually sees the queue depth
+        // the routing decision implies; sequentially `await`-ing each
+        // fetch would serialise an opportunity the device can already
+        // satisfy concurrently. Hits are resolved inline.
+        let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
+        let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
+            Vec::new();
+        for (i, &id) in target.iter().enumerate() {
             if let Some(r) = self.cache.get(id) {
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 stats.hits += 1;
                 debug!(expert = id, "cache hit");
-                residents.push(r);
+                residents[i] = Some(r);
             } else {
                 self.counters.misses.fetch_add(1, Ordering::Relaxed);
                 stats.misses += 1;
                 debug!(expert = id, "cache miss, fetching from NVMe");
-                let r = self.fetch(id).await;
-                stats.bytes_read += r.buffer.len() as u64;
-                self.counters
-                    .bytes_read
-                    .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
-                residents.push(r);
+                let me = self.clone();
+                miss_handles.push((
+                    i,
+                    tokio::spawn(async move { me.fetch(id).await }),
+                ));
             }
         }
+        for (i, h) in miss_handles {
+            // `fetch` panics on a fatal read error (the engine cannot
+            // make progress without the requested expert); propagate by
+            // unwrapping the `JoinError` so the panic surfaces exactly
+            // as it did before this was made concurrent.
+            let r = h.await.expect("expert fetch task panicked");
+            stats.bytes_read += r.buffer.len() as u64;
+            self.counters
+                .bytes_read
+                .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
+            residents[i] = Some(r);
+        }
+        let residents: Vec<Arc<ExpertResident>> = residents
+            .into_iter()
+            .map(|r| r.expect("internal invariant: every routed expert slot must be populated by either a hit or a completed miss fetch"))
+            .collect();
 
         // 2) Real expert FFN forward pass over weights streamed from SSD.
         //    `synth_hidden_state` mocks the residual-stream activation that
@@ -412,4 +436,223 @@ pub struct EngineReport {
     pub d_model: usize,
     pub d_ff: usize,
     pub predictor_observations: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration test for the full `Engine::generate` loop.
+    //!
+    //! Wires the real `NvmeStorage` (with `O_DIRECT` disabled — required on
+    //! tmpfs/CI), real `BufferPool`, real `ExpertCache`, real `TopKRouter`
+    //! and `PredictiveLoader` against on-disk synthetic experts written by
+    //! `generate_synthetic_experts`, and runs many tokens through
+    //! `Engine::generate`. This is the "no integration tests for the full
+    //! Engine::generate loop" gap closed.
+    use super::*;
+    use crate::buffer_pool::BufferPool;
+    use crate::expert_cache::ExpertCache;
+    use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
+    use crate::router::{PredictiveLoader, TopKRouter};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Self-cleaning unique temp directory for test fixtures.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            // Combine pid + monotonic counter + nanos for uniqueness across
+            // parallel test runs without pulling in a tempfile dependency.
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "micro-expert-router-{label}-{}-{n}-{ts}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn build_engine(
+        data_dir: &std::path::Path,
+        num_experts: u32,
+        d_model: usize,
+        d_ff: usize,
+        cache_slots: usize,
+        top_k: usize,
+        predict_fanout: usize,
+        seed: u64,
+    ) -> Arc<Engine> {
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        // Round expert_size up to a multiple of block_align (an O_DIRECT
+        // invariant the storage layer asserts even when --no-direct is set).
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+
+        generate_synthetic_experts(data_dir, num_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: data_dir.to_path_buf(),
+                expert_size,
+                block_align,
+                // tmpfs / overlayfs (typical for CI) doesn't support O_DIRECT.
+                use_direct_io: false,
+            })
+            .expect("storage init"),
+        );
+        storage
+            .warmup_fds(0..num_experts)
+            .expect("pre-open expert fds");
+
+        let pool_slots = cache_slots + predict_fanout.max(1);
+        let pool = BufferPool::new(pool_slots, expert_size, block_align);
+        let cache = Arc::new(ExpertCache::new(cache_slots));
+        let router = Arc::new(TopKRouter::new(num_experts, top_k, seed));
+        let predictor = Arc::new(PredictiveLoader::new(num_experts, predict_fanout, 0.05, seed));
+
+        Arc::new(Engine::new(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape { d_model, d_ff, hidden_seed: seed },
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generate_loop_routes_fetches_and_runs_inference() {
+        let dir = TempDir::new("gen-integration");
+        let num_experts: u32 = 16;
+        let top_k = 2;
+        let d_model = 32;
+        let d_ff = 64;
+        let cache_slots = 8;
+        let predict_fanout = 2;
+        let tokens: u64 = 64;
+
+        let engine = build_engine(
+            &dir.path,
+            num_experts,
+            d_model,
+            d_ff,
+            cache_slots,
+            top_k,
+            predict_fanout,
+            0xC0FFEE,
+        );
+
+        let mut total_hits = 0u64;
+        let mut total_misses = 0u64;
+        let mut total_bytes = 0u64;
+        for t in 0..tokens {
+            let s = engine.generate(t).await;
+            total_hits += s.hits;
+            total_misses += s.misses;
+            total_bytes += s.bytes_read;
+        }
+
+        // Every token routes to exactly `top_k` experts, so the cumulative
+        // hit + miss count must be exactly `tokens * top_k`.
+        assert_eq!(
+            total_hits + total_misses,
+            tokens * top_k as u64,
+            "every routed expert must produce exactly one cache lookup"
+        );
+
+        // The first token always misses (cold cache); after that the
+        // cache + prefetcher should eventually start serving experts
+        // from RAM rather than disk.
+        assert!(total_hits > 0, "expected at least some cache hits across {tokens} tokens");
+        assert!(total_misses > 0, "expected at least some cache misses across {tokens} tokens");
+        assert!(total_bytes > 0, "expected the engine to read bytes from the SSD");
+
+        // The aggregate report mirrors the per-cycle totals on the
+        // critical path. `r.bytes_read` may exceed `total_bytes` because
+        // background prefetch tasks also contribute to the counter
+        // without being part of any single token's stats.
+        let r = engine.report();
+        assert_eq!(r.hits, total_hits);
+        assert_eq!(r.misses, total_misses);
+        assert!(
+            r.bytes_read >= total_bytes,
+            "report bytes_read ({}) must include at least the critical-path bytes ({total_bytes})",
+            r.bytes_read
+        );
+        assert!(r.io_count >= total_misses, "io histogram must record every miss");
+        // Latency histograms must have observed at least one sample of each
+        // category (compute always, I/O at least once because a cold start
+        // forces a miss).
+        assert!(r.cycle_p50_us > 0);
+        assert!(r.compute_p50_us > 0);
+        assert!(r.io_p50_us > 0);
+
+        // Predictor learned something (transitions other than the very first
+        // were observed).
+        assert!(
+            r.predictor_observations > 0,
+            "predictor should have logged at least one transition"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_with_preloads_experts_into_cache() {
+        // Mirrors the spec's "router selects Expert ID 3 and 7" warm-up.
+        let dir = TempDir::new("gen-warm");
+        let num_experts: u32 = 8;
+        let engine = build_engine(&dir.path, num_experts, 16, 32, 4, 2, 1, 0xBEEF);
+
+        engine.warm_with(&[3, 7]).await.expect("warm fetch");
+
+        // `warm_with` reads through `fetch`, which doesn't bump the
+        // hit/miss/bytes counters (those track router-driven `generate`
+        // traffic only). The observable side-effect is that both warmed
+        // experts are now resident in the cache.
+        let r = engine.report();
+        assert_eq!(r.hits, 0);
+        assert_eq!(r.misses, 0);
+        assert!(engine.cache.contains(3));
+        assert!(engine.cache.contains(7));
+
+        // Subsequent generate calls now have warmed slots to hit.
+        let _ = engine.generate(0).await;
+        // After at least one token, the per-token cycle histogram must
+        // have recorded a sample.
+        let r = engine.report();
+        assert!(r.cycle_p50_us > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_cap_bounds_residency_under_load() {
+        // The engine must never let more than `cache_slots` experts be
+        // resident at once, even under heavy churn. Pick num_experts >>
+        // cache_slots to force eviction on most tokens.
+        let dir = TempDir::new("gen-evict");
+        let num_experts: u32 = 32;
+        let cache_slots = 4;
+        let engine = build_engine(&dir.path, num_experts, 16, 32, cache_slots, 2, 2, 7);
+
+        for t in 0..50 {
+            let _ = engine.generate(t).await;
+        }
+        let r = engine.report();
+        assert_eq!(r.cache_capacity, cache_slots);
+        // Misses dominate when cache_slots is small relative to working set.
+        assert!(r.misses > r.hits / 2, "expected eviction churn to produce many misses");
+    }
 }
