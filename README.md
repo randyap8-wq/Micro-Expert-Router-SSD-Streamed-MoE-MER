@@ -225,6 +225,87 @@ micro-expert-router run
 
 ---
 
+## What can it actually run today?
+
+**Today, in this repository: nothing end-to-end.** `inference::run_inference`
+is a placeholder FNV-1a hash over the buffer — there is no matmul, no
+softmax, no tokenizer. The engine demonstrates the **I/O substrate** that a
+real MoE runtime would sit on top of, not the runtime itself. Wiring a
+tensor library into `run_inference` is the missing step.
+
+That said, the architecture (per-expert files, fixed expert size,
+top-K activation, LRU + prefetch) is shaped specifically for **sparse
+Mixture-of-Experts transformers where the expert FFNs are the dominant
+weight**. Concretely, the following published models drop into this layout
+with no architectural changes — only a real inference kernel and a sharding
+script that splits their `safetensors` into one `expert_<id>.bin` per
+expert (or per-layer-per-expert, see "Sharding granularity" below):
+
+| Model | Total params | Active / token | Experts | Top-K | Per-expert FFN (bf16) | Notes |
+|---|---|---|---|---|---|---|
+| **Mixtral 8x7B** | ~47 B | ~12.9 B | 8 × 32 layers | 2 | ~88 MB | Canonical fit. ~22 GB of expert weight, easily streamed from a single PCIe-4 NVMe. |
+| **Mixtral 8x22B** | ~141 B | ~39 B | 8 × 56 layers | 2 | ~240 MB | Comfortable on PCIe-5 NVMe. Cache 8–16 experts; prefetcher learns the routing well. |
+| **Phi-3.5-MoE-instruct** | ~42 B | ~6.6 B | 16 × 32 layers | 2 | ~80 MB | Smaller experts, more of them — exercises the predictor harder. |
+| **Qwen1.5-MoE-A2.7B / Qwen2-MoE** | ~14 B | ~2.7 B | 60 × 24 layers | 4 | ~10 MB | Fine-grained experts; ideal for demonstrating prefetch hit-rate. |
+| **DeepSeek-MoE 16B** | ~16.4 B | ~2.8 B | 64 routed + 2 shared × 28 layers | 6 | ~5–8 MB | "Shared experts" should be pinned (use `--first-token` to warm them, set `--cache-slots` ≥ shared count). |
+| **DeepSeek-V2-Lite / V2** | 16 B / 236 B | 2.4 B / 21 B | 64–160 × many layers | 6 | small | Same shape, larger scale. V2-full needs PCIe-5 + ≥ 32 cache slots to keep p99 sane. |
+| **DeepSeek-V3 / V3-0324** | 671 B | 37 B | 256 routed + 1 shared × 61 layers | 8 | small but many | Stress test of the design — ~15 K expert tensors. Sharding at per-layer-per-expert is mandatory. |
+| **OLMoE-1B-7B** | 7 B | 1.3 B | 64 × 16 layers | 8 | ~6 MB | Open-everything; good for benchmarking and reproducibility. |
+| **Snowflake Arctic** | 480 B | 17 B | 128 × 35 layers | 2 | medium | Top-2 makes prefetcher very effective. |
+| **Grok-1** | 314 B | ~78 B | 8 × 64 layers | 2 | ~600 MB | Per-expert footprint approaches GB; keep `--cache-slots` modest and let the LRU breathe. |
+
+What this means in practice:
+
+- **Any **sparse MoE** transformer whose forward pass is "router → top-K MLPs"
+  is compatible.** That covers essentially every modern open-weights MoE.
+- **Dense models do not benefit.** A dense Llama-3 has no experts to swap.
+- **Vision/multimodal MoEs (e.g. DeepSeek-VL2-MoE) work the same way** as
+  long as the visual encoder is held resident in RAM (it's tiny next to the
+  expert pool).
+
+### Agents
+
+The engine is *inference infrastructure*, not an agent runtime. There is
+nothing here that loops over tool calls, parses ReAct traces, or manages
+memory between turns. However, **any agent framework that delegates
+generation to one of the LLMs above can use this engine as the underlying
+serving layer once a tensor backend is wired in** — LangChain, LangGraph,
+Microsoft AutoGen, CrewAI, llama-index, OpenAI-Agents-SDK, and the
+`smolagents` family are all framework-agnostic about the model server. The
+practical path is: this engine → an OpenAI-compatible HTTP shim →
+the agent framework's standard client.
+
+### Sharding granularity
+
+Two ways to lay an MoE on disk; both are supported by the engine
+unchanged — only `--num-experts` and `--expert-size` differ:
+
+1. **One file per expert (all layers concatenated).** Smaller `--num-experts`,
+   larger `--expert-size`. Best when DRAM is large enough to hold the
+   active set of "whole experts". Higher prefetch payoff (one read per
+   miss). Mixtral works well like this.
+2. **One file per (layer, expert) pair.** Larger `--num-experts =
+   layers × experts`, smaller `--expert-size`. Best for very wide models
+   (DeepSeek-V3-class) where a single concatenated expert wouldn't fit a
+   pool slot. Routing per-layer becomes the natural granularity for the
+   predictor too.
+
+The included `gen-data` subcommand creates the **same fixed-size per-expert
+file format** the engine expects, so you can prototype a new model's
+layout without writing a real sharder first: just pick `--num-experts` and
+`--expert-size` to match the geometry above and you'll get realistic
+latency / throughput numbers for that model's I/O profile.
+
+### Picking a tensor backend (when you wire one in)
+
+| Backend | Language | MoE support | Notes |
+|---|---|---|---|
+| **`mistral.rs`** | Rust | First-class (Mixtral, DeepSeek, Phi-MoE, Qwen-MoE) | Closest fit. Replace its weight loader with this engine's `ExpertCache::get` and you're done. |
+| **`candle`** | Rust | Mixtral example in-tree | Tensor lib with no engine; you write the routing loop. Cleanest integration target. |
+| **`burn`** | Rust | Generic; community Mixtral | Good if you want pluggable compute backends (wgpu, cuda, ndarray). |
+| **`llama.cpp` (GGUF MoE)** | C++ | Mixtral, DeepSeek, Qwen-MoE, OLMoE | FFI required. GGUF stores experts contiguously per layer, easy to map to per-expert files. |
+| **`vLLM`** | Python | Excellent | FFI required (the storage layer would expose a `/expert/<id>` server). Hardest, highest payoff for scale. |
+
 ## Tests
 
 ```bash

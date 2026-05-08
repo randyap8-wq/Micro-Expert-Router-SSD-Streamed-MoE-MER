@@ -1,29 +1,46 @@
 //! NVMe storage provider.
 //!
-//! On Linux this opens each expert file (optionally with `O_DIRECT`) at
-//! startup, keeps the file descriptors resident, and submits async reads
-//! through an [`rio`] io_uring instance into a [`PooledBuffer`] owned by the
-//! caller. On non-Linux platforms it falls back to blocking `pread` on a
-//! Tokio blocking thread, which keeps the rest of the engine portable for
-//! development on macOS / WSL even though the hot path requires Linux.
+//! Opens each expert as its own file (optionally with `O_DIRECT` on Linux),
+//! keeps the file descriptors resident in an fd cache, and reads experts
+//! into a [`PooledBuffer`] owned by the caller via positional reads
+//! (`pread(2)`).
 //!
 //! ## Why this layout?
 //!
-//! * **One ring, many fds.** A single io_uring SQ can drive thousands of
-//!   in-flight reads. Opening files once removes per-read open() syscalls
-//!   from the latency budget.
-//! * **`O_DIRECT`.** Bypasses the page cache so we measure (and consume) raw
-//!   NVMe bandwidth. Required by the spec; the buffer pool guarantees the
-//!   alignment invariants the kernel checks.
-//! * **Optional fallback.** `--no-direct` reverts to buffered reads, which is
-//!   useful on tmpfs / overlayfs / non-Linux CI where `O_DIRECT` returns
-//!   `EINVAL`. The engine still exercises the same prefetch + LRU logic.
+//! * **One fd per expert, kept open.** Removes per-read `open()` syscalls
+//!   from the steady-state latency budget — the same property an io_uring
+//!   path would want with registered files.
+//! * **`O_DIRECT`.** Bypasses the page cache so we measure (and consume)
+//!   raw NVMe bandwidth. Required by the spec; the buffer pool guarantees
+//!   the alignment invariants the kernel checks.
+//! * **`block_in_place` + `pread`.** Each cache miss runs the synchronous
+//!   `pread(2)` on the current Tokio worker via
+//!   [`tokio::task::block_in_place`]. The worker is donated to blocking
+//!   work and other ready tasks are picked up by sibling workers, so the
+//!   runtime stays responsive. Using `pread` (positional) instead of
+//!   `read_exact` means we do not touch the file offset and reads are
+//!   safe to issue concurrently against the same fd.
+//! * **Optional `--no-direct` fallback.** Useful on tmpfs / overlayfs /
+//!   non-Linux CI where `O_DIRECT` returns `EINVAL`. The engine still
+//!   exercises the same prefetch + LRU + alignment logic.
+//!
+//! ## Why not `rio`?
+//!
+//! Earlier drafts used the [`rio`] io_uring crate directly. `rio 0.9.4` has
+//! an unfixed use-after-free advisory and the crate is unmaintained, so we
+//! removed the dependency. The intended production replacement is
+//! [`tokio-uring`] (or the raw `io-uring` crate with registered fixed
+//! buffers); both require restructuring `main` around their own runtime
+//! entry points (`tokio_uring::start`), which is left as future work. The
+//! `io_provider` module is the only place that needs to change to swap
+//! backends, so this is a self-contained migration.
 
 use crate::buffer_pool::PooledBuffer;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -43,12 +60,10 @@ pub struct StorageConfig {
     pub use_direct_io: bool,
 }
 
-/// NVMe-backed storage with an io_uring backend on Linux.
+/// NVMe-backed storage with a per-expert fd cache.
 pub struct NvmeStorage {
     cfg: StorageConfig,
     files: RwLock<HashMap<u32, Arc<File>>>,
-    #[cfg(target_os = "linux")]
-    ring: rio::Rio,
 }
 
 impl NvmeStorage {
@@ -61,14 +76,9 @@ impl NvmeStorage {
             cfg.block_align
         );
 
-        #[cfg(target_os = "linux")]
-        let ring = rio::new()?;
-
         Ok(Self {
             cfg,
             files: RwLock::new(HashMap::new()),
-            #[cfg(target_os = "linux")]
-            ring,
         })
     }
 
@@ -135,24 +145,27 @@ impl NvmeStorage {
 
     #[cfg(target_os = "linux")]
     async fn read_into(&self, file: &File, buf: &mut PooledBuffer) -> io::Result<usize> {
-        // rio's `read_at` takes `&B` where `B: AsMut<[u8]>` (via `AsIoVecMut`)
-        // and writes through the slice's raw pointer. We hold `&mut buf`
-        // exclusively for the duration of the await, so no aliasing can
-        // occur. The buffer is page-aligned and its length is a multiple of
-        // the block size, which satisfies the `O_DIRECT` kernel preconditions.
-        let completion = self.ring.read_at(file, &*buf, 0);
-        completion.await
+        // Run the synchronous `pread(2)` on the current Tokio worker via
+        // `block_in_place`. Other ready tasks are migrated to sibling
+        // workers, so we don't stall the runtime; we also avoid the
+        // `'static` requirement of `spawn_blocking`, which lets us keep
+        // the borrow on `buf`.
+        let len = buf.len();
+        tokio::task::block_in_place(|| {
+            // `read_at` is a positional read (`pread`) that does not touch
+            // the file offset, so concurrent reads against the same fd
+            // from multiple workers are safe.
+            file.read_at(buf.as_mut_slice(), 0)
+        })?;
+        Ok(len)
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
     async fn read_into(&self, file: &File, buf: &mut PooledBuffer) -> io::Result<usize> {
-        // Portable Unix fallback (macOS): synchronous `pread` directly.
-        // This blocks the executor briefly and is *not* the high-performance
-        // path — it exists so the engine still builds and runs end-to-end
-        // on macOS for development.
-        use std::os::unix::fs::FileExt;
+        // Same logic on macOS for development. `O_DIRECT` is unavailable;
+        // the user is expected to pass `--no-direct` on those hosts.
         let len = buf.len();
-        file.read_at(buf.as_mut_slice(), 0)?;
+        tokio::task::block_in_place(|| file.read_at(buf.as_mut_slice(), 0))?;
         Ok(len)
     }
 
@@ -160,8 +173,7 @@ impl NvmeStorage {
     async fn read_into(&self, _file: &File, _buf: &mut PooledBuffer) -> io::Result<usize> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "this engine targets Linux (io_uring) with a Unix fallback; \
-             non-Unix platforms are not supported",
+            "this engine targets Unix; non-Unix platforms are not supported",
         ))
     }
 }

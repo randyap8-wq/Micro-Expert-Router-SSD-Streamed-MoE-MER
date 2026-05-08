@@ -2,16 +2,13 @@
 name = "micro-expert-router"
 version = "0.1.0"
 edition = "2021"
-description = "MoE execution engine that streams experts from NVMe into RAM via io_uring + O_DIRECT"
+description = "MoE execution engine that streams experts from NVMe into RAM with O_DIRECT, an LRU expert cache, and a learned predictive prefetcher"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Async io_uring wrapper used for the NVMe hot path on Linux.
-# rio is small and pragmatic; for production you'd consider `tokio-uring` or
-# the raw `io-uring` crate with registered fixed buffers + SQPOLL. See README.
-rio = "0.9"
-
 # Tokio drives the orchestration (scheduling, prefetch tasks, channels).
+# We use `block_in_place` from `rt-multi-thread` to dispatch blocking
+# `pread(2)` syscalls without satisfying `'static` lifetimes.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 
 # Fixed-capacity LRU cache for resident experts.
