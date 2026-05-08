@@ -4,13 +4,18 @@ A Rust execution engine for **Mixture-of-Experts** models that keeps the
 router resident in RAM and **hot-swaps individual experts on demand** from a
 PCIe-attached NVMe drive into a pool of pre-allocated, page-aligned RAM
 buffers using **io_uring** with **`O_DIRECT`** (zero-copy, kernel-page-cache
-bypass).
+bypass). Each routed expert then **executes a real Mixtral / Llama-style
+SwiGLU FFN forward pass** directly over the bytes that just arrived from the
+drive.
 
-It is the I/O substrate you'd pair with a Mixtral-style model whose total
-parameter footprint exceeds available DRAM but whose *active* parameter
-footprint per token (top-K experts) does not. Instead of mmap-thrashing the
-page cache, this engine treats the NVMe like a manual paging device with an
-LRU cache and a learned prefetcher.
+The premise is straightforward: a **modern PCIe-4 / 5 NVMe SSD sustains
+6–14 GB/s** of sequential read; a Mixtral-class expert is ~88 MB; pulling
+the top-K active experts per token therefore costs a few milliseconds of
+I/O even when the *full* parameter set is 10–100× DRAM. So you can run
+much larger models on much more modest hardware by treating the SSD as
+the main weight store and DRAM as a small cache of *active* experts.
+This engine is the substrate that makes that tradeoff observable and
+measurable.
 
 The engine lives under [`rust-engine/`](./rust-engine).
 
@@ -34,11 +39,11 @@ all `N` experts you have two options:
 ### End-to-end pipeline
 
 ```
-        +-----------+     +-------------+     +-----------+     +-----------+
-token → |  Router   | →  | Expert IDs   | →  | LRU Cache | →  | Inference |
-        |  (top-K)  |    |  e.g. [3,7]  |    +-----+-----+     +-----------+
-        +-----------+    +--------------+         | miss
-                                                  ↓
+        +-----------+     +-------------+     +-----------+     +------------------+
+token → |  Router   | →  | Expert IDs   | →  | LRU Cache | →  | SwiGLU FFN       |
+        |  (top-K)  |    |  e.g. [3,7]  |    +-----+-----+     | per expert,      |
+        +-----------+    +--------------+         | miss       | combine outputs  |
+                                                  ↓            +------------------+
                                          +------------------+
                                          | BufferPool slot  | ←───┐
                                          |  (aligned, pre-  |     │
@@ -52,12 +57,37 @@ token → |  Router   | →  | Expert IDs   | →  | LRU Cache | →  | Inferenc
                                          +--------+---------+     │
                                                   ↓               │
                                          NVMe SSD → DMA → RAM ────┘
+                                                  ↓
+                                         bytes reinterpreted as
+                                         f32 weights → matmul
 ```
 
 After every token the engine also updates a first-order **Markov model** of
 expert transitions and uses it to **speculatively prefetch** the most likely
 next experts on the side. The prefetch path is non-blocking and
 non-evicting — it never starves a real cache miss.
+
+### What "running" actually does
+
+For each token, the engine:
+
+1. asks the (mocked) router for K distinct expert ids;
+2. for each id, hits the LRU cache or streams the expert file off the
+   NVMe drive into a page-aligned pool buffer via `O_DIRECT`;
+3. **reinterprets the buffer as `f32` weight matrices** (`gate_proj`,
+   `up_proj`, `down_proj`, in that order, row-major — the standard
+   Mixtral / Llama / DeepSeek FFN layout);
+4. runs a real **SwiGLU FFN forward pass**:
+   `y = down_proj · ( silu(gate_proj · x) ⊙ (up_proj · x) )`;
+5. averages the K expert outputs (mock combine — a real router would do a
+   weighted sum using its softmax gates);
+6. updates the Markov predictor and kicks off speculative prefetches.
+
+The forward pass is plain scalar `f32` Rust — no BLAS, no SIMD, no GPU.
+That's deliberate: the project's thesis is about **storage bandwidth**,
+not compute, so the kernel is just real enough to exercise every byte
+that came off the drive (compiler can't fold it away) and to surface a
+believable compute-vs-I/O latency picture in the per-token logs.
 
 ---
 
@@ -72,7 +102,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, submits async reads through `rio`. Includes a `gen-data` helper to create synthetic test files and a portable Unix fallback for development on macOS. |
 | `router` | `TopKRouter` (distinct top-K, weighted) and `PredictiveLoader` (first-order Markov over expert ids, learns online, smoothed with a uniform prior so predictions are immediately usable). |
-| `inference` | Placeholder "compute" — a strided FNV-1a hash that touches every page so the I/O is actually observable. Replace with `tch`/`candle`/`cudarc` for real weights. |
+| `inference` | Real SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`) computed in scalar `f32` directly over the bytes streamed off NVMe. Reinterprets each pool buffer as three weight matrices (no copy). Replace with `tch`/`candle`/`cudarc` for SIMD / GPU. |
 | `engine` | Top-level orchestrator. Owns the router/predictor/cache/pool/storage, drives the per-token cycle, schedules prefetches, records HDR histograms. |
 | `main` | `clap`-based CLI with `gen-data` and `run` subcommands, structured `tracing` logs, `--first-token 3,7` to reproduce the spec example. |
 
@@ -132,23 +162,38 @@ cargo build --release
 
 ```bash
 # 64 experts × 16 MiB each = 1 GiB of test data on disk.
+# Default FFN shape: d_model=512, d_ff=2048 → 12 MiB of f32 SwiGLU weights
+# per expert + 4 MiB zero-padding (so the file size stays a multiple of
+# 4096 bytes for O_DIRECT).
 ./target/release/micro-expert-router gen-data \
   --data-dir ./data \
   --num-experts 64 \
-  --expert-size $((16 * 1024 * 1024))
+  --expert-size $((16 * 1024 * 1024)) \
+  --d-model 512 \
+  --d-ff 2048
 ```
 
-Each file is filled with a deterministic per-expert byte pattern so reads
-can be verified end-to-end.
+Each file holds three deterministically-generated `f32` matrices in
+`gate_proj || up_proj || down_proj` order (row-major), drawn from
+`U(-1/√d_model, +1/√d_model)`. That keeps the SwiGLU forward pass
+numerically stable for any chosen `d_model`/`d_ff` and lets reads be
+verified end-to-end.
+
+> **Sizing rule of thumb.** The weights occupy `3 · d_model · d_ff · 4`
+> bytes; pad up to a multiple of `--block-align` (4096) for `O_DIRECT`.
+> `gen-data` enforces this and errors if `--expert-size` is too small.
 
 ### Run the simulation
 
 ```bash
 # 200-token stream, top-2 routing, 16 experts resident, with O_DIRECT.
+# d_model / d_ff MUST match what was passed to gen-data.
 ./target/release/micro-expert-router run \
   --data-dir ./data \
   --num-experts 64 \
   --expert-size $((16 * 1024 * 1024)) \
+  --d-model 512 \
+  --d-ff 2048 \
   --cache-slots 16 \
   --top-k 2 \
   --tokens 200 \
@@ -181,22 +226,29 @@ RUST_LOG=micro_expert_router=debug ./target/release/micro-expert-router run ...
 ### Sample output
 
 ```
-INFO starting engine num_experts=64 top_k=2 cache_slots=16 expert_mib=16 direct_io=true
-INFO buffer pool sized with prefetch headroom cache_slots=16 pool_slots=18 prefetch_headroom=2
-INFO streaming tokens (latency / throughput logs follow) tokens=200
-INFO tick token=0 cycle_us=812 tps="1231.0" hits=0 misses=2 kib=32768 resident=[15, 5]
-INFO tick token=1 cycle_us=634 tps="1577.7" hits=1 misses=1 kib=16384 resident=[4, 0, 15, 5]
-...
-INFO tick token=199 cycle_us=178 tps="5597.8" hits=2 misses=0 kib=0    resident=[13, 4, 1, 9]
-INFO stream complete wall_s=0.034 sustained_tps=5732 avg_throughput_mibps=11866 hit_rate_pct=34.5
+INFO starting engine num_experts=16 top_k=2 cache_slots=8 expert_mib=16 d_model=512 d_ff=2048 weight_mib=12 direct_io=false
+INFO buffer pool sized with prefetch headroom cache_slots=8 pool_slots=10 prefetch_headroom=2
+INFO streaming tokens (latency / throughput logs follow) tokens=30
+INFO tick token=0  cycle_us=5569 tps="179.6" hits=0 misses=2 kib=32768 resident=[12, 15, 2, 10, 8, 3, 0, 1]
+INFO tick token=17 cycle_us=3620 tps="276.2" hits=2 misses=0 kib=0     resident=[4, 3, 2, 12, 15, 10, 8, 0]
+INFO tick token=29 cycle_us=3448 tps="290.0" hits=2 misses=0 kib=0     resident=[0, 4, 3, 7, 5, 6, 2, 1]
+INFO stream complete wall_s=0.124 sustained_tps=243 avg_throughput_mibps=2717 hit_rate_pct=71.7
 INFO ===================== run summary =====================
-INFO experts:       64 (top-2), cache=16 slots, pool=18 slots
-INFO lookups:       hits=138  misses=262  hit_rate=34.50%
-INFO prefetches:    completed=152  predictor_observations=796
-INFO i/o:           reads=262  bytes=4192.00 MiB
-INFO i/o latency:   p50=684us  p95=925us  p99=1142us
-INFO cycle latency: p50=1083us p95=1718us p99=1966us  max=1966us
+INFO experts:       16 (top-2), cache=8 slots, pool=10 slots
+INFO ffn shape:     d_model=512  d_ff=2048  bytes/expert=12582912
+INFO lookups:       hits=43  misses=17  hit_rate=71.67%
+INFO prefetches:    completed=4   predictor_observations=116
+INFO i/o:           reads=17  bytes=336.00 MiB
+INFO i/o latency:   p50=1057us  p95=1743us  p99=1743us
+INFO compute:       p50=3435us  p95=3521us  p99=3617us  (SwiGLU FFN per token)
+INFO cycle latency: p50=3451us  p95=5643us  p99=6915us  max=6915us
 ```
+
+The `compute` row is the actual SwiGLU forward pass (per-token, summed
+over the K active experts). On a real PCIe-4 NVMe with `O_DIRECT` the
+`i/o` row drops further; on bigger `d_model`/`d_ff` the `compute` row
+grows linearly — exactly the trade you'd want to surface when reasoning
+about SSD-as-RAM viability for a given model size.
 
 ### CLI reference
 
@@ -205,11 +257,15 @@ micro-expert-router gen-data
   --data-dir <PATH>          Output directory (default ./data)
   --num-experts <N>          Number of expert files (default 64)
   --expert-size <BYTES>      Bytes per file, multiple of 4096 (default 16 MiB)
+  --d-model <N>              FFN hidden dim (default 512)
+  --d-ff <N>                 FFN intermediate dim (default 2048)
 
 micro-expert-router run
   --data-dir <PATH>          Directory with expert_<id>.bin files
   --num-experts <N>          Total experts in the model
   --expert-size <BYTES>      Must match gen-data
+  --d-model <N>              Must match gen-data
+  --d-ff <N>                 Must match gen-data
   --cache-slots <N>          Resident experts (LRU capacity)
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
@@ -227,19 +283,38 @@ micro-expert-router run
 
 ## What can it actually run today?
 
-**Today, in this repository: nothing end-to-end.** `inference::run_inference`
-is a placeholder FNV-1a hash over the buffer — there is no matmul, no
-softmax, no tokenizer. The engine demonstrates the **I/O substrate** that a
-real MoE runtime would sit on top of, not the runtime itself. Wiring a
-tensor library into `run_inference` is the missing step.
+**Today, in this repository: a real Mixtral / Llama-style SwiGLU expert
+FFN over weights streamed from NVMe.** Each routed expert performs the
+exact `down · (silu(gate·x) ⊙ (up·x))` block that every modern sparse
+MoE transformer uses for its experts — at synthetic, configurable
+dimensions (default `d_model=512, d_ff=2048`).
+
+What is **still mocked**:
+
+- **The router** is a weighted top-K sampler, not a learned softmax over
+  a gating projection.
+- **Combining** averages the K expert outputs; a real gate-weighted sum
+  using router probabilities is one line of code away once a real router
+  is wired in.
+- **Attention, embedding, layer norm, the residual stream, and tokenizer**
+  are not implemented. Only the *expert FFN* — the dominant weight-bound
+  block in every MoE — is real.
+
+So: the engine demonstrates **the per-expert compute path of a sparse MoE
+transformer**, end-to-end, with weights paged off the SSD. Wiring the
+remaining transformer machinery (attention, layer norm, embeddings) and a
+real tokenizer is the missing step to a turn-key model server. The
+expected drop-in path is to replace `inference::run_inference` with a
+call into a tensor library:
 
 That said, the architecture (per-expert files, fixed expert size,
 top-K activation, LRU + prefetch) is shaped specifically for **sparse
 Mixture-of-Experts transformers where the expert FFNs are the dominant
 weight**. Concretely, the following published models drop into this layout
-with no architectural changes — only a real inference kernel and a sharding
-script that splits their `safetensors` into one `expert_<id>.bin` per
-expert (or per-layer-per-expert, see "Sharding granularity" below):
+with no architectural changes — only a real attention/embedding kernel and
+a sharding script that splits their `safetensors` into one
+`expert_<id>.bin` per expert (or per-layer-per-expert, see "Sharding
+granularity" below):
 
 | Model | Total params | Active / token | Experts | Top-K | Per-expert FFN (bf16) | Notes |
 |---|---|---|---|---|---|---|
@@ -319,7 +394,10 @@ Covers:
 - buffer-pool acquire/release cycle and async waiter wakeup,
 - LRU eviction returns buffers to the pool only after all `Arc`s drop,
 - top-K router produces distinct ids,
-- predictor learns simple transitions and respects `min_prob`.
+- predictor learns simple transitions and respects `min_prob`,
+- the `f32` weight-view partitions buffers correctly,
+- the SwiGLU forward pass produces finite, deterministic outputs of the
+  correct shape, and zeroed weights yield a zero output.
 
 ---
 
@@ -328,6 +406,16 @@ Covers:
 - **Static top-K router.** Real Mixtral routing is a learned `softmax` over
   the gating projection. The mocked router is sufficient to drive the I/O
   pipeline; integrating a real one is mostly plumbing.
+- **Scalar `f32` matmul.** The expert FFN runs as a plain triple-nested
+  scalar loop. That is intentional — the project's thesis is about
+  storage bandwidth — but a real serving deployment would call into BLAS
+  / a SIMD kernel / a CUDA kernel via `tch` / `candle` / `cudarc`. The
+  byte→`f32` view in `inference::ExpertWeights::from_bytes` already does
+  zero-copy reinterpretation, so any of those backends slot in cleanly.
+- **Synthetic weights, no attention, no embedding, no tokenizer.** The
+  engine runs the *expert FFN* of a sparse MoE; the rest of a real
+  transformer (attention, RMSNorm, residual, embedding, lm-head) and a
+  tokenizer are not yet wired in.
 - **`rio` is unmaintained.** A production deployment should switch to the
   raw `io-uring` crate with **registered fixed buffers** and **registered
   files** — the cleanest single throughput win available.
@@ -336,9 +424,6 @@ Covers:
 - **No batched / vectored reads.** When two experts on the same token both
   miss, we issue two SQEs; on a NVMe drive with deep queues that's already
   efficient, but on slower devices you might want `readv`-style batching.
-- **Inference is a placeholder.** Wire `tch::nn::Module::forward` /
-  `candle::Tensor::matmul` / a CUDA kernel into `inference::run_inference`
-  to make this a real model server.
 
 ## License
 

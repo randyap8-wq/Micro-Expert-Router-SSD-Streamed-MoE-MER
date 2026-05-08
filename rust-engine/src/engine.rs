@@ -15,7 +15,9 @@
 
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
-use crate::inference::{InferenceOutput, run_inference};
+use crate::inference::{
+    combine_outputs, run_inference, synth_hidden_state, HiddenState, InferenceOutput,
+};
 use crate::io_provider::NvmeStorage;
 use crate::router::{PredictiveLoader, TopKRouter};
 use hdrhistogram::Histogram;
@@ -41,17 +43,34 @@ struct Counters {
     bytes_read: AtomicU64,
 }
 
+/// Shape parameters of the SwiGLU expert FFN executed by the engine.
+///
+/// Each on-disk expert file is a flat blob of `f32` weights laid out as
+/// `gate_proj || up_proj || down_proj` (see [`crate::inference`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ModelShape {
+    pub d_model: usize,
+    pub d_ff: usize,
+    /// Seed used to derive per-token hidden states. In a real model this
+    /// would come from the previous transformer layer; here it lets us
+    /// produce reproducible activations for the synthetic stream.
+    pub hidden_seed: u64,
+}
+
 pub struct Engine {
     cache: Arc<ExpertCache>,
     pool: BufferPool,
     storage: Arc<NvmeStorage>,
     router: Arc<TopKRouter>,
     predictor: Arc<PredictiveLoader>,
+    shape: ModelShape,
     counters: Arc<Counters>,
     /// Latency histogram of per-token cycle time, in microseconds.
     cycle_hist: parking_lot::Mutex<Histogram<u64>>,
     /// Latency histogram of cache-miss I/O reads, in microseconds.
     io_hist: parking_lot::Mutex<Histogram<u64>>,
+    /// Latency histogram of per-token compute (FFN forward), in microseconds.
+    compute_hist: parking_lot::Mutex<Histogram<u64>>,
     last_experts: parking_lot::Mutex<Vec<u32>>,
 }
 
@@ -62,6 +81,7 @@ impl Engine {
         storage: Arc<NvmeStorage>,
         router: Arc<TopKRouter>,
         predictor: Arc<PredictiveLoader>,
+        shape: ModelShape,
     ) -> Self {
         Self {
             cache,
@@ -69,6 +89,7 @@ impl Engine {
             storage,
             router,
             predictor,
+            shape,
             counters: Arc::new(Counters::default()),
             cycle_hist: parking_lot::Mutex::new(
                 Histogram::new_with_bounds(1, 60_000_000, 3)
@@ -78,8 +99,16 @@ impl Engine {
                 Histogram::new_with_bounds(1, 60_000_000, 3)
                     .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
             ),
+            compute_hist: parking_lot::Mutex::new(
+                Histogram::new_with_bounds(1, 60_000_000, 3)
+                    .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
+            ),
             last_experts: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn shape(&self) -> ModelShape {
+        self.shape
     }
 
     /// Process a single token: route, fetch missing experts, run inference,
@@ -110,12 +139,29 @@ impl Engine {
             }
         }
 
-        // 2) Inference (placeholder).
-        let outputs: Vec<InferenceOutput> = residents
-            .iter()
-            .map(|r| run_inference(token_idx, r))
-            .collect();
-        debug!(token = token_idx, ?outputs, "inference complete");
+        // 2) Real expert FFN forward pass over weights streamed from SSD.
+        //    `synth_hidden_state` mocks the residual-stream activation that
+        //    would normally come from the previous transformer layer.
+        let x: HiddenState = synth_hidden_state(token_idx, self.shape.d_model, self.shape.hidden_seed);
+        let compute_start = Instant::now();
+        let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
+        let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
+        for r in &residents {
+            let (out, y) = run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff);
+            outputs.push(out);
+            per_expert_y.push(y);
+        }
+        let combined = combine_outputs(&per_expert_y);
+        let compute_us = compute_start.elapsed().as_micros() as u64;
+        let _ = self.compute_hist.lock().record(compute_us.max(1));
+        debug!(
+            token = token_idx,
+            d_model = self.shape.d_model,
+            d_ff = self.shape.d_ff,
+            ?outputs,
+            combined_norm = combined.iter().map(|v| v * v).sum::<f32>().sqrt(),
+            "FFN forward complete"
+        );
 
         // 3) Update predictor with the observed transition.
         {
@@ -253,6 +299,7 @@ impl Engine {
     pub fn report(&self) -> EngineReport {
         let cycle = self.cycle_hist.lock();
         let io = self.io_hist.lock();
+        let compute = self.compute_hist.lock();
         EngineReport {
             hits: self.counters.hits.load(Ordering::Relaxed),
             misses: self.counters.misses.load(Ordering::Relaxed),
@@ -266,10 +313,15 @@ impl Engine {
             io_p95_us: io.value_at_quantile(0.95),
             io_p99_us: io.value_at_quantile(0.99),
             io_count: io.len(),
+            compute_p50_us: compute.value_at_quantile(0.50),
+            compute_p95_us: compute.value_at_quantile(0.95),
+            compute_p99_us: compute.value_at_quantile(0.99),
             cache_capacity: self.cache.capacity(),
             pool_capacity: self.pool.capacity(),
             num_experts: self.router.num_experts(),
             top_k: self.router.k(),
+            d_model: self.shape.d_model,
+            d_ff: self.shape.d_ff,
             predictor_observations: self.predictor.observations(),
         }
     }
@@ -288,6 +340,12 @@ impl Engine {
             r.num_experts, r.top_k, r.cache_capacity, r.pool_capacity
         );
         info!(
+            "ffn shape:     d_model={}  d_ff={}  bytes/expert={}",
+            r.d_model,
+            r.d_ff,
+            crate::inference::expert_weight_bytes(r.d_model, r.d_ff)
+        );
+        info!(
             "lookups:       hits={}  misses={}  hit_rate={:.2}%",
             r.hits, r.misses, hit_rate
         );
@@ -303,6 +361,10 @@ impl Engine {
         info!(
             "i/o latency:   p50={}us  p95={}us  p99={}us",
             r.io_p50_us, r.io_p95_us, r.io_p99_us
+        );
+        info!(
+            "compute:       p50={}us  p95={}us  p99={}us  (SwiGLU FFN per token)",
+            r.compute_p50_us, r.compute_p95_us, r.compute_p99_us
         );
         info!(
             "cycle latency: p50={}us  p95={}us  p99={}us  max={}us",
@@ -326,9 +388,14 @@ pub struct EngineReport {
     pub io_p95_us: u64,
     pub io_p99_us: u64,
     pub io_count: u64,
+    pub compute_p50_us: u64,
+    pub compute_p95_us: u64,
+    pub compute_p99_us: u64,
     pub cache_capacity: usize,
     pub pool_capacity: usize,
     pub num_experts: u32,
     pub top_k: usize,
+    pub d_model: usize,
+    pub d_ff: usize,
     pub predictor_observations: u64,
 }
