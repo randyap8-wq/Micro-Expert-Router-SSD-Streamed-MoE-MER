@@ -20,8 +20,9 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::buffer_pool::BufferPool;
-use crate::engine::Engine;
+use crate::engine::{Engine, ModelShape};
 use crate::expert_cache::ExpertCache;
+use crate::inference::expert_weight_bytes;
 use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
 use crate::router::{PredictiveLoader, TopKRouter};
 
@@ -47,11 +48,23 @@ enum Cmd {
         /// Number of experts to create.
         #[arg(long, default_value_t = 64)]
         num_experts: u32,
-        /// Bytes per expert. Must be a multiple of 4096 for O_DIRECT.
-        /// Default is 16 MiB which is enough to demonstrate latency without
-        /// chewing 8 GiB of disk on a default `gen-data` run.
+        /// Bytes per expert. Must be a multiple of 4096 for O_DIRECT and
+        /// at least `3 * d_model * d_ff * 4` bytes (the SwiGLU weights);
+        /// any extra bytes are zero-padded.
+        ///
+        /// Default 16 MiB pairs cleanly with `d_model=512 d_ff=2048`
+        /// (12 MiB of weights + 4 MiB of padding).
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         expert_size: usize,
+        /// Hidden / residual-stream dimension of the FFN (Mixtral: 4096,
+        /// DeepSeek-V3: 7168). Default 512 keeps the synthetic compute
+        /// cheap so I/O remains observable.
+        #[arg(long, default_value_t = 512)]
+        d_model: usize,
+        /// Intermediate FFN dimension (Mixtral: 14336, Llama-3-MoE: 14336).
+        /// Default 2048.
+        #[arg(long, default_value_t = 2048)]
+        d_ff: usize,
     },
 
     /// Run the token-generation simulation against the on-disk experts.
@@ -65,6 +78,12 @@ enum Cmd {
         /// Bytes per expert. Must equal what was used in `gen-data`.
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         expert_size: usize,
+        /// Hidden / residual-stream dimension. Must match `gen-data`.
+        #[arg(long, default_value_t = 512)]
+        d_model: usize,
+        /// Intermediate FFN dimension. Must match `gen-data`.
+        #[arg(long, default_value_t = 2048)]
+        d_ff: usize,
         /// LRU cache + buffer pool capacity (resident experts at once).
         #[arg(long, default_value_t = 16)]
         cache_slots: usize,
@@ -119,7 +138,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_dir,
             num_experts,
             expert_size,
-        } => cmd_gen_data(&data_dir, num_experts, expert_size),
+            d_model,
+            d_ff,
+        } => cmd_gen_data(&data_dir, num_experts, expert_size, d_model, d_ff),
         Cmd::Run { .. } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -129,6 +150,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     data_dir,
                     num_experts,
                     expert_size,
+                    d_model,
+                    d_ff,
                     cache_slots,
                     top_k,
                     tokens,
@@ -146,6 +169,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         data_dir,
                         num_experts,
                         expert_size,
+                        d_model,
+                        d_ff,
                         cache_slots,
                         top_k,
                         tokens,
@@ -171,15 +196,29 @@ fn cmd_gen_data(
     data_dir: &std::path::Path,
     num_experts: u32,
     expert_size: usize,
+    d_model: usize,
+    d_ff: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let weight_bytes = expert_weight_bytes(d_model, d_ff);
+    if weight_bytes > expert_size {
+        return Err(format!(
+            "expert_size ({expert_size}) is too small for the SwiGLU weights of \
+             d_model={d_model}, d_ff={d_ff} ({weight_bytes} bytes). Increase \
+             --expert-size or shrink --d-model / --d-ff."
+        )
+        .into());
+    }
     info!(
         path = %data_dir.display(),
         num_experts,
         expert_size_mib = expert_size as f64 / (1024.0 * 1024.0),
-        "generating synthetic expert files"
+        d_model,
+        d_ff,
+        weight_mib = weight_bytes as f64 / (1024.0 * 1024.0),
+        "generating synthetic SwiGLU expert weights"
     );
     let started = Instant::now();
-    generate_synthetic_experts(data_dir, num_experts, expert_size)?;
+    generate_synthetic_experts(data_dir, num_experts, expert_size, d_model, d_ff)?;
     let total_bytes = num_experts as u64 * expert_size as u64;
     info!(
         elapsed_s = started.elapsed().as_secs_f64(),
@@ -193,6 +232,8 @@ struct RunArgs {
     data_dir: PathBuf,
     num_experts: u32,
     expert_size: usize,
+    d_model: usize,
+    d_ff: usize,
     cache_slots: usize,
     top_k: usize,
     tokens: u64,
@@ -207,11 +248,15 @@ struct RunArgs {
 }
 
 async fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let weight_bytes = expert_weight_bytes(args.d_model, args.d_ff);
     info!(
         num_experts = args.num_experts,
         top_k = args.top_k,
         cache_slots = args.cache_slots,
         expert_mib = args.expert_size as f64 / (1024.0 * 1024.0),
+        d_model = args.d_model,
+        d_ff = args.d_ff,
+        weight_mib = weight_bytes as f64 / (1024.0 * 1024.0),
         direct_io = !args.no_direct,
         block_align = args.block_align,
         "starting engine"
@@ -221,6 +266,15 @@ async fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!(
             "expert_size ({}) must be a multiple of block_align ({}) for O_DIRECT",
             args.expert_size, args.block_align
+        )
+        .into());
+    }
+    if weight_bytes > args.expert_size {
+        return Err(format!(
+            "expert_size ({}) is too small for the SwiGLU weights of d_model={}, \
+             d_ff={} ({} bytes). Increase --expert-size or shrink --d-model / --d-ff \
+             so it matches what gen-data wrote.",
+            args.expert_size, args.d_model, args.d_ff, weight_bytes
         )
         .into());
     }
@@ -264,6 +318,11 @@ async fn cmd_run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         storage.clone(),
         router.clone(),
         predictor.clone(),
+        ModelShape {
+            d_model: args.d_model,
+            d_ff: args.d_ff,
+            hidden_seed: args.seed,
+        },
     ));
 
     // Optional warm-up to mirror the spec example ("the router selects

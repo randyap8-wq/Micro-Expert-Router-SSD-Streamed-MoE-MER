@@ -211,18 +211,49 @@ fn open_expert_file(path: &Path, _direct: bool) -> io::Result<File> {
     OpenOptions::new().read(true).open(path)
 }
 
-/// Generate `num_experts` deterministic test files in `dir`. Each file has
-/// `expert_size` bytes and is filled with a per-expert byte pattern so reads
-/// can be verified.
+/// Generate `num_experts` deterministic test files in `dir`. Each file
+/// contains real `f32` SwiGLU weights laid out as
+/// `gate_proj || up_proj || down_proj` (row-major; see
+/// [`crate::inference`]).
+///
+/// `weight_bytes` is the number of bytes the engine will actually consume
+/// (`expert_weight_bytes(d_model, d_ff)`). `expert_size` is the size on
+/// disk; if it is larger than `weight_bytes` the trailing region is zero
+/// padded so the file size stays a multiple of `block_align` (an
+/// `O_DIRECT` requirement on Linux).
+///
+/// Weights are drawn from a small bounded uniform distribution
+/// (`U(-scale, +scale)` with `scale ≈ 1 / sqrt(d_model)`) using a
+/// per-expert deterministic xorshift, so the SwiGLU forward pass remains
+/// numerically stable for any `d_model`/`d_ff` and runs are reproducible.
 pub fn generate_synthetic_experts(
     dir: &Path,
     num_experts: u32,
     expert_size: usize,
+    d_model: usize,
+    d_ff: usize,
 ) -> io::Result<()> {
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
-    // Write 1 MiB at a time to keep memory use bounded for large experts.
-    let chunk_size = (1 << 20).min(expert_size);
+
+    let weight_bytes = 3 * d_model * d_ff * 4;
+    if weight_bytes > expert_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "expert_size {expert_size} too small for d_model={d_model} d_ff={d_ff} \
+                 (need at least {weight_bytes} bytes for the SwiGLU weights)"
+            ),
+        ));
+    }
+
+    // Initialisation scale. With small inputs in [-1, 1] this keeps the
+    // pre-activation roughly unit-scale and avoids saturating SiLU.
+    let scale = 1.0f32 / (d_model.max(1) as f32).sqrt();
+    let pad_bytes = expert_size - weight_bytes;
+    let zero_pad = vec![0u8; (1 << 20).min(pad_bytes.max(1))];
+    let chunk_floats = 16 * 1024; // 64 KiB at a time
+
     for id in 0..num_experts {
         let path = dir.join(format!("expert_{id}.bin"));
         let mut f = OpenOptions::new()
@@ -230,13 +261,36 @@ pub fn generate_synthetic_experts(
             .create(true)
             .truncate(true)
             .open(&path)?;
-        let pattern = (id & 0xFF) as u8;
-        let chunk = vec![pattern; chunk_size];
-        let mut remaining = expert_size;
-        while remaining > 0 {
-            let n = remaining.min(chunk.len());
-            f.write_all(&chunk[..n])?;
-            remaining -= n;
+
+        // xorshift64* seeded per-expert so gen-data is fully deterministic.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15u64
+            .wrapping_add((id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+
+        let mut floats_remaining = 3 * d_model * d_ff;
+        let mut buf = Vec::<u8>::with_capacity(chunk_floats * 4);
+        while floats_remaining > 0 {
+            let n = floats_remaining.min(chunk_floats);
+            buf.clear();
+            for _ in 0..n {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Map the high 24 bits to [-scale, +scale).
+                let u = (state >> 40) as u32; // 24 bits
+                let unit = (u as f32) / ((1u32 << 23) as f32) - 1.0; // [-1, 1)
+                let v = unit * scale;
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            f.write_all(&buf)?;
+            floats_remaining -= n;
+        }
+
+        // Zero pad up to expert_size to satisfy O_DIRECT block alignment.
+        let mut remaining_pad = pad_bytes;
+        while remaining_pad > 0 {
+            let n = remaining_pad.min(zero_pad.len());
+            f.write_all(&zero_pad[..n])?;
+            remaining_pad -= n;
         }
         f.flush()?;
     }
