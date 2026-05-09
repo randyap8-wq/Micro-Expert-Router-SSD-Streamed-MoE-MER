@@ -231,10 +231,19 @@ impl Engine {
                 // is observed, the whole point of `--io-only`.
                 let mut acc: u64 = 0;
                 for chunk in bytes.chunks(8) {
+                    // Final chunk may be < 8 bytes; the remaining slots
+                    // in `buf` stay zero. XOR with zero is a no-op, so
+                    // the digest is still deterministic and every
+                    // actually-read byte still contributes.
                     let mut buf = [0u8; 8];
                     buf[..chunk.len()].copy_from_slice(chunk);
                     acc ^= u64::from_le_bytes(buf);
                 }
+                // `% 63` (deliberately not 64): `rotate_left(0)` and
+                // `rotate_left(64)` are both no-ops on `u64`. Using 63
+                // keeps the rotation amount in `0..63` so adjacent
+                // expert ids actually pick different rotations and
+                // the per-expert contributions don't collapse.
                 digest ^= acc.rotate_left((r.id % 63) as u32);
             }
             let us = compute_start.elapsed().as_micros() as u64;

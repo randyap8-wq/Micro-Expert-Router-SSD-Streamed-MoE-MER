@@ -152,7 +152,13 @@ def main() -> int:
     top_k: int = int(config.num_experts_per_tok)
     d_model: int = int(config.hidden_size)
     d_ff: int = int(config.intermediate_size)
-    weight_bytes = 3 * d_model * d_ff * 4  # gate || up || down, f32
+    # SwiGLU expert holds three weight matrices (gate, up, down), each
+    # of shape (d_ff, d_model) or (d_model, d_ff), stored as little-
+    # endian f32 (4 bytes per element). The Rust engine reinterprets
+    # these bytes as `&[f32]` directly — no quantisation on disk.
+    NUM_WEIGHT_MATRICES = 3
+    F32_BYTES = 4
+    weight_bytes = NUM_WEIGHT_MATRICES * d_model * d_ff * F32_BYTES
     expert_size = ((weight_bytes + args.block_align - 1) // args.block_align) * args.block_align
 
     print(

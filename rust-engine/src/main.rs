@@ -363,6 +363,11 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // macOS / non-Linux: O_DIRECT is not available. Force the user (or the
     // run config) into buffered reads and explain what that means for the
     // measurements.
+    //
+    // Note: the if-else branch selection is decided once at line entry —
+    // the `args.no_direct = true` mutation inside the `if` body does NOT
+    // retroactively flip the condition. The `else` branch fires when the
+    // user *already* passed `--no-direct` on the command line.
     #[cfg(not(target_os = "linux"))]
     {
         if !args.no_direct {
@@ -600,7 +605,7 @@ fn apply_metadata_if_present(args: &mut RunArgs) {
     };
     info!(path = %path.display(), "found metadata.json — auto-filling unspecified args");
     let mut overrode_anything = false;
-    let mut maybe_set = |key: &str, current: u64, default: u64, sink: &mut dyn FnMut(u64)| {
+    let mut set_if_default = |key: &str, current: u64, default: u64, sink: &mut dyn FnMut(u64)| {
         if let Some(v) = parse_json_number(&body, key) {
             // Only fill in values the user didn't override on the CLI.
             if current == default {
@@ -616,31 +621,31 @@ fn apply_metadata_if_present(args: &mut RunArgs) {
             }
         }
     };
-    maybe_set(
+    set_if_default(
         "num_experts",
         args.num_experts as u64,
         cli_defaults::NUM_EXPERTS as u64,
         &mut |v| args.num_experts = v as u32,
     );
-    maybe_set(
+    set_if_default(
         "d_model",
         args.d_model as u64,
         cli_defaults::D_MODEL as u64,
         &mut |v| args.d_model = v as usize,
     );
-    maybe_set(
+    set_if_default(
         "d_ff",
         args.d_ff as u64,
         cli_defaults::D_FF as u64,
         &mut |v| args.d_ff = v as usize,
     );
-    maybe_set(
+    set_if_default(
         "top_k",
         args.top_k as u64,
         cli_defaults::TOP_K as u64,
         &mut |v| args.top_k = v as usize,
     );
-    maybe_set(
+    set_if_default(
         "expert_size",
         args.expert_size as u64,
         cli_defaults::EXPERT_SIZE as u64,

@@ -143,7 +143,10 @@ impl TopKRouter {
             }
             // If single cluster (out_cluster empty) and intra_cluster_p < 1,
             // fold the remaining mass back into the in-cluster row so the
-            // row still sums to 1.
+            // row still sums to 1. `in_cluster` is non-empty here:
+            // every `from` is in some cluster, so its own cluster
+            // contains at least itself. The `.max(1)` is belt-and-suspenders
+            // against `cluster_count > num_experts` configurations.
             if out_cluster.is_empty() {
                 let extra = (1.0 - intra_cluster_p) / in_cluster.len().max(1) as f64;
                 for &j in &in_cluster {
@@ -263,10 +266,10 @@ impl TopKRouter {
 /// rows fall back to a uniform distribution so the router never panics on
 /// a malformed input matrix.
 fn normalise_row(row: &[f64], n: usize) -> Vec<f64> {
-    let sum: f64 = row.iter().filter(|v| v.is_finite() && **v > 0.0).sum();
+    let sum: f64 = row.iter().filter(|&&v| v.is_finite() && v > 0.0).sum();
     if sum > 0.0 && sum.is_finite() {
         row.iter()
-            .map(|v| if v.is_finite() && *v > 0.0 { v / sum } else { 0.0 })
+            .map(|&v| if v.is_finite() && v > 0.0 { v / sum } else { 0.0 })
             .collect()
     } else {
         vec![1.0 / n as f64; n]
