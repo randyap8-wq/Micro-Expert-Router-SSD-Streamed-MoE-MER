@@ -59,6 +59,76 @@ compile_error!(
 use crate::expert_cache::ExpertResident;
 use std::fmt;
 
+/// Bit-width with which expert weights are stored on disk.
+///
+/// `F32` is the legacy (and default) format: each weight is 4 bytes,
+/// reinterpreted directly as `&[f32]`. `F16` halves bytes-per-parameter
+/// (the dominant SSD-energy cost in this engine) and is dequantised into
+/// an owned `Vec<f32>` at fetch time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WeightDtype {
+    /// Little-endian `f32`, 4 bytes per weight.
+    F32,
+    /// Little-endian IEEE-754 `f16` (`half::f16`), 2 bytes per weight.
+    F16,
+}
+
+impl WeightDtype {
+    /// Number of on-disk bytes per weight for this dtype.
+    #[inline]
+    pub const fn bytes_per_weight(self) -> usize {
+        match self {
+            WeightDtype::F32 => 4,
+            WeightDtype::F16 => 2,
+        }
+    }
+
+    /// Parse from CLI / metadata.json string. Returns `None` for unknown.
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "f32" | "fp32" => Some(WeightDtype::F32),
+            "f16" | "fp16" | "half" => Some(WeightDtype::F16),
+            _ => None,
+        }
+    }
+
+    /// Stable string form used in metadata.json / CLI flags.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WeightDtype::F32 => "f32",
+            WeightDtype::F16 => "f16",
+        }
+    }
+}
+
+impl Default for WeightDtype {
+    fn default() -> Self {
+        WeightDtype::F32
+    }
+}
+
+/// Dequantise a little-endian `f16` byte buffer into an owned `Vec<f32>`.
+///
+/// Each pair of bytes is interpreted as one little-endian `half::f16`
+/// and converted to `f32`. `dst` is `clear()`ed first so the caller can
+/// reuse a previously-allocated buffer.
+pub fn dequantize_f16_to_f32(src: &[u8], dst: &mut Vec<f32>) {
+    assert!(
+        src.len() % 2 == 0,
+        "f16 byte buffer length must be a multiple of 2, got {}",
+        src.len()
+    );
+    let n = src.len() / 2;
+    dst.clear();
+    dst.reserve(n);
+    // Manual LE conversion: avoids requiring a top-level `bytemuck`
+    // dependency and works regardless of pointer alignment of `src`.
+    for chunk in src.chunks_exact(2) {
+        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        dst.push(half::f16::from_bits(bits).to_f32());
+    }
+}
+
 /// Hidden-state vector flowing through the FFN block (`d_model` floats).
 pub type HiddenState = Vec<f32>;
 
@@ -110,6 +180,24 @@ pub const fn expert_weight_count(d_model: usize, d_ff: usize) -> usize {
 #[inline]
 pub const fn expert_weight_bytes(d_model: usize, d_ff: usize) -> usize {
     expert_weight_count(d_model, d_ff).saturating_mul(4)
+}
+
+/// Number of bytes an expert with these dimensions occupies on disk
+/// when stored as little-endian `f16` (2 bytes per weight). Saturates to
+/// `usize::MAX` on overflow.
+#[inline]
+pub const fn expert_weight_bytes_f16(d_model: usize, d_ff: usize) -> usize {
+    expert_weight_count(d_model, d_ff).saturating_mul(2)
+}
+
+/// Number of bytes an expert with these dimensions occupies on disk
+/// for the given dtype.
+#[inline]
+pub const fn expert_weight_bytes_for(d_model: usize, d_ff: usize, dtype: WeightDtype) -> usize {
+    match dtype {
+        WeightDtype::F32 => expert_weight_bytes(d_model, d_ff),
+        WeightDtype::F16 => expert_weight_bytes_f16(d_model, d_ff),
+    }
 }
 
 /// Errors produced when reinterpreting a raw byte buffer as expert
@@ -217,7 +305,35 @@ impl<'a> ExpertWeights<'a> {
         Ok(Self { d_model, d_ff, gate, up, down })
     }
 
-    /// `down_proj · ( silu(gate_proj · x)  ⊙  (up_proj · x) )`
+    /// Build the three-matrix view from a fully-materialised `&[f32]`
+    /// slice (rather than from raw on-disk bytes). This is the shared
+    /// helper used by both [`Self::from_bytes`] (zero-copy reinterpret)
+    /// and [`OwnedExpertWeights::from_bytes_f16`] (dequantised owned
+    /// `Vec<f32>`). Returns `BufferTooSmall` if `floats.len()` is short.
+    pub fn from_floats(
+        floats: &'a [f32],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        let need_floats = expert_weight_count(d_model, d_ff);
+        if floats.len() < need_floats {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: floats.len().saturating_mul(4),
+                need: need_floats.saturating_mul(4),
+                d_model,
+                d_ff,
+            });
+        }
+        let gate_len = d_ff * d_model;
+        let up_len = d_ff * d_model;
+        let down_len = d_model * d_ff;
+        let (gate, rest) = floats[..need_floats].split_at(gate_len);
+        let (up, rest) = rest.split_at(up_len);
+        let (down, _trailing) = rest.split_at(down_len);
+        Ok(Self { d_model, d_ff, gate, up, down })
+    }
+
+
     ///
     /// Allocates one `Vec<f32>` for the gated intermediate (`d_ff`) and
     /// returns a `Vec<f32>` of length `d_model` for the FFN output.
@@ -268,6 +384,200 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// Owned variant of [`ExpertWeights`] backed by a `Vec<f32>` rather than
+/// borrowed bytes. Returned by [`OwnedExpertWeights::from_bytes_f16`] and
+/// [`OwnedExpertWeights::from_bytes_partial`], where dequantisation /
+/// column repacking forces materialising fresh f32 storage.
+pub struct OwnedExpertWeights {
+    pub d_model: usize,
+    pub d_ff: usize,
+    /// `gate_proj` row-major. For partial-load this is `[d_ff x M]`,
+    /// where `M = col_indices.len()`; otherwise `[d_ff x d_model]`.
+    pub gate: Vec<f32>,
+    /// `up_proj` row-major (same shape conventions as `gate`).
+    pub up: Vec<f32>,
+    /// `down_proj` row-major. For full / f16 weights: `[d_model x d_ff]`.
+    /// For partial-load: still `[d_model x d_ff]` (down_proj rows are not
+    /// reduced) but only computed against a packed gated vector of
+    /// length `d_ff`.
+    pub down: Vec<f32>,
+    /// For partial-load: the column indices of `gate`/`up` in the
+    /// original `[d_ff x d_model]` matrix that were actually loaded.
+    /// `None` means full load (all `d_model` columns).
+    pub col_indices: Option<Vec<usize>>,
+}
+
+impl OwnedExpertWeights {
+    /// Build an owned weight set by dequantising a little-endian `f16`
+    /// byte buffer into a fresh `Vec<f32>`. The resulting buffer is
+    /// partitioned the same way as [`ExpertWeights::from_bytes`].
+    pub fn from_bytes_f16(
+        bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        let need_floats = expert_weight_count(d_model, d_ff);
+        let need_bytes = need_floats.saturating_mul(2);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
+        // Only dequantise exactly the bytes we need; trailing padding
+        // (added so the file size is a multiple of `block_align`) is
+        // ignored, matching `from_bytes`.
+        let mut floats: Vec<f32> = Vec::new();
+        dequantize_f16_to_f32(&bytes[..need_bytes], &mut floats);
+
+        // Split into the three matrices using the f32 helper.
+        // `from_floats` borrows from `floats`; we copy each region into
+        // its own owned `Vec` so the resulting struct can outlive the
+        // staging buffer without retaining the whole blob.
+        let view = ExpertWeights::from_floats(&floats, d_model, d_ff)?;
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate: view.gate.to_vec(),
+            up: view.up.to_vec(),
+            down: view.down.to_vec(),
+            col_indices: None,
+        })
+    }
+
+    /// Build an owned weight set from the **packed-column** byte format
+    /// written by `read_expert_columns`: only the `M` columns listed in
+    /// `col_indices` are present for `gate_proj` and `up_proj`; the full
+    /// `down_proj` is present (no row reduction is done — `forward_partial`
+    /// just zeros out the unloaded gated coordinates).
+    ///
+    /// Layout (after dequantisation if `dtype == F16`):
+    /// `gate_packed [d_ff x M]  ||  up_packed [d_ff x M]  ||  down [d_model x d_ff]`.
+    #[allow(dead_code)]
+    pub fn from_bytes_partial(
+        bytes: &[u8],
+        col_indices: &[usize],
+        d_model: usize,
+        d_ff: usize,
+        dtype: WeightDtype,
+    ) -> Result<Self, ExpertWeightsError> {
+        let m = col_indices.len();
+        for &c in col_indices {
+            assert!(c < d_model, "col index {c} out of range for d_model={d_model}");
+        }
+        let packed_floats = d_ff
+            .saturating_mul(m)
+            .saturating_mul(2)
+            .saturating_add(d_model.saturating_mul(d_ff));
+        let bpw = dtype.bytes_per_weight();
+        let need_bytes = packed_floats.saturating_mul(bpw);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
+        // Materialise a single f32 buffer covering the packed blob.
+        let floats: Vec<f32> = match dtype {
+            WeightDtype::F32 => {
+                let mut v = Vec::with_capacity(packed_floats);
+                for chunk in bytes[..packed_floats * 4].chunks_exact(4) {
+                    v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+                v
+            }
+            WeightDtype::F16 => {
+                let mut v = Vec::new();
+                dequantize_f16_to_f32(&bytes[..packed_floats * 2], &mut v);
+                v
+            }
+        };
+        let gate_len = d_ff * m;
+        let up_len = d_ff * m;
+        let down_len = d_model * d_ff;
+        let gate = floats[..gate_len].to_vec();
+        let up = floats[gate_len..gate_len + up_len].to_vec();
+        let down = floats[gate_len + up_len..gate_len + up_len + down_len].to_vec();
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate,
+            up,
+            down,
+            col_indices: Some(col_indices.to_vec()),
+        })
+    }
+
+    /// Run the SwiGLU FFN forward pass on the owned weights. Behaves
+    /// identically to [`ExpertWeights::forward`] when `col_indices` is
+    /// `None`; otherwise dispatches to [`Self::forward_partial`].
+    pub fn forward(&self, x: &[f32]) -> HiddenState {
+        if self.col_indices.is_some() {
+            self.forward_partial(x)
+        } else {
+            // Build a borrowed view and reuse the existing forward.
+            ExpertWeights {
+                d_model: self.d_model,
+                d_ff: self.d_ff,
+                gate: &self.gate,
+                up: &self.up,
+                down: &self.down,
+            }
+            .forward(x)
+        }
+    }
+
+    /// Forward pass using only the columns listed in `col_indices`.
+    /// `gate`/`up` are stored as `[d_ff x M]` packed (column j of the
+    /// packed matrix corresponds to original column `col_indices[j]`).
+    /// The dot products sum only over the loaded columns of `x`; this
+    /// trades a tiny bit of accuracy for proportionally fewer SSD bytes.
+    pub fn forward_partial(&self, x: &[f32]) -> HiddenState {
+        debug_assert_eq!(x.len(), self.d_model);
+        let cols = self
+            .col_indices
+            .as_ref()
+            .expect("forward_partial requires col_indices");
+        let m = cols.len();
+        debug_assert_eq!(self.gate.len(), self.d_ff * m);
+        debug_assert_eq!(self.up.len(), self.d_ff * m);
+
+        // 1) gate / up projections, each summed only over the loaded columns.
+        let mut gated = vec![0.0f32; self.d_ff];
+        for i in 0..self.d_ff {
+            let row_off = i * m;
+            let g_row = &self.gate[row_off..row_off + m];
+            let u_row = &self.up[row_off..row_off + m];
+            let mut g = 0.0f32;
+            let mut u = 0.0f32;
+            for (j, &orig_col) in cols.iter().enumerate() {
+                g += g_row[j] * x[orig_col];
+                u += u_row[j] * x[orig_col];
+            }
+            gated[i] = silu(g) * u;
+        }
+
+        // 2) Down projection over the full `gated` vector. (Unloaded
+        // input columns of x affect only how `gated` was computed, not
+        // the down-projection structure.)
+        let mut y = vec![0.0f32; self.d_model];
+        for i in 0..self.d_model {
+            let row = i * self.d_ff;
+            let d_row = &self.down[row..row + self.d_ff];
+            let mut acc = 0.0f32;
+            for j in 0..self.d_ff {
+                acc += d_row[j] * gated[j];
+            }
+            y[i] = acc;
+        }
+        y
+    }
+}
+
 /// Generate the per-token hidden-state vector that flows into the FFN.
 ///
 /// In a real model this would be the residual-stream activation produced
@@ -295,6 +605,26 @@ pub fn synth_hidden_state(token_idx: u64, d_model: usize, seed: u64) -> HiddenSt
     out
 }
 
+/// Compute the (digest, out_norm) summary fields shared by `run_inference`
+/// and its f16 / partial variants. Folded over `f32::to_bits` so the
+/// digest is exactly reproducible bit-for-bit between runs.
+fn summarise_output(token_idx: u64, expert_id: u32, y: &[f32]) -> InferenceOutput {
+    let mut sum_sq = 0.0f64;
+    for &v in y {
+        sum_sq += (v as f64) * (v as f64);
+    }
+    let out_norm = sum_sq.sqrt() as f32;
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut digest = FNV_OFFSET ^ token_idx ^ (expert_id as u64);
+    for &v in y {
+        let bits = v.to_bits() as u64;
+        digest ^= bits;
+        digest = digest.wrapping_mul(FNV_PRIME);
+    }
+    InferenceOutput { expert_id, digest, out_norm }
+}
+
 /// Run one expert's FFN on the hidden state. The buffer behind `resident`
 /// is the bytes that came directly off the SSD via `O_DIRECT`. Returns
 /// both the activation vector (for combining with other experts) and an
@@ -310,27 +640,50 @@ pub fn run_inference(
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     let weights = ExpertWeights::from_bytes(resident.data(), d_model, d_ff)?;
     let y = weights.forward(x);
-    let mut sum_sq = 0.0f64;
-    for &v in &y {
-        sum_sq += (v as f64) * (v as f64);
-    }
-    let out_norm = (sum_sq.sqrt()) as f32;
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
 
-    // Cheap, deterministic digest over (token_idx, expert_id, output bits).
-    // Folded over `f32::to_bits` so the digest is exactly reproducible
-    // bit-for-bit between runs.
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut digest = FNV_OFFSET ^ token_idx ^ (resident.id as u64);
-    for &v in &y {
-        let bits = v.to_bits() as u64;
-        digest ^= bits;
-        digest = digest.wrapping_mul(FNV_PRIME);
-    }
-    Ok((
-        InferenceOutput { expert_id: resident.id, digest, out_norm },
-        y,
-    ))
+/// f16 counterpart of [`run_inference`]: dequantises the resident bytes
+/// into an owned `Vec<f32>` (via [`OwnedExpertWeights::from_bytes_f16`])
+/// and runs the same SwiGLU forward pass. Used when the on-disk dtype
+/// is [`WeightDtype::F16`], halving SSD bytes per expert read.
+pub fn run_inference_f16(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = OwnedExpertWeights::from_bytes_f16(resident.data(), d_model, d_ff)?;
+    let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+/// Partial-load counterpart of [`run_inference`]: reconstructs the
+/// expert from a packed-column blob (produced by `read_expert_columns`)
+/// and runs [`OwnedExpertWeights::forward_partial`].
+#[allow(dead_code)]
+pub fn run_inference_partial(
+    token_idx: u64,
+    resident: &ExpertResident,
+    col_indices: &[usize],
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    dtype: WeightDtype,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = OwnedExpertWeights::from_bytes_partial(
+        resident.data(),
+        col_indices,
+        d_model,
+        d_ff,
+        dtype,
+    )?;
+    let y = weights.forward_partial(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
 }
 
 /// Fold the top-K expert outputs together. Mixtral / Llama-MoE actually
@@ -480,5 +833,156 @@ mod tests {
         let b = vec![3.0, 2.0, 1.0];
         let c = combine_outputs(&[a, b]);
         assert_eq!(c, vec![2.0, 2.0, 2.0]);
+    }
+
+    /// Build a `Vec<u8>` containing `expert_weight_count` weights as
+    /// little-endian f16 with the specified fill value.
+    fn make_f16_buffer(d_model: usize, d_ff: usize, fill: f32) -> Vec<u8> {
+        let n = expert_weight_count(d_model, d_ff);
+        let h = half::f16::from_f32(fill);
+        let mut v = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            v.extend_from_slice(&h.to_bits().to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn dequantize_f16_round_trips_known_values() {
+        let src: Vec<u8> = [1.0_f32, -0.5, 0.25, 2.0]
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let mut dst = Vec::new();
+        dequantize_f16_to_f32(&src, &mut dst);
+        assert_eq!(dst.len(), 4);
+        assert!((dst[0] - 1.0).abs() < 1e-3);
+        assert!((dst[1] - (-0.5)).abs() < 1e-3);
+        assert!((dst[2] - 0.25).abs() < 1e-3);
+        assert!((dst[3] - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn from_bytes_f16_round_trips() {
+        // f16 path must produce a finite output of the right shape, and
+        // it must agree with the f32 forward computed on the same fill
+        // value to within f16 quantisation noise.
+        let d_model = 16;
+        let d_ff = 32;
+        let fill = 0.05_f32;
+
+        let f16_bytes = make_f16_buffer(d_model, d_ff, fill);
+        let weights16 = OwnedExpertWeights::from_bytes_f16(&f16_bytes, d_model, d_ff).unwrap();
+        let x = synth_hidden_state(7, d_model, 1234);
+        let y16 = weights16.forward(&x);
+        assert_eq!(y16.len(), d_model);
+        assert!(y16.iter().all(|v| v.is_finite()));
+
+        let f32_buf = make_weights_buffer(d_model, d_ff, fill);
+        let w32 = ExpertWeights::from_bytes(f32_buf.as_slice(), d_model, d_ff).unwrap();
+        let y32 = w32.forward(&x);
+        for (a, b) in y16.iter().zip(y32.iter()) {
+            assert!(
+                (a - b).abs() < 1e-2,
+                "f16 forward diverged from f32: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn f16_bytes_helper_is_half_of_f32() {
+        let d_model = 32;
+        let d_ff = 64;
+        assert_eq!(
+            expert_weight_bytes_f16(d_model, d_ff) * 2,
+            expert_weight_bytes(d_model, d_ff)
+        );
+    }
+
+    /// Build a packed-column buffer for partial loading. With `m == d_model`
+    /// the packed layout is identical to the full f32 layout (column ids
+    /// are [0..d_model]), so partial forward must equal full forward.
+    fn make_packed_partial_buffer(
+        d_model: usize,
+        d_ff: usize,
+        cols: &[usize],
+        fill: f32,
+    ) -> Vec<u8> {
+        let m = cols.len();
+        // Full gate / up matrices we'd produce, then pick columns out.
+        let _ = (d_model, d_ff, fill);
+        // For a constant fill, every column is `fill`, so packed = fill repeated.
+        let mut out = Vec::new();
+        for _ in 0..(d_ff * m) {
+            out.extend_from_slice(&fill.to_le_bytes());
+        }
+        for _ in 0..(d_ff * m) {
+            out.extend_from_slice(&fill.to_le_bytes());
+        }
+        for _ in 0..(d_model * d_ff) {
+            out.extend_from_slice(&fill.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn partial_forward_matches_full_for_large_fraction() {
+        // With M == d_model (fraction 1.0) and column indices [0..d_model],
+        // partial forward and full forward must be bit-for-bit equal.
+        let d_model = 8;
+        let d_ff = 16;
+        let fill = 0.1;
+        let cols: Vec<usize> = (0..d_model).collect();
+        let packed = make_packed_partial_buffer(d_model, d_ff, &cols, fill);
+        let owned = OwnedExpertWeights::from_bytes_partial(
+            &packed,
+            &cols,
+            d_model,
+            d_ff,
+            WeightDtype::F32,
+        )
+        .unwrap();
+
+        let full = make_weights_buffer(d_model, d_ff, fill);
+        let full_view = ExpertWeights::from_bytes(full.as_slice(), d_model, d_ff).unwrap();
+        let x = synth_hidden_state(3, d_model, 9);
+        let y_partial = owned.forward_partial(&x);
+        let y_full = full_view.forward(&x);
+        for (a, b) in y_partial.iter().zip(y_full.iter()) {
+            assert!((a - b).abs() < 1e-5, "partial vs full: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn partial_forward_produces_finite_output() {
+        let d_model = 8;
+        let d_ff = 16;
+        let fill = 0.05;
+        // M = d_model / 2 — partial-load fraction 0.5.
+        let cols: Vec<usize> = (0..d_model).step_by(2).collect();
+        assert_eq!(cols.len(), 4);
+        let packed = make_packed_partial_buffer(d_model, d_ff, &cols, fill);
+        let owned = OwnedExpertWeights::from_bytes_partial(
+            &packed,
+            &cols,
+            d_model,
+            d_ff,
+            WeightDtype::F32,
+        )
+        .unwrap();
+        let x = synth_hidden_state(0, d_model, 1);
+        let y = owned.forward_partial(&x);
+        assert_eq!(y.len(), d_model);
+        assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn weight_dtype_round_trips_through_string() {
+        assert_eq!(WeightDtype::from_str_opt("f32"), Some(WeightDtype::F32));
+        assert_eq!(WeightDtype::from_str_opt("F16"), Some(WeightDtype::F16));
+        assert_eq!(WeightDtype::from_str_opt("fp16"), Some(WeightDtype::F16));
+        assert_eq!(WeightDtype::from_str_opt("bogus"), None);
+        assert_eq!(WeightDtype::F32.as_str(), "f32");
+        assert_eq!(WeightDtype::F16.as_str(), "f16");
     }
 }

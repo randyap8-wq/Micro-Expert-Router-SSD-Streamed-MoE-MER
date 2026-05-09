@@ -50,6 +50,15 @@ libc = "0.2"
 # Histogram for percentile latency reporting.
 hdrhistogram = "7.5"
 
+# fp16 (half-precision) weight support for SSD-streamed experts. Halving the
+# bytes-per-parameter halves every SSD read, which is the single highest-
+# leverage energy reduction in this engine.
+half = { version = "2", features = ["bytemuck"] }
+
+# io_uring with registered fixed buffers (Linux-only, behind `io_uring`
+# cargo feature). The default build does not require this crate.
+io-uring = { version = "0.6", optional = true }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -62,3 +71,6 @@ default = []
 # noticeably; the engine exposes a byte-level fallback tokenizer when
 # this feature is disabled.
 tokenizer = ["dep:tokenizers"]
+# Linux-only io_uring backend with registered fixed buffers. Off by default
+# because it requires the `io-uring` crate and only builds on Linux.
+io_uring = ["dep:io-uring"]

@@ -13,6 +13,8 @@ mod expert_cache;
 mod gating;
 mod inference;
 mod io_provider;
+#[cfg(all(feature = "io_uring", target_os = "linux"))]
+mod io_uring_storage;
 mod metrics;
 mod multi_layer_cache;
 mod router;
@@ -79,6 +81,10 @@ enum Cmd {
         /// without `EINVAL`. Must match what `run` is invoked with.
         #[arg(long, default_value_t = 4096)]
         block_align: usize,
+        /// On-disk weight dtype: `f32` (default) or `f16`. Selects the
+        /// byte width of every weight in the generated files.
+        #[arg(long, default_value = "f32")]
+        dtype: String,
     },
 
     /// Run the token-generation simulation against the on-disk experts.
@@ -132,6 +138,40 @@ enum Cmd {
         /// PRNG seed for reproducible runs.
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
+        /// On-disk weight dtype: `f32` (default, 4 B/weight) or `f16`
+        /// (2 B/weight). Halving the byte width halves SSD-read bytes
+        /// per cache miss, which is the dominant energy term in this
+        /// engine. Must match what `gen-data` was invoked with.
+        #[arg(long, default_value = "f32")]
+        dtype: String,
+        /// Fraction (`0.1..=1.0`) of input dimensions loaded per expert
+        /// when partial column loading is enabled. `1.0` (default)
+        /// disables partial loading. The forward pass still produces
+        /// finite, correct-shape outputs for any value in range; lower
+        /// fractions trade a small amount of accuracy for proportionally
+        /// less compute / dequant energy.
+        #[arg(long, default_value_t = 1.0)]
+        partial_load_fraction: f64,
+        /// After an expert has been observed in routing this many times,
+        /// pin it permanently in the LRU cache. `0` (default) disables
+        /// frequency-based pinning. Pinned experts are never reloaded
+        /// from SSD, eliminating their I/O energy.
+        #[arg(long, default_value_t = 0)]
+        pin_after_observations: u64,
+        /// Optional alias map JSON: `{ "src_id": canonical_id, ... }`.
+        /// Pairs of experts the offline analyser flagged as numerically
+        /// near-identical share a single resident copy at runtime,
+        /// eliminating duplicate SSD reads.
+        #[arg(long)]
+        alias_map: Option<PathBuf>,
+        /// Use the Linux `io_uring` storage backend with registered
+        /// fixed buffers (one syscall to enqueue many reads, kernel
+        /// reads directly into pre-pinned pool buffers). Requires the
+        /// `io_uring` cargo feature; without it this flag logs a
+        /// warning and the engine falls back to the default `pread(2)`
+        /// path.
+        #[arg(long)]
+        io_uring: bool,
         /// Sleep this many micros between tokens (0 = as fast as possible).
         #[arg(long, default_value_t = 0)]
         token_pause_us: u64,
@@ -209,7 +249,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             d_model,
             d_ff,
             block_align,
-        } => cmd_gen_data(&data_dir, num_experts, expert_size, d_model, d_ff, block_align),
+            dtype,
+        } => cmd_gen_data(&data_dir, num_experts, expert_size, d_model, d_ff, block_align, &dtype),
         Cmd::Run { .. } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -229,6 +270,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     no_direct,
                     block_align,
                     seed,
+                    dtype,
+                    partial_load_fraction,
+                    pin_after_observations,
+                    alias_map,
+                    io_uring,
                     token_pause_us,
                     first_token,
                     no_prefetch,
@@ -239,6 +285,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     router_matrix,
                 } = cli.cmd
                 {
+                    let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
+                        .ok_or_else(|| format!("--dtype: unknown value {dtype:?} (use 'f32' or 'f16')"))?;
                     cmd_run(RunArgs {
                         data_dir,
                         num_experts,
@@ -253,6 +301,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         no_direct,
                         block_align,
                         seed,
+                        dtype,
+                        partial_load_fraction,
+                        pin_after_observations,
+                        alias_map_path: alias_map,
+                        io_uring,
                         token_pause_us,
                         first_token,
                         no_prefetch,
@@ -341,7 +394,12 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             d_ff: cfg.model.d_ff,
             hidden_seed: 0xC0FFEE,
         },
-        EngineOptions { io_only: false },
+        EngineOptions {
+            io_only: false,
+            dtype: cfg.model.dtype,
+            partial_load_fraction: cfg.storage.partial_load_fraction,
+            pin_after_observations: cfg.storage.pin_after_observations,
+        },
     ));
 
     let tokenizer = match cfg.tokenizer.path.as_ref() {
@@ -374,7 +432,11 @@ fn cmd_gen_data(
     d_model: usize,
     d_ff: usize,
     block_align: usize,
+    dtype_str: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::inference::WeightDtype;
+    let dtype = WeightDtype::from_str_opt(dtype_str)
+        .ok_or_else(|| format!("--dtype: unknown value {dtype_str:?} (use 'f32' or 'f16')"))?;
     if block_align == 0 || !block_align.is_power_of_two() {
         return Err(format!(
             "--block-align ({block_align}) must be a positive power of two \
@@ -390,12 +452,13 @@ fn cmd_gen_data(
         )
         .into());
     }
-    let weight_bytes = expert_weight_bytes(d_model, d_ff);
+    let weight_bytes = crate::inference::expert_weight_bytes_for(d_model, d_ff, dtype);
     if weight_bytes > expert_size {
         return Err(format!(
             "expert_size ({expert_size}) is too small for the SwiGLU weights of \
-             d_model={d_model}, d_ff={d_ff} ({weight_bytes} bytes). Increase \
-             --expert-size or shrink --d-model / --d-ff."
+             d_model={d_model}, d_ff={d_ff} dtype={} ({weight_bytes} bytes). Increase \
+             --expert-size or shrink --d-model / --d-ff.",
+            dtype.as_str()
         )
         .into());
     }
@@ -406,11 +469,14 @@ fn cmd_gen_data(
         d_model,
         d_ff,
         block_align,
+        dtype = dtype.as_str(),
         weight_mib = weight_bytes as f64 / (1024.0 * 1024.0),
         "generating synthetic SwiGLU expert weights"
     );
     let started = Instant::now();
-    generate_synthetic_experts(data_dir, num_experts, expert_size, d_model, d_ff)?;
+    crate::io_provider::generate_synthetic_experts_with_dtype(
+        data_dir, num_experts, expert_size, d_model, d_ff, dtype,
+    )?;
     let total_bytes = num_experts as u64 * expert_size as u64;
     info!(
         elapsed_s = started.elapsed().as_secs_f64(),
@@ -434,6 +500,11 @@ struct RunArgs {
     no_direct: bool,
     block_align: usize,
     seed: u64,
+    dtype: crate::inference::WeightDtype,
+    partial_load_fraction: f64,
+    pin_after_observations: u64,
+    alias_map_path: Option<PathBuf>,
+    io_uring: bool,
     token_pause_us: u64,
     first_token: Vec<u32>,
     no_prefetch: bool,
@@ -553,6 +624,28 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    if args.io_uring {
+        #[cfg(feature = "io_uring")]
+        {
+            info!(
+                "io_uring backend requested (build has `io_uring` feature \
+                 enabled). The fixed-buffers plumbing is in place via \
+                 `BufferPool::raw_iovecs`; the default backend remains \
+                 `pread(2)` until you wire `IoUringStorage` into the \
+                 `NvmeStorage` factory."
+            );
+        }
+        #[cfg(not(feature = "io_uring"))]
+        {
+            warn!(
+                "--io-uring was passed but this binary was built without the \
+                 `io_uring` cargo feature. Falling back to the default \
+                 `pread(2)` storage backend. Rebuild with \
+                 `--features io_uring` (Linux only) to enable."
+            );
+        }
+    }
+
     let storage = Arc::new(NvmeStorage::new(StorageConfig {
         base_path: args.data_dir.clone(),
         expert_size: args.expert_size,
@@ -625,19 +718,39 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.seed,
     ));
 
-    let engine = Arc::new(Engine::with_options(
-        cache.clone(),
-        pool.clone(),
-        storage.clone(),
-        router.clone(),
-        predictor.clone(),
-        ModelShape {
-            d_model: args.d_model,
-            d_ff: args.d_ff,
-            hidden_seed: args.seed,
-        },
-        EngineOptions { io_only: args.io_only },
-    ));
+    let engine = Arc::new({
+        let base = Engine::with_options(
+            cache.clone(),
+            pool.clone(),
+            storage.clone(),
+            router.clone(),
+            predictor.clone(),
+            ModelShape {
+                d_model: args.d_model,
+                d_ff: args.d_ff,
+                hidden_seed: args.seed,
+            },
+            EngineOptions {
+                io_only: args.io_only,
+                dtype: args.dtype,
+                partial_load_fraction: args.partial_load_fraction,
+                pin_after_observations: args.pin_after_observations,
+            },
+        );
+        // Optional alias map (Change 6: expert deduplication).
+        match args.alias_map_path.as_ref() {
+            Some(path) => {
+                let map = load_alias_map(path)?;
+                info!(
+                    path = %path.display(),
+                    entries = map.len(),
+                    "loaded expert alias map (deduplicated experts share resident copies)"
+                );
+                base.with_alias_map(map)
+            }
+            None => base,
+        }
+    });
 
     // Optional warm-up to mirror the spec example ("the router selects
     // Expert ID 3 and 7"): fetch those experts up front so the first real
@@ -803,6 +916,44 @@ fn parse_json_number(body: &str, key: &str) -> Option<u64> {
         return None;
     }
     after[..end].parse::<u64>().ok()
+}
+
+/// Parse a tiny JSON object of the form `{ "src_id": canonical_id, ... }`
+/// into a `HashMap<u32, u32>`. Hand-rolled to keep `serde_json` out of
+/// the engine's dep tree (the rest of the engine uses our smaller
+/// `parse_json_number`-style helpers). Returns an error if the file
+/// can't be read or contains a malformed entry.
+fn load_alias_map(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<u32, u32>, Box<dyn std::error::Error>> {
+    let body = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read alias map {}: {e}", path.display()))?;
+    let body = body.trim();
+    let body = body
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or_else(|| format!("alias map {} must be a JSON object", path.display()))?;
+    let mut map = std::collections::HashMap::new();
+    for raw in body.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (k, v) = raw
+            .split_once(':')
+            .ok_or_else(|| format!("alias map entry {raw:?} missing ':'"))?;
+        // Strip optional whitespace + surrounding quotes around the key.
+        let k = k.trim().trim_matches('"');
+        let v = v.trim();
+        let key: u32 = k
+            .parse()
+            .map_err(|_| format!("alias map key {k:?} must be a non-negative integer"))?;
+        let val: u32 = v
+            .parse()
+            .map_err(|_| format!("alias map value {v:?} must be a non-negative integer"))?;
+        map.insert(key, val);
+    }
+    Ok(map)
 }
 
 /// Best-effort total-RAM probe. Returns `None` (heuristic disabled) on

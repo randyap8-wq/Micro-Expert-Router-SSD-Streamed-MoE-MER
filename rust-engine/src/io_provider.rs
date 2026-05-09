@@ -36,6 +36,7 @@
 //! backends, so this is a self-contained migration.
 
 use crate::buffer_pool::PooledBuffer;
+use crate::inference::WeightDtype;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -143,6 +144,103 @@ impl NvmeStorage {
         Ok(n)
     }
 
+    /// Partial-column read: load only the listed input-feature columns
+    /// of an expert's `gate_proj` and `up_proj` plus the full `down_proj`,
+    /// packed into `buf` in the layout consumed by
+    /// [`crate::inference::OwnedExpertWeights::from_bytes_partial`]:
+    ///
+    /// ```text
+    ///   gate_packed [d_ff x M]  ||  up_packed [d_ff x M]  ||  down [d_model x d_ff]
+    /// ```
+    ///
+    /// `M = col_indices.len()` and `dtype` selects the on-disk byte width
+    /// (2 for f16, 4 for f32). `buf.len()` must be at least the packed
+    /// blob size (`(2*d_ff*M + d_model*d_ff) * bytes_per_weight`).
+    ///
+    /// **Implementation note (energy):** the row-major on-disk layout
+    /// stores all columns of every row contiguously, so a strict
+    /// "read only M columns" path would still need to touch every row.
+    /// Today this function reads the full expert file once and packs
+    /// the requested columns into `buf` in-process; that gives the
+    /// **compute / dequantise** energy saving (proportional to M/d_model)
+    /// without (yet) the **SSD bandwidth** saving. Switching to a
+    /// column-major on-disk layout — written by the offline extractor —
+    /// is the follow-up that turns this into a true bandwidth reduction.
+    /// The engine API and the `from_bytes_partial` consumer are stable
+    /// across that change.
+    #[allow(dead_code)]
+    pub async fn read_expert_columns(
+        &self,
+        expert_id: u32,
+        col_indices: &[usize],
+        dtype: WeightDtype,
+        d_model: usize,
+        d_ff: usize,
+        buf: &mut PooledBuffer,
+    ) -> io::Result<usize> {
+        let bpw = dtype.bytes_per_weight();
+        let m = col_indices.len();
+        for &c in col_indices {
+            if c >= d_model {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("col index {c} out of range for d_model={d_model}"),
+                ));
+            }
+        }
+        let packed_bytes = (2 * d_ff * m + d_model * d_ff) * bpw;
+        if buf.len() < packed_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination buffer too small for partial load: have {}, need {}",
+                    buf.len(),
+                    packed_bytes
+                ),
+            ));
+        }
+
+        // Stage the full file into a scratch Vec, then pack out the
+        // requested columns. `block_in_place` keeps the runtime
+        // responsive while pread runs.
+        let file = self.fd_for(expert_id)?;
+        let expert_size = self.cfg.expert_size;
+        let mut scratch = vec![0u8; expert_size];
+        tokio::task::block_in_place(|| file.read_at(&mut scratch, 0))?;
+
+        let row_bytes = d_model * bpw;
+        let gate_off = 0;
+        let up_off = d_ff * row_bytes;
+        let down_off = 2 * d_ff * row_bytes;
+
+        let mut pos = 0usize;
+        // gate_packed
+        for i in 0..d_ff {
+            let row_start = gate_off + i * row_bytes;
+            for &c in col_indices {
+                let src = row_start + c * bpw;
+                buf.as_mut_slice()[pos..pos + bpw].copy_from_slice(&scratch[src..src + bpw]);
+                pos += bpw;
+            }
+        }
+        // up_packed
+        for i in 0..d_ff {
+            let row_start = up_off + i * row_bytes;
+            for &c in col_indices {
+                let src = row_start + c * bpw;
+                buf.as_mut_slice()[pos..pos + bpw].copy_from_slice(&scratch[src..src + bpw]);
+                pos += bpw;
+            }
+        }
+        // down_proj copied verbatim
+        let down_size = d_model * d_ff * bpw;
+        buf.as_mut_slice()[pos..pos + down_size]
+            .copy_from_slice(&scratch[down_off..down_off + down_size]);
+        pos += down_size;
+
+        Ok(pos)
+    }
+
     #[cfg(target_os = "linux")]
     async fn read_into(&self, file: &File, buf: &mut PooledBuffer) -> io::Result<usize> {
         // Run the synchronous `pread(2)` on the current Tokio worker via
@@ -211,21 +309,9 @@ fn open_expert_file(path: &Path, _direct: bool) -> io::Result<File> {
     OpenOptions::new().read(true).open(path)
 }
 
-/// Generate `num_experts` deterministic test files in `dir`. Each file
-/// contains real `f32` SwiGLU weights laid out as
-/// `gate_proj || up_proj || down_proj` (row-major; see
-/// [`crate::inference`]).
-///
-/// `weight_bytes` is the number of bytes the engine will actually consume
-/// (`expert_weight_bytes(d_model, d_ff)`). `expert_size` is the size on
-/// disk; if it is larger than `weight_bytes` the trailing region is zero
-/// padded so the file size stays a multiple of `block_align` (an
-/// `O_DIRECT` requirement on Linux).
-///
-/// Weights are drawn from a small bounded uniform distribution
-/// (`U(-scale, +scale)` with `scale ≈ 1 / sqrt(d_model)`) using a
-/// per-expert deterministic xorshift, so the SwiGLU forward pass remains
-/// numerically stable for any `d_model`/`d_ff` and runs are reproducible.
+/// Generate `num_experts` deterministic test files in `dir` with f32
+/// weights. See [`generate_synthetic_experts_with_dtype`] for the f16
+/// variant.
 pub fn generate_synthetic_experts(
     dir: &Path,
     num_experts: u32,
@@ -233,27 +319,53 @@ pub fn generate_synthetic_experts(
     d_model: usize,
     d_ff: usize,
 ) -> io::Result<()> {
+    generate_synthetic_experts_with_dtype(dir, num_experts, expert_size, d_model, d_ff, WeightDtype::F32)
+}
+
+/// Generate `num_experts` deterministic test files in `dir`. Each file
+/// contains real `f32` *or* `f16` SwiGLU weights laid out as
+/// `gate_proj || up_proj || down_proj` (row-major; see
+/// [`crate::inference`]).
+///
+/// `weight_bytes` (= [`crate::inference::expert_weight_bytes_for`])
+/// is the number of bytes the engine will actually consume. `expert_size`
+/// is the size on disk; if it is larger than `weight_bytes` the trailing
+/// region is zero padded so the file size stays a multiple of
+/// `block_align` (an `O_DIRECT` requirement on Linux).
+///
+/// Weights are drawn from a small bounded uniform distribution
+/// (`U(-scale, +scale)` with `scale ≈ 1 / sqrt(d_model)`) using a
+/// per-expert deterministic xorshift, so the SwiGLU forward pass remains
+/// numerically stable for any `d_model`/`d_ff` and runs are reproducible.
+pub fn generate_synthetic_experts_with_dtype(
+    dir: &Path,
+    num_experts: u32,
+    expert_size: usize,
+    d_model: usize,
+    d_ff: usize,
+    dtype: WeightDtype,
+) -> io::Result<()> {
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
 
-    let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+    let weight_bytes = crate::inference::expert_weight_bytes_for(d_model, d_ff, dtype);
     if weight_bytes > expert_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "expert_size {expert_size} too small for d_model={d_model} d_ff={d_ff} \
-                 (need at least {weight_bytes} bytes for the SwiGLU weights)"
+                 dtype={:?} (need at least {weight_bytes} bytes for the SwiGLU weights)",
+                dtype
             ),
         ));
     }
 
-    // Initialisation scale. With small inputs in [-1, 1] this keeps the
-    // pre-activation roughly unit-scale and avoids saturating SiLU.
     let scale = 1.0f32 / (d_model.max(1) as f32).sqrt();
     let pad_bytes = expert_size - weight_bytes;
     let zero_pad = vec![0u8; (1 << 20).min(pad_bytes.max(1))];
-    let chunk_floats = 16 * 1024; // 64 KiB at a time
+    let chunk_floats = 16 * 1024;
 
+    let bpw = dtype.bytes_per_weight();
     for id in 0..num_experts {
         let path = dir.join(format!("expert_{id}.bin"));
         let mut f = OpenOptions::new()
@@ -262,12 +374,11 @@ pub fn generate_synthetic_experts(
             .truncate(true)
             .open(&path)?;
 
-        // xorshift64* seeded per-expert so gen-data is fully deterministic.
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15u64
             .wrapping_add((id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
 
         let mut floats_remaining = crate::inference::expert_weight_count(d_model, d_ff);
-        let mut buf = Vec::<u8>::with_capacity(chunk_floats * 4);
+        let mut buf = Vec::<u8>::with_capacity(chunk_floats * bpw);
         while floats_remaining > 0 {
             let n = floats_remaining.min(chunk_floats);
             buf.clear();
@@ -275,17 +386,21 @@ pub fn generate_synthetic_experts(
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
-                // Map the high 24 bits to [-scale, +scale).
-                let u = (state >> 40) as u32; // 24 bits
-                let unit = (u as f32) / ((1u32 << 23) as f32) - 1.0; // [-1, 1)
+                let u = (state >> 40) as u32;
+                let unit = (u as f32) / ((1u32 << 23) as f32) - 1.0;
                 let v = unit * scale;
-                buf.extend_from_slice(&v.to_le_bytes());
+                match dtype {
+                    WeightDtype::F32 => buf.extend_from_slice(&v.to_le_bytes()),
+                    WeightDtype::F16 => {
+                        let h = half::f16::from_f32(v);
+                        buf.extend_from_slice(&h.to_bits().to_le_bytes());
+                    }
+                }
             }
             f.write_all(&buf)?;
             floats_remaining -= n;
         }
 
-        // Zero pad up to expert_size to satisfy O_DIRECT block alignment.
         let mut remaining_pad = pad_bytes;
         while remaining_pad > 0 {
             let n = remaining_pad.min(zero_pad.len());

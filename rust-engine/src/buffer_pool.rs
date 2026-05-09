@@ -63,6 +63,26 @@ impl BufferPool {
         self.inner.align
     }
 
+    /// Snapshot the raw `(ptr, len)` of every currently-free buffer.
+    /// Intended for the `io_uring` registered-fixed-buffers path: at
+    /// startup, callers register every pool buffer with the kernel
+    /// once, then submit reads referencing buffer indices instead of
+    /// per-read iovecs. Returned pointers are stable for the lifetime
+    /// of the pool (each `AlignedBuffer` owns a heap allocation that
+    /// the pool keeps alive).
+    ///
+    /// **Safety contract:** the caller must not write to these
+    /// pointers concurrently with another holder of the corresponding
+    /// `PooledBuffer`. In practice this means: register the iovecs
+    /// once at startup, before any `acquire()` call, and never modify
+    /// the pool's free-list contents while reads are in flight.
+    pub fn raw_iovecs(&self) -> Vec<(*mut u8, usize)> {
+        let mut g = self.inner.free.lock();
+        g.iter_mut()
+            .map(|b| (b.as_mut_slice().as_mut_ptr(), b.len()))
+            .collect()
+    }
+
     /// Try to pop a free buffer immediately. Returns `None` if the pool is empty.
     pub fn try_acquire(&self) -> Option<PooledBuffer> {
         let buf = self.inner.free.lock().pop()?;
@@ -174,5 +194,17 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         drop(held);
         h.await.unwrap();
+    }
+
+    #[test]
+    fn raw_iovecs_reports_every_free_buffer() {
+        // With nothing acquired, raw_iovecs reports all `slots` buffers.
+        let pool = BufferPool::new(3, 4096, 4096);
+        let iovecs = pool.raw_iovecs();
+        assert_eq!(iovecs.len(), 3);
+        for (p, l) in iovecs {
+            assert!(!p.is_null());
+            assert_eq!(l, 4096);
+        }
     }
 }
