@@ -82,7 +82,16 @@ def parse_args() -> argparse.Namespace:
         "--layer",
         type=int,
         default=0,
-        help="Which transformer layer's expert FFNs to dump (Mixtral has 32).",
+        help="Which transformer layer's expert FFNs to dump (Mixtral has 32). "
+             "Ignored when --all-layers is set.",
+    )
+    p.add_argument(
+        "--all-layers",
+        action="store_true",
+        help="Dump experts from every layer. Files are named "
+             "`expert_<layer>_<id>.bin` (vs `expert_<id>.bin` for single-layer). "
+             "metadata.json includes `num_layers`. This is the format "
+             "consumed by the Rust engine's MultiLayerExpertCache.",
     )
     p.add_argument(
         "--out",
@@ -178,71 +187,101 @@ def main() -> int:
         low_cpu_mem_usage=True,
     )
 
-    # Walk the state dict for the requested layer's experts.
+    # Walk the state dict for the requested layer(s)' experts.
     # Mixtral parameter names look like:
     #   model.layers.<layer>.block_sparse_moe.experts.<expert_id>.w1.weight  (gate_proj)
     #   model.layers.<layer>.block_sparse_moe.experts.<expert_id>.w2.weight  (down_proj)
     #   model.layers.<layer>.block_sparse_moe.experts.<expert_id>.w3.weight  (up_proj)
     # Note: Mixtral's `w1` is the gate, `w3` is the up, `w2` is the down.
     sd = model.state_dict()
-    prefix = f"model.layers.{args.layer}.block_sparse_moe.experts"
 
-    n = num_experts if args.limit is None else min(num_experts, args.limit)
-    written = 0
-    for expert_id in range(n):
-        w1 = sd.get(f"{prefix}.{expert_id}.w1.weight")  # gate_proj [d_ff, d_model]
-        w3 = sd.get(f"{prefix}.{expert_id}.w3.weight")  # up_proj   [d_ff, d_model]
-        w2 = sd.get(f"{prefix}.{expert_id}.w2.weight")  # down_proj [d_model, d_ff]
-        if w1 is None or w2 is None or w3 is None:
+    # Discover the set of layers to dump. With --all-layers we walk every
+    # block_sparse_moe layer present in the state dict; otherwise we
+    # dump just `--layer`.
+    if args.all_layers:
+        layer_ids = sorted({
+            int(name.split(".")[2])
+            for name in sd.keys()
+            if name.startswith("model.layers.") and ".block_sparse_moe.experts." in name
+        })
+        if not layer_ids:
             print(
-                f"error: missing tensors for expert {expert_id} on layer {args.layer}; "
-                "is the layer index correct?",
+                "error: --all-layers set but no MoE layers found in state dict; "
+                "is this actually a Mixtral-style model?",
                 file=sys.stderr,
             )
             return 1
-        # Sanity-check shapes — fail loudly if HF ever changes the layout.
-        assert tuple(w1.shape) == (d_ff, d_model), (
-            f"w1 (gate_proj) for expert {expert_id} has shape {tuple(w1.shape)}, "
-            f"expected ({d_ff}, {d_model})"
-        )
-        assert tuple(w3.shape) == (d_ff, d_model), (
-            f"w3 (up_proj) for expert {expert_id} has shape {tuple(w3.shape)}, "
-            f"expected ({d_ff}, {d_model})"
-        )
-        assert tuple(w2.shape) == (d_model, d_ff), (
-            f"w2 (down_proj) for expert {expert_id} has shape {tuple(w2.shape)}, "
-            f"expected ({d_model}, {d_ff})"
-        )
+        print(f"--all-layers: dumping {len(layer_ids)} layers ({layer_ids[0]}..{layer_ids[-1]})", file=sys.stderr)
+    else:
+        layer_ids = [args.layer]
 
-        # Concatenate as gate || up || down, contiguous row-major f32, LE.
-        # `.contiguous().cpu().numpy().tobytes()` produces the correct
-        # bit-for-bit on-disk layout for the Rust `&[f32]` reinterpret.
-        gate = w1.to(torch.float32).contiguous().cpu().numpy()
-        up = w3.to(torch.float32).contiguous().cpu().numpy()
-        down = w2.to(torch.float32).contiguous().cpu().numpy()
-
-        path = out / f"expert_{expert_id}.bin"
-        with open(path, "wb") as f:
-            f.write(gate.tobytes(order="C"))
-            f.write(up.tobytes(order="C"))
-            f.write(down.tobytes(order="C"))
-            # Pad up to expert_size with zero bytes so O_DIRECT alignment
-            # holds. The engine ignores anything past `weight_bytes`.
-            wrote = gate.nbytes + up.nbytes + down.nbytes
-            assert wrote == weight_bytes, (
-                f"internal: wrote {wrote} bytes, expected {weight_bytes}"
+    n = num_experts if args.limit is None else min(num_experts, args.limit)
+    written = 0
+    for layer in layer_ids:
+        prefix = f"model.layers.{layer}.block_sparse_moe.experts"
+        for expert_id in range(n):
+            w1 = sd.get(f"{prefix}.{expert_id}.w1.weight")  # gate_proj [d_ff, d_model]
+            w3 = sd.get(f"{prefix}.{expert_id}.w3.weight")  # up_proj   [d_ff, d_model]
+            w2 = sd.get(f"{prefix}.{expert_id}.w2.weight")  # down_proj [d_model, d_ff]
+            if w1 is None or w2 is None or w3 is None:
+                print(
+                    f"error: missing tensors for expert {expert_id} on layer {layer}; "
+                    "is the layer index correct?",
+                    file=sys.stderr,
+                )
+                return 1
+            # Sanity-check shapes — fail loudly if HF ever changes the layout.
+            assert tuple(w1.shape) == (d_ff, d_model), (
+                f"w1 (gate_proj) for layer {layer} expert {expert_id} has shape "
+                f"{tuple(w1.shape)}, expected ({d_ff}, {d_model})"
             )
-            pad = expert_size - wrote
-            if pad > 0:
-                f.write(b"\x00" * pad)
-        written += 1
-        if written % 8 == 0 or written == n:
-            print(f"  wrote expert {expert_id} -> {path}", file=sys.stderr)
+            assert tuple(w3.shape) == (d_ff, d_model), (
+                f"w3 (up_proj) for layer {layer} expert {expert_id} has shape "
+                f"{tuple(w3.shape)}, expected ({d_ff}, {d_model})"
+            )
+            assert tuple(w2.shape) == (d_model, d_ff), (
+                f"w2 (down_proj) for layer {layer} expert {expert_id} has shape "
+                f"{tuple(w2.shape)}, expected ({d_model}, {d_ff})"
+            )
+
+            # Concatenate as gate || up || down, contiguous row-major f32, LE.
+            gate = w1.to(torch.float32).contiguous().cpu().numpy()
+            up = w3.to(torch.float32).contiguous().cpu().numpy()
+            down = w2.to(torch.float32).contiguous().cpu().numpy()
+
+            # Single-layer: keep the legacy `expert_<id>.bin` name so the
+            # existing run path keeps working without changes.
+            # Multi-layer: `expert_<layer>_<id>.bin`, consumed by the
+            # Rust `MultiLayerExpertCache`.
+            if args.all_layers:
+                path = out / f"expert_{layer}_{expert_id}.bin"
+            else:
+                path = out / f"expert_{expert_id}.bin"
+            with open(path, "wb") as f:
+                f.write(gate.tobytes(order="C"))
+                f.write(up.tobytes(order="C"))
+                f.write(down.tobytes(order="C"))
+                # Pad up to expert_size with zero bytes so O_DIRECT alignment
+                # holds. The engine ignores anything past `weight_bytes`.
+                wrote = gate.nbytes + up.nbytes + down.nbytes
+                assert wrote == weight_bytes, (
+                    f"internal: wrote {wrote} bytes, expected {weight_bytes}"
+                )
+                pad = expert_size - wrote
+                if pad > 0:
+                    f.write(b"\x00" * pad)
+            written += 1
+            if written % 8 == 0:
+                print(f"  wrote layer {layer} expert {expert_id} -> {path}", file=sys.stderr)
+    # Always log the final write so the user sees a clean tail line even
+    # when `written` isn't a multiple of 8 (e.g. with `--limit`).
+    print(f"  finished writing {written} expert file(s)", file=sys.stderr)
 
     metadata = {
         "model": args.model,
-        "layer": args.layer,
-        "num_experts": written,
+        "layer": layer_ids[0] if not args.all_layers else None,
+        "num_layers": len(layer_ids),
+        "num_experts": n,
         "top_k": top_k,
         "d_model": d_model,
         "d_ff": d_ff,
@@ -250,6 +289,7 @@ def main() -> int:
         "block_align": args.block_align,
         "dtype": args.dtype,
         "weight_layout": "gate_proj || up_proj || down_proj (row-major, little-endian f32)",
+        "file_naming": "expert_<layer>_<id>.bin" if args.all_layers else "expert_<id>.bin",
     }
     meta_path = out / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2) + "\n")

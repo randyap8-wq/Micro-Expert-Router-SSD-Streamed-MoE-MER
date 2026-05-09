@@ -9,10 +9,28 @@ license = "MIT OR Apache-2.0"
 # Tokio drives the orchestration (scheduling, prefetch tasks, channels).
 # We use `block_in_place` from `rt-multi-thread` to dispatch blocking
 # `pread(2)` syscalls without satisfying `'static` lifetimes.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 
 # Fixed-capacity LRU cache for resident experts.
 lru = "0.12"
+
+# Serialisation: TOML config file + JSON request/response bodies.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP server for the OpenAI-compatible API. Pin minor versions; both are
+# 0.x and follow strict semver, so a wildcard would break us.
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+tower = { version = "0.5", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+# HuggingFace tokenizer. Optional via `tokenizer` feature so users without
+# the model files can still build / test.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+
+# Prometheus metrics export.
+prometheus = { version = "0.13", default-features = false }
 
 # Sync primitive for the LRU + buffer pool. parking_lot is faster and not async,
 # which is exactly what we want around a short critical section.
@@ -36,3 +54,11 @@ hdrhistogram = "7.5"
 lto = "thin"
 codegen-units = 1
 debug = 1
+
+[features]
+default = []
+# Real HuggingFace tokenizer support. Off by default because the
+# `tokenizers` crate pulls in `onig` (C library) which slows the build
+# noticeably; the engine exposes a byte-level fallback tokenizer when
+# this feature is disabled.
+tokenizer = ["dep:tokenizers"]
