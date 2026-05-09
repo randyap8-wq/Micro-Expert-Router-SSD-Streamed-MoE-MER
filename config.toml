@@ -1,0 +1,62 @@
+# Example TOML configuration for `micro-expert-router serve`.
+#
+# Run:
+#   cargo run --release -p micro-expert-router -- serve --config config.toml
+#
+# The server reads this file at startup and exposes the OpenAI-compatible
+# HTTP API plus Prometheus metrics. Engine settings (cache slots, O_DIRECT
+# alignment, predictive prefetch fanout, …) match what the legacy `run`
+# subcommand exposes, but driven from one place instead of a long-tail of
+# CLI flags.
+#
+# All sections are required except `[tokenizer]`, which falls back to a
+# byte-level tokenizer when omitted.
+
+[server]
+# Address to listen on. `0.0.0.0:8080` to expose to the network.
+bind = "127.0.0.1:8080"
+# Hard cap on the `max_tokens` any single request can ask for. Requests
+# asking for more are silently clamped to this value.
+max_tokens = 256
+
+[model]
+# Directory containing `expert_<id>.bin` files (and optionally
+# `metadata.json` written by `scripts/extract_mixtral_experts.py`).
+data_dir = "./data"
+# Number of experts in the (per-layer) MoE pool. For Mixtral 8x7B: 8.
+num_experts = 8
+# Top-K experts activated per token. For Mixtral 8x7B: 2.
+top_k = 2
+# Hidden / residual-stream dimension. For Mixtral 8x7B: 4096.
+d_model = 512
+# FFN intermediate dimension. For Mixtral 8x7B: 14336.
+d_ff = 2048
+# Bytes per expert file on disk. Must be a multiple of `block_align`.
+# For Mixtral 8x7B (d_model=4096, d_ff=14336, fp32) you'd compute:
+#   3 * 4096 * 14336 * 4 = 704_643_072 bytes, padded up to 4096.
+expert_size = 16777216
+# Number of transformer layers. 1 for the legacy single-layer benchmark
+# data; 32 for full Mixtral-8x7B.
+num_layers = 1
+
+[storage]
+# LRU cache slots (per layer). The whole point of this engine is that
+# experts stream from SSD; a large cache hides the metric you're trying
+# to measure. Recommended: 4-8.
+cache_slots = 4
+# O_DIRECT block alignment, bytes. 4096 on most NVMe drives.
+block_align = 4096
+# Set to `true` on tmpfs / overlayfs / macOS / CI where O_DIRECT is
+# unavailable. Buffered reads will let the OS page cache warm up,
+# under-reporting cold-read SSD latency.
+no_direct = false
+# Predictive prefetcher fanout (0 disables prefetching entirely).
+predict_fanout = 2
+# Don't issue prefetches whose Markov-predicted probability falls below
+# this threshold.
+predict_min_prob = 0.05
+
+[tokenizer]
+# Path to a HuggingFace `tokenizer.json` (e.g. the one shipped with
+# Mixtral). Comment out / delete to use the byte-level fallback.
+# path = "./data/tokenizer.json"

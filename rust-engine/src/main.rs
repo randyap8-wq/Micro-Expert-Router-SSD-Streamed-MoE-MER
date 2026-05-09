@@ -7,11 +7,18 @@
 
 mod aligned_buffer;
 mod buffer_pool;
+mod config;
 mod engine;
 mod expert_cache;
+mod gating;
 mod inference;
 mod io_provider;
+mod metrics;
+mod multi_layer_cache;
 mod router;
+mod server;
+mod tokenizer;
+mod transformer;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -166,6 +173,20 @@ enum Cmd {
         #[arg(long)]
         router_matrix: Option<PathBuf>,
     },
+
+    /// Start the OpenAI-compatible HTTP server (Phase 6 / 8 / 9).
+    ///
+    /// Reads server, model, storage, and tokenizer settings from a TOML
+    /// config file. The engine is built exactly as in `run`, but instead
+    /// of streaming a fixed token count it stays up serving requests on
+    /// `POST /v1/completions`, `POST /v1/chat/completions`, and exports
+    /// Prometheus metrics on `GET /metrics`.
+    Serve {
+        /// Path to the TOML config file. See `config.toml` at the
+        /// repository root for an example.
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn init_logging(filter: &str) {
@@ -247,7 +268,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
         }
+        Cmd::Serve { config } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_serve(config))
+        }
     }
+}
+
+async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+    use crate::metrics::Metrics;
+    use crate::server::{serve, AppState};
+    use crate::tokenizer::Tokenizer;
+
+    let cfg = Config::from_file(&config_path)?;
+    info!(
+        bind = %cfg.server.bind,
+        data_dir = %cfg.model.data_dir.display(),
+        num_experts = cfg.model.num_experts,
+        num_layers = cfg.model.num_layers,
+        top_k = cfg.model.top_k,
+        d_model = cfg.model.d_model,
+        d_ff = cfg.model.d_ff,
+        "loaded server config"
+    );
+
+    if !cfg.model.data_dir.is_dir() {
+        return Err(format!(
+            "data dir {} does not exist; run `gen-data` or the extractor first",
+            cfg.model.data_dir.display()
+        )
+        .into());
+    }
+
+    let storage = Arc::new(NvmeStorage::new(StorageConfig {
+        base_path: cfg.model.data_dir.clone(),
+        expert_size: cfg.model.expert_size,
+        block_align: cfg.storage.block_align,
+        use_direct_io: !cfg.storage.no_direct,
+    })?);
+    storage.warmup_fds(0..cfg.model.num_experts)?;
+
+    let prefetch_headroom = cfg.storage.predict_fanout.max(1);
+    let pool_slots = cfg.storage.cache_slots + prefetch_headroom;
+    let pool = BufferPool::new(pool_slots, cfg.model.expert_size, cfg.storage.block_align);
+    let cache = Arc::new(ExpertCache::new(cfg.storage.cache_slots));
+
+    let router = Arc::new(TopKRouter::clustered(
+        cfg.model.num_experts,
+        cfg.model.top_k,
+        4,
+        0.9,
+        0xC0FFEE,
+    ));
+    let predictor = Arc::new(PredictiveLoader::new(
+        cfg.model.num_experts,
+        cfg.storage.predict_fanout,
+        cfg.storage.predict_min_prob,
+        0xC0FFEE,
+    ));
+
+    let engine = Arc::new(Engine::with_options(
+        cache,
+        pool,
+        storage,
+        router,
+        predictor,
+        ModelShape {
+            d_model: cfg.model.d_model,
+            d_ff: cfg.model.d_ff,
+            hidden_seed: 0xC0FFEE,
+        },
+        EngineOptions { io_only: false },
+    ));
+
+    let tokenizer = match cfg.tokenizer.path.as_ref() {
+        Some(p) => match Tokenizer::from_file(p) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                warn!(path = %p.display(), error = %e, "tokenizer load failed; falling back to byte tokenizer");
+                Arc::new(Tokenizer::bytes())
+            }
+        },
+        None => {
+            info!("no tokenizer.json configured; using byte-level fallback tokenizer");
+            Arc::new(Tokenizer::bytes())
+        }
+    };
+
+    let state = AppState {
+        engine,
+        tokenizer,
+        metrics: Metrics::new(),
+        max_tokens_cap: cfg.server.max_tokens,
+    };
+    serve(state, &cfg.server.bind).await
 }
 
 fn cmd_gen_data(

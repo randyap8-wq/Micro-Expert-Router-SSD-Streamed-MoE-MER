@@ -254,6 +254,57 @@ To reproduce the **exact spec example** (router selects expert 3 and 7 first):
   --first-token 3,7
 ```
 
+### Run as an OpenAI-compatible HTTP server
+
+The same engine — same SSD-streaming expert cache, same `O_DIRECT`
+reads, same SwiGLU FFN over the bytes that just arrived from disk — can
+be run as a long-lived HTTP server with an OpenAI-compatible API.
+
+```bash
+# Start the server. Reads everything from a TOML config file (see
+# `config.toml` at the repo root for an annotated example).
+./target/release/micro-expert-router serve --config ../config.toml
+```
+
+Endpoints:
+
+| method   | path                    | purpose                                            |
+| -------- | ----------------------- | -------------------------------------------------- |
+| `GET`    | `/health`               | liveness probe (`{"status":"ok",...}`)             |
+| `GET`    | `/metrics`              | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait |
+| `POST`   | `/v1/completions`       | OpenAI text-completion shape (`prompt`, `max_tokens`, …) |
+| `POST`   | `/v1/chat/completions`  | OpenAI chat-completion shape (`messages`, …)       |
+
+Example:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/completions \
+  -H "content-type: application/json" \
+  -d '{"prompt":"Once upon a time","max_tokens":32}' | jq .
+```
+
+The server is intentionally **stateless per request** in this PR: each
+request drives `Engine::generate` for `max_tokens` cycles and returns
+the decoded tokens in one shot. Streaming (`stream: true`) is accepted
+in the request body for OpenAI compatibility but currently produces a
+non-streaming response. Continuous batching is on the roadmap (see
+`server.rs` for the trait boundaries it will plug into).
+
+Tokenization is via the [`tokenizers`] crate when the optional
+`tokenizer` cargo feature is enabled and a `tokenizer.json` is configured,
+or a deterministic byte-level fallback otherwise (so the server is
+useful end-to-end for testing without shipping a 60 MB tokenizer file).
+
+```bash
+# Build with the real HuggingFace tokenizer wired in.
+cargo build --release --features tokenizer
+```
+
+Configuration lives in TOML — see [`config.toml`](./config.toml) for
+the full annotated schema (server bind address, model dimensions, cache
+slots, `O_DIRECT` block alignment, predictive prefetch fanout, optional
+tokenizer path).
+
 To **isolate pure I/O cost** (skip the SwiGLU FFN; XOR every byte read
 to force the page in):
 
@@ -555,22 +606,30 @@ Covers:
 
 ## Limitations / next steps
 
-- **Static top-K router.** Real Mixtral routing is a learned `softmax` over
-  the gating projection conditioned on the per-token hidden state. The
-  Markov-chain router used here captures the *temporal locality* of
-  real routing traces (and can be fed one directly via
-  `--router-matrix`), but doesn't condition on `x`. Integrating a real
-  gate is mostly plumbing.
+- **Static top-K router (in the legacy `run` and `serve` paths).** Real
+  Mixtral routing is a learned `softmax` over the gating projection
+  conditioned on the per-token hidden state. The Markov-chain router
+  used by `Engine::generate` captures the *temporal locality* of real
+  routing traces (and can be fed one directly via `--router-matrix`),
+  but doesn't condition on `x`. The production code path lives in
+  `gating::LinearGate` (`x @ W_gate.T → softmax → top-K`) — wiring it
+  into the engine's per-token loop is the next step.
 - **Scalar `f32` matmul.** The expert FFN runs as a plain triple-nested
   scalar loop. That is intentional — the project's thesis is about
   storage bandwidth — but a real serving deployment would call into BLAS
   / a SIMD kernel / a CUDA kernel via `tch` / `candle` / `cudarc`. The
   byte→`f32` view in `inference::ExpertWeights::from_bytes` already does
   zero-copy reinterpretation, so any of those backends slot in cleanly.
-- **Synthetic weights, no attention, no embedding, no tokenizer.** The
-  engine runs the *expert FFN* of a sparse MoE; the rest of a real
-  transformer (attention, RMSNorm, residual, embedding, lm-head) and a
-  tokenizer are not yet wired in.
+- **Single-layer wiring in the live engine.** `MultiLayerExpertCache`
+  (per-layer LRU keyed on `(layer, expert_id)`) and the dense
+  transformer pieces (`RmsNorm`, RoPE, scalar causal MHA with KV
+  cache, MoE output combiner) now live in-tree under `multi_layer_cache`,
+  `transformer`, and `gating`, with unit tests; the `serve` path drives
+  one layer through them. Stacking 32 layers and threading the hidden
+  state across them is the follow-up.
+- **No streaming responses.** The HTTP server accepts `stream: true` for
+  OpenAI compatibility but returns a non-streaming response; SSE
+  streaming + continuous batching is on the roadmap.
 - **Synchronous `pread` on a blocking-donated worker.** The current
   backend uses `tokio::task::block_in_place` + `pread(2)`. A production
   deployment should switch to the raw `io-uring` crate with **registered
