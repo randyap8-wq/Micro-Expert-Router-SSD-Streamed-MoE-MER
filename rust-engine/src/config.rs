@@ -88,7 +88,7 @@ pub struct StorageConfigToml {
 
     /// Fraction of input dimensions to load per expert when partial
     /// column loading is enabled. `1.0` (default) loads every column
-    /// (legacy behaviour); values in `[0.1, 1.0)` load only the top-M
+    /// (legacy behaviour); values in `[0.1, 1.0]` load only the top-M
     /// columns of `x` by absolute magnitude, reducing bytes read per
     /// miss in proportion to the chosen fraction.
     #[serde(default = "default_partial_load_fraction")]

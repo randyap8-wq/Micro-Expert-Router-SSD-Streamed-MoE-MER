@@ -170,7 +170,7 @@ def main() -> int:
             canonical_ids.append(eid)
         else:
             alias_map[eid] = chosen
-            print(f"  alias: {eid} -> {chosen}  (cosine ~ {args.threshold:.3f}+)",
+            print(f"  alias: {eid} -> {chosen}  (cosine = {sim:.6f}, threshold = {args.threshold:.3f})",
                   file=sys.stderr)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

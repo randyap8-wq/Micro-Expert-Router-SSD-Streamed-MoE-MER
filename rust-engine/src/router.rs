@@ -353,6 +353,11 @@ impl PredictiveLoader {
         let mut rows = self.rows.write();
         let row = &mut rows[from as usize];
         let entry = row.counts.entry(to).or_insert(0);
+        // Saturate at u32::MAX rather than wrapping. Once a cell
+        // saturates, further observations stop counting toward the row
+        // total too — otherwise the implied probability
+        // `(*entry + prior) / total` would drift away from the true
+        // frequency as `total` grew past `*entry`.
         if *entry < u32::MAX {
             *entry += 1;
             row.total_observed = row.total_observed.saturating_add(1);
