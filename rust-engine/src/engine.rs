@@ -57,6 +57,20 @@ pub struct ModelShape {
     pub hidden_seed: u64,
 }
 
+/// Run-time options that affect how `Engine::generate` executes a token.
+///
+/// The defaults model a normal end-to-end run (router → I/O → SwiGLU
+/// FFN); `io_only` flips off the FFN compute so the same instrumentation
+/// can be used to measure pure I/O cost.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EngineOptions {
+    /// When `true`, skip [`run_inference`] and instead XOR every byte of
+    /// the resident buffer to force the read to fully materialise. This
+    /// isolates the SSD-streaming cost from FFN compute and is what
+    /// `--io-only` on the CLI maps to.
+    pub io_only: bool,
+}
+
 pub struct Engine {
     cache: Arc<ExpertCache>,
     pool: BufferPool,
@@ -64,6 +78,7 @@ pub struct Engine {
     router: Arc<TopKRouter>,
     predictor: Arc<PredictiveLoader>,
     shape: ModelShape,
+    options: EngineOptions,
     counters: Arc<Counters>,
     /// Latency histogram of per-token cycle time, in microseconds.
     cycle_hist: parking_lot::Mutex<Histogram<u64>>,
@@ -71,6 +86,18 @@ pub struct Engine {
     io_hist: parking_lot::Mutex<Histogram<u64>>,
     /// Latency histogram of per-token compute (FFN forward), in microseconds.
     compute_hist: parking_lot::Mutex<Histogram<u64>>,
+    /// Aggregate microseconds spent on I/O wait across all tokens (i.e.
+    /// the sum of per-token critical-path miss latencies). Lets us
+    /// report `avg_io_wait_us` and "% of token time on I/O" without
+    /// re-deriving them from the histogram.
+    total_io_wait_us: AtomicU64,
+    /// Aggregate microseconds spent on per-token compute across all tokens.
+    total_compute_us: AtomicU64,
+    /// Aggregate microseconds spent on per-token cycle (compute + I/O wait
+    /// + scheduling overhead) across all tokens.
+    total_cycle_us: AtomicU64,
+    /// Number of tokens processed (i.e. `Engine::generate` calls).
+    tokens_processed: AtomicU64,
     last_experts: parking_lot::Mutex<Vec<u32>>,
 }
 
@@ -83,6 +110,18 @@ impl Engine {
         predictor: Arc<PredictiveLoader>,
         shape: ModelShape,
     ) -> Self {
+        Self::with_options(cache, pool, storage, router, predictor, shape, EngineOptions::default())
+    }
+
+    pub fn with_options(
+        cache: Arc<ExpertCache>,
+        pool: BufferPool,
+        storage: Arc<NvmeStorage>,
+        router: Arc<TopKRouter>,
+        predictor: Arc<PredictiveLoader>,
+        shape: ModelShape,
+        options: EngineOptions,
+    ) -> Self {
         Self {
             cache,
             pool,
@@ -90,6 +129,7 @@ impl Engine {
             router,
             predictor,
             shape,
+            options,
             counters: Arc::new(Counters::default()),
             cycle_hist: parking_lot::Mutex::new(
                 Histogram::new_with_bounds(1, 60_000_000, 3)
@@ -103,6 +143,10 @@ impl Engine {
                 Histogram::new_with_bounds(1, 60_000_000, 3)
                     .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
             ),
+            total_io_wait_us: AtomicU64::new(0),
+            total_compute_us: AtomicU64::new(0),
+            total_cycle_us: AtomicU64::new(0),
+            tokens_processed: AtomicU64::new(0),
             last_experts: parking_lot::Mutex::new(Vec::new()),
         }
     }
@@ -126,6 +170,7 @@ impl Engine {
         // the routing decision implies; sequentially `await`-ing each
         // fetch would serialise an opportunity the device can already
         // satisfy concurrently. Hits are resolved inline.
+        let io_wait_start = Instant::now();
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
         let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
             Vec::new();
@@ -146,6 +191,7 @@ impl Engine {
                 ));
             }
         }
+        let had_misses = !miss_handles.is_empty();
         for (i, h) in miss_handles {
             // `fetch` panics on a fatal read error (the engine cannot
             // make progress without the requested expert); propagate by
@@ -158,48 +204,89 @@ impl Engine {
                 .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
             residents[i] = Some(r);
         }
+        let io_wait_us = if had_misses {
+            io_wait_start.elapsed().as_micros() as u64
+        } else {
+            0
+        };
         let residents: Vec<Arc<ExpertResident>> = residents
             .into_iter()
             .map(|r| r.expect("internal invariant: every routed expert slot must be populated by either a hit or a completed miss fetch"))
             .collect();
 
-        // 2) Real expert FFN forward pass over weights streamed from SSD.
-        //    `synth_hidden_state` mocks the residual-stream activation that
-        //    would normally come from the previous transformer layer.
-        let x: HiddenState = synth_hidden_state(token_idx, self.shape.d_model, self.shape.hidden_seed);
+        // 2) Either run the real SwiGLU FFN, or — under `--io-only` —
+        //    just touch every byte of the resident buffer with a cheap
+        //    XOR checksum so the kernel actually delivers the page data
+        //    and we can isolate the SSD-streaming cost from FFN compute.
         let compute_start = Instant::now();
-        let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
-        let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
-        for r in &residents {
-            match run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff) {
-                Ok((out, y)) => {
-                    outputs.push(out);
-                    per_expert_y.push(y);
+        let compute_us = if self.options.io_only {
+            let mut digest: u64 = 0;
+            let mut total_bytes: u64 = 0;
+            for r in &residents {
+                let bytes = r.data();
+                total_bytes += bytes.len() as u64;
+                // XOR every byte. The accumulator is 64 bits wide so we
+                // also rotate per chunk; this prevents a smart compiler
+                // from folding the loop and guarantees every read byte
+                // is observed, the whole point of `--io-only`.
+                let mut acc: u64 = 0;
+                for chunk in bytes.chunks(8) {
+                    let mut buf = [0u8; 8];
+                    buf[..chunk.len()].copy_from_slice(chunk);
+                    acc ^= u64::from_le_bytes(buf);
                 }
-                Err(e) => {
-                    // The on-disk file is truncated / corrupt or violates
-                    // an alignment invariant. Log and skip this expert
-                    // rather than aborting the whole token cycle / run.
-                    warn!(
-                        token = token_idx,
-                        expert = r.id,
-                        error = %e,
-                        "skipping expert: failed to reinterpret buffer as SwiGLU weights"
-                    );
+                digest ^= acc.rotate_left((r.id % 63) as u32);
+            }
+            let us = compute_start.elapsed().as_micros() as u64;
+            debug!(
+                token = token_idx,
+                bytes_touched = total_bytes,
+                io_only_digest = digest,
+                "io-only mode: skipped FFN, touched buffer bytes"
+            );
+            us
+        } else {
+            // Real expert FFN forward pass over weights streamed from SSD.
+            // `synth_hidden_state` mocks the residual-stream activation that
+            // would normally come from the previous transformer layer.
+            let x: HiddenState =
+                synth_hidden_state(token_idx, self.shape.d_model, self.shape.hidden_seed);
+            let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
+            let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
+            for r in &residents {
+                match run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff) {
+                    Ok((out, y)) => {
+                        outputs.push(out);
+                        per_expert_y.push(y);
+                    }
+                    Err(e) => {
+                        // The on-disk file is truncated / corrupt or violates
+                        // an alignment invariant. Log and skip this expert
+                        // rather than aborting the whole token cycle / run.
+                        warn!(
+                            token = token_idx,
+                            expert = r.id,
+                            error = %e,
+                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                        );
+                    }
                 }
             }
-        }
-        let combined = combine_outputs(&per_expert_y);
-        let compute_us = compute_start.elapsed().as_micros() as u64;
+            let combined = combine_outputs(&per_expert_y);
+            let us = compute_start.elapsed().as_micros() as u64;
+            debug!(
+                token = token_idx,
+                d_model = self.shape.d_model,
+                d_ff = self.shape.d_ff,
+                ?outputs,
+                combined_norm = combined.iter().map(|v| v * v).sum::<f32>().sqrt(),
+                "FFN forward complete"
+            );
+            us
+        };
         let _ = self.compute_hist.lock().record(compute_us.max(1));
-        debug!(
-            token = token_idx,
-            d_model = self.shape.d_model,
-            d_ff = self.shape.d_ff,
-            ?outputs,
-            combined_norm = combined.iter().map(|v| v * v).sum::<f32>().sqrt(),
-            "FFN forward complete"
-        );
+        self.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
+        self.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
 
         // 3) Update predictor with the observed transition.
         {
@@ -222,6 +309,8 @@ impl Engine {
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
         let _ = self.cycle_hist.lock().record(cycle_us.max(1));
+        self.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
+        self.tokens_processed.fetch_add(1, Ordering::Relaxed);
 
         stats
     }
@@ -338,6 +427,17 @@ impl Engine {
         let cycle = self.cycle_hist.lock();
         let io = self.io_hist.lock();
         let compute = self.compute_hist.lock();
+        let tokens = self.tokens_processed.load(Ordering::Relaxed);
+        let total_io_wait_us = self.total_io_wait_us.load(Ordering::Relaxed);
+        let total_compute_us = self.total_compute_us.load(Ordering::Relaxed);
+        let total_cycle_us = self.total_cycle_us.load(Ordering::Relaxed);
+        let avg_io_wait_us = if tokens == 0 { 0.0 } else { total_io_wait_us as f64 / tokens as f64 };
+        let avg_compute_us = if tokens == 0 { 0.0 } else { total_compute_us as f64 / tokens as f64 };
+        let pct_time_io = if total_cycle_us == 0 {
+            0.0
+        } else {
+            (total_io_wait_us as f64 / total_cycle_us as f64) * 100.0
+        };
         EngineReport {
             hits: self.counters.hits.load(Ordering::Relaxed),
             misses: self.counters.misses.load(Ordering::Relaxed),
@@ -361,6 +461,13 @@ impl Engine {
             d_model: self.shape.d_model,
             d_ff: self.shape.d_ff,
             predictor_observations: self.predictor.observations(),
+            tokens_processed: tokens,
+            avg_io_wait_us,
+            avg_compute_us,
+            total_io_wait_us,
+            total_cycle_us,
+            pct_time_io,
+            io_only: self.options.io_only,
         }
     }
 
@@ -401,12 +508,23 @@ impl Engine {
             r.io_p50_us, r.io_p95_us, r.io_p99_us
         );
         info!(
-            "compute:       p50={}us  p95={}us  p99={}us  (SwiGLU FFN per token)",
-            r.compute_p50_us, r.compute_p95_us, r.compute_p99_us
+            "compute:       p50={}us  p95={}us  p99={}us  ({})",
+            r.compute_p50_us,
+            r.compute_p95_us,
+            r.compute_p99_us,
+            if r.io_only { "io-only XOR digest, FFN skipped" } else { "SwiGLU FFN per token" }
         );
         info!(
             "cycle latency: p50={}us  p95={}us  p99={}us  max={}us",
             r.cycle_p50_us, r.cycle_p95_us, r.cycle_p99_us, r.cycle_max_us
+        );
+        info!(
+            "per-token avg: io_wait={:.1}us  compute={:.1}us  (over {} tokens)",
+            r.avg_io_wait_us, r.avg_compute_us, r.tokens_processed
+        );
+        info!(
+            "I/O share:     {:.2}% of token cycle time spent waiting on SSD reads",
+            r.pct_time_io
         );
         info!("=======================================================");
     }
@@ -436,6 +554,24 @@ pub struct EngineReport {
     pub d_model: usize,
     pub d_ff: usize,
     pub predictor_observations: u64,
+    /// Number of `Engine::generate` calls completed.
+    pub tokens_processed: u64,
+    /// Mean per-token critical-path I/O wait, in microseconds. Tokens that
+    /// were entirely served from cache contribute 0 to this average.
+    pub avg_io_wait_us: f64,
+    /// Mean per-token compute (FFN forward, or XOR-digest under
+    /// `--io-only`), in microseconds.
+    pub avg_compute_us: f64,
+    /// Sum of per-token critical-path I/O wait (microseconds).
+    pub total_io_wait_us: u64,
+    /// Sum of per-token cycle time (microseconds).
+    pub total_cycle_us: u64,
+    /// `total_io_wait_us / total_cycle_us * 100` — the headline "what
+    /// fraction of token time was the engine waiting on SSD?" number
+    /// the gist asks the run summary to print.
+    pub pct_time_io: f64,
+    /// Whether this run was executed in `--io-only` mode (FFN skipped).
+    pub io_only: bool,
 }
 
 #[cfg(test)]
@@ -649,9 +785,32 @@ mod tests {
 
         for t in 0..50 {
             let _ = engine.generate(t).await;
+            // Residency must NEVER exceed the configured cache capacity,
+            // even mid-stream — this is the actual invariant the test
+            // name promises. Asserting after every token catches a class
+            // of regressions where the cache temporarily holds N+1
+            // entries in between an insert and an eviction.
+            assert!(
+                engine.cache.resident_ids().len() <= cache_slots,
+                "cache residency {} exceeded capacity {} at token {t}",
+                engine.cache.resident_ids().len(),
+                cache_slots
+            );
+            assert!(
+                engine.cache.len() <= cache_slots,
+                "cache.len() {} exceeded capacity {} at token {t}",
+                engine.cache.len(),
+                cache_slots
+            );
         }
         let r = engine.report();
         assert_eq!(r.cache_capacity, cache_slots);
+        assert!(
+            engine.cache.resident_ids().len() <= cache_slots,
+            "post-stream residency {} exceeded capacity {}",
+            engine.cache.resident_ids().len(),
+            cache_slots
+        );
         // Misses dominate when cache_slots is small relative to working set.
         assert!(r.misses > r.hits / 2, "expected eviction churn to produce many misses");
     }

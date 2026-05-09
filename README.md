@@ -238,15 +238,16 @@ RUST_LOG=micro_expert_router=debug ./target/release/micro-expert-router run ...
 ### Sample output
 
 ```
-INFO starting engine num_experts=16 top_k=2 cache_slots=8 expert_mib=16 d_model=512 d_ff=2048 weight_mib=12 direct_io=false
-INFO buffer pool sized with prefetch headroom cache_slots=8 pool_slots=10 prefetch_headroom=2
+INFO starting engine num_experts=16 top_k=2 cache_slots=4 expert_mib=16 d_model=512 d_ff=2048 weight_mib=12 direct_io=false io_only=false force_ssd=false
+INFO router: deterministic Markov chain with structured cluster locality clusters=4 intra_cluster_p=0.9
+INFO buffer pool sized with prefetch headroom cache_slots=4 pool_slots=6 prefetch_headroom=2
 INFO streaming tokens (latency / throughput logs follow) tokens=30
-INFO tick token=0  cycle_us=5569 tps="179.6" hits=0 misses=2 kib=32768 resident=[12, 15, 2, 10, 8, 3, 0, 1]
-INFO tick token=17 cycle_us=3620 tps="276.2" hits=2 misses=0 kib=0     resident=[4, 3, 2, 12, 15, 10, 8, 0]
-INFO tick token=29 cycle_us=3448 tps="290.0" hits=2 misses=0 kib=0     resident=[0, 4, 3, 7, 5, 6, 2, 1]
+INFO tick token=0  cycle_us=5569 tps="179.6" hits=0 misses=2 kib=32768 resident=[12, 15, 2, 10]
+INFO tick token=17 cycle_us=3620 tps="276.2" hits=2 misses=0 kib=0     resident=[4, 3, 2, 12]
+INFO tick token=29 cycle_us=3448 tps="290.0" hits=2 misses=0 kib=0     resident=[0, 4, 3, 7]
 INFO stream complete wall_s=0.124 sustained_tps=243 avg_throughput_mibps=2717 hit_rate_pct=71.7
 INFO ===================== run summary =====================
-INFO experts:       16 (top-2), cache=8 slots, pool=10 slots
+INFO experts:       16 (top-2), cache=4 slots, pool=6 slots
 INFO ffn shape:     d_model=512  d_ff=2048  bytes/expert=12582912
 INFO lookups:       hits=43  misses=17  hit_rate=71.67%
 INFO prefetches:    completed=4   predictor_observations=116
@@ -254,13 +255,26 @@ INFO i/o:           reads=17  bytes=336.00 MiB
 INFO i/o latency:   p50=1057us  p95=1743us  p99=1743us
 INFO compute:       p50=3435us  p95=3521us  p99=3617us  (SwiGLU FFN per token)
 INFO cycle latency: p50=3451us  p95=5643us  p99=6915us  max=6915us
+INFO per-token avg: io_wait=572.4us  compute=3478.0us  (over 30 tokens)
+INFO I/O share:     14.13% of token cycle time spent waiting on SSD reads
 ```
 
 The `compute` row is the actual SwiGLU forward pass (per-token, summed
-over the K active experts). On a real PCIe-4 NVMe with `O_DIRECT` the
-`i/o` row drops further; on bigger `d_model`/`d_ff` the `compute` row
-grows linearly — exactly the trade you'd want to surface when reasoning
-about SSD-as-RAM viability for a given model size.
+over the K active experts). The trailing **`per-token avg`** + **`I/O
+share`** lines are the headline numbers: they tell you, on this run,
+how many microseconds the engine spent waiting on the SSD per token and
+what fraction of total token time that represents. Re-run with
+`--io-only` to drop the SwiGLU compute and isolate pure I/O:
+
+```
+INFO compute:       p50=18us  p95=42us  p99=51us  (io-only XOR digest, FFN skipped)
+INFO I/O share:     74.6% of token cycle time spent waiting on SSD reads
+```
+
+On a real PCIe-4 NVMe with `O_DIRECT` the `i/o` row drops further; on
+bigger `d_model`/`d_ff` the `compute` row grows linearly — exactly the
+trade you'd want to surface when reasoning about SSD-as-RAM viability
+for a given model size.
 
 ### CLI reference
 
@@ -274,22 +288,83 @@ micro-expert-router gen-data
 
 micro-expert-router run
   --data-dir <PATH>          Directory with expert_<id>.bin files
+                              (auto-loads metadata.json if present)
   --num-experts <N>          Total experts in the model
   --expert-size <BYTES>      Must match gen-data
   --d-model <N>              Must match gen-data
   --d-ff <N>                 Must match gen-data
-  --cache-slots <N>          Resident experts (LRU capacity)
+  --cache-slots <N>          Resident experts (default 4; warns if > 16)
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
   --predict-fanout <N>       Prefetch candidates per token (default 2)
   --predict-min-prob <P>     Skip prefetch below this probability (default 0.05)
-  --no-direct                Disable O_DIRECT (use page cache; CI / tmpfs)
+  --no-direct                Disable O_DIRECT (use page cache; CI / tmpfs / macOS)
   --block-align <BYTES>      O_DIRECT alignment, default 4096
   --first-token <IDS>        Comma-separated expert ids to warm into cache
   --no-prefetch              Disable predictive loader (for ablation)
+  --io-only                  Skip the SwiGLU FFN; XOR every byte to isolate I/O cost
+  --force-ssd                Refuse to run with anything that lets the OS serve
+                              experts from RAM (requires O_DIRECT on Linux)
+  --router-clusters <N>      Markov router cluster count (default 4)
+  --router-intra-p <P>       P(stay in current cluster) (default 0.9)
+  --router-matrix <PATH>     Load a precomputed N×N transition matrix from a
+                              text file (whitespace-separated f64, row-major).
+                              Overrides --router-clusters / --router-intra-p.
   --token-pause-us <N>       Sleep between tokens to throttle the stream
   --seed <U64>               PRNG seed for reproducibility
 ```
+
+### Running on real Mixtral weights
+
+`scripts/extract_mixtral_experts.py` dumps a single transformer
+layer's expert FFNs from a Hugging Face Mixtral checkpoint into the
+on-disk format the engine expects (`expert_<id>.bin` blobs +
+`metadata.json`):
+
+```
+pip install 'transformers>=4.38' torch
+python scripts/extract_mixtral_experts.py \
+    --model mistralai/Mixtral-8x7B-v0.1 \
+    --layer 0 --out ./mixtral-data
+
+cargo run --release --manifest-path rust-engine/Cargo.toml -- \
+    run --data-dir ./mixtral-data --tokens 200
+```
+
+The `metadata.json` written by the script lets `run` auto-fill
+`--num-experts`, `--d-model`, `--d-ff`, `--top-k`, and `--expert-size`
+so the second command needs no further flags. Each Mixtral 8x7B expert
+is ~88 MiB (zero-padded to a 4 KiB multiple) — ~700 MiB on disk for
+one layer, fully streamable from any modern NVMe.
+
+### Routing model — Markov chain over expert ids
+
+The router is a **deterministic first-order Markov chain**, not a
+random uniform top-K sampler: this is the property that makes the
+prefetcher worth running. Two ways to build the chain:
+
+1. **Generated** (default): experts are partitioned into
+   `--router-clusters` groups (by `id % cluster_count`) and the chain
+   stays inside its current cluster with probability
+   `--router-intra-p` (default `0.9`). This produces the same
+   "topic-sticky" behaviour real MoE traces show — the predictor
+   converges quickly and prefetch hit rate climbs above 60%.
+2. **Loaded** (`--router-matrix path.txt`): supply a whitespace-separated
+   `num_experts × num_experts` matrix of `f64` transition probabilities,
+   row-major. Rows are normalised to sum to 1. Use this to feed a real
+   Mixtral routing trace (e.g. produced by hooking `block_sparse_moe`'s
+   gate softmax during a Hugging Face inference run) directly into the
+   engine.
+
+Given a fixed `--seed`, the routed sequence is fully reproducible.
+
+### macOS
+
+`O_DIRECT` is Linux-only. On macOS the engine automatically falls back
+to buffered reads (`--no-direct`) and prints a startup warning that
+measured I/O latency will include OS page-cache effects (and therefore
+under-report cold-NVMe latency). Use a Linux host on a real NVMe device
+for clean numbers.
 
 ---
 
