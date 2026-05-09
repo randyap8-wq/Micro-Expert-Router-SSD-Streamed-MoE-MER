@@ -168,6 +168,7 @@ impl NvmeStorage {
     /// is the follow-up that turns this into a true bandwidth reduction.
     /// The engine API and the `from_bytes_partial` consumer are stable
     /// across that change.
+    #[allow(dead_code)]
     pub async fn read_expert_columns(
         &self,
         expert_id: u32,

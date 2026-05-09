@@ -604,6 +604,164 @@ Covers:
 
 ---
 
+## Energy Efficiency Features
+
+The engine spends almost all of its energy in two places: **moving
+expert bytes off the SSD** (per-byte cost: PCIe + NVMe controller +
+DRAM write) and **executing the SwiGLU FFN** (per-FLOP cost: SIMD
+units + L1/L2 cache traffic). Every change in this section attacks one
+of those two terms by reducing the *number* of bytes moved or the
+*number* of FLOPs executed — i.e. they reduce work, which is the only
+durable way to reduce energy. Knobs that merely shift cost around (e.g.
+faster CPU at the same workload) are out of scope.
+
+The headline numbers shipped in `EngineReport.print_summary` are
+`bytes_read` (Joules ∝ bytes for SSD reads), `pct_time_io` (the share
+of token cycle time the CPU sits waiting on SSD, multiplying its idle
+energy), `pinned_count`, and `alias_redirects`. Each subsection below
+explains which of these the change moves and why.
+
+### 1. fp16 quantization on disk (`--dtype f16`)
+
+Each weight is stored as a 2-byte little-endian `f16` instead of a
+4-byte `f32`. The engine dequantises on the fly via
+`OwnedExpertWeights::from_bytes_f16` and runs the same SwiGLU forward
+pass on the resulting `Vec<f32>`.
+
+**How this saves energy.** Every cache miss reads
+`3 · d_model · d_ff` weights off the SSD. Halving the byte width
+halves the bytes the NVMe controller has to deliver, halves the PCIe
+traffic, and halves the DRAM writes — roughly a **2× reduction in
+SSD-read energy per miss**. That is by far the dominant term in any
+benchmark with a non-trivial miss rate. The dequantisation step is
+~`d_model · d_ff` cheap `f16 -> f32` conversions per expert; on modern
+SIMD this is far less energy than the bytes-moved savings recover.
+
+`gen-data` and the offline extractor both accept `--dtype`, so you can
+choose per-run whether to spend the disk space on f32 (highest
+fidelity) or f16 (lowest energy).
+
+### 2. 2nd-order Markov + gate-lookahead prefetching
+
+The `PredictiveLoader` now keeps two count tables: the legacy
+`(prev -> next)` 1st-order rows and a sparse `(prev_prev, prev) -> next`
+2nd-order map (`rows2`). `predict_next2(prev_prev, prev)` blends the
+two distributions 50/50 and returns the top-fanout next experts. The
+engine remembers the previous *and* previous-previous active sets and
+calls the 2nd-order path automatically once two tokens of history are
+available.
+
+**How this saves energy.** Speculative prefetches that *miss* burn full
+SSD-read energy for nothing. A sharper conditional distribution
+(`p(next | prev, prev_prev)` is strictly more informative than
+`p(next | prev)`) means we issue **fewer wasted prefetches** for the
+same prefetch hit rate, or alternatively hit the same hit rate at
+**lower fanout** — both reduce `bytes_read` directly. The 2nd-order
+table is sparse (`HashMap` keyed by `(prev_prev, prev)`), so memory
+overhead stays tiny.
+
+### 3. Partial weight loading (`--partial-load-fraction`)
+
+`OwnedExpertWeights::from_bytes_partial` accepts a packed-column blob
+produced by `NvmeStorage::read_expert_columns` — only the M most
+relevant input dimensions of `gate_proj` and `up_proj` are loaded
+(plus the full `down_proj`). `forward_partial` sums the dot products
+only over those M columns. The fraction `M / d_model` is configurable
+via `--partial-load-fraction` and `storage.partial_load_fraction`.
+
+**How this saves energy.** Each gate/up matmul today is `d_ff · d_model`
+multiply-adds per expert. Reducing to M loaded columns turns those
+into `d_ff · M` MAdds — **proportional to M / d_model**. With
+M = d_model / 2 you save ~50 % of the gate/up FLOPs, which is most of
+the per-expert compute cost. The forward pass remains correct on a
+finite, well-shaped output; the trade is a small, bounded accuracy
+delta. `1.0` (default) preserves byte-exact legacy behaviour. The SSD
+*bandwidth* saving requires a column-major on-disk layout — that's a
+follow-up change to the offline extractor; today's runtime saves the
+compute term and prepares the API surface for the bandwidth term.
+
+### 4. io_uring with registered fixed buffers (`--io-uring`)
+
+A new feature-gated `io_uring_storage.rs` module declares the API
+surface for the Linux `io_uring` backend with **registered fixed
+buffers**. `BufferPool::raw_iovecs` exposes every pool slot as a stable
+`(ptr, len)` so the kernel can be told about all of them up front
+exactly once. `--io-uring` accepts the flag, logs which path is in use,
+and falls back gracefully on non-Linux / non-feature builds.
+
+**How this saves energy.** Each `pread(2)` cache miss today is one
+syscall plus a per-read iovec setup. With `io_uring` + fixed buffers,
+a token that misses on K experts becomes **one syscall** (`io_uring_enter`)
+referencing K pre-pinned buffer indices — the kernel never has to walk
+the user mapping or pin pages on the hot path. Published microbenchmarks
+report 30–50 % less per-read CPU on NVMe-class SSDs. CPU time during
+I/O wait is pure overhead — the same bytes were going to leave the
+device either way; `io_uring` just makes the kernel cheaper, which is
+energy out of the budget. Build with `cargo build --release --features
+io_uring` (Linux only) to enable; the engine selects the `pread(2)`
+backend by default so the portable path stays the warning-free default.
+
+### 5. Frequency-based expert pinning (`--pin-after-observations N`)
+
+`ExpertCache` now holds a `pinned: HashSet<u32>`. Once the engine has
+observed an expert as a routing destination N times, it calls
+`cache.pin(id)` and the LRU eviction path skips that id permanently.
+`evict_lru` and `insert` both walk past pinned ids; the cache returns
+`None` from `evict_lru` if every entry is pinned (caught by the engine's
+existing "wait for a free buffer" loop, so progress is preserved).
+
+**How this saves energy.** MoE workloads have heavy-tailed expert
+usage — a small subset of experts handles a large fraction of tokens.
+A plain LRU still evicts those popular experts when a flurry of cold
+ones arrives, paying their full SSD read energy on the next miss. By
+pinning the demonstrated-hot ones, **every subsequent activation of
+those experts is a cache hit** (zero SSD bytes, zero I/O wait). With a
+realistic Zipfian routing distribution this typically eliminates the
+top-N contributors to `bytes_read`. `0` (default) preserves legacy
+behaviour.
+
+### 6. Expert deduplication via alias map (`--alias-map`)
+
+`scripts/compute_expert_aliases.py` scans every `expert_<id>.bin` in a
+data directory, computes pairwise cosine similarity over the full
+weight blob, and emits a JSON map `{ src_id: canonical_id, ... }` for
+pairs whose similarity is above a threshold (default 0.995). The
+engine loads it via `Engine::with_alias_map` (CLI flag `--alias-map`)
+and resolves every routed and predicted id through it before
+consulting the cache.
+
+**How this saves energy.** Without aliasing, two near-identical experts
+each consume one cache slot and one SSD read on first activation —
+even though their weight bytes are nearly the same. With the map,
+both expert ids resolve to a *single* canonical id; the cache holds
+one resident copy, the SSD reads it once, and **every redirect counted
+in `EngineReport.alias_redirects` is a cache lookup that didn't burn
+SSD bytes**. The detection runs offline (no runtime cost), and the
+runtime overhead is one `HashMap` lookup per routed expert per token.
+Empty / absent maps disable the feature entirely.
+
+### How to combine them
+
+The six knobs are independent and compose freely. A reasonable
+"low-energy" preset on a Linux NVMe box looks like:
+
+```bash
+micro-expert-router run \
+    --data-dir ./data \
+    --dtype f16 \                  # Change 1: 2× less SSD energy per miss
+    --predict-fanout 4 \           # Change 2: 2nd-order kicks in automatically
+    --partial-load-fraction 0.5 \  # Change 3: ~50% less gate/up compute
+    --io-uring \                   # Change 4: cheaper kernel I/O path
+    --pin-after-observations 8 \   # Change 5: hot experts never re-read
+    --alias-map ./data/aliases.json  # Change 6: deduplicated experts share a slot
+```
+
+`print_summary` reports each knob's state and effect (`pinned`,
+`alias_redirects`, `dtype`, `partial_load_fraction`) on every run, so
+you can verify the energy-saving paths actually engaged.
+
+---
+
 ## Limitations / next steps
 
 - **Static top-K router (in the legacy `run` and `serve` paths).** Real

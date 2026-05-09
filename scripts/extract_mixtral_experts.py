@@ -113,9 +113,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--dtype",
-        choices=["f32"],
+        choices=["f32", "f16"],
         default="f32",
-        help="On-disk dtype. Currently only f32 is supported by the engine.",
+        help=(
+            "On-disk dtype. `f32` (legacy) writes 4 bytes per weight; "
+            "`f16` writes 2 bytes per weight, halving the SSD bytes the "
+            "engine must read on every cache miss (the dominant energy "
+            "term). The Rust engine dequantises f16 to f32 in DRAM."
+        ),
     )
     return p.parse_args()
 
@@ -161,18 +166,20 @@ def main() -> int:
     top_k: int = int(config.num_experts_per_tok)
     d_model: int = int(config.hidden_size)
     d_ff: int = int(config.intermediate_size)
-    # SwiGLU expert holds three weight matrices (gate, up, down), each
-    # of shape (d_ff, d_model) or (d_model, d_ff), stored as little-
-    # endian f32 (4 bytes per element). The Rust engine reinterprets
-    # these bytes as `&[f32]` directly — no quantisation on disk.
+    # SwiGLU expert holds three weight matrices (gate, up, down). The
+    # Rust engine reinterprets the bytes as either `&[f32]` (4 B / weight)
+    # or dequantises from little-endian `f16` (2 B / weight) depending on
+    # `--dtype`. The on-disk byte order is always little-endian, matching
+    # `compile_error!` guards in `inference.rs`.
     NUM_WEIGHT_MATRICES = 3
-    F32_BYTES = 4
-    weight_bytes = NUM_WEIGHT_MATRICES * d_model * d_ff * F32_BYTES
+    bytes_per_weight = 4 if args.dtype == "f32" else 2
+    weight_bytes = NUM_WEIGHT_MATRICES * d_model * d_ff * bytes_per_weight
     expert_size = ((weight_bytes + args.block_align - 1) // args.block_align) * args.block_align
 
     print(
         f"model has {num_experts} experts/layer, top_k={top_k}, "
-        f"d_model={d_model}, d_ff={d_ff} -> {weight_bytes / 1024 / 1024:.1f} MiB/expert "
+        f"d_model={d_model}, d_ff={d_ff} dtype={args.dtype} -> "
+        f"{weight_bytes / 1024 / 1024:.1f} MiB/expert "
         f"(padded to {expert_size / 1024 / 1024:.1f} MiB on disk)",
         file=sys.stderr,
     )
@@ -244,10 +251,12 @@ def main() -> int:
                 f"{tuple(w2.shape)}, expected ({d_model}, {d_ff})"
             )
 
-            # Concatenate as gate || up || down, contiguous row-major f32, LE.
-            gate = w1.to(torch.float32).contiguous().cpu().numpy()
-            up = w3.to(torch.float32).contiguous().cpu().numpy()
-            down = w2.to(torch.float32).contiguous().cpu().numpy()
+            # Concatenate as gate || up || down, contiguous row-major.
+            # For f16, downcast f32 -> float16 before serialisation.
+            np_dtype = "float32" if args.dtype == "f32" else "float16"
+            gate = w1.to(torch.float32).contiguous().cpu().numpy().astype(np_dtype, copy=False)
+            up = w3.to(torch.float32).contiguous().cpu().numpy().astype(np_dtype, copy=False)
+            down = w2.to(torch.float32).contiguous().cpu().numpy().astype(np_dtype, copy=False)
 
             # Single-layer: keep the legacy `expert_<id>.bin` name so the
             # existing run path keeps working without changes.

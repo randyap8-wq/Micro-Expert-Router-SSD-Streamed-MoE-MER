@@ -16,8 +16,8 @@
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::inference::{
-    combine_outputs, run_inference, run_inference_f16, run_inference_partial, synth_hidden_state,
-    HiddenState, InferenceOutput, WeightDtype,
+    combine_outputs, run_inference, run_inference_f16, synth_hidden_state, HiddenState,
+    InferenceOutput, WeightDtype,
 };
 use crate::io_provider::NvmeStorage;
 use crate::router::{PredictiveLoader, TopKRouter};

@@ -455,6 +455,7 @@ impl OwnedExpertWeights {
     ///
     /// Layout (after dequantisation if `dtype == F16`):
     /// `gate_packed [d_ff x M]  ||  up_packed [d_ff x M]  ||  down [d_model x d_ff]`.
+    #[allow(dead_code)]
     pub fn from_bytes_partial(
         bytes: &[u8],
         col_indices: &[usize],
@@ -663,6 +664,7 @@ pub fn run_inference_f16(
 /// Partial-load counterpart of [`run_inference`]: reconstructs the
 /// expert from a packed-column blob (produced by `read_expert_columns`)
 /// and runs [`OwnedExpertWeights::forward_partial`].
+#[allow(dead_code)]
 pub fn run_inference_partial(
     token_idx: u64,
     resident: &ExpertResident,

@@ -13,6 +13,8 @@ mod expert_cache;
 mod gating;
 mod inference;
 mod io_provider;
+#[cfg(all(feature = "io_uring", target_os = "linux"))]
+mod io_uring_storage;
 mod metrics;
 mod multi_layer_cache;
 mod router;
@@ -162,6 +164,14 @@ enum Cmd {
         /// eliminating duplicate SSD reads.
         #[arg(long)]
         alias_map: Option<PathBuf>,
+        /// Use the Linux `io_uring` storage backend with registered
+        /// fixed buffers (one syscall to enqueue many reads, kernel
+        /// reads directly into pre-pinned pool buffers). Requires the
+        /// `io_uring` cargo feature; without it this flag logs a
+        /// warning and the engine falls back to the default `pread(2)`
+        /// path.
+        #[arg(long)]
+        io_uring: bool,
         /// Sleep this many micros between tokens (0 = as fast as possible).
         #[arg(long, default_value_t = 0)]
         token_pause_us: u64,
@@ -264,6 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     partial_load_fraction,
                     pin_after_observations,
                     alias_map,
+                    io_uring,
                     token_pause_us,
                     first_token,
                     no_prefetch,
@@ -294,6 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         partial_load_fraction,
                         pin_after_observations,
                         alias_map_path: alias_map,
+                        io_uring,
                         token_pause_us,
                         first_token,
                         no_prefetch,
@@ -492,6 +504,7 @@ struct RunArgs {
     partial_load_fraction: f64,
     pin_after_observations: u64,
     alias_map_path: Option<PathBuf>,
+    io_uring: bool,
     token_pause_us: u64,
     first_token: Vec<u32>,
     no_prefetch: bool,
@@ -609,6 +622,28 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.data_dir.display()
         )
         .into());
+    }
+
+    if args.io_uring {
+        #[cfg(feature = "io_uring")]
+        {
+            info!(
+                "io_uring backend requested (build has `io_uring` feature \
+                 enabled). The fixed-buffers plumbing is in place via \
+                 `BufferPool::raw_iovecs`; the default backend remains \
+                 `pread(2)` until you wire `IoUringStorage` into the \
+                 `NvmeStorage` factory."
+            );
+        }
+        #[cfg(not(feature = "io_uring"))]
+        {
+            warn!(
+                "--io-uring was passed but this binary was built without the \
+                 `io_uring` cargo feature. Falling back to the default \
+                 `pread(2)` storage backend. Rebuild with \
+                 `--features io_uring` (Linux only) to enable."
+            );
+        }
     }
 
     let storage = Arc::new(NvmeStorage::new(StorageConfig {

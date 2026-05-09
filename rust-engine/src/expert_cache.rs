@@ -143,6 +143,7 @@ impl ExpertCache {
     }
 
     /// Snapshot of currently-pinned ids (for diagnostics / metrics).
+    #[allow(dead_code)]
     pub fn pinned_ids(&self) -> Vec<u32> {
         let mut v: Vec<u32> = self.pinned.lock().iter().copied().collect();
         v.sort_unstable();

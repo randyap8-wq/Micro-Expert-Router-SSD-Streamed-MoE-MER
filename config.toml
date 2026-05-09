@@ -38,6 +38,11 @@ expert_size = 16777216
 # Number of transformer layers. 1 for the legacy single-layer benchmark
 # data; 32 for full Mixtral-8x7B.
 num_layers = 1
+# On-disk weight dtype: "f32" (4 B/weight, default, legacy) or "f16"
+# (2 B/weight). f16 halves SSD bytes per expert read, the dominant
+# energy term in this engine. Must match what `extract_mixtral_experts.py`
+# (or `gen-data`) was invoked with.
+dtype = "f32"
 
 [storage]
 # LRU cache slots (per layer). The whole point of this engine is that
@@ -55,6 +60,14 @@ predict_fanout = 2
 # Don't issue prefetches whose Markov-predicted probability falls below
 # this threshold.
 predict_min_prob = 0.05
+# Fraction of input dimensions to load per expert with partial column
+# loading. 1.0 (default) disables it; values in [0.1, 1.0) trade a small
+# amount of accuracy for proportionally less compute / dequant energy.
+partial_load_fraction = 1.0
+# After an expert has been observed in routing this many times, pin it
+# permanently in the LRU cache so it is never evicted by cold experts.
+# 0 (default) disables frequency-based pinning.
+pin_after_observations = 0
 
 [tokenizer]
 # Path to a HuggingFace `tokenizer.json` (e.g. the one shipped with
