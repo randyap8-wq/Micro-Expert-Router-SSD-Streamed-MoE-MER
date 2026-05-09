@@ -309,8 +309,15 @@ impl Row {
 
 pub struct PredictiveLoader {
     num_experts: u32,
-    /// `rows[from]` — sparse counts of successors of `from`.
+    /// `rows[from]` — sparse counts of successors of `from` (1st-order).
     rows: RwLock<Vec<Row>>,
+    /// `rows2[(prev_prev, prev)]` — sparse counts of successors of the
+    /// pair `(prev_prev -> prev)`. Stored as a `HashMap` keyed by the
+    /// flat index `prev_prev * num_experts + prev` to keep the memory
+    /// footprint sparse — only pairs we actually observed are
+    /// allocated. Used by [`Self::predict_next`] to blend a 2nd-order
+    /// signal with the 1st-order baseline.
+    rows2: RwLock<HashMap<u64, Row>>,
     /// Number of successors to suggest per call.
     fanout: usize,
     /// Probability threshold below which we don't bother prefetching.
@@ -330,6 +337,7 @@ impl PredictiveLoader {
         Self {
             num_experts,
             rows: RwLock::new(rows),
+            rows2: RwLock::new(HashMap::new()),
             fanout,
             min_prob,
             prior: 1,
@@ -345,11 +353,23 @@ impl PredictiveLoader {
         let mut rows = self.rows.write();
         let row = &mut rows[from as usize];
         let entry = row.counts.entry(to).or_insert(0);
-        // Saturate at u32::MAX rather than wrapping, matching the dense
-        // implementation. Once a cell saturates, further observations
-        // stop counting toward the row total too — otherwise the implied
-        // probability `(*entry + prior) / total` would drift away from
-        // the true frequency as `total` grew past `*entry`.
+        if *entry < u32::MAX {
+            *entry += 1;
+            row.total_observed = row.total_observed.saturating_add(1);
+        }
+    }
+
+    /// Record a 2nd-order observation: `(prev_prev -> prev -> to)` was
+    /// the actual sequence over three consecutive tokens.
+    pub fn observe2(&self, prev_prev: u32, prev: u32, to: u32) {
+        let n = self.num_experts;
+        if prev_prev >= n || prev >= n || to >= n {
+            return;
+        }
+        let key = (prev_prev as u64) * (n as u64) + prev as u64;
+        let mut rows2 = self.rows2.write();
+        let row = rows2.entry(key).or_insert_with(Row::new);
+        let entry = row.counts.entry(to).or_insert(0);
         if *entry < u32::MAX {
             *entry += 1;
             row.total_observed = row.total_observed.saturating_add(1);
@@ -362,6 +382,21 @@ impl PredictiveLoader {
         for &p in prev_set {
             for &n in next_set {
                 self.observe(p, n);
+            }
+        }
+    }
+
+    /// Record both the 1st-order `(prev -> next)` and the 2nd-order
+    /// `(prev_prev -> prev -> next)` transitions. `prev_prev_set` may
+    /// be empty (e.g. very first token after a cold start), in which
+    /// case only the 1st-order observations are recorded.
+    pub fn observe_step2(&self, prev_prev_set: &[u32], prev_set: &[u32], next_set: &[u32]) {
+        self.observe_step(prev_set, next_set);
+        for &pp in prev_prev_set {
+            for &p in prev_set {
+                for &n in next_set {
+                    self.observe2(pp, p, n);
+                }
             }
         }
     }
@@ -418,7 +453,45 @@ impl PredictiveLoader {
         probs
     }
 
-    /// Sample `fanout` distinct successors of `from` using the weighted
+    /// 2nd-order variant of [`Self::predict_next`]. When a `(prev_prev,
+    /// prev)` row has been observed, blends its distribution with the
+    /// 1st-order distribution from `prev` (50/50). Falls back to pure
+    /// 1st-order when no 2nd-order data exists for the pair, so the
+    /// caller can use this unconditionally without warm-up.
+    pub fn predict_next2(&self, prev_prev: u32, prev: u32) -> Vec<(u32, f64)> {
+        let baseline = self.predict_next(prev);
+        if prev_prev >= self.num_experts || prev >= self.num_experts || self.fanout == 0 {
+            return baseline;
+        }
+        let key = (prev_prev as u64) * (self.num_experts as u64) + prev as u64;
+        let rows2 = self.rows2.read();
+        let Some(row2) = rows2.get(&key) else {
+            return baseline;
+        };
+        if row2.total_observed == 0 {
+            return baseline;
+        }
+        let total = self.effective_total(row2.total_observed);
+        let total_f = total as f64;
+        let prior_f = self.prior as f64;
+        // Build a combined probability map: blend 1st-order and 2nd-order.
+        let mut combined: HashMap<u32, f64> = HashMap::new();
+        for (id, p) in &baseline {
+            *combined.entry(*id).or_insert(0.0) += 0.5 * *p;
+        }
+        for (&id, &c) in &row2.counts {
+            let p = (c as f64 + prior_f) / total_f;
+            *combined.entry(id).or_insert(0.0) += 0.5 * p;
+        }
+        let mut out: Vec<(u32, f64)> = combined
+            .into_iter()
+            .filter(|&(_, p)| p >= self.min_prob)
+            .collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(self.fanout);
+        out
+    }
+
     /// distribution (rather than a deterministic argmax). Useful when you
     /// want exploration in the prefetch policy.
     #[allow(dead_code)]
@@ -607,5 +680,43 @@ mod tests {
         p.observe(0, 1);
         assert!(p.predict_next(0).is_empty());
         assert!(p.sample_next(0).is_empty());
+    }
+
+    #[test]
+    fn second_order_predictor_outranks_first_order_when_signal_disagrees() {
+        // 1st-order: from `prev=2` we mostly see `5`.
+        // 2nd-order: from `(prev_prev=7, prev=2)` we mostly see `9`.
+        // `predict_next2(7, 2)` should rank `9` higher than `predict_next(2)` does.
+        let p = PredictiveLoader::new(16, 4, 0.0, 1);
+        for _ in 0..50 {
+            p.observe(2, 5);
+        }
+        for _ in 0..50 {
+            p.observe2(7, 2, 9);
+            // observe2 also implies observe(2, 9) is *not* called; the
+            // engine wires both via observe_step2. Test only the rows2
+            // contribution here.
+        }
+        let preds1 = p.predict_next(2);
+        let preds2 = p.predict_next2(7, 2);
+        let rank1 = |id: u32, list: &[(u32, f64)]| {
+            list.iter().position(|(e, _)| *e == id)
+        };
+        let r9_first = rank1(9, &preds1).unwrap_or(usize::MAX);
+        let r9_second = rank1(9, &preds2).unwrap_or(usize::MAX);
+        assert!(
+            r9_second < r9_first || (r9_second == 0),
+            "2nd-order should rank 9 at least as high as 1st-order: \
+             1st={preds1:?} 2nd={preds2:?}"
+        );
+    }
+
+    #[test]
+    fn observe_step2_falls_back_to_first_order_when_prev_prev_empty() {
+        let p = PredictiveLoader::new(8, 2, 0.0, 1);
+        // Empty prev_prev means we only get 1st-order observations.
+        p.observe_step2(&[], &[1], &[3]);
+        let preds = p.predict_next(1);
+        assert_eq!(preds[0].0, 3);
     }
 }

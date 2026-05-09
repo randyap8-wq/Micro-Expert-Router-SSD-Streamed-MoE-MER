@@ -16,11 +16,14 @@
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::inference::{
-    combine_outputs, run_inference, synth_hidden_state, HiddenState, InferenceOutput,
+    combine_outputs, run_inference, run_inference_f16, run_inference_partial, synth_hidden_state,
+    HiddenState, InferenceOutput, WeightDtype,
 };
 use crate::io_provider::NvmeStorage;
 use crate::router::{PredictiveLoader, TopKRouter};
 use hdrhistogram::Histogram;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,13 +65,35 @@ pub struct ModelShape {
 /// The defaults model a normal end-to-end run (router → I/O → SwiGLU
 /// FFN); `io_only` flips off the FFN compute so the same instrumentation
 /// can be used to measure pure I/O cost.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct EngineOptions {
     /// When `true`, skip [`run_inference`] and instead XOR every byte of
     /// the resident buffer to force the read to fully materialise. This
     /// isolates the SSD-streaming cost from FFN compute and is what
     /// `--io-only` on the CLI maps to.
     pub io_only: bool,
+    /// On-disk weight dtype. Selects which of the `run_inference*`
+    /// variants is dispatched per cache hit.
+    pub dtype: WeightDtype,
+    /// Fraction of `d_model` columns to load when the partial-load path
+    /// is enabled (`(0.1..1.0)`). `1.0` disables partial loading and
+    /// the engine reads the full expert as before.
+    pub partial_load_fraction: f64,
+    /// After an expert has been observed this many times in routing
+    /// targets, pin it permanently in the LRU cache. `0` disables
+    /// frequency-based pinning entirely.
+    pub pin_after_observations: u64,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            io_only: false,
+            dtype: WeightDtype::F32,
+            partial_load_fraction: 1.0,
+            pin_after_observations: 0,
+        }
+    }
 }
 
 pub struct Engine {
@@ -99,6 +124,24 @@ pub struct Engine {
     /// Number of tokens processed (i.e. `Engine::generate` calls).
     tokens_processed: AtomicU64,
     last_experts: parking_lot::Mutex<Vec<u32>>,
+    /// Set of experts active two tokens ago — fed to the predictor's
+    /// 2nd-order rows so prefetch decisions condition on the
+    /// `(prev_prev, prev)` pair when one is available.
+    last_last_experts: parking_lot::Mutex<Vec<u32>>,
+    /// Per-expert routing-observation counts used by frequency-based
+    /// pinning. Once an expert's count crosses
+    /// `options.pin_after_observations`, the engine asks the cache to
+    /// pin it.
+    route_observations: RwLock<HashMap<u32, u64>>,
+    /// Optional alias map: when present, any routed/predicted expert id
+    /// is remapped to its canonical id before the cache is consulted.
+    /// Used for **expert deduplication** — pairs of experts that the
+    /// offline analyser flagged as numerically near-identical share a
+    /// single resident copy. `None` means no aliasing.
+    alias_map: Option<Arc<HashMap<u32, u32>>>,
+    /// Number of times an alias redirect actually changed an expert id
+    /// during routing/prefetch (for diagnostics).
+    alias_redirects: AtomicU64,
 }
 
 impl Engine {
@@ -148,7 +191,40 @@ impl Engine {
             total_cycle_us: AtomicU64::new(0),
             tokens_processed: AtomicU64::new(0),
             last_experts: parking_lot::Mutex::new(Vec::new()),
+            last_last_experts: parking_lot::Mutex::new(Vec::new()),
+            route_observations: RwLock::new(HashMap::new()),
+            alias_map: None,
+            alias_redirects: AtomicU64::new(0),
         }
+    }
+
+    /// Install an alias map. Calls to [`Self::generate`] / prefetch will
+    /// remap ids through it before consulting the cache, so multiple
+    /// near-identical experts share a single resident copy.
+    pub fn with_alias_map(mut self, map: HashMap<u32, u32>) -> Self {
+        // Keep only entries that actually move ids. Self-aliases are noise.
+        let cleaned: HashMap<u32, u32> = map.into_iter().filter(|(k, v)| k != v).collect();
+        self.alias_map = if cleaned.is_empty() {
+            None
+        } else {
+            Some(Arc::new(cleaned))
+        };
+        self
+    }
+
+    /// Resolve an id through the alias map (if any), bumping the
+    /// redirect counter on a hit. Pure function on `&self`; safe to
+    /// call from any context.
+    fn resolve_alias(&self, id: u32) -> u32 {
+        if let Some(m) = &self.alias_map {
+            if let Some(&canon) = m.get(&id) {
+                if canon != id {
+                    self.alias_redirects.fetch_add(1, Ordering::Relaxed);
+                    return canon;
+                }
+            }
+        }
+        id
     }
 
     pub fn shape(&self) -> ModelShape {
@@ -159,8 +235,27 @@ impl Engine {
     /// update predictor, and kick off prefetches. Returns one [`CycleStats`].
     pub async fn generate(self: &Arc<Self>, token_idx: u64) -> CycleStats {
         let cycle_start = Instant::now();
-        let target = self.router.route(token_idx);
+        let raw_target = self.router.route(token_idx);
+        // Resolve aliases up front so the cache + predictor only ever
+        // see canonical expert ids. This is what makes deduplicated
+        // experts share one resident copy.
+        let target: Vec<u32> = raw_target.iter().map(|&id| self.resolve_alias(id)).collect();
         let mut stats = CycleStats::default();
+
+        // Frequency-based pinning: bump observation counts and ask the
+        // cache to pin any id that crossed the threshold this token.
+        if self.options.pin_after_observations > 0 {
+            let mut obs = self.route_observations.write();
+            let threshold = self.options.pin_after_observations;
+            for &id in &target {
+                let entry = obs.entry(id).or_insert(0);
+                *entry += 1;
+                if *entry == threshold {
+                    debug!(expert = id, count = *entry, "pinning hot expert");
+                    self.cache.pin(id);
+                }
+            }
+        }
 
         // 1) Make sure every required expert is resident.
         //
@@ -263,15 +358,16 @@ impl Engine {
             let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
             let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
             for r in &residents {
-                match run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff) {
+                let res = match self.options.dtype {
+                    WeightDtype::F32 => run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::F16 => run_inference_f16(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
+                };
+                match res {
                     Ok((out, y)) => {
                         outputs.push(out);
                         per_expert_y.push(y);
                     }
                     Err(e) => {
-                        // The on-disk file is truncated / corrupt or violates
-                        // an alignment invariant. Log and skip this expert
-                        // rather than aborting the whole token cycle / run.
                         warn!(
                             token = token_idx,
                             expert = r.id,
@@ -298,20 +394,35 @@ impl Engine {
         self.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
 
         // 3) Update predictor with the observed transition.
+        //    Use the 2nd-order helper when we have a `prev_prev` set
+        //    (anything from token_idx >= 2), so the predictor learns
+        //    `(prev_prev -> prev -> next)` triples in addition to the
+        //    `(prev -> next)` baseline.
         {
             let mut last = self.last_experts.lock();
+            let mut last_last = self.last_last_experts.lock();
             if !last.is_empty() {
-                self.predictor.observe_step(&last, &target);
+                self.predictor.observe_step2(&last_last, &last, &target);
             }
+            *last_last = last.clone();
             *last = target.clone();
         }
 
-        // 4) Kick off speculative prefetches for the most-recent expert.
+        // 4) Kick off speculative prefetches for the most-recent expert,
+        //    using the 2nd-order predictor when a prev_prev is available
+        //    (which gives sharper distributions than 1st-order alone and
+        //    therefore wastes less prefetch bandwidth).
         if let Some(&seed) = target.last() {
-            let preds = self.predictor.predict_next(seed);
+            let last_last = self.last_last_experts.lock();
+            let preds = match last_last.last() {
+                Some(&pp) => self.predictor.predict_next2(pp, seed),
+                None => self.predictor.predict_next(seed),
+            };
+            drop(last_last);
             for (id, p) in preds {
-                if !self.cache.contains(id) {
-                    self.spawn_prefetch(id, p);
+                let canon = self.resolve_alias(id);
+                if !self.cache.contains(canon) {
+                    self.spawn_prefetch(canon, p);
                 }
             }
         }
@@ -477,6 +588,10 @@ impl Engine {
             total_cycle_us,
             pct_time_io,
             io_only: self.options.io_only,
+            pinned_count: self.cache.pinned_count(),
+            alias_redirects: self.alias_redirects.load(Ordering::Relaxed),
+            dtype: self.options.dtype,
+            partial_load_fraction: self.options.partial_load_fraction,
         }
     }
 
@@ -494,10 +609,11 @@ impl Engine {
             r.num_experts, r.top_k, r.cache_capacity, r.pool_capacity
         );
         info!(
-            "ffn shape:     d_model={}  d_ff={}  bytes/expert={}",
+            "ffn shape:     d_model={}  d_ff={}  bytes/expert={} (dtype={})",
             r.d_model,
             r.d_ff,
-            crate::inference::expert_weight_bytes(r.d_model, r.d_ff)
+            crate::inference::expert_weight_bytes_for(r.d_model, r.d_ff, r.dtype),
+            r.dtype.as_str()
         );
         info!(
             "lookups:       hits={}  misses={}  hit_rate={:.2}%",
@@ -534,6 +650,13 @@ impl Engine {
         info!(
             "I/O share:     {:.2}% of token cycle time spent waiting on SSD reads",
             r.pct_time_io
+        );
+        info!(
+            "energy knobs:  dtype={}  partial_load_fraction={:.2}  pinned={}  alias_redirects={}",
+            r.dtype.as_str(),
+            r.partial_load_fraction,
+            r.pinned_count,
+            r.alias_redirects
         );
         info!("=======================================================");
     }
@@ -581,6 +704,17 @@ pub struct EngineReport {
     pub pct_time_io: f64,
     /// Whether this run was executed in `--io-only` mode (FFN skipped).
     pub io_only: bool,
+    /// Number of experts currently pinned in the LRU cache (Change 5:
+    /// frequency-based pinning).
+    pub pinned_count: usize,
+    /// Number of times an alias map redirected an expert id to a
+    /// canonical id (Change 6: expert deduplication). Each redirect is
+    /// one cache lookup that targeted a deduplicated copy.
+    pub alias_redirects: u64,
+    /// On-disk weight dtype used by this engine instance (Change 1).
+    pub dtype: WeightDtype,
+    /// Partial-load fraction used by this engine instance (Change 3).
+    pub partial_load_fraction: f64,
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub use crate::inference::WeightDtype;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// HTTP bind address, e.g. `127.0.0.1:8080`.
@@ -48,7 +50,16 @@ pub struct ModelConfig {
     /// 32 for full Mixtral).
     #[serde(default = "default_num_layers")]
     pub num_layers: usize,
+
+    /// On-disk weight dtype. `f32` (default) reinterprets bytes as
+    /// `&[f32]` directly; `f16` halves bytes-per-parameter (and hence
+    /// SSD read energy) at the cost of a small dequantisation step on
+    /// every fetch.
+    #[serde(default = "default_dtype")]
+    pub dtype: WeightDtype,
 }
+
+fn default_dtype() -> WeightDtype { WeightDtype::F32 }
 
 fn default_top_k() -> usize { 2 }
 fn default_num_layers() -> usize { 1 }
@@ -74,7 +85,24 @@ pub struct StorageConfigToml {
     /// Don't prefetch below this transition probability.
     #[serde(default = "default_predict_min_prob")]
     pub predict_min_prob: f64,
+
+    /// Fraction of input dimensions to load per expert when partial
+    /// column loading is enabled. `1.0` (default) loads every column
+    /// (legacy behaviour); values in `[0.1, 1.0)` load only the top-M
+    /// columns of `x` by absolute magnitude, reducing bytes read per
+    /// miss in proportion to the chosen fraction.
+    #[serde(default = "default_partial_load_fraction")]
+    pub partial_load_fraction: f64,
+
+    /// After an expert has been observed as a routing destination this
+    /// many times, pin it permanently in the LRU cache so it is never
+    /// evicted by cold experts. `0` (default) disables pinning.
+    #[serde(default = "default_pin_after_observations")]
+    pub pin_after_observations: u64,
 }
+
+fn default_partial_load_fraction() -> f64 { 1.0 }
+fn default_pin_after_observations() -> u64 { 0 }
 
 fn default_cache_slots() -> usize { 4 }
 fn default_block_align() -> usize { 4096 }
@@ -146,6 +174,12 @@ impl Config {
         if self.server.max_tokens == 0 {
             return Err(ConfigError::Invalid("server.max_tokens must be > 0".into()));
         }
+        if !(0.1..=1.0).contains(&self.storage.partial_load_fraction) {
+            return Err(ConfigError::Invalid(format!(
+                "storage.partial_load_fraction ({}) must be in [0.1, 1.0]",
+                self.storage.partial_load_fraction
+            )));
+        }
         Ok(())
     }
 }
@@ -184,6 +218,7 @@ mod tests {
                 d_ff: 256,
                 expert_size: 4096,
                 num_layers: 1,
+                dtype: WeightDtype::F32,
             },
             storage: StorageConfigToml {
                 cache_slots: 4,
@@ -191,6 +226,8 @@ mod tests {
                 no_direct: false,
                 predict_fanout: 2,
                 predict_min_prob: 0.05,
+                partial_load_fraction: 1.0,
+                pin_after_observations: 0,
             },
             tokenizer: TokenizerConfig::default(),
         }
