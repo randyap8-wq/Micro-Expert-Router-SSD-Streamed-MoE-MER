@@ -88,7 +88,11 @@ impl LinearGate {
         // simple `O(N log N)` sort is fine — the cost is dwarfed by the
         // expert FFN matmul, never mind by the SSD read.
         let mut idx: Vec<u32> = (0..self.num_experts as u32).collect();
-        idx.sort_by(|&a, &b| logits[b as usize].partial_cmp(&logits[a as usize]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.sort_by(|&a, &b| {
+            logits[b as usize]
+                .partial_cmp(&logits[a as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         idx.truncate(self.top_k);
         let mut weights: Vec<f32> = idx.iter().map(|&i| logits[i as usize]).collect();
         if self.normalise_topk {

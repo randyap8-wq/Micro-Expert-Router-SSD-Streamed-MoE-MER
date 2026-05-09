@@ -342,12 +342,18 @@ async fn generate(
 fn rand_request_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    // 2^64 / phi — the standard "golden ratio" odd multiplier used by
+    // Knuth's multiplicative hash (also used in Java's HashMap and
+    // Linux's hash_64). Mixes the per-call counter into the high bits
+    // before XORing with the wall clock so two requests issued in the
+    // same nanosecond still get distinct ids.
+    const GOLDEN_RATIO_U64: u64 = 0x9E3779B97F4A7C15;
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    nanos ^ n.wrapping_mul(0x9E3779B97F4A7C15)
+    nanos ^ n.wrapping_mul(GOLDEN_RATIO_U64)
 }
 
 #[derive(Serialize)]

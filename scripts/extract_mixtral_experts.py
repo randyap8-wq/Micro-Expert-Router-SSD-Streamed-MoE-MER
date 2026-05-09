@@ -273,6 +273,9 @@ def main() -> int:
             written += 1
             if written % 8 == 0:
                 print(f"  wrote layer {layer} expert {expert_id} -> {path}", file=sys.stderr)
+    # Always log the final write so the user sees a clean tail line even
+    # when `written` isn't a multiple of 8 (e.g. with `--limit`).
+    print(f"  finished writing {written} expert file(s)", file=sys.stderr)
 
     metadata = {
         "model": args.model,
