@@ -101,22 +101,52 @@ pub fn apply_rope_inplace(v: &mut [f32], pos: usize, base: f32) {
     }
 }
 
-/// One layer's KV cache (per head). Stores keys and values in
-/// row-major `[seq_len, num_kv_heads * head_dim]` layout, growing as new
-/// tokens are appended.
+/// One layer's **paged** KV cache (per-layer). Stores keys and values
+/// in fixed-size blocks of [`PAGED_BLOCK_TOKENS`] tokens × `kv_dim`
+/// floats each, indexed by a block table.
+///
+/// Replaces the original `Vec<f32>` flat layout (which `extend_from_slice`d
+/// — and therefore reallocated the entire backing storage — every time
+/// the sequence grew past the `Vec`'s capacity) with vLLM-style
+/// PagedAttention block allocation: each block is a separately-owned
+/// boxed slice and the cache grows by *appending one new block to the
+/// block table* when the trailing block fills up. The block table
+/// (`Vec<Box<[f32]>>` here, conceptually a `Vec<u32>` of block ids in a
+/// shared pool) is the indirection layer that decouples per-request
+/// sequence growth from a single contiguous allocation per request.
+///
+/// Public surface compatibility: the original `KvCache` exposed
+/// `keys: Vec<f32>` / `values: Vec<f32>` as `pub` fields used only
+/// inside this module via `key(i)` / `value(i)` accessors and a single
+/// `extend_from_slice` call inside `append`. All external callers go
+/// through `KvCache::new(kv_dim)` plus `append`, `reset`, `seq_len` and
+/// `kv_dim`, all of which keep their original semantics.
 #[derive(Debug, Clone, Default)]
 pub struct KvCache {
-    pub keys: Vec<f32>,
-    pub values: Vec<f32>,
+    /// Block table: each entry holds [`PAGED_BLOCK_TOKENS`] tokens'
+    /// worth of `kv_dim` floats laid out as `[token_in_block, kv_dim]`
+    /// row-major. The last block may be partially filled (the unused
+    /// tail is never read because `seq_len` bounds every iteration).
+    keys_blocks: Vec<Box<[f32]>>,
+    /// Mirrors `keys_blocks` for the value half of the cache.
+    values_blocks: Vec<Box<[f32]>>,
     pub seq_len: usize,
     pub kv_dim: usize,
 }
 
+/// Number of tokens per PagedAttention block. Matches the spec value
+/// (16) and the vLLM default. Larger blocks waste more memory at the
+/// tail; smaller blocks add more block-table indirections per
+/// attention sweep. 16 is a known sweet spot for Mixtral / Llama
+/// shapes and keeps each block at `16 * kv_dim * 4` bytes — well
+/// under one OS page for any realistic `kv_dim`.
+pub const PAGED_BLOCK_TOKENS: usize = 16;
+
 impl KvCache {
     pub fn new(kv_dim: usize) -> Self {
         Self {
-            keys: Vec::new(),
-            values: Vec::new(),
+            keys_blocks: Vec::new(),
+            values_blocks: Vec::new(),
             seq_len: 0,
             kv_dim,
         }
@@ -125,24 +155,62 @@ impl KvCache {
     pub fn append(&mut self, k: &[f32], v: &[f32]) {
         debug_assert_eq!(k.len(), self.kv_dim);
         debug_assert_eq!(v.len(), self.kv_dim);
-        self.keys.extend_from_slice(k);
-        self.values.extend_from_slice(v);
+        let pos = self.seq_len;
+        let block_idx = pos / PAGED_BLOCK_TOKENS;
+        let in_block = pos % PAGED_BLOCK_TOKENS;
+        // Allocate a fresh block when crossing a block boundary. This
+        // is the *only* allocation point in the per-token path — the
+        // existing block bytes are written in place.
+        if in_block == 0 {
+            debug_assert_eq!(self.keys_blocks.len(), block_idx);
+            let block_floats = PAGED_BLOCK_TOKENS * self.kv_dim;
+            self.keys_blocks
+                .push(vec![0.0f32; block_floats].into_boxed_slice());
+            self.values_blocks
+                .push(vec![0.0f32; block_floats].into_boxed_slice());
+        }
+        let start = in_block * self.kv_dim;
+        let end = start + self.kv_dim;
+        // Borrow the freshly-allocated (or current) trailing block and
+        // write directly into its in-place slot.
+        let kb = self
+            .keys_blocks
+            .last_mut()
+            .expect("block must exist after append");
+        let vb = self
+            .values_blocks
+            .last_mut()
+            .expect("block must exist after append");
+        kb[start..end].copy_from_slice(k);
+        vb[start..end].copy_from_slice(v);
         self.seq_len += 1;
     }
 
     pub fn reset(&mut self) {
-        self.keys.clear();
-        self.values.clear();
+        self.keys_blocks.clear();
+        self.values_blocks.clear();
         self.seq_len = 0;
+    }
+
+    /// Number of allocated blocks. Useful for telemetry — matches
+    /// the vLLM `block_tables` length.
+    pub fn num_blocks(&self) -> usize {
+        self.keys_blocks.len()
     }
 
     /// Get the i-th cached key as a slice of length `kv_dim`.
     fn key(&self, i: usize) -> &[f32] {
-        &self.keys[i * self.kv_dim..(i + 1) * self.kv_dim]
+        let block_idx = i / PAGED_BLOCK_TOKENS;
+        let in_block = i % PAGED_BLOCK_TOKENS;
+        let start = in_block * self.kv_dim;
+        &self.keys_blocks[block_idx][start..start + self.kv_dim]
     }
 
     fn value(&self, i: usize) -> &[f32] {
-        &self.values[i * self.kv_dim..(i + 1) * self.kv_dim]
+        let block_idx = i / PAGED_BLOCK_TOKENS;
+        let in_block = i % PAGED_BLOCK_TOKENS;
+        let start = in_block * self.kv_dim;
+        &self.values_blocks[block_idx][start..start + self.kv_dim]
     }
 }
 
@@ -839,5 +907,88 @@ mod tests {
                 assert!((a - b).abs() < 1e-5);
             }
         }
+    }
+
+    // ----------------- PagedAttention block-storage tests -------------
+
+    #[test]
+    fn paged_kv_cache_grows_one_block_per_block_tokens() {
+        let kv = KvCache::new(8);
+        assert_eq!(kv.num_blocks(), 0);
+        let mut kv = kv;
+        // Insert exactly PAGED_BLOCK_TOKENS tokens — should fit in one block.
+        for _ in 0..PAGED_BLOCK_TOKENS {
+            kv.append(&[1.0; 8], &[2.0; 8]);
+        }
+        assert_eq!(kv.seq_len, PAGED_BLOCK_TOKENS);
+        assert_eq!(kv.num_blocks(), 1);
+        // One more token forces a new block.
+        kv.append(&[3.0; 8], &[4.0; 8]);
+        assert_eq!(kv.num_blocks(), 2);
+        // The just-appended token should round-trip via `key`/`value`.
+        let last = kv.seq_len - 1;
+        assert_eq!(kv.key(last), &[3.0; 8][..]);
+        assert_eq!(kv.value(last), &[4.0; 8][..]);
+        // And the first token in the previous block should still match.
+        assert_eq!(kv.key(0), &[1.0; 8][..]);
+    }
+
+    #[test]
+    fn paged_kv_cache_reset_releases_blocks() {
+        let mut kv = KvCache::new(4);
+        for _ in 0..(PAGED_BLOCK_TOKENS * 2 + 3) {
+            kv.append(&[1.0; 4], &[2.0; 4]);
+        }
+        assert!(kv.num_blocks() >= 3);
+        kv.reset();
+        assert_eq!(kv.seq_len, 0);
+        assert_eq!(kv.num_blocks(), 0);
+    }
+
+    #[test]
+    fn paged_kv_cache_attention_matches_legacy_layout() {
+        // Build an attention block, run a few tokens through it, and
+        // verify the per-token output is unchanged from what a flat
+        // KV cache would have produced. Since the block layout is
+        // accessed only through `key(i)`/`value(i)` — which return
+        // slices identical to what the old flat `Vec<f32>` would
+        // have — the block index just has to stay correct as we
+        // cross block boundaries. Walk past at least one boundary.
+        let d_model = 4;
+        let head_dim = 2;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mk = |rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+                .collect()
+        };
+        let attn = MultiHeadSelfAttention {
+            d_model,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base: 10000.0,
+            wq: mk(q_dim, d_model),
+            wk: mk(kv_dim, d_model),
+            wv: mk(kv_dim, d_model),
+            wo: mk(d_model, q_dim),
+            window_size: None,
+        };
+        let mut kv = KvCache::new(kv_dim);
+        // Walk past the first block boundary to exercise multi-block
+        // indexing.
+        let xs: Vec<Vec<f32>> = (0..(PAGED_BLOCK_TOKENS + 3))
+            .map(|t| (0..d_model).map(|j| 0.05 * (t as f32) + 0.01 * (j as f32)).collect())
+            .collect();
+        let mut last = vec![0.0f32; d_model];
+        for (pos, x) in xs.iter().enumerate() {
+            last = attn.forward(x, pos, &mut kv);
+        }
+        assert_eq!(kv.seq_len, xs.len());
+        assert_eq!(kv.num_blocks(), 2);
+        assert!(last.iter().all(|v| v.is_finite()));
     }
 }

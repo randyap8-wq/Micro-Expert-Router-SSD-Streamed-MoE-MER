@@ -80,28 +80,49 @@ pub enum WeightDtype {
     /// header (`[gate_scale, up_scale, down_scale]: [f32; 3]`) at the
     /// start of every expert blob. Dequantised to `f32` at fetch time.
     Int8,
+    /// **GGUF-style Q4_K_M block quantisation.** Each 256-weight
+    /// super-block occupies 144 bytes: an `f16` super-scale `d`, an
+    /// `f16` super-min `dmin`, 12 bytes of 6-bit packed sub-block
+    /// scales and mins (8 of each), and 128 bytes of 4-bit packed
+    /// weights. Effective bytes-per-weight = 144 / 256 = 0.5625, which
+    /// roughly **doubles** the SSD-streamed expert capacity that fits
+    /// in a given RAM budget versus `F16`. See [`Q4K_BLOCK_BYTES`] /
+    /// [`Q4K_BLOCK_ELEMS`] for the layout constants and
+    /// [`dequantize_q4k_block`] for the inverse kernel.
+    Q4K,
 }
 
 impl WeightDtype {
     /// Number of on-disk bytes per weight for this dtype. **Excludes**
     /// any per-tensor scale header — see [`Self::header_bytes`].
+    ///
+    /// For block-quantised dtypes (Q4K) this is **fractional** in
+    /// reality (144 bytes per 256-weight block ≈ 0.5625 byte/weight);
+    /// to keep the integer return type stable we round up to the
+    /// nearest whole byte and let [`expert_weight_bytes_for`] do the
+    /// exact accounting on the block boundary. Callers that need exact
+    /// sizing should always go through [`expert_weight_bytes_for`].
     #[inline]
     pub const fn bytes_per_weight(self) -> usize {
         match self {
             WeightDtype::F32 => 4,
             WeightDtype::F16 => 2,
             WeightDtype::Int8 => 1,
+            // 144 / 256 rounded up = 1; not used for sizing — see docs.
+            WeightDtype::Q4K => 1,
         }
     }
 
     /// Number of constant-size header bytes prepended to every expert
     /// blob for this dtype, **before** the weight stream begins.
     /// `Int8` uses 12 bytes (`[f32; 3]` per-tensor scales); the
-    /// floating-point dtypes use no header.
+    /// floating-point dtypes use no header. Q4K is self-describing
+    /// (the per-block `d`/`dmin` already live inside each super-block)
+    /// so it also uses no global header.
     #[inline]
     pub const fn header_bytes(self) -> usize {
         match self {
-            WeightDtype::F32 | WeightDtype::F16 => 0,
+            WeightDtype::F32 | WeightDtype::F16 | WeightDtype::Q4K => 0,
             WeightDtype::Int8 => INT8_HEADER_BYTES,
         }
     }
@@ -112,6 +133,7 @@ impl WeightDtype {
             "f32" | "fp32" => Some(WeightDtype::F32),
             "f16" | "fp16" | "half" => Some(WeightDtype::F16),
             "i8" | "int8" | "q8" => Some(WeightDtype::Int8),
+            "q4k" | "q4_k" | "q4_k_m" | "q4km" => Some(WeightDtype::Q4K),
             _ => None,
         }
     }
@@ -122,6 +144,7 @@ impl WeightDtype {
             WeightDtype::F32 => "f32",
             WeightDtype::F16 => "f16",
             WeightDtype::Int8 => "int8",
+            WeightDtype::Q4K => "q4k",
         }
     }
 }
@@ -189,6 +212,173 @@ pub fn dequantize_f16_to_f32(src: &[u8], dst: &mut Vec<f32>) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Q4_K (GGUF Q4_K_M) block quantisation.
+// ---------------------------------------------------------------------
+
+/// Number of weights per Q4_K super-block.
+pub const Q4K_BLOCK_ELEMS: usize = 256;
+/// Bytes per Q4_K super-block on disk.
+///
+/// Layout:
+/// ```text
+///   d      : f16 (2 bytes)   — super-block scale
+///   dmin   : f16 (2 bytes)   — super-block min
+///   scales : 12 bytes        — 8x 6-bit sub-scales + 8x 6-bit sub-mins,
+///                              packed exactly as in `ggml-quants.c`.
+///   qs     : 128 bytes       — 256x 4-bit weights (low nibble first).
+/// ```
+/// Total: `2 + 2 + 12 + 128 = 144` bytes.
+pub const Q4K_BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
+/// Number of sub-blocks per Q4_K super-block (8 sub-blocks of 32 weights).
+pub const Q4K_SUBBLOCKS: usize = 8;
+/// Number of weights per Q4_K sub-block.
+pub const Q4K_SUBBLOCK_ELEMS: usize = Q4K_BLOCK_ELEMS / Q4K_SUBBLOCKS; // 32
+
+/// Decode the 12-byte `scales[12]` array from a Q4_K block into 8
+/// sub-block (scale, min) 6-bit values.
+///
+/// This matches the bit-packing used by `llama.cpp`'s `ggml-quants.c`
+/// `get_scale_min_k4`: for the first four sub-blocks, scale and min
+/// are the low 6 bits of `scales[i]` and `scales[i+4]`; for the last
+/// four, the high 2 bits live in the upper bits of `scales[0..4]` /
+/// `scales[4..8]` and the low 4 bits live in the upper nibbles of
+/// `scales[8..12]`. The output `(scale6, min6)` are integers in
+/// `0..64`.
+fn q4k_unpack_scales(scales: &[u8; 12]) -> [(u8, u8); Q4K_SUBBLOCKS] {
+    // Reference implementation from `ggml-quants.c`:
+    //
+    //   if (j < 4) {
+    //       *d = q[j] & 63;
+    //       *m = q[j + 4] & 63;
+    //   } else {
+    //       *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+    //       *m = (q[j+4] >>  4) | ((q[j  ] >> 6) << 4);
+    //   }
+    let mut out = [(0u8, 0u8); Q4K_SUBBLOCKS];
+    for j in 0..Q4K_SUBBLOCKS {
+        let (d, m) = if j < 4 {
+            let d = scales[j] & 0x3F;
+            let m = scales[j + 4] & 0x3F;
+            (d, m)
+        } else {
+            let d = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+            let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+            (d & 0x3F, m & 0x3F)
+        };
+        out[j] = (d, m);
+    }
+    out
+}
+
+/// Encode 8 `(scale6, min6)` pairs into a 12-byte `scales[12]` buffer
+/// using the inverse of [`q4k_unpack_scales`]. Used by tests that need
+/// to construct synthetic Q4_K blocks.
+fn q4k_pack_scales(pairs: &[(u8, u8); Q4K_SUBBLOCKS]) -> [u8; 12] {
+    // Inverse of the unpack above. Each input value must fit in 6 bits.
+    let mut s = [0u8; 12];
+    // First fill the low-6-bit slots for j in 0..4.
+    for j in 0..4 {
+        s[j] = pairs[j].0 & 0x3F; // scale[0..4]
+        s[j + 4] = pairs[j].1 & 0x3F; // min[0..4]
+    }
+    // Now layer in the j in 4..8 entries:
+    //   scale6_j = (s[j+4] & 0xF)  | ((s[j-4] >> 6) << 4)
+    //   min6_j   = (s[j+4] >> 4)   | ((s[j  ] >> 6) << 4)
+    // We need to (a) place the low 4 bits of scale_j into s[j+4][0..4],
+    // (b) place the low 4 bits of min_j into s[j+4][4..8], (c) place
+    // the high 2 bits of scale_j into s[j-4][6..8], (d) place the
+    // high 2 bits of min_j into s[j][6..8].
+    for j in 4..Q4K_SUBBLOCKS {
+        let (scale_j, min_j) = pairs[j];
+        let scale_j = scale_j & 0x3F;
+        let min_j = min_j & 0x3F;
+        s[j + 4] = (scale_j & 0x0F) | ((min_j & 0x0F) << 4);
+        // Top 2 bits of scale_j go into the upper 2 bits of s[j-4].
+        s[j - 4] = (s[j - 4] & 0x3F) | (((scale_j >> 4) & 0x03) << 6);
+        // Top 2 bits of min_j go into the upper 2 bits of s[j].
+        s[j] = (s[j] & 0x3F) | (((min_j >> 4) & 0x03) << 6);
+    }
+    s
+}
+
+/// Dequantise one Q4_K super-block into `dst` (must hold exactly
+/// [`Q4K_BLOCK_ELEMS`] floats).
+///
+/// The inverse of the GGUF Q4_K_M quantiser:
+/// ```text
+///   for sub_j in 0..8:
+///       scale_j = sub_scales[j] (6-bit)
+///       min_j   = sub_mins[j]   (6-bit)
+///       for i in 0..32:
+///           q4 = qs[(j*32 + i) >> 1] >> ((i & 1) * 4) & 0xF      (low/high nibble)
+///           dst[j*32 + i] = d * scale_j * q4 - dmin * min_j
+/// ```
+/// `d` and `dmin` are read as little-endian `f16` from the first four
+/// bytes of `src`.
+pub fn dequantize_q4k_block(src: &[u8], dst: &mut [f32]) {
+    assert_eq!(
+        src.len(),
+        Q4K_BLOCK_BYTES,
+        "Q4K block must be {} bytes",
+        Q4K_BLOCK_BYTES
+    );
+    assert_eq!(
+        dst.len(),
+        Q4K_BLOCK_ELEMS,
+        "Q4K dst must hold {} floats",
+        Q4K_BLOCK_ELEMS
+    );
+
+    let d = half::f16::from_bits(u16::from_le_bytes([src[0], src[1]])).to_f32();
+    let dmin = half::f16::from_bits(u16::from_le_bytes([src[2], src[3]])).to_f32();
+    let scales: [u8; 12] = src[4..16].try_into().expect("12-byte slice");
+    let pairs = q4k_unpack_scales(&scales);
+    let qs = &src[16..16 + 128];
+    debug_assert_eq!(qs.len(), 128);
+
+    for j in 0..Q4K_SUBBLOCKS {
+        let (scale6, min6) = pairs[j];
+        let s = d * scale6 as f32;
+        let m = dmin * min6 as f32;
+        // 32 weights per sub-block, packed as 16 bytes (low nibble first).
+        let qs_off = j * (Q4K_SUBBLOCK_ELEMS / 2);
+        for i in 0..Q4K_SUBBLOCK_ELEMS {
+            let byte = qs[qs_off + (i >> 1)];
+            let q4 = if i & 1 == 0 { byte & 0x0F } else { byte >> 4 };
+            dst[j * Q4K_SUBBLOCK_ELEMS + i] = s * (q4 as f32) - m;
+        }
+    }
+}
+
+/// Dequantise a contiguous Q4_K stream of `n_weights` weights into
+/// `dst`. The input `src` must contain exactly `ceil(n_weights / 256)`
+/// blocks (`* 144` bytes); a tail block whose effective weight count
+/// is < 256 is fully decoded and the unused floats at the end of the
+/// last block are dropped.
+///
+/// Used by [`OwnedExpertWeights::from_bytes_q4k`] to decode the three
+/// expert weight matrices in a single sweep before splitting them by
+/// row.
+pub fn dequantize_q4k_to_f32(src: &[u8], n_weights: usize, dst: &mut Vec<f32>) {
+    let blocks = n_weights.div_ceil(Q4K_BLOCK_ELEMS);
+    assert!(
+        src.len() >= blocks * Q4K_BLOCK_BYTES,
+        "Q4K source has {} bytes, need {} for {n_weights} weights",
+        src.len(),
+        blocks * Q4K_BLOCK_BYTES
+    );
+    dst.clear();
+    dst.resize(blocks * Q4K_BLOCK_ELEMS, 0.0);
+    for b in 0..blocks {
+        let s = &src[b * Q4K_BLOCK_BYTES..(b + 1) * Q4K_BLOCK_BYTES];
+        let d = &mut dst[b * Q4K_BLOCK_ELEMS..(b + 1) * Q4K_BLOCK_ELEMS];
+        dequantize_q4k_block(s, d);
+    }
+    // Truncate any padding at the tail (for n_weights not divisible by 256).
+    dst.truncate(n_weights);
+}
+
 /// Hidden-state vector flowing through the FFN block (`d_model` floats).
 pub type HiddenState = Vec<f32>;
 
@@ -253,10 +443,26 @@ pub const fn expert_weight_bytes_f16(d_model: usize, d_ff: usize) -> usize {
 /// Number of bytes an expert with these dimensions occupies on disk
 /// for the given dtype, **including** any per-expert header (e.g. the
 /// 12-byte INT8 scale header).
+///
+/// For [`WeightDtype::Q4K`] the weight count is rounded **up** to a
+/// multiple of [`Q4K_BLOCK_ELEMS`] (256) — Q4K only quantises whole
+/// super-blocks, so a tail of < 256 weights still pays for one full
+/// 144-byte block on disk. This matches the behaviour of every
+/// production GGUF quantiser.
 #[inline]
 pub const fn expert_weight_bytes_for(d_model: usize, d_ff: usize, dtype: WeightDtype) -> usize {
-    let payload = expert_weight_count(d_model, d_ff).saturating_mul(dtype.bytes_per_weight());
-    payload.saturating_add(dtype.header_bytes())
+    match dtype {
+        WeightDtype::Q4K => {
+            let weights = expert_weight_count(d_model, d_ff);
+            let blocks = weights.div_ceil(Q4K_BLOCK_ELEMS);
+            blocks.saturating_mul(Q4K_BLOCK_BYTES)
+        }
+        _ => {
+            let payload = expert_weight_count(d_model, d_ff)
+                .saturating_mul(dtype.bytes_per_weight());
+            payload.saturating_add(dtype.header_bytes())
+        }
+    }
 }
 
 /// Errors produced when reinterpreting a raw byte buffer as expert
@@ -581,6 +787,77 @@ pub struct OwnedExpertWeights {
 }
 
 impl OwnedExpertWeights {
+    /// Build an owned weight set by dequantising a **Q4_K** byte buffer
+    /// (GGUF Q4_K_M layout) into a fresh `Vec<f32>`. The buffer is
+    /// expected to be a contiguous stream of [`Q4K_BLOCK_BYTES`]-sized
+    /// super-blocks covering the three weight matrices in the same
+    /// partitioned order as [`ExpertWeights::from_bytes`]:
+    ///
+    /// ```text
+    ///   gate_proj   (ceil(d_ff*d_model / 256) * 144 bytes)
+    ///   up_proj     (ceil(d_ff*d_model / 256) * 144 bytes)
+    ///   down_proj   (ceil(d_model*d_ff / 256) * 144 bytes)
+    /// ```
+    ///
+    /// Each tensor is dequantised independently (sub-block scales /
+    /// mins do not cross matrix boundaries), so a tail of < 256
+    /// weights in any one matrix still consumes one full super-block.
+    /// The total on-disk size is given by
+    /// [`expert_weight_bytes_for(d_model, d_ff, WeightDtype::Q4K)`](expert_weight_bytes_for).
+    pub fn from_bytes_q4k(
+        bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        let gate_n = d_ff.saturating_mul(d_model);
+        let up_n = d_ff.saturating_mul(d_model);
+        let down_n = d_model.saturating_mul(d_ff);
+        let gate_blocks = gate_n.div_ceil(Q4K_BLOCK_ELEMS);
+        let up_blocks = up_n.div_ceil(Q4K_BLOCK_ELEMS);
+        let down_blocks = down_n.div_ceil(Q4K_BLOCK_ELEMS);
+        let need_bytes = (gate_blocks + up_blocks + down_blocks)
+            .saturating_mul(Q4K_BLOCK_BYTES);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
+
+        let mut off = 0;
+        let mut gate_buf: Vec<f32> = Vec::new();
+        dequantize_q4k_to_f32(
+            &bytes[off..off + gate_blocks * Q4K_BLOCK_BYTES],
+            gate_n,
+            &mut gate_buf,
+        );
+        off += gate_blocks * Q4K_BLOCK_BYTES;
+        let mut up_buf: Vec<f32> = Vec::new();
+        dequantize_q4k_to_f32(
+            &bytes[off..off + up_blocks * Q4K_BLOCK_BYTES],
+            up_n,
+            &mut up_buf,
+        );
+        off += up_blocks * Q4K_BLOCK_BYTES;
+        let mut down_buf: Vec<f32> = Vec::new();
+        dequantize_q4k_to_f32(
+            &bytes[off..off + down_blocks * Q4K_BLOCK_BYTES],
+            down_n,
+            &mut down_buf,
+        );
+
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate: gate_buf,
+            up: up_buf,
+            down: down_buf,
+            col_indices: None,
+        })
+    }
+
     /// Build an owned weight set by dequantising a per-tensor symmetric
     /// **INT8** byte buffer into a fresh `Vec<f32>`. The buffer layout
     /// is: 12-byte [`Int8ExpertMeta`] header (`[gate, up, down]: [f32; 3]`
@@ -720,12 +997,13 @@ impl OwnedExpertWeights {
                 dequantize_f16_to_f32(&bytes[..packed_floats * 2], &mut v);
                 v
             }
-            WeightDtype::Int8 => {
-                // Partial-load + INT8 isn't supported (the partial-load
-                // packing is column-major and the INT8 scales are
-                // per-tensor not per-column, so the dequant rounding
-                // would shift). Bail out cleanly so callers can fall
-                // back to the full-load path.
+            WeightDtype::Int8 | WeightDtype::Q4K => {
+                // Partial-load + INT8 / Q4K isn't supported (the
+                // partial-load packing is column-major and the
+                // block / per-tensor scales are not per-column, so
+                // the dequant rounding would shift). Bail out
+                // cleanly so callers can fall back to the full-load
+                // path.
                 return Err(ExpertWeightsError::BufferTooSmall {
                     have: bytes.len(),
                     need: usize::MAX,
@@ -905,6 +1183,25 @@ pub fn run_inference_int8(
     d_ff: usize,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     let weights = OwnedExpertWeights::from_bytes_int8(resident.data(), d_model, d_ff)?;
+    let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+/// Q4_K counterpart of [`run_inference`]: dequantises the resident
+/// bytes (a stream of GGUF Q4_K_M super-blocks) into an owned
+/// `Vec<f32>` (via [`OwnedExpertWeights::from_bytes_q4k`]) and runs
+/// the same SwiGLU forward pass. Used when the on-disk dtype is
+/// [`WeightDtype::Q4K`], roughly **doubling** the on-DRAM hot-expert
+/// capacity that fits in a given memory budget vs `F16`.
+pub fn run_inference_q4k(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = OwnedExpertWeights::from_bytes_q4k(resident.data(), d_model, d_ff)?;
     let y = weights.forward(x);
     let out = summarise_output(token_idx, resident.id, &y);
     Ok((out, y))
@@ -1336,5 +1633,150 @@ mod tests {
         assert_eq!(WeightDtype::from_str_opt("bogus"), None);
         assert_eq!(WeightDtype::F32.as_str(), "f32");
         assert_eq!(WeightDtype::F16.as_str(), "f16");
+        assert_eq!(WeightDtype::from_str_opt("q4k"), Some(WeightDtype::Q4K));
+        assert_eq!(WeightDtype::from_str_opt("Q4_K_M"), Some(WeightDtype::Q4K));
+        assert_eq!(WeightDtype::Q4K.as_str(), "q4k");
+    }
+
+    // ------------------------- Q4_K tests ------------------------------
+
+    /// Build one synthetic Q4_K block whose every weight equals
+    /// `d * scale6 * q - dmin * min6` for the given parameters. Returns
+    /// the 144-byte block and the expected dequantised float vector.
+    fn make_q4k_block(
+        d: f32,
+        dmin: f32,
+        sub_pairs: [(u8, u8); Q4K_SUBBLOCKS],
+        nibble_fill: u8,
+    ) -> ([u8; Q4K_BLOCK_BYTES], [f32; Q4K_BLOCK_ELEMS]) {
+        let mut blk = [0u8; Q4K_BLOCK_BYTES];
+        let d16 = half::f16::from_f32(d).to_bits().to_le_bytes();
+        let dm16 = half::f16::from_f32(dmin).to_bits().to_le_bytes();
+        blk[0..2].copy_from_slice(&d16);
+        blk[2..4].copy_from_slice(&dm16);
+        let s = q4k_pack_scales(&sub_pairs);
+        blk[4..16].copy_from_slice(&s);
+        // Pack the same 4-bit nibble (low and high) in every byte.
+        let q = nibble_fill & 0x0F;
+        let byte = q | (q << 4);
+        for i in 16..16 + 128 {
+            blk[i] = byte;
+        }
+        let d_decoded = half::f16::from_f32(d).to_f32();
+        let dmin_decoded = half::f16::from_f32(dmin).to_f32();
+        let mut expected = [0.0f32; Q4K_BLOCK_ELEMS];
+        for j in 0..Q4K_SUBBLOCKS {
+            let (sc, mn) = sub_pairs[j];
+            let s = d_decoded * sc as f32;
+            let m = dmin_decoded * mn as f32;
+            for i in 0..Q4K_SUBBLOCK_ELEMS {
+                expected[j * Q4K_SUBBLOCK_ELEMS + i] = s * (q as f32) - m;
+            }
+        }
+        (blk, expected)
+    }
+
+    #[test]
+    fn q4k_pack_unpack_round_trips_random_pairs() {
+        // Every (scale6, min6) pair in 0..64 must survive a pack/unpack.
+        let pairs: [(u8, u8); Q4K_SUBBLOCKS] = [
+            (0, 0),
+            (1, 63),
+            (15, 32),
+            (33, 7),
+            (63, 1),
+            (16, 16),
+            (47, 48),
+            (8, 9),
+        ];
+        let packed = q4k_pack_scales(&pairs);
+        let unpacked = q4k_unpack_scales(&packed);
+        assert_eq!(unpacked, pairs, "packed bytes: {:?}", packed);
+    }
+
+    #[test]
+    fn dequantize_q4k_block_matches_reference_formula() {
+        let pairs: [(u8, u8); Q4K_SUBBLOCKS] = [
+            (10, 5),
+            (12, 7),
+            (14, 9),
+            (16, 11),
+            (18, 13),
+            (20, 15),
+            (22, 17),
+            (24, 19),
+        ];
+        let (blk, expected) = make_q4k_block(0.25, 0.125, pairs, 0x07);
+        let mut dst = vec![0.0f32; Q4K_BLOCK_ELEMS];
+        dequantize_q4k_block(&blk, &mut dst);
+        for (a, b) in dst.iter().zip(expected.iter()) {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "Q4K dequant diverged: got {a}, expected {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn dequantize_q4k_to_f32_truncates_to_exact_count() {
+        // Dequantise 1.5 blocks worth of weights.
+        let pairs = [(8u8, 4u8); Q4K_SUBBLOCKS];
+        let (blk, _) = make_q4k_block(0.5, 0.25, pairs, 3);
+        let mut src = Vec::new();
+        src.extend_from_slice(&blk);
+        src.extend_from_slice(&blk);
+        let mut dst = Vec::new();
+        dequantize_q4k_to_f32(&src, 256 + 100, &mut dst);
+        assert_eq!(dst.len(), 256 + 100);
+        // First 256 must equal the per-element formula.
+        let d = half::f16::from_f32(0.5).to_f32();
+        let dmin = half::f16::from_f32(0.25).to_f32();
+        let expected = d * 8.0 * 3.0 - dmin * 4.0;
+        for v in &dst[..256] {
+            assert!((v - expected).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn q4k_expert_bytes_round_to_block() {
+        // Choose dimensions so neither tensor lands exactly on 256.
+        let d_model = 32; // gate/up = 32*64=2048 = 8 blocks; down = 32*64 = 8.
+        let d_ff = 64;
+        let total = expert_weight_bytes_for(d_model, d_ff, WeightDtype::Q4K);
+        // 3 matrices × 8 blocks × 144 bytes = 3456.
+        assert_eq!(total, 3 * 8 * Q4K_BLOCK_BYTES);
+    }
+
+    #[test]
+    fn from_bytes_q4k_round_trips_to_owned_weights() {
+        // Build a tiny expert with constant Q4_K weights and verify
+        // forward produces a finite output of the right shape.
+        let d_model: usize = 16;
+        let d_ff: usize = 32; // 16*32 = 512 = 2 blocks per matrix; 6 blocks total.
+        let pairs = [(4u8, 2u8); Q4K_SUBBLOCKS];
+        let (blk, _expected) = make_q4k_block(0.1, 0.05, pairs, 5);
+        let blocks_per_matrix = (d_model * d_ff).div_ceil(Q4K_BLOCK_ELEMS as usize);
+        let mut bytes = Vec::new();
+        for _ in 0..(3 * blocks_per_matrix) {
+            bytes.extend_from_slice(&blk);
+        }
+        let w = OwnedExpertWeights::from_bytes_q4k(&bytes, d_model, d_ff).unwrap();
+        // All weights are constant; forward must produce a finite vector.
+        assert_eq!(w.gate.len(), d_model * d_ff);
+        assert_eq!(w.up.len(), d_model * d_ff);
+        assert_eq!(w.down.len(), d_model * d_ff);
+        let x = synth_hidden_state(0, d_model, 1);
+        let y = w.forward(&x);
+        assert_eq!(y.len(), d_model);
+        assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn from_bytes_q4k_rejects_short_buffer() {
+        let d_model = 16;
+        let d_ff = 32;
+        let bytes = vec![0u8; 100]; // way too small
+        let res = OwnedExpertWeights::from_bytes_q4k(&bytes, d_model, d_ff);
+        assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
     }
 }

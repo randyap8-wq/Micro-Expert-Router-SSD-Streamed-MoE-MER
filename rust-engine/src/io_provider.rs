@@ -431,7 +431,6 @@ pub fn generate_synthetic_experts_with_dtype(
     let zero_pad = vec![0u8; (1 << 20).min(pad_bytes.max(1))];
     let chunk_floats = 16 * 1024;
 
-    let bpw = dtype.bytes_per_weight();
     for id in 0..num_experts {
         let path = dir.join(format!("expert_{id}.bin"));
         let mut f = OpenOptions::new()
@@ -460,36 +459,67 @@ pub fn generate_synthetic_experts_with_dtype(
         }
 
         let mut floats_remaining = crate::inference::expert_weight_count(d_model, d_ff);
-        let mut buf = Vec::<u8>::with_capacity(chunk_floats * bpw);
-        while floats_remaining > 0 {
-            let n = floats_remaining.min(chunk_floats);
-            buf.clear();
-            for _ in 0..n {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                let u = (state >> 40) as u32;
-                let unit = (u as f32) / ((1u32 << 23) as f32) - 1.0;
-                let v = unit * scale;
-                match dtype {
-                    WeightDtype::F32 => buf.extend_from_slice(&v.to_le_bytes()),
-                    WeightDtype::F16 => {
-                        let h = half::f16::from_f32(v);
-                        buf.extend_from_slice(&h.to_bits().to_le_bytes());
-                    }
-                    WeightDtype::Int8 => {
-                        // Per-tensor symmetric quant. With the synthetic
-                        // distribution and `q = scale/127.0`, `v / q`
-                        // is in `[-127, +127]` so no clamp loss occurs;
-                        // we still clamp defensively for robustness.
-                        let q = scale / 127.0;
-                        let qv = (v / q).round().clamp(-127.0, 127.0) as i8;
-                        buf.push(qv as u8);
+        // Q4K writes per-block (144 bytes for 256 weights). For other
+        // dtypes we write per-weight. Keep the per-weight RNG fed
+        // through `state` so synthetic experts remain deterministic
+        // across dtype choices for tests / golden runs.
+        if matches!(dtype, WeightDtype::Q4K) {
+            use crate::inference::{Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS};
+            let mut block_floats = vec![0.0f32; Q4K_BLOCK_ELEMS];
+            let mut block_bytes = vec![0u8; Q4K_BLOCK_BYTES];
+            while floats_remaining > 0 {
+                let n = floats_remaining.min(Q4K_BLOCK_ELEMS);
+                for slot in block_floats.iter_mut().take(n) {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let u = (state >> 40) as u32;
+                    let unit = (u as f32) / ((1u32 << 23) as f32) - 1.0;
+                    *slot = unit * scale;
+                }
+                // Pad the tail of the last block with zeros so its
+                // dequant produces zeros for the unused tail slots.
+                for slot in block_floats.iter_mut().skip(n) {
+                    *slot = 0.0;
+                }
+                quantize_q4k_block_min_max(&block_floats, &mut block_bytes);
+                f.write_all(&block_bytes)?;
+                floats_remaining = floats_remaining.saturating_sub(n);
+            }
+        } else {
+            let bpw = dtype.bytes_per_weight();
+            let mut buf = Vec::<u8>::with_capacity(chunk_floats * bpw);
+            while floats_remaining > 0 {
+                let n = floats_remaining.min(chunk_floats);
+                buf.clear();
+                for _ in 0..n {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let u = (state >> 40) as u32;
+                    let unit = (u as f32) / ((1u32 << 23) as f32) - 1.0;
+                    let v = unit * scale;
+                    match dtype {
+                        WeightDtype::F32 => buf.extend_from_slice(&v.to_le_bytes()),
+                        WeightDtype::F16 => {
+                            let h = half::f16::from_f32(v);
+                            buf.extend_from_slice(&h.to_bits().to_le_bytes());
+                        }
+                        WeightDtype::Int8 => {
+                            // Per-tensor symmetric quant. With the synthetic
+                            // distribution and `q = scale/127.0`, `v / q`
+                            // is in `[-127, +127]` so no clamp loss occurs;
+                            // we still clamp defensively for robustness.
+                            let q = scale / 127.0;
+                            let qv = (v / q).round().clamp(-127.0, 127.0) as i8;
+                            buf.push(qv as u8);
+                        }
+                        WeightDtype::Q4K => unreachable!("Q4K handled above"),
                     }
                 }
+                f.write_all(&buf)?;
+                floats_remaining -= n;
             }
-            f.write_all(&buf)?;
-            floats_remaining -= n;
         }
 
         let mut remaining_pad = pad_bytes;
@@ -501,6 +531,111 @@ pub fn generate_synthetic_experts_with_dtype(
         f.flush()?;
     }
     Ok(())
+}
+
+/// Quantise a 256-element block to GGUF Q4_K_M layout, writing 144
+/// bytes into `dst`. The encoder uses simple per-sub-block min/max
+/// clipping followed by 4-bit linear quantisation:
+///
+/// * super-block range `(lo, hi) = (min(x), max(x))`;
+/// * `d = (hi - lo) / 63 / 15`,  `dmin = -lo / 63`;
+/// * each sub-block's `scale6` is the 6-bit value that minimises the
+///   sub-block's quantisation error against `d` (here we use the
+///   block-wide max of |x - lo| -> 63 mapping for simplicity, which
+///   is what the reference `ggml_quantize_q4_K_reference` does for a
+///   minimum-effort encoder when no statistics are available);
+/// * each sub-block's `min6` is `0` (no per-sub-block offset beyond
+///   the global `dmin`).
+///
+/// This is a faithful inverse of [`crate::inference::dequantize_q4k_block`]
+/// for the synthetic-weight regime: every weight produced by the
+/// generator is bounded in `[-scale, +scale]`, so the simple
+/// per-block fitting suffices and no per-sub-block bias correction
+/// is needed for tests / golden runs to round-trip cleanly. A
+/// production encoder (e.g. `python/quantize_q4k.py`) would solve
+/// the per-sub-block 2-D least-squares problem; we don't do that
+/// here because the synthetic distribution is uniform.
+fn quantize_q4k_block_min_max(src: &[f32], dst: &mut [u8]) {
+    use crate::inference::{Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q4K_SUBBLOCKS, Q4K_SUBBLOCK_ELEMS};
+    debug_assert_eq!(src.len(), Q4K_BLOCK_ELEMS);
+    debug_assert_eq!(dst.len(), Q4K_BLOCK_BYTES);
+
+    // Find the super-block range.
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for &v in src {
+        if v < lo {
+            lo = v;
+        }
+        if v > hi {
+            hi = v;
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+        // Degenerate block: emit all zeros (which dequantises to 0).
+        for b in dst.iter_mut() {
+            *b = 0;
+        }
+        return;
+    }
+    // d * 63 * 15 = (hi - lo)  =>  d = (hi - lo) / 945.
+    let denom = (hi - lo) / 945.0f32;
+    let d_f16 = half::f16::from_f32(denom);
+    // dmin * 63 = -lo  =>  dmin = -lo / 63.
+    let dmin_f16 = half::f16::from_f32(-lo / 63.0);
+
+    dst[0..2].copy_from_slice(&d_f16.to_bits().to_le_bytes());
+    dst[2..4].copy_from_slice(&dmin_f16.to_bits().to_le_bytes());
+
+    // Use a constant per-sub-block scale6 = 63 and min6 = 63 so the
+    // dequant maps q4 in 0..15 to lo + (q4 / 15) * (hi - lo) — i.e.
+    // the standard 4-bit linear quantiser scaled across the whole
+    // super-block. (sub_scale=63 ensures q4=15 -> hi; min6=63 with
+    // dmin = -lo/63 contributes -dmin * 63 = lo.)
+    //
+    // Pack the 8 (scale6, min6) = (63, 63) pairs.
+    let pairs = [(63u8, 63u8); Q4K_SUBBLOCKS];
+    let s = q4k_pack_scales_local(&pairs);
+    dst[4..16].copy_from_slice(&s);
+
+    // Quantise each weight: q4 = round((v - lo) / (hi - lo) * 15).
+    // (Using the block-wide range, since every sub_scale equals 63
+    // and dmin*min6 == lo.)
+    let inv_range = 15.0f32 / (hi - lo);
+    let qs = &mut dst[16..16 + 128];
+    for j in 0..Q4K_SUBBLOCKS {
+        let qs_off = j * (Q4K_SUBBLOCK_ELEMS / 2);
+        for i in 0..Q4K_SUBBLOCK_ELEMS {
+            let v = src[j * Q4K_SUBBLOCK_ELEMS + i];
+            let q = ((v - lo) * inv_range).round().clamp(0.0, 15.0) as u8;
+            let byte_idx = qs_off + (i >> 1);
+            if i & 1 == 0 {
+                qs[byte_idx] = (qs[byte_idx] & 0xF0) | (q & 0x0F);
+            } else {
+                qs[byte_idx] = (qs[byte_idx] & 0x0F) | ((q & 0x0F) << 4);
+            }
+        }
+    }
+}
+
+/// Local copy of the inference module's q4k scale packer; kept here to
+/// avoid making the inference helper `pub`. Mirrors the bit layout
+/// described in [`crate::inference::dequantize_q4k_block`].
+fn q4k_pack_scales_local(pairs: &[(u8, u8); 8]) -> [u8; 12] {
+    let mut s = [0u8; 12];
+    for j in 0..4 {
+        s[j] = pairs[j].0 & 0x3F;
+        s[j + 4] = pairs[j].1 & 0x3F;
+    }
+    for j in 4..8 {
+        let (scale_j, min_j) = pairs[j];
+        let scale_j = scale_j & 0x3F;
+        let min_j = min_j & 0x3F;
+        s[j + 4] = (scale_j & 0x0F) | ((min_j & 0x0F) << 4);
+        s[j - 4] = (s[j - 4] & 0x3F) | (((scale_j >> 4) & 0x03) << 6);
+        s[j] = (s[j] & 0x3F) | (((min_j >> 4) & 0x03) << 6);
+    }
+    s
 }
 
 #[cfg(test)]

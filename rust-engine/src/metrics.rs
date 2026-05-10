@@ -32,6 +32,19 @@ struct MetricsInner {
     pub cache_hits_total: Counter,
     pub cache_misses_total: Counter,
     pub io_wait_seconds: Histogram,
+    /// Speculator predictions that intersected the gate's actual top-K.
+    pub speculator_hits_total: Counter,
+    /// Speculator predictions that did **not** intersect the gate's actual top-K.
+    pub speculator_misses_total: Counter,
+    /// Activations whose chosen expert was already in the locality
+    /// monitor's hot set at the time of routing.
+    pub locality_hits_total: Counter,
+    /// Activations whose chosen expert was *not* in the hot set.
+    pub locality_misses_total: Counter,
+    /// Per-token cumulative SSD stall time (the slice of the critical
+    /// path that was actually waiting on the storage device, as
+    /// distinct from the total I/O time which can overlap compute).
+    pub ssd_stall_seconds: Histogram,
 }
 
 impl Default for Metrics {
@@ -87,6 +100,39 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_io_wait_seconds");
+        let speculator_hits_total = register_counter_with_registry!(
+            "mer_speculator_hits_total",
+            "Neural speculator predictions that intersected the gate's chosen top-K.",
+            registry
+        )
+        .expect("metric registration: mer_speculator_hits_total");
+        let speculator_misses_total = register_counter_with_registry!(
+            "mer_speculator_misses_total",
+            "Neural speculator predictions that did NOT intersect the gate's chosen top-K.",
+            registry
+        )
+        .expect("metric registration: mer_speculator_misses_total");
+        let locality_hits_total = register_counter_with_registry!(
+            "mer_locality_hits_total",
+            "Routed activations whose chosen expert was in the locality monitor's hot set.",
+            registry
+        )
+        .expect("metric registration: mer_locality_hits_total");
+        let locality_misses_total = register_counter_with_registry!(
+            "mer_locality_misses_total",
+            "Routed activations whose chosen expert was NOT in the locality monitor's hot set.",
+            registry
+        )
+        .expect("metric registration: mer_locality_misses_total");
+        let ssd_stall_seconds = register_histogram_with_registry!(
+            "mer_ssd_stall_seconds",
+            "Per-token cumulative SSD stall time on the inference critical path.",
+            // 10us .. 1s log-spaced; SSD stall is typically much
+            // smaller than the wall-clock io wait when prefetch lands.
+            vec![0.00001, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+            registry
+        )
+        .expect("metric registration: mer_ssd_stall_seconds");
         Self {
             inner: Arc::new(MetricsInner {
                 registry,
@@ -96,6 +142,11 @@ impl Metrics {
                 cache_hits_total,
                 cache_misses_total,
                 io_wait_seconds,
+                speculator_hits_total,
+                speculator_misses_total,
+                locality_hits_total,
+                locality_misses_total,
+                ssd_stall_seconds,
             }),
         }
     }
@@ -122,6 +173,33 @@ impl Metrics {
         self.inner.io_wait_seconds.observe(seconds);
     }
 
+    /// Record speculator accuracy: `hits` predictions that overlapped
+    /// the gate's top-K and `misses` that did not. Either may be zero.
+    pub fn record_speculator(&self, hits: u64, misses: u64) {
+        if hits > 0 {
+            self.inner.speculator_hits_total.inc_by(hits as f64);
+        }
+        if misses > 0 {
+            self.inner.speculator_misses_total.inc_by(misses as f64);
+        }
+    }
+
+    /// Record locality monitor effectiveness for one token's set of
+    /// chosen activations.
+    pub fn record_locality(&self, hits: u64, misses: u64) {
+        if hits > 0 {
+            self.inner.locality_hits_total.inc_by(hits as f64);
+        }
+        if misses > 0 {
+            self.inner.locality_misses_total.inc_by(misses as f64);
+        }
+    }
+
+    /// Record the SSD stall time portion of the per-token critical path.
+    pub fn record_ssd_stall(&self, seconds: f64) {
+        self.inner.ssd_stall_seconds.observe(seconds);
+    }
+
     /// Render the registry to a Prometheus text-format payload (the body
     /// of `GET /metrics`).
     pub fn render(&self) -> Result<Vec<u8>, prometheus::Error> {
@@ -143,6 +221,9 @@ mod tests {
         m.record_tokens(10);
         m.record_cache(3, 1);
         m.record_io_wait(0.002);
+        m.record_speculator(7, 3);
+        m.record_locality(5, 2);
+        m.record_ssd_stall(0.0005);
         let body = String::from_utf8(m.render().unwrap()).unwrap();
         for name in [
             "mer_requests_total",
@@ -151,6 +232,11 @@ mod tests {
             "mer_cache_hits_total",
             "mer_cache_misses_total",
             "mer_io_wait_seconds",
+            "mer_speculator_hits_total",
+            "mer_speculator_misses_total",
+            "mer_locality_hits_total",
+            "mer_locality_misses_total",
+            "mer_ssd_stall_seconds",
         ] {
             assert!(body.contains(name), "metric {name} missing from /metrics body:\n{body}");
         }

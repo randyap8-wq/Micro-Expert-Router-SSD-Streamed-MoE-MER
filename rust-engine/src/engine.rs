@@ -16,15 +16,16 @@
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::inference::{
-    combine_outputs, run_inference, run_inference_f16, run_inference_int8, synth_hidden_state,
+    combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4k, synth_hidden_state,
     uniform_scores, HiddenState,
     InferenceOutput, WeightDtype,
 };
 use crate::io_provider::NvmeStorage;
-use crate::router::{PredictiveLoader, TopKRouter};
+use crate::metrics::Metrics;
+use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter};
 use hdrhistogram::Histogram;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,6 +37,27 @@ pub struct CycleStats {
     pub misses: u64,
     pub prefetch_hits: u64,
     pub bytes_read: u64,
+}
+
+/// Snapshot of the engine's predictive-architecture telemetry: the
+/// running accuracy of the [`NeuralSpeculator`] (M arm), the running
+/// hit rate of the [`LocalityMonitor`] (L arm), and the cumulative
+/// SSD-stall time on the inference critical path. Returned by
+/// [`Engine::predictive_telemetry`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PredictiveTelemetry {
+    pub speculator_hits: u64,
+    pub speculator_misses: u64,
+    /// `speculator_hits / (speculator_hits + speculator_misses)`, or
+    /// `0.0` when neither has fired.
+    pub speculator_accuracy: f64,
+    pub locality_hits: u64,
+    pub locality_misses: u64,
+    /// `locality_hits / (locality_hits + locality_misses)`, or `0.0`
+    /// when neither has fired.
+    pub locality_hit_rate: f64,
+    /// Cumulative SSD critical-path stall, in microseconds.
+    pub ssd_stall_us: u64,
 }
 
 #[derive(Default)]
@@ -143,6 +165,50 @@ pub struct Engine {
     /// Number of times an alias redirect actually changed an expert id
     /// during routing/prefetch (for diagnostics).
     alias_redirects: AtomicU64,
+    /// Locality monitor — sliding-window heat map over recently-routed
+    /// experts. When configured, the engine reconciles its hot set
+    /// against the expert cache after every token: ids in the hot set
+    /// are pinned (cannot be LRU-evicted) and ids that just dropped
+    /// out are unpinned. Forms the **L** arm of the speculative I/O
+    /// union `E = S ∪ L ∪ M`.
+    locality: Option<Arc<LocalityMonitor>>,
+    /// Set of expert ids the locality monitor pinned on the previous
+    /// reconciliation. Diff'd against the current hot set so we only
+    /// `pin`/`unpin` ids that actually changed status.
+    locality_pinned: parking_lot::Mutex<HashSet<u32>>,
+    /// Heat threshold for [`Self::locality`]. Mirrors
+    /// [`LocalityMonitor::DEFAULT_THRESHOLD_PCT`] when not overridden.
+    locality_threshold_pct: f32,
+    /// Neural speculator — a tiny 2-layer MLP that predicts the gate's
+    /// top-K from the hidden state. Forms the **M** arm of the union
+    /// `E = S ∪ L ∪ M` and is trained online against the actual gate
+    /// decision. Wrapped in an `Arc` for cheap cloning into spawned
+    /// prefetch tasks; internal weights are guarded by an `RwLock`
+    /// owned by the speculator itself.
+    speculator: Option<Arc<NeuralSpeculator>>,
+    /// Number of speculator predictions pulled per token (top-K size
+    /// for the M arm). Defaults to the router's `top_k`.
+    speculator_topk: usize,
+    /// Optional Prometheus metrics sink. When present, the locality
+    /// hit / miss counters and speculator hit / miss counters are
+    /// updated alongside the per-Engine atomics.
+    metrics: Option<Metrics>,
+    /// Cumulative microseconds spent on the SSD critical-path stall —
+    /// the wall-clock window during which the engine was blocked
+    /// waiting for cache-miss reads to land. Distinct from
+    /// `total_io_wait_us` only in that it's exported as its own
+    /// Prometheus histogram (`mer_ssd_stall_seconds`).
+    total_ssd_stall_us: AtomicU64,
+    /// Cumulative speculator hit count (predictions that intersected
+    /// the gate's actual top-K).
+    spec_hits: AtomicU64,
+    /// Cumulative speculator miss count.
+    spec_misses: AtomicU64,
+    /// Cumulative locality-hit count (target experts that were already
+    /// in the locality monitor's hot set at routing time).
+    locality_hits: AtomicU64,
+    /// Cumulative locality-miss count.
+    locality_misses: AtomicU64,
 }
 
 impl Engine {
@@ -166,6 +232,7 @@ impl Engine {
         shape: ModelShape,
         options: EngineOptions,
     ) -> Self {
+        let speculator_topk_default = router.k();
         Self {
             cache,
             pool,
@@ -196,6 +263,17 @@ impl Engine {
             route_observations: RwLock::new(HashMap::new()),
             alias_map: None,
             alias_redirects: AtomicU64::new(0),
+            locality: None,
+            locality_pinned: parking_lot::Mutex::new(HashSet::new()),
+            locality_threshold_pct: LocalityMonitor::DEFAULT_THRESHOLD_PCT,
+            speculator: None,
+            speculator_topk: speculator_topk_default,
+            metrics: None,
+            total_ssd_stall_us: AtomicU64::new(0),
+            spec_hits: AtomicU64::new(0),
+            spec_misses: AtomicU64::new(0),
+            locality_hits: AtomicU64::new(0),
+            locality_misses: AtomicU64::new(0),
         }
     }
 
@@ -210,6 +288,40 @@ impl Engine {
         } else {
             Some(Arc::new(cleaned))
         };
+        self
+    }
+
+    /// Install a sliding-window [`LocalityMonitor`]. The engine will
+    /// observe every routed expert and, after each `generate` /
+    /// `moe_step`, reconcile the monitor's hot set with the cache's pin
+    /// state — newly hot ids are pinned, ids that fell below the heat
+    /// threshold are unpinned.
+    pub fn with_locality_monitor(mut self, monitor: Arc<LocalityMonitor>, threshold_pct: f32) -> Self {
+        self.locality = Some(monitor);
+        // Clamp into a sane range; values outside `[0,1]` make no
+        // semantic sense for a "fraction of the window" threshold.
+        self.locality_threshold_pct = threshold_pct.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Install a [`NeuralSpeculator`]. When set, the engine will (a)
+    /// query the speculator for its top-K prediction at every routed
+    /// hidden state, (b) compare it against the actual gate decision
+    /// to update speculator-accuracy telemetry, (c) feed that decision
+    /// back into a single online SGD step, and (d) union the
+    /// speculator's prediction with the predictor's Markov chain hint
+    /// when issuing speculative prefetches.
+    pub fn with_speculator(mut self, spec: Arc<NeuralSpeculator>, top_k: usize) -> Self {
+        self.speculator = Some(spec);
+        self.speculator_topk = top_k.max(1);
+        self
+    }
+
+    /// Wire a Prometheus metrics sink. The engine will mirror its
+    /// telemetry counters (locality / speculator hits & misses, SSD
+    /// stall) into the metrics registry alongside its own atomics.
+    pub fn with_metrics(mut self, m: Metrics) -> Self {
+        self.metrics = Some(m);
         self
     }
 
@@ -242,6 +354,14 @@ impl Engine {
         // experts share one resident copy.
         let target: Vec<u32> = raw_target.iter().map(|&id| self.resolve_alias(id)).collect();
         let mut stats = CycleStats::default();
+
+        // Locality monitor: observe the chosen experts and reconcile
+        // pin state. When no monitor is configured this is a no-op
+        // and we fall back to the legacy frequency-based pinning
+        // below. (The two are intentionally orthogonal — frequency
+        // pinning is monotonic and global; locality pinning is
+        // sliding-window and topical.)
+        self.locality_observe_and_reconcile(&target);
 
         // Frequency-based pinning: bump observation counts and ask the
         // cache to pin any id that crossed the threshold this token.
@@ -305,6 +425,19 @@ impl Engine {
         } else {
             0
         };
+        // The *SSD stall* is the slice of the critical path we were
+        // actually blocked on reads. With concurrent miss fetches it's
+        // bounded by `io_wait_us`; we report them as the same value
+        // here, since a mock-storage benchmark has no separate "in
+        // flight, but not blocking" component. The Prometheus sink
+        // exports it as its own histogram so future overlapped-fetch
+        // refactors can decouple the two without breaking dashboards.
+        if io_wait_us > 0 {
+            self.total_ssd_stall_us.fetch_add(io_wait_us, Ordering::Relaxed);
+            if let Some(m) = &self.metrics {
+                m.record_ssd_stall(io_wait_us as f64 / 1_000_000.0);
+            }
+        }
         let residents: Vec<Arc<ExpertResident>> = residents
             .into_iter()
             .map(|r| r.expect("internal invariant: every routed expert slot must be populated by either a hit or a completed miss fetch"))
@@ -363,6 +496,7 @@ impl Engine {
                     WeightDtype::F32 => run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
                     WeightDtype::F16 => run_inference_f16(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
                     WeightDtype::Int8 => run_inference_int8(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::Q4K => run_inference_q4k(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
                 };
                 match res {
                     Ok((out, y)) => {
@@ -418,20 +552,24 @@ impl Engine {
         // 4) Kick off speculative prefetches for the most-recent expert,
         //    using the 2nd-order predictor when a prev_prev is available
         //    (which gives sharper distributions than 1st-order alone and
-        //    therefore wastes less prefetch bandwidth).
+        //    therefore wastes less prefetch bandwidth). When a neural
+        //    speculator is configured, also union its top-K (the **M**
+        //    arm) and the locality monitor's hot set (the **L** arm)
+        //    into the prefetch set — see [`Engine::union_prefetch`].
         if let Some(&seed) = target.last() {
             let last_last = self.last_last_experts.lock();
-            let preds = match last_last.last() {
+            let s_markov = match last_last.last() {
                 Some(&pp) => self.predictor.predict_next2(pp, seed),
                 None => self.predictor.predict_next(seed),
             };
             drop(last_last);
-            for (id, p) in preds {
-                let canon = self.resolve_alias(id);
-                if !self.cache.contains(canon) {
-                    self.spawn_prefetch(canon, p);
-                }
-            }
+            // Speculator: predict + train on the synthetic hidden state
+            // (when the speculator's d_model matches; otherwise this is
+            // a no-op — see `speculator_predict_and_train`).
+            let x_for_spec: HiddenState =
+                synth_hidden_state(token_idx, self.shape.d_model, self.shape.hidden_seed);
+            let m_speculator = self.speculator_predict_and_train(&x_for_spec, &target);
+            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
@@ -533,6 +671,183 @@ impl Engine {
         self.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
     }
 
+    // -----------------------------------------------------------------
+    // Locality / speculator integration helpers.
+    //
+    // These are called from `generate` and `moe_step` after the gating
+    // decision (`target`) is known. They are no-ops when neither
+    // monitor is configured, which preserves the legacy code path
+    // bit-for-bit.
+    // -----------------------------------------------------------------
+
+    /// Observe the chosen expert ids in the locality monitor and
+    /// reconcile pinning with the expert cache: ids that just entered
+    /// the hot set are pinned (LRU-eviction-protected), ids that just
+    /// dropped out are unpinned.
+    ///
+    /// Also records per-token locality hit/miss telemetry: a chosen
+    /// expert is a "locality hit" if it was *already* in the hot set
+    /// at the time of routing (i.e. before this token's observation
+    /// pushed it in or out). Returns the size of the hot set, useful
+    /// for tests.
+    fn locality_observe_and_reconcile(&self, target: &[u32]) -> usize {
+        let Some(monitor) = self.locality.as_ref() else {
+            return 0;
+        };
+        // Snapshot pre-observation hit/miss against the *current* hot set.
+        let mut hits: u64 = 0;
+        let mut misses: u64 = 0;
+        for &id in target {
+            if monitor.is_hot(id, self.locality_threshold_pct) {
+                hits += 1;
+            } else {
+                misses += 1;
+            }
+        }
+        if hits > 0 {
+            self.locality_hits.fetch_add(hits, Ordering::Relaxed);
+        }
+        if misses > 0 {
+            self.locality_misses.fetch_add(misses, Ordering::Relaxed);
+        }
+        if let Some(m) = &self.metrics {
+            m.record_locality(hits, misses);
+        }
+
+        // Update the monitor's window with this token's activations.
+        monitor.observe(target);
+
+        // Reconcile pin set against the post-observation hot set.
+        let new_hot: HashSet<u32> = monitor
+            .hot_set(self.locality_threshold_pct)
+            .into_iter()
+            .collect();
+        let mut prev = self.locality_pinned.lock();
+        for &id in new_hot.iter() {
+            if !prev.contains(&id) {
+                self.cache.pin(id);
+            }
+        }
+        for &id in prev.iter() {
+            if !new_hot.contains(&id) {
+                self.cache.unpin(id);
+            }
+        }
+        let len = new_hot.len();
+        *prev = new_hot;
+        len
+    }
+
+    /// Run the speculator forward over `x`, compare its top-K to the
+    /// gate's actual `target`, record accuracy telemetry, and take one
+    /// online SGD step against the actual decision. Returns the
+    /// speculator's prediction so the caller can union it into the
+    /// prefetch set.
+    fn speculator_predict_and_train(&self, x: &[f32], target: &[u32]) -> Vec<u32> {
+        let Some(spec) = self.speculator.as_ref() else {
+            return Vec::new();
+        };
+        if x.len() != spec.d_model() {
+            // Hidden state shape mismatch — nothing useful we can
+            // predict against, so silently disable for this token.
+            // This makes the speculator graceful in the synthetic
+            // benchmark where d_model can disagree with the real model.
+            return Vec::new();
+        }
+        let preds = spec.predict_topk(x, self.speculator_topk);
+        let target_set: HashSet<u32> = target.iter().copied().collect();
+        let mut hits: u64 = 0;
+        for &p in &preds {
+            if target_set.contains(&p) {
+                hits += 1;
+            }
+        }
+        let misses = preds.len() as u64 - hits;
+        if hits > 0 {
+            self.spec_hits.fetch_add(hits, Ordering::Relaxed);
+        }
+        if misses > 0 {
+            self.spec_misses.fetch_add(misses, Ordering::Relaxed);
+        }
+        if let Some(m) = &self.metrics {
+            m.record_speculator(hits, misses);
+        }
+        // Online SGD step against the *actual* gate decision.
+        let _loss = spec.train_step(x, target, NeuralSpeculator::DEFAULT_LR);
+        preds
+    }
+
+    /// Prefetch every id in the union `S ∪ L ∪ M` that isn't already
+    /// resident — the **speculative I/O union-fetch** described in the
+    /// design spec. `s_markov` is the predictor's Markov-chain top-K
+    /// (already prob-ranked), `m_speculator` is the neural speculator's
+    /// top-K, `target_seed` is used to dedupe against ids that the
+    /// caller already kicked off via the regular cache-miss path.
+    fn union_prefetch(
+        self: &Arc<Self>,
+        s_markov: &[(u32, f64)],
+        m_speculator: &[u32],
+        already_in_flight: &HashSet<u32>,
+    ) {
+        // Preserve the predictor's per-id probability when it has one;
+        // ids that come only from the locality / speculator arms
+        // borrow the speculator's "best guess" probability of 0.5
+        // (high enough to clear most prefetch budget thresholds, low
+        // enough to be visibly different in the prefetch logs from
+        // a real Markov-chain prediction).
+        let mut seen: HashSet<u32> = already_in_flight.clone();
+        for &(id, p) in s_markov {
+            let canon = self.resolve_alias(id);
+            if seen.insert(canon) && !self.cache.contains(canon) {
+                self.spawn_prefetch(canon, p);
+            }
+        }
+        if let Some(monitor) = self.locality.as_ref() {
+            for id in monitor.hot_set(self.locality_threshold_pct) {
+                let canon = self.resolve_alias(id);
+                if seen.insert(canon) && !self.cache.contains(canon) {
+                    self.spawn_prefetch(canon, 0.5);
+                }
+            }
+        }
+        for &id in m_speculator {
+            let canon = self.resolve_alias(id);
+            if seen.insert(canon) && !self.cache.contains(canon) {
+                self.spawn_prefetch(canon, 0.5);
+            }
+        }
+    }
+
+    /// Snapshot of the engine's predictive-architecture telemetry. The
+    /// returned ratios are in `[0, 1]`; both fall back to `0.0` when no
+    /// observations have been recorded yet (the safer default for a
+    /// freshly-warmed engine).
+    pub fn predictive_telemetry(&self) -> PredictiveTelemetry {
+        let s_hits = self.spec_hits.load(Ordering::Relaxed);
+        let s_misses = self.spec_misses.load(Ordering::Relaxed);
+        let l_hits = self.locality_hits.load(Ordering::Relaxed);
+        let l_misses = self.locality_misses.load(Ordering::Relaxed);
+        let s_total = s_hits + s_misses;
+        let l_total = l_hits + l_misses;
+        PredictiveTelemetry {
+            speculator_hits: s_hits,
+            speculator_misses: s_misses,
+            speculator_accuracy: if s_total == 0 {
+                0.0
+            } else {
+                s_hits as f64 / s_total as f64
+            },
+            locality_hits: l_hits,
+            locality_misses: l_misses,
+            locality_hit_rate: if l_total == 0 {
+                0.0
+            } else {
+                l_hits as f64 / l_total as f64
+            },
+            ssd_stall_us: self.total_ssd_stall_us.load(Ordering::Relaxed),
+        }
+    }
+
     /// **Real-transformer MoE step.** Given a hidden state `x` and the
     /// expert ids the gating network selected for it, ensure every chosen
     /// expert is resident in the SSD-streaming cache (concurrent
@@ -564,6 +879,15 @@ impl Engine {
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids (mirrors `generate`).
         let target: Vec<u32> = experts.iter().map(|&id| self.resolve_alias(id)).collect();
+
+        // Locality monitor: observe and reconcile pinning. Same
+        // semantics as in `generate`.
+        self.locality_observe_and_reconcile(&target);
+
+        // Speculator: predict against the *real* hidden state (this is
+        // the path where d_model matches by construction) and train
+        // online against the gate's actual top-K decision.
+        let m_speculator = self.speculator_predict_and_train(x, &target);
 
         // Frequency-based pinning: same logic as `generate`.
         if self.options.pin_after_observations > 0 {
@@ -620,6 +944,7 @@ impl Engine {
                 WeightDtype::F32 => run_inference(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
                 WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
                 WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
             };
             match res {
                 Ok((_out, y)) => per_expert_y.push(y),
@@ -641,6 +966,38 @@ impl Engine {
         let _ = self.compute_hist.lock().record(compute_us.max(1));
         self.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
         self.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
+        if io_wait_us > 0 {
+            self.total_ssd_stall_us.fetch_add(io_wait_us, Ordering::Relaxed);
+            if let Some(m) = &self.metrics {
+                m.record_ssd_stall(io_wait_us as f64 / 1_000_000.0);
+            }
+        }
+
+        // Speculative I/O union-fetch (S ∪ L ∪ M). Fire the predictor's
+        // 2nd-order Markov-chain hint and union it with the locality
+        // hot set and the speculator's top-K so all three arms compete
+        // for cache slots together. We fold this into the predictor's
+        // observation history first so the next token's S has a chance
+        // to learn from this token's transition.
+        if let Some(&seed) = target.last() {
+            // Update predictor history (mirrors `generate`).
+            {
+                let mut last = self.last_experts.lock();
+                let mut last_last = self.last_last_experts.lock();
+                if !last.is_empty() {
+                    self.predictor.observe_step2(&last_last, &last, &target);
+                }
+                *last_last = last.clone();
+                *last = target.clone();
+            }
+            let last_last = self.last_last_experts.lock();
+            let s_markov = match last_last.last() {
+                Some(&pp) => self.predictor.predict_next2(pp, seed),
+                None => self.predictor.predict_next(seed),
+            };
+            drop(last_last);
+            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
+        }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
         let _ = self.cycle_hist.lock().record(cycle_us.max(1));
@@ -1080,5 +1437,140 @@ mod tests {
         );
         // Misses dominate when cache_slots is small relative to working set.
         assert!(r.misses > r.hits / 2, "expected eviction churn to produce many misses");
+    }
+
+    // ----------- Locality / Speculator / Union-Fetch tests ----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_with_locality_monitor_pins_hot_experts() {
+        // Build an engine with a tight hot threshold so any expert
+        // routed twice in the recent window enters the hot set, and
+        // verify that those experts get pinned in the cache.
+        let dir = TempDir::new("locality-pin");
+        let num_experts: u32 = 8;
+        let top_k = 2;
+        let d_model = 16;
+        let d_ff = 32;
+        let cache_slots = 6;
+        let predict_fanout = 1;
+
+        let engine = build_engine(
+            &dir.path,
+            num_experts,
+            d_model,
+            d_ff,
+            cache_slots,
+            top_k,
+            predict_fanout,
+            0x10CA117F,
+        );
+        // Re-wrap with a locality monitor. We drop the previous Arc
+        // and rebuild via the same helpers; the cleanest way is to
+        // unwrap and rebuild — the helper returns `Arc<Engine>` so
+        // we mutate via a fresh constructor instead.
+        let engine = {
+            // SAFETY: tests own the only Arc reference at this point.
+            let cache = engine.cache.clone();
+            let pool = engine.pool.clone();
+            let storage = engine.storage.clone();
+            let router = engine.router.clone();
+            let predictor = engine.predictor.clone();
+            let shape = engine.shape;
+            let monitor = Arc::new(LocalityMonitor::new(num_experts, /*window=*/ 16));
+            // Threshold of 0.05 ⇒ any id observed at least once in
+            // the 16-slot window is "hot" — easy to trip.
+            Arc::new(
+                Engine::new(cache, pool, storage, router, predictor, shape)
+                    .with_locality_monitor(monitor.clone(), 0.05),
+            )
+        };
+        // Drive a few tokens; the synthetic router routes deterministically,
+        // so after several tokens the locality monitor will see repeated
+        // ids and start pinning them.
+        for t in 0..32u64 {
+            let _ = engine.generate(t).await;
+        }
+        let pinned = engine.cache.pinned_count();
+        assert!(
+            pinned > 0,
+            "locality monitor should have pinned at least one hot expert; got {pinned}"
+        );
+        // Telemetry must show non-zero locality observations.
+        let tele = engine.predictive_telemetry();
+        assert!(
+            tele.locality_hits + tele.locality_misses > 0,
+            "expected locality counters to fire; got {:?}",
+            tele
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_with_speculator_records_accuracy_telemetry() {
+        let dir = TempDir::new("spec-accuracy");
+        let num_experts: u32 = 8;
+        let top_k = 2;
+        let d_model = 16;
+        let d_ff = 32;
+        let cache_slots = 6;
+        let predict_fanout = 1;
+
+        let engine = build_engine(
+            &dir.path,
+            num_experts,
+            d_model,
+            d_ff,
+            cache_slots,
+            top_k,
+            predict_fanout,
+            0x5EEEEDED,
+        );
+        let engine = {
+            let cache = engine.cache.clone();
+            let pool = engine.pool.clone();
+            let storage = engine.storage.clone();
+            let router = engine.router.clone();
+            let predictor = engine.predictor.clone();
+            let shape = engine.shape;
+            let spec = Arc::new(NeuralSpeculator::new(d_model, 32, num_experts, 0xABCD));
+            Arc::new(
+                Engine::new(cache, pool, storage, router, predictor, shape)
+                    .with_speculator(spec, top_k),
+            )
+        };
+        for t in 0..50u64 {
+            let _ = engine.generate(t).await;
+        }
+        let tele = engine.predictive_telemetry();
+        assert!(
+            tele.speculator_hits + tele.speculator_misses > 0,
+            "speculator counters should be non-zero after 50 tokens; got {:?}",
+            tele
+        );
+        assert!(tele.speculator_accuracy >= 0.0 && tele.speculator_accuracy <= 1.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_predictive_telemetry_reports_ssd_stall() {
+        let dir = TempDir::new("ssd-stall");
+        let num_experts: u32 = 8;
+        let top_k = 2;
+        let d_model = 16;
+        let d_ff = 32;
+        // Tiny cache so we must take SSD misses.
+        let cache_slots = 2;
+        let predict_fanout = 1;
+        let engine = build_engine(
+            &dir.path, num_experts, d_model, d_ff, cache_slots, top_k, predict_fanout, 0xDEADBEEF,
+        );
+        for t in 0..16u64 {
+            let _ = engine.generate(t).await;
+        }
+        let tele = engine.predictive_telemetry();
+        // With a 2-slot cache and 8 experts at top-k=2, we expect to
+        // pay for at least *some* SSD stall.
+        assert!(
+            tele.ssd_stall_us > 0,
+            "expected non-zero ssd stall; got {tele:?}"
+        );
     }
 }

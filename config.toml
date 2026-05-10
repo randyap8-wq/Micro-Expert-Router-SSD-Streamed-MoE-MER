@@ -148,3 +148,34 @@ max_batch_size = 8
 # small amount of per-token latency for substantially better
 # throughput under concurrent load.
 batch_timeout_ms = 5
+
+# Predictive Architecture (the "Omniscient" upgrade). Three opt-in
+# components feed the speculative-I/O union-fetch `E = S ∪ L ∪ M`:
+#   * S: the existing Markov-chain `PredictiveLoader` (always on; see
+#     `[storage] predict_fanout`).
+#   * L: a sliding-window `LocalityMonitor` whose hot set is also pinned
+#     in the expert cache for as long as it stays hot.
+#   * M: a 2-layer `NeuralSpeculator` (MLP) trained online against the
+#     gate's actual top-K decision via SGD.
+#
+# Telemetry: `mer_locality_hits/misses_total`,
+# `mer_speculator_hits/misses_total`, and `mer_ssd_stall_seconds` are
+# exported on `/metrics` as soon as the corresponding component is
+# enabled. With everything disabled (the default) the engine runs the
+# legacy Markov-chain prefetch path bit-for-bit.
+[predictive]
+locality_enabled = false
+# Sliding window size, in routing observations. Larger = smoother heat
+# map, slower to react to topic changes.
+locality_window = 256
+# Heat threshold: an expert is "hot" once its observation count crosses
+# `locality_threshold_pct * locality_window`. 0.10 ≈ "appeared in 10%
+# of recent activations".
+locality_threshold_pct = 0.10
+speculator_enabled = false
+# Hidden dimension of the speculator's 2-layer MLP. 128 is the spec
+# recommendation; smaller = faster predict + train, less capacity.
+speculator_hidden_dim = 128
+# Top-K experts pulled from the speculator each routing step. 0 ⇒
+# inherit `model.top_k`.
+speculator_top_k = 0
