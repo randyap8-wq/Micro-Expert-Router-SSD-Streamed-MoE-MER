@@ -147,8 +147,10 @@ pub struct CompletionRequest {
     /// stateless (matches the legacy behaviour bit-for-bit).
     #[serde(default)]
     pub session_id: Option<String>,
-    /// We accept `stream` for OpenAI compatibility but currently ignore
-    /// it; streaming is on the roadmap (Phase 7).
+    /// When `true`, the response is streamed as Server-Sent Events
+    /// (`text/event-stream`) — one OpenAI-style `text_completion` chunk
+    /// per generated token, terminated by `data: [DONE]`. Defaults to
+    /// `false` (single-shot JSON response).
     #[serde(default)]
     pub stream: Option<bool>,
 }
@@ -469,7 +471,7 @@ async fn generate(
             last = next;
             start_pos += 1;
         }
-        save_session_kv(state, session_id.as_deref(), kv, start_pos, last);
+        save_session_kv(state, session_id.as_deref(), kv, start_pos);
         let post = state.engine.report();
         hits_total = post.hits.saturating_sub(pre_hits);
         misses_total = post.misses.saturating_sub(pre_misses);
@@ -592,7 +594,6 @@ fn save_session_kv(
     session_id: Option<&str>,
     kv: Vec<crate::transformer::KvCache>,
     position: usize,
-    last_token: u32,
 ) {
     if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
         store.put(
@@ -600,7 +601,6 @@ fn save_session_kv(
             SessionState {
                 kv,
                 position,
-                last_token,
                 last_used: Instant::now(),
             },
         );
@@ -781,9 +781,9 @@ async fn stream_tokens(
             // Final chunk carries `finish_reason: length` and no new text.
             // Persist KV-cache state back to the session store so a
             // follow-up request can pick up where we stopped.
-            if let GenMode::Real { kv, last_token, position } = &mut st.mode {
+            if let GenMode::Real { kv, last_token: _, position } = &mut st.mode {
                 let kv_take = std::mem::take(kv);
-                save_session_kv(&st.state, st.session_id.as_deref(), kv_take, *position, *last_token);
+                save_session_kv(&st.state, st.session_id.as_deref(), kv_take, *position);
             }
             st.finished_emitted = true;
             return Some((

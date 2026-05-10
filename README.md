@@ -314,12 +314,13 @@ be run as a long-lived HTTP server with an OpenAI-compatible API.
 
 Endpoints:
 
-| method   | path                    | purpose                                            |
-| -------- | ----------------------- | -------------------------------------------------- |
-| `GET`    | `/health`               | liveness probe (`{"status":"ok",...}`)             |
-| `GET`    | `/metrics`              | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait |
-| `POST`   | `/v1/completions`       | OpenAI text-completion shape (`prompt`, `max_tokens`, …) |
-| `POST`   | `/v1/chat/completions`  | OpenAI chat-completion shape (`messages`, …)       |
+| method   | path                       | purpose                                            |
+| -------- | -------------------------- | -------------------------------------------------- |
+| `GET`    | `/health`                  | liveness probe (`{"status":"ok",...}`)             |
+| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait |
+| `POST`   | `/v1/completions`          | OpenAI text-completion shape (`prompt`, `max_tokens`, …) |
+| `POST`   | `/v1/chat/completions`     | OpenAI chat-completion shape (`messages`, …)       |
+| `DELETE` | `/v1/sessions/{id}`        | explicitly drop a saved KV-cache session (see [Session API](#session-api)) |
 
 Example:
 
@@ -329,12 +330,12 @@ curl -s http://127.0.0.1:8080/v1/completions \
   -d '{"prompt":"Once upon a time","max_tokens":32}' | jq .
 ```
 
-The server is intentionally **stateless per request** in this PR: each
-request drives the model for `max_tokens` cycles and returns the decoded
-tokens in one shot. Per-request KV caches mean that concurrent axum
-requests never alias each other's attention state — that is the
-foundational request-scheduler piece that token-level cross-request
-batching will layer on top of.
+By default each request is **fully stateless**: the server drives the
+model for `max_tokens` cycles and returns the decoded tokens in one
+shot, with per-request KV caches that never alias other in-flight
+requests. Cross-request KV reuse for multi-turn chat is opt-in via
+the [Session API](#session-api), and concurrent decoder steps are
+fused via the [Continuous batching scheduler](#continuous-batching).
 
 **Streaming (`stream: true`) is supported.** The server emits one
 `data: { ... }` SSE event per generated token in OpenAI's
@@ -344,6 +345,110 @@ batching will layer on top of.
 the OpenAI wire protocol exactly. Non-streaming requests (the default
 when `stream` is absent or `false`) keep returning a single JSON
 response.
+
+#### Sampling
+
+Both `/v1/completions` and `/v1/chat/completions` accept the standard
+OpenAI-style sampling fields. They are merged with the server-wide
+`[sampling]` defaults from `config.toml`; per-request fields
+override the server defaults one knob at a time.
+
+| field         | type    | meaning                                                                 |
+| ------------- | ------- | ----------------------------------------------------------------------- |
+| `temperature` | `f32`   | Softmax temperature. `0.0` (or any non-positive value) ⇒ greedy `argmax`, bit-for-bit reproducible. Mainstream values: `0.7` (creative) … `1.0` (default). |
+| `top_p`       | `f32`   | Nucleus cumulative-mass cutoff. `1.0` disables. `0.9` keeps the smallest set of tokens whose cumulative softmax probability `≥ 0.9`. |
+| `top_k`       | `usize` | Top-K truncation. `0` disables. Combined with `top_p`, the more restrictive of the two takes effect. |
+| `seed`        | `u64`   | Sampling RNG seed. Combined with the absolute token position via splitmix64, so the same `(prompt, seed, max_tokens)` produces the same completion bit-for-bit even at `temperature > 0`. |
+
+```bash
+curl -s http://127.0.0.1:8080/v1/completions \
+  -H "content-type: application/json" \
+  -d '{
+        "prompt": "Once upon a time",
+        "max_tokens": 32,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "top_k": 40,
+        "seed": 1
+      }' | jq .
+```
+
+`temperature == 0.0` skips the softmax / top-K / top-P pipeline
+entirely and returns `argmax(logits)`, matching the legacy
+deterministic behaviour every existing test relies on. With
+`temperature > 0` the cost is a partial-sort + small softmax over
+`vocab_size` — negligible relative to a full transformer step. The
+sampling pipeline lives in [`sampling.rs`](./rust-engine/src/sampling.rs)
+and applies only to the real-transformer path
+(`[real_transformer].enabled = true`); the legacy synthetic generator
+ignores these fields apart from `seed`, which still drives its
+deterministic id stream.
+
+#### Session API
+
+Multi-turn chat normally re-runs attention over the entire
+conversation on every turn — quadratic in the chat length. With
+sessions, the server persists each conversation's per-layer KV
+caches between requests so the next turn only attends over the
+*new* tokens (linear amortised cost).
+
+Sessions are **opt-in** at the server level — set
+`server.session_ttl_secs > 0` in `config.toml` to enable the in-
+memory store, then attach a stable `session_id` to each request:
+
+```bash
+# First turn: server stores the KV cache under "chat-42" after
+# generating the response. Idle sessions are evicted after
+# `session_ttl_secs` seconds.
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "content-type: application/json" \
+  -d '{
+        "session_id": "chat-42",
+        "messages": [{"role":"user","content":"Hello!"}],
+        "max_tokens": 64
+      }' | jq .
+
+# Second turn: same session_id resumes the saved KV cache; the new
+# user message is fed at the position the previous turn left off.
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "content-type: application/json" \
+  -d '{
+        "session_id": "chat-42",
+        "messages": [{"role":"user","content":"And what is 2+2?"}],
+        "max_tokens": 64
+      }' | jq .
+
+# Free the saved KV cache when the conversation is done.
+curl -s -X DELETE http://127.0.0.1:8080/v1/sessions/chat-42 | jq .
+```
+
+When `session_ttl_secs == 0` (the default) the session store is
+disabled entirely, every request is stateless, and `DELETE
+/v1/sessions/{id}` returns `404`. A request that names a
+`session_id` no other request has registered simply starts fresh —
+matching how vLLM, llama.cpp and ollama's session APIs behave.
+
+The store is backed by a lock-free `dashmap` so concurrent HTTP
+handlers don't contend on a global lock; `take` is destructive while
+the request is active so two concurrent requests for the *same*
+`session_id` never interleave attention state. Implementation lives
+in [`session.rs`](./rust-engine/src/session.rs).
+
+#### Continuous batching
+
+When the real-transformer pipeline is enabled, all in-flight
+requests' decoder steps are routed through a `BatchScheduler` that
+fuses up to `max_batch_size` concurrent requests (or whatever
+arrives within `batch_timeout_ms`) into a single batch and runs
+them concurrently against the shared `Engine`. Per-request KV
+caches travel through the channel + a `oneshot` reply, so attention
+state stays strictly per-request while expert streaming and decoder
+compute overlap. The two knobs live under `[real_transformer]`:
+
+```toml
+max_batch_size  = 8   # max concurrent requests fused per step (1 disables batching)
+batch_timeout_ms = 5  # how long to wait for more requests to join a partial batch
+```
 
 #### Real-transformer pipeline (gist Phase 5/6)
 
@@ -597,32 +702,57 @@ for clean numbers.
 
 ## What can it actually run today?
 
-**Today, in this repository: a real Mixtral / Llama-style SwiGLU expert
-FFN over weights streamed from NVMe.** Each routed expert performs the
-exact `down · (silu(gate·x) ⊙ (up·x))` block that every modern sparse
-MoE transformer uses for its experts — at synthetic, configurable
-dimensions (default `d_model=512, d_ff=2048`).
+**Today, in this repository: a real Mixtral / Llama-style transformer
+forward pass with weights streamed from NVMe.** When
+`[real_transformer].enabled = true` the server runs the full decoder
 
-What is **still mocked**:
+```
+embedding -> for each layer: ( RMSNorm -> MultiHeadSelfAttention -> +
+                               RMSNorm -> LinearGate.route -> moe_step -> + )
+            -> final RMSNorm -> LMHead -> sample
+```
 
-- **The router** is a deterministic Markov chain over expert ids
-  (clustered locality by default, or load a real Mixtral routing-trace
-  matrix via `--router-matrix`) — not a learned `softmax` over a
-  gating projection driven by the actual hidden state. The transition
-  matrix is fixed for a given run; it doesn't condition on `x`.
-- **Combining** averages the K expert outputs; a real gate-weighted sum
-  using router probabilities is one line of code away once a real router
-  is wired in.
-- **Attention, embedding, layer norm, the residual stream, and tokenizer**
-  are not implemented. Only the *expert FFN* — the dominant weight-bound
-  block in every MoE — is real.
+`moe_step` reads expert weights from SSD via the LRU cache, so the
+SSD-streaming substrate is exercised on every routed expert. The
+dense (resident) tensors — embedding, attention projections, the
+learned MoE gate, RMSNorm gains, LM head — are loaded from
+`real_transformer.weights_dir` (or fall back to a deterministic
+seeded init when files are missing, so a smoke run is always
+possible). Each routed expert performs the exact
+`down · (silu(gate·x) ⊙ (up·x))` block that every modern sparse
+MoE transformer uses for its experts, at synthetic-or-real
+dimensions (`d_model`, `d_ff`).
 
-So: the engine demonstrates **the per-expert compute path of a sparse MoE
-transformer**, end-to-end, with weights paged off the SSD. Wiring the
-remaining transformer machinery (attention, layer norm, embeddings) and a
-real tokenizer is the missing step to a turn-key model server. The
-expected drop-in path is to replace `inference::run_inference` with a
-call into a tensor library such as `candle`, `tch`, or `cudarc`.
+Tokenisation goes through the [`tokenizers`] crate when the
+`tokenizer` cargo feature is enabled and `tokenizer.json` is
+configured, with a deterministic byte-level fallback otherwise.
+Next-token selection runs through a configurable
+softmax-temperature + top-K + top-P sampler (see
+[Sampling](#sampling)), and per-request KV caches can be persisted
+between HTTP calls via the [Session API](#session-api).
+
+What is **still synthetic by default**:
+
+- **The router** is, by default, a deterministic Markov chain over
+  expert ids (clustered locality, or load a real Mixtral routing-trace
+  matrix via `--router-matrix`). When `[real_transformer]` is enabled
+  routing instead goes through the per-layer learned `LinearGate`
+  driven by the actual hidden state — the same `softmax`-over-gate-
+  logits a real Mixtral implementation uses. The Markov path stays
+  available for benchmarks where you want a fixed, reproducible
+  routing distribution independent of the model weights.
+- **Combining** uses the gate's softmax probabilities as weights on
+  the K expert outputs (real gate-weighted sum). The legacy
+  uniform-average path is preserved for the synthetic / benchmark
+  pipeline only.
+
+So: the engine demonstrates **the per-token forward pass of a sparse
+MoE transformer**, end-to-end, with experts paged off the SSD and
+real logit-driven token sampling. The expected drop-in path for
+production use is to replace `inference::run_inference` with a call
+into a tensor library such as `candle`, `tch`, or `cudarc`; the
+byte→`f32` view at `inference::ExpertWeights::from_bytes` already
+does zero-copy reinterpretation, so the swap is cleanly localised.
 
 Real Mixtral expert weights can already be fed to the engine end-to-end
 via [`scripts/extract_mixtral_experts.py`](./scripts/extract_mixtral_experts.py),
@@ -729,7 +859,38 @@ Covers:
 - the SwiGLU forward pass produces finite, deterministic outputs of the
   correct shape, and zeroed weights yield a zero output,
 - the `metadata.json` mini-parser handles both compact and
-  pretty-printed JSON.
+  pretty-printed JSON,
+- the **transformer block** — RMSNorm normalises to unit variance,
+  RoPE preserves vector norm and is the identity at position 0,
+  sliding-window attention matches full attention inside its span,
+  the MoE pre-routing picks top-K experts and the post-combine
+  weights expert outputs correctly, the LM head projects to
+  `vocab_size`, and `KvCache` grows by one slot per forward pass,
+- the **real-transformer model** — multi-layer expert id namespacing
+  (`global_id = layer * num_experts + local_id`) partitions
+  correctly, `safetensors` loaders pull dense tensors with the
+  expected shapes, `from_dir` auto-dispatches based on whether
+  `.safetensors` files are present, two `step()` calls with the same
+  inputs produce the same token id, and the dense-config validator
+  rejects bad shapes,
+- the **token sampler** — `temperature == 0.0` is greedy `argmax`,
+  `top_k == 1` collapses to argmax even at high temperature, top-P
+  truncation excludes the tail, the same `(seed, position)` always
+  produces the same token, and high temperatures can pick lower-
+  ranked logits,
+- the **session store** — `put` then `take` round-trips the persisted
+  state, `delete` reports prior existence, the TTL evictor drops
+  stale entries while keeping fresh ones, and `ttl == 0` disables
+  eviction entirely,
+- the **batch scheduler** — fused decoder steps are functionally
+  equivalent to direct `RealModel::step` calls, and concurrent
+  batched wall-clock stays within 1.5× the strictly-sequential
+  baseline,
+- the **HTTP server** — `/health`, `/metrics`, `/v1/completions`
+  (streaming and non-streaming), `/v1/chat/completions` (streaming
+  and non-streaming) round-trip, the real-model path actually
+  samples from logits, and the empty-prompt error path returns
+  `400 Bad Request`.
 
 ---
 
