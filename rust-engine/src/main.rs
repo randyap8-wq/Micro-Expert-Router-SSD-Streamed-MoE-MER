@@ -480,7 +480,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             window_size: if rt.window_size == 0 { None } else { Some(rt.window_size) },
         };
         let m = match rt.weights_dir.as_ref() {
-            Some(dir) => crate::model::RealModel::from_dir(model_cfg, dir, rt.seed)?,
+            Some(dir) => crate::model::RealModel::from_dir_auto(model_cfg, dir, rt.seed)?,
             None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),
         };
         let model_arc = Arc::new(m);
