@@ -385,8 +385,8 @@ mod linux_impl {
                 }
                 total += result as usize;
             }
-            // `keep_alive` dropped here — fds remain in self.fds.
-            drop(keep_alive);
+            // `keep_alive` goes out of scope here; the fds remain
+            // cached in `self.fds` and will be reused on the next call.
             Ok(total)
         }
     }

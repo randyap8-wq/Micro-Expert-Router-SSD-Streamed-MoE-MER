@@ -742,20 +742,12 @@ async fn build_chat_stream(
                     hits += chunk.hits;
                     misses += chunk.misses;
                     if chunk.finished {
-                        let _ = ChatChunk {
-                            id: id.clone(),
-                            object: "chat.completion.chunk",
-                            model: model_name.clone(),
-                            choices: vec![ChatChunkChoice {
-                                index: 0,
-                                delta: ChatDelta::default(),
-                                finish_reason: Some("length"),
-                            }],
-                        };
-                        // Emit DONE as the single terminator (OpenAI
-                        // compatible). A dedicated finish_reason event
-                        // could be inserted before DONE if needed; the
-                        // simple form keeps the response minimal.
+                        // End of stream. We could optionally precede the
+                        // terminator with a `ChatChunk { delta: {},
+                        // finish_reason: "length" }` event; OpenAI-
+                        // compatible clients accept either shape, so we
+                        // emit only the `[DONE]` terminator to keep the
+                        // wire output minimal.
                         let done = Event::default().data("[DONE]");
                         metrics.record_tokens(tokens_done);
                         metrics.record_cache(hits, misses);

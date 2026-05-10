@@ -411,7 +411,11 @@ fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_mode
                             }
                         }));
                     }
-                    for h in handles { let _ = h.join(); }
+                    for h in handles {
+                        // Propagate worker panics — a silent failure here
+                        // would leave `gated` partially written.
+                        h.join().expect("expert gate/up matmul worker panicked");
+                    }
                 });
                 return;
             }
@@ -466,7 +470,11 @@ fn down_proj(down: &[f32], gated: &[f32], y: &mut [f32], d_ff: usize) {
                             }
                         }));
                     }
-                    for h in handles { let _ = h.join(); }
+                    for h in handles {
+                        // Propagate worker panics — a silent failure here
+                        // would leave `y` partially written.
+                        h.join().expect("expert down-proj matmul worker panicked");
+                    }
                 });
                 return;
             }
