@@ -581,7 +581,7 @@ impl PredictiveLoader {
         });
         // Honour the loader's fanout when set; otherwise return all.
         if self.fanout > 0 {
-            out.truncate(self.fanout.max(speculator_k));
+            out.truncate(self.fanout);
         }
         out
     }

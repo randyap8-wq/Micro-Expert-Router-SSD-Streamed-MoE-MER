@@ -221,6 +221,9 @@ pub struct Engine {
     /// prediction matched the gate's actual top-1 routed expert.
     /// Mirrors the `mer_speculator_accuracy_total` Prometheus counter.
     spec_top1_matches: AtomicU64,
+    /// Cumulative count of tokens for which the speculator was
+    /// invoked. Denominator of the top-1 accuracy ratio.
+    spec_tokens: AtomicU64,
     /// Cumulative locality-hit count (target experts that were already
     /// in the locality monitor's hot set at routing time).
     locality_hits: AtomicU64,
@@ -290,6 +293,7 @@ impl Engine {
             spec_hits: AtomicU64::new(0),
             spec_misses: AtomicU64::new(0),
             spec_top1_matches: AtomicU64::new(0),
+            spec_tokens: AtomicU64::new(0),
             locality_hits: AtomicU64::new(0),
             locality_misses: AtomicU64::new(0),
         }
@@ -798,6 +802,8 @@ impl Engine {
         if top1_match > 0 {
             self.spec_top1_matches.fetch_add(1, Ordering::Relaxed);
         }
+        // One token observed by the speculator (regardless of match).
+        self.spec_tokens.fetch_add(1, Ordering::Relaxed);
         if let Some(m) = &self.metrics {
             m.record_speculator(hits, misses);
             m.record_speculator_top1(top1_match);
@@ -856,21 +862,11 @@ impl Engine {
         let s_hits = self.spec_hits.load(Ordering::Relaxed);
         let s_misses = self.spec_misses.load(Ordering::Relaxed);
         let s_top1 = self.spec_top1_matches.load(Ordering::Relaxed);
+        let s_top1_total = self.spec_tokens.load(Ordering::Relaxed);
         let l_hits = self.locality_hits.load(Ordering::Relaxed);
         let l_misses = self.locality_misses.load(Ordering::Relaxed);
         let s_total = s_hits + s_misses;
         let l_total = l_hits + l_misses;
-        // The number of top-1 observations equals the number of tokens
-        // for which the speculator was invoked, which is the same as
-        // the number of tokens that contributed to (s_hits + s_misses)
-        // divided by `speculator_topk` — every speculator call records
-        // exactly `speculator_topk` predictions into the hit/miss
-        // counters. Use that to recover the per-token denominator.
-        let s_top1_total = if self.speculator_topk == 0 {
-            0
-        } else {
-            s_total / self.speculator_topk as u64
-        };
         PredictiveTelemetry {
             speculator_hits: s_hits,
             speculator_misses: s_misses,
@@ -952,6 +948,35 @@ impl Engine {
             }
         }
 
+        // **Speculative I/O union-fetch (S ∪ L ∪ M), issued
+        // concurrently with the target-miss fetches.** Fire the
+        // predictor's 2nd-order Markov-chain hint and union it with
+        // the locality hot set and the speculator's top-K so all
+        // three arms compete for cache slots while the SSD is *also*
+        // pulling the experts the gate just chose. The prefetch
+        // tasks are spawned here (they only depend on the cache /
+        // storage Arcs) and *do not block* the await on
+        // `miss_handles` below — the OS / io_uring queue interleaves
+        // both sets of reads. This is the change called out in the
+        // design spec under Task 2: the predictive-controller's union
+        // prefetch must overlap the critical-path SSD stall, not run
+        // sequentially after it.
+        //
+        // We use the predictor's *prior* `last_last_experts` here
+        // (i.e. before observing `target`) so the prefetch sees the
+        // same state it would have at the start of the cycle. The
+        // history update happens after compute below, mirroring
+        // `generate`'s order.
+        if let Some(&seed) = target.last() {
+            let last_last = self.last_last_experts.lock();
+            let s_markov = match last_last.last() {
+                Some(&pp) => self.predictor.predict_next2(pp, seed),
+                None => self.predictor.predict_next(seed),
+            };
+            drop(last_last);
+            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
+        }
+
         // Concurrent miss fetches; hits resolved inline.
         let io_wait_start = Instant::now();
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
@@ -1023,30 +1048,18 @@ impl Engine {
             }
         }
 
-        // Speculative I/O union-fetch (S ∪ L ∪ M). Fire the predictor's
-        // 2nd-order Markov-chain hint and union it with the locality
-        // hot set and the speculator's top-K so all three arms compete
-        // for cache slots together. We fold this into the predictor's
-        // observation history first so the next token's S has a chance
-        // to learn from this token's transition.
-        if let Some(&seed) = target.last() {
-            // Update predictor history (mirrors `generate`).
-            {
-                let mut last = self.last_experts.lock();
-                let mut last_last = self.last_last_experts.lock();
-                if !last.is_empty() {
-                    self.predictor.observe_step2(&last_last, &last, &target);
-                }
-                *last_last = last.clone();
-                *last = target.clone();
+        // Update predictor history (mirrors `generate`). The actual
+        // union prefetch was already fired above, before the
+        // target-miss await — this block only carries forward the
+        // 2nd-order ring buffer for the *next* token's prefetch.
+        if !target.is_empty() {
+            let mut last = self.last_experts.lock();
+            let mut last_last = self.last_last_experts.lock();
+            if !last.is_empty() {
+                self.predictor.observe_step2(&last_last, &last, &target);
             }
-            let last_last = self.last_last_experts.lock();
-            let s_markov = match last_last.last() {
-                Some(&pp) => self.predictor.predict_next2(pp, seed),
-                None => self.predictor.predict_next(seed),
-            };
-            drop(last_last);
-            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
+            *last_last = last.clone();
+            *last = target.clone();
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
