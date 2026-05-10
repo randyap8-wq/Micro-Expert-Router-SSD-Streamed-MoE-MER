@@ -27,7 +27,7 @@ use parking_lot::RwLock;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -549,6 +549,522 @@ impl PredictiveLoader {
     }
 }
 
+/// Sliding-window **Locality Monitor** — the temporal-stability arm of the
+/// dual-path predictive controller.
+///
+/// The monitor observes every routed expert id and maintains a heat map
+/// (frequency count) over a sliding window of the most recent `window`
+/// observations. The intent is orthogonal to the Markov predictor: where
+/// the Markov chain answers "given the last expert id, what tends to
+/// fire next?", the locality monitor answers "regardless of *which*
+/// expert just fired, which experts have been disproportionately busy
+/// over the last few hundred tokens?". An expert that crosses the
+/// `threshold_pct` heat ratio is "hot" and can be **pinned** in the
+/// expert cache so it is protected from LRU eviction even when the
+/// Markov chain wanders elsewhere.
+///
+/// Internally:
+/// * `window` is a `VecDeque<u32>` of expert ids in arrival order; once
+///   it reaches capacity each new observation evicts the oldest entry.
+/// * `counts` is a flat `Vec<u32>` indexed by expert id holding the
+///   number of times that id appears in the window. The flat layout is
+///   `O(num_experts)` memory but reads/writes are cache-line tight.
+/// * `total` mirrors `window.len()` so `is_hot` doesn't have to lock the
+///   deque just to compute the denominator.
+///
+/// All accessors lock a single `RwLock`; the monitor is small, the
+/// critical section is short, and contention is bounded by the rate at
+/// which the engine routes tokens.
+pub struct LocalityMonitor {
+    num_experts: u32,
+    capacity: usize,
+    inner: RwLock<LocalityInner>,
+}
+
+struct LocalityInner {
+    window: VecDeque<u32>,
+    counts: Vec<u32>,
+    total: u64,
+}
+
+impl LocalityMonitor {
+    /// Default sliding-window length when no explicit value is configured.
+    /// 512 tokens matches the value called out in the design spec — long
+    /// enough to smooth out per-token noise, short enough to track topic
+    /// shifts that warrant repinning.
+    pub const DEFAULT_WINDOW: usize = 512;
+
+    /// Default heat threshold (10% of the window) for declaring an
+    /// expert "hot". Mirrors the spec's example.
+    pub const DEFAULT_THRESHOLD_PCT: f32 = 0.10;
+
+    pub fn new(num_experts: u32, window: usize) -> Self {
+        let capacity = window.max(1);
+        Self {
+            num_experts,
+            capacity,
+            inner: RwLock::new(LocalityInner {
+                window: VecDeque::with_capacity(capacity),
+                counts: vec![0u32; num_experts as usize],
+                total: 0,
+            }),
+        }
+    }
+
+    /// Observe a single expert activation. Drops the oldest observation
+    /// if the window is full.
+    pub fn observe_one(&self, id: u32) {
+        if id >= self.num_experts {
+            return;
+        }
+        let mut inner = self.inner.write();
+        if inner.window.len() == self.capacity {
+            if let Some(old) = inner.window.pop_front() {
+                let slot = &mut inner.counts[old as usize];
+                if *slot > 0 {
+                    *slot -= 1;
+                }
+            }
+        } else {
+            inner.total += 1;
+        }
+        inner.window.push_back(id);
+        inner.counts[id as usize] = inner.counts[id as usize].saturating_add(1);
+    }
+
+    /// Observe a batch of expert activations (e.g. one token's top-K).
+    pub fn observe(&self, ids: &[u32]) {
+        for &id in ids {
+            self.observe_one(id);
+        }
+    }
+
+    /// Window capacity (the maximum number of observations kept).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Number of observations currently in the window.
+    pub fn len(&self) -> usize {
+        self.inner.read().window.len()
+    }
+
+    /// Whether `id` currently exceeds the heat threshold. `threshold_pct`
+    /// is a fraction in `[0, 1]`; e.g. `0.1` means "≥10% of the window".
+    /// Always returns `false` when the window is empty (no signal yet).
+    pub fn is_hot(&self, id: u32, threshold_pct: f32) -> bool {
+        if id >= self.num_experts {
+            return false;
+        }
+        let inner = self.inner.read();
+        let len = inner.window.len();
+        if len == 0 {
+            return false;
+        }
+        let count = inner.counts[id as usize] as f32;
+        let cutoff = threshold_pct.max(0.0) * len as f32;
+        // `>=` so a threshold of 0.0 still requires at least one
+        // observation (since `count == 0` for absent ids).
+        count > 0.0 && count >= cutoff
+    }
+
+    /// Snapshot of the current hot set: every id whose count meets the
+    /// `threshold_pct` ratio. Sorted descending by heat count, ties
+    /// broken by ascending id for determinism.
+    pub fn hot_set(&self, threshold_pct: f32) -> Vec<u32> {
+        let inner = self.inner.read();
+        let len = inner.window.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let cutoff = (threshold_pct.max(0.0) * len as f32).max(1.0);
+        let mut out: Vec<(u32, u32)> = inner
+            .counts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &c)| {
+                if (c as f32) >= cutoff {
+                    Some((i as u32, c))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Heat count for a specific id (0 if `id` is out of range).
+    pub fn heat(&self, id: u32) -> u32 {
+        if id >= self.num_experts {
+            return 0;
+        }
+        self.inner.read().counts[id as usize]
+    }
+
+    /// Aggregate observation count since construction (saturating).
+    pub fn total_observations(&self) -> u64 {
+        self.inner.read().total
+    }
+
+    /// Reset the monitor back to its empty state. Useful for tests and
+    /// for re-warming the monitor between unrelated request streams.
+    #[allow(dead_code)]
+    pub fn clear(&self) {
+        let mut inner = self.inner.write();
+        inner.window.clear();
+        for c in inner.counts.iter_mut() {
+            *c = 0;
+        }
+        inner.total = 0;
+    }
+}
+
+/// Tiny **Neural Speculator** — the semantic-intent arm of the dual-path
+/// predictive controller.
+///
+/// A two-layer MLP (`d_model -> hidden -> num_experts`) trained online
+/// against the gating network's actual top-K decisions. The network is
+/// kept intentionally small (default hidden = 128) so it fits in L1/L2
+/// cache and so a single SGD step per token is cheap; the goal is not
+/// to *replace* the gate but to provide a fast, stateless prediction of
+/// "what experts will likely fire next given this hidden state" that
+/// can be unioned with the Markov chain's hint to drive prefetch.
+///
+/// Architecture details:
+/// * Layer 1: `W1` of shape `[hidden, d_model]`, bias `b1` of `hidden`,
+///   ReLU activation.
+/// * Layer 2: `W2` of shape `[num_experts, hidden]`, bias `b2` of
+///   `num_experts`. The output is interpreted as a logit vector;
+///   `predict_topk` returns the top-K ids by logit, and `train_step`
+///   takes a softmax + cross-entropy step against a soft target spread
+///   uniformly over the actual top-K ids selected by the real gate.
+///
+/// Initialisation uses He-uniform scaling (the standard ReLU init) with
+/// a deterministic seed so identical runs produce identical predictions.
+/// All numerical paths are `f32`; gradient clipping at `±1.0` and a
+/// `clamp_finite` guard on every weight write keep a stuck model from
+/// producing NaN/Inf — the predictor never tearing down the engine
+/// (this is a *prefetch hint*; correctness still flows through the real
+/// gate downstream).
+pub struct NeuralSpeculator {
+    d_model: usize,
+    hidden: usize,
+    num_experts: u32,
+    /// Locked together so a `predict()` always sees a consistent `(W1,
+    /// b1, W2, b2)` snapshot — `train_step` writes all four and we
+    /// don't want a half-updated set of weights to be read mid-update.
+    weights: RwLock<SpeculatorWeights>,
+}
+
+struct SpeculatorWeights {
+    /// `[hidden, d_model]` row-major.
+    w1: Vec<f32>,
+    /// `[hidden]`.
+    b1: Vec<f32>,
+    /// `[num_experts, hidden]` row-major.
+    w2: Vec<f32>,
+    /// `[num_experts]`.
+    b2: Vec<f32>,
+}
+
+impl NeuralSpeculator {
+    /// Default hidden size called out in the design spec.
+    pub const DEFAULT_HIDDEN: usize = 128;
+
+    /// Default learning rate for the online SGD step. Small by design:
+    /// the speculator is trained continuously over every token and a
+    /// large lr would let occasional outlier routings dominate.
+    pub const DEFAULT_LR: f32 = 1e-3;
+
+    /// Build a fresh speculator with He-uniform initialisation.
+    pub fn new(d_model: usize, hidden: usize, num_experts: u32, seed: u64) -> Self {
+        assert!(d_model > 0 && hidden > 0 && num_experts > 0);
+        let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0xC0DE_FEED));
+        // He uniform: U(-sqrt(6/fan_in), +sqrt(6/fan_in)).
+        let bound1 = (6.0f32 / d_model as f32).sqrt();
+        let bound2 = (6.0f32 / hidden as f32).sqrt();
+        use rand::Rng;
+        let w1: Vec<f32> = (0..hidden * d_model)
+            .map(|_| rng.gen_range(-bound1..bound1))
+            .collect();
+        let w2: Vec<f32> = (0..(num_experts as usize) * hidden)
+            .map(|_| rng.gen_range(-bound2..bound2))
+            .collect();
+        let b1 = vec![0.0f32; hidden];
+        let b2 = vec![0.0f32; num_experts as usize];
+        Self {
+            d_model,
+            hidden,
+            num_experts,
+            weights: RwLock::new(SpeculatorWeights { w1, b1, w2, b2 }),
+        }
+    }
+
+    pub fn d_model(&self) -> usize {
+        self.d_model
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    pub fn num_experts(&self) -> u32 {
+        self.num_experts
+    }
+
+    /// Forward pass returning the full logit vector of length `num_experts`.
+    /// Used internally by `predict_topk` and `train_step` and also by
+    /// tests that want to inspect the raw logits.
+    pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(x.len(), self.d_model);
+        let w = self.weights.read();
+        let mut h = vec![0.0f32; self.hidden];
+        for i in 0..self.hidden {
+            let row = &w.w1[i * self.d_model..(i + 1) * self.d_model];
+            let mut acc = w.b1[i];
+            for j in 0..self.d_model {
+                acc += row[j] * x[j];
+            }
+            // ReLU
+            h[i] = if acc > 0.0 { acc } else { 0.0 };
+        }
+        let n = self.num_experts as usize;
+        let mut logits = vec![0.0f32; n];
+        for i in 0..n {
+            let row = &w.w2[i * self.hidden..(i + 1) * self.hidden];
+            let mut acc = w.b2[i];
+            for j in 0..self.hidden {
+                acc += row[j] * h[j];
+            }
+            logits[i] = acc;
+        }
+        logits
+    }
+
+    /// Predict the top-`k` expert ids by logit. Output is in descending
+    /// logit order; ties broken by ascending id so the choice is fully
+    /// deterministic. Empty input or `k==0` yields an empty vector.
+    pub fn predict_topk(&self, x: &[f32], k: usize) -> Vec<u32> {
+        if k == 0 || x.len() != self.d_model {
+            return Vec::new();
+        }
+        let logits = self.forward(x);
+        let mut idx: Vec<(u32, f32)> = logits
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, v))
+            .collect();
+        idx.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        idx.truncate(k.min(self.num_experts as usize));
+        idx.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// Predict the top-`k` expert ids together with their softmax
+    /// probabilities. Useful for callers (telemetry, prefetch
+    /// budgeting) that want a confidence signal alongside the ranking.
+    pub fn predict_topk_with_probs(&self, x: &[f32], k: usize) -> Vec<(u32, f32)> {
+        if k == 0 || x.len() != self.d_model {
+            return Vec::new();
+        }
+        let mut logits = self.forward(x);
+        // Numerically-stable softmax in place.
+        let mut max = f32::NEG_INFINITY;
+        for &v in &logits {
+            if v > max {
+                max = v;
+            }
+        }
+        if !max.is_finite() {
+            return Vec::new();
+        }
+        let mut sum = 0.0f32;
+        for v in logits.iter_mut() {
+            *v = (*v - max).exp();
+            sum += *v;
+        }
+        if sum > 0.0 {
+            for v in logits.iter_mut() {
+                *v /= sum;
+            }
+        }
+        let mut idx: Vec<(u32, f32)> = logits
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, v))
+            .collect();
+        idx.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        idx.truncate(k.min(self.num_experts as usize));
+        idx
+    }
+
+    /// One step of online SGD against a soft-target distribution that
+    /// places mass `1/|actual|` on each id in `actual_top_k` and 0
+    /// elsewhere. The loss is cross-entropy on top of softmax; the
+    /// gradient w.r.t. the logits is `softmax(logits) - target`.
+    /// Gradient values are clipped to `±1.0` per element and weight
+    /// updates are NaN/Inf-guarded.
+    ///
+    /// Returns the cross-entropy loss for diagnostics. Out-of-range
+    /// ids in `actual_top_k` are silently ignored; if every id is
+    /// out of range the weights are not updated and the returned loss
+    /// is `f32::NAN`.
+    pub fn train_step(&self, x: &[f32], actual_top_k: &[u32], lr: f32) -> f32 {
+        if x.len() != self.d_model || actual_top_k.is_empty() {
+            return f32::NAN;
+        }
+        // Build the target distribution.
+        let n = self.num_experts as usize;
+        let mut target = vec![0.0f32; n];
+        let mut hits = 0usize;
+        for &id in actual_top_k {
+            if (id as usize) < n {
+                target[id as usize] += 1.0;
+                hits += 1;
+            }
+        }
+        if hits == 0 {
+            return f32::NAN;
+        }
+        let inv = 1.0f32 / hits as f32;
+        for v in target.iter_mut() {
+            *v *= inv;
+        }
+
+        // Forward (re-do here so we can capture the hidden activation).
+        let mut w = self.weights.write();
+        let mut h_pre = vec![0.0f32; self.hidden];
+        let mut h = vec![0.0f32; self.hidden];
+        for i in 0..self.hidden {
+            let row = &w.w1[i * self.d_model..(i + 1) * self.d_model];
+            let mut acc = w.b1[i];
+            for j in 0..self.d_model {
+                acc += row[j] * x[j];
+            }
+            h_pre[i] = acc;
+            h[i] = if acc > 0.0 { acc } else { 0.0 };
+        }
+        let mut logits = vec![0.0f32; n];
+        for i in 0..n {
+            let row = &w.w2[i * self.hidden..(i + 1) * self.hidden];
+            let mut acc = w.b2[i];
+            for j in 0..self.hidden {
+                acc += row[j] * h[j];
+            }
+            logits[i] = acc;
+        }
+        // Softmax + cross-entropy loss.
+        let mut max = f32::NEG_INFINITY;
+        for &v in &logits {
+            if v > max {
+                max = v;
+            }
+        }
+        if !max.is_finite() {
+            return f32::NAN;
+        }
+        let mut probs = logits.clone();
+        let mut sum = 0.0f32;
+        for v in probs.iter_mut() {
+            *v = (*v - max).exp();
+            sum += *v;
+        }
+        if !(sum > 0.0 && sum.is_finite()) {
+            return f32::NAN;
+        }
+        let mut loss = 0.0f32;
+        for (i, v) in probs.iter_mut().enumerate() {
+            *v /= sum;
+            if target[i] > 0.0 {
+                let p = v.max(1e-12);
+                loss -= target[i] * p.ln();
+            }
+        }
+
+        // Gradient w.r.t. logits = probs - target.
+        let mut dlogits = probs;
+        for i in 0..n {
+            dlogits[i] -= target[i];
+            // Per-element gradient clipping.
+            if dlogits[i] > 1.0 {
+                dlogits[i] = 1.0;
+            } else if dlogits[i] < -1.0 {
+                dlogits[i] = -1.0;
+            } else if !dlogits[i].is_finite() {
+                dlogits[i] = 0.0;
+            }
+        }
+
+        // Backprop into hidden: dh = W2^T · dlogits, masked by ReLU
+        // derivative (1 where pre-activation > 0, else 0).
+        let mut dh = vec![0.0f32; self.hidden];
+        for i in 0..n {
+            let g = dlogits[i];
+            if g == 0.0 {
+                continue;
+            }
+            let row = &w.w2[i * self.hidden..(i + 1) * self.hidden];
+            for j in 0..self.hidden {
+                dh[j] += row[j] * g;
+            }
+        }
+        for j in 0..self.hidden {
+            if h_pre[j] <= 0.0 {
+                dh[j] = 0.0;
+            }
+            // Clip again post-mask (the multiplication by W2 can blow up).
+            if dh[j] > 1.0 {
+                dh[j] = 1.0;
+            } else if dh[j] < -1.0 {
+                dh[j] = -1.0;
+            } else if !dh[j].is_finite() {
+                dh[j] = 0.0;
+            }
+        }
+
+        // Update W2 / b2.
+        for i in 0..n {
+            let g = dlogits[i];
+            if g == 0.0 {
+                continue;
+            }
+            let row = &mut w.w2[i * self.hidden..(i + 1) * self.hidden];
+            for j in 0..self.hidden {
+                let upd = lr * g * h[j];
+                let new = row[j] - upd;
+                row[j] = if new.is_finite() { new } else { row[j] };
+            }
+            let new_b = w.b2[i] - lr * g;
+            w.b2[i] = if new_b.is_finite() { new_b } else { w.b2[i] };
+        }
+        // Update W1 / b1.
+        for i in 0..self.hidden {
+            let g = dh[i];
+            if g == 0.0 {
+                continue;
+            }
+            let row = &mut w.w1[i * self.d_model..(i + 1) * self.d_model];
+            for j in 0..self.d_model {
+                let upd = lr * g * x[j];
+                let new = row[j] - upd;
+                row[j] = if new.is_finite() { new } else { row[j] };
+            }
+            let new_b = w.b1[i] - lr * g;
+            w.b1[i] = if new_b.is_finite() { new_b } else { w.b1[i] };
+        }
+
+        loss
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,5 +1239,137 @@ mod tests {
         p.observe_step2(&[], &[1], &[3]);
         let preds = p.predict_next(1);
         assert_eq!(preds[0].0, 3);
+    }
+
+    // ---------------------- LocalityMonitor tests ---------------------
+
+    #[test]
+    fn locality_monitor_tracks_window_and_heat_counts() {
+        let m = LocalityMonitor::new(8, 4);
+        m.observe(&[1, 2, 1, 3]);
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.heat(1), 2);
+        assert_eq!(m.heat(2), 1);
+        assert_eq!(m.heat(3), 1);
+        // Adding a 5th observation evicts the oldest (id=1).
+        m.observe_one(5);
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.heat(1), 1);
+        assert_eq!(m.heat(5), 1);
+    }
+
+    #[test]
+    fn locality_monitor_hot_set_above_threshold() {
+        let m = LocalityMonitor::new(8, 10);
+        // Expert 4 is hammered; others get one observation each.
+        for _ in 0..7 {
+            m.observe_one(4);
+        }
+        m.observe(&[0, 1, 2]);
+        // 70% > 10% -> expert 4 is hot.
+        assert!(m.is_hot(4, 0.10));
+        // 10% threshold: only ids whose count >= 1 (== 10%*10) qualify
+        // — i.e. every observed id (0,1,2,4).
+        let hot = m.hot_set(0.10);
+        assert!(hot.contains(&4), "expected 4 in hot set: {hot:?}");
+        // 50% threshold: only expert 4 (>=5 obs) qualifies.
+        let hot_strict = m.hot_set(0.50);
+        assert_eq!(hot_strict, vec![4]);
+    }
+
+    #[test]
+    fn locality_monitor_ignores_out_of_range_ids() {
+        let m = LocalityMonitor::new(4, 8);
+        m.observe(&[0, 1, 99, 2, 100]);
+        assert_eq!(m.len(), 3);
+        assert!(!m.is_hot(99, 0.0));
+    }
+
+    #[test]
+    fn locality_monitor_clear_resets_state() {
+        let m = LocalityMonitor::new(4, 8);
+        m.observe(&[0, 1, 2, 3, 0]);
+        assert!(m.len() > 0);
+        m.clear();
+        assert_eq!(m.len(), 0);
+        assert_eq!(m.heat(0), 0);
+        assert!(m.hot_set(0.0).is_empty());
+    }
+
+    // ---------------------- NeuralSpeculator tests --------------------
+
+    #[test]
+    fn speculator_predict_topk_returns_distinct_sorted_ids() {
+        let s = NeuralSpeculator::new(16, 32, 8, 1);
+        let x: Vec<f32> = (0..16).map(|i| i as f32 * 0.1 - 0.5).collect();
+        let top = s.predict_topk(&x, 3);
+        assert_eq!(top.len(), 3);
+        // distinct
+        let mut sorted = top.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3);
+        for id in top {
+            assert!(id < 8);
+        }
+    }
+
+    #[test]
+    fn speculator_initial_distribution_is_deterministic() {
+        let a = NeuralSpeculator::new(8, 16, 4, 42);
+        let b = NeuralSpeculator::new(8, 16, 4, 42);
+        let x: Vec<f32> = (0..8).map(|i| (i as f32).sin()).collect();
+        assert_eq!(a.forward(&x), b.forward(&x));
+    }
+
+    #[test]
+    fn speculator_train_step_reduces_loss_on_fixed_target() {
+        // Simple test: repeatedly train the speculator against a single
+        // (x, target) pair and verify the cross-entropy loss decreases.
+        let s = NeuralSpeculator::new(8, 16, 4, 7);
+        let x: Vec<f32> = vec![0.5; 8];
+        let target = [2u32, 3];
+        let initial = s.train_step(&x, &target, 0.1);
+        for _ in 0..200 {
+            s.train_step(&x, &target, 0.1);
+        }
+        let after = s.train_step(&x, &target, 0.0); // 0 lr -> just measure loss
+        assert!(initial.is_finite());
+        assert!(after.is_finite());
+        assert!(
+            after < initial * 0.9,
+            "expected loss to decrease materially: initial={initial} after={after}"
+        );
+        // After training, the top-2 prediction must include both target ids.
+        let preds = s.predict_topk(&x, 2);
+        assert!(preds.contains(&2), "preds={preds:?}");
+        assert!(preds.contains(&3), "preds={preds:?}");
+    }
+
+    #[test]
+    fn speculator_handles_empty_or_invalid_input() {
+        let s = NeuralSpeculator::new(4, 8, 4, 1);
+        assert!(s.predict_topk(&[1.0; 4], 0).is_empty());
+        assert!(s.predict_topk(&[], 2).is_empty());
+        // Wrong-length input: predict returns empty rather than panicking.
+        assert!(s.predict_topk(&[1.0; 8], 2).is_empty());
+        // Train with empty actual set -> no-op (NaN sentinel).
+        assert!(s.train_step(&[1.0; 4], &[], 0.1).is_nan());
+        // Train with all out-of-range ids -> no-op.
+        assert!(s.train_step(&[1.0; 4], &[99, 100], 0.1).is_nan());
+    }
+
+    #[test]
+    fn speculator_predict_topk_with_probs_is_normalised() {
+        let s = NeuralSpeculator::new(4, 8, 8, 11);
+        let x: Vec<f32> = vec![0.1, -0.2, 0.3, -0.4];
+        let preds = s.predict_topk_with_probs(&x, 8);
+        assert_eq!(preds.len(), 8);
+        let total: f32 = preds.iter().map(|(_, p)| *p).sum();
+        assert!((total - 1.0).abs() < 1e-4, "softmax sums to {total}");
+        // Sorted descending by probability.
+        for w in preds.windows(2) {
+            assert!(w[0].1 + 1e-6 >= w[1].1);
+        }
     }
 }
