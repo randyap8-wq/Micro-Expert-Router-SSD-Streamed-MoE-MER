@@ -123,6 +123,56 @@ impl Default for TokenizerConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RealTransformerConfig {
+    /// When `true`, the server runs requests through the full real
+    /// transformer (`embedding → stacked layers → LM head`), with each
+    /// layer's MoE block streaming its routed experts from SSD via the
+    /// engine. When `false` (default), the legacy benchmark generator is
+    /// used: the engine still streams experts, but next-token ids are
+    /// synthesised from cycle stats — so the SSD-streaming substrate is
+    /// exercised either way.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional directory containing pre-extracted dense weight files
+    /// (`embed.bin`, `attn_<L>_q.bin`, `gate_<L>.bin`, …). Tensors not
+    /// present fall back to a deterministic seeded initialisation, so
+    /// the engine always has an end-to-end runnable path. See
+    /// `crate::model::RealModel::from_dir` for the file-name schema.
+    #[serde(default)]
+    pub weights_dir: Option<PathBuf>,
+    /// Vocab size. Must match the tokenizer when one is configured (for
+    /// the byte fallback this should be 256).
+    #[serde(default = "default_vocab_size")]
+    pub vocab_size: usize,
+    /// Number of attention heads.
+    #[serde(default = "default_num_heads")]
+    pub num_heads: usize,
+    /// Grouped-Query-Attention KV head count. `0` = auto (set equal to
+    /// `num_heads`, recovering vanilla MHA).
+    #[serde(default)]
+    pub num_kv_heads: usize,
+    /// Per-head dimension. `0` = auto (`d_model / num_heads`).
+    #[serde(default)]
+    pub head_dim: usize,
+    /// RoPE base θ (Mixtral / Llama-3 default = 10000.0; Llama-3.1 uses
+    /// 500000.0 for long-context).
+    #[serde(default = "default_rope_base")]
+    pub rope_base: f32,
+    /// RMSNorm ε.
+    #[serde(default = "default_rms_eps")]
+    pub rms_eps: f32,
+    /// PRNG seed for the deterministic init fallback.
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+}
+
+fn default_vocab_size() -> usize { 256 }
+fn default_num_heads() -> usize { 8 }
+fn default_rope_base() -> f32 { 10_000.0 }
+fn default_rms_eps() -> f32 { 1e-6 }
+fn default_seed() -> u64 { 0xC0FFEE }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -130,6 +180,8 @@ pub struct Config {
     pub storage: StorageConfigToml,
     #[serde(default)]
     pub tokenizer: TokenizerConfig,
+    #[serde(default)]
+    pub real_transformer: RealTransformerConfig,
 }
 
 impl Config {
@@ -179,6 +231,49 @@ impl Config {
                 "storage.partial_load_fraction ({}) must be in [0.1, 1.0]",
                 self.storage.partial_load_fraction
             )));
+        }
+        if self.real_transformer.enabled {
+            let rt = &self.real_transformer;
+            if rt.num_heads == 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.num_heads must be > 0 when enabled".into(),
+                ));
+            }
+            // 0 = auto: head_dim defaults to d_model / num_heads.
+            let head_dim = if rt.head_dim == 0 {
+                if self.model.d_model % rt.num_heads != 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "real_transformer.head_dim is auto but d_model ({}) is not \
+                         divisible by num_heads ({})",
+                        self.model.d_model, rt.num_heads
+                    )));
+                }
+                self.model.d_model / rt.num_heads
+            } else {
+                rt.head_dim
+            };
+            if head_dim * rt.num_heads != self.model.d_model {
+                return Err(ConfigError::Invalid(format!(
+                    "real_transformer: head_dim*num_heads ({}*{}={}) must equal \
+                     model.d_model ({})",
+                    head_dim,
+                    rt.num_heads,
+                    head_dim * rt.num_heads,
+                    self.model.d_model
+                )));
+            }
+            let kv_heads = if rt.num_kv_heads == 0 { rt.num_heads } else { rt.num_kv_heads };
+            if kv_heads == 0 || rt.num_heads % kv_heads != 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "real_transformer.num_kv_heads ({kv_heads}) must divide num_heads ({})",
+                    rt.num_heads
+                )));
+            }
+            if rt.vocab_size == 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.vocab_size must be > 0".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -230,6 +325,7 @@ mod tests {
                 pin_after_observations: 0,
             },
             tokenizer: TokenizerConfig::default(),
+            real_transformer: RealTransformerConfig::default(),
         }
     }
 

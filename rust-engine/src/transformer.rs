@@ -270,9 +270,26 @@ pub fn run_expert_forward(
 
 /// Row-major matrix-vector multiply: `y = W · x` where `W` is
 /// `[rows, cols]` row-major. Returns a fresh `Vec<f32>` of length `rows`.
+///
+/// The `simd` cargo feature replaces the scalar loop with a row-parallel
+/// implementation using `std::thread::scope` (no extra crate dependency),
+/// which stands in for the rayon / candle / cudarc backend the gist
+/// mentions in Phase 6. The scalar path remains the default — it has zero
+/// extra deps and is the same shape every other matmul in this engine
+/// uses, so behaviour is bit-for-bit unchanged unless you opt in.
 pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
+    #[cfg(feature = "simd")]
+    {
+        // Heuristic: only parallelise when the matrix is large enough
+        // that thread-spawn overhead doesn't dominate. The break-even
+        // point is around ~32 KiB of work; below that the scalar path
+        // is faster.
+        if rows * cols >= 8 * 1024 {
+            return matmul_row_major_parallel(w, x, rows, cols);
+        }
+    }
     let mut y = vec![0.0f32; rows];
     for i in 0..rows {
         let row = &w[i * cols..(i + 1) * cols];
@@ -283,6 +300,151 @@ pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f
         y[i] = acc;
     }
     y
+}
+
+/// Row-parallel matmul using `std::thread::scope`. Each worker computes a
+/// contiguous block of output rows; no synchronisation is required because
+/// the output rows are disjoint. Used when the `simd` feature is on. A
+/// future PR can swap the body for a `candle::Tensor` op or a CUDA kernel
+/// without changing this function's signature — the call sites are
+/// already routed through `matmul_row_major`.
+#[cfg(feature = "simd")]
+fn matmul_row_major_parallel(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(rows.max(1));
+    if nthreads <= 1 {
+        // Fall back to scalar for tiny outputs.
+        let mut y = vec![0.0f32; rows];
+        for i in 0..rows {
+            let row = &w[i * cols..(i + 1) * cols];
+            let mut acc = 0.0f32;
+            for j in 0..cols {
+                acc += row[j] * x[j];
+            }
+            y[i] = acc;
+        }
+        return y;
+    }
+    let mut y = vec![0.0f32; rows];
+    let chunk = rows.div_ceil(nthreads);
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(nthreads);
+        for (chunk_idx, out_chunk) in y.chunks_mut(chunk).enumerate() {
+            let row_start = chunk_idx * chunk;
+            let w_slice = &w[row_start * cols..(row_start + out_chunk.len()) * cols];
+            let x_ref = x;
+            handles.push(s.spawn(move || {
+                for (i, slot) in out_chunk.iter_mut().enumerate() {
+                    let row = &w_slice[i * cols..(i + 1) * cols];
+                    let mut acc = 0.0f32;
+                    for j in 0..cols {
+                        acc += row[j] * x_ref[j];
+                    }
+                    *slot = acc;
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+    });
+    y
+}
+
+/// Final language-modelling head: a linear projection from the residual
+/// stream `[d_model]` to per-token logits `[vocab_size]`. In real models
+/// this is sometimes weight-tied with the input embedding; we keep them
+/// separate so the engine can sanity-check sampling without an embedding
+/// matrix.
+#[derive(Debug, Clone)]
+pub struct LMHead {
+    pub weights: Vec<f32>,
+    pub vocab_size: usize,
+    pub d_model: usize,
+}
+
+impl LMHead {
+    pub fn new(weights: Vec<f32>, vocab_size: usize, d_model: usize) -> Self {
+        assert_eq!(
+            weights.len(),
+            vocab_size * d_model,
+            "lm_head weights must be [vocab_size, d_model]"
+        );
+        Self { weights, vocab_size, d_model }
+    }
+
+    /// Compute logits = `W · hidden`.
+    pub fn forward(&self, hidden: &[f32]) -> Vec<f32> {
+        matmul_row_major(&self.weights, hidden, self.vocab_size, self.d_model)
+    }
+}
+
+/// Element-wise residual add: `y = a + b`.
+#[inline]
+pub fn add_residual(a: &[f32], b: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
+}
+
+/// One Llama / Mixtral-style transformer decoder layer.
+///
+/// Holds the dense (resident) weights — RMSNorms, attention projections,
+/// and the routing gate — but **not** the expert FFN weights themselves.
+/// Those are streamed from SSD per token by the engine's
+/// [`crate::expert_cache::ExpertCache`] and handed back here as already-
+/// loaded `ExpertResident`s for the [`Self::moe_combine`] step.
+///
+/// The layer is intentionally split into three sync helpers
+/// ([`Self::attn_block`], [`Self::moe_pre`], [`Self::moe_combine`])
+/// rather than one monolithic `forward` because expert loading is
+/// **async** (it issues `pread(2)` to NVMe). The async driver in
+/// `crate::model::RealModel::step` calls `attn_block`, then `moe_pre`,
+/// then `await`s expert fetches via the engine, then calls
+/// `moe_combine` to fold the per-expert FFN outputs back into the
+/// residual stream — exactly the pseudocode the gist gives.
+#[derive(Debug, Clone)]
+pub struct TransformerLayer {
+    pub rms_attn: RmsNorm,
+    pub attn: MultiHeadSelfAttention,
+    pub rms_moe: RmsNorm,
+    pub gate: crate::gating::LinearGate,
+}
+
+impl TransformerLayer {
+    /// `hidden -> rmsnorm -> attention -> residual`. Updates `kv` with
+    /// the K/V for this token.
+    pub fn attn_block(&self, hidden: &[f32], pos: usize, kv: &mut KvCache) -> Vec<f32> {
+        let normed = self.rms_attn.forward(hidden);
+        let attn_out = self.attn.forward(&normed, pos, kv);
+        add_residual(hidden, &attn_out)
+    }
+
+    /// `hidden -> rmsnorm -> gate.route()`. Returns the normalised
+    /// hidden state (which is what every expert FFN should consume) and
+    /// the routing decision.
+    pub fn moe_pre(&self, hidden: &[f32]) -> (Vec<f32>, crate::gating::RoutingDecision) {
+        let normed = self.rms_moe.forward(hidden);
+        let routing = self.gate.route(&normed);
+        (normed, routing)
+    }
+
+    /// Fold the per-expert FFN outputs back into the residual stream:
+    /// `hidden + sum_i weights[i] * expert_outputs[i]`. The lengths of
+    /// `expert_outputs` and `weights` must match (one per chosen expert);
+    /// any expert that failed to materialise on disk should be filtered
+    /// out of *both* slices upstream so the weighted sum stays
+    /// well-defined.
+    pub fn moe_combine(
+        &self,
+        hidden: &[f32],
+        expert_outputs: &[HiddenState],
+        weights: &[f32],
+    ) -> Vec<f32> {
+        let moe = combine_moe_outputs(expert_outputs, weights, self.attn.d_model);
+        add_residual(hidden, &moe)
+    }
 }
 
 /// Numerically-stable softmax, in place.
@@ -404,6 +566,116 @@ mod tests {
         // 0.5*1 + 0.25*2 + 0.25*4 = 2.0
         for v in y {
             assert!((v - 2.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn lm_head_projects_to_vocab() {
+        let d_model = 4;
+        let vocab = 6;
+        // Identity-ish: first d_model rows are I, rest are zero.
+        let mut w = vec![0.0f32; vocab * d_model];
+        for i in 0..d_model.min(vocab) {
+            w[i * d_model + i] = 1.0;
+        }
+        let head = LMHead::new(w, vocab, d_model);
+        let logits = head.forward(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(logits.len(), vocab);
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[1], 2.0);
+        assert_eq!(logits[2], 3.0);
+        assert_eq!(logits[3], 4.0);
+        // Rows beyond d_model are all zero.
+        assert_eq!(logits[4], 0.0);
+        assert_eq!(logits[5], 0.0);
+    }
+
+    #[test]
+    fn add_residual_is_elementwise() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![10.0, 20.0, 30.0];
+        let y = add_residual(&a, &b);
+        assert_eq!(y, vec![11.0, 22.0, 33.0]);
+    }
+
+    /// Build a tiny `TransformerLayer` with deterministic small weights
+    /// so we can exercise the full `attn_block + moe_pre + moe_combine`
+    /// path without loading anything from disk.
+    fn make_layer(d_model: usize, num_experts: usize, top_k: usize) -> TransformerLayer {
+        let head_dim = 4;
+        let num_heads = d_model / head_dim;
+        let num_kv_heads = num_heads;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mk = |rows: usize, cols: usize, scale: f32| {
+            (0..rows * cols)
+                .map(|i| ((i % 7) as f32 - 3.0) * scale)
+                .collect::<Vec<f32>>()
+        };
+        TransformerLayer {
+            rms_attn: RmsNorm::new(vec![1.0; d_model], 1e-6),
+            attn: MultiHeadSelfAttention {
+                d_model,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                rope_base: 10000.0,
+                wq: mk(q_dim, d_model, 0.05),
+                wk: mk(kv_dim, d_model, 0.05),
+                wv: mk(kv_dim, d_model, 0.05),
+                wo: mk(d_model, q_dim, 0.05),
+            },
+            rms_moe: RmsNorm::new(vec![1.0; d_model], 1e-6),
+            gate: crate::gating::LinearGate::new(
+                mk(num_experts, d_model, 0.1),
+                num_experts,
+                d_model,
+                top_k,
+            ),
+        }
+    }
+
+    #[test]
+    fn transformer_layer_attn_block_is_finite_and_grows_kv() {
+        let d_model = 16;
+        let layer = make_layer(d_model, 4, 2);
+        let mut kv = KvCache::new(layer.attn.kv_dim());
+        let x: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32 - 0.5).collect();
+        let y0 = layer.attn_block(&x, 0, &mut kv);
+        assert_eq!(y0.len(), d_model);
+        assert!(y0.iter().all(|v| v.is_finite()));
+        assert_eq!(kv.seq_len, 1);
+        let y1 = layer.attn_block(&y0, 1, &mut kv);
+        assert_eq!(kv.seq_len, 2);
+        assert!(y1.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn transformer_layer_moe_pre_routes_top_k_experts() {
+        let d_model = 16;
+        let layer = make_layer(d_model, 8, 2);
+        let x: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32 - 0.5).collect();
+        let (normed, routing) = layer.moe_pre(&x);
+        assert_eq!(normed.len(), d_model);
+        assert!(normed.iter().all(|v| v.is_finite()));
+        assert_eq!(routing.experts.len(), 2);
+        assert_eq!(routing.weights.len(), 2);
+        let sum: f32 = routing.weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn transformer_layer_moe_combine_blends_outputs() {
+        let d_model = 8;
+        let layer = make_layer(d_model, 4, 2);
+        let hidden = vec![1.0; d_model];
+        // Two expert outputs of all-ones and all-twos with equal weights:
+        // combined moe = 1.5 * 1.0 vector; hidden + moe = 2.5 vector.
+        let outs = vec![vec![1.0; d_model], vec![2.0; d_model]];
+        let weights = vec![0.5, 0.5];
+        let y = layer.moe_combine(&hidden, &outs, &weights);
+        for v in y {
+            assert!((v - 2.5).abs() < 1e-6);
         }
     }
 }

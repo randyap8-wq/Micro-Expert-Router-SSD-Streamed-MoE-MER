@@ -73,3 +73,36 @@ pin_after_observations = 0
 # Path to a HuggingFace `tokenizer.json` (e.g. the one shipped with
 # Mixtral). Comment out / delete to use the byte-level fallback.
 # path = "./data/tokenizer.json"
+
+# Real transformer pipeline (gist Phase 5/6). When `enabled = false`
+# (the default), the server uses the legacy benchmark generator and
+# synthesises next-token ids from `Engine::generate` cycle stats — the
+# SSD-streaming substrate is exercised identically. When `enabled =
+# true`, requests run the full decoder forward (`embedding -> stacked
+# layers (each with SSD-streamed MoE) -> LM head -> argmax`) and the
+# response text is sampled from real logits.
+[real_transformer]
+enabled = false
+# Optional directory of pre-extracted dense weight files. See
+# `RealModel::from_dir` in `src/model.rs` for the file-name schema
+# (`embed.bin`, `attn_<L>_q.bin`, `gate_<L>.bin`, …). Tensors not
+# present fall back to a deterministic seeded init.
+# weights_dir = "./data/dense"
+# Vocab size. Must match the tokenizer (256 for the byte fallback).
+vocab_size = 256
+# Attention head count. For Mixtral 8x7B: 32.
+num_heads = 8
+# Grouped-Query-Attention KV head count. 0 = auto (set equal to
+# num_heads, recovering vanilla MHA). For Mixtral 8x7B: 8.
+num_kv_heads = 0
+# Per-head dimension. 0 = auto (d_model / num_heads).
+head_dim = 0
+# RoPE base θ. Mixtral / Llama-3 default 10000; Llama-3.1 long-ctx 500000.
+rope_base = 10000.0
+# RMSNorm epsilon.
+rms_eps = 1e-6
+# PRNG seed for the deterministic-init fallback (used for any tensor
+# missing from `weights_dir`). 12648430 == 0xC0FFEE; matches the
+# `default_seed()` constant in `src/config.rs` (TOML doesn't accept
+# hex literals).
+seed = 12648430
