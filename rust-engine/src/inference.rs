@@ -64,22 +64,45 @@ use std::fmt;
 /// `F32` is the legacy (and default) format: each weight is 4 bytes,
 /// reinterpreted directly as `&[f32]`. `F16` halves bytes-per-parameter
 /// (the dominant SSD-energy cost in this engine) and is dequantised into
-/// an owned `Vec<f32>` at fetch time.
+/// an owned `Vec<f32>` at fetch time. `Int8` uses **per-tensor symmetric
+/// quantization** with three `f32` scales (one each for `gate_proj`,
+/// `up_proj`, `down_proj`) stored as a 12-byte header at the start of
+/// every expert blob, followed by `i8` weights. This 4× compression
+/// over F32 (and 2× over F16) is the dominant SSD-bandwidth win for
+/// the Mixtral-scale workloads this engine targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WeightDtype {
     /// Little-endian `f32`, 4 bytes per weight.
     F32,
     /// Little-endian IEEE-754 `f16` (`half::f16`), 2 bytes per weight.
     F16,
+    /// Per-tensor symmetric `int8`, 1 byte per weight, with a 12-byte
+    /// header (`[gate_scale, up_scale, down_scale]: [f32; 3]`) at the
+    /// start of every expert blob. Dequantised to `f32` at fetch time.
+    Int8,
 }
 
 impl WeightDtype {
-    /// Number of on-disk bytes per weight for this dtype.
+    /// Number of on-disk bytes per weight for this dtype. **Excludes**
+    /// any per-tensor scale header — see [`Self::header_bytes`].
     #[inline]
     pub const fn bytes_per_weight(self) -> usize {
         match self {
             WeightDtype::F32 => 4,
             WeightDtype::F16 => 2,
+            WeightDtype::Int8 => 1,
+        }
+    }
+
+    /// Number of constant-size header bytes prepended to every expert
+    /// blob for this dtype, **before** the weight stream begins.
+    /// `Int8` uses 12 bytes (`[f32; 3]` per-tensor scales); the
+    /// floating-point dtypes use no header.
+    #[inline]
+    pub const fn header_bytes(self) -> usize {
+        match self {
+            WeightDtype::F32 | WeightDtype::F16 => 0,
+            WeightDtype::Int8 => INT8_HEADER_BYTES,
         }
     }
 
@@ -88,6 +111,7 @@ impl WeightDtype {
         match s.trim().to_ascii_lowercase().as_str() {
             "f32" | "fp32" => Some(WeightDtype::F32),
             "f16" | "fp16" | "half" => Some(WeightDtype::F16),
+            "i8" | "int8" | "q8" => Some(WeightDtype::Int8),
             _ => None,
         }
     }
@@ -97,7 +121,43 @@ impl WeightDtype {
         match self {
             WeightDtype::F32 => "f32",
             WeightDtype::F16 => "f16",
+            WeightDtype::Int8 => "int8",
         }
+    }
+}
+
+/// Size of the per-expert INT8 scale header: three `f32` per-tensor
+/// scales (`gate`, `up`, `down`).
+pub const INT8_HEADER_BYTES: usize = 3 * 4;
+
+/// Per-tensor symmetric-quantization scales for one expert's INT8
+/// weights. Stored as the first 12 bytes of an `Int8` expert blob.
+#[derive(Debug, Clone, Copy)]
+pub struct Int8ExpertMeta {
+    pub gate_scale: f32,
+    pub up_scale: f32,
+    pub down_scale: f32,
+}
+
+impl Int8ExpertMeta {
+    /// Read the 12-byte header. Returns `None` if the buffer is too short.
+    pub fn read_from(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < INT8_HEADER_BYTES {
+            return None;
+        }
+        let g = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let u = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let d = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        Some(Self { gate_scale: g, up_scale: u, down_scale: d })
+    }
+
+    /// Serialise the header to its on-disk byte layout.
+    pub fn to_bytes(self) -> [u8; INT8_HEADER_BYTES] {
+        let mut out = [0u8; INT8_HEADER_BYTES];
+        out[0..4].copy_from_slice(&self.gate_scale.to_le_bytes());
+        out[4..8].copy_from_slice(&self.up_scale.to_le_bytes());
+        out[8..12].copy_from_slice(&self.down_scale.to_le_bytes());
+        out
     }
 }
 
@@ -191,13 +251,12 @@ pub const fn expert_weight_bytes_f16(d_model: usize, d_ff: usize) -> usize {
 }
 
 /// Number of bytes an expert with these dimensions occupies on disk
-/// for the given dtype.
+/// for the given dtype, **including** any per-expert header (e.g. the
+/// 12-byte INT8 scale header).
 #[inline]
 pub const fn expert_weight_bytes_for(d_model: usize, d_ff: usize, dtype: WeightDtype) -> usize {
-    match dtype {
-        WeightDtype::F32 => expert_weight_bytes(d_model, d_ff),
-        WeightDtype::F16 => expert_weight_bytes_f16(d_model, d_ff),
-    }
+    let payload = expert_weight_count(d_model, d_ff).saturating_mul(dtype.bytes_per_weight());
+    payload.saturating_add(dtype.header_bytes())
 }
 
 /// Errors produced when reinterpreting a raw byte buffer as expert
@@ -522,6 +581,58 @@ pub struct OwnedExpertWeights {
 }
 
 impl OwnedExpertWeights {
+    /// Build an owned weight set by dequantising a per-tensor symmetric
+    /// **INT8** byte buffer into a fresh `Vec<f32>`. The buffer layout
+    /// is: 12-byte [`Int8ExpertMeta`] header (`[gate, up, down]: [f32; 3]`
+    /// scales), followed by `i8` weights in the same partitioned order
+    /// as [`ExpertWeights::from_bytes`]:
+    ///
+    /// ```text
+    ///   header        (12 bytes)
+    ///   gate_proj     (d_ff * d_model bytes, i8)
+    ///   up_proj       (d_ff * d_model bytes, i8)
+    ///   down_proj     (d_model * d_ff bytes, i8)
+    /// ```
+    ///
+    /// Each tensor is dequantised by `f32_value = i8_value * tensor_scale`.
+    /// This is the inverse of [`crate::main::cmd_gen_data`]'s INT8
+    /// emitter and matches the reference scheme used by every
+    /// production INT8 inference kernel (Mixtral-INT8, AWQ, GPTQ).
+    pub fn from_bytes_int8(
+        bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        let need_floats = expert_weight_count(d_model, d_ff);
+        let need_bytes = need_floats.saturating_add(INT8_HEADER_BYTES);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
+        let meta = Int8ExpertMeta::read_from(bytes).expect("header byte length pre-checked");
+        let payload = &bytes[INT8_HEADER_BYTES..need_bytes];
+        let gate_len = d_ff * d_model;
+        let up_len = d_ff * d_model;
+        let down_len = d_model * d_ff;
+        debug_assert_eq!(gate_len + up_len + down_len, payload.len());
+
+        let dequant = |src: &[u8], scale: f32| -> Vec<f32> {
+            // Two's-complement reinterpret: `i8` is a single byte cast.
+            src.iter().map(|&b| (b as i8) as f32 * scale).collect()
+        };
+        let gate = dequant(&payload[..gate_len], meta.gate_scale);
+        let up = dequant(&payload[gate_len..gate_len + up_len], meta.up_scale);
+        let down = dequant(
+            &payload[gate_len + up_len..gate_len + up_len + down_len],
+            meta.down_scale,
+        );
+        Ok(Self { d_model, d_ff, gate, up, down, col_indices: None })
+    }
+
     /// Build an owned weight set by dequantising a little-endian `f16`
     /// byte buffer into a fresh `Vec<f32>`. The resulting buffer is
     /// partitioned the same way as [`ExpertWeights::from_bytes`].
@@ -608,6 +719,19 @@ impl OwnedExpertWeights {
                 let mut v = Vec::new();
                 dequantize_f16_to_f32(&bytes[..packed_floats * 2], &mut v);
                 v
+            }
+            WeightDtype::Int8 => {
+                // Partial-load + INT8 isn't supported (the partial-load
+                // packing is column-major and the INT8 scales are
+                // per-tensor not per-column, so the dequant rounding
+                // would shift). Bail out cleanly so callers can fall
+                // back to the full-load path.
+                return Err(ExpertWeightsError::BufferTooSmall {
+                    have: bytes.len(),
+                    need: usize::MAX,
+                    d_model,
+                    d_ff,
+                });
             }
         };
         let gate_len = d_ff * m;
@@ -767,6 +891,25 @@ pub fn run_inference_f16(
     Ok((out, y))
 }
 
+/// INT8 counterpart of [`run_inference`]: dequantises the resident bytes
+/// (12-byte scale header + per-tensor symmetric `i8` weights) into an
+/// owned `Vec<f32>` (via [`OwnedExpertWeights::from_bytes_int8`]) and
+/// runs the same SwiGLU forward pass. Used when the on-disk dtype is
+/// [`WeightDtype::Int8`], **quartering** SSD bytes per expert read
+/// versus F32 — the dominant SSD-bandwidth optimisation in this engine.
+pub fn run_inference_int8(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = OwnedExpertWeights::from_bytes_int8(resident.data(), d_model, d_ff)?;
+    let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
 /// Partial-load counterpart of [`run_inference`]: reconstructs the
 /// expert from a packed-column blob (produced by `read_expert_columns`)
 /// and runs [`OwnedExpertWeights::forward_partial`].
@@ -792,28 +935,56 @@ pub fn run_inference_partial(
     Ok((out, y))
 }
 
-/// Fold the top-K expert outputs together. Mixtral / Llama-MoE actually
-/// take a **gated weighted sum** of expert outputs (the gate weights come
-/// from the router's softmax). Since this engine mocks the router we just
-/// average — the byte-for-byte path through every routed expert is what
-/// matters for the I/O story.
-pub fn combine_outputs(per_expert: &[HiddenState]) -> HiddenState {
-    if per_expert.is_empty() {
+/// Fold the top-K expert outputs together with a **softmax-gated weighted
+/// sum** — the standard Mixtral / Llama-MoE combiner:
+///
+/// ```text
+///   y = sum_i ( scores[i] * outputs[i] )
+/// ```
+///
+/// `scores` must already be normalised over the chosen top-K experts
+/// (the caller is responsible for the softmax + re-normalisation —
+/// [`crate::gating::LinearGate::route`] does it for the real-transformer
+/// path; the benchmark / synthetic path passes uniform `1/k` weights so
+/// behaviour is unchanged when no real gate weights are available).
+///
+/// `outputs` and `scores` must have the same length; if they're empty,
+/// the returned vector is empty (the caller is expected to handle that
+/// case — the real-transformer path filters out experts that failed to
+/// materialise on disk *from both* slices upstream so the weighted sum
+/// stays well-defined).
+pub fn combine_outputs(outputs: &[HiddenState], scores: &[f32]) -> HiddenState {
+    debug_assert_eq!(
+        outputs.len(),
+        scores.len(),
+        "combine_outputs: outputs and scores must have the same length"
+    );
+    if outputs.is_empty() {
         return Vec::new();
     }
-    let d = per_expert[0].len();
+    let d = outputs[0].len();
     let mut out = vec![0.0f32; d];
-    for vec in per_expert {
+    for (vec, &s) in outputs.iter().zip(scores.iter()) {
         debug_assert_eq!(vec.len(), d);
         for (o, v) in out.iter_mut().zip(vec.iter()) {
-            *o += *v;
+            *o += s * *v;
         }
     }
-    let inv = 1.0 / per_expert.len() as f32;
-    for o in out.iter_mut() {
-        *o *= inv;
-    }
     out
+}
+
+/// Helper: build a uniform `[1/k; k]` score vector for the synthetic /
+/// benchmark path that has no real gating network. With these scores the
+/// new [`combine_outputs`] reproduces the legacy "uniform average"
+/// behaviour exactly.
+#[inline]
+pub fn uniform_scores(k: usize) -> Vec<f32> {
+    if k == 0 {
+        Vec::new()
+    } else {
+        let s = 1.0 / k as f32;
+        vec![s; k]
+    }
 }
 
 #[cfg(test)]
@@ -934,11 +1105,86 @@ mod tests {
     }
 
     #[test]
-    fn combine_outputs_averages_correctly() {
+    fn combine_outputs_uniform_scores_averages() {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![3.0, 2.0, 1.0];
-        let c = combine_outputs(&[a, b]);
+        let c = combine_outputs(&[a, b], &uniform_scores(2));
         assert_eq!(c, vec![2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn from_bytes_int8_dequantizes_with_per_tensor_scales() {
+        // Build an INT8 expert blob by hand and verify dequantisation
+        // produces the expected f32 weights (within rounding).
+        let d_model = 4;
+        let d_ff = 4;
+        let count = expert_weight_count(d_model, d_ff);
+        // Use distinct scales per tensor so a bug that confuses them
+        // would visibly break the assertions.
+        let meta = Int8ExpertMeta {
+            gate_scale: 0.01,
+            up_scale: 0.02,
+            down_scale: 0.04,
+        };
+        let mut bytes = Vec::with_capacity(INT8_HEADER_BYTES + count);
+        bytes.extend_from_slice(&meta.to_bytes());
+        let gate_len = d_ff * d_model;
+        let up_len = d_ff * d_model;
+        let down_len = d_model * d_ff;
+        // Fill with deterministic int8 values.
+        for i in 0..gate_len {
+            bytes.push((((i as i32) % 7) - 3) as i8 as u8);
+        }
+        for i in 0..up_len {
+            bytes.push((((i as i32) % 5) - 2) as i8 as u8);
+        }
+        for i in 0..down_len {
+            bytes.push((((i as i32) % 9) - 4) as i8 as u8);
+        }
+        let w = OwnedExpertWeights::from_bytes_int8(&bytes, d_model, d_ff).unwrap();
+        // Spot-check: gate[0] = (0 % 7 - 3) * 0.01 = -0.03
+        assert!((w.gate[0] - (-0.03)).abs() < 1e-6);
+        assert!((w.up[0] - (-0.04)).abs() < 1e-6);
+        assert!((w.down[0] - (-0.16)).abs() < 1e-6);
+        // Forward must produce a finite vector (smoke test).
+        let x = vec![0.1; d_model];
+        let y = w.forward(&x);
+        assert_eq!(y.len(), d_model);
+        assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn int8_short_buffer_returns_error() {
+        let bytes = vec![0u8; INT8_HEADER_BYTES + 4]; // way too small
+        let res = OwnedExpertWeights::from_bytes_int8(&bytes, 8, 8);
+        assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
+    }
+
+    #[test]
+    fn combine_outputs_weighted_sum_uses_scores() {
+        let d = 4;
+        let outs = vec![vec![1.0; d], vec![2.0; d], vec![4.0; d]];
+        // 0.5*1 + 0.25*2 + 0.25*4 = 2.0
+        let scores = vec![0.5, 0.25, 0.25];
+        let y = combine_outputs(&outs, &scores);
+        for v in y {
+            assert!((v - 2.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn combine_outputs_empty_inputs() {
+        let y = combine_outputs(&[], &[]);
+        assert!(y.is_empty());
+    }
+
+    #[test]
+    fn uniform_scores_sums_to_one() {
+        let s = uniform_scores(4);
+        assert_eq!(s.len(), 4);
+        let sum: f32 = s.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert_eq!(uniform_scores(0), Vec::<f32>::new());
     }
 
     /// Build a `Vec<u8>` containing `expert_weight_count` weights as

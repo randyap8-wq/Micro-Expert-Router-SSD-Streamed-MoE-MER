@@ -164,6 +164,14 @@ pub struct MultiHeadSelfAttention {
     pub wk: Vec<f32>,
     pub wv: Vec<f32>,
     pub wo: Vec<f32>,
+    /// Sliding-window attention span (Mixtral default = 4096). When
+    /// `Some(w)`, each query position `pos` only attends to KV positions
+    /// in `[pos.saturating_sub(w - 1) ..= pos]`. The KV cache itself
+    /// still stores all positions (that's required for correctness as
+    /// the window slides forward); only the attention sum is restricted.
+    /// `None` recovers full causal attention (backward compatible
+    /// default used by every existing test).
+    pub window_size: Option<usize>,
 }
 
 impl MultiHeadSelfAttention {
@@ -202,16 +210,23 @@ impl MultiHeadSelfAttention {
 
         // 4) Scaled dot-product attention per head.
         //    GQA: head h queries KV head (h * num_kv_heads / num_heads).
+        //    Sliding window: when `self.window_size = Some(w)`, restrict
+        //    `t` to the most recent `w` positions.
         let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let t_max = kv.seq_len; // includes the position we just appended
+        let t_start = match self.window_size {
+            Some(w) if w > 0 => t_max.saturating_sub(w),
+            _ => 0,
+        };
         let mut attn_out = vec![0.0f32; self.q_dim()];
         for h in 0..self.num_heads {
             let kv_head = h * self.num_kv_heads / self.num_heads;
             let q_head = &q[h * self.head_dim..(h + 1) * self.head_dim];
 
-            // scores[t] = q · k_t * scale, for t in 0..=pos (causal).
-            let t_max = kv.seq_len; // includes the position we just appended
-            let mut scores = Vec::with_capacity(t_max);
-            for t in 0..t_max {
+            // scores[t] = q · k_t * scale, for t in [t_start, t_max).
+            let span = t_max - t_start;
+            let mut scores = Vec::with_capacity(span);
+            for t in t_start..t_max {
                 let k_t = kv.key(t);
                 let k_h = &k_t[kv_head * self.head_dim..(kv_head + 1) * self.head_dim];
                 let mut s = 0.0f32;
@@ -222,9 +237,10 @@ impl MultiHeadSelfAttention {
             }
             softmax_inplace(&mut scores);
 
-            // out[h] = sum_t scores[t] * v_t[kv_head]
+            // out[h] = sum_t scores[t-t_start] * v_t[kv_head]
             let out_h = &mut attn_out[h * self.head_dim..(h + 1) * self.head_dim];
-            for (t, score) in scores.iter().enumerate() {
+            for (idx, score) in scores.iter().enumerate() {
+                let t = t_start + idx;
                 let v_t = kv.value(t);
                 let v_h = &v_t[kv_head * self.head_dim..(kv_head + 1) * self.head_dim];
                 for j in 0..self.head_dim {
@@ -241,16 +257,17 @@ impl MultiHeadSelfAttention {
 /// Combine the per-token outputs of `k` selected experts using the gating
 /// scores. `outputs[i]` and `scores[i]` must be aligned (same expert).
 /// Scores must already be softmax-normalised over the chosen top-K set.
+///
+/// Thin wrapper over [`crate::inference::combine_outputs`] (the canonical
+/// MoE combiner) that ignores the redundant `d_model` argument; kept for
+/// backwards compatibility with `TransformerLayer::moe_combine`.
 pub fn combine_moe_outputs(outputs: &[HiddenState], scores: &[f32], d_model: usize) -> HiddenState {
-    debug_assert_eq!(outputs.len(), scores.len());
-    let mut y = vec![0.0f32; d_model];
-    for (out, &s) in outputs.iter().zip(scores.iter()) {
-        debug_assert_eq!(out.len(), d_model);
-        for (yi, &oi) in y.iter_mut().zip(out.iter()) {
-            *yi += s * oi;
-        }
-    }
-    y
+    debug_assert!(
+        outputs.iter().all(|o| o.len() == d_model),
+        "every expert output must have length d_model"
+    );
+    let _ = d_model;
+    crate::inference::combine_outputs(outputs, scores)
 }
 
 /// Run one expert FFN by reinterpreting its on-disk bytes (already loaded
@@ -280,6 +297,47 @@ pub fn run_expert_forward(
 pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
+    // Compile-time guard: `simd` and `blas` are mutually exclusive
+    // backend choices for this matmul. Building with both on at once
+    // is almost certainly a configuration mistake.
+    #[cfg(all(feature = "simd", feature = "blas"))]
+    compile_error!(
+        "cargo features `simd` and `blas` are mutually exclusive — pick one matmul backend"
+    );
+    #[cfg(feature = "blas")]
+    {
+        // BLAS-equivalent SGEMV via `matrixmultiply::sgemm`: treat the
+        // matrix-vector product as a `(rows × cols) × (cols × 1)`
+        // SGEMM. The crate's tuned microkernel (the same one used by
+        // `ndarray`'s `dot`) gives ~order-of-magnitude speedups over
+        // the scalar loop on AVX2 / NEON for the dense projections in
+        // `TransformerLayer`.
+        let mut y = vec![0.0f32; rows];
+        // Safety: matrixmultiply::sgemm is defined as taking pointers
+        // to row-major (m × k) and (k × n) matrices and writing into a
+        // row-major (m × n) output; we satisfy all aliasing and bounds
+        // requirements. `rsa` / `csa` etc. are the row/col strides for
+        // the three matrices; `1` everywhere selects row-major.
+        unsafe {
+            matrixmultiply::sgemm(
+                rows,
+                cols,
+                1,
+                1.0,
+                w.as_ptr(),
+                cols as isize,
+                1,
+                x.as_ptr(),
+                1,
+                1,
+                0.0,
+                y.as_mut_ptr(),
+                1,
+                1,
+            );
+        }
+        return y;
+    }
     #[cfg(feature = "simd")]
     {
         // Heuristic: only parallelise when the matrix is large enough
@@ -378,6 +436,21 @@ impl LMHead {
     /// Compute logits = `W · hidden`.
     pub fn forward(&self, hidden: &[f32]) -> Vec<f32> {
         matmul_row_major(&self.weights, hidden, self.vocab_size, self.d_model)
+    }
+
+    /// One-shot: project `hidden` to logits and sample a next-token id
+    /// using the given [`crate::sampling::SamplingParams`]. The
+    /// `position` is folded into the sampler's per-step seed so a
+    /// `(seed, position)` pair always yields the same token — see
+    /// `crate::sampling` for the deterministic-decode contract.
+    pub fn sample(
+        &self,
+        hidden: &[f32],
+        params: &crate::sampling::SamplingParams,
+        position: u64,
+    ) -> u32 {
+        let logits = self.forward(hidden);
+        crate::sampling::sample(&logits, params, position)
     }
 }
 
@@ -544,6 +617,7 @@ mod tests {
             wk: mk(kv_dim, d_model),
             wv: mk(kv_dim, d_model),
             wo: mk(d_model, q_dim),
+            window_size: None,
         };
         let mut kv = KvCache::new(kv_dim);
         let x: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32).collect();
@@ -624,6 +698,7 @@ mod tests {
                 wk: mk(kv_dim, d_model, 0.05),
                 wv: mk(kv_dim, d_model, 0.05),
                 wo: mk(d_model, q_dim, 0.05),
+                window_size: None,
             },
             rms_moe: RmsNorm::new(vec![1.0; d_model], 1e-6),
             gate: crate::gating::LinearGate::new(
@@ -676,6 +751,93 @@ mod tests {
         let y = layer.moe_combine(&hidden, &outs, &weights);
         for v in y {
             assert!((v - 2.5).abs() < 1e-6);
+        }
+    }
+
+    /// Build a tiny attention block with controllable window. Uses
+    /// identity-like Q/K projections so we can read the V contribution
+    /// of position 0 directly.
+    fn make_window_attn(window: Option<usize>) -> MultiHeadSelfAttention {
+        let d_model = 4;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        // Identity for q/k/v/o (vector of d_model^2 with diagonal 1.0).
+        let identity = |dim: usize| -> Vec<f32> {
+            let mut w = vec![0.0f32; dim * dim];
+            for i in 0..dim {
+                w[i * dim + i] = 1.0;
+            }
+            w
+        };
+        MultiHeadSelfAttention {
+            d_model,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base: 10000.0,
+            wq: identity(d_model),
+            wk: identity(d_model),
+            wv: identity(d_model),
+            wo: identity(d_model),
+            window_size: window,
+        }
+    }
+
+    /// With `window_size = Some(2)`, position 3 must NOT attend to
+    /// position 0 — the window covers only positions [2, 3]. The
+    /// attention output for a query whose key would otherwise dominate
+    /// at t=0 (a unique large signal there) must therefore *not* reflect
+    /// that signal once we step past the window.
+    #[test]
+    fn sliding_window_excludes_positions_outside_span() {
+        let attn = make_window_attn(Some(2));
+        let mut kv = KvCache::new(attn.kv_dim());
+        // Distinct token at position 0; the rest are ~zero.
+        let big = vec![10.0f32, 0.0, 0.0, 0.0];
+        let small = vec![0.0f32, 0.0, 0.0, 0.0];
+        let _ = attn.forward(&big, 0, &mut kv);
+        let _ = attn.forward(&small, 1, &mut kv);
+        let _ = attn.forward(&small, 2, &mut kv);
+        // At pos 3 with window 2 the visible KV span is [2, 3] → t=0 must
+        // not contribute. Output should reflect (mostly) the zero tokens.
+        let y = attn.forward(&small, 3, &mut kv);
+        // The big spike at t=0 had a 10.0 in dim 0; if we *were*
+        // attending to it the output's dim 0 would be > 1.0. With the
+        // window excluding t=0 it must stay near 0.
+        assert!(y[0].abs() < 1e-3, "leaked value from outside window: {y:?}");
+
+        // Sanity check: with full attention (window = None), the same
+        // pattern leaks the t=0 spike into the output (proves the
+        // fixture is non-degenerate).
+        let attn_full = make_window_attn(None);
+        let mut kv2 = KvCache::new(attn_full.kv_dim());
+        let _ = attn_full.forward(&big, 0, &mut kv2);
+        let _ = attn_full.forward(&small, 1, &mut kv2);
+        let _ = attn_full.forward(&small, 2, &mut kv2);
+        let y_full = attn_full.forward(&small, 3, &mut kv2);
+        assert!(y_full[0] > 0.5, "full attention should see t=0 spike: {y_full:?}");
+    }
+
+    #[test]
+    fn sliding_window_inside_span_behaves_like_full_attention() {
+        // For a window larger than the sequence, results must match
+        // unrestricted attention bit-for-bit.
+        let attn_w = make_window_attn(Some(10));
+        let attn_n = make_window_attn(None);
+        let mut kv1 = KvCache::new(attn_w.kv_dim());
+        let mut kv2 = KvCache::new(attn_n.kv_dim());
+        let xs = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        for (pos, x) in xs.iter().enumerate() {
+            let y_w = attn_w.forward(x, pos, &mut kv1);
+            let y_n = attn_n.forward(x, pos, &mut kv2);
+            for (a, b) in y_w.iter().zip(y_n.iter()) {
+                assert!((a - b).abs() < 1e-5);
+            }
         }
     }
 }

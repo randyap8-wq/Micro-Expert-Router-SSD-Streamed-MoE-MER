@@ -19,10 +19,59 @@ pub struct ServerConfig {
     /// Maximum tokens any one request is allowed to generate.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+
+    /// Idle TTL for KV-cache sessions, in seconds. `0` (default)
+    /// disables the persistent session store entirely (every request
+    /// is stateless, matching the legacy behaviour). When > 0,
+    /// requests carrying `"session_id": "<id>"` will resume from the
+    /// session's saved KV cache, and a background task evicts
+    /// sessions idle for longer than this many seconds.
+    #[serde(default)]
+    pub session_ttl_secs: u64,
 }
 
 fn default_bind() -> String { "127.0.0.1:8080".to_string() }
 fn default_max_tokens() -> usize { 256 }
+
+/// Server-wide sampling defaults. Each request can override these via
+/// the `temperature` / `top_p` / `top_k` / `seed` JSON fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingConfig {
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub top_k: usize,
+    #[serde(default)]
+    pub seed: u64,
+}
+
+fn default_temperature() -> f32 { 1.0 }
+fn default_top_p() -> f32 { 1.0 }
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: default_temperature(),
+            top_p: default_top_p(),
+            top_k: 0,
+            seed: 0,
+        }
+    }
+}
+
+impl SamplingConfig {
+    /// Convert to runtime [`crate::sampling::SamplingParams`].
+    pub fn to_params(&self) -> crate::sampling::SamplingParams {
+        crate::sampling::SamplingParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            seed: self.seed,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -182,6 +231,11 @@ pub struct RealTransformerConfig {
     /// arrive. Only takes effect when `enabled = true`.
     #[serde(default = "default_batch_timeout_ms")]
     pub batch_timeout_ms: u64,
+
+    /// Sliding-window attention span. `0` or omitted = full causal
+    /// attention (backward compatible). Mixtral uses `4096`.
+    #[serde(default)]
+    pub window_size: usize,
 }
 
 fn default_vocab_size() -> usize { 256 }
@@ -201,6 +255,8 @@ pub struct Config {
     pub tokenizer: TokenizerConfig,
     #[serde(default)]
     pub real_transformer: RealTransformerConfig,
+    #[serde(default)]
+    pub sampling: SamplingConfig,
 }
 
 impl Config {
@@ -328,7 +384,11 @@ mod tests {
 
     fn minimal_cfg() -> Config {
         Config {
-            server: ServerConfig { bind: "127.0.0.1:8080".into(), max_tokens: 64 },
+            server: ServerConfig {
+                bind: "127.0.0.1:8080".into(),
+                max_tokens: 64,
+                session_ttl_secs: 0,
+            },
             model: ModelConfig {
                 data_dir: PathBuf::from("./data"),
                 num_experts: 8,
@@ -350,6 +410,7 @@ mod tests {
             },
             tokenizer: TokenizerConfig::default(),
             real_transformer: RealTransformerConfig::default(),
+            sampling: SamplingConfig::default(),
         }
     }
 

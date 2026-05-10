@@ -43,6 +43,8 @@ pub struct StepRequest {
     /// scheduler so the decoder step can mutate it without aliasing
     /// other requests' state.
     pub kv: Vec<KvCache>,
+    /// Per-request sampling parameters (temperature/top-p/top-k/seed).
+    pub params: crate::sampling::SamplingParams,
     /// Channel used by the scheduler to return the next-token id and
     /// the (now-grown) KV cache.
     pub resp: oneshot::Sender<StepResponse>,
@@ -112,9 +114,10 @@ impl BatchScheduler {
         token_id: u32,
         pos: usize,
         kv: Vec<KvCache>,
+        params: crate::sampling::SamplingParams,
     ) -> Result<StepResponse, BatchError> {
         let (tx, rx) = oneshot::channel();
-        let req = StepRequest { token_id, pos, kv, resp: tx };
+        let req = StepRequest { token_id, pos, kv, params, resp: tx };
         self.tx.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
         rx.await.map_err(|_| BatchError::SchedulerClosed)
     }
@@ -186,7 +189,9 @@ async fn scheduler_loop(
             let model = model.clone();
             let engine = engine.clone();
             handles.push(tokio::spawn(async move {
-                let next = model.step(&engine, req.token_id, req.pos, &mut req.kv).await;
+                let next = model
+                    .step(&engine, req.token_id, req.pos, &mut req.kv, &req.params)
+                    .await;
                 let _ = req.resp.send(StepResponse {
                     next_token: next,
                     kv: req.kv,
@@ -277,7 +282,7 @@ mod tests {
         let cfg = RealModelConfig {
             vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
             head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
-            rope_base: 10_000.0, rms_eps: 1e-6,
+            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
         let sched = BatchScheduler::spawn(
@@ -287,10 +292,10 @@ mod tests {
         );
 
         let mut kv_a = model.fresh_kv_caches();
-        let direct = model.step(&engine, 7, 0, &mut kv_a).await;
+        let direct = model.step(&engine, 7, 0, &mut kv_a, &crate::sampling::SamplingParams::greedy()).await;
 
         let kv_b = model.fresh_kv_caches();
-        let resp = sched.step(7, 0, kv_b).await.unwrap();
+        let resp = sched.step(7, 0, kv_b, crate::sampling::SamplingParams::greedy()).await.unwrap();
         assert_eq!(direct, resp.next_token, "scheduler must be functionally identical to model.step");
     }
 
@@ -304,7 +309,7 @@ mod tests {
         let cfg = RealModelConfig {
             vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
             head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
-            rope_base: 10_000.0, rms_eps: 1e-6,
+            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
 
@@ -317,7 +322,7 @@ mod tests {
             let mut kv = model.fresh_kv_caches();
             let mut last = 7u32;
             for pos in 0..TOKENS {
-                last = model.step(&engine, last, pos, &mut kv).await;
+                last = model.step(&engine, last, pos, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
             }
         }
         let sequential = seq_start.elapsed();
@@ -337,7 +342,7 @@ mod tests {
                 let mut kv = kv0;
                 let mut last = 7u32;
                 for pos in 0..TOKENS {
-                    let resp = sched.step(last, pos, kv).await.unwrap();
+                    let resp = sched.step(last, pos, kv, crate::sampling::SamplingParams::greedy()).await.unwrap();
                     last = resp.next_token;
                     kv = resp.kv;
                 }

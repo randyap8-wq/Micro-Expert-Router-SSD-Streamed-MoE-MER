@@ -16,7 +16,8 @@
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::inference::{
-    combine_outputs, run_inference, run_inference_f16, synth_hidden_state, HiddenState,
+    combine_outputs, run_inference, run_inference_f16, run_inference_int8, synth_hidden_state,
+    uniform_scores, HiddenState,
     InferenceOutput, WeightDtype,
 };
 use crate::io_provider::NvmeStorage;
@@ -361,6 +362,7 @@ impl Engine {
                 let res = match self.options.dtype {
                     WeightDtype::F32 => run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
                     WeightDtype::F16 => run_inference_f16(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::Int8 => run_inference_int8(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
                 };
                 match res {
                     Ok((out, y)) => {
@@ -377,7 +379,12 @@ impl Engine {
                     }
                 }
             }
-            let combined = combine_outputs(&per_expert_y);
+            // Synthetic / benchmark path has no real gating network, so
+            // weight every routed expert uniformly (`1/k`) — that matches
+            // the legacy averaging behaviour bit-for-bit while flowing
+            // through the new softmax-gated combiner signature.
+            let scores = uniform_scores(per_expert_y.len());
+            let combined = combine_outputs(&per_expert_y, &scores);
             let us = compute_start.elapsed().as_micros() as u64;
             debug!(
                 token = token_idx,
@@ -612,6 +619,7 @@ impl Engine {
             let res = match self.options.dtype {
                 WeightDtype::F32 => run_inference(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
                 WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
             };
             match res {
                 Ok((_out, y)) => per_expert_y.push(y),
