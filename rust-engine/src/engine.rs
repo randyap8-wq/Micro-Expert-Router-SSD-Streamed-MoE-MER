@@ -50,8 +50,20 @@ pub struct PredictiveTelemetry {
     pub speculator_hits: u64,
     pub speculator_misses: u64,
     /// `speculator_hits / (speculator_hits + speculator_misses)`, or
-    /// `0.0` when neither has fired.
+    /// `0.0` when neither has fired. This is the **top-K overlap**
+    /// accuracy and is preserved for backwards compatibility — the
+    /// design spec's "speculator accuracy" is the top-1 metric below.
     pub speculator_accuracy: f64,
+    /// Cumulative count of tokens for which the speculator's **top-1**
+    /// prediction matched the gate's actual top-1 routed expert.
+    /// Mirrors the `mer_speculator_accuracy_total` Prometheus counter.
+    pub speculator_top1_matches: u64,
+    /// Total tokens for which the speculator was invoked (the
+    /// denominator of the top-1 accuracy ratio).
+    pub speculator_top1_total: u64,
+    /// `speculator_top1_matches / speculator_top1_total`, or `0.0`
+    /// when the speculator has not been invoked yet.
+    pub speculator_top1_accuracy: f64,
     pub locality_hits: u64,
     pub locality_misses: u64,
     /// `locality_hits / (locality_hits + locality_misses)`, or `0.0`
@@ -205,6 +217,10 @@ pub struct Engine {
     spec_hits: AtomicU64,
     /// Cumulative speculator miss count.
     spec_misses: AtomicU64,
+    /// Cumulative count of tokens for which the speculator's **top-1**
+    /// prediction matched the gate's actual top-1 routed expert.
+    /// Mirrors the `mer_speculator_accuracy_total` Prometheus counter.
+    spec_top1_matches: AtomicU64,
     /// Cumulative locality-hit count (target experts that were already
     /// in the locality monitor's hot set at routing time).
     locality_hits: AtomicU64,
@@ -273,6 +289,7 @@ impl Engine {
             total_ssd_stall_us: AtomicU64::new(0),
             spec_hits: AtomicU64::new(0),
             spec_misses: AtomicU64::new(0),
+            spec_top1_matches: AtomicU64::new(0),
             locality_hits: AtomicU64::new(0),
             locality_misses: AtomicU64::new(0),
         }
@@ -771,8 +788,19 @@ impl Engine {
         if misses > 0 {
             self.spec_misses.fetch_add(misses, Ordering::Relaxed);
         }
+        // Top-1 accuracy: 1 if the speculator's #1 expert matches the
+        // gate's #1 expert for this token, 0 otherwise. This is the
+        // counter the design spec calls `mer_speculator_accuracy_total`.
+        let top1_match: u64 = match (preds.first(), target.first()) {
+            (Some(&p), Some(&t)) if p == t => 1,
+            _ => 0,
+        };
+        if top1_match > 0 {
+            self.spec_top1_matches.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(m) = &self.metrics {
             m.record_speculator(hits, misses);
+            m.record_speculator_top1(top1_match);
         }
         // Online SGD step against the *actual* gate decision.
         let _loss = spec.train_step(x, target, NeuralSpeculator::DEFAULT_LR);
@@ -827,10 +855,22 @@ impl Engine {
     pub fn predictive_telemetry(&self) -> PredictiveTelemetry {
         let s_hits = self.spec_hits.load(Ordering::Relaxed);
         let s_misses = self.spec_misses.load(Ordering::Relaxed);
+        let s_top1 = self.spec_top1_matches.load(Ordering::Relaxed);
         let l_hits = self.locality_hits.load(Ordering::Relaxed);
         let l_misses = self.locality_misses.load(Ordering::Relaxed);
         let s_total = s_hits + s_misses;
         let l_total = l_hits + l_misses;
+        // The number of top-1 observations equals the number of tokens
+        // for which the speculator was invoked, which is the same as
+        // the number of tokens that contributed to (s_hits + s_misses)
+        // divided by `speculator_topk` — every speculator call records
+        // exactly `speculator_topk` predictions into the hit/miss
+        // counters. Use that to recover the per-token denominator.
+        let s_top1_total = if self.speculator_topk == 0 {
+            0
+        } else {
+            s_total / self.speculator_topk as u64
+        };
         PredictiveTelemetry {
             speculator_hits: s_hits,
             speculator_misses: s_misses,
@@ -838,6 +878,13 @@ impl Engine {
                 0.0
             } else {
                 s_hits as f64 / s_total as f64
+            },
+            speculator_top1_matches: s_top1,
+            speculator_top1_total: s_top1_total,
+            speculator_top1_accuracy: if s_top1_total == 0 {
+                0.0
+            } else {
+                s_top1 as f64 / s_top1_total as f64
             },
             locality_hits: l_hits,
             locality_misses: l_misses,

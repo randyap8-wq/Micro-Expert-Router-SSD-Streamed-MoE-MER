@@ -1404,6 +1404,7 @@ mod tests {
             crate::batch_scheduler::BatchConfig {
                 max_batch_size: 4,
                 batch_timeout: std::time::Duration::from_millis(2),
+                ..Default::default()
             },
         ));
         let state = AppState {
