@@ -48,11 +48,14 @@ pub struct SessionState {
     /// generate (i.e. `kv[*].seq_len` for any layer; we track it
     /// explicitly so a future request can pick up regardless of how
     /// the KV cache is laid out internally).
+    ///
+    /// On resume, the next request's prompt tokens are fed in starting
+    /// at this position so RoPE indices and KV slots line up with what
+    /// the prior turn already wrote. The "last token to feed into the
+    /// next step" is implicit: every request carries its own prompt,
+    /// and the new prompt's last token is what seeds the first
+    /// generated token of the new turn.
     pub position: usize,
-    /// Last token id observed in this session (the value to feed
-    /// into `RealModel::step` for the first generated token of the
-    /// next turn).
-    pub last_token: u32,
     /// When this session was last touched. Updated on every
     /// successful `take` / `put` round-trip.
     pub last_used: Instant,
@@ -60,7 +63,7 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(kv: Vec<KvCache>) -> Self {
-        Self { kv, position: 0, last_token: 0, last_used: Instant::now() }
+        Self { kv, position: 0, last_used: Instant::now() }
     }
 }
 
@@ -178,12 +181,10 @@ mod tests {
         let store = SessionStore::new(Duration::from_secs(60));
         let mut s = SessionState::new(fake_kv());
         s.position = 4;
-        s.last_token = 99;
         store.put("alice".to_string(), s);
         assert_eq!(store.len(), 1);
         let back = store.take("alice").expect("session must exist");
         assert_eq!(back.position, 4);
-        assert_eq!(back.last_token, 99);
         // Take is destructive.
         assert!(store.take("alice").is_none());
         assert_eq!(store.len(), 0);

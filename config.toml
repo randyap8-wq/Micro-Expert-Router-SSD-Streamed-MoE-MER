@@ -18,6 +18,38 @@ bind = "127.0.0.1:8080"
 # Hard cap on the `max_tokens` any single request can ask for. Requests
 # asking for more are silently clamped to this value.
 max_tokens = 256
+# Idle TTL (seconds) for KV-cache sessions. `0` (default) disables the
+# session store entirely — every request is fully stateless. When > 0,
+# requests that include `"session_id": "<id>"` resume from the saved
+# per-layer KV cache (multi-turn chat without re-running attention over
+# the entire history), and a background task evicts sessions that
+# haven't been touched in this many seconds. Use the
+# `DELETE /v1/sessions/{id}` endpoint to purge a session explicitly.
+session_ttl_secs = 0
+
+[sampling]
+# Server-wide defaults for the next-token sampler. Each request can
+# override any of these via the OpenAI-style JSON fields
+# (`temperature`, `top_p`, `top_k`, `seed`).
+#
+# `temperature = 0.0` (or any non-positive value) forces greedy
+# `argmax` sampling — bit-for-bit reproducible regardless of the other
+# knobs. This matches how OpenAI / vLLM treat "deterministic"
+# sampling, and is the right default for benchmarks / regression tests
+# where every change to throughput should leave the output text
+# unchanged.
+temperature = 0.0
+# Nucleus (top-P) cumulative-mass cutoff. `1.0` disables the
+# truncation; `0.9` keeps the smallest set of tokens whose cumulative
+# softmax probability is `>= 0.9`.
+top_p = 1.0
+# Top-K truncation. `0` disables; combined with `top_p`, the more
+# restrictive of the two takes effect.
+top_k = 0
+# Sampling RNG seed. Combined with the absolute token position via
+# splitmix64, so the same `(prompt, seed, max_tokens)` triple produces
+# the same completion bit-for-bit even at `temperature > 0`.
+seed = 0
 
 [model]
 # Directory containing `expert_<id>.bin` files (and optionally
