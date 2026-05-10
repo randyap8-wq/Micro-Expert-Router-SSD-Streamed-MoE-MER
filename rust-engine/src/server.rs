@@ -6,12 +6,15 @@
 //! - `GET  /health`              — liveness
 //! - `GET  /metrics`             — Prometheus metrics
 //!
-//! The server is intentionally **stateless per request**: each request
-//! drives the existing [`crate::engine::Engine`] for `max_tokens` token
-//! cycles. The engine in turn uses the SSD-streaming expert cache as
-//! before — that's the whole point of this codebase. Continuous batching
-//! is *not* implemented in this PR (gist Phase 7); the simple per-request
-//! generator is the foundation a batched scheduler can be added on top of.
+//! The server is stateless per request at the HTTP layer, but the
+//! real-transformer path routes per-token decoder steps through a
+//! shared [`crate::batch_scheduler::BatchScheduler`]: an `mpsc`-fed
+//! background task fuses concurrent requests' steps into a single
+//! batch (up to `max_batch_size` or `batch_timeout_ms`) and runs them
+//! concurrently against the shared engine, so multiple HTTP clients
+//! amortise each round of SSD-streamed expert FFN compute. Per-request
+//! KV caches are moved into the scheduler and back, so attention state
+//! stays strictly per-request.
 //!
 //! Generation strategy: the synthesised hidden state from
 //! [`crate::inference::synth_hidden_state`] drives one
@@ -22,6 +25,7 @@
 //! pieces), this loop swaps to producing real next-token logits — the
 //! HTTP shape doesn't change.
 
+use crate::batch_scheduler::BatchScheduler;
 use crate::engine::Engine;
 use crate::metrics::Metrics;
 use crate::model::RealModel;
@@ -57,6 +61,14 @@ pub struct AppState {
     /// SSD-streamed expert FFN compute either way, so cache / I/O
     /// metrics are populated identically).
     pub real_model: Option<Arc<RealModel>>,
+    /// Optional continuous-batching scheduler. Always set together
+    /// with `real_model` (see `cmd_serve` in `main.rs`); when `Some`,
+    /// the real-transformer generation paths submit each per-token
+    /// step to the scheduler instead of calling `RealModel::step`
+    /// directly. The scheduler fuses concurrent requests' steps into a
+    /// single batch so multiple HTTP clients share each round of
+    /// SSD-streamed expert FFN compute.
+    pub batch_scheduler: Option<Arc<BatchScheduler>>,
 }
 
 /// Build the axum [`Router`] for the API.
@@ -350,11 +362,12 @@ async fn generate(
 
     if let Some(model) = state.real_model.as_ref() {
         // Per-request KV caches: one full set per request, so concurrent
-        // axum requests never alias each other's attention state. (This
-        // is the foundational "request scheduler" piece — token-level
-        // cross-request batching can be layered on top by sharing the
-        // engine across requests but keeping KV per request, which is
-        // already what happens here.)
+        // axum requests never alias each other's attention state.
+        // When a [`BatchScheduler`] is configured (the production path),
+        // every per-token step is submitted to it so the engine fuses
+        // concurrent requests into shared SSD-streamed decoder steps.
+        // When no scheduler is set (e.g. unit tests), we fall back to
+        // calling `RealModel::step` directly.
         let mut kv = model.fresh_kv_caches();
         let pre_hits = state.engine.report().hits;
         let pre_misses = state.engine.report().misses;
@@ -365,14 +378,14 @@ async fn generate(
         // model's predictions of the *next* prompt token, not part of
         // the completion.
         for (pos, &tid) in prompt_ids.iter().enumerate() {
-            let _ = model.step(&state.engine, tid, pos, &mut kv).await;
+            let _ = step_through_scheduler(state, model, tid, pos, &mut kv).await;
         }
 
         // Now generate `max_tokens` real tokens.
         let mut last = *prompt_ids.last().unwrap_or(&0u32);
         for i in 0..max_tokens {
             let pos = prompt_ids.len() + i;
-            let next = model.step(&state.engine, last, pos, &mut kv).await;
+            let next = step_through_scheduler(state, model, last, pos, &mut kv).await;
             completion_ids.push(next);
             last = next;
         }
@@ -426,7 +439,44 @@ async fn generate(
     })
 }
 
-// --------------------- streaming generation -------------------------
+// ------------------------ scheduler helper --------------------------
+
+/// Drive one decoder step for a single request, routing through the
+/// [`BatchScheduler`] when one is configured and falling back to a
+/// direct `RealModel::step` otherwise. The KV cache is moved into the
+/// scheduler and back so attention state stays strictly per-request
+/// even though many requests share the underlying scheduler task.
+async fn step_through_scheduler(
+    state: &AppState,
+    model: &Arc<RealModel>,
+    token_id: u32,
+    pos: usize,
+    kv: &mut Vec<crate::transformer::KvCache>,
+) -> u32 {
+    if let Some(sched) = state.batch_scheduler.as_ref() {
+        // Move the KV cache through the scheduler. `mem::take` leaves
+        // an empty Vec in its place; the response brings the (now-
+        // grown) Vec back. If the scheduler has shut down (server
+        // teardown) we fall back to a direct call against a freshly
+        // allocated KV cache so the request can finish — losing
+        // history is the price of a clean shutdown path here.
+        let owned = std::mem::take(kv);
+        match sched.step(token_id, pos, owned).await {
+            Ok(resp) => {
+                *kv = resp.kv;
+                resp.next_token
+            }
+            Err(_) => {
+                *kv = model.fresh_kv_caches();
+                model.step(&state.engine, token_id, pos, kv).await
+            }
+        }
+    } else {
+        model.step(&state.engine, token_id, pos, kv).await
+    }
+}
+
+// ----------------------- generation helpers --------------------------
 
 /// One streamed completion chunk. Mirrors OpenAI's `text_completion` SSE
 /// event shape so any OpenAI-compatible client can consume it.
@@ -513,7 +563,7 @@ async fn stream_tokens(
         // Prime the KV cache with the prompt tokens (same as `generate`).
         let mut kv = model.fresh_kv_caches();
         for (pos, &tid) in prompt_ids.iter().enumerate() {
-            let _ = model.step(&state.engine, tid, pos, &mut kv).await;
+            let _ = step_through_scheduler(&state, model, tid, pos, &mut kv).await;
         }
         GenMode::Real {
             kv,
@@ -572,7 +622,7 @@ async fn stream_tokens(
                     .real_model
                     .as_ref()
                     .expect("Real mode requires real_model");
-                let n = model.step(&st.state.engine, *last_token, *position, kv).await;
+                let n = step_through_scheduler(&st.state, model, *last_token, *position, kv).await;
                 *last_token = n;
                 *position += 1;
                 n
@@ -925,6 +975,7 @@ mod tests {
             metrics: Metrics::new(),
             max_tokens_cap: 32,
             real_model: None,
+            batch_scheduler: None,
         };
         (state, dir)
     }
@@ -1163,12 +1214,21 @@ mod tests {
             EngineOptions::default(),
         ));
         let model = Arc::new(crate::model::RealModel::new_seeded(cfg.clone(), 0xBEEF));
+        let scheduler = Arc::new(crate::batch_scheduler::BatchScheduler::spawn(
+            model.clone(),
+            engine.clone(),
+            crate::batch_scheduler::BatchConfig {
+                max_batch_size: 4,
+                batch_timeout: std::time::Duration::from_millis(2),
+            },
+        ));
         let state = AppState {
             engine,
             tokenizer: Arc::new(Tokenizer::bytes()),
             metrics: Metrics::new(),
             max_tokens_cap: 16,
             real_model: Some(model),
+            batch_scheduler: Some(scheduler),
         };
         (state, dir)
     }
