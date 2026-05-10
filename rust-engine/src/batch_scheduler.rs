@@ -23,12 +23,20 @@
 //! `Arc`s, so multiple `moe_step` calls from sibling tasks are safe;
 //! see [`crate::engine`] for details.
 
+use crate::block_pool::{BlockManager, BlockPool};
 use crate::engine::Engine;
 use crate::model::RealModel;
 use crate::transformer::KvCache;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+// Re-export the block-pool types so HTTP handlers and tests can build
+// `BlockManager`s directly off the scheduler's shared pool without
+// taking an additional dependency on the `block_pool` module path.
+#[allow(unused_imports)]
+pub use crate::block_pool::{BlockAllocError, BlockId, BlockManager as PooledBlockManager,
+    BlockPool as PooledBlockPool, POOL_BLOCK_TOKENS};
 
 /// One "give me the next token" request issued by an in-flight HTTP
 /// generation future. The KV cache is moved into the scheduler each
@@ -65,6 +73,17 @@ pub struct BatchConfig {
     /// How long the scheduler waits for additional requests to arrive
     /// after the first one before flushing the current batch.
     pub batch_timeout: Duration,
+    /// Optional shared physical [`PooledBlockPool`] sizing. When
+    /// `block_pool_capacity > 0` and `block_pool_kv_dim > 0`, the
+    /// scheduler will own a single pool of that many blocks and
+    /// expose it via [`BatchScheduler::block_pool`] so HTTP handlers
+    /// can hand out a [`BlockManager`] per request from a *single*
+    /// pre-allocated slab. This is the implementation of the
+    /// "Refactor the KV-Cache to a Paged System" task in the design
+    /// spec; the existing per-request [`KvCache`] path keeps working
+    /// for backwards compatibility.
+    pub block_pool_capacity: usize,
+    pub block_pool_kv_dim: usize,
 }
 
 impl Default for BatchConfig {
@@ -72,6 +91,8 @@ impl Default for BatchConfig {
         Self {
             max_batch_size: 8,
             batch_timeout: Duration::from_millis(5),
+            block_pool_capacity: 0,
+            block_pool_kv_dim: 0,
         }
     }
 }
@@ -82,6 +103,12 @@ impl Default for BatchConfig {
 pub struct BatchScheduler {
     tx: mpsc::Sender<StepRequest>,
     cfg: BatchConfig,
+    /// Optional shared physical pool for paged KV caches. Populated
+    /// when [`BatchConfig::block_pool_capacity`] and
+    /// [`BatchConfig::block_pool_kv_dim`] are both non-zero. Cloned
+    /// `Arc`s are cheap, so handing one out to every HTTP request
+    /// imposes no real cost.
+    block_pool: Option<Arc<BlockPool>>,
 }
 
 impl BatchScheduler {
@@ -100,11 +127,32 @@ impl BatchScheduler {
         let depth = cfg.max_batch_size.saturating_mul(4).max(8);
         let (tx, rx) = mpsc::channel::<StepRequest>(depth);
         tokio::spawn(scheduler_loop(model, engine, cfg, rx));
-        Self { tx, cfg }
+        let block_pool = if cfg.block_pool_capacity > 0 && cfg.block_pool_kv_dim > 0 {
+            Some(BlockPool::new(cfg.block_pool_kv_dim, cfg.block_pool_capacity))
+        } else {
+            None
+        };
+        Self { tx, cfg, block_pool }
     }
 
     /// Configuration the scheduler was built with.
     pub fn config(&self) -> BatchConfig { self.cfg }
+
+    /// Shared physical block pool, if one is configured. Returns
+    /// `None` when the scheduler was built without a paged-cache
+    /// budget (the default).
+    pub fn block_pool(&self) -> Option<Arc<BlockPool>> {
+        self.block_pool.clone()
+    }
+
+    /// Convenience: allocate a per-request [`BlockManager`] backed by
+    /// the scheduler's shared pool. Returns `None` when the scheduler
+    /// was built without a paged-cache budget. The caller owns the
+    /// returned manager; on `Drop` it will release every block back
+    /// to the pool.
+    pub fn new_block_manager(&self) -> Option<BlockManager> {
+        self.block_pool.clone().map(BlockManager::new)
+    }
 
     /// Submit one decoder step. Returns the next-token id and the
     /// (mutated) KV cache. The scheduler may fuse this call with other
@@ -288,7 +336,7 @@ mod tests {
         let sched = BatchScheduler::spawn(
             model.clone(),
             engine.clone(),
-            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2) },
+            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2), ..Default::default() },
         );
 
         let mut kv_a = model.fresh_kv_caches();
@@ -331,7 +379,7 @@ mod tests {
         let sched = BatchScheduler::spawn(
             model.clone(),
             engine.clone(),
-            BatchConfig { max_batch_size: N, batch_timeout: Duration::from_millis(5) },
+            BatchConfig { max_batch_size: N, batch_timeout: Duration::from_millis(5), ..Default::default() },
         );
         let batched_start = Instant::now();
         let mut handles = Vec::new();

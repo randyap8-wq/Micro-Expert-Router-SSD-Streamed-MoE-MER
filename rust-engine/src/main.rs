@@ -7,6 +7,7 @@
 
 mod aligned_buffer;
 mod batch_scheduler;
+mod block_pool;
 mod buffer_pool;
 mod config;
 mod engine;
@@ -512,6 +513,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let batch_cfg = crate::batch_scheduler::BatchConfig {
             max_batch_size: rt.max_batch_size,
             batch_timeout: std::time::Duration::from_millis(rt.batch_timeout_ms),
+            ..Default::default()
         };
         let scheduler = crate::batch_scheduler::BatchScheduler::spawn(
             model_arc.clone(),

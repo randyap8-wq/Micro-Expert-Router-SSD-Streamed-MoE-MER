@@ -36,6 +36,12 @@ struct MetricsInner {
     pub speculator_hits_total: Counter,
     /// Speculator predictions that did **not** intersect the gate's actual top-K.
     pub speculator_misses_total: Counter,
+    /// Tokens for which the speculator's **top-1** prediction matched
+    /// the actual top-1 routed expert. The "Omniscient Predictive
+    /// Architecture" design spec calls this counter
+    /// `mer_speculator_accuracy_total` and uses it as the primary
+    /// quality signal for the predictive controller.
+    pub speculator_accuracy_total: Counter,
     /// Activations whose chosen expert was already in the locality
     /// monitor's hot set at the time of routing.
     pub locality_hits_total: Counter,
@@ -112,6 +118,12 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_speculator_misses_total");
+        let speculator_accuracy_total = register_counter_with_registry!(
+            "mer_speculator_accuracy_total",
+            "Tokens for which the neural speculator's top-1 prediction matched the gate's actual top-1 routed expert.",
+            registry
+        )
+        .expect("metric registration: mer_speculator_accuracy_total");
         let locality_hits_total = register_counter_with_registry!(
             "mer_locality_hits_total",
             "Routed activations whose chosen expert was in the locality monitor's hot set.",
@@ -144,6 +156,7 @@ impl Metrics {
                 io_wait_seconds,
                 speculator_hits_total,
                 speculator_misses_total,
+                speculator_accuracy_total,
                 locality_hits_total,
                 locality_misses_total,
                 ssd_stall_seconds,
@@ -181,6 +194,18 @@ impl Metrics {
         }
         if misses > 0 {
             self.inner.speculator_misses_total.inc_by(misses as f64);
+        }
+    }
+
+    /// Record one token's worth of **top-1** speculator accuracy.
+    /// Pass `1` if the speculator's highest-logit expert matched the
+    /// gate's actual top-1 routed expert for this token, `0` otherwise.
+    /// Increments `mer_speculator_accuracy_total` by `top1_match`.
+    pub fn record_speculator_top1(&self, top1_match: u64) {
+        if top1_match > 0 {
+            self.inner
+                .speculator_accuracy_total
+                .inc_by(top1_match as f64);
         }
     }
 
@@ -222,6 +247,7 @@ mod tests {
         m.record_cache(3, 1);
         m.record_io_wait(0.002);
         m.record_speculator(7, 3);
+        m.record_speculator_top1(1);
         m.record_locality(5, 2);
         m.record_ssd_stall(0.0005);
         let body = String::from_utf8(m.render().unwrap()).unwrap();
@@ -234,6 +260,7 @@ mod tests {
             "mer_io_wait_seconds",
             "mer_speculator_hits_total",
             "mer_speculator_misses_total",
+            "mer_speculator_accuracy_total",
             "mer_locality_hits_total",
             "mer_locality_misses_total",
             "mer_ssd_stall_seconds",

@@ -486,6 +486,41 @@ pub fn generate_synthetic_experts_with_dtype(
                 f.write_all(&block_bytes)?;
                 floats_remaining = floats_remaining.saturating_sub(n);
             }
+        } else if matches!(dtype, WeightDtype::Q4_0) {
+            // Q4_0 writes per-block (18 bytes for 32 weights), per-tensor.
+            // Each of gate / up / down is rounded up to a 32-weight
+            // boundary independently to match
+            // [`expert_weight_bytes_for(_, _, Q4_0)`] and
+            // [`OwnedExpertWeights::from_bytes_q4_0`].
+            use crate::inference::{quantize_q4_0_block, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS};
+            let mut block_floats = vec![0.0f32; Q4_0_BLOCK_ELEMS];
+            let mut block_bytes = vec![0u8; Q4_0_BLOCK_BYTES];
+            // Three tensors of `d_model * d_ff` weights each.
+            let one = d_model.saturating_mul(d_ff);
+            for _tensor in 0..3 {
+                let mut t_remaining = one;
+                while t_remaining > 0 {
+                    let n = t_remaining.min(Q4_0_BLOCK_ELEMS);
+                    for slot in block_floats.iter_mut().take(n) {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let u = (state >> 40) as u32;
+                        let unit = (u as f32) / ((1u32 << 23) as f32) - 1.0;
+                        *slot = unit * scale;
+                    }
+                    for slot in block_floats.iter_mut().skip(n) {
+                        *slot = 0.0;
+                    }
+                    quantize_q4_0_block(&block_floats[..Q4_0_BLOCK_ELEMS], &mut block_bytes);
+                    f.write_all(&block_bytes)?;
+                    t_remaining = t_remaining.saturating_sub(n);
+                }
+            }
+            // The per-weight loop below writes nothing because
+            // floats_remaining was set assuming the per-weight format;
+            // null it out so we don't double-write.
+            floats_remaining = 0;
         } else {
             let bpw = dtype.bytes_per_weight();
             let mut buf = Vec::<u8>::with_capacity(chunk_floats * bpw);
@@ -515,6 +550,7 @@ pub fn generate_synthetic_experts_with_dtype(
                             buf.push(qv as u8);
                         }
                         WeightDtype::Q4K => unreachable!("Q4K handled above"),
+                        WeightDtype::Q4_0 => unreachable!("Q4_0 handled above"),
                     }
                 }
                 f.write_all(&buf)?;

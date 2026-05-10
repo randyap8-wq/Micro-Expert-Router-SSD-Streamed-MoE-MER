@@ -16,7 +16,8 @@
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::inference::{
-    combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4k, synth_hidden_state,
+    combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4_0,
+    run_inference_q4k, synth_hidden_state,
     uniform_scores, HiddenState,
     InferenceOutput, WeightDtype,
 };
@@ -49,8 +50,20 @@ pub struct PredictiveTelemetry {
     pub speculator_hits: u64,
     pub speculator_misses: u64,
     /// `speculator_hits / (speculator_hits + speculator_misses)`, or
-    /// `0.0` when neither has fired.
+    /// `0.0` when neither has fired. This is the **top-K overlap**
+    /// accuracy and is preserved for backwards compatibility — the
+    /// design spec's "speculator accuracy" is the top-1 metric below.
     pub speculator_accuracy: f64,
+    /// Cumulative count of tokens for which the speculator's **top-1**
+    /// prediction matched the gate's actual top-1 routed expert.
+    /// Mirrors the `mer_speculator_accuracy_total` Prometheus counter.
+    pub speculator_top1_matches: u64,
+    /// Total tokens for which the speculator was invoked (the
+    /// denominator of the top-1 accuracy ratio).
+    pub speculator_top1_total: u64,
+    /// `speculator_top1_matches / speculator_top1_total`, or `0.0`
+    /// when the speculator has not been invoked yet.
+    pub speculator_top1_accuracy: f64,
     pub locality_hits: u64,
     pub locality_misses: u64,
     /// `locality_hits / (locality_hits + locality_misses)`, or `0.0`
@@ -204,6 +217,13 @@ pub struct Engine {
     spec_hits: AtomicU64,
     /// Cumulative speculator miss count.
     spec_misses: AtomicU64,
+    /// Cumulative count of tokens for which the speculator's **top-1**
+    /// prediction matched the gate's actual top-1 routed expert.
+    /// Mirrors the `mer_speculator_accuracy_total` Prometheus counter.
+    spec_top1_matches: AtomicU64,
+    /// Cumulative count of tokens for which the speculator was
+    /// invoked. Denominator of the top-1 accuracy ratio.
+    spec_tokens: AtomicU64,
     /// Cumulative locality-hit count (target experts that were already
     /// in the locality monitor's hot set at routing time).
     locality_hits: AtomicU64,
@@ -272,6 +292,8 @@ impl Engine {
             total_ssd_stall_us: AtomicU64::new(0),
             spec_hits: AtomicU64::new(0),
             spec_misses: AtomicU64::new(0),
+            spec_top1_matches: AtomicU64::new(0),
+            spec_tokens: AtomicU64::new(0),
             locality_hits: AtomicU64::new(0),
             locality_misses: AtomicU64::new(0),
         }
@@ -497,6 +519,7 @@ impl Engine {
                     WeightDtype::F16 => run_inference_f16(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
                     WeightDtype::Int8 => run_inference_int8(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
                     WeightDtype::Q4K => run_inference_q4k(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
                 };
                 match res {
                     Ok((out, y)) => {
@@ -769,8 +792,21 @@ impl Engine {
         if misses > 0 {
             self.spec_misses.fetch_add(misses, Ordering::Relaxed);
         }
+        // Top-1 accuracy: 1 if the speculator's #1 expert matches the
+        // gate's #1 expert for this token, 0 otherwise. This is the
+        // counter the design spec calls `mer_speculator_accuracy_total`.
+        let top1_match: u64 = match (preds.first(), target.first()) {
+            (Some(&p), Some(&t)) if p == t => 1,
+            _ => 0,
+        };
+        if top1_match > 0 {
+            self.spec_top1_matches.fetch_add(1, Ordering::Relaxed);
+        }
+        // One token observed by the speculator (regardless of match).
+        self.spec_tokens.fetch_add(1, Ordering::Relaxed);
         if let Some(m) = &self.metrics {
             m.record_speculator(hits, misses);
+            m.record_speculator_top1(top1_match);
         }
         // Online SGD step against the *actual* gate decision.
         let _loss = spec.train_step(x, target, NeuralSpeculator::DEFAULT_LR);
@@ -825,6 +861,8 @@ impl Engine {
     pub fn predictive_telemetry(&self) -> PredictiveTelemetry {
         let s_hits = self.spec_hits.load(Ordering::Relaxed);
         let s_misses = self.spec_misses.load(Ordering::Relaxed);
+        let s_top1 = self.spec_top1_matches.load(Ordering::Relaxed);
+        let s_top1_total = self.spec_tokens.load(Ordering::Relaxed);
         let l_hits = self.locality_hits.load(Ordering::Relaxed);
         let l_misses = self.locality_misses.load(Ordering::Relaxed);
         let s_total = s_hits + s_misses;
@@ -836,6 +874,13 @@ impl Engine {
                 0.0
             } else {
                 s_hits as f64 / s_total as f64
+            },
+            speculator_top1_matches: s_top1,
+            speculator_top1_total: s_top1_total,
+            speculator_top1_accuracy: if s_top1_total == 0 {
+                0.0
+            } else {
+                s_top1 as f64 / s_top1_total as f64
             },
             locality_hits: l_hits,
             locality_misses: l_misses,
@@ -903,6 +948,35 @@ impl Engine {
             }
         }
 
+        // **Speculative I/O union-fetch (S ∪ L ∪ M), issued
+        // concurrently with the target-miss fetches.** Fire the
+        // predictor's 2nd-order Markov-chain hint and union it with
+        // the locality hot set and the speculator's top-K so all
+        // three arms compete for cache slots while the SSD is *also*
+        // pulling the experts the gate just chose. The prefetch
+        // tasks are spawned here (they only depend on the cache /
+        // storage Arcs) and *do not block* the await on
+        // `miss_handles` below — the OS / io_uring queue interleaves
+        // both sets of reads. This is the change called out in the
+        // design spec under Task 2: the predictive-controller's union
+        // prefetch must overlap the critical-path SSD stall, not run
+        // sequentially after it.
+        //
+        // We use the predictor's *prior* `last_last_experts` here
+        // (i.e. before observing `target`) so the prefetch sees the
+        // same state it would have at the start of the cycle. The
+        // history update happens after compute below, mirroring
+        // `generate`'s order.
+        if let Some(&seed) = target.last() {
+            let last_last = self.last_last_experts.lock();
+            let s_markov = match last_last.last() {
+                Some(&pp) => self.predictor.predict_next2(pp, seed),
+                None => self.predictor.predict_next(seed),
+            };
+            drop(last_last);
+            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
+        }
+
         // Concurrent miss fetches; hits resolved inline.
         let io_wait_start = Instant::now();
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
@@ -945,6 +1019,7 @@ impl Engine {
                 WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
                 WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
                 WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
             };
             match res {
                 Ok((_out, y)) => per_expert_y.push(y),
@@ -973,30 +1048,18 @@ impl Engine {
             }
         }
 
-        // Speculative I/O union-fetch (S ∪ L ∪ M). Fire the predictor's
-        // 2nd-order Markov-chain hint and union it with the locality
-        // hot set and the speculator's top-K so all three arms compete
-        // for cache slots together. We fold this into the predictor's
-        // observation history first so the next token's S has a chance
-        // to learn from this token's transition.
-        if let Some(&seed) = target.last() {
-            // Update predictor history (mirrors `generate`).
-            {
-                let mut last = self.last_experts.lock();
-                let mut last_last = self.last_last_experts.lock();
-                if !last.is_empty() {
-                    self.predictor.observe_step2(&last_last, &last, &target);
-                }
-                *last_last = last.clone();
-                *last = target.clone();
+        // Update predictor history (mirrors `generate`). The actual
+        // union prefetch was already fired above, before the
+        // target-miss await — this block only carries forward the
+        // 2nd-order ring buffer for the *next* token's prefetch.
+        if !target.is_empty() {
+            let mut last = self.last_experts.lock();
+            let mut last_last = self.last_last_experts.lock();
+            if !last.is_empty() {
+                self.predictor.observe_step2(&last_last, &last, &target);
             }
-            let last_last = self.last_last_experts.lock();
-            let s_markov = match last_last.last() {
-                Some(&pp) => self.predictor.predict_next2(pp, seed),
-                None => self.predictor.predict_next(seed),
-            };
-            drop(last_last);
-            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
+            *last_last = last.clone();
+            *last = target.clone();
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;

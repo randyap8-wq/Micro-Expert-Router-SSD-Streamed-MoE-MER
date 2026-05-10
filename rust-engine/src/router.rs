@@ -497,8 +497,98 @@ impl PredictiveLoader {
         out
     }
 
-    /// distribution (rather than a deterministic argmax). Useful when you
-    /// want exploration in the prefetch policy.
+    /// **Unified prediction.** Combines the Markov-chain row predictions
+    /// with the [`LocalityMonitor`]'s current hot set and (optionally)
+    /// the [`NeuralSpeculator`]'s top-K to produce a single ranked list
+    /// of `(expert_id, priority_score)` pairs. This is the API called
+    /// out in the design spec under Task 1: *"the predictor should now
+    /// be able to return a unified set of (expert_id, priority_score)"*.
+    ///
+    /// Scoring (in `[0, 1]`):
+    /// * Markov contribution: probability from
+    ///   [`Self::predict_next2`] (or [`Self::predict_next`] when
+    ///   `prev_prev` is `None`), weighted **0.5** — so a near-certain
+    ///   transition adds up to 0.5 to an expert's score.
+    /// * Locality contribution: a flat **0.3** for every expert in
+    ///   `monitor.get_hot_experts(threshold_pct)` — these are
+    ///   temporally stable hot experts and we want them in the
+    ///   prefetch set even when the Markov chain is uncertain.
+    /// * Speculator contribution: a flat **0.4** for every expert in
+    ///   `speculator.predict_topk(hidden, speculator_k)` — semantic
+    ///   intent is the strongest single signal in the design.
+    ///
+    /// The three contributions sum, then the result is sorted by
+    /// descending score (ties broken by ascending id for determinism)
+    /// and truncated to `self.fanout`. An expert that lights up in
+    /// every arm is therefore prioritised over one that lights up in
+    /// only one.
+    ///
+    /// Hidden state is borrowed (not cloned) so this is safe to call
+    /// on the hot path; the speculator forward is its own internal
+    /// allocation.
+    pub fn predict_unified(
+        &self,
+        prev_prev: Option<u32>,
+        prev: u32,
+        monitor: Option<&LocalityMonitor>,
+        threshold_pct: f32,
+        speculator: Option<&NeuralSpeculator>,
+        hidden: &[f32],
+        speculator_k: usize,
+    ) -> Vec<(u32, f32)> {
+        // Weights for each predictive arm. Tuned so that an expert
+        // hit by all three arms tops out at ~1.2 (over-budget by
+        // design — those are the experts we *really* want pinned).
+        const W_MARKOV: f32 = 0.5;
+        const W_LOCALITY: f32 = 0.3;
+        const W_SPECULATOR: f32 = 0.4;
+
+        let mut combined: HashMap<u32, f32> = HashMap::new();
+
+        // 1) Markov contribution.
+        let markov = match prev_prev {
+            Some(pp) => self.predict_next2(pp, prev),
+            None => self.predict_next(prev),
+        };
+        for (id, p) in markov {
+            *combined.entry(id).or_insert(0.0) += W_MARKOV * (p as f32);
+        }
+
+        // 2) Locality contribution.
+        if let Some(m) = monitor {
+            for id in m.get_hot_experts(threshold_pct) {
+                *combined.entry(id).or_insert(0.0) += W_LOCALITY;
+            }
+        }
+
+        // 3) Speculator contribution.
+        if let Some(s) = speculator {
+            if speculator_k > 0 {
+                for id in s.predict_topk(hidden, speculator_k) {
+                    *combined.entry(id).or_insert(0.0) += W_SPECULATOR;
+                }
+            }
+        }
+
+        let mut out: Vec<(u32, f32)> = combined
+            .into_iter()
+            .filter(|&(_, p)| p > 0.0)
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        // Honour the loader's fanout when set; otherwise return all.
+        if self.fanout > 0 {
+            out.truncate(self.fanout);
+        }
+        out
+    }
+
+    /// Sample the next predicted experts from the Markov-chain row's
+    /// distribution (rather than a deterministic argmax). Useful when
+    /// you want exploration in the prefetch policy.
     #[allow(dead_code)]
     pub fn sample_next(&self, from: u32) -> Vec<u32> {
         if from >= self.num_experts || self.fanout == 0 {
@@ -694,6 +784,16 @@ impl LocalityMonitor {
             .collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Spec-compliant alias of [`Self::hot_set`]. The "Omniscient
+    /// Predictive Architecture" design document calls this method
+    /// `get_hot_experts(threshold)`; the original implementation
+    /// shipped under the shorter `hot_set` name. Both are kept so
+    /// callers can use whichever they prefer.
+    #[inline]
+    pub fn get_hot_experts(&self, threshold_pct: f32) -> Vec<u32> {
+        self.hot_set(threshold_pct)
     }
 
     /// Heat count for a specific id (0 if `id` is out of range).
@@ -1372,6 +1472,86 @@ mod tests {
         // Sorted descending by probability.
         for w in preds.windows(2) {
             assert!(w[0].1 + 1e-6 >= w[1].1);
+        }
+    }
+
+    #[test]
+    fn locality_monitor_get_hot_experts_aliases_hot_set() {
+        // Spec-named alias must be byte-equivalent to `hot_set`.
+        let m = LocalityMonitor::new(4, 16);
+        for _ in 0..6 { m.observe_one(2); }
+        for _ in 0..3 { m.observe_one(0); }
+        let from_alias = m.get_hot_experts(0.10);
+        let from_orig = m.hot_set(0.10);
+        assert_eq!(from_alias, from_orig);
+        assert!(from_alias.contains(&2));
+    }
+
+    #[test]
+    fn predict_unified_blends_three_arms() {
+        // 8 experts, fanout 8 so we get every contributing arm in
+        // the output. Markov hand-trained to predict 0->1, locality
+        // pre-warmed with id=2, speculator predicts id=3.
+        let p = PredictiveLoader::new(8, 8, 0.0, 42);
+        for _ in 0..20 { p.observe(0, 1); }
+        let monitor = LocalityMonitor::new(8, 16);
+        for _ in 0..6 { monitor.observe_one(2); }
+        let speculator = NeuralSpeculator::new(4, 8, 8, 7);
+        let hidden = vec![0.5f32, -0.2, 0.3, 0.1];
+        // Force speculator's top-1 to be id=3 by training on id=3
+        // many times until that becomes its top output for `hidden`.
+        for _ in 0..200 {
+            speculator.train_step(&hidden, &[3], 0.1);
+        }
+        let unified = p.predict_unified(
+            None,
+            0,
+            Some(&monitor),
+            0.10,
+            Some(&speculator),
+            &hidden,
+            1,
+        );
+        // Result is ordered by descending priority.
+        for w in unified.windows(2) {
+            assert!(
+                w[0].1 + 1e-6 >= w[1].1,
+                "priority must be sorted descending, got {:?}",
+                unified
+            );
+        }
+        // Each of the three contributing ids appears at least once.
+        let ids: Vec<u32> = unified.iter().map(|&(id, _)| id).collect();
+        for expected in [1u32, 2u32, 3u32] {
+            assert!(ids.contains(&expected),
+                "predict_unified missing id {expected}: {unified:?}");
+        }
+        // No score is negative.
+        for &(_, s) in &unified {
+            assert!(s > 0.0);
+        }
+    }
+
+    #[test]
+    fn predict_unified_handles_no_optional_arms() {
+        // With monitor=None and speculator=None the result should be
+        // identical to the Markov-only `predict_next` (modulo weight
+        // scaling and the f64->f32 cast).
+        let p = PredictiveLoader::new(4, 4, 0.0, 42);
+        for _ in 0..10 { p.observe(0, 1); p.observe(0, 2); }
+        let unified = p.predict_unified(
+            None,
+            0,
+            None,
+            0.0,
+            None,
+            &[],
+            0,
+        );
+        let markov = p.predict_next(0);
+        assert_eq!(unified.len(), markov.len());
+        for ((id_u, _), (id_m, _)) in unified.iter().zip(markov.iter()) {
+            assert_eq!(id_u, id_m);
         }
     }
 }
