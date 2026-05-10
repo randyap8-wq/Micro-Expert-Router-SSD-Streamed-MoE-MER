@@ -297,6 +297,47 @@ pub fn run_expert_forward(
 pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
+    // Compile-time guard: `simd` and `blas` are mutually exclusive
+    // backend choices for this matmul. Building with both on at once
+    // is almost certainly a configuration mistake.
+    #[cfg(all(feature = "simd", feature = "blas"))]
+    compile_error!(
+        "cargo features `simd` and `blas` are mutually exclusive — pick one matmul backend"
+    );
+    #[cfg(feature = "blas")]
+    {
+        // BLAS-equivalent SGEMV via `matrixmultiply::sgemm`: treat the
+        // matrix-vector product as a `(rows × cols) × (cols × 1)`
+        // SGEMM. The crate's tuned microkernel (the same one used by
+        // `ndarray`'s `dot`) gives ~order-of-magnitude speedups over
+        // the scalar loop on AVX2 / NEON for the dense projections in
+        // `TransformerLayer`.
+        let mut y = vec![0.0f32; rows];
+        // Safety: matrixmultiply::sgemm is defined as taking pointers
+        // to row-major (m × k) and (k × n) matrices and writing into a
+        // row-major (m × n) output; we satisfy all aliasing and bounds
+        // requirements. `rsa` / `csa` etc. are the row/col strides for
+        // the three matrices; `1` everywhere selects row-major.
+        unsafe {
+            matrixmultiply::sgemm(
+                rows,
+                cols,
+                1,
+                1.0,
+                w.as_ptr(),
+                cols as isize,
+                1,
+                x.as_ptr(),
+                1,
+                1,
+                0.0,
+                y.as_mut_ptr(),
+                1,
+                1,
+            );
+        }
+        return y;
+    }
     #[cfg(feature = "simd")]
     {
         // Heuristic: only parallelise when the matrix is large enough

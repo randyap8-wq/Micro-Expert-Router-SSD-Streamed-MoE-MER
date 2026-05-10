@@ -61,6 +61,18 @@ dashmap = "5.5"
 # files when present.
 safetensors = "0.4"
 
+# Optional BLAS-equivalent dense matmul backend. Pulled in only when
+# the `blas` cargo feature is enabled. We use `matrixmultiply` rather
+# than `cblas-sys` + `blas-src` (the gist's nominal choice) because it:
+#   * is pure Rust — no `system OpenBLAS` install required, so CI and
+#     `cargo test` keep working out of the box;
+#   * provides the same hand-tuned-microkernel SGEMM/SGEMV used by
+#     `ndarray` for its `dot` op (the canonical BLAS-shaped path in the
+#     Rust ecosystem);
+#   * lets a follow-up PR drop in `cblas-sys` behind the same feature
+#     gate without touching call sites in `transformer.rs`.
+matrixmultiply = { version = "0.3", optional = true }
+
 # fp16 (half-precision) weight support for SSD-streamed experts. Halving the
 # bytes-per-parameter halves every SSD read, which is the single highest-
 # leverage energy reduction in this engine.
@@ -91,3 +103,11 @@ io_uring = ["dep:io-uring"]
 # the call sites are already routed through `matmul_row_major`, so a
 # future PR can swap the body for a CUDA kernel without touching callers.
 simd = []
+
+# BLAS-equivalent dense matmul. When enabled, `matmul_row_major` routes
+# through `matrixmultiply`'s tuned SGEMV microkernel instead of the
+# scalar / `simd` row-parallel loop. Mutually exclusive with `simd`
+# (a static `compile_error!` enforces this in `transformer.rs` so a
+# misconfigured `--features simd,blas` build fails fast rather than
+# silently picking one branch).
+blas = ["dep:matrixmultiply"]

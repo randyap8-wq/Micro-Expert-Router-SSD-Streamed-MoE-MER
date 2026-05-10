@@ -548,8 +548,9 @@ fn cmd_gen_data(
     dtype_str: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::inference::WeightDtype;
-    let dtype = WeightDtype::from_str_opt(dtype_str)
-        .ok_or_else(|| format!("--dtype: unknown value {dtype_str:?} (use 'f32' or 'f16')"))?;
+    let dtype = WeightDtype::from_str_opt(dtype_str).ok_or_else(|| {
+        format!("--dtype: unknown value {dtype_str:?} (use 'f32', 'f16', or 'int8')")
+    })?;
     if block_align == 0 || !block_align.is_power_of_two() {
         return Err(format!(
             "--block-align ({block_align}) must be a positive power of two \

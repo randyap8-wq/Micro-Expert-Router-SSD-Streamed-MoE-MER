@@ -443,6 +443,22 @@ pub fn generate_synthetic_experts_with_dtype(
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15u64
             .wrapping_add((id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
 
+        // For INT8, write the 12-byte per-tensor scale header first.
+        // Synthetic weights are drawn from `U(-scale, +scale)`, so the
+        // per-tensor max-abs is bounded by `scale` and the symmetric
+        // quantizer divisor is `scale / 127.0`. Real INT8-quantised
+        // weights would compute these from the actual tensor maxima
+        // during conversion (see `python/quantize_int8.py`).
+        if matches!(dtype, WeightDtype::Int8) {
+            let q = scale / 127.0;
+            let meta = crate::inference::Int8ExpertMeta {
+                gate_scale: q,
+                up_scale: q,
+                down_scale: q,
+            };
+            f.write_all(&meta.to_bytes())?;
+        }
+
         let mut floats_remaining = crate::inference::expert_weight_count(d_model, d_ff);
         let mut buf = Vec::<u8>::with_capacity(chunk_floats * bpw);
         while floats_remaining > 0 {
@@ -460,6 +476,15 @@ pub fn generate_synthetic_experts_with_dtype(
                     WeightDtype::F16 => {
                         let h = half::f16::from_f32(v);
                         buf.extend_from_slice(&h.to_bits().to_le_bytes());
+                    }
+                    WeightDtype::Int8 => {
+                        // Per-tensor symmetric quant. With the synthetic
+                        // distribution and `q = scale/127.0`, `v / q`
+                        // is in `[-127, +127]` so no clamp loss occurs;
+                        // we still clamp defensively for robustness.
+                        let q = scale / 127.0;
+                        let qv = (v / q).round().clamp(-127.0, 127.0) as i8;
+                        buf.push(qv as u8);
                     }
                 }
             }
