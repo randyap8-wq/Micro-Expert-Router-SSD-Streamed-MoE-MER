@@ -477,7 +477,7 @@ prefetch path bit-for-bit; flipping each flag wires its arm into
 the prefetch union and lights up the corresponding Prometheus
 counters on `/metrics`. The schema is validated at startup
 (`config.rs`) and rejects nonsensical settings — `locality_window
-== 0`, `locality_threshold_pct ∉ (0, 1]`, `speculator_top_k >
+== 0`, `locality_threshold_pct` outside `(0, 1]`, `speculator_top_k >
 num_experts`, etc.
 
 #### Real-transformer pipeline (gist Phase 5/6)
