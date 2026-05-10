@@ -38,7 +38,7 @@ use crate::engine::{Engine, EngineOptions, ModelShape};
 use crate::expert_cache::ExpertCache;
 use crate::inference::expert_weight_bytes;
 use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
-use crate::router::{PredictiveLoader, TopKRouter};
+use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter};
 
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
 #[derive(Parser, Debug)]
@@ -420,7 +420,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         0xC0FFEE,
     ));
 
-    let engine = Arc::new(Engine::with_options(
+    let mut engine_builder = Engine::with_options(
         cache,
         pool,
         storage,
@@ -437,7 +437,32 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             partial_load_fraction: cfg.storage.partial_load_fraction,
             pin_after_observations: cfg.storage.pin_after_observations,
         },
-    ));
+    );
+    // Attach the speculative-architecture components requested via
+    // the `[predictive]` config section.
+    if cfg.predictive.locality_enabled {
+        let monitor = Arc::new(LocalityMonitor::new(
+            cfg.model.num_experts,
+            cfg.predictive.locality_window,
+        ));
+        engine_builder = engine_builder
+            .with_locality_monitor(monitor, cfg.predictive.locality_threshold_pct);
+    }
+    if cfg.predictive.speculator_enabled {
+        let top_k = if cfg.predictive.speculator_top_k == 0 {
+            cfg.model.top_k
+        } else {
+            cfg.predictive.speculator_top_k
+        };
+        let spec = Arc::new(NeuralSpeculator::new(
+            cfg.model.d_model,
+            cfg.predictive.speculator_hidden_dim,
+            cfg.model.num_experts,
+            0xC0FFEE,
+        ));
+        engine_builder = engine_builder.with_speculator(spec, top_k);
+    }
+    let engine = Arc::new(engine_builder);
 
     let tokenizer = match cfg.tokenizer.path.as_ref() {
         Some(p) => match Tokenizer::from_file(p) {

@@ -246,6 +246,58 @@ fn default_seed() -> u64 { 0xC0FFEE }
 fn default_max_batch_size() -> usize { 8 }
 fn default_batch_timeout_ms() -> u64 { 5 }
 
+/// Configuration for the predictive architecture (`[predictive]` block).
+///
+/// All three components are **opt-in** and default to disabled. When
+/// disabled the engine runs the legacy Markov-chain-only prefetch path
+/// bit-for-bit, so adding the section to an existing config never
+/// silently changes behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictiveConfig {
+    /// Enable the sliding-window [`crate::router::LocalityMonitor`].
+    /// Sets the **L** arm of the speculative I/O union.
+    #[serde(default)]
+    pub locality_enabled: bool,
+    /// Number of recent activations the locality window remembers.
+    /// 256 ≈ a few dozen tokens at top-K = 8.
+    #[serde(default = "default_locality_window")]
+    pub locality_window: usize,
+    /// Heat threshold (fraction of the window) above which an expert
+    /// is considered hot. `0.10` matches
+    /// [`crate::router::LocalityMonitor::DEFAULT_THRESHOLD_PCT`].
+    #[serde(default = "default_locality_threshold")]
+    pub locality_threshold_pct: f32,
+
+    /// Enable the [`crate::router::NeuralSpeculator`] (M arm).
+    #[serde(default)]
+    pub speculator_enabled: bool,
+    /// Hidden dimension of the speculator's 2-layer MLP. The spec
+    /// recommends 128.
+    #[serde(default = "default_speculator_hidden")]
+    pub speculator_hidden_dim: usize,
+    /// Top-K size pulled from the speculator at every routing
+    /// decision. Defaults to the router's `top_k` when zero.
+    #[serde(default)]
+    pub speculator_top_k: usize,
+}
+
+fn default_locality_window() -> usize { 256 }
+fn default_locality_threshold() -> f32 { 0.10 }
+fn default_speculator_hidden() -> usize { 128 }
+
+impl Default for PredictiveConfig {
+    fn default() -> Self {
+        Self {
+            locality_enabled: false,
+            locality_window: default_locality_window(),
+            locality_threshold_pct: default_locality_threshold(),
+            speculator_enabled: false,
+            speculator_hidden_dim: default_speculator_hidden(),
+            speculator_top_k: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -257,6 +309,8 @@ pub struct Config {
     pub real_transformer: RealTransformerConfig,
     #[serde(default)]
     pub sampling: SamplingConfig,
+    #[serde(default)]
+    pub predictive: PredictiveConfig,
 }
 
 impl Config {
@@ -355,6 +409,33 @@ impl Config {
                 ));
             }
         }
+        // [predictive] section.
+        let p = &self.predictive;
+        if p.locality_enabled {
+            if p.locality_window == 0 {
+                return Err(ConfigError::Invalid(
+                    "predictive.locality_window must be > 0 when locality_enabled".into(),
+                ));
+            }
+            if !(p.locality_threshold_pct > 0.0 && p.locality_threshold_pct <= 1.0) {
+                return Err(ConfigError::Invalid(
+                    "predictive.locality_threshold_pct must be in (0.0, 1.0]".into(),
+                ));
+            }
+        }
+        if p.speculator_enabled {
+            if p.speculator_hidden_dim == 0 {
+                return Err(ConfigError::Invalid(
+                    "predictive.speculator_hidden_dim must be > 0 when speculator_enabled".into(),
+                ));
+            }
+            if p.speculator_top_k > self.model.num_experts as usize {
+                return Err(ConfigError::Invalid(format!(
+                    "predictive.speculator_top_k ({}) must not exceed model.num_experts ({})",
+                    p.speculator_top_k, self.model.num_experts,
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -411,6 +492,7 @@ mod tests {
             tokenizer: TokenizerConfig::default(),
             real_transformer: RealTransformerConfig::default(),
             sampling: SamplingConfig::default(),
+            predictive: PredictiveConfig::default(),
         }
     }
 
@@ -448,5 +530,49 @@ mod tests {
         back.validate().unwrap();
         assert_eq!(back.model.num_experts, c.model.num_experts);
         assert_eq!(back.server.bind, c.server.bind);
+    }
+
+    #[test]
+    fn predictive_section_defaults_to_disabled() {
+        let c = minimal_cfg();
+        assert!(!c.predictive.locality_enabled);
+        assert!(!c.predictive.speculator_enabled);
+        c.validate().expect("disabled predictive section is valid");
+    }
+
+    #[test]
+    fn predictive_section_validates_when_enabled() {
+        let mut c = minimal_cfg();
+        c.predictive.locality_enabled = true;
+        c.predictive.locality_window = 64;
+        c.predictive.locality_threshold_pct = 0.1;
+        c.predictive.speculator_enabled = true;
+        c.predictive.speculator_hidden_dim = 32;
+        c.predictive.speculator_top_k = 2;
+        c.validate().expect("valid predictive section");
+    }
+
+    #[test]
+    fn predictive_rejects_zero_window() {
+        let mut c = minimal_cfg();
+        c.predictive.locality_enabled = true;
+        c.predictive.locality_window = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn predictive_rejects_out_of_range_threshold() {
+        let mut c = minimal_cfg();
+        c.predictive.locality_enabled = true;
+        c.predictive.locality_threshold_pct = 1.5;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn predictive_rejects_too_large_speculator_topk() {
+        let mut c = minimal_cfg();
+        c.predictive.speculator_enabled = true;
+        c.predictive.speculator_top_k = 9999;
+        assert!(c.validate().is_err());
     }
 }
