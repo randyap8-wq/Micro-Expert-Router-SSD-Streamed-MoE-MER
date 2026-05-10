@@ -213,6 +213,24 @@ enum Cmd {
         /// Overrides `--router-clusters` / `--router-intra-p` when set.
         #[arg(long)]
         router_matrix: Option<PathBuf>,
+        /// Optional path to a real **gating-network** weight matrix
+        /// (`f32` little-endian, row-major, shape `[num_experts × d_model]`).
+        ///
+        /// When set, the run loop bypasses the deterministic Markov
+        /// `TopKRouter` and instead computes per-token routing the way
+        /// production Mixtral does: `softmax(W_gate · x) → top-K`.
+        /// Each routed expert is still streamed from the SSD via the
+        /// LRU cache (`Engine::moe_step`), so the SSD-bandwidth /
+        /// cache-hit metrics reported at the end are directly
+        /// comparable to the legacy Markov path.
+        ///
+        /// File format: bare little-endian `f32`s, no header. Generate
+        /// one with `numpy.tofile` from a real Mixtral checkpoint, or
+        /// use the seeded synthetic fallback if you only want to
+        /// exercise the path (omit this flag to keep the legacy
+        /// Markov router).
+        #[arg(long)]
+        gate_weights: Option<PathBuf>,
     },
 
     /// Start the OpenAI-compatible HTTP server (Phase 6 / 8 / 9).
@@ -284,6 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     router_clusters,
                     router_intra_p,
                     router_matrix,
+                    gate_weights,
                 } = cli.cmd
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
@@ -315,6 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         router_clusters,
                         router_intra_p,
                         router_matrix,
+                        gate_weights,
                     })
                     .await
                 } else {
@@ -558,6 +578,7 @@ struct RunArgs {
     router_clusters: usize,
     router_intra_p: f64,
     router_matrix: Option<PathBuf>,
+    gate_weights: Option<PathBuf>,
 }
 
 async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -670,23 +691,52 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.io_uring {
-        #[cfg(feature = "io_uring")]
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
-            info!(
-                "io_uring backend requested (build has `io_uring` feature \
-                 enabled). The fixed-buffers plumbing is in place via \
-                 `BufferPool::raw_iovecs`; the default backend remains \
-                 `pread(2)` until you wire `IoUringStorage` into the \
-                 `NvmeStorage` factory."
+            // Build the backend from the same pool we'll hand the
+            // engine; the registration happens inside ::new(). We log
+            // the result and then continue with the portable backend
+            // for the actual generate() loop — `IoUringStorage` is a
+            // drop-in alternative read API (`read_expert_fixed` /
+            // `read_experts_batch_fixed`) that callers can wire into
+            // their own `Storage` impl. Validating it here gives users
+            // a clear error path on misconfigured kernels without
+            // reaching the hot path.
+            let probe_pool = crate::buffer_pool::BufferPool::new(
+                args.cache_slots.max(1),
+                args.expert_size,
+                args.block_align,
             );
+            match crate::io_uring_storage::IoUringStorage::new(
+                crate::io_uring_storage::IoUringConfig {
+                    base_path: args.data_dir.clone(),
+                    expert_size: args.expert_size,
+                    block_align: args.block_align,
+                    queue_depth: 64,
+                },
+                &probe_pool,
+            ) {
+                Ok(s) => info!(
+                    registered_buffers = s.registered_buffers(),
+                    "io_uring backend initialised: registered fixed buffers + ring ready. \
+                     The engine still drives reads through the portable pread path; \
+                     IoUringStorage::read_experts_batch_fixed is available for \
+                     custom integrations."
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    "io_uring backend probe failed (kernel may not support it); \
+                     continuing with the portable pread backend."
+                ),
+            }
         }
-        #[cfg(not(feature = "io_uring"))]
+        #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
         {
             warn!(
                 "--io-uring was passed but this binary was built without the \
-                 `io_uring` cargo feature. Falling back to the default \
-                 `pread(2)` storage backend. Rebuild with \
-                 `--features io_uring` (Linux only) to enable."
+                 `io_uring` cargo feature (or is not on Linux). Falling back \
+                 to the default `pread(2)` storage backend. Rebuild on Linux \
+                 with `--features io_uring` to enable."
             );
         }
     }
@@ -811,9 +861,55 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         tokens = args.tokens,
         "streaming tokens (latency / throughput logs follow)"
     );
+
+    // Optional production gating network. When present, every token's
+    // expert ids come from `softmax(W_gate · x) → top-K` (real Mixtral
+    // routing) instead of the deterministic Markov `TopKRouter`. The
+    // SSD-streaming substrate is identical either way — only the *id
+    // selection* changes — so the cycle / I/O / hit-rate metrics are
+    // directly comparable across the two paths.
+    let gate: Option<crate::gating::LinearGate> = match args.gate_weights.as_ref() {
+        Some(path) => {
+            info!(
+                gate_weights = %path.display(),
+                num_experts = args.num_experts,
+                d_model = args.d_model,
+                top_k = args.top_k,
+                "loading gating-network weight matrix"
+            );
+            Some(load_gate_weights(
+                path,
+                args.num_experts as usize,
+                args.d_model,
+                args.top_k,
+            )?)
+        }
+        None => None,
+    };
+
     for t in 0..args.tokens {
         let start = Instant::now();
-        let stats = engine.generate(t).await;
+        let stats = if let Some(gate) = gate.as_ref() {
+            // Real gating-network path. Hidden state is the same
+            // synthetic activation `Engine::generate` would have used,
+            // so the only difference relative to the legacy path is
+            // *which* experts are selected.
+            let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
+            let dec = gate.route(&hidden);
+            let pre_hits = engine.report().hits;
+            let pre_misses = engine.report().misses;
+            let pre_bytes = engine.report().bytes_read;
+            let _ = engine.moe_step(t, &hidden, &dec.experts).await;
+            let post = engine.report();
+            crate::engine::CycleStats {
+                hits: post.hits.saturating_sub(pre_hits),
+                misses: post.misses.saturating_sub(pre_misses),
+                prefetch_hits: 0,
+                bytes_read: post.bytes_read.saturating_sub(pre_bytes),
+            }
+        } else {
+            engine.generate(t).await
+        };
         let elapsed = start.elapsed();
         let throughput = if elapsed.as_secs_f64() > 0.0 {
             1.0 / elapsed.as_secs_f64()
@@ -999,6 +1095,45 @@ fn load_alias_map(
         map.insert(key, val);
     }
     Ok(map)
+}
+
+/// Load a real gating-network weight matrix from disk.
+///
+/// File format: bare little-endian `f32`s, no header, row-major,
+/// `[num_experts × d_model]`. This is the layout `numpy.tofile` writes
+/// for `block_sparse_moe.gate.weight` after `astype(np.float32)`. A
+/// future PR can teach this to read `safetensors` directly so the user
+/// can point it at a HuggingFace shard without a conversion step.
+fn load_gate_weights(
+    path: &std::path::Path,
+    num_experts: usize,
+    d_model: usize,
+    top_k: usize,
+) -> Result<crate::gating::LinearGate, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read gate weights {}: {e}", path.display()))?;
+    let expected = num_experts
+        .checked_mul(d_model)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| "num_experts * d_model overflowed".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "gate weights file {} has {} bytes, expected {} ({} experts × {} d_model × 4 bytes/f32)",
+            path.display(),
+            bytes.len(),
+            expected,
+            num_experts,
+            d_model
+        )
+        .into());
+    }
+    let mut weights = Vec::<f32>::with_capacity(num_experts * d_model);
+    for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(chunk);
+        weights.push(f32::from_le_bytes(buf));
+    }
+    Ok(crate::gating::LinearGate::new(weights, num_experts, d_model, top_k))
 }
 
 /// Best-effort total-RAM probe. Returns `None` (heuristic disabled) on
