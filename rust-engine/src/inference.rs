@@ -334,9 +334,19 @@ impl<'a> ExpertWeights<'a> {
     }
 
 
+    /// Run the SwiGLU forward pass.
     ///
     /// Allocates one `Vec<f32>` for the gated intermediate (`d_ff`) and
     /// returns a `Vec<f32>` of length `d_model` for the FFN output.
+    ///
+    /// **Parallelism.** When the `simd` cargo feature is enabled and the
+    /// matrices are large enough (`d_ff * d_model >= 8 KiB`), the gate /
+    /// up projection and the down projection are split row-wise across
+    /// threads using `std::thread::scope` (the same pattern as
+    /// [`crate::transformer::matmul_row_major`] — no extra crate
+    /// dependency). Each row of the output is independent, so no
+    /// synchronisation is required. The scalar fallback is the default
+    /// build.
     pub fn forward(&self, x: &[f32]) -> HiddenState {
         debug_assert_eq!(
             x.len(),
@@ -348,33 +358,129 @@ impl<'a> ExpertWeights<'a> {
         //    Fuse them in the same loop so each row of (gate, up) reads
         //    `x` once — better cache behaviour than two separate matmuls.
         let mut gated = vec![0.0f32; self.d_ff];
-        for i in 0..self.d_ff {
-            let row = i * self.d_model;
-            let g_row = &self.gate[row..row + self.d_model];
-            let u_row = &self.up[row..row + self.d_model];
-            // Manual sums; the compiler vectorises these well in release.
-            let mut g = 0.0f32;
-            let mut u = 0.0f32;
-            for j in 0..self.d_model {
-                g += g_row[j] * x[j];
-                u += u_row[j] * x[j];
-            }
-            // SwiGLU intermediate: silu(g) * u.
-            gated[i] = silu(g) * u;
-        }
+        gate_up_swiglu(self.gate, self.up, x, &mut gated, self.d_model);
 
         // 2) Down projection: y = W_d · gated  -> length d_model.
         let mut y = vec![0.0f32; self.d_model];
-        for i in 0..self.d_model {
-            let row = i * self.d_ff;
-            let d_row = &self.down[row..row + self.d_ff];
-            let mut acc = 0.0f32;
-            for j in 0..self.d_ff {
-                acc += d_row[j] * gated[j];
-            }
-            y[i] = acc;
-        }
+        down_proj(self.down, &gated, &mut y, self.d_ff);
         y
+    }
+}
+
+/// Fused gate / up SwiGLU projection: `gated[i] = silu(gate[i,:]·x) * (up[i,:]·x)`.
+///
+/// Row-parallel under the `simd` cargo feature; scalar otherwise. Each
+/// row of `gated` is computed independently so the parallelisation is
+/// embarrassingly safe.
+#[inline]
+fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_model: usize) {
+    debug_assert_eq!(gate.len(), gated.len() * d_model);
+    debug_assert_eq!(up.len(), gated.len() * d_model);
+    debug_assert_eq!(x.len(), d_model);
+
+    #[cfg(feature = "simd")]
+    {
+        let d_ff = gated.len();
+        if d_ff * d_model >= 8 * 1024 {
+            let nthreads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(d_ff.max(1));
+            if nthreads > 1 {
+                let chunk = d_ff.div_ceil(nthreads);
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(nthreads);
+                    for (chunk_idx, out_chunk) in gated.chunks_mut(chunk).enumerate() {
+                        let row_start = chunk_idx * chunk;
+                        let g_slice = &gate[row_start * d_model
+                            ..(row_start + out_chunk.len()) * d_model];
+                        let u_slice = &up[row_start * d_model
+                            ..(row_start + out_chunk.len()) * d_model];
+                        let x_ref = x;
+                        handles.push(s.spawn(move || {
+                            for (i, slot) in out_chunk.iter_mut().enumerate() {
+                                let g_row = &g_slice[i * d_model..(i + 1) * d_model];
+                                let u_row = &u_slice[i * d_model..(i + 1) * d_model];
+                                let mut g = 0.0f32;
+                                let mut u = 0.0f32;
+                                for j in 0..d_model {
+                                    g += g_row[j] * x_ref[j];
+                                    u += u_row[j] * x_ref[j];
+                                }
+                                *slot = silu(g) * u;
+                            }
+                        }));
+                    }
+                    for h in handles { let _ = h.join(); }
+                });
+                return;
+            }
+        }
+    }
+    let d_ff = gated.len();
+    for i in 0..d_ff {
+        let row = i * d_model;
+        let g_row = &gate[row..row + d_model];
+        let u_row = &up[row..row + d_model];
+        let mut g = 0.0f32;
+        let mut u = 0.0f32;
+        for j in 0..d_model {
+            g += g_row[j] * x[j];
+            u += u_row[j] * x[j];
+        }
+        gated[i] = silu(g) * u;
+    }
+}
+
+/// Down projection `y = W_d · gated`. Row-parallel under `simd`.
+#[inline]
+fn down_proj(down: &[f32], gated: &[f32], y: &mut [f32], d_ff: usize) {
+    debug_assert_eq!(down.len(), y.len() * d_ff);
+    debug_assert_eq!(gated.len(), d_ff);
+
+    #[cfg(feature = "simd")]
+    {
+        let d_model = y.len();
+        if d_model * d_ff >= 8 * 1024 {
+            let nthreads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(d_model.max(1));
+            if nthreads > 1 {
+                let chunk = d_model.div_ceil(nthreads);
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(nthreads);
+                    for (chunk_idx, out_chunk) in y.chunks_mut(chunk).enumerate() {
+                        let row_start = chunk_idx * chunk;
+                        let d_slice = &down[row_start * d_ff
+                            ..(row_start + out_chunk.len()) * d_ff];
+                        let g_ref = gated;
+                        handles.push(s.spawn(move || {
+                            for (i, slot) in out_chunk.iter_mut().enumerate() {
+                                let d_row = &d_slice[i * d_ff..(i + 1) * d_ff];
+                                let mut acc = 0.0f32;
+                                for j in 0..d_ff {
+                                    acc += d_row[j] * g_ref[j];
+                                }
+                                *slot = acc;
+                            }
+                        }));
+                    }
+                    for h in handles { let _ = h.join(); }
+                });
+                return;
+            }
+        }
+    }
+    let d_model = y.len();
+    for i in 0..d_model {
+        let row = i * d_ff;
+        let d_row = &down[row..row + d_ff];
+        let mut acc = 0.0f32;
+        for j in 0..d_ff {
+            acc += d_row[j] * gated[j];
+        }
+        y[i] = acc;
     }
 }
 
@@ -565,15 +671,7 @@ impl OwnedExpertWeights {
         // input columns of x affect only how `gated` was computed, not
         // the down-projection structure.)
         let mut y = vec![0.0f32; self.d_model];
-        for i in 0..self.d_model {
-            let row = i * self.d_ff;
-            let d_row = &self.down[row..row + self.d_ff];
-            let mut acc = 0.0f32;
-            for j in 0..self.d_ff {
-                acc += d_row[j] * gated[j];
-            }
-            y[i] = acc;
-        }
+        down_proj(&self.down, &gated, &mut y, self.d_ff);
         y
     }
 }
