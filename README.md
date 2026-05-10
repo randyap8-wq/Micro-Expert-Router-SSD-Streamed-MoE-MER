@@ -95,6 +95,11 @@ For each token, the engine:
 5. averages the K expert outputs (mock combine — a real router would do a
    weighted sum using its softmax gates);
 6. updates the Markov predictor and kicks off speculative prefetches.
+   With the predictive architecture's L / M arms enabled (see
+   [Predictive architecture](#7-predictive-architecture-s--l--m-speculative-io)),
+   the prefetch set is the union `E = S ∪ L ∪ M` of the Markov-chain hint
+   `S`, the locality monitor's hot set `L`, and the neural speculator's
+   top-K `M`.
 
 The forward pass is plain scalar `f32` Rust — no BLAS, no SIMD, no GPU.
 That's deliberate: the project's thesis is about **storage bandwidth**,
@@ -114,7 +119,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s. Hands out `PooledBuffer` RAII guards; dropping a guard returns the buffer to the free list and notifies waiters. This is the literal "pre-allocated RAM buffer" the spec asks for. |
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`). Includes a `gen-data` helper to create synthetic test files and a portable Unix fallback for development on macOS. |
-| `router` | `TopKRouter` (deterministic first-order Markov chain over expert ids — clustered locality by default, or load a precomputed `N×N` transition matrix via `--router-matrix`) and `PredictiveLoader` (online sparse first-order Markov predictor over observed transitions, smoothed with a uniform Laplace prior so predictions are immediately usable). |
+| `router` | `TopKRouter` (deterministic first-order Markov chain over expert ids — clustered locality by default, or load a precomputed `N×N` transition matrix via `--router-matrix`), `PredictiveLoader` (online sparse first-order **and** second-order Markov predictor over observed transitions, smoothed with a uniform Laplace prior), `LocalityMonitor` (sliding-window heat map — the **L** arm of the speculative `S ∪ L ∪ M` union-fetch), and `NeuralSpeculator` (tiny 2-layer MLP trained online against the gate's actual top-K — the **M** arm of the same union). |
 | `inference` | Real SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`) computed in scalar `f32` directly over the bytes streamed off NVMe. Reinterprets each pool buffer as three weight matrices (no copy). Replace with `tch`/`candle`/`cudarc` for SIMD / GPU. |
 | `engine` | Top-level orchestrator. Owns the router/predictor/cache/pool/storage, drives the per-token cycle, schedules prefetches, records HDR histograms. |
 | `main` | `clap`-based CLI with `gen-data` and `run` subcommands, structured `tracing` logs, `--first-token 3,7` to reproduce the spec example, `--io-only` for pure-I/O benchmarking, `--force-ssd` to refuse page-cache shortcuts, and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py`) so a real Mixtral checkpoint runs with no further flags. |
@@ -317,7 +322,7 @@ Endpoints:
 | method   | path                       | purpose                                            |
 | -------- | -------------------------- | -------------------------------------------------- |
 | `GET`    | `/health`                  | liveness probe (`{"status":"ok",...}`)             |
-| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait |
+| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and — when the predictive arms are enabled — `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, and the `mer_ssd_stall_seconds` histogram |
 | `POST`   | `/v1/completions`          | OpenAI text-completion shape (`prompt`, `max_tokens`, …) |
 | `POST`   | `/v1/chat/completions`     | OpenAI chat-completion shape (`messages`, …)       |
 | `DELETE` | `/v1/sessions/{id}`        | explicitly drop a saved KV-cache session (see [Session API](#session-api)) |
@@ -449,6 +454,31 @@ compute overlap. The two knobs live under `[real_transformer]`:
 max_batch_size  = 8   # max concurrent requests fused per step (1 disables batching)
 batch_timeout_ms = 5  # how long to wait for more requests to join a partial batch
 ```
+
+#### Predictive architecture (`[predictive]`)
+
+The HTTP server can opt the engine into the dual-path predictive
+architecture (the **L** and **M** arms of `E = S ∪ L ∪ M` — see
+[Predictive architecture](#7-predictive-architecture-s--l--m-speculative-io))
+without any code changes, via an additional TOML block:
+
+```toml
+[predictive]
+locality_enabled       = true   # turn on the LocalityMonitor (L arm)
+locality_window        = 256    # sliding window length, in observations
+locality_threshold_pct = 0.10   # heat ratio for declaring an expert "hot"
+speculator_enabled     = true   # turn on the NeuralSpeculator (M arm)
+speculator_hidden_dim  = 128    # MLP hidden size; 128 is the spec recommendation
+speculator_top_k       = 0      # 0 ⇒ inherit `model.top_k`
+```
+
+The defaults (everything off) reproduce the legacy Markov-only
+prefetch path bit-for-bit; flipping each flag wires its arm into
+the prefetch union and lights up the corresponding Prometheus
+counters on `/metrics`. The schema is validated at startup
+(`config.rs`) and rejects nonsensical settings — `locality_window
+== 0`, `locality_threshold_pct ∉ (0, 1]`, `speculator_top_k >
+num_experts`, etc.
 
 #### Real-transformer pipeline (gist Phase 5/6)
 
@@ -886,6 +916,18 @@ Covers:
   equivalent to direct `RealModel::step` calls, and concurrent
   batched wall-clock stays within 1.5× the strictly-sequential
   baseline,
+- the **predictive architecture** — the `LocalityMonitor` tracks
+  its sliding window correctly (heat counts, hot-set membership,
+  out-of-range ids, reset semantics), the `NeuralSpeculator`
+  produces distinct sorted top-K ids, deterministically reproduces
+  the same prediction for a given seed, drives loss down on a
+  fixed target across SGD steps, gracefully handles empty / invalid
+  inputs, and `predict_topk_with_probs` returns a normalised
+  distribution; the `Engine` integration tests verify that the
+  hot set actually pins experts in the cache, the speculator
+  correctly records hit / miss telemetry against the gate's
+  decision, and `predictive_telemetry` reports non-zero SSD-stall
+  microseconds when the engine had to wait on cache-miss reads,
 - the **HTTP server** — `/health`, `/metrics`, `/v1/completions`
   (streaming and non-streaming), `/v1/chat/completions` (streaming
   and non-streaming) round-trip, the real-model path actually
@@ -1039,10 +1081,102 @@ SSD bytes**. The detection runs offline (no runtime cost), and the
 runtime overhead is one `HashMap` lookup per routed expert per token.
 Empty / absent maps disable the feature entirely.
 
+### 7. Predictive architecture (`S ∪ L ∪ M` speculative I/O)
+
+The original prefetcher is a single Markov-chain predictor (call it
+`S`). Real MoE traces have two other exploitable signals it can't
+see:
+
+* **temporal locality** — within a topic, the same handful of experts
+  fire over and over for hundreds of tokens, *regardless* of the
+  precise transition the chain just made;
+* **semantic intent** — the hidden state itself encodes which
+  experts the gate is *about* to pick, often before the routing
+  decision is finalised.
+
+Two opt-in components capture those signals and **union** their
+hints with the Markov chain's into a single speculative-I/O fetch
+set `E = S ∪ L ∪ M`:
+
+* **L — `LocalityMonitor`** (`router::LocalityMonitor`). A sliding
+  window of the most recent `locality_window` routing observations
+  with a flat `Vec<u32>` heat map. An expert whose count crosses
+  `locality_threshold_pct * window_len` is "hot" and is **pinned in
+  the LRU cache** until it falls back below the threshold —
+  protected from eviction even when the Markov chain wanders
+  elsewhere. Reconciliation runs after every token: ids that just
+  joined the hot set get pinned, ids that just left get unpinned.
+* **M — `NeuralSpeculator`** (`router::NeuralSpeculator`). A tiny
+  two-layer MLP (`d_model -> hidden -> num_experts`, ReLU + softmax,
+  default `hidden = 128`) trained **online** by SGD against the
+  gate's actual top-K decision at each token. Cheap enough to run
+  on the critical path, with He-uniform init, gradient clipping at
+  `±1`, and a `clamp_finite` weight guard so a stuck speculator
+  never NaNs out the predictor.
+
+Both arms are wired into `Engine::union_prefetch`: per token, the
+engine builds the union of (a) the predictor's `predict_next2(prev_prev,
+prev)` Markov hint `S`, (b) the locality monitor's `hot_set(threshold)`
+`L`, and (c) the speculator's `predict_topk(hidden_state)` `M`,
+deduplicates against ids already in flight or already resident,
+and spawns prefetches for the rest. Per-id Markov probabilities
+are preserved when available; ids that come only from `L` or `M`
+borrow a `0.5` "best guess" so they clear typical
+`predict_min_prob` budgets but stay distinguishable in the logs.
+
+Online speculator training is interleaved with prediction in a
+single `RwLock` critical section so a `predict()` always sees a
+consistent `(W1, b1, W2, b2)` snapshot — the predictor never reads
+half-updated weights mid-SGD-step.
+
+**How this saves energy.** `S` alone misses two failure modes:
+prefetches **wasted** when the chain wanders out of the active
+topic (the resident hot set still gets evicted by cold experts,
+then re-paged on every loopback), and prefetches **never issued**
+when the gate is about to pick an expert the chain has no
+short-history evidence for. Adding `L` keeps the recently-hot set
+pinned so it is read **at most once per topic** instead of
+re-paged every few tokens; adding `M` lets the prefetcher react
+to the *hidden state* before the routing decision lands, so cache
+misses on real-but-rare transitions can be hidden behind compute.
+Both reduce the count of cache-miss reads — the dominant byte
+mover in `bytes_read` — at the cost of a tiny CPU budget (one
+small MLP forward + SGD step per token, plus one ring-buffer
+update) that is far below the energy cost of even a single
+NVMe expert read.
+
+**Telemetry.** The engine maintains four atomic counters
+(`spec_hits`, `spec_misses`, `locality_hits`, `locality_misses`)
+and a cumulative `total_ssd_stall_us`, all readable through
+`Engine::predictive_telemetry()` and exported as Prometheus
+counters / a histogram on `/metrics`:
+
+| Metric | Meaning |
+|---|---|
+| `mer_speculator_hits_total` | Per-token speculator predictions that intersected the gate's actual top-K. |
+| `mer_speculator_misses_total` | Per-token speculator predictions that did not. The ratio is the speculator's running accuracy. |
+| `mer_locality_hits_total` | Routed experts that were already in the locality monitor's hot set at routing time (would-be cache miss avoided by pinning). |
+| `mer_locality_misses_total` | Routed experts that were not. |
+| `mer_ssd_stall_seconds` | Histogram of cumulative SSD critical-path stall time per token — the wall-clock window the engine spent blocked waiting for cache-miss reads to land. The headline number the L / M arms aim to drive down. |
+
+The CLI run summary (`print_summary`) appends an extra line when
+either arm is enabled, e.g.:
+
+```
+predictive:    locality=on (hit_rate=64.32%)  speculator=on (accuracy=58.10%)  ssd_stall=12.4ms
+```
+
+When `[predictive]` is left at its defaults (everything off), the
+engine takes the legacy Markov-chain prefetch path bit-for-bit and
+the new line is omitted from the summary, so existing benchmarks
+and golden outputs are unchanged.
+
 ### How to combine them
 
-The six knobs are independent and compose freely. A reasonable
-"low-energy" preset on a Linux NVMe box looks like:
+The seven knobs are independent and compose freely. The first six
+live on the CLI; the predictive arms (`L` + `M`) are config-driven
+and apply equally to the CLI run loop and the HTTP server. A
+reasonable "low-energy" preset on a Linux NVMe box looks like:
 
 ```bash
 micro-expert-router run \
@@ -1055,8 +1189,23 @@ micro-expert-router run \
     --alias-map ./data/aliases.json  # Change 6: deduplicated experts share a slot
 ```
 
+…and, alongside it in `config.toml` (or the equivalent `serve`-time
+TOML), Change 7 — the predictive `L` + `M` arms:
+
+```toml
+[predictive]
+locality_enabled       = true
+locality_window        = 256
+locality_threshold_pct = 0.10
+speculator_enabled     = true
+speculator_hidden_dim  = 128
+speculator_top_k       = 0
+```
+
 `print_summary` reports each knob's state and effect (`pinned`,
-`alias_redirects`, `dtype`, `partial_load_fraction`) on every run, so
+`alias_redirects`, `dtype`, `partial_load_fraction`, plus a
+`predictive:` line when L / M are enabled — locality hit-rate,
+speculator accuracy, and cumulative SSD stall) on every run, so
 you can verify the energy-saving paths actually engaged.
 
 ---

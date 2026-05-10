@@ -1073,6 +1073,9 @@ impl Engine {
             alias_redirects: self.alias_redirects.load(Ordering::Relaxed),
             dtype: self.options.dtype,
             partial_load_fraction: self.options.partial_load_fraction,
+            predictive: self.predictive_telemetry(),
+            locality_enabled: self.locality.is_some(),
+            speculator_enabled: self.speculator.is_some(),
         }
     }
 
@@ -1139,6 +1142,19 @@ impl Engine {
             r.pinned_count,
             r.alias_redirects
         );
+        // Only emit the predictive line when either L or M is wired in;
+        // the legacy benchmark path (everything off) keeps its existing
+        // summary shape so older diff-on-output tests stay valid.
+        if r.locality_enabled || r.speculator_enabled {
+            info!(
+                "predictive:    locality={} (hit_rate={:.2}%)  speculator={} (accuracy={:.2}%)  ssd_stall={:.1}ms",
+                if r.locality_enabled { "on" } else { "off" },
+                r.predictive.locality_hit_rate * 100.0,
+                if r.speculator_enabled { "on" } else { "off" },
+                r.predictive.speculator_accuracy * 100.0,
+                r.predictive.ssd_stall_us as f64 / 1000.0,
+            );
+        }
         info!("=======================================================");
     }
 }
@@ -1196,6 +1212,18 @@ pub struct EngineReport {
     pub dtype: WeightDtype,
     /// Partial-load fraction used by this engine instance (Change 3).
     pub partial_load_fraction: f64,
+    /// Snapshot of the predictive-architecture telemetry: locality
+    /// hit-rate, speculator accuracy, and cumulative SSD critical-path
+    /// stall. Populated regardless of whether the L/M arms are wired
+    /// in (the counters stay at zero when disabled, which still
+    /// produces the correct `0.0` ratios).
+    pub predictive: PredictiveTelemetry,
+    /// Whether the [`LocalityMonitor`] (the **L** arm of the
+    /// predictive `S ∪ L ∪ M` union-fetch) was configured on this run.
+    pub locality_enabled: bool,
+    /// Whether the [`NeuralSpeculator`] (the **M** arm of the
+    /// predictive `S ∪ L ∪ M` union-fetch) was configured on this run.
+    pub speculator_enabled: bool,
 }
 
 #[cfg(test)]
