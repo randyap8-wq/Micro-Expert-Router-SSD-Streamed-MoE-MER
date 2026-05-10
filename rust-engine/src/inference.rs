@@ -449,7 +449,7 @@ pub fn dequantize_q4_0_block(src: &[u8], dst: &mut [f32]) {
     for i in 0..Q4_0_BLOCK_ELEMS {
         let byte = qs[i >> 1];
         let q4 = if i & 1 == 0 { byte & 0x0F } else { byte >> 4 };
-        // Symmetric range: q4 ∈ 0..16 dequantises to q4-8 ∈ -8..+7.
+        // Symmetric range: q4 ∈ 0..15 dequantises to q4-8 ∈ -8..+7.
         dst[i] = d * (q4 as i32 - 8) as f32;
     }
 }

@@ -31,9 +31,10 @@
 //! * gives the scheduler an easy "how many slots are free?" knob it
 //!   can use to refuse / queue new requests instead of OOM-ing.
 //!
-//! `KvCache` is kept as the canonical attention-side API; the new
-//! [`PooledKvCache`] in this module is the *memory-managed* sibling
-//! used by the batch scheduler. Both are fully tested.
+//! `KvCache` is kept as the canonical attention-side API; this
+//! module's [`BlockPool`] and [`BlockManager`] provide the
+//! *memory-managed* sibling used by the batch scheduler. Both are
+//! fully tested.
 
 use std::sync::Arc;
 
@@ -67,9 +68,11 @@ pub struct BlockId(pub u32);
 /// separately.
 ///
 /// The pool is `Sync` and is intended to be wrapped in `Arc`. Free
-/// list mutations take a short `parking_lot::Mutex`; the slab itself
-/// is never re-allocated (capacity is fixed at construction time) so
-/// concurrent reads/writes of *different* blocks never need to lock.
+/// list mutations take a short `parking_lot::Mutex`, and the backing
+/// key/value slabs are also protected by `Mutex<Vec<f32>>`. The slab
+/// storage is fixed at construction time and never re-allocated, but
+/// reads and writes still synchronize through those mutexes in the
+/// current implementation.
 pub struct BlockPool {
     kv_dim: usize,
     capacity: usize,
