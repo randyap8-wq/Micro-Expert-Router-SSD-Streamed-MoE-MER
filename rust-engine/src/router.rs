@@ -625,9 +625,11 @@ impl LocalityMonitor {
                     *slot -= 1;
                 }
             }
-        } else {
-            inner.total += 1;
         }
+        // `total` is the cumulative observation counter (saturating
+        // semantics promised by [`Self::total_observations`]); count
+        // every observation, not just the ones that grew the window.
+        inner.total = inner.total.saturating_add(1);
         inner.window.push_back(id);
         inner.counts[id as usize] = inner.counts[id as usize].saturating_add(1);
     }
