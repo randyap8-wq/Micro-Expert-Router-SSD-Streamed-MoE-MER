@@ -102,5 +102,7 @@ rope_base = 10000.0
 # RMSNorm epsilon.
 rms_eps = 1e-6
 # PRNG seed for the deterministic-init fallback (used for any tensor
-# missing from `weights_dir`).
+# missing from `weights_dir`). 12648430 == 0xC0FFEE; matches the
+# `default_seed()` constant in `src/config.rs` (TOML doesn't accept
+# hex literals).
 seed = 12648430
