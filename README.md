@@ -150,33 +150,78 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
   (e.g. macOS dev boxes) the same code path runs without `O_DIRECT` so the
   engine still runs end-to-end during development.
 
-### "Why `pread` + `block_in_place` and not io_uring?"
+### `pread` + `block_in_place` *or* io_uring (`--features io_uring`)
 
-Earlier drafts used the `rio` io_uring wrapper, but `rio 0.9.4` carries an
-unfixed use-after-free advisory and the crate is unmaintained, so the
-dependency was removed. The current backend is intentionally simple —
-positional `pread` is `O_DIRECT`-compatible, deep-queue-friendly on NVMe,
-and avoids touching the file offset so concurrent reads against the same
-fd are safe. Future `io_provider` upgrade paths:
+The default backend uses positional `pread(2)` driven on Tokio's
+blocking thread pool via `block_in_place`. It's `O_DIRECT`-compatible,
+deep-queue-friendly on NVMe, and avoids touching the file offset so
+concurrent reads against the same fd are safe — and it works on every
+Unix without any extra dependencies.
+
+A real **io_uring backend with registered fixed buffers** ships in
+`src/io_uring_storage.rs` and is built when the cargo feature
+`io_uring` is enabled (Linux only). On startup it
+`io_uring_register(IORING_REGISTER_BUFFERS)`s every `BufferPool` slot
+with the kernel exactly once, so subsequent reads are
+`IORING_OP_READ_FIXED` SQEs that reference a buffer *index* — the
+kernel never has to walk the user mapping or pin pages on the hot
+path. A batched submission entry point
+(`IoUringStorage::read_experts_batch_fixed`) pushes `K` SQEs and calls
+`submit_and_wait(K)` once when a token misses on multiple experts.
+Pass `--io-uring` on the CLI (or build with `--features io_uring`) to
+opt in. When the kernel doesn't support the registration (older
+kernels, restrictive sandboxes) we log a warning and stay on the
+portable `pread` backend.
+
+For comparison with other Rust async-I/O options on this workload:
 
 | Crate | Verdict for this workload |
 |---|---|
-| **`pread` + `block_in_place`** *(used here)* | Zero extra deps, works on every Unix, exercises the full `O_DIRECT` + page-aligned-buffer + LRU + prefetch logic. The compute and storage stay observably distinct in the per-token logs. |
+| **`pread` + `block_in_place`** *(default)* | Zero extra deps, works on every Unix, exercises the full `O_DIRECT` + page-aligned-buffer + LRU + prefetch logic. The compute and storage stay observably distinct in the per-token logs. |
+| **`io-uring`** *(`--features io_uring`, used here)* | The thinnest binding to the kernel ABI. We use it with **registered (fixed) buffers** + cached fds, which removes per-op address validation in the kernel — the single biggest win for sustained NVMe throughput. |
 | **`tokio-uring`** | Best ergonomic fit if you live in Tokio. Single-threaded per ring, requires `#[tokio_uring::start]` instead of `#[tokio::main]` — would force a runtime restructuring. |
-| **`io-uring`** (raw, by tokio-rs) | The thinnest binding to the kernel ABI. Lets you use **registered (fixed) buffers** + **registered files**, which removes per-op address validation in the kernel — the single biggest win for sustained NVMe throughput. **This is what a production build of this engine would use.** |
 | **`glommio`** | Thread-per-core, polled io_uring. Made for NVMe-bound workloads (ScyllaDB heritage). For a pure expert-fetch service pinning workers to cores feeding local rings, glommio is arguably the *fastest* answer on Linux. Trade-off: incompatible with Tokio (it owns the runtime). |
 
-The clean separation between `io_provider` and the rest of the engine means
-swapping the backend for `io-uring` or `glommio` is a self-contained change.
+The clean separation between `io_provider` / `io_uring_storage` and the
+rest of the engine means swapping in `glommio` or `tokio-uring` later
+is a self-contained change.
 
 ---
 
 ## Building and running
 
+### Quickstart (Docker / docker-compose)
+
+If you just want to see the engine answer an HTTP request on a fresh
+laptop, the project ships a `Dockerfile`, a `docker-compose.yml`, and a
+helper script that generates a small synthetic dataset before starting
+the server:
+
+```bash
+# 1. (optional) generate ~128 MiB of synthetic expert files into ./data
+./scripts/quickstart.sh    # generates data + runs the binary directly
+
+# 2. or use Docker (builds a slim runtime image, mounts ./data + config.toml)
+docker compose up --build
+
+# 3. smoke test
+curl -sS http://localhost:8080/healthz
+curl -sS -X POST http://localhost:8080/v1/completions \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Hello","max_tokens":4,"stream":true}'
+```
+
+The compose file defaults to building with `--features io_uring`
+(set the `FEATURES=""` build arg to opt out). Edit `config.toml` on
+the host and `docker compose restart mer` to reload settings — the
+file is bind-mounted read-only into `/etc/mer/config.toml`.
+
 ### Prerequisites
 
-- **Linux kernel ≥ 3.0** is enough — the I/O path uses `pread(2)` with
-  `O_DIRECT`, not io_uring. No special kernel features are required.
+- **Linux kernel ≥ 3.0** is enough for the default `pread(2)` +
+  `O_DIRECT` I/O path. The optional `--features io_uring` backend
+  needs **kernel ≥ 5.6** (and a sandbox that doesn't filter
+  `io_uring_setup`).
 - **Rust 1.74+** (uses `clap 4`, edition 2021).
 - A real **block-device-backed filesystem** (ext4, xfs, btrfs on NVMe) for
   the `O_DIRECT` path. tmpfs / overlayfs / many FUSE mounts return `EINVAL`
@@ -197,7 +242,8 @@ swapping the backend for `io-uring` or `glommio` is a self-contained change.
 
 ```bash
 cd rust-engine
-cargo build --release
+cargo build --release                    # default, portable
+cargo build --release --features io_uring  # Linux: enables IoUringStorage
 ```
 
 ### Generate synthetic expert files
@@ -285,12 +331,19 @@ curl -s http://127.0.0.1:8080/v1/completions \
 
 The server is intentionally **stateless per request** in this PR: each
 request drives the model for `max_tokens` cycles and returns the decoded
-tokens in one shot. Streaming (`stream: true`) is accepted in the
-request body for OpenAI compatibility but currently produces a
-non-streaming response. Per-request KV caches mean that concurrent
-axum requests never alias each other's attention state — that is the
+tokens in one shot. Per-request KV caches mean that concurrent axum
+requests never alias each other's attention state — that is the
 foundational request-scheduler piece that token-level cross-request
 batching will layer on top of.
+
+**Streaming (`stream: true`) is supported.** The server emits one
+`data: { ... }` SSE event per generated token in OpenAI's
+`text_completion` / `chat.completion.chunk` shape, terminated with a
+`data: [DONE]` line. For chat completions the first event carries the
+`{ "role": "assistant" }` delta before any content tokens, matching
+the OpenAI wire protocol exactly. Non-streaming requests (the default
+when `stream` is absent or `false`) keep returning a single JSON
+response.
 
 #### Real-transformer pipeline (gist Phase 5/6)
 
@@ -472,6 +525,18 @@ micro-expert-router run
   --router-matrix <PATH>     Load a precomputed N×N transition matrix from a
                               text file (whitespace-separated f64, row-major).
                               Overrides --router-clusters / --router-intra-p.
+  --gate-weights <PATH>      Load a real gating-network weight matrix
+                              ([num_experts × d_model] little-endian f32,
+                              row-major, no header). When set, the run loop
+                              bypasses the Markov router and computes
+                              softmax(W_gate · x) → top-K per token (the
+                              real Mixtral routing equation), with the
+                              selected experts still streamed from the SSD
+                              by Engine::moe_step.
+  --io-uring                 Probe the IoUringStorage backend (Linux,
+                              --features io_uring); also pins the process
+                              to NUMA-local cores (override count via
+                              MER_PIN_CORES env var).
   --token-pause-us <N>       Sleep between tokens to throttle the stream
   --seed <U64>               PRNG seed for reproducibility
 ```
@@ -744,26 +809,35 @@ delta. `1.0` (default) preserves byte-exact legacy behaviour. The SSD
 follow-up change to the offline extractor; today's runtime saves the
 compute term and prepares the API surface for the bandwidth term.
 
-### 4. io_uring with registered fixed buffers (`--io-uring`)
+### 4. io_uring with registered fixed buffers (`--features io_uring`, `--io-uring`)
 
-A new feature-gated `io_uring_storage.rs` module declares the API
-surface for the Linux `io_uring` backend with **registered fixed
-buffers**. `BufferPool::raw_iovecs` exposes every pool slot as a stable
-`(ptr, len)` so the kernel can be told about all of them up front
-exactly once. `--io-uring` accepts the flag, logs which path is in use,
-and falls back gracefully on non-Linux / non-feature builds.
+`io_uring_storage.rs` is a real Linux backend, gated behind the
+`io_uring` cargo feature. `IoUringStorage::new` calls
+`io_uring_register(IORING_REGISTER_BUFFERS)` over every
+`BufferPool::raw_iovecs` slot at startup; `read_expert_fixed` then
+submits an `IORING_OP_READ_FIXED` SQE that references the buffer
+*index* and waits for the completion. A batched submission entry point
+(`read_experts_batch_fixed`) pushes K SQEs and `submit_and_wait(K)`
+once when a token misses on multiple experts. Per-expert file
+descriptors are cached on the first call, mirroring `NvmeStorage`'s
+`fd_for` behaviour. `--io-uring` on the CLI now actually probes the
+backend at startup (logging `registered_buffers`) and surfaces a clean
+error path when the kernel rejects the registration (older kernels,
+restrictive sandboxes); we then keep running on the portable `pread`
+backend so the run completes either way.
 
 **How this saves energy.** Each `pread(2)` cache miss today is one
 syscall plus a per-read iovec setup. With `io_uring` + fixed buffers,
-a token that misses on K experts becomes **one syscall** (`io_uring_enter`)
-referencing K pre-pinned buffer indices — the kernel never has to walk
-the user mapping or pin pages on the hot path. Published microbenchmarks
-report 30–50 % less per-read CPU on NVMe-class SSDs. CPU time during
-I/O wait is pure overhead — the same bytes were going to leave the
-device either way; `io_uring` just makes the kernel cheaper, which is
-energy out of the budget. Build with `cargo build --release --features
-io_uring` (Linux only) to enable; the engine selects the `pread(2)`
-backend by default so the portable path stays the warning-free default.
+a token that misses on K experts becomes **one syscall**
+(`io_uring_enter`) referencing K pre-pinned buffer indices — the
+kernel never has to walk the user mapping or pin pages on the hot
+path. Published microbenchmarks report 30–50 % less per-read CPU on
+NVMe-class SSDs. CPU time during I/O wait is pure overhead — the same
+bytes were going to leave the device either way; `io_uring` just makes
+the kernel cheaper, which is energy out of the budget. Build with
+`cargo build --release --features io_uring` (Linux only) to enable;
+the engine selects the `pread(2)` backend by default so the portable
+path stays the warning-free default.
 
 ### 5. Frequency-based expert pinning (`--pin-after-observations N`)
 
@@ -828,41 +902,38 @@ you can verify the energy-saving paths actually engaged.
 
 ## Limitations / next steps
 
-- **Static top-K router (in the legacy `run` and `serve` paths).** Real
-  Mixtral routing is a learned `softmax` over the gating projection
-  conditioned on the per-token hidden state. The Markov-chain router
-  used by `Engine::generate` captures the *temporal locality* of real
-  routing traces (and can be fed one directly via `--router-matrix`),
-  but doesn't condition on `x`. The production code path lives in
-  `gating::LinearGate` (`x @ W_gate.T → softmax → top-K`) — wiring it
-  into the engine's per-token loop is the next step.
+- **Static top-K router (in the legacy `serve` path).** The `serve`
+  binary still uses the deterministic Markov `TopKRouter`. The
+  production-style learned `softmax(W_gate · x) → top-K` path is fully
+  wired into `cmd_run` via `--gate-weights <PATH>` (loads
+  `[num_experts × d_model]` little-endian f32 into `gating::LinearGate`);
+  threading the same gate through the HTTP server's per-request loop
+  is straightforward and is the next step.
 - **Scalar `f32` matmul.** The expert FFN runs as a plain triple-nested
-  scalar loop. That is intentional — the project's thesis is about
-  storage bandwidth — but a real serving deployment would call into BLAS
-  / a SIMD kernel / a CUDA kernel via `tch` / `candle` / `cudarc`. The
-  byte→`f32` view in `inference::ExpertWeights::from_bytes` already does
-  zero-copy reinterpretation, so any of those backends slot in cleanly.
+  scalar loop; the `simd` cargo feature parallelises the gate/up/down
+  matmuls across rayon-style scopes but a real serving deployment
+  would still drop in BLAS / a CUDA kernel via `tch` / `candle` /
+  `cudarc`. The byte→`f32` view in
+  `inference::ExpertWeights::from_bytes` already does zero-copy
+  reinterpretation, so any of those backends slot in cleanly.
 - **Single-layer wiring in the live engine.** `MultiLayerExpertCache`
   (per-layer LRU keyed on `(layer, expert_id)`) and the dense
   transformer pieces (`RmsNorm`, RoPE, scalar causal MHA with KV
-  cache, MoE output combiner) now live in-tree under `multi_layer_cache`,
-  `transformer`, and `gating`, with unit tests; the `serve` path drives
-  one layer through them. Stacking 32 layers and threading the hidden
-  state across them is the follow-up.
-- **No streaming responses.** The HTTP server accepts `stream: true` for
-  OpenAI compatibility but returns a non-streaming response; SSE
-  streaming + continuous batching is on the roadmap.
-- **Synchronous `pread` on a blocking-donated worker.** The current
-  backend uses `tokio::task::block_in_place` + `pread(2)`. A production
-  deployment should switch to the raw `io-uring` crate with **registered
-  fixed buffers** and **registered files** — the cleanest single
-  throughput win available.
-- **No NUMA pinning.** On multi-socket boxes you'd want one ring per NUMA
-  node and to pin worker threads + buffers locally.
-- **No batched / vectored reads.** When two experts on the same token both
-  miss, we issue two independent `pread` calls; on a NVMe drive with deep
-  queues that's already efficient, but on slower devices you might want
-  `readv`-style batching (or io_uring submission batching).
+  cache, MoE output combiner) now live in-tree under
+  `multi_layer_cache`, `transformer`, and `gating`, with unit tests;
+  the `serve` path drives one layer through them. Stacking 32 layers
+  and threading the hidden state across them is the follow-up.
+- **Continuous batching.** SSE streaming responses are now in place
+  (one event per token, OpenAI-compatible, terminated with
+  `data: [DONE]`). Per-request KV caches keep concurrent axum
+  requests independent. Token-level cross-request batching (so K
+  concurrent users share a single decoder step) is the next layer
+  on top.
+- **Picking a NUMA budget.** `MER_PIN_CORES=N` is honoured at
+  startup to `sched_setaffinity(2)` the process to the first `N`
+  CPUs of NUMA node 0 (best-effort, Linux only). Real per-ring
+  per-node pinning would need one io_uring ring per node and
+  per-node buffer pools — a deeper refactor.
 
 ## License
 

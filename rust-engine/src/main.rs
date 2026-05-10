@@ -357,6 +357,19 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     use crate::server::{serve, AppState};
     use crate::tokenizer::Tokenizer;
 
+    // Best-effort NUMA-local pinning. Off by default; opt in by
+    // setting `MER_PIN_CORES=N` in the environment. Useful for
+    // reducing cross-socket DRAM hops on multi-NUMA hosts under
+    // sustained load. Has no effect on non-Linux builds.
+    if let Some(n) = std::env::var("MER_PIN_CORES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if let Err(e) = pin_to_local_cores(n) {
+            warn!(error = %e, "MER_PIN_CORES set but pinning failed; continuing without affinity");
+        }
+    }
+
     let cfg = Config::from_file(&config_path)?;
     info!(
         bind = %cfg.server.bind,
@@ -691,6 +704,21 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.io_uring {
+        // Best-effort affinity: keep the engine on the NUMA node that
+        // owns CPU 0 to avoid cross-socket DRAM hops on every io_uring
+        // completion. Honored only on Linux. Configurable via the
+        // `MER_PIN_CORES` env var (number of cores to pin to); defaults
+        // to `min(8, available_parallelism)` when unset, which is a
+        // reasonable starting point for a single-socket workstation.
+        let n = std::env::var("MER_PIN_CORES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8)
+            });
+        if let Err(e) = pin_to_local_cores(n) {
+            warn!(error = %e, "could not set CPU affinity (continuing without pinning)");
+        }
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
             // Build the backend from the same pool we'll hand the
@@ -1155,6 +1183,94 @@ fn total_ram_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+/// Best-effort NUMA / CPU-affinity hint.
+///
+/// On Linux, when `num_cores > 0`, pin the current process to the first
+/// `num_cores` CPUs of the NUMA node owning CPU 0 (via
+/// `sched_setaffinity(2)`). The intent is to keep io_uring completion
+/// processing, the engine's matmul threads, and the tokio runtime on
+/// the same memory controller — for an SSD-streaming MoE this avoids
+/// cross-socket DRAM hops on every cache fill, which dominate latency
+/// at high QPS.
+///
+/// We deliberately don't pull in a NUMA crate: this function picks the
+/// CPUs from `/sys/devices/system/node/node0/cpulist` (a kernel-exposed
+/// comma+dash list). When that file isn't available we fall back to
+/// CPUs `0..num_cores`. On non-Linux targets this is a no-op that
+/// returns `Ok(())` so callers can always invoke it unconditionally.
+fn pin_to_local_cores(num_cores: usize) -> std::io::Result<()> {
+    if num_cores == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cpus = read_local_node_cpus().unwrap_or_else(|| (0..num_cores).collect());
+        let chosen: Vec<usize> = cpus.into_iter().take(num_cores).collect();
+        if chosen.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `cpu_set_t` is a POD bitset; we zero it with
+        // `mem::zeroed`, fill in valid CPU bits with the libc helpers,
+        // then hand it to `sched_setaffinity` which only reads.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            for cpu in &chosen {
+                libc::CPU_SET(*cpu, &mut set);
+            }
+            let rc = libc::sched_setaffinity(
+                0, // current process
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &set as *const _,
+            );
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        info!(
+            cores = ?chosen,
+            "pinned process to NUMA-local CPU set (best-effort; sched_setaffinity)"
+        );
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn!(
+            "core affinity hint requested ({} cores) but pinning is Linux-only; \
+             continuing without affinity",
+            num_cores
+        );
+        Ok(())
+    }
+}
+
+/// Parse `/sys/devices/system/node/node0/cpulist` into an ordered
+/// `Vec<usize>` of CPU ids (e.g. `"0-3,8,10-11"` -> `[0,1,2,3,8,10,11]`).
+/// Returns `None` if the file is missing / unparseable — callers fall
+/// back to a contiguous `0..N` range in that case.
+#[cfg(target_os = "linux")]
+fn read_local_node_cpus() -> Option<Vec<usize>> {
+    let body = std::fs::read_to_string("/sys/devices/system/node/node0/cpulist").ok()?;
+    let mut out: Vec<usize> = Vec::new();
+    for part in body.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            let lo: usize = lo.parse().ok()?;
+            let hi: usize = hi.parse().ok()?;
+            if hi < lo {
+                return None;
+            }
+            out.extend(lo..=hi);
+        } else {
+            out.push(part.parse().ok()?);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[cfg(test)]
