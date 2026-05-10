@@ -60,6 +60,9 @@ pub struct RealModelConfig {
     pub top_k: usize,
     pub rope_base: f32,
     pub rms_eps: f32,
+    /// Sliding-window attention span. `None` (default) = full causal
+    /// attention. Mixtral uses `Some(4096)`.
+    pub window_size: Option<usize>,
 }
 
 impl RealModelConfig {
@@ -77,6 +80,7 @@ impl RealModelConfig {
             top_k: 2,
             rope_base: 10_000.0,
             rms_eps: 1e-6,
+            window_size: None,
         }
     }
 
@@ -152,6 +156,7 @@ impl RealModel {
                     wk: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
                     wv: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
                     wo: sample_uniform_vec(&mut rng, config.d_model * q_dim, proj_scale),
+                    window_size: config.window_size,
                 },
                 rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 gate: LinearGate::new(
@@ -322,17 +327,21 @@ impl RealModel {
     ///       x = layer.moe_combine(x, experts_y, routing.weights)
     ///   x = final_rms(x)
     ///   logits = lm_head(x)
-    ///   return argmax(logits)
+    ///   return sample(logits, params, pos)
     /// ```
     ///
     /// `engine.moe_step` is what reads expert weights from SSD via the
     /// LRU cache — that's the whole point of the substrate.
+    /// Sampling is delegated to [`crate::sampling::sample`], so
+    /// `temperature == 0.0` reproduces the original deterministic
+    /// `argmax` behaviour bit-for-bit.
     pub async fn step(
         &self,
         engine: &Arc<Engine>,
         token_id: u32,
         pos: usize,
         kv: &mut [KvCache],
+        params: &crate::sampling::SamplingParams,
     ) -> u32 {
         assert_eq!(
             kv.len(),
@@ -359,23 +368,8 @@ impl RealModel {
             x = layer.moe_combine(&x, &expert_outs, &routing.weights);
         }
         let normed = self.final_rms.forward(&x);
-        let logits = self.lm_head.forward(&normed);
-        argmax(&logits)
+        self.lm_head.sample(&normed, params, pos as u64)
     }
-}
-
-/// Argmax over a logit vector, returning the index. Stable on ties (the
-/// lower index wins) so output is deterministic across runs.
-fn argmax(logits: &[f32]) -> u32 {
-    let mut best = 0u32;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i as u32;
-        }
-    }
-    best
 }
 
 /// Small `splitmix64` PRNG so we can produce deterministic, dependency-free
@@ -530,7 +524,7 @@ mod tests {
         let engine = build_engine_for_model(&dir.path, &cfg);
         let model = RealModel::new_seeded(cfg.clone(), 0xDEAD);
         let mut kv = model.fresh_kv_caches();
-        let next = model.step(&engine, 42, 0, &mut kv).await;
+        let next = model.step(&engine, 42, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
         assert!((next as usize) < cfg.vocab_size);
         // KV caches grew by exactly one position.
         for c in &kv {
@@ -551,12 +545,12 @@ mod tests {
         let model = RealModel::new_seeded(cfg.clone(), 1);
 
         let mut kv1 = model.fresh_kv_caches();
-        let t1 = model.step(&engine, 7, 0, &mut kv1).await;
-        let t2 = model.step(&engine, t1, 1, &mut kv1).await;
+        let t1 = model.step(&engine, 7, 0, &mut kv1, &crate::sampling::SamplingParams::greedy()).await;
+        let t2 = model.step(&engine, t1, 1, &mut kv1, &crate::sampling::SamplingParams::greedy()).await;
 
         let mut kv2 = model.fresh_kv_caches();
-        let u1 = model.step(&engine, 7, 0, &mut kv2).await;
-        let u2 = model.step(&engine, u1, 1, &mut kv2).await;
+        let u1 = model.step(&engine, 7, 0, &mut kv2, &crate::sampling::SamplingParams::greedy()).await;
+        let u2 = model.step(&engine, u1, 1, &mut kv2, &crate::sampling::SamplingParams::greedy()).await;
 
         assert_eq!((t1, t2), (u1, u2));
     }
@@ -573,7 +567,7 @@ mod tests {
         let engine = build_engine_for_model(&dir.path, &cfg);
         let model = RealModel::new_seeded(cfg.clone(), 9);
         let mut kv = model.fresh_kv_caches();
-        let _ = model.step(&engine, 5, 0, &mut kv).await;
+        let _ = model.step(&engine, 5, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
         // Both layers contributed to KV cache growth.
         assert_eq!(kv.len(), 2);
         for c in &kv {

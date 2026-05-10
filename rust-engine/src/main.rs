@@ -20,7 +20,9 @@ mod metrics;
 mod model;
 mod multi_layer_cache;
 mod router;
+mod sampling;
 mod server;
+mod session;
 mod tokenizer;
 mod transformer;
 
@@ -475,6 +477,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             top_k: cfg.model.top_k,
             rope_base: rt.rope_base,
             rms_eps: rt.rms_eps,
+            window_size: if rt.window_size == 0 { None } else { Some(rt.window_size) },
         };
         let m = match rt.weights_dir.as_ref() {
             Some(dir) => crate::model::RealModel::from_dir(model_cfg, dir, rt.seed)?,
@@ -506,6 +509,22 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         (None, None)
     };
 
+    let sessions = if cfg.server.session_ttl_secs > 0 {
+        let store = crate::session::SessionStore::new(std::time::Duration::from_secs(
+            cfg.server.session_ttl_secs,
+        ));
+        // Sweep every TTL/2 (or once a minute, whichever is shorter) so
+        // peak memory stays bounded but the evictor doesn't dominate
+        // the wakeup budget.
+        let sweep = std::time::Duration::from_secs(
+            (cfg.server.session_ttl_secs / 2).max(1).min(60),
+        );
+        store.spawn_evictor(sweep);
+        Some(store)
+    } else {
+        None
+    };
+
     let state = AppState {
         engine,
         tokenizer,
@@ -513,6 +532,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         max_tokens_cap: cfg.server.max_tokens,
         real_model,
         batch_scheduler,
+        default_sampling: cfg.sampling.to_params(),
+        sessions,
     };
     serve(state, &cfg.server.bind).await
 }

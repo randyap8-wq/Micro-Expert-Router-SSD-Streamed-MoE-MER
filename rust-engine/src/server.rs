@@ -29,13 +29,15 @@ use crate::batch_scheduler::BatchScheduler;
 use crate::engine::Engine;
 use crate::metrics::Metrics;
 use crate::model::RealModel;
+use crate::sampling::SamplingParams;
+use crate::session::{SessionState, SessionStore};
 use crate::tokenizer::Tokenizer;
 use axum::{
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures::stream::{self, Stream};
@@ -69,6 +71,12 @@ pub struct AppState {
     /// single batch so multiple HTTP clients share each round of
     /// SSD-streamed expert FFN compute.
     pub batch_scheduler: Option<Arc<BatchScheduler>>,
+    /// Server-wide sampling defaults. Each request can override these
+    /// via `temperature` / `top_p` / `top_k` / `seed` JSON fields.
+    pub default_sampling: SamplingParams,
+    /// Optional session store for KV-cache persistence between
+    /// requests. `None` when `server.session_ttl_secs == 0`.
+    pub sessions: Option<SessionStore>,
 }
 
 /// Build the axum [`Router`] for the API.
@@ -78,6 +86,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/sessions/:id", delete(delete_session))
         .with_state(state)
 }
 
@@ -125,6 +134,19 @@ pub struct CompletionRequest {
     pub model: String,
     #[serde(default)]
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Optional session id. When present, the per-layer KV caches for
+    /// this session are restored before the prompt is ingested and
+    /// stored back when the request completes — see `crate::session`
+    /// for the persistence model. When absent, the request is
+    /// stateless (matches the legacy behaviour bit-for-bit).
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// We accept `stream` for OpenAI compatibility but currently ignore
     /// it; streaming is on the roadmap (Phase 7).
     #[serde(default)]
@@ -162,12 +184,22 @@ async fn completions(
     Json(req): Json<CompletionRequest>,
 ) -> Response {
     let started = Instant::now();
+    let params = resolve_params(&state, req.temperature, req.top_p, req.top_k, req.seed);
+    let session_id = req.session_id.clone();
     if req.stream.unwrap_or(false) {
         // Server-Sent Events streaming path: emit one OpenAI-style chunk
         // per generated token, terminated with `data: [DONE]`. The whole
         // SSD-streaming substrate is exercised inside the generator
         // exactly as in the non-streaming path.
-        match build_completion_stream(&state, &req.prompt, req.max_tokens, req.model.clone()).await
+        match build_completion_stream(
+            &state,
+            &req.prompt,
+            req.max_tokens,
+            req.model.clone(),
+            params,
+            session_id,
+        )
+        .await
         {
             Ok(s) => {
                 state
@@ -185,7 +217,7 @@ async fn completions(
             }
         }
     }
-    match generate(&state, &req.prompt, req.max_tokens, &req.model).await {
+    match generate(&state, &req.prompt, req.max_tokens, &req.model, params, session_id).await {
         Ok(resp) => {
             state.metrics.record_request("/v1/completions", started.elapsed().as_secs_f64());
             (StatusCode::OK, Json(resp)).into_response()
@@ -214,6 +246,14 @@ pub struct ChatCompletionRequest {
     pub model: String,
     #[serde(default)]
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub stream: Option<bool>,
 }
@@ -246,8 +286,19 @@ async fn chat_completions(
 ) -> Response {
     let started = Instant::now();
     let prompt = flatten_messages(&req.messages);
+    let params = resolve_params(&state, req.temperature, req.top_p, req.top_k, req.seed);
+    let session_id = req.session_id.clone();
     if req.stream.unwrap_or(false) {
-        match build_chat_stream(&state, &prompt, req.max_tokens, req.model.clone()).await {
+        match build_chat_stream(
+            &state,
+            &prompt,
+            req.max_tokens,
+            req.model.clone(),
+            params,
+            session_id,
+        )
+        .await
+        {
             Ok(s) => {
                 state
                     .metrics
@@ -267,7 +318,7 @@ async fn chat_completions(
     // Flatten messages into a single prompt — exactly the same shape
     // simple OpenAI-compatible servers (vLLM, llama.cpp's HTTP) do when
     // no chat template is configured.
-    match generate(&state, &prompt, req.max_tokens, &req.model).await {
+    match generate(&state, &prompt, req.max_tokens, &req.model, params, session_id).await {
         Ok(comp) => {
             let resp = ChatCompletionResponse {
                 id: comp.id,
@@ -321,11 +372,41 @@ impl std::fmt::Display for GenerateError {
     }
 }
 
+/// Resolve per-request sampling parameters from the request fields,
+/// falling back to the server-wide defaults from
+/// [`AppState::default_sampling`]. OpenAI's API treats `temperature: 0`
+/// as "deterministic" — we mirror that by passing it through verbatim
+/// (the sampler in [`crate::sampling`] degrades to greedy `argmax`).
+fn resolve_params(
+    state: &AppState,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: Option<u64>,
+) -> SamplingParams {
+    let mut p = state.default_sampling;
+    if let Some(t) = temperature {
+        p.temperature = t;
+    }
+    if let Some(t) = top_p {
+        p.top_p = t;
+    }
+    if let Some(t) = top_k {
+        p.top_k = t;
+    }
+    if let Some(t) = seed {
+        p.seed = t;
+    }
+    p
+}
+
 async fn generate(
     state: &AppState,
     prompt: &str,
     requested_max: usize,
     model_name: &str,
+    params: SamplingParams,
+    session_id: Option<String>,
 ) -> Result<CompletionResponse, GenerateError> {
     if prompt.is_empty() {
         return Err(GenerateError::InvalidRequest("prompt must be non-empty".into()));
@@ -346,8 +427,8 @@ async fn generate(
     //     output token, run the full decoder forward — embedding →
     //     stacked layers (each calling the engine's `moe_step` to load
     //     and run experts from SSD) → final RMSNorm → LM head — and
-    //     sample the next token id by argmax. This is the gist's
-    //     "actual generated text" path.
+    //     sample the next token id from real logits via `params`.
+    //     This is the gist's "actual generated text" path.
     //
     //   * **Legacy benchmark path** (`real_model` is `None`): drive
     //     `Engine::generate` for `max_tokens` cycles and synthesise a
@@ -361,14 +442,10 @@ async fn generate(
     let mut completion_ids: Vec<u32> = Vec::with_capacity(max_tokens);
 
     if let Some(model) = state.real_model.as_ref() {
-        // Per-request KV caches: one full set per request, so concurrent
-        // axum requests never alias each other's attention state.
-        // When a [`BatchScheduler`] is configured (the production path),
-        // every per-token step is submitted to it so the engine fuses
-        // concurrent requests into shared SSD-streamed decoder steps.
-        // When no scheduler is set (e.g. unit tests), we fall back to
-        // calling `RealModel::step` directly.
-        let mut kv = model.fresh_kv_caches();
+        // Resolve session: take any existing KV state, then put it
+        // back at the end. When no session is configured the request
+        // is fully stateless (legacy behaviour).
+        let (mut kv, mut start_pos) = load_session_kv(state, model, session_id.as_deref());
         let pre_hits = state.engine.report().hits;
         let pre_misses = state.engine.report().misses;
 
@@ -376,32 +453,40 @@ async fn generate(
         // generated token actually attends over the prompt. We discard
         // the sampled ids during the prompt sweep — those would be the
         // model's predictions of the *next* prompt token, not part of
-        // the completion.
-        for (pos, &tid) in prompt_ids.iter().enumerate() {
-            let _ = step_through_scheduler(state, model, tid, pos, &mut kv).await;
+        // the completion. When a session is active and `start_pos > 0`
+        // the prompt continues from where the previous request left
+        // off (multi-turn chat).
+        for &tid in prompt_ids.iter() {
+            let _ = step_through_scheduler(state, model, tid, start_pos, &mut kv, &params).await;
+            start_pos += 1;
         }
 
         // Now generate `max_tokens` real tokens.
         let mut last = *prompt_ids.last().unwrap_or(&0u32);
-        for i in 0..max_tokens {
-            let pos = prompt_ids.len() + i;
-            let next = step_through_scheduler(state, model, last, pos, &mut kv).await;
+        for _ in 0..max_tokens {
+            let next = step_through_scheduler(state, model, last, start_pos, &mut kv, &params).await;
             completion_ids.push(next);
             last = next;
+            start_pos += 1;
         }
+        save_session_kv(state, session_id.as_deref(), kv, start_pos, last);
         let post = state.engine.report();
         hits_total = post.hits.saturating_sub(pre_hits);
         misses_total = post.misses.saturating_sub(pre_misses);
     } else {
-        // Legacy benchmark path.
-        let base = prompt_ids.last().copied().unwrap_or(0) as u64;
+        // Legacy benchmark path — sampling params are unused (no real
+        // logits) but we still respect `seed` for the deterministic
+        // synthetic token stream so requests are reproducible.
+        let base = prompt_ids
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(params.seed as u32) as u64;
         for i in 0..max_tokens {
             let stats = state.engine.generate(base.wrapping_add(i as u64)).await;
             hits_total += stats.hits;
             misses_total += stats.misses;
-            // Map engine cycle stats to a deterministic next-token id. The
-            // synthesis is deliberately simple (vocab modulo); the real LM
-            // head argmax is what fires when `real_model` is set.
+            // Map engine cycle stats to a deterministic next-token id.
             let vocab = state.tokenizer.vocab_size().max(1) as u64;
             let next = ((base.wrapping_add(i as u64).wrapping_mul(0x9E3779B97F4A7C15)) % vocab) as u32;
             completion_ids.push(next);
@@ -452,6 +537,7 @@ async fn step_through_scheduler(
     token_id: u32,
     pos: usize,
     kv: &mut Vec<crate::transformer::KvCache>,
+    params: &crate::sampling::SamplingParams,
 ) -> u32 {
     if let Some(sched) = state.batch_scheduler.as_ref() {
         // Move the KV cache through the scheduler. `mem::take` leaves
@@ -461,18 +547,92 @@ async fn step_through_scheduler(
         // allocated KV cache so the request can finish — losing
         // history is the price of a clean shutdown path here.
         let owned = std::mem::take(kv);
-        match sched.step(token_id, pos, owned).await {
+        match sched.step(token_id, pos, owned, *params).await {
             Ok(resp) => {
                 *kv = resp.kv;
                 resp.next_token
             }
             Err(_) => {
                 *kv = model.fresh_kv_caches();
-                model.step(&state.engine, token_id, pos, kv).await
+                model.step(&state.engine, token_id, pos, kv, params).await
             }
         }
     } else {
-        model.step(&state.engine, token_id, pos, kv).await
+        model.step(&state.engine, token_id, pos, kv, params).await
+    }
+}
+
+/// Fetch the persisted KV state for a session, or build a fresh one.
+/// Returns `(kv_caches, next_position)`. The next position is `0` for
+/// fresh sessions and the saved cursor otherwise — multi-turn chats
+/// then continue token absolute positions across requests, which is
+/// what RoPE expects.
+fn load_session_kv(
+    state: &AppState,
+    model: &Arc<RealModel>,
+    session_id: Option<&str>,
+) -> (Vec<crate::transformer::KvCache>, usize) {
+    if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
+        if let Some(prev) = store.take(id) {
+            // Validate shape: layer count must match the live model.
+            // Mismatches happen if the server is restarted with a
+            // different config; treat as a fresh session.
+            if prev.kv.len() == model.config.num_layers {
+                return (prev.kv, prev.position);
+            }
+        }
+    }
+    (model.fresh_kv_caches(), 0)
+}
+
+/// Persist KV state back to the store at request completion. No-op
+/// when no session is configured.
+fn save_session_kv(
+    state: &AppState,
+    session_id: Option<&str>,
+    kv: Vec<crate::transformer::KvCache>,
+    position: usize,
+    last_token: u32,
+) {
+    if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
+        store.put(
+            id.to_string(),
+            SessionState {
+                kv,
+                position,
+                last_token,
+                last_used: Instant::now(),
+            },
+        );
+    }
+}
+
+#[derive(Serialize, Debug)]
+struct SessionDeleteResponse {
+    id: String,
+    deleted: bool,
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match state.sessions.as_ref() {
+        Some(store) => {
+            let deleted = store.delete(&id);
+            (
+                StatusCode::OK,
+                Json(SessionDeleteResponse { id, deleted }),
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "session store disabled (server.session_ttl_secs == 0)"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -536,6 +696,8 @@ async fn stream_tokens(
     state: AppState,
     prompt: String,
     requested_max: usize,
+    params: SamplingParams,
+    session_id: Option<String>,
 ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>, GenerateError> {
     if prompt.is_empty() {
         return Err(GenerateError::InvalidRequest("prompt must be non-empty".into()));
@@ -560,19 +722,25 @@ async fn stream_tokens(
         },
     }
     let mode = if let Some(model) = state.real_model.as_ref() {
-        // Prime the KV cache with the prompt tokens (same as `generate`).
-        let mut kv = model.fresh_kv_caches();
-        for (pos, &tid) in prompt_ids.iter().enumerate() {
-            let _ = step_through_scheduler(&state, model, tid, pos, &mut kv).await;
+        // Resume from session state if configured — otherwise start
+        // fresh, matching the non-streaming `generate` path.
+        let (mut kv, mut pos) = load_session_kv(&state, model, session_id.as_deref());
+        for &tid in prompt_ids.iter() {
+            let _ = step_through_scheduler(&state, model, tid, pos, &mut kv, &params).await;
+            pos += 1;
         }
         GenMode::Real {
             kv,
             last_token: *prompt_ids.last().unwrap_or(&0u32),
-            position: prompt_ids.len(),
+            position: pos,
         }
     } else {
         GenMode::Legacy {
-            base: prompt_ids.last().copied().unwrap_or(0) as u64,
+            base: prompt_ids
+                .last()
+                .copied()
+                .unwrap_or(0)
+                .wrapping_add(params.seed as u32) as u64,
             i: 0,
         }
     };
@@ -589,6 +757,8 @@ async fn stream_tokens(
         emitted: usize,
         max_tokens: usize,
         finished_emitted: bool,
+        params: SamplingParams,
+        session_id: Option<String>,
     }
 
     let st = St {
@@ -599,6 +769,8 @@ async fn stream_tokens(
         emitted: 0,
         max_tokens,
         finished_emitted: false,
+        params,
+        session_id,
     };
 
     Ok(Box::pin(stream::unfold(st, move |mut st| async move {
@@ -607,6 +779,12 @@ async fn stream_tokens(
         }
         if st.emitted >= st.max_tokens {
             // Final chunk carries `finish_reason: length` and no new text.
+            // Persist KV-cache state back to the session store so a
+            // follow-up request can pick up where we stopped.
+            if let GenMode::Real { kv, last_token, position } = &mut st.mode {
+                let kv_take = std::mem::take(kv);
+                save_session_kv(&st.state, st.session_id.as_deref(), kv_take, *position, *last_token);
+            }
             st.finished_emitted = true;
             return Some((
                 StreamChunk { text: String::new(), finished: true, hits: 0, misses: 0 },
@@ -622,7 +800,7 @@ async fn stream_tokens(
                     .real_model
                     .as_ref()
                     .expect("Real mode requires real_model");
-                let n = step_through_scheduler(&st.state, model, *last_token, *position, kv).await;
+                let n = step_through_scheduler(&st.state, model, *last_token, *position, kv, &st.params).await;
                 *last_token = n;
                 *position += 1;
                 n
@@ -673,10 +851,12 @@ async fn build_completion_stream(
     prompt: &str,
     requested_max: usize,
     model_name: String,
+    params: SamplingParams,
+    session_id: Option<String>,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, GenerateError> {
     let id = format!("cmpl-{:x}", rand_request_id());
     let metrics = state.metrics.clone();
-    let inner = stream_tokens(state.clone(), prompt.to_string(), requested_max).await?;
+    let inner = stream_tokens(state.clone(), prompt.to_string(), requested_max, params, session_id).await?;
     let s = stream::unfold(
         (inner, id, model_name, metrics, 0u64, 0u64, 0u64, false),
         |(mut inner, id, model_name, metrics, mut hits, mut misses, mut tokens_done, terminated)| async move {
@@ -743,10 +923,12 @@ async fn build_chat_stream(
     prompt: &str,
     requested_max: usize,
     model_name: String,
+    params: SamplingParams,
+    session_id: Option<String>,
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, GenerateError> {
     let id = format!("chatcmpl-{:x}", rand_request_id());
     let metrics = state.metrics.clone();
-    let inner = stream_tokens(state.clone(), prompt.to_string(), requested_max).await?;
+    let inner = stream_tokens(state.clone(), prompt.to_string(), requested_max, params, session_id).await?;
 
     // OpenAI emits a first "delta: { role: assistant }" event before any
     // content tokens. We do the same so streaming chat clients see the
@@ -976,6 +1158,8 @@ mod tests {
             max_tokens_cap: 32,
             real_model: None,
             batch_scheduler: None,
+            default_sampling: SamplingParams::greedy(),
+            sessions: None,
         };
         (state, dir)
     }
@@ -1229,6 +1413,8 @@ mod tests {
             max_tokens_cap: 16,
             real_model: Some(model),
             batch_scheduler: Some(scheduler),
+            default_sampling: SamplingParams::greedy(),
+            sessions: Some(crate::session::SessionStore::new(std::time::Duration::from_secs(60))),
         };
         (state, dir)
     }
@@ -1248,6 +1434,7 @@ mod tests {
             top_k: 2,
             rope_base: 10_000.0,
             rms_eps: 1e-6,
+            window_size: None,
         };
         let (state, _tmp) = make_state_with_real_model(cfg).await;
         let app = build_router(state.clone());

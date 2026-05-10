@@ -16,7 +16,8 @@
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::inference::{
-    combine_outputs, run_inference, run_inference_f16, synth_hidden_state, HiddenState,
+    combine_outputs, run_inference, run_inference_f16, synth_hidden_state, uniform_scores,
+    HiddenState,
     InferenceOutput, WeightDtype,
 };
 use crate::io_provider::NvmeStorage;
@@ -377,7 +378,12 @@ impl Engine {
                     }
                 }
             }
-            let combined = combine_outputs(&per_expert_y);
+            // Synthetic / benchmark path has no real gating network, so
+            // weight every routed expert uniformly (`1/k`) — that matches
+            // the legacy averaging behaviour bit-for-bit while flowing
+            // through the new softmax-gated combiner signature.
+            let scores = uniform_scores(per_expert_y.len());
+            let combined = combine_outputs(&per_expert_y, &scores);
             let us = compute_start.elapsed().as_micros() as u64;
             debug!(
                 token = token_idx,

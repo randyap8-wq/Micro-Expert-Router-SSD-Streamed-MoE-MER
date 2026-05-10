@@ -792,28 +792,56 @@ pub fn run_inference_partial(
     Ok((out, y))
 }
 
-/// Fold the top-K expert outputs together. Mixtral / Llama-MoE actually
-/// take a **gated weighted sum** of expert outputs (the gate weights come
-/// from the router's softmax). Since this engine mocks the router we just
-/// average — the byte-for-byte path through every routed expert is what
-/// matters for the I/O story.
-pub fn combine_outputs(per_expert: &[HiddenState]) -> HiddenState {
-    if per_expert.is_empty() {
+/// Fold the top-K expert outputs together with a **softmax-gated weighted
+/// sum** — the standard Mixtral / Llama-MoE combiner:
+///
+/// ```text
+///   y = sum_i ( scores[i] * outputs[i] )
+/// ```
+///
+/// `scores` must already be normalised over the chosen top-K experts
+/// (the caller is responsible for the softmax + re-normalisation —
+/// [`crate::gating::LinearGate::route`] does it for the real-transformer
+/// path; the benchmark / synthetic path passes uniform `1/k` weights so
+/// behaviour is unchanged when no real gate weights are available).
+///
+/// `outputs` and `scores` must have the same length; if they're empty,
+/// the returned vector is empty (the caller is expected to handle that
+/// case — the real-transformer path filters out experts that failed to
+/// materialise on disk *from both* slices upstream so the weighted sum
+/// stays well-defined).
+pub fn combine_outputs(outputs: &[HiddenState], scores: &[f32]) -> HiddenState {
+    debug_assert_eq!(
+        outputs.len(),
+        scores.len(),
+        "combine_outputs: outputs and scores must have the same length"
+    );
+    if outputs.is_empty() {
         return Vec::new();
     }
-    let d = per_expert[0].len();
+    let d = outputs[0].len();
     let mut out = vec![0.0f32; d];
-    for vec in per_expert {
+    for (vec, &s) in outputs.iter().zip(scores.iter()) {
         debug_assert_eq!(vec.len(), d);
         for (o, v) in out.iter_mut().zip(vec.iter()) {
-            *o += *v;
+            *o += s * *v;
         }
     }
-    let inv = 1.0 / per_expert.len() as f32;
-    for o in out.iter_mut() {
-        *o *= inv;
-    }
     out
+}
+
+/// Helper: build a uniform `[1/k; k]` score vector for the synthetic /
+/// benchmark path that has no real gating network. With these scores the
+/// new [`combine_outputs`] reproduces the legacy "uniform average"
+/// behaviour exactly.
+#[inline]
+pub fn uniform_scores(k: usize) -> Vec<f32> {
+    if k == 0 {
+        Vec::new()
+    } else {
+        let s = 1.0 / k as f32;
+        vec![s; k]
+    }
 }
 
 #[cfg(test)]
@@ -934,11 +962,38 @@ mod tests {
     }
 
     #[test]
-    fn combine_outputs_averages_correctly() {
+    fn combine_outputs_uniform_scores_averages() {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![3.0, 2.0, 1.0];
-        let c = combine_outputs(&[a, b]);
+        let c = combine_outputs(&[a, b], &uniform_scores(2));
         assert_eq!(c, vec![2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn combine_outputs_weighted_sum_uses_scores() {
+        let d = 4;
+        let outs = vec![vec![1.0; d], vec![2.0; d], vec![4.0; d]];
+        // 0.5*1 + 0.25*2 + 0.25*4 = 2.0
+        let scores = vec![0.5, 0.25, 0.25];
+        let y = combine_outputs(&outs, &scores);
+        for v in y {
+            assert!((v - 2.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn combine_outputs_empty_inputs() {
+        let y = combine_outputs(&[], &[]);
+        assert!(y.is_empty());
+    }
+
+    #[test]
+    fn uniform_scores_sums_to_one() {
+        let s = uniform_scores(4);
+        assert_eq!(s.len(), 4);
+        let sum: f32 = s.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert_eq!(uniform_scores(0), Vec::<f32>::new());
     }
 
     /// Build a `Vec<u8>` containing `expert_weight_count` weights as

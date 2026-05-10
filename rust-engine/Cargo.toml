@@ -50,6 +50,17 @@ libc = "0.2"
 # Histogram for percentile latency reporting.
 hdrhistogram = "7.5"
 
+# Lock-free concurrent hash map for the per-request KV-cache session
+# store (Phase 9). Using `dashmap` instead of `parking_lot::RwLock<HashMap>`
+# keeps the steady-state path lock-free for reads, which matters when
+# many concurrent HTTP requests share the same store.
+dashmap = "5.5"
+
+# Safetensors loader for HuggingFace dense weights. Auto-detected by
+# `RealModel::from_dir` and used in preference to per-tensor `.bin`
+# files when present.
+safetensors = "0.4"
+
 # fp16 (half-precision) weight support for SSD-streamed experts. Halving the
 # bytes-per-parameter halves every SSD read, which is the single highest-
 # leverage energy reduction in this engine.
