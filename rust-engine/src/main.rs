@@ -6,6 +6,7 @@
 //! See README.md at the repository root for architecture and design notes.
 
 mod aligned_buffer;
+mod batch_scheduler;
 mod buffer_pool;
 mod config;
 mod engine;
@@ -454,7 +455,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // runs `embedding -> stacked layers (each with SSD-streamed MoE) ->
     // LM head -> argmax`; when disabled, the legacy benchmark generator
     // is used (the engine still streams expert FFN compute either way).
-    let real_model = if cfg.real_transformer.enabled {
+    let (real_model, batch_scheduler) = if cfg.real_transformer.enabled {
         let rt = &cfg.real_transformer;
         let head_dim = if rt.head_dim == 0 {
             cfg.model.d_model / rt.num_heads
@@ -479,18 +480,30 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             Some(dir) => crate::model::RealModel::from_dir(model_cfg, dir, rt.seed)?,
             None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),
         };
+        let model_arc = Arc::new(m);
+        let batch_cfg = crate::batch_scheduler::BatchConfig {
+            max_batch_size: rt.max_batch_size,
+            batch_timeout: std::time::Duration::from_millis(rt.batch_timeout_ms),
+        };
+        let scheduler = crate::batch_scheduler::BatchScheduler::spawn(
+            model_arc.clone(),
+            engine.clone(),
+            batch_cfg,
+        );
         info!(
             num_layers = cfg.model.num_layers,
             num_heads = rt.num_heads,
             num_kv_heads,
             head_dim,
             vocab_size = rt.vocab_size,
-            "real transformer pipeline enabled"
+            max_batch_size = rt.max_batch_size,
+            batch_timeout_ms = rt.batch_timeout_ms,
+            "real transformer pipeline enabled (with continuous batching)"
         );
-        Some(Arc::new(m))
+        (Some(model_arc), Some(Arc::new(scheduler)))
     } else {
         info!("real_transformer disabled; using legacy benchmark generator");
-        None
+        (None, None)
     };
 
     let state = AppState {
@@ -499,6 +512,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         metrics: Metrics::new(),
         max_tokens_cap: cfg.server.max_tokens,
         real_model,
+        batch_scheduler,
     };
     serve(state, &cfg.server.bind).await
 }

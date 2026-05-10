@@ -902,13 +902,6 @@ you can verify the energy-saving paths actually engaged.
 
 ## Limitations / next steps
 
-- **Static top-K router (in the legacy `serve` path).** The `serve`
-  binary still uses the deterministic Markov `TopKRouter`. The
-  production-style learned `softmax(W_gate · x) → top-K` path is fully
-  wired into `cmd_run` via `--gate-weights <PATH>` (loads
-  `[num_experts × d_model]` little-endian f32 into `gating::LinearGate`);
-  threading the same gate through the HTTP server's per-request loop
-  is straightforward and is the next step.
 - **Scalar `f32` matmul.** The expert FFN runs as a plain triple-nested
   scalar loop; the `simd` cargo feature parallelises the gate/up/down
   matmuls across rayon-style scopes but a real serving deployment
@@ -916,19 +909,22 @@ you can verify the energy-saving paths actually engaged.
   `cudarc`. The byte→`f32` view in
   `inference::ExpertWeights::from_bytes` already does zero-copy
   reinterpretation, so any of those backends slot in cleanly.
-- **Single-layer wiring in the live engine.** `MultiLayerExpertCache`
-  (per-layer LRU keyed on `(layer, expert_id)`) and the dense
-  transformer pieces (`RmsNorm`, RoPE, scalar causal MHA with KV
-  cache, MoE output combiner) now live in-tree under
-  `multi_layer_cache`, `transformer`, and `gating`, with unit tests;
-  the `serve` path drives one layer through them. Stacking 32 layers
-  and threading the hidden state across them is the follow-up.
-- **Continuous batching.** SSE streaming responses are now in place
-  (one event per token, OpenAI-compatible, terminated with
-  `data: [DONE]`). Per-request KV caches keep concurrent axum
-  requests independent. Token-level cross-request batching (so K
-  concurrent users share a single decoder step) is the next layer
-  on top.
+- **Continuous batching is now in place.** The HTTP server wires a
+  `BatchScheduler` (see `src/batch_scheduler.rs`) in front of
+  `RealModel::step` whenever `[real_transformer] enabled = true`. Each
+  in-flight request submits one decoder step at a time over an
+  `mpsc` channel; the scheduler fuses up to `max_batch_size` requests
+  (or whatever has arrived within `batch_timeout_ms`) into a single
+  batch and runs their steps concurrently on the shared `Engine`,
+  so the SSD-streamed MoE compute is amortised across all of them.
+  Per-request KV caches are moved into the scheduler and back, so
+  attention state stays strictly per-request. Both streaming (SSE)
+  and non-streaming requests use the same path. The two knobs live
+  under `[real_transformer]`:
+  ```toml
+  max_batch_size  = 8   # max concurrent requests fused per step (1 disables batching)
+  batch_timeout_ms = 5  # how long to wait for more requests to join a partial batch
+  ```
 - **Picking a NUMA budget.** `MER_PIN_CORES=N` is honoured at
   startup to `sched_setaffinity(2)` the process to the first `N`
   CPUs of NUMA node 0 (best-effort, Linux only). Real per-ring

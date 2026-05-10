@@ -106,3 +106,13 @@ rms_eps = 1e-6
 # `default_seed()` constant in `src/config.rs` (TOML doesn't accept
 # hex literals).
 seed = 12648430
+# Continuous batching: maximum number of concurrent in-flight requests
+# fused into a single decoder step. The scheduler waits up to
+# `batch_timeout_ms` for additional requests before flushing the
+# current batch. Set to 1 to disable batching.
+max_batch_size = 8
+# Continuous batching: how long the scheduler waits for additional
+# requests to join a not-yet-full batch, in milliseconds. Trades a
+# small amount of per-token latency for substantially better
+# throughput under concurrent load.
+batch_timeout_ms = 5

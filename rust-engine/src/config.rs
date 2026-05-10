@@ -165,6 +165,23 @@ pub struct RealTransformerConfig {
     /// PRNG seed for the deterministic init fallback.
     #[serde(default = "default_seed")]
     pub seed: u64,
+
+    /// Continuous-batching: maximum number of in-flight requests fused
+    /// into a single decoder step. The background scheduler waits up to
+    /// [`Self::batch_timeout_ms`] for additional requests to arrive
+    /// before flushing the current batch. `1` disables batching (each
+    /// request runs its decoder step independently). Only takes effect
+    /// when `enabled = true`.
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: usize,
+
+    /// Continuous-batching: how long the scheduler waits for more
+    /// requests to join a not-yet-full batch, in milliseconds. A short
+    /// timeout (e.g. 5 ms) trades a small amount of per-token latency
+    /// for substantially better throughput when concurrent requests
+    /// arrive. Only takes effect when `enabled = true`.
+    #[serde(default = "default_batch_timeout_ms")]
+    pub batch_timeout_ms: u64,
 }
 
 fn default_vocab_size() -> usize { 256 }
@@ -172,6 +189,8 @@ fn default_num_heads() -> usize { 8 }
 fn default_rope_base() -> f32 { 10_000.0 }
 fn default_rms_eps() -> f32 { 1e-6 }
 fn default_seed() -> u64 { 0xC0FFEE }
+fn default_max_batch_size() -> usize { 8 }
+fn default_batch_timeout_ms() -> u64 { 5 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -272,6 +291,11 @@ impl Config {
             if rt.vocab_size == 0 {
                 return Err(ConfigError::Invalid(
                     "real_transformer.vocab_size must be > 0".into(),
+                ));
+            }
+            if rt.max_batch_size == 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.max_batch_size must be > 0".into(),
                 ));
             }
         }
