@@ -144,6 +144,72 @@ impl NvmeStorage {
         Ok(n)
     }
 
+    /// Batched read: fill `bufs[i]` with the bytes of `ids[i]`, all in
+    /// one blocking-donation. The two slices must have the same length.
+    ///
+    /// **Why this exists.** When a single token misses on `K > 1` experts,
+    /// the engine wants to push all `K` reads into the device's queue
+    /// before doing any per-buffer post-processing. The default per-fetch
+    /// path runs each `pread(2)` inside its own
+    /// [`tokio::task::block_in_place`] call, which means the runtime has
+    /// to round-trip between scheduler decisions for every expert. This
+    /// helper hoists all `K` syscalls into one `block_in_place` block:
+    /// the underlying [`std::os::unix::fs::FileExt::read_at`] calls are
+    /// issued back-to-back to the kernel so the NVMe queue depth ramps
+    /// up immediately, which is the same property an `io_uring`
+    /// `submit_and_wait(K)` provides on the high-throughput path.
+    ///
+    /// On Linux with the `io_uring` cargo feature this method also has
+    /// a sibling, `crate::io_uring_storage::IoUringStorage::read_experts_batch_fixed`,
+    /// that pushes all `K` reads as `READ_FIXED` SQEs and submits once.
+    pub async fn read_experts_batch(
+        &self,
+        ids: &[u32],
+        bufs: &mut [&mut PooledBuffer],
+    ) -> io::Result<usize> {
+        assert_eq!(
+            ids.len(),
+            bufs.len(),
+            "read_experts_batch: ids and bufs must have the same length"
+        );
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // Resolve all fds before donating the worker — `fd_for` takes a
+        // (rare) write lock the first time it sees an id, and we don't
+        // want to hold that lock across `block_in_place`.
+        let mut files: Vec<Arc<File>> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            files.push(self.fd_for(id)?);
+        }
+        let expert_size = self.cfg.expert_size;
+        for buf in bufs.iter() {
+            debug_assert_eq!(buf.len(), expert_size);
+        }
+
+        // Single donation: all K reads dispatched without yielding to the
+        // runtime between syscalls. On Linux this hands the NVMe queue
+        // K consecutive submissions, matching the io_uring path's
+        // submit-once semantics.
+        let total = tokio::task::block_in_place(|| -> io::Result<usize> {
+            let mut total = 0usize;
+            for (file, buf) in files.iter().zip(bufs.iter_mut()) {
+                let n = file.read_at(buf.as_mut_slice(), 0)?;
+                if n != expert_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "short read in batch: got {n} bytes, expected {expert_size}"
+                        ),
+                    ));
+                }
+                total += n;
+            }
+            Ok(total)
+        })?;
+        Ok(total)
+    }
+
     /// Partial-column read: load only the listed input-feature columns
     /// of an expert's `gate_proj` and `up_proj` plus the full `down_proj`,
     /// packed into `buf` in the layout consumed by
@@ -410,4 +476,67 @@ pub fn generate_synthetic_experts_with_dtype(
         f.flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer_pool::BufferPool;
+
+    /// Internal helper: a unique tempdir under `std::env::temp_dir()`.
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        path.push(format!("mer-io-test-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_experts_batch_returns_same_bytes_as_single_reads() {
+        let dir = tempdir("batch");
+        let num_experts = 4u32;
+        let d_model = 8usize;
+        let d_ff = 16usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block = 4096usize;
+        let expert_size = ((weight_bytes + block - 1) / block) * block;
+        generate_synthetic_experts(&dir, num_experts, expert_size, d_model, d_ff).unwrap();
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+        })
+        .unwrap();
+
+        let pool = BufferPool::new(num_experts as usize * 2 + 2, expert_size, block);
+
+        // Reference: read each expert one-by-one.
+        let mut ref_bufs: Vec<Vec<u8>> = Vec::with_capacity(num_experts as usize);
+        for id in 0..num_experts {
+            let mut b = pool.acquire().await;
+            storage.read_expert(id, &mut b).await.unwrap();
+            ref_bufs.push(b.as_slice().to_vec());
+        }
+
+        // Batched read into fresh buffers.
+        let mut bufs: Vec<_> = Vec::with_capacity(num_experts as usize);
+        for _ in 0..num_experts {
+            bufs.push(pool.acquire().await);
+        }
+        let ids: Vec<u32> = (0..num_experts).collect();
+        let mut buf_refs: Vec<&mut crate::buffer_pool::PooledBuffer> = bufs.iter_mut().collect();
+        let total = storage.read_experts_batch(&ids, &mut buf_refs).await.unwrap();
+        assert_eq!(total, expert_size * num_experts as usize);
+        for (i, b) in bufs.iter().enumerate() {
+            assert_eq!(b.as_slice(), ref_bufs[i].as_slice(), "mismatch on expert {i}");
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

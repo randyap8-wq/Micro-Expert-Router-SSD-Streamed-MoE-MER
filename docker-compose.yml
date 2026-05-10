@@ -1,0 +1,57 @@
+# --------------------------------------------------------------------
+# docker-compose.yml — minimal "small / medium business" deployment of
+# the SSD-streamed MoE engine.
+#
+# Layout:
+#   - Service `mer`: the engine itself, listening on :8080 and serving
+#     the OpenAI-compatible `/v1/completions`, `/v1/chat/completions`,
+#     and Prometheus `/metrics` endpoints.
+#   - Volume `./data` (host) → `/data` (container) holds the
+#     `expert_<id>.bin` files plus `metadata.json` and (optionally)
+#     `tokenizer.json`.
+#   - Volume `./config.toml` (host) → `/etc/mer/config.toml`
+#     (container) overrides the baked-in default.
+#
+# Bring up:
+#   docker compose up --build
+#
+# Smoke test:
+#   curl -sS http://localhost:8080/healthz
+#   curl -sS -X POST http://localhost:8080/v1/completions \
+#     -H 'content-type: application/json' \
+#     -d '{"prompt":"Hello","max_tokens":4,"stream":true}'
+# --------------------------------------------------------------------
+
+services:
+  mer:
+    build:
+      context: .
+      args:
+        # Set FEATURES="" to compile without the io_uring backend (the
+        # default works on every Linux host).
+        FEATURES: io_uring
+    image: micro-expert-router:latest
+    container_name: mer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data:ro
+      - ./config.toml:/etc/mer/config.toml:ro
+    environment:
+      RUST_LOG: info
+    # Allow `O_DIRECT` and `io_uring` syscalls. Most distros ship a
+    # default seccomp profile that already permits these, but we
+    # spell it out for clarity / portability.
+    security_opt:
+      - seccomp=unconfined
+    # If the host has a real NVMe device you want exposed to the
+    # container, uncomment this and point at it. (For development
+    # against a regular filesystem the bind-mount above is enough.)
+    # devices:
+    #   - "/dev/nvme0n1:/dev/nvme0n1"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/micro-expert-router", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

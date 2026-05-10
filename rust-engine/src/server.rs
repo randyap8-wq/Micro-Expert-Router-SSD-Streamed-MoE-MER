@@ -29,14 +29,18 @@ use crate::tokenizer::Tokenizer;
 use axum::{
     extract::State,
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Shared handler state. Cheap to clone — everything is `Arc`.
 #[derive(Clone)]
@@ -147,7 +151,27 @@ async fn completions(
 ) -> Response {
     let started = Instant::now();
     if req.stream.unwrap_or(false) {
-        warn!("client requested streaming, but streaming is not yet implemented; returning non-streaming response");
+        // Server-Sent Events streaming path: emit one OpenAI-style chunk
+        // per generated token, terminated with `data: [DONE]`. The whole
+        // SSD-streaming substrate is exercised inside the generator
+        // exactly as in the non-streaming path.
+        match build_completion_stream(&state, &req.prompt, req.max_tokens, req.model.clone()).await
+        {
+            Ok(s) => {
+                state
+                    .metrics
+                    .record_request("/v1/completions", started.elapsed().as_secs_f64());
+                return Sse::new(s)
+                    .keep_alive(KeepAlive::default())
+                    .into_response();
+            }
+            Err(e) => {
+                state
+                    .metrics
+                    .record_request("/v1/completions", started.elapsed().as_secs_f64());
+                return error_response(e);
+            }
+        }
     }
     match generate(&state, &req.prompt, req.max_tokens, &req.model).await {
         Ok(resp) => {
@@ -209,13 +233,28 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let started = Instant::now();
+    let prompt = flatten_messages(&req.messages);
     if req.stream.unwrap_or(false) {
-        warn!("client requested streaming, but streaming is not yet implemented; returning non-streaming response");
+        match build_chat_stream(&state, &prompt, req.max_tokens, req.model.clone()).await {
+            Ok(s) => {
+                state
+                    .metrics
+                    .record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
+                return Sse::new(s)
+                    .keep_alive(KeepAlive::default())
+                    .into_response();
+            }
+            Err(e) => {
+                state
+                    .metrics
+                    .record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
+                return error_response(e);
+            }
+        }
     }
     // Flatten messages into a single prompt — exactly the same shape
     // simple OpenAI-compatible servers (vLLM, llama.cpp's HTTP) do when
     // no chat template is configured.
-    let prompt = flatten_messages(&req.messages);
     match generate(&state, &prompt, req.max_tokens, &req.model).await {
         Ok(comp) => {
             let resp = ChatCompletionResponse {
@@ -385,6 +424,370 @@ async fn generate(
             total_tokens: prompt_tokens + max_tokens,
         },
     })
+}
+
+// --------------------- streaming generation -------------------------
+
+/// One streamed completion chunk. Mirrors OpenAI's `text_completion` SSE
+/// event shape so any OpenAI-compatible client can consume it.
+#[derive(Serialize, Debug)]
+struct CompletionChunk {
+    id: String,
+    object: &'static str,
+    model: String,
+    choices: Vec<CompletionChunkChoice>,
+}
+#[derive(Serialize, Debug)]
+struct CompletionChunkChoice {
+    text: String,
+    index: u32,
+    finish_reason: Option<&'static str>,
+}
+
+/// One streamed chat-completion chunk. Same shape OpenAI uses for
+/// `chat.completion.chunk`: each event carries a *delta* with the
+/// incremental content rather than the full message.
+#[derive(Serialize, Debug)]
+struct ChatChunk {
+    id: String,
+    object: &'static str,
+    model: String,
+    choices: Vec<ChatChunkChoice>,
+}
+#[derive(Serialize, Debug)]
+struct ChatChunkChoice {
+    index: u32,
+    delta: ChatDelta,
+    finish_reason: Option<&'static str>,
+}
+#[derive(Serialize, Debug, Default)]
+struct ChatDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+/// Per-token output yielded by the streaming generators below: the new
+/// piece of decoded text since the previous token, plus the cache
+/// hits/misses recorded by the engine for that step.
+struct StreamChunk {
+    text: String,
+    finished: bool,
+    hits: u64,
+    misses: u64,
+}
+
+/// Drive token-by-token generation, yielding incremental decoded text
+/// after each step. Both the real-transformer and legacy paths are
+/// supported (mirroring `generate`). Returns a boxed Stream so the
+/// SSE handler can wrap it.
+async fn stream_tokens(
+    state: AppState,
+    prompt: String,
+    requested_max: usize,
+) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>, GenerateError> {
+    if prompt.is_empty() {
+        return Err(GenerateError::InvalidRequest("prompt must be non-empty".into()));
+    }
+    let max_tokens = requested_max.min(state.max_tokens_cap).max(1);
+    let prompt_ids = state
+        .tokenizer
+        .encode(&prompt)
+        .map_err(|e| GenerateError::Tokenizer(e.to_string()))?;
+
+    // Generator state passed through `stream::unfold`. Holds everything a
+    // single-stream generator needs across `await` points.
+    enum GenMode {
+        Real {
+            kv: Vec<crate::transformer::KvCache>,
+            last_token: u32,
+            position: usize,
+        },
+        Legacy {
+            base: u64,
+            i: u64,
+        },
+    }
+    let mode = if let Some(model) = state.real_model.as_ref() {
+        // Prime the KV cache with the prompt tokens (same as `generate`).
+        let mut kv = model.fresh_kv_caches();
+        for (pos, &tid) in prompt_ids.iter().enumerate() {
+            let _ = model.step(&state.engine, tid, pos, &mut kv).await;
+        }
+        GenMode::Real {
+            kv,
+            last_token: *prompt_ids.last().unwrap_or(&0u32),
+            position: prompt_ids.len(),
+        }
+    } else {
+        GenMode::Legacy {
+            base: prompt_ids.last().copied().unwrap_or(0) as u64,
+            i: 0,
+        }
+    };
+
+    // Carry the cumulative completion ids so we can decode each step's
+    // *delta* (a new id may extend a multi-byte UTF-8 token from the
+    // previous one; decoding the cumulative buffer and diffing is the
+    // safe way to compute "what's new since last chunk").
+    struct St {
+        state: AppState,
+        mode: GenMode,
+        completion_ids: Vec<u32>,
+        decoded_so_far: String,
+        emitted: usize,
+        max_tokens: usize,
+        finished_emitted: bool,
+    }
+
+    let st = St {
+        state,
+        mode,
+        completion_ids: Vec::with_capacity(max_tokens),
+        decoded_so_far: String::new(),
+        emitted: 0,
+        max_tokens,
+        finished_emitted: false,
+    };
+
+    Ok(Box::pin(stream::unfold(st, move |mut st| async move {
+        if st.finished_emitted {
+            return None;
+        }
+        if st.emitted >= st.max_tokens {
+            // Final chunk carries `finish_reason: length` and no new text.
+            st.finished_emitted = true;
+            return Some((
+                StreamChunk { text: String::new(), finished: true, hits: 0, misses: 0 },
+                st,
+            ));
+        }
+        let pre_hits = st.state.engine.report().hits;
+        let pre_misses = st.state.engine.report().misses;
+        let next: u32 = match &mut st.mode {
+            GenMode::Real { kv, last_token, position } => {
+                let model = st
+                    .state
+                    .real_model
+                    .as_ref()
+                    .expect("Real mode requires real_model");
+                let n = model.step(&st.state.engine, *last_token, *position, kv).await;
+                *last_token = n;
+                *position += 1;
+                n
+            }
+            GenMode::Legacy { base, i } => {
+                let stats = st.state.engine.generate(base.wrapping_add(*i)).await;
+                let _ = stats;
+                let vocab = st.state.tokenizer.vocab_size().max(1) as u64;
+                let id = ((base.wrapping_add(*i).wrapping_mul(0x9E3779B97F4A7C15)) % vocab) as u32;
+                *i = i.wrapping_add(1);
+                id
+            }
+        };
+        let post = st.state.engine.report();
+        let hits = post.hits.saturating_sub(pre_hits);
+        let misses = post.misses.saturating_sub(pre_misses);
+
+        st.completion_ids.push(next);
+        st.emitted += 1;
+
+        // Decode the cumulative ids and diff against what we've already
+        // sent — robust to multi-byte tokens. Tokenizer errors fall back
+        // to "no new text this step" rather than aborting the stream.
+        let new_decoded = st
+            .state
+            .tokenizer
+            .decode(&st.completion_ids)
+            .unwrap_or_else(|_| st.decoded_so_far.clone());
+        let delta = if new_decoded.starts_with(&st.decoded_so_far) {
+            new_decoded[st.decoded_so_far.len()..].to_string()
+        } else {
+            // Re-tokenized text changed earlier characters — emit the
+            // full new text and reset the cursor. Rare but possible
+            // with BPE tokenizers.
+            new_decoded.clone()
+        };
+        st.decoded_so_far = new_decoded;
+
+        Some((
+            StreamChunk { text: delta, finished: false, hits, misses },
+            st,
+        ))
+    })))
+}
+
+async fn build_completion_stream(
+    state: &AppState,
+    prompt: &str,
+    requested_max: usize,
+    model_name: String,
+) -> Result<impl Stream<Item = Result<Event, Infallible>>, GenerateError> {
+    let id = format!("cmpl-{:x}", rand_request_id());
+    let metrics = state.metrics.clone();
+    let inner = stream_tokens(state.clone(), prompt.to_string(), requested_max).await?;
+    let s = stream::unfold(
+        (inner, id, model_name, metrics, 0u64, 0u64, 0u64, false),
+        |(mut inner, id, model_name, metrics, mut hits, mut misses, mut tokens_done, terminated)| async move {
+            if terminated {
+                return None;
+            }
+            // Pull next token from the inner generator.
+            use futures::stream::StreamExt;
+            match inner.next().await {
+                None => {
+                    // Inner exhausted unexpectedly — emit DONE.
+                    metrics.record_tokens(tokens_done);
+                    metrics.record_cache(hits, misses);
+                    let ev = Event::default().data("[DONE]");
+                    Some((Ok(ev), (inner, id, model_name, metrics, hits, misses, tokens_done, true)))
+                }
+                Some(chunk) => {
+                    hits += chunk.hits;
+                    misses += chunk.misses;
+                    if chunk.finished {
+                        // End of stream: emit `[DONE]` and terminate.
+                        // (We could optionally precede it with a chunk
+                        // carrying `finish_reason: length` and empty
+                        // text; OpenAI-compatible clients handle either
+                        // shape, so we keep the wire output minimal.)
+                        let done = Event::default().data("[DONE]");
+                        metrics.record_tokens(tokens_done);
+                        metrics.record_cache(hits, misses);
+                        info!(
+                            tokens = tokens_done,
+                            cache_hits = hits,
+                            cache_misses = misses,
+                            "streamed completion finished"
+                        );
+                        Some((Ok(done), (inner, id, model_name, metrics, hits, misses, tokens_done, true)))
+                    } else {
+                        tokens_done += 1;
+                        let payload = CompletionChunk {
+                            id: id.clone(),
+                            object: "text_completion",
+                            model: model_name.clone(),
+                            choices: vec![CompletionChunkChoice {
+                                text: chunk.text,
+                                index: 0,
+                                finish_reason: None,
+                            }],
+                        };
+                        let ev = Event::default()
+                            .data(serde_json::to_string(&payload).unwrap_or_default());
+                        Some((
+                            Ok(ev),
+                            (inner, id, model_name, metrics, hits, misses, tokens_done, false),
+                        ))
+                    }
+                }
+            }
+        },
+    );
+    Ok(s)
+}
+
+async fn build_chat_stream(
+    state: &AppState,
+    prompt: &str,
+    requested_max: usize,
+    model_name: String,
+) -> Result<impl Stream<Item = Result<Event, Infallible>>, GenerateError> {
+    let id = format!("chatcmpl-{:x}", rand_request_id());
+    let metrics = state.metrics.clone();
+    let inner = stream_tokens(state.clone(), prompt.to_string(), requested_max).await?;
+
+    // OpenAI emits a first "delta: { role: assistant }" event before any
+    // content tokens. We do the same so streaming chat clients see the
+    // role before the first content delta.
+    let role_chunk = ChatChunk {
+        id: id.clone(),
+        object: "chat.completion.chunk",
+        model: model_name.clone(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta { role: Some("assistant"), content: None },
+            finish_reason: None,
+        }],
+    };
+    let role_event =
+        Event::default().data(serde_json::to_string(&role_chunk).unwrap_or_default());
+
+    let s = stream::unfold(
+        (Some(role_event), inner, id, model_name, metrics, 0u64, 0u64, 0u64, false),
+        |(role_ev, mut inner, id, model_name, metrics, mut hits, mut misses, mut tokens_done, terminated)| async move {
+            if let Some(ev) = role_ev {
+                // Emit the role event first.
+                return Some((
+                    Ok(ev),
+                    (None, inner, id, model_name, metrics, hits, misses, tokens_done, terminated),
+                ));
+            }
+            if terminated {
+                return None;
+            }
+            use futures::stream::StreamExt;
+            match inner.next().await {
+                None => {
+                    metrics.record_tokens(tokens_done);
+                    metrics.record_cache(hits, misses);
+                    let ev = Event::default().data("[DONE]");
+                    Some((
+                        Ok(ev),
+                        (None, inner, id, model_name, metrics, hits, misses, tokens_done, true),
+                    ))
+                }
+                Some(chunk) => {
+                    hits += chunk.hits;
+                    misses += chunk.misses;
+                    if chunk.finished {
+                        // End of stream. We could optionally precede the
+                        // terminator with a `ChatChunk { delta: {},
+                        // finish_reason: "length" }` event; OpenAI-
+                        // compatible clients accept either shape, so we
+                        // emit only the `[DONE]` terminator to keep the
+                        // wire output minimal.
+                        let done = Event::default().data("[DONE]");
+                        metrics.record_tokens(tokens_done);
+                        metrics.record_cache(hits, misses);
+                        info!(
+                            tokens = tokens_done,
+                            cache_hits = hits,
+                            cache_misses = misses,
+                            "streamed chat completion finished"
+                        );
+                        Some((
+                            Ok(done),
+                            (None, inner, id, model_name, metrics, hits, misses, tokens_done, true),
+                        ))
+                    } else {
+                        tokens_done += 1;
+                        let payload = ChatChunk {
+                            id: id.clone(),
+                            object: "chat.completion.chunk",
+                            model: model_name.clone(),
+                            choices: vec![ChatChunkChoice {
+                                index: 0,
+                                delta: ChatDelta {
+                                    role: None,
+                                    content: Some(chunk.text),
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        let ev = Event::default()
+                            .data(serde_json::to_string(&payload).unwrap_or_default());
+                        Some((
+                            Ok(ev),
+                            (None, inner, id, model_name, metrics, hits, misses, tokens_done, false),
+                        ))
+                    }
+                }
+            }
+        },
+    );
+    Ok(s)
 }
 
 /// 64-bit pseudo-random id derived from the wall clock and a per-call
@@ -643,6 +1046,79 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completions_with_stream_returns_sse_events() {
+        let (state, _tmp) = make_state().await;
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "prompt": "Once upon",
+            "max_tokens": 3,
+            "stream": true,
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "expected SSE content-type, got {ct:?}"
+        );
+        // Read enough body to capture all events for max_tokens=3.
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let s = String::from_utf8(body.to_vec()).unwrap();
+        // Should contain at least one data: line with text_completion shape and a [DONE] terminator.
+        assert!(s.contains("data: "), "expected SSE data: lines, got {s}");
+        assert!(s.contains("text_completion"), "expected event payload to be a text_completion chunk; got {s}");
+        assert!(s.contains("[DONE]"), "expected [DONE] terminator; got {s}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chat_completions_with_stream_returns_sse_events() {
+        let (state, _tmp) = make_state().await;
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 2,
+            "stream": true,
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let s = String::from_utf8(body.to_vec()).unwrap();
+        // Role event should appear before any content delta.
+        assert!(
+            s.contains("\"role\":\"assistant\""),
+            "expected leading role event; got {s}"
+        );
+        assert!(s.contains("chat.completion.chunk"), "expected chunk objects; got {s}");
+        assert!(s.contains("[DONE]"));
     }
 
     /// Build an `AppState` whose engine + storage are sized for a real

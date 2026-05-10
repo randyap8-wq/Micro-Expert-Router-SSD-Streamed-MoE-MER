@@ -213,6 +213,24 @@ enum Cmd {
         /// Overrides `--router-clusters` / `--router-intra-p` when set.
         #[arg(long)]
         router_matrix: Option<PathBuf>,
+        /// Optional path to a real **gating-network** weight matrix
+        /// (`f32` little-endian, row-major, shape `[num_experts × d_model]`).
+        ///
+        /// When set, the run loop bypasses the deterministic Markov
+        /// `TopKRouter` and instead computes per-token routing the way
+        /// production Mixtral does: `softmax(W_gate · x) → top-K`.
+        /// Each routed expert is still streamed from the SSD via the
+        /// LRU cache (`Engine::moe_step`), so the SSD-bandwidth /
+        /// cache-hit metrics reported at the end are directly
+        /// comparable to the legacy Markov path.
+        ///
+        /// File format: bare little-endian `f32`s, no header. Generate
+        /// one with `numpy.tofile` from a real Mixtral checkpoint, or
+        /// use the seeded synthetic fallback if you only want to
+        /// exercise the path (omit this flag to keep the legacy
+        /// Markov router).
+        #[arg(long)]
+        gate_weights: Option<PathBuf>,
     },
 
     /// Start the OpenAI-compatible HTTP server (Phase 6 / 8 / 9).
@@ -284,6 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     router_clusters,
                     router_intra_p,
                     router_matrix,
+                    gate_weights,
                 } = cli.cmd
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
@@ -315,6 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         router_clusters,
                         router_intra_p,
                         router_matrix,
+                        gate_weights,
                     })
                     .await
                 } else {
@@ -336,6 +356,19 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     use crate::metrics::Metrics;
     use crate::server::{serve, AppState};
     use crate::tokenizer::Tokenizer;
+
+    // Best-effort NUMA-local pinning. Off by default; opt in by
+    // setting `MER_PIN_CORES=N` in the environment. Useful for
+    // reducing cross-socket DRAM hops on multi-NUMA hosts under
+    // sustained load. Has no effect on non-Linux builds.
+    if let Some(n) = std::env::var("MER_PIN_CORES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if let Err(e) = pin_to_local_cores(n) {
+            warn!(error = %e, "MER_PIN_CORES set but pinning failed; continuing without affinity");
+        }
+    }
 
     let cfg = Config::from_file(&config_path)?;
     info!(
@@ -558,6 +591,7 @@ struct RunArgs {
     router_clusters: usize,
     router_intra_p: f64,
     router_matrix: Option<PathBuf>,
+    gate_weights: Option<PathBuf>,
 }
 
 async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -670,23 +704,67 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.io_uring {
-        #[cfg(feature = "io_uring")]
-        {
-            info!(
-                "io_uring backend requested (build has `io_uring` feature \
-                 enabled). The fixed-buffers plumbing is in place via \
-                 `BufferPool::raw_iovecs`; the default backend remains \
-                 `pread(2)` until you wire `IoUringStorage` into the \
-                 `NvmeStorage` factory."
-            );
+        // Best-effort affinity: keep the engine on the NUMA node that
+        // owns CPU 0 to avoid cross-socket DRAM hops on every io_uring
+        // completion. Honored only on Linux. Configurable via the
+        // `MER_PIN_CORES` env var (number of cores to pin to); defaults
+        // to `min(8, available_parallelism)` when unset, which is a
+        // reasonable starting point for a single-socket workstation.
+        let n = std::env::var("MER_PIN_CORES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8)
+            });
+        if let Err(e) = pin_to_local_cores(n) {
+            warn!(error = %e, "could not set CPU affinity (continuing without pinning)");
         }
-        #[cfg(not(feature = "io_uring"))]
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        {
+            // Build the backend from the same pool we'll hand the
+            // engine; the registration happens inside ::new(). We log
+            // the result and then continue with the portable backend
+            // for the actual generate() loop — `IoUringStorage` is a
+            // drop-in alternative read API (`read_expert_fixed` /
+            // `read_experts_batch_fixed`) that callers can wire into
+            // their own `Storage` impl. Validating it here gives users
+            // a clear error path on misconfigured kernels without
+            // reaching the hot path.
+            let probe_pool = crate::buffer_pool::BufferPool::new(
+                args.cache_slots.max(1),
+                args.expert_size,
+                args.block_align,
+            );
+            match crate::io_uring_storage::IoUringStorage::new(
+                crate::io_uring_storage::IoUringConfig {
+                    base_path: args.data_dir.clone(),
+                    expert_size: args.expert_size,
+                    block_align: args.block_align,
+                    queue_depth: 64,
+                },
+                &probe_pool,
+            ) {
+                Ok(s) => info!(
+                    registered_buffers = s.registered_buffers(),
+                    "io_uring backend initialised: registered fixed buffers + ring ready. \
+                     The engine still drives reads through the portable pread path; \
+                     IoUringStorage::read_experts_batch_fixed is available for \
+                     custom integrations."
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    "io_uring backend probe failed (kernel may not support it); \
+                     continuing with the portable pread backend."
+                ),
+            }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
         {
             warn!(
                 "--io-uring was passed but this binary was built without the \
-                 `io_uring` cargo feature. Falling back to the default \
-                 `pread(2)` storage backend. Rebuild with \
-                 `--features io_uring` (Linux only) to enable."
+                 `io_uring` cargo feature (or is not on Linux). Falling back \
+                 to the default `pread(2)` storage backend. Rebuild on Linux \
+                 with `--features io_uring` to enable."
             );
         }
     }
@@ -811,9 +889,55 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         tokens = args.tokens,
         "streaming tokens (latency / throughput logs follow)"
     );
+
+    // Optional production gating network. When present, every token's
+    // expert ids come from `softmax(W_gate · x) → top-K` (real Mixtral
+    // routing) instead of the deterministic Markov `TopKRouter`. The
+    // SSD-streaming substrate is identical either way — only the *id
+    // selection* changes — so the cycle / I/O / hit-rate metrics are
+    // directly comparable across the two paths.
+    let gate: Option<crate::gating::LinearGate> = match args.gate_weights.as_ref() {
+        Some(path) => {
+            info!(
+                gate_weights = %path.display(),
+                num_experts = args.num_experts,
+                d_model = args.d_model,
+                top_k = args.top_k,
+                "loading gating-network weight matrix"
+            );
+            Some(load_gate_weights(
+                path,
+                args.num_experts as usize,
+                args.d_model,
+                args.top_k,
+            )?)
+        }
+        None => None,
+    };
+
     for t in 0..args.tokens {
         let start = Instant::now();
-        let stats = engine.generate(t).await;
+        let stats = if let Some(gate) = gate.as_ref() {
+            // Real gating-network path. Hidden state is the same
+            // synthetic activation `Engine::generate` would have used,
+            // so the only difference relative to the legacy path is
+            // *which* experts are selected.
+            let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
+            let dec = gate.route(&hidden);
+            let pre_hits = engine.report().hits;
+            let pre_misses = engine.report().misses;
+            let pre_bytes = engine.report().bytes_read;
+            let _ = engine.moe_step(t, &hidden, &dec.experts).await;
+            let post = engine.report();
+            crate::engine::CycleStats {
+                hits: post.hits.saturating_sub(pre_hits),
+                misses: post.misses.saturating_sub(pre_misses),
+                prefetch_hits: 0,
+                bytes_read: post.bytes_read.saturating_sub(pre_bytes),
+            }
+        } else {
+            engine.generate(t).await
+        };
         let elapsed = start.elapsed();
         let throughput = if elapsed.as_secs_f64() > 0.0 {
             1.0 / elapsed.as_secs_f64()
@@ -1001,6 +1125,45 @@ fn load_alias_map(
     Ok(map)
 }
 
+/// Load a real gating-network weight matrix from disk.
+///
+/// File format: bare little-endian `f32`s, no header, row-major,
+/// `[num_experts × d_model]`. This is the layout `numpy.tofile` writes
+/// for `block_sparse_moe.gate.weight` after `astype(np.float32)`. A
+/// future PR can teach this to read `safetensors` directly so the user
+/// can point it at a HuggingFace shard without a conversion step.
+fn load_gate_weights(
+    path: &std::path::Path,
+    num_experts: usize,
+    d_model: usize,
+    top_k: usize,
+) -> Result<crate::gating::LinearGate, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read gate weights {}: {e}", path.display()))?;
+    let expected = num_experts
+        .checked_mul(d_model)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| "num_experts * d_model overflowed".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "gate weights file {} has {} bytes, expected {} ({} experts × {} d_model × 4 bytes/f32)",
+            path.display(),
+            bytes.len(),
+            expected,
+            num_experts,
+            d_model
+        )
+        .into());
+    }
+    let mut weights = Vec::<f32>::with_capacity(num_experts * d_model);
+    for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(chunk);
+        weights.push(f32::from_le_bytes(buf));
+    }
+    Ok(crate::gating::LinearGate::new(weights, num_experts, d_model, top_k))
+}
+
 /// Best-effort total-RAM probe. Returns `None` (heuristic disabled) on
 /// platforms or filesystems we don't recognise. We intentionally avoid
 /// pulling in a `sysinfo`-style dependency for one number.
@@ -1020,6 +1183,94 @@ fn total_ram_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+/// Best-effort NUMA / CPU-affinity hint.
+///
+/// On Linux, when `num_cores > 0`, pin the current process to the first
+/// `num_cores` CPUs of the NUMA node owning CPU 0 (via
+/// `sched_setaffinity(2)`). The intent is to keep io_uring completion
+/// processing, the engine's matmul threads, and the tokio runtime on
+/// the same memory controller — for an SSD-streaming MoE this avoids
+/// cross-socket DRAM hops on every cache fill, which dominate latency
+/// at high QPS.
+///
+/// We deliberately don't pull in a NUMA crate: this function picks the
+/// CPUs from `/sys/devices/system/node/node0/cpulist` (a kernel-exposed
+/// comma+dash list). When that file isn't available we fall back to
+/// CPUs `0..num_cores`. On non-Linux targets this is a no-op that
+/// returns `Ok(())` so callers can always invoke it unconditionally.
+fn pin_to_local_cores(num_cores: usize) -> std::io::Result<()> {
+    if num_cores == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cpus = read_local_node_cpus().unwrap_or_else(|| (0..num_cores).collect());
+        let chosen: Vec<usize> = cpus.into_iter().take(num_cores).collect();
+        if chosen.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `cpu_set_t` is a POD bitset; we zero it with
+        // `mem::zeroed`, fill in valid CPU bits with the libc helpers,
+        // then hand it to `sched_setaffinity` which only reads.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            for cpu in &chosen {
+                libc::CPU_SET(*cpu, &mut set);
+            }
+            let rc = libc::sched_setaffinity(
+                0, // current process
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &set as *const _,
+            );
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        info!(
+            cores = ?chosen,
+            "pinned process to NUMA-local CPU set (best-effort; sched_setaffinity)"
+        );
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn!(
+            "core affinity hint requested ({} cores) but pinning is Linux-only; \
+             continuing without affinity",
+            num_cores
+        );
+        Ok(())
+    }
+}
+
+/// Parse `/sys/devices/system/node/node0/cpulist` into an ordered
+/// `Vec<usize>` of CPU ids (e.g. `"0-3,8,10-11"` -> `[0,1,2,3,8,10,11]`).
+/// Returns `None` if the file is missing / unparseable — callers fall
+/// back to a contiguous `0..N` range in that case.
+#[cfg(target_os = "linux")]
+fn read_local_node_cpus() -> Option<Vec<usize>> {
+    let body = std::fs::read_to_string("/sys/devices/system/node/node0/cpulist").ok()?;
+    let mut out: Vec<usize> = Vec::new();
+    for part in body.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            let lo: usize = lo.parse().ok()?;
+            let hi: usize = hi.parse().ok()?;
+            if hi < lo {
+                return None;
+            }
+            out.extend(lo..=hi);
+        } else {
+            out.push(part.parse().ok()?);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 #[cfg(test)]

@@ -1,0 +1,8 @@
+# Don't ship the host's build artefacts or local data into the image.
+rust-engine/target/
+data/
+.git/
+.github/
+*.bin
+*.safetensors
+.DS_Store
