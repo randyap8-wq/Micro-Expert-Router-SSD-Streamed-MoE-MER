@@ -284,11 +284,75 @@ curl -s http://127.0.0.1:8080/v1/completions \
 ```
 
 The server is intentionally **stateless per request** in this PR: each
-request drives `Engine::generate` for `max_tokens` cycles and returns
-the decoded tokens in one shot. Streaming (`stream: true`) is accepted
-in the request body for OpenAI compatibility but currently produces a
-non-streaming response. Continuous batching is on the roadmap (see
-`server.rs` for the trait boundaries it will plug into).
+request drives the model for `max_tokens` cycles and returns the decoded
+tokens in one shot. Streaming (`stream: true`) is accepted in the
+request body for OpenAI compatibility but currently produces a
+non-streaming response. Per-request KV caches mean that concurrent
+axum requests never alias each other's attention state — that is the
+foundational request-scheduler piece that token-level cross-request
+batching will layer on top of.
+
+#### Real-transformer pipeline (gist Phase 5/6)
+
+By default the server runs the **legacy benchmark generator**: each
+request drives `Engine::generate` for `max_tokens` cycles and synthesises
+a deterministic id stream. The SSD-streaming substrate is exercised
+identically.
+
+When `[real_transformer].enabled = true` in the TOML config, requests go
+through the **full decoder forward pass**:
+
+```
+embedding → for each layer: ( RMSNorm → MultiHeadSelfAttention → +
+                              RMSNorm → LinearGate.route → moe_step → +)
+            → final RMSNorm → LMHead → argmax
+```
+
+`moe_step` is what reads expert weights from SSD via the LRU cache, so
+the same hits / misses / I/O wait counters get populated regardless of
+which path drives the loop.
+
+The dense (resident) weights — embedding, attention projections, MoE
+gate, RMSNorm gains, LM head — are loaded from the directory in
+`real_transformer.weights_dir` (one `.bin` file per tensor, raw
+little-endian `f32`; see `RealModel::from_dir` for the file-name
+schema). Tensors that aren't present fall back to a deterministic
+seeded initialisation, so the engine always has an end-to-end runnable
+path even without real model files. Multi-layer experts share the
+existing single-namespace cache via the global addressing scheme
+`global_id = layer * num_experts + local_id` — so the run summary
+statistics are populated by the same instrumentation regardless of
+layer count.
+
+```toml
+[real_transformer]
+enabled = true
+# Optional. Missing tensors fall back to a deterministic seeded init.
+# weights_dir = "./data/dense"
+vocab_size = 256          # match the tokenizer (256 for the byte fallback)
+num_heads = 8
+num_kv_heads = 2          # 0 = MHA (auto-set to num_heads); GQA otherwise
+head_dim = 0              # 0 = auto (d_model / num_heads)
+rope_base = 10000.0
+rms_eps = 1e-6
+seed = 0xC0FFEE
+```
+
+#### Optional row-parallel matmul (`simd` feature)
+
+The dense projections inside `TransformerLayer` and `LMHead` are routed
+through `transformer::matmul_row_major`. With the `simd` cargo feature
+enabled, that function dispatches to a `std::thread::scope`-based
+row-parallel implementation (no extra crate dep — output rows are
+disjoint, so no synchronisation is needed):
+
+```bash
+cargo build --release --features simd
+```
+
+The call sites are unchanged, so a future PR can swap the body for a
+`candle::Tensor` op or a CUDA kernel without touching the layer
+definitions.
 
 Tokenization is via the [`tokenizers`] crate when the optional
 `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured,

@@ -16,6 +16,7 @@ mod io_provider;
 #[cfg(all(feature = "io_uring", target_os = "linux"))]
 mod io_uring_storage;
 mod metrics;
+mod model;
 mod multi_layer_cache;
 mod router;
 mod server;
@@ -416,11 +417,55 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         }
     };
 
+    // Optional real-transformer pipeline. When enabled, every request
+    // runs `embedding -> stacked layers (each with SSD-streamed MoE) ->
+    // LM head -> argmax`; when disabled, the legacy benchmark generator
+    // is used (the engine still streams expert FFN compute either way).
+    let real_model = if cfg.real_transformer.enabled {
+        let rt = &cfg.real_transformer;
+        let head_dim = if rt.head_dim == 0 {
+            cfg.model.d_model / rt.num_heads
+        } else {
+            rt.head_dim
+        };
+        let num_kv_heads = if rt.num_kv_heads == 0 { rt.num_heads } else { rt.num_kv_heads };
+        let model_cfg = crate::model::RealModelConfig {
+            d_model: cfg.model.d_model,
+            d_ff: cfg.model.d_ff,
+            num_heads: rt.num_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size: rt.vocab_size,
+            num_layers: cfg.model.num_layers,
+            num_experts: cfg.model.num_experts as usize,
+            top_k: cfg.model.top_k,
+            rope_base: rt.rope_base,
+            rms_eps: rt.rms_eps,
+        };
+        let m = match rt.weights_dir.as_ref() {
+            Some(dir) => crate::model::RealModel::from_dir(model_cfg, dir, rt.seed)?,
+            None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),
+        };
+        info!(
+            num_layers = cfg.model.num_layers,
+            num_heads = rt.num_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size = rt.vocab_size,
+            "real transformer pipeline enabled"
+        );
+        Some(Arc::new(m))
+    } else {
+        info!("real_transformer disabled; using legacy benchmark generator");
+        None
+    };
+
     let state = AppState {
         engine,
         tokenizer,
         metrics: Metrics::new(),
         max_tokens_cap: cfg.server.max_tokens,
+        real_model,
     };
     serve(state, &cfg.server.bind).await
 }

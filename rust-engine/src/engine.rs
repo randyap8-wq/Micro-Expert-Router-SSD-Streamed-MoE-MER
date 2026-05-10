@@ -526,6 +526,122 @@ impl Engine {
         self.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// **Real-transformer MoE step.** Given a hidden state `x` and the
+    /// expert ids the gating network selected for it, ensure every chosen
+    /// expert is resident in the SSD-streaming cache (concurrent
+    /// `pread(2)` for the misses, exactly as `generate` does), run each
+    /// expert's SwiGLU FFN over `x`, and return the per-expert output
+    /// vectors aligned with the input `experts` slice.
+    ///
+    /// This is the bridge from the dense `TransformerLayer` code (which
+    /// produces a routing decision) to the MoE compute (which the
+    /// SSD-streaming substrate makes interesting). The caller — typically
+    /// `crate::model::RealModel::step` — then folds the returned vectors
+    /// back into the residual stream via `TransformerLayer::moe_combine`.
+    ///
+    /// The same hits / misses / bytes / latency counters that
+    /// `Engine::generate` updates are bumped here too, so
+    /// `engine.print_summary()` shows the same shape regardless of
+    /// whether the engine is driving the benchmark Markov path or a real
+    /// transformer.
+    ///
+    /// `token_idx` is used only as a digest seed for `InferenceOutput`;
+    /// it has no effect on the activation produced.
+    pub async fn moe_step(
+        self: &Arc<Self>,
+        token_idx: u64,
+        x: &HiddenState,
+        experts: &[u32],
+    ) -> Vec<HiddenState> {
+        let cycle_start = Instant::now();
+        // Resolve aliases up front so the cache + predictor only ever
+        // see canonical expert ids (mirrors `generate`).
+        let target: Vec<u32> = experts.iter().map(|&id| self.resolve_alias(id)).collect();
+
+        // Frequency-based pinning: same logic as `generate`.
+        if self.options.pin_after_observations > 0 {
+            let mut obs = self.route_observations.write();
+            let threshold = self.options.pin_after_observations;
+            for &id in &target {
+                let entry = obs.entry(id).or_insert(0);
+                *entry += 1;
+                if *entry == threshold {
+                    debug!(expert = id, count = *entry, "pinning hot expert");
+                    self.cache.pin(id);
+                }
+            }
+        }
+
+        // Concurrent miss fetches; hits resolved inline.
+        let io_wait_start = Instant::now();
+        let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
+        let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
+            Vec::new();
+        for (i, &id) in target.iter().enumerate() {
+            if let Some(r) = self.cache.get(id) {
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                residents[i] = Some(r);
+            } else {
+                self.counters.misses.fetch_add(1, Ordering::Relaxed);
+                let me = self.clone();
+                miss_handles.push((i, tokio::spawn(async move { me.fetch(id).await })));
+            }
+        }
+        let had_misses = !miss_handles.is_empty();
+        for (i, h) in miss_handles {
+            let r = h.await.expect("expert fetch task panicked");
+            self.counters
+                .bytes_read
+                .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
+            residents[i] = Some(r);
+        }
+        let io_wait_us = if had_misses {
+            io_wait_start.elapsed().as_micros() as u64
+        } else {
+            0
+        };
+        let residents: Vec<Arc<ExpertResident>> = residents
+            .into_iter()
+            .map(|r| r.expect("internal invariant: every routed expert slot must be populated"))
+            .collect();
+
+        // Run the SwiGLU FFN per expert against the hidden state.
+        let compute_start = Instant::now();
+        let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
+        for r in &residents {
+            let res = match self.options.dtype {
+                WeightDtype::F32 => run_inference(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+            };
+            match res {
+                Ok((_out, y)) => per_expert_y.push(y),
+                Err(e) => {
+                    warn!(
+                        token = token_idx,
+                        expert = r.id,
+                        error = %e,
+                        "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                    );
+                    // Push a zero vector so the caller's weights[] alignment
+                    // stays valid; combining with weight `w_i * 0 = 0` is
+                    // the same as if this expert were never picked.
+                    per_expert_y.push(vec![0.0f32; self.shape.d_model]);
+                }
+            }
+        }
+        let compute_us = compute_start.elapsed().as_micros() as u64;
+        let _ = self.compute_hist.lock().record(compute_us.max(1));
+        self.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
+        self.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
+
+        let cycle_us = cycle_start.elapsed().as_micros() as u64;
+        let _ = self.cycle_hist.lock().record(cycle_us.max(1));
+        self.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
+        self.tokens_processed.fetch_add(1, Ordering::Relaxed);
+
+        per_expert_y
+    }
+
     /// Force-fetch a specific set of experts and load them into the cache.
     /// Mirrors the spec example "the router selects Expert ID 3 and 7".
     pub async fn warm_with(self: &Arc<Self>, ids: &[u32]) -> std::io::Result<()> {

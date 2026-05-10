@@ -24,6 +24,7 @@
 
 use crate::engine::Engine;
 use crate::metrics::Metrics;
+use crate::model::RealModel;
 use crate::tokenizer::Tokenizer;
 use axum::{
     extract::State,
@@ -44,6 +45,14 @@ pub struct AppState {
     pub tokenizer: Arc<Tokenizer>,
     pub metrics: Metrics,
     pub max_tokens_cap: usize,
+    /// Optional real transformer. When set, [`generate`] runs the
+    /// embedding → stacked layers → LM head pipeline (with experts
+    /// streamed from SSD by the engine on every layer's MoE step) and
+    /// samples next-token ids from real logits. When `None`, the
+    /// legacy deterministic generator is used (the engine still drives
+    /// SSD-streamed expert FFN compute either way, so cache / I/O
+    /// metrics are populated identically).
+    pub real_model: Option<Arc<RealModel>>,
 }
 
 /// Build the axum [`Router`] for the API.
@@ -280,30 +289,71 @@ async fn generate(
         .map_err(|e| GenerateError::Tokenizer(e.to_string()))?;
     let prompt_tokens = prompt_ids.len();
 
-    // 2) Drive `Engine::generate` for `max_tokens` cycles. Each cycle
-    //    streams its routed experts from SSD (cache-miss) or from the
-    //    LRU (hit), runs the SwiGLU FFN over real f32 weights, and
-    //    updates the predictor / metrics. We use the prompt's last
-    //    token id (or 0) as the base for our token-index stream so
-    //    different prompts get different routing trajectories.
+    // 2) Drive next-token generation. Two paths:
     //
-    //    NOTE: this is the "single-stream, scalar inference" path. A
-    //    future PR adds the real transformer decoder; the HTTP shape
-    //    above is unchanged when that happens.
-    let base = prompt_ids.last().copied().unwrap_or(0) as u64;
+    //   * **Real-transformer path** (`real_model` is `Some`): for each
+    //     output token, run the full decoder forward — embedding →
+    //     stacked layers (each calling the engine's `moe_step` to load
+    //     and run experts from SSD) → final RMSNorm → LM head — and
+    //     sample the next token id by argmax. This is the gist's
+    //     "actual generated text" path.
+    //
+    //   * **Legacy benchmark path** (`real_model` is `None`): drive
+    //     `Engine::generate` for `max_tokens` cycles and synthesise a
+    //     deterministic id stream. Same SSD-streaming behaviour, no
+    //     real logits.
+    //
+    //   Both paths populate the same hits / misses / I/O counters, so
+    //   the run summary stats look identical.
     let mut hits_total = 0u64;
     let mut misses_total = 0u64;
     let mut completion_ids: Vec<u32> = Vec::with_capacity(max_tokens);
-    for i in 0..max_tokens {
-        let stats = state.engine.generate(base.wrapping_add(i as u64)).await;
-        hits_total += stats.hits;
-        misses_total += stats.misses;
-        // Map engine cycle stats to a deterministic next-token id. The
-        // synthesis is deliberately simple (vocab modulo); when the
-        // real LM head is added, this is where its argmax lands.
-        let vocab = state.tokenizer.vocab_size().max(1) as u64;
-        let next = ((base.wrapping_add(i as u64).wrapping_mul(0x9E3779B97F4A7C15)) % vocab) as u32;
-        completion_ids.push(next);
+
+    if let Some(model) = state.real_model.as_ref() {
+        // Per-request KV caches: one full set per request, so concurrent
+        // axum requests never alias each other's attention state. (This
+        // is the foundational "request scheduler" piece — token-level
+        // cross-request batching can be layered on top by sharing the
+        // engine across requests but keeping KV per request, which is
+        // already what happens here.)
+        let mut kv = model.fresh_kv_caches();
+        let pre_hits = state.engine.report().hits;
+        let pre_misses = state.engine.report().misses;
+
+        // Prime the KV cache with the prompt tokens so the first
+        // generated token actually attends over the prompt. We discard
+        // the sampled ids during the prompt sweep — those would be the
+        // model's predictions of the *next* prompt token, not part of
+        // the completion.
+        for (pos, &tid) in prompt_ids.iter().enumerate() {
+            let _ = model.step(&state.engine, tid, pos, &mut kv).await;
+        }
+
+        // Now generate `max_tokens` real tokens.
+        let mut last = *prompt_ids.last().unwrap_or(&0u32);
+        for i in 0..max_tokens {
+            let pos = prompt_ids.len() + i;
+            let next = model.step(&state.engine, last, pos, &mut kv).await;
+            completion_ids.push(next);
+            last = next;
+        }
+        let post = state.engine.report();
+        hits_total = post.hits.saturating_sub(pre_hits);
+        misses_total = post.misses.saturating_sub(pre_misses);
+    } else {
+        // Legacy benchmark path.
+        let base = prompt_ids.last().copied().unwrap_or(0) as u64;
+        for i in 0..max_tokens {
+            let stats = state.engine.generate(base.wrapping_add(i as u64)).await;
+            hits_total += stats.hits;
+            misses_total += stats.misses;
+            // Map engine cycle stats to a deterministic next-token id. The
+            // synthesis is deliberately simple (vocab modulo); the real LM
+            // head argmax is what fires when `real_model` is set.
+            let vocab = state.tokenizer.vocab_size().max(1) as u64;
+            let next = ((base.wrapping_add(i as u64).wrapping_mul(0x9E3779B97F4A7C15)) % vocab) as u32;
+            completion_ids.push(next);
+        }
     }
     state.metrics.record_tokens(max_tokens as u64);
     state.metrics.record_cache(hits_total, misses_total);
@@ -471,6 +521,7 @@ mod tests {
             tokenizer: Arc::new(Tokenizer::bytes()),
             metrics: Metrics::new(),
             max_tokens_cap: 32,
+            real_model: None,
         };
         (state, dir)
     }
@@ -592,5 +643,106 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+    }
+
+    /// Build an `AppState` whose engine + storage are sized for a real
+    /// transformer with the given config. Returns the state plus the
+    /// temp dir that holds the synthesised expert weight files.
+    async fn make_state_with_real_model(
+        cfg: crate::model::RealModelConfig,
+    ) -> (AppState, TempDir) {
+        let dir = TempDir::new("server-real").unwrap();
+        let total = cfg.num_layers as u32 * cfg.num_experts as u32;
+        let weight_bytes = crate::inference::expert_weight_bytes(cfg.d_model, cfg.d_ff);
+        let block = 4096usize;
+        let expert_size = ((weight_bytes + block - 1) / block) * block;
+        crate::io_provider::generate_synthetic_experts(
+            dir.path(),
+            total,
+            expert_size,
+            cfg.d_model,
+            cfg.d_ff,
+        )
+        .unwrap();
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path().to_path_buf(),
+                expert_size,
+                block_align: block,
+                use_direct_io: false,
+            })
+            .unwrap(),
+        );
+        let cache = Arc::new(ExpertCache::new((total as usize).max(2)));
+        let pool = BufferPool::new(total as usize + 2, expert_size, block);
+        let router = Arc::new(TopKRouter::new(total, cfg.top_k, 1));
+        let predictor = Arc::new(PredictiveLoader::new(total, 0, 0.05, 1));
+        let engine = Arc::new(Engine::with_options(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape { d_model: cfg.d_model, d_ff: cfg.d_ff, hidden_seed: 1 },
+            EngineOptions::default(),
+        ));
+        let model = Arc::new(crate::model::RealModel::new_seeded(cfg.clone(), 0xBEEF));
+        let state = AppState {
+            engine,
+            tokenizer: Arc::new(Tokenizer::bytes()),
+            metrics: Metrics::new(),
+            max_tokens_cap: 16,
+            real_model: Some(model),
+        };
+        (state, dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completions_with_real_model_returns_logit_sampled_tokens() {
+        let cfg = crate::model::RealModelConfig {
+            // vocab=256 matches the byte tokenizer.
+            vocab_size: 256,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+        };
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "prompt": "Hi",
+            "max_tokens": 3
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        assert!(v["choices"][0]["text"].is_string());
+        // The engine's hits/misses counters were populated by the
+        // real-transformer path's `moe_step` calls.
+        let r = state.engine.report();
+        assert!(
+            r.misses + r.hits > 0,
+            "engine cache should be touched by real transformer path"
+        );
+        assert!(r.bytes_read > 0, "engine should have read expert bytes from SSD");
     }
 }

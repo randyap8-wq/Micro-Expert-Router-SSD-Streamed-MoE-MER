@@ -74,3 +74,9 @@ tokenizer = ["dep:tokenizers"]
 # Linux-only io_uring backend with registered fixed buffers. Off by default
 # because it requires the `io-uring` crate and only builds on Linux.
 io_uring = ["dep:io-uring"]
+# Row-parallel matmul (uses `std::thread::scope`, no extra crate dep) for
+# the dense projections inside `TransformerLayer` and the LM head. This
+# stands in for the rayon / candle / cudarc backend the gist mentions —
+# the call sites are already routed through `matmul_row_major`, so a
+# future PR can swap the body for a CUDA kernel without touching callers.
+simd = []
