@@ -198,23 +198,16 @@ impl KvCache {
     /// (potentially sensitive) attention state cannot be read by a
     /// subsequent allocation that lands in the same heap region.
     ///
-    /// We force the writes through `std::hint::black_box` so the
-    /// optimiser cannot prove them dead and elide them — the stdlib
-    /// `Vec::fill` on a value that is dropped immediately afterwards
-    /// is, in principle, eligible for DSE.
+    /// We use `std::ptr::write_volatile` to perform the zeroing
+    /// writes: volatile stores are defined to have observable side
+    /// effects and may not be elided by the optimiser, which is the
+    /// guarantee `Vec::fill` (followed by a drop) does *not* provide
+    /// — without volatile semantics the stdlib `fill` of a value that
+    /// is dropped immediately afterwards is, in principle, eligible
+    /// for dead-store elimination.
     pub fn zeroize(&mut self) {
-        for block in self.keys_blocks.iter_mut() {
-            block.fill(0.0);
-            // Round-trip through black_box so the compiler must
-            // materialise the stores above. `as_ptr` reads the
-            // (cleared) slice, which `black_box` then treats as an
-            // observable side effect.
-            let _ = std::hint::black_box(block.as_ptr());
-        }
-        for block in self.values_blocks.iter_mut() {
-            block.fill(0.0);
-            let _ = std::hint::black_box(block.as_ptr());
-        }
+        zeroize_blocks(&mut self.keys_blocks);
+        zeroize_blocks(&mut self.values_blocks);
         self.reset();
     }
 
@@ -238,6 +231,26 @@ impl KvCache {
         let start = in_block * self.kv_dim;
         &self.values_blocks[block_idx][start..start + self.kv_dim]
     }
+}
+
+/// Zero every `f32` of every block via `ptr::write_volatile` so the
+/// optimiser cannot elide the stores even though the underlying
+/// `Vec`s are dropped immediately afterwards. The trailing
+/// `compiler_fence` prevents the writes from being reordered past
+/// the eventual deallocation of the backing buffers.
+#[inline(never)]
+fn zeroize_blocks(blocks: &mut [Box<[f32]>]) {
+    for block in blocks.iter_mut() {
+        let ptr = block.as_mut_ptr();
+        let len = block.len();
+        // Safety: `ptr` is the start of a `Vec<f32>` of length `len`,
+        // every offset 0..len is in-bounds, properly aligned, and
+        // exclusively borrowed via `&mut block`.
+        for i in 0..len {
+            unsafe { std::ptr::write_volatile(ptr.add(i), 0.0f32) };
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Causal multi-head self attention with optional grouped-query attention.

@@ -88,11 +88,27 @@ pub struct AppState {
 }
 
 /// Build the axum [`Router`] for the API.
+///
+/// Routes are split into two sub-routers:
+///
+/// * **Public**: `/health`, `/metrics`. These are required by
+///   Kubernetes liveness/readiness probes and Prometheus scrapers,
+///   which generally cannot present API keys and must not be subject
+///   to per-tenant rate-limiting or admission shedding. They only
+///   receive the request-id layer so logs remain correlated.
+/// * **Protected**: every other route (`/v1/...`). These pass
+///   through the full middleware stack: API key, in-process rate
+///   limit, and admission control.
 pub fn build_router(state: AppState) -> Router {
     let mw_state = state.middleware.clone();
-    Router::new()
+
+    // Operational endpoints — always reachable, no auth/rate-limit/admission.
+    let public = Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(metrics));
+
+    // Tenant-facing endpoints — protected by the full middleware stack.
+    let protected = Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/sessions/:id", delete(delete_session))
@@ -109,7 +125,10 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             mw_state,
             api_key_layer,
-        ))
+        ));
+
+    public
+        .merge(protected)
         .layer(axum::middleware::from_fn(request_id_layer))
         .with_state(state)
 }

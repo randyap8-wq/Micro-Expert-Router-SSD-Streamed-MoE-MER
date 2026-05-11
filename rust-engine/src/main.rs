@@ -745,13 +745,16 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         sessions,
         middleware: middleware_state,
     };
-    // SIGHUP-triggered config reload. Re-reads the file, validates it,
-    // and logs which fields differ from the running configuration.
-    // Fields that can be safely live-updated are applied in place;
-    // others emit a "restart required" warning. This is the gist's
-    // "dynamic config reload" item without an invasive engine-wide
-    // refactor: the operator gets clear feedback that the new file
-    // parsed, and the safe-to-change knobs take effect immediately.
+    // SIGHUP-triggered config reload (diff-only). Re-reads the file,
+    // validates it, and logs which fields differ from the
+    // configuration baseline used by the reload task. This path does
+    // *not* mutate the live `AppState` that requests use — the
+    // engine, scheduler, sampling defaults, and middleware are
+    // constructed once at startup and are not currently
+    // atomic-mutable. The task advances its local baseline after a
+    // successful parse so later SIGHUPs compare against the most
+    // recently accepted file, but operators must restart the process
+    // for any reloaded value to actually take effect.
     #[cfg(unix)]
     {
         let path = config_path.clone();
@@ -775,11 +778,14 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                         continue;
                     }
                 };
-                // Safe-to-reload knobs: log what would change. Engine
-                // state behind these is constructed once at startup
-                // and is not currently atomic-mutable, so we surface
-                // the diff and recommend a restart for the fields
-                // that require it.
+                // Diff-only: log what would change. The reload task
+                // does not hold a handle to the live AppState, so
+                // none of these knobs are applied in place — both
+                // "safe-to-reload" and "restart-required" buckets
+                // require a process restart in this release. The
+                // bucketing is preserved so we can mark fields safe
+                // for live update once AppState is wrapped in an
+                // ArcSwap/lock in a follow-up.
                 let safe_keys: &[(&str, String, String)] = &[
                     (
                         "sampling.temperature",
@@ -826,8 +832,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                 ];
                 for (k, before, after) in safe_keys {
                     if before != after {
-                        info!(key = k, before = %before, after = %after,
-                            "reloaded (effective on next request)");
+                        warn!(key = k, before = %before, after = %after,
+                            "config changed; restart required to apply (diff-only reload)");
                     }
                 }
                 for (k, before, after) in restart_keys {
