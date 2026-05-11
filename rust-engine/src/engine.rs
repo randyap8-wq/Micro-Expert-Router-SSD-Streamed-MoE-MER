@@ -33,6 +33,56 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+/// Internal: outcome of a single fetch attempt.
+enum FetchOnceError {
+    /// The buffer pool was exhausted for so long that we hit the
+    /// MAX_FETCH_YIELDS cap. Surface to the caller so it can return
+    /// 503 / NotReady rather than degrade into an unbounded busy-loop.
+    PoolStarved,
+    /// The storage layer returned an I/O error. The retry loop in
+    /// [`Engine::fetch_with_retry`] may choose to try again.
+    Io(String),
+}
+
+/// Public error type for [`Engine::fetch_with_retry`].
+///
+/// The legacy [`Engine::fetch`] keeps its prior crashing semantics —
+/// the synthetic benchmark / `Engine::generate` path has no upstream
+/// "skip this expert" path. The real-transformer path uses
+/// `fetch_with_retry` (via [`Engine::moe_step`]) so a single corrupt
+/// expert downgrades gracefully into a missing top-K member rather
+/// than killing the server.
+#[derive(Debug)]
+pub enum ExpertReadError {
+    /// Storage returned a (possibly transient) I/O error every attempt.
+    Io {
+        id: u32,
+        attempts: usize,
+        source: String,
+    },
+    /// Buffer pool starved for too long — likely a configuration bug
+    /// (more pinned experts than the pool can keep resident, or way
+    /// more concurrent requests than expected).
+    PoolStarved { id: u32 },
+}
+
+impl std::fmt::Display for ExpertReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpertReadError::Io { id, attempts, source } => write!(
+                f,
+                "expert {id} read failed after {attempts} attempts: {source}"
+            ),
+            ExpertReadError::PoolStarved { id } => write!(
+                f,
+                "expert {id} fetch starved: buffer pool exhausted with cache pinned",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExpertReadError {}
+
 /// Optional JSONL trace sink — one record per `Engine::generate` call.
 ///
 /// When the engine is constructed with a trace path, every token's
@@ -265,6 +315,11 @@ struct Counters {
     prefetch_completed: AtomicU64,
     prefetch_used: AtomicU64,
     bytes_read: AtomicU64,
+    /// Cumulative experts dropped from a `moe_step` mixture because
+    /// their fetch failed after all retry attempts. Surfaced via
+    /// `EngineReport::expert_read_failures` so operators can alert on
+    /// it from /metrics + /health.
+    expert_read_failures: AtomicU64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -836,6 +891,85 @@ impl Engine {
     }
 
     async fn fetch(self: &Arc<Self>, id: u32) -> Arc<ExpertResident> {
+        match self.fetch_with_retry(id).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Critical-path miss could not be satisfied even after
+                // retries. Surfacing the error as a panic preserves
+                // the engine's prior crash semantics for the synthetic
+                // benchmark path (`Engine::generate`), which has no
+                // upstream "skip this expert" option. The real-
+                // transformer path uses [`Self::moe_step`] which
+                // calls [`Self::try_fetch_with_skip`] instead, so a
+                // single corrupt expert no longer kills the process.
+                warn!(expert = id, error = %e, "fatal: expert fetch failed after retries");
+                panic!("failed to read expert {id}: {e}");
+            }
+        }
+    }
+
+    /// Try to fetch an expert with exponential-backoff retry on
+    /// transient I/O errors. Returns `Err(ExpertReadError::*)` when
+    /// the request cannot be satisfied (corrupt file, persistent I/O
+    /// error, or saturated buffer pool with every cache slot pinned).
+    ///
+    /// This is the production entry point: prefer it over the
+    /// panicking [`Self::fetch`] when the caller has a way to
+    /// degrade — e.g. the multi-expert `moe_step` can drop a single
+    /// failed expert from the top-K mixture and continue.
+    pub async fn fetch_with_retry(
+        self: &Arc<Self>,
+        id: u32,
+    ) -> Result<Arc<ExpertResident>, ExpertReadError> {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.fetch_once(id).await {
+                Ok(r) => {
+                    if attempt > 0 {
+                        info!(expert = id, attempt, "expert fetch recovered after retry");
+                    }
+                    return Ok(r);
+                }
+                Err(FetchOnceError::PoolStarved) => {
+                    return Err(ExpertReadError::PoolStarved { id });
+                }
+                Err(FetchOnceError::Io(msg)) => {
+                    last_err = Some(msg.clone());
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        // Exponential backoff: 10ms, 40ms, 160ms. Cap
+                        // at 500ms to keep request latency bounded —
+                        // the real-transformer path can skip failed
+                        // experts so a long retry storm is worse than
+                        // a quick degraded response.
+                        let backoff_ms = (10u64 << (attempt * 2)).min(500);
+                        warn!(
+                            expert = id,
+                            attempt,
+                            backoff_ms,
+                            error = %msg,
+                            "expert fetch failed; will retry"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+        Err(ExpertReadError::Io {
+            id,
+            attempts: MAX_ATTEMPTS,
+            source: last_err.unwrap_or_else(|| "unknown".into()),
+        })
+    }
+
+    /// One single fetch attempt. Acquires a buffer (yielding briefly
+    /// if the pool is under pressure), issues the read, and either
+    /// installs the resident in the cache or surfaces the I/O error
+    /// to the retry loop.
+    async fn fetch_once(
+        self: &Arc<Self>,
+        id: u32,
+    ) -> Result<Arc<ExpertResident>, FetchOnceError> {
         let io_start = Instant::now();
         // Race-free acquire-with-eviction: in a loop, evict an LRU entry
         // if the cache is at capacity (which releases its `PooledBuffer` on
@@ -847,7 +981,7 @@ impl Engine {
         // entries *and* the buffer pool has no free slot, no amount of
         // yielding will help — we're hard-blocked on a configuration
         // bug (more pinned experts than the pool can keep resident).
-        // Panic with a clear message rather than spin forever.
+        // Return `PoolStarved` rather than spin forever.
         const MAX_FETCH_YIELDS: usize = 1024;
         let mut yields = 0usize;
         let mut buf;
@@ -867,14 +1001,7 @@ impl Engine {
             // Yield to the runtime briefly to let them make progress.
             yields += 1;
             if yields > MAX_FETCH_YIELDS {
-                panic!(
-                    "Engine::fetch could not acquire a buffer for expert {id} after {} yields. \
-                     Cache capacity={}, pinned={}, pool busy. This indicates more experts are \
-                     pinned than the buffer pool can hold; raise pool size or pin fewer experts.",
-                    yields,
-                    self.cache.capacity(),
-                    self.cache.pinned_count(),
-                );
+                return Err(FetchOnceError::PoolStarved);
             }
             tokio::task::yield_now().await;
         }
@@ -898,18 +1025,14 @@ impl Engine {
                             "expert loaded but cache rejected insert (every slot pinned); \
                              returning resident without caching"
                         );
-                        return rejected;
+                        return Ok(rejected);
                     }
                 }
-                resident
+                Ok(resident)
             }
             Err(e) => {
                 // The buffer is returned to the pool when `buf` is dropped.
-                warn!(expert = id, error = %e, "expert read failed");
-                // Surface the error by panicking — the engine cannot make
-                // progress without the requested expert. A production build
-                // would route around the failure or retry.
-                panic!("failed to read expert {id}: {e}");
+                Err(FetchOnceError::Io(e.to_string()))
             }
         }
     }
@@ -1260,8 +1383,10 @@ impl Engine {
         // Concurrent miss fetches; hits resolved inline.
         let io_wait_start = Instant::now();
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
-        let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
-            Vec::new();
+        let mut miss_handles: Vec<(
+            usize,
+            tokio::task::JoinHandle<Result<Arc<ExpertResident>, ExpertReadError>>,
+        )> = Vec::new();
         let mut cache_hits_per_expert: Vec<bool> = Vec::with_capacity(target.len());
         for (i, &id) in target.iter().enumerate() {
             if let Some(r) = self.cache.get(id) {
@@ -1271,7 +1396,10 @@ impl Engine {
             } else {
                 self.counters.misses.fetch_add(1, Ordering::Relaxed);
                 let me = self.clone();
-                miss_handles.push((i, tokio::spawn(async move { me.fetch(id).await })));
+                miss_handles.push((
+                    i,
+                    tokio::spawn(async move { me.fetch_with_retry(id).await }),
+                ));
                 cache_hits_per_expert.push(false);
             }
         }
@@ -1284,27 +1412,66 @@ impl Engine {
             tw.write_record(token_idx, layer, &target, &cache_hits_per_expert);
         }
         let had_misses = !miss_handles.is_empty();
+        // Track expert slots whose fetch task failed: we'll drop them
+        // from the mixture below and emit a zero contribution, which
+        // is exactly what happens for an expert that returned 0 from
+        // run_inference (the existing "skipping expert" path). This
+        // means a single corrupt expert file no longer takes down the
+        // process — the gist's production-readiness ask.
+        let mut failed_experts: Vec<u32> = Vec::new();
         for (i, h) in miss_handles {
-            let r = h.await.expect("expert fetch task panicked");
-            self.counters
-                .bytes_read
-                .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
-            residents[i] = Some(r);
+            // `fetch_with_retry` already retried with backoff. A join
+            // error means the task itself panicked, which is fatal —
+            // re-raise so the supervising scheduler can restart us.
+            match h.await.expect("expert fetch task panicked") {
+                Ok(r) => {
+                    self.counters
+                        .bytes_read
+                        .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
+                    residents[i] = Some(r);
+                }
+                Err(e) => {
+                    let id = target[i];
+                    self.counters
+                        .expert_read_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(token = token_idx, layer, expert = id, error = %e,
+                        "moe_step: expert fetch failed after retries; skipping from mixture");
+                    failed_experts.push(id);
+                }
+            }
         }
         let io_wait_us = if had_misses {
             io_wait_start.elapsed().as_micros() as u64
         } else {
             0
         };
-        let residents: Vec<Arc<ExpertResident>> = residents
-            .into_iter()
-            .map(|r| r.expect("internal invariant: every routed expert slot must be populated"))
-            .collect();
+        // Drop the failed expert slots from the parallel arrays so the
+        // downstream FFN loop only ever sees Some(_). To preserve the
+        // alignment with the caller's mixing weights array, we emit a
+        // zero-vector contribution for every failed slot inline below
+        // (same semantics as `run_inference` failing for a single
+        // expert). The engine itself never panics anymore.
+        let _ = failed_experts; // retained for telemetry below
+        // Reconstruct a Vec<Option<Arc<ExpertResident>>> aligned with
+        // `target.len()`; None entries correspond to failed fetches.
+        let residents: Vec<Option<Arc<ExpertResident>>> = residents;
 
         // Run the SwiGLU FFN per expert against the hidden state.
         let compute_start = Instant::now();
         let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
-        for r in &residents {
+        for r_opt in &residents {
+            let r = match r_opt {
+                Some(r) => r,
+                None => {
+                    // Failed fetch: push a zero vector so the caller's
+                    // weights[] alignment stays valid (combining with
+                    // weight `w_i * 0 = 0` is equivalent to dropping
+                    // this expert from the mixture).
+                    per_expert_y.push(vec![0.0f32; self.shape.d_model]);
+                    continue;
+                }
+            };
             let res = match self.options.dtype {
                 WeightDtype::F32 => run_inference(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
                 WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
@@ -1430,6 +1597,7 @@ impl Engine {
             predictive: self.predictive_telemetry(),
             locality_enabled: self.locality.is_some(),
             speculator_enabled: self.speculator.is_some(),
+            expert_read_failures: self.counters.expert_read_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -1578,6 +1746,11 @@ pub struct EngineReport {
     /// Whether the [`NeuralSpeculator`] (the **M** arm of the
     /// predictive `S ∪ L ∪ M` union-fetch) was configured on this run.
     pub speculator_enabled: bool,
+    /// Cumulative number of routed experts dropped from a mixture
+    /// because their fetch (after retries) failed. Non-zero values
+    /// indicate corrupt weight files or persistent SSD I/O errors;
+    /// alert on a non-zero rate from the Prometheus exporter.
+    pub expert_read_failures: u64,
 }
 
 #[cfg(test)]

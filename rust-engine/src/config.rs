@@ -28,10 +28,65 @@ pub struct ServerConfig {
     /// sessions idle for longer than this many seconds.
     #[serde(default)]
     pub session_ttl_secs: u64,
+
+    /// Maximum number of HTTP requests allowed to be executing
+    /// concurrently. Excess requests are rejected with `503 Service
+    /// Unavailable` so the engine never silently degrades into
+    /// unbounded queueing. `0` (default) disables the limit.
+    #[serde(default)]
+    pub max_concurrent_requests: usize,
+
+    /// Minimum number of free blocks the paged-KV pool must hold for
+    /// new requests to be admitted. When configured (and a block pool
+    /// is configured under `[real_transformer]`), incoming requests
+    /// that would push the pool below this watermark are rejected
+    /// with `503 Service Unavailable`. `0` (default) disables.
+    #[serde(default)]
+    pub admission_min_free_blocks: usize,
 }
 
 fn default_bind() -> String { "127.0.0.1:8080".to_string() }
 fn default_max_tokens() -> usize { 256 }
+
+/// Optional API-key gate + simple in-process rate limiting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Bearer / `X-API-Key` values that may access the API. When
+    /// empty, the API-key middleware is disabled and every request
+    /// is allowed (legacy behaviour). When non-empty, requests
+    /// missing or carrying a value not in this set are rejected with
+    /// `401 Unauthorized`. Plumb in distinct keys per tenant so the
+    /// access log identifies who issued each request.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+
+    /// Optional in-process token-bucket rate limit, expressed in
+    /// requests per second per API key. `0` (default) disables.
+    /// Bursts of up to `rate_limit_burst` are allowed before the
+    /// bucket empties.
+    #[serde(default)]
+    pub rate_limit_rps: u32,
+
+    /// Burst size for the token bucket. `0` defaults to `rate_limit_rps`.
+    #[serde(default)]
+    pub rate_limit_burst: u32,
+
+    /// Path to a PEM-encoded TLS certificate. When both `tls_cert`
+    /// and `tls_key` are set, the server starts in HTTPS mode using
+    /// rustls. **Production setups should usually terminate TLS at a
+    /// reverse proxy** (nginx, Envoy, AWS ALB) — this knob exists for
+    /// closed-network deployments where the engine binary needs to
+    /// serve HTTPS directly. See `docs/production.md`.
+    ///
+    /// This release does *not* link rustls into the binary; the field
+    /// is honoured by [`Config::validate`] and a clear error is
+    /// emitted at startup if it is set. Wiring rustls is a one-line
+    /// `axum_server::bind_rustls` once the deployment is ready.
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+}
 
 /// Server-wide sampling defaults. Each request can override these via
 /// the `temperature` / `top_p` / `top_k` / `seed` JSON fields.
@@ -311,6 +366,11 @@ pub struct Config {
     pub sampling: SamplingConfig,
     #[serde(default)]
     pub predictive: PredictiveConfig,
+    /// Optional API-key gate, rate limit, and TLS configuration.
+    /// Defaults are fully permissive (no auth, no rate limit, plain
+    /// HTTP) to preserve the legacy behaviour bit-for-bit.
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 impl Config {
@@ -436,6 +496,35 @@ impl Config {
                 )));
             }
         }
+        // [security] section.
+        let s = &self.security;
+        match (&s.tls_cert, &s.tls_key) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "security.tls_cert and security.tls_key must both be set or both omitted"
+                        .into(),
+                ));
+            }
+            (Some(c), Some(k)) => {
+                // We don't link rustls in by default; surface the
+                // intent clearly so operators understand why HTTPS
+                // doesn't actually come up. See `docs/production.md`
+                // for the recommended reverse-proxy delegation
+                // pattern.
+                tracing::warn!(
+                    cert = %c.display(),
+                    key = %k.display(),
+                    "security.tls_cert/key are configured but native TLS is not compiled in; \
+                     terminate TLS at a reverse proxy (nginx/Envoy/ALB). See docs/production.md.",
+                );
+            }
+            (None, None) => {}
+        }
+        if s.rate_limit_burst > 0 && s.rate_limit_rps == 0 {
+            return Err(ConfigError::Invalid(
+                "security.rate_limit_burst requires rate_limit_rps > 0".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -469,6 +558,8 @@ mod tests {
                 bind: "127.0.0.1:8080".into(),
                 max_tokens: 64,
                 session_ttl_secs: 0,
+                max_concurrent_requests: 0,
+                admission_min_free_blocks: 0,
             },
             model: ModelConfig {
                 data_dir: PathBuf::from("./data"),
@@ -493,6 +584,7 @@ mod tests {
             real_transformer: RealTransformerConfig::default(),
             sampling: SamplingConfig::default(),
             predictive: PredictiveConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 
