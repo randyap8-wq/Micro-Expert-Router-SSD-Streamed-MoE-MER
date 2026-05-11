@@ -13,6 +13,8 @@ mod config;
 mod engine;
 mod expert_cache;
 mod gating;
+mod gguf;
+mod gguf_loader;
 mod inference;
 mod io_provider;
 #[cfg(all(feature = "io_uring", target_os = "linux"))]
@@ -235,6 +237,47 @@ enum Cmd {
         /// Markov router).
         #[arg(long)]
         gate_weights: Option<PathBuf>,
+        /// Optional path to write a JSONL **routing trace** to. Each
+        /// line records one token's `{token, layer, experts,
+        /// cache_hit}`, suitable for offline analysis with
+        /// `scripts/compute_transition_matrix.py` and the
+        /// `validate-predictor` subcommand.
+        #[arg(long)]
+        trace_out: Option<PathBuf>,
+    },
+
+    /// Convert a GGUF checkpoint (Mixtral-style) into the engine's
+    /// per-expert binary format plus a `metadata.json` and the dense
+    /// weight files [`RealModel::from_dir`] consumes. Phase 2.
+    GgufConvert {
+        /// Path to the source `*.gguf` file.
+        #[arg(long)]
+        gguf_path: PathBuf,
+        /// Output directory. Created if it doesn't exist.
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Override the number of layers (defaults to
+        /// `llama.block_count` from the GGUF metadata).
+        #[arg(long, default_value_t = 0)]
+        num_layers: usize,
+        /// Override the experts-per-layer (defaults to
+        /// `llama.expert_count` from the GGUF metadata).
+        #[arg(long, default_value_t = 0)]
+        num_experts: usize,
+    },
+
+    /// Replay a routing trace through the predictive prefetcher and
+    /// print per-K hit-rate statistics. Phase 6.
+    ValidatePredictor {
+        /// Path to a JSONL routing trace (produced by `run --trace-out`).
+        #[arg(long)]
+        trace: PathBuf,
+        /// LRU cache size to simulate. Repeat the flag to evaluate
+        /// multiple sizes in one run (e.g. `--cache-slots 4
+        /// --cache-slots 8 --cache-slots 16`). Defaults to a sweep of
+        /// 2, 4, 8, 16.
+        #[arg(long)]
+        cache_slots: Vec<usize>,
     },
 
     /// Start the OpenAI-compatible HTTP server (Phase 6 / 8 / 9).
@@ -307,6 +350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     router_intra_p,
                     router_matrix,
                     gate_weights,
+                    trace_out,
                 } = cli.cmd
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
@@ -339,6 +383,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         router_intra_p,
                         router_matrix,
                         gate_weights,
+                        trace_out,
                     })
                     .await
                 } else {
@@ -351,6 +396,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             rt.block_on(cmd_serve(config))
+        }
+        Cmd::GgufConvert {
+            gguf_path,
+            out_dir,
+            num_layers,
+            num_experts,
+        } => cmd_gguf_convert(&gguf_path, &out_dir, num_layers, num_experts),
+        Cmd::ValidatePredictor { trace, cache_slots } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_validate_predictor(&trace, &cache_slots))
         }
     }
 }
@@ -655,6 +712,7 @@ struct RunArgs {
     router_intra_p: f64,
     router_matrix: Option<PathBuf>,
     gate_weights: Option<PathBuf>,
+    trace_out: Option<PathBuf>,
 }
 
 async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -758,13 +816,33 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    if !args.data_dir.is_dir() {
-        return Err(format!(
-            "data dir {} does not exist; run `gen-data` first",
-            args.data_dir.display()
-        )
-        .into());
+    // Multi-drive striping (gist Phase 4). If `--data-dir` contains
+    // commas (e.g. `--data-dir /mnt/nvme0,/mnt/nvme1`), we shard
+    // experts across the listed directories by `id % n_drives`. The
+    // single-dir path is unchanged. Done early because the io_uring
+    // NUMA probe below also takes the (canonical) data dir.
+    let data_dirs: Vec<PathBuf> = parse_striped_data_dir(&args.data_dir);
+    let primary_dir = data_dirs.first().cloned().unwrap_or_else(|| args.data_dir.clone());
+    for d in &data_dirs {
+        if !d.is_dir() {
+            return Err(format!(
+                "data dir {} does not exist; run `gen-data` first",
+                d.display()
+            )
+            .into());
+        }
     }
+    if data_dirs.len() > 1 {
+        info!(
+            drives = data_dirs.len(),
+            dirs = ?data_dirs,
+            "multi-drive striping enabled (experts sharded by id % n_drives)"
+        );
+    }
+    // Treat the first dir as the canonical metadata source for any
+    // `metadata.json` / `alias-map` lookups downstream. The other
+    // directories only need to contain `expert_<id>.bin`.
+    args.data_dir = primary_dir.clone();
 
     if args.io_uring {
         // Best-effort affinity: keep the engine on the NUMA node that
@@ -844,12 +922,17 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let storage = Arc::new(NvmeStorage::new(StorageConfig {
-        base_path: args.data_dir.clone(),
+    let storage_cfg = StorageConfig {
+        base_path: primary_dir.clone(),
         expert_size: args.expert_size,
         block_align: args.block_align,
         use_direct_io: !args.no_direct,
-    })?);
+    };
+    let storage = Arc::new(if data_dirs.len() > 1 {
+        NvmeStorage::striped(storage_cfg, data_dirs.clone())?
+    } else {
+        NvmeStorage::new(storage_cfg)?
+    });
     storage.warmup_fds(0..args.num_experts)?;
 
     let prefetch_headroom = if args.no_prefetch { 0 } else { args.predict_fanout.max(1) };
@@ -959,6 +1042,21 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         engine.warm_with(&target).await?;
     }
 
+    // Optional JSONL routing trace (gist Phase 6). When set, every
+    // call to `engine.generate` appends one record. Wired up *after*
+    // the warm-up so warm-fetched experts don't pollute the trace
+    // with synthetic tokens (`Engine::warm_with` doesn't go through
+    // `generate`).
+    let trace_writer = match args.trace_out.as_ref() {
+        Some(path) => {
+            info!(path = %path.display(), "writing routing trace");
+            let w = Arc::new(crate::engine::TraceWriter::open(path)?);
+            engine.set_trace_writer(Some(w.clone()));
+            Some(w)
+        }
+        None => None,
+    };
+
     let stream_started = Instant::now();
     info!(
         tokens = args.tokens,
@@ -1051,6 +1149,11 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             "I/O latency histogram is empty despite cache misses; check that \
              tracing is enabled and runs are long enough to produce samples."
         );
+    }
+
+    // Flush the trace before returning so the JSONL file is complete.
+    if let Some(tw) = trace_writer.as_ref() {
+        tw.flush();
     }
 
     Ok(())
@@ -1382,6 +1485,185 @@ pub fn detect_data_dir_numa_node(data_dir: &std::path::Path) -> Option<i32> {
         let _ = data_dir;
         None
     }
+}
+
+/// Parse `--data-dir` into a list of directories. If the path
+/// stringifies to a comma-separated list, split it; otherwise return a
+/// single-element vec. Used by gist Phase 4 (multi-drive striping).
+fn parse_striped_data_dir(p: &std::path::Path) -> Vec<PathBuf> {
+    let s = p.to_string_lossy();
+    if s.contains(',') {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    } else {
+        vec![p.to_path_buf()]
+    }
+}
+
+fn cmd_gguf_convert(
+    gguf_path: &PathBuf,
+    out_dir: &PathBuf,
+    num_layers: usize,
+    num_experts: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(path = %gguf_path.display(), "opening GGUF file");
+    let gguf = crate::gguf::GgufFile::open(gguf_path)?;
+    if let Some(arch) = gguf.architecture() {
+        info!(architecture = arch, version = gguf.version, "GGUF parsed");
+    }
+    let report =
+        crate::gguf_loader::extract_experts_from_gguf(&gguf, out_dir, num_layers, num_experts)?;
+    let total_gib = report.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let read_time_at_7gbps = report.total_bytes as f64 / (7.0 * 1024.0 * 1024.0 * 1024.0);
+    info!(
+        experts_written = report.experts_written,
+        dense_written = report.dense_written,
+        skipped = report.skipped,
+        total_bytes = report.total_bytes,
+        total_gib,
+        expected_read_seconds_at_7gbps = read_time_at_7gbps,
+        d_model = report.d_model,
+        d_ff = report.d_ff,
+        num_layers = report.num_layers,
+        num_experts_per_layer = report.num_experts_per_layer,
+        "gguf-convert complete"
+    );
+    println!(
+        "gguf-convert: wrote {} expert files + {} dense tensors ({:.2} GiB total). \
+         At 7 GB/s aggregate SSD read bandwidth, a full warm-up scan would take ~{:.2}s.",
+        report.experts_written, report.dense_written, total_gib, read_time_at_7gbps
+    );
+    Ok(())
+}
+
+async fn cmd_validate_predictor(
+    trace_path: &PathBuf,
+    cache_slots: &[usize],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(trace_path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    // Parse JSONL records {"token": .., "layer": .., "experts": [..], "cache_hit": [..]}.
+    // We extract just the per-token expert id sequence; the predictor
+    // validation replays them through a fresh LRU and prints per-K
+    // hit rates plus per-layer breakdown and top-1 / top-2 accuracy.
+    #[derive(Default)]
+    struct LayerStats {
+        tokens: u64,
+        // for top-1 / top-2 accuracy we compare the predicted set of
+        // size K against the actual top-1 / top-2 routed experts.
+        top1_hits: u64,
+        top2_hits: u64,
+    }
+    let mut by_layer: std::collections::BTreeMap<u32, LayerStats> = Default::default();
+    let mut tokens_per_layer: std::collections::BTreeMap<u32, Vec<Vec<u32>>> = Default::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let layer = json_get_u64(line, "layer").unwrap_or(0) as u32;
+        let experts = json_get_u32_array(line, "experts");
+        if experts.is_empty() {
+            continue;
+        }
+        by_layer.entry(layer).or_default().tokens += 1;
+        tokens_per_layer.entry(layer).or_default().push(experts);
+    }
+
+    // Per-cache-size simulation: maintain a tiny LRU and count hits.
+    let ks: Vec<usize> = if cache_slots.is_empty() {
+        vec![2, 4, 8, 16]
+    } else {
+        cache_slots.to_vec()
+    };
+    println!("validate-predictor: trace={}", trace_path.display());
+    for k in &ks {
+        let mut hits = 0u64;
+        let mut total = 0u64;
+        for (_layer, seq) in tokens_per_layer.iter() {
+            let mut lru: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+            for experts in seq {
+                for &e in experts {
+                    if lru.iter().any(|&x| x == e) {
+                        hits += 1;
+                        lru.retain(|&x| x != e);
+                    } else if lru.len() == *k {
+                        lru.pop_front();
+                    }
+                    lru.push_back(e);
+                    total += 1;
+                }
+            }
+        }
+        let rate = if total > 0 {
+            hits as f64 / total as f64
+        } else {
+            0.0
+        };
+        println!("  cache_slots={k:>3}  hit_rate={rate:>6.3}  hits={hits}/{total}");
+    }
+
+    // Top-1 / Top-2 predictor accuracy: replay one-step-ahead via a
+    // simple last-expert Markov predictor (the cheapest baseline the
+    // engine has). For each (prev, curr) pair we predict `prev` and
+    // count it as a top-1 hit if it appears in `curr`, top-2 if any
+    // of {prev, second-most-recent} appears in `curr`.
+    for (layer, seq) in tokens_per_layer.iter() {
+        let stats = by_layer.entry(*layer).or_default();
+        let mut prev: Option<u32> = None;
+        let mut prev2: Option<u32> = None;
+        for experts in seq {
+            if let Some(p) = prev {
+                if experts.iter().any(|&x| x == p) {
+                    stats.top1_hits += 1;
+                }
+                let predict2: std::collections::HashSet<u32> =
+                    [Some(p), prev2].iter().filter_map(|x| *x).collect();
+                if experts.iter().any(|x| predict2.contains(x)) {
+                    stats.top2_hits += 1;
+                }
+            }
+            prev2 = prev;
+            prev = experts.first().copied();
+        }
+    }
+    println!("\nper-layer Markov predictor accuracy:");
+    for (layer, st) in &by_layer {
+        let denom = st.tokens.saturating_sub(1).max(1);
+        let top1 = st.top1_hits as f64 / denom as f64;
+        let top2 = st.top2_hits as f64 / denom as f64;
+        println!(
+            "  layer={layer:>3}  tokens={:>6}  top1={top1:>6.3}  top2={top2:>6.3}",
+            st.tokens
+        );
+    }
+    Ok(())
+}
+
+/// Pull a numeric field and a `[..]` u32 array out of one JSONL line.
+/// The trace records have a fixed schema (`{token, layer, experts,
+/// cache_hit}`), so we route through `serde_json::Value` for safety
+/// without paying the cost of deriving a full type.
+fn json_get_u64(line: &str, key: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get(key).and_then(|x| x.as_u64())
+}
+
+fn json_get_u32_array(line: &str, key: &str) -> Vec<u32> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

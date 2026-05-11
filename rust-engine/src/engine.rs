@@ -32,6 +32,63 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+/// Optional JSONL trace sink — one record per `Engine::generate` call.
+///
+/// When the engine is constructed with a trace path, every token's
+/// `{token, layer, experts, cache_hit}` is appended as a line. Used by
+/// `scripts/compute_transition_matrix.py` and the
+/// `validate-predictor` subcommand to evaluate the predictor offline
+/// against real routing distributions. See gist Phase 6.
+pub struct TraceWriter {
+    file: parking_lot::Mutex<std::io::BufWriter<std::fs::File>>,
+}
+
+impl TraceWriter {
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        Ok(Self {
+            file: parking_lot::Mutex::new(std::io::BufWriter::new(f)),
+        })
+    }
+
+    pub fn write_record(&self, token: u64, layer: u32, experts: &[u32], cache_hit: &[bool]) {
+        use std::io::Write;
+        let mut s = String::with_capacity(64 + experts.len() * 8);
+        s.push_str(&format!(
+            "{{\"token\":{token},\"layer\":{layer},\"experts\":["
+        ));
+        for (i, e) in experts.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&e.to_string());
+        }
+        s.push_str("],\"cache_hit\":[");
+        for (i, h) in cache_hit.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(if *h { "true" } else { "false" });
+        }
+        s.push_str("]}\n");
+        let mut g = self.file.lock();
+        // Best-effort: a write failure on trace I/O must not abort the
+        // hot path. Log once and continue.
+        if let Err(e) = g.write_all(s.as_bytes()) {
+            warn!(error = %e, "trace writer failed; subsequent records may be lost");
+        }
+    }
+
+    pub fn flush(&self) {
+        use std::io::Write;
+        let _ = self.file.lock().flush();
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CycleStats {
     pub hits: u64,
@@ -229,6 +286,9 @@ pub struct Engine {
     locality_hits: AtomicU64,
     /// Cumulative locality-miss count.
     locality_misses: AtomicU64,
+    /// Optional JSONL trace sink. When set, every `generate` call
+    /// appends one record. See [`TraceWriter`] and gist Phase 6.
+    trace_writer: parking_lot::RwLock<Option<Arc<TraceWriter>>>,
 }
 
 impl Engine {
@@ -296,7 +356,15 @@ impl Engine {
             spec_tokens: AtomicU64::new(0),
             locality_hits: AtomicU64::new(0),
             locality_misses: AtomicU64::new(0),
+            trace_writer: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Install a JSONL routing trace sink. Every subsequent
+    /// `generate` call appends `{token, layer, experts, cache_hit}` to
+    /// the underlying file. Passing `None` disables tracing.
+    pub fn set_trace_writer(&self, writer: Option<Arc<TraceWriter>>) {
+        *self.trace_writer.write() = writer;
     }
 
     /// Install an alias map. Calls to [`Self::generate`] / prefetch will
@@ -415,6 +483,7 @@ impl Engine {
         // satisfy concurrently. Hits are resolved inline.
         let io_wait_start = Instant::now();
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
+        let mut cache_hits_per_expert: Vec<bool> = vec![false; target.len()];
         let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
             Vec::new();
         for (i, &id) in target.iter().enumerate() {
@@ -422,6 +491,7 @@ impl Engine {
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 stats.hits += 1;
                 debug!(expert = id, "cache hit");
+                cache_hits_per_expert[i] = true;
                 residents[i] = Some(r);
             } else {
                 self.counters.misses.fetch_add(1, Ordering::Relaxed);
@@ -433,6 +503,14 @@ impl Engine {
                     tokio::spawn(async move { me.fetch(id).await }),
                 ));
             }
+        }
+        // Emit a trace record after we know which experts were chosen
+        // and which were already resident. Layer is `0` for the
+        // single-namespace flat router path; the multi-layer path
+        // (`moe_step`) carries its own layer id and would call into a
+        // future `trace_writer.write_record(token, layer, …)` directly.
+        if let Some(tw) = self.trace_writer.read().as_ref() {
+            tw.write_record(token_idx, 0, &target, &cache_hits_per_expert);
         }
         let had_misses = !miss_handles.is_empty();
         for (i, h) in miss_handles {
