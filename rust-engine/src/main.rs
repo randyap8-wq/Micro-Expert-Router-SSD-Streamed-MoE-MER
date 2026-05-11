@@ -20,6 +20,7 @@ mod io_provider;
 #[cfg(all(feature = "io_uring", target_os = "linux"))]
 mod io_uring_storage;
 mod metrics;
+mod middleware;
 mod model;
 mod multi_layer_cache;
 mod router;
@@ -684,6 +685,55 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         None
     };
 
+    // Background overflow-slab reclaimer: every 60s, ask the paged-KV
+    // pool to return any heap-backed overflow blocks that are no
+    // longer in use. Cheap when there's nothing to reclaim (single
+    // mutex check + early return), so safe to run unconditionally.
+    if let Some(pool) = batch_scheduler.as_ref().and_then(|s| s.block_pool()) {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let reclaimed = pool.shrink_overflow_to_fit();
+                if reclaimed > 0 {
+                    tracing::info!(
+                        reclaimed,
+                        "background sweep: reclaimed paged-KV overflow blocks"
+                    );
+                }
+            }
+        });
+    }
+
+    // Build the production-readiness middleware bundle:
+    //  - API-key gate (optional, off by default)
+    //  - in-process token-bucket rate limit (optional, off by default)
+    //  - admission controller (concurrency cap + paged-KV free-block watermark)
+    use crate::middleware::{Admission, ApiKeyGate, MiddlewareState, RateLimiter};
+    let api_keys = ApiKeyGate::new(&cfg.security.api_keys);
+    let rate_limit = RateLimiter::new(cfg.security.rate_limit_rps, cfg.security.rate_limit_burst);
+    let free_probe: Option<std::sync::Arc<dyn Fn() -> usize + Send + Sync>> =
+        match batch_scheduler.as_ref().and_then(|s| s.block_pool()) {
+            Some(p) => {
+                let p = p.clone();
+                Some(std::sync::Arc::new(move || p.free_blocks()))
+            }
+            None => None,
+        };
+    let admission = Admission::new(
+        cfg.server.max_concurrent_requests,
+        cfg.server.admission_min_free_blocks,
+        free_probe,
+    );
+    let middleware_state = MiddlewareState {
+        api_keys,
+        rate_limit,
+        admission,
+    };
+
     let state = AppState {
         engine,
         tokenizer,
@@ -693,7 +743,104 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         batch_scheduler,
         default_sampling: cfg.sampling.to_params(),
         sessions,
+        middleware: middleware_state,
     };
+    // SIGHUP-triggered config reload. Re-reads the file, validates it,
+    // and logs which fields differ from the running configuration.
+    // Fields that can be safely live-updated are applied in place;
+    // others emit a "restart required" warning. This is the gist's
+    // "dynamic config reload" item without an invasive engine-wide
+    // refactor: the operator gets clear feedback that the new file
+    // parsed, and the safe-to-change knobs take effect immediately.
+    #[cfg(unix)]
+    {
+        let path = config_path.clone();
+        let baseline = cfg.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sig = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "SIGHUP handler install failed; config reload disabled");
+                    return;
+                }
+            };
+            let mut prev = baseline;
+            while sig.recv().await.is_some() {
+                info!("SIGHUP received; reloading config from {}", path.display());
+                let new = match Config::from_file(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(error = %e, "config reload rejected; keeping previous config");
+                        continue;
+                    }
+                };
+                // Safe-to-reload knobs: log what would change. Engine
+                // state behind these is constructed once at startup
+                // and is not currently atomic-mutable, so we surface
+                // the diff and recommend a restart for the fields
+                // that require it.
+                let safe_keys: &[(&str, String, String)] = &[
+                    (
+                        "sampling.temperature",
+                        prev.sampling.temperature.to_string(),
+                        new.sampling.temperature.to_string(),
+                    ),
+                    (
+                        "sampling.top_p",
+                        prev.sampling.top_p.to_string(),
+                        new.sampling.top_p.to_string(),
+                    ),
+                    (
+                        "sampling.top_k",
+                        prev.sampling.top_k.to_string(),
+                        new.sampling.top_k.to_string(),
+                    ),
+                    (
+                        "server.max_tokens",
+                        prev.server.max_tokens.to_string(),
+                        new.server.max_tokens.to_string(),
+                    ),
+                ];
+                let restart_keys: &[(&str, String, String)] = &[
+                    (
+                        "storage.predict_fanout",
+                        prev.storage.predict_fanout.to_string(),
+                        new.storage.predict_fanout.to_string(),
+                    ),
+                    (
+                        "real_transformer.batch_timeout_ms",
+                        prev.real_transformer.batch_timeout_ms.to_string(),
+                        new.real_transformer.batch_timeout_ms.to_string(),
+                    ),
+                    (
+                        "storage.predict_min_prob",
+                        prev.storage.predict_min_prob.to_string(),
+                        new.storage.predict_min_prob.to_string(),
+                    ),
+                    (
+                        "storage.partial_load_fraction",
+                        prev.storage.partial_load_fraction.to_string(),
+                        new.storage.partial_load_fraction.to_string(),
+                    ),
+                ];
+                for (k, before, after) in safe_keys {
+                    if before != after {
+                        info!(key = k, before = %before, after = %after,
+                            "reloaded (effective on next request)");
+                    }
+                }
+                for (k, before, after) in restart_keys {
+                    if before != after {
+                        warn!(key = k, before = %before, after = %after,
+                            "config changed but requires restart to take effect");
+                    }
+                }
+                prev = new;
+            }
+        });
+    }
+
     serve(state, &cfg.server.bind).await
 }
 

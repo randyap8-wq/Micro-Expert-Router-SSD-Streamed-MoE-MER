@@ -1,0 +1,79 @@
+# Default values for the micro-expert-router Helm chart.
+
+image:
+  repository: ghcr.io/example/micro-expert-router
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Pod-level replica count when HPA is disabled.
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: "2"
+    memory: "4Gi"
+  limits:
+    cpu: "8"
+    memory: "16Gi"
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Horizontal Pod Autoscaler driven by the engine's request-rate
+# metric. Disabled by default — turn on if you have prometheus-adapter
+# (or KEDA) wired up to surface `mer_requests_total` as a Kubernetes
+# custom metric.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 16
+  # Target requests-per-second per pod. With prometheus-adapter this
+  # is a `Pods` metric named `mer_requests_per_second`.
+  targetRequestsPerSecond: 50
+
+# Mount a PVC at /var/lib/mer for the synthetic / converted expert
+# files. NVMe is strongly recommended.
+persistence:
+  enabled: true
+  size: 50Gi
+  storageClass: "fast-nvme"
+  mountPath: /var/lib/mer
+
+# Pod Disruption Budget so rolling node maintenance never takes the
+# whole service offline.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Liveness + readiness probes (readiness uses the admin endpoint
+# documented in docs/production.md so degraded pods drain out of the
+# Service automatically).
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 10
+    periodSeconds: 10
+  readiness:
+    path: /v1/admin/health/experts
+    initialDelaySeconds: 15
+    periodSeconds: 15
+
+# Inline config — mounted as /etc/mer/config.toml.
+config: |
+  [server]
+  bind = "0.0.0.0:8080"
+  max_tokens = 1024
+  max_concurrent_requests = 64
+  admission_min_free_blocks = 8
+  session_ttl_secs = 600
+
+  [security]
+  api_keys = []
+  rate_limit_rps = 0
+  rate_limit_burst = 0
+
+  [model]
+  data_dir = "/var/lib/mer/experts"
+  num_experts = 8
+  num_layers = 4

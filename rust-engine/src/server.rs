@@ -28,6 +28,9 @@
 use crate::batch_scheduler::BatchScheduler;
 use crate::engine::Engine;
 use crate::metrics::Metrics;
+use crate::middleware::{
+    admission_layer, api_key_layer, rate_limit_layer, request_id_layer, MiddlewareState,
+};
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;
 use crate::session::{SessionState, SessionStore};
@@ -77,16 +80,37 @@ pub struct AppState {
     /// Optional session store for KV-cache persistence between
     /// requests. `None` when `server.session_ttl_secs == 0`.
     pub sessions: Option<SessionStore>,
+    /// Production-readiness middleware bundle: API-key gate, in-process
+    /// rate limit, and admission controller. All three are no-ops
+    /// when not configured, so this is safe to construct
+    /// unconditionally.
+    pub middleware: MiddlewareState,
 }
 
 /// Build the axum [`Router`] for the API.
 pub fn build_router(state: AppState) -> Router {
+    let mw_state = state.middleware.clone();
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/sessions/:id", delete(delete_session))
+        .route("/v1/admin/health/experts", get(admin_health_experts))
+        .route("/v1/admin/evict", post(admin_evict_overflow))
+        .layer(axum::middleware::from_fn_with_state(
+            mw_state.clone(),
+            admission_layer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            mw_state.clone(),
+            rate_limit_layer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            mw_state,
+            api_key_layer,
+        ))
+        .layer(axum::middleware::from_fn(request_id_layer))
         .with_state(state)
 }
 
@@ -640,6 +664,92 @@ async fn delete_session(
     }
 }
 
+// ---------------------------- /v1/admin/* ----------------------------
+
+#[derive(Serialize, Debug)]
+struct ExpertHealth {
+    /// `"ok"` when no expert reads have failed since startup,
+    /// `"degraded"` when one or more failed (i.e. the engine has
+    /// served at least one request with a missing top-K expert).
+    status: &'static str,
+    expert_read_failures: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_pinned: usize,
+    cache_capacity: usize,
+    in_flight_requests: usize,
+    block_pool_free: Option<usize>,
+    block_pool_capacity: Option<usize>,
+    block_pool_overflow_in_use: Option<usize>,
+    tokens_generated: u64,
+}
+
+/// Lightweight production health probe that surfaces the engine's
+/// per-process counters in a format alerting systems can consume
+/// without scraping Prometheus.
+async fn admin_health_experts(State(state): State<AppState>) -> Response {
+    let report = state.engine.report();
+    let status = if report.expert_read_failures > 0 {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let (free, cap, overflow) = match state.batch_scheduler.as_ref().and_then(|s| s.block_pool()) {
+        Some(p) => (
+            Some(p.free_blocks()),
+            Some(p.capacity()),
+            Some(p.overflow_in_use()),
+        ),
+        None => (None, None, None),
+    };
+    let body = ExpertHealth {
+        status,
+        expert_read_failures: report.expert_read_failures,
+        cache_hits: report.hits,
+        cache_misses: report.misses,
+        cache_pinned: report.pinned_count,
+        cache_capacity: report.cache_capacity,
+        in_flight_requests: state.middleware.admission.in_flight(),
+        block_pool_free: free,
+        block_pool_capacity: cap,
+        block_pool_overflow_in_use: overflow,
+        tokens_generated: report.tokens_processed,
+    };
+    // Surface degraded health via HTTP status so naive uptime probes
+    // (HAProxy health checks, K8s liveness) light up without parsing
+    // the body.
+    let code = if status == "ok" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(body)).into_response()
+}
+
+#[derive(Serialize, Debug)]
+struct EvictResponse {
+    reclaimed_overflow_blocks: usize,
+}
+
+/// Admin endpoint: trigger a one-shot reclaim pass on the paged-KV
+/// pool's overflow slab. Useful for operators after a transient
+/// burst inflated the heap-backed fallback — calling this returns
+/// the memory to the allocator immediately rather than waiting for
+/// the periodic background sweep.
+async fn admin_evict_overflow(State(state): State<AppState>) -> Response {
+    let reclaimed = match state.batch_scheduler.as_ref().and_then(|s| s.block_pool()) {
+        Some(p) => p.shrink_overflow_to_fit(),
+        None => 0,
+    };
+    (
+        StatusCode::OK,
+        Json(EvictResponse {
+            reclaimed_overflow_blocks: reclaimed,
+        }),
+    )
+        .into_response()
+}
+
 // ----------------------- generation helpers --------------------------
 
 /// One streamed completion chunk. Mirrors OpenAI's `text_completion` SSE
@@ -1165,6 +1275,11 @@ mod tests {
             batch_scheduler: None,
             default_sampling: SamplingParams::greedy(),
             sessions: None,
+            middleware: MiddlewareState {
+                api_keys: crate::middleware::ApiKeyGate::default(),
+                rate_limit: crate::middleware::RateLimiter::new(0, 0),
+                admission: crate::middleware::Admission::new(0, 0, None),
+            },
         };
         (state, dir)
     }
@@ -1422,6 +1537,11 @@ mod tests {
             batch_scheduler: Some(scheduler),
             default_sampling: SamplingParams::greedy(),
             sessions: Some(crate::session::SessionStore::new(std::time::Duration::from_secs(60))),
+            middleware: MiddlewareState {
+                api_keys: crate::middleware::ApiKeyGate::default(),
+                rate_limit: crate::middleware::RateLimiter::new(0, 0),
+                admission: crate::middleware::Admission::new(0, 0, None),
+            },
         };
         (state, dir)
     }

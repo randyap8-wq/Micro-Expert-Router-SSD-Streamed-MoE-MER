@@ -34,7 +34,7 @@
 //! `Vec<KvCache>` in by-move) is preserved for callers that don't
 //! want to manage a registry handle directly; it internally
 //! `register`s, drives one step, then `release`s — at the cost of
-//! one short `Mutex<HashMap>` insert per token, which is negligible
+//! one short sharded-DashMap insert per token, which is negligible
 //! compared to the matmul cost of the step itself.
 //!
 //! ## Dynamic paged KV pool
@@ -55,8 +55,7 @@ use crate::block_pool::{BlockManager, BlockPool};
 use crate::engine::Engine;
 use crate::model::RealModel;
 use crate::transformer::KvCache;
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,31 +82,38 @@ pub struct RequestId(pub u64);
 /// wrapped in its own `Mutex` so the scheduler can mutate a single
 /// request's caches concurrently with other requests in the same
 /// batch without holding the top-level registry lock.
+///
+/// Backed by a [`dashmap::DashMap`] (sharded, lock-free reads) so
+/// per-token `get` calls from concurrent scheduler tasks never
+/// serialise on a single global mutex. This addresses the registry
+/// scalability item in the production-readiness gist: with 100+
+/// concurrent requests the old `Mutex<HashMap>` was a measurable hot
+/// spot.
 #[derive(Default)]
 struct RequestRegistry {
     next: AtomicU64,
     /// `Arc<tokio::sync::Mutex<…>>` so the scheduler loop can hold a
     /// per-request lock across the `.await` inside `model.step()`
     /// while other requests in the same batch proceed in parallel.
-    /// The outer `parking_lot::Mutex` on the table itself is held
-    /// only for the (very short) insert / lookup / remove operations.
-    table: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<Vec<KvCache>>>>>,
+    /// The outer DashMap is sharded internally so insert / lookup /
+    /// remove operations on different request ids never contend.
+    table: DashMap<u64, Arc<tokio::sync::Mutex<Vec<KvCache>>>>,
 }
 
 impl RequestRegistry {
     fn register(&self, kv: Vec<KvCache>) -> RequestId {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(tokio::sync::Mutex::new(kv));
-        self.table.lock().insert(id, entry);
+        self.table.insert(id, entry);
         RequestId(id)
     }
 
     fn get(&self, id: RequestId) -> Option<Arc<tokio::sync::Mutex<Vec<KvCache>>>> {
-        self.table.lock().get(&id.0).cloned()
+        self.table.get(&id.0).map(|e| e.value().clone())
     }
 
     fn release(&self, id: RequestId) -> Option<Vec<KvCache>> {
-        let entry = self.table.lock().remove(&id.0)?;
+        let (_, entry) = self.table.remove(&id.0)?;
         match Arc::try_unwrap(entry) {
             Ok(m) => Some(m.into_inner()),
             Err(arc) => {
@@ -143,7 +149,7 @@ impl RequestRegistry {
     }
 
     fn len(&self) -> usize {
-        self.table.lock().len()
+        self.table.len()
     }
 }
 
@@ -499,6 +505,15 @@ async fn scheduler_loop(
                         .step(&engine, token_id, pos, &mut kv, &params)
                         .await
                 };
+                // Drop our Arc clone *before* signalling completion
+                // so the caller's subsequent `release(id)` sees the
+                // refcount drop to one and `try_unwrap` succeeds
+                // without falling through to the deferred-reclaim
+                // branch. Without this, a tight test sequence (and
+                // in rare cases a real client doing
+                // step_registered → release back-to-back) could race
+                // the spawned task's natural Arc drop at end-of-task.
+                drop(entry);
                 let _ = resp.send(Ok(StepResponse { next_token: next }));
             }));
         }

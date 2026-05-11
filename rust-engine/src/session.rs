@@ -115,9 +115,21 @@ impl SessionStore {
     }
 
     /// Remove `id` and report whether it existed. Used by the
-    /// `DELETE /v1/sessions/{id}` endpoint.
+    /// `DELETE /v1/sessions/{id}` endpoint. Before discarding the
+    /// entry, every KV-cache buffer is overwritten with zeros so the
+    /// (potentially sensitive) attention state cannot be read by a
+    /// later allocation that lands in the same memory. This is the
+    /// "memory zeroing" production-readiness ask.
     pub fn delete(&self, id: &str) -> bool {
-        self.inner.remove(id).is_some()
+        match self.inner.remove(id) {
+            Some((_, mut state)) => {
+                for cache in state.kv.iter_mut() {
+                    cache.zeroize();
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Evict entries idle for longer than the configured TTL. Returns

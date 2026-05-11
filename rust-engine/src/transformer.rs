@@ -192,6 +192,32 @@ impl KvCache {
         self.seq_len = 0;
     }
 
+    /// Overwrite every cached K/V byte with zero before discarding the
+    /// cache, then truncate the block tables. Called from the session
+    /// store's `DELETE /v1/sessions/{id}` handler so that a tenant's
+    /// (potentially sensitive) attention state cannot be read by a
+    /// subsequent allocation that lands in the same heap region.
+    ///
+    /// We force the writes through `std::hint::black_box` so the
+    /// optimiser cannot prove them dead and elide them — the stdlib
+    /// `Vec::fill` on a value that is dropped immediately afterwards
+    /// is, in principle, eligible for DSE.
+    pub fn zeroize(&mut self) {
+        for block in self.keys_blocks.iter_mut() {
+            block.fill(0.0);
+            // Round-trip through black_box so the compiler must
+            // materialise the stores above. `as_ptr` reads the
+            // (cleared) slice, which `black_box` then treats as an
+            // observable side effect.
+            let _ = std::hint::black_box(block.as_ptr());
+        }
+        for block in self.values_blocks.iter_mut() {
+            block.fill(0.0);
+            let _ = std::hint::black_box(block.as_ptr());
+        }
+        self.reset();
+    }
+
     /// Number of allocated blocks. Useful for telemetry — matches
     /// the vLLM `block_tables` length.
     pub fn num_blocks(&self) -> usize {

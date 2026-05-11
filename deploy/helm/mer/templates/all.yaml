@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mer
+  labels: { app: mer }
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: { app: mer }
+  template:
+    metadata:
+      labels: { app: mer }
+    spec:
+      containers:
+        - name: mer
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--config", "/etc/mer/config.toml"]
+          ports:
+            - containerPort: {{ .Values.service.port }}
+              name: http
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mer
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: mer-config
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: mer-data
+        {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mer-config
+data:
+  config.toml: |-
+{{ .Values.config | indent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mer
+spec:
+  type: {{ .Values.service.type }}
+  selector: { app: mer }
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+{{- if .Values.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mer-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+{{- end }}
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mer
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels: { app: mer }
+{{- end }}
+{{- if .Values.autoscaling.enabled }}
+---
+# HPA driven by a custom Pods metric exposed via prometheus-adapter
+# (or KEDA's PrometheusScaler). The metric name `mer_requests_per_second`
+# is the recommended adapter rule:
+#
+#   - seriesQuery: 'mer_requests_total{namespace!="",pod!=""}'
+#     resources: { overrides: { namespace: { resource: namespace }, pod: { resource: pod } } }
+#     name: { matches: "(.*)_total$", as: "${1}_per_second" }
+#     metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mer
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mer
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: mer_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "{{ .Values.autoscaling.targetRequestsPerSecond }}"
+{{- end }}
