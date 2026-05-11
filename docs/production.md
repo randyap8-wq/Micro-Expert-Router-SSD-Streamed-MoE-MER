@@ -27,7 +27,9 @@ net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 ```
 
-For NVMe specifically:
+For NVMe specifically (replace `nvme0n1` with your actual device name
+— check `lsblk -d -o NAME,ROTA,TYPE` to confirm which device the
+expert files live on):
 
 ```bash
 # `none` scheduler is preferred for NVMe; `mq-deadline` is also fine.

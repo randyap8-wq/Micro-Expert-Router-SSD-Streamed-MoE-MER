@@ -198,31 +198,23 @@ impl KvCache {
     /// (potentially sensitive) attention state cannot be read by a
     /// subsequent allocation that lands in the same heap region.
     ///
-    /// Note: the standard library does not guarantee the writes won't
-    /// be optimised out for a `Box<[f32]>` whose lifetime ends
-    /// immediately afterwards. We deliberately drop the boxes only
-    /// *after* the explicit fill so the compiler must materialise the
-    /// stores (the slice is observably read by `len()` etc. below).
+    /// We force the writes through `std::hint::black_box` so the
+    /// optimiser cannot prove them dead and elide them — the stdlib
+    /// `Vec::fill` on a value that is dropped immediately afterwards
+    /// is, in principle, eligible for DSE.
     pub fn zeroize(&mut self) {
         for block in self.keys_blocks.iter_mut() {
             block.fill(0.0);
+            // Round-trip through black_box so the compiler must
+            // materialise the stores above. `as_ptr` reads the
+            // (cleared) slice, which `black_box` then treats as an
+            // observable side effect.
+            let _ = std::hint::black_box(block.as_ptr());
         }
         for block in self.values_blocks.iter_mut() {
             block.fill(0.0);
+            let _ = std::hint::black_box(block.as_ptr());
         }
-        // Touch a derived value of the buffer contents so the optimiser
-        // cannot prove the stores above are dead — using `len()` is
-        // enough because LLVM treats the slice as escaped here.
-        let _ = self
-            .keys_blocks
-            .iter()
-            .map(|b| b.len())
-            .sum::<usize>();
-        let _ = self
-            .values_blocks
-            .iter()
-            .map(|b| b.len())
-            .sum::<usize>();
         self.reset();
     }
 
