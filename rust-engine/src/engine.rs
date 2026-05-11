@@ -2129,4 +2129,58 @@ mod tests {
             "expected non-zero ssd stall; got {tele:?}"
         );
     }
+
+    /// End-to-end smoke test (the gist's "e2e integration test"
+    /// production-readiness item). Builds the full SSD-streamed
+    /// expert pipeline against synthetic weights, runs N tokens
+    /// through `Engine::generate`, and checks the deterministic
+    /// conservation laws that any healthy run must satisfy:
+    ///
+    ///   * total expert fetches = `top_k * num_tokens` (no router
+    ///     drop or double-fetch)
+    ///   * prefetch hits never exceed total fetches
+    ///   * no expert read failures on synthetic data
+    ///
+    /// We deliberately do **not** hash per-token `hits` vs `misses` —
+    /// that ratio depends on background-prefetcher timing relative
+    /// to the synchronous fetch loop and is non-deterministic by
+    /// design. For decoded-token-stream determinism see
+    /// `batch_scheduler::tests::step_registered_matches_direct_step`,
+    /// which exercises the real `RealModel.step` path.
+    ///
+    /// Marked `#[ignore]` so it doesn't run in the default `cargo
+    /// test` invocation. Invoke with
+    /// `cargo test --release -- --ignored e2e` to exercise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "e2e — run with `cargo test --release -- --ignored e2e`"]
+    async fn e2e_engine_runs_a_full_token_stream() {
+        let dir = TempDir::new("e2e");
+        const TOP_K: usize = 2;
+        const N: u64 = 32;
+        let engine = build_engine(
+            &dir.path, /*num_experts=*/ 8, /*d_model=*/ 16,
+            /*d_ff=*/ 32, /*cache_slots=*/ 4, TOP_K,
+            /*predict_fanout=*/ 2, /*seed=*/ 0xE2E5EED1,
+        );
+        let mut total_fetches: u64 = 0;
+        let mut total_prefetch: u64 = 0;
+        for t in 0..N {
+            let s = engine.generate(t).await;
+            let per_token = s.hits + s.misses;
+            assert_eq!(
+                per_token, TOP_K as u64,
+                "token {t}: expected {TOP_K} fetches, got {per_token} ({s:?})"
+            );
+            total_fetches += per_token;
+            total_prefetch += s.prefetch_hits;
+        }
+        assert_eq!(total_fetches, N * TOP_K as u64);
+        assert!(
+            total_prefetch <= total_fetches,
+            "prefetch hits ({total_prefetch}) cannot exceed total fetches ({total_fetches})",
+        );
+        let report = engine.report();
+        assert_eq!(report.hits + report.misses, total_fetches);
+        assert_eq!(report.expert_read_failures, 0);
+    }
 }
