@@ -2239,4 +2239,94 @@ mod tests {
         let res = OwnedExpertWeights::from_bytes_q4_0(&bytes, d_model, d_ff);
         assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
     }
+
+    /// Scalar reference for `gate_up_swiglu`, deliberately independent
+    /// of the feature-gated SIMD / BLAS paths so the comparison
+    /// remains meaningful when those features are enabled.
+    fn gate_up_swiglu_reference(
+        gate: &[f32],
+        up: &[f32],
+        x: &[f32],
+        gated: &mut [f32],
+        d_model: usize,
+    ) {
+        let d_ff = gated.len();
+        for i in 0..d_ff {
+            let g_row = &gate[i * d_model..(i + 1) * d_model];
+            let u_row = &up[i * d_model..(i + 1) * d_model];
+            let mut g = 0.0f32;
+            let mut u = 0.0f32;
+            for j in 0..d_model {
+                g += g_row[j] * x[j];
+                u += u_row[j] * x[j];
+            }
+            gated[i] = silu(g) * u;
+        }
+    }
+
+    /// The BLAS branch of `gate_up_swiglu` writes `g` directly into the
+    /// caller's `gated` slot and uses a thread-local scratch buffer
+    /// for `u`. This test, gated on the `blas` cargo feature, asserts
+    /// that:
+    ///   1. Outputs match the scalar reference within f32 tolerance
+    ///      (i.e. the in-place rewrite of `gated[i] = silu(gated[i]) * u[i]`
+    ///      is correct).
+    ///   2. The thread-local scratch is reused correctly across
+    ///      successive calls, including a call that grows `d_ff`
+    ///      (which forces a `resize`) followed by a call that shrinks
+    ///      it back (which must still produce correct results from the
+    ///      first `d_ff` elements of the now-larger scratch).
+    #[cfg(feature = "blas")]
+    #[test]
+    fn gate_up_swiglu_blas_matches_scalar_reference_and_reuses_scratch() {
+        // Deterministic small weights / inputs.
+        fn fill_deterministic(buf: &mut [f32], seed: u64) {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for v in buf.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                // Map to small range so silu * x stays well-behaved.
+                *v = ((s as i32 as f32) / i32::MAX as f32) * 0.1;
+            }
+        }
+
+        let cases = [
+            (8usize, 16usize),   // small
+            (8, 32),             // grow scratch (d_ff bigger than first call)
+            (8, 16),             // shrink back — scratch len stays >= d_ff
+            (4, 4),              // tiny, exercises d_ff == d_model
+        ];
+
+        for (idx, &(d_model, d_ff)) in cases.iter().enumerate() {
+            let mut gate = vec![0.0f32; d_ff * d_model];
+            let mut up = vec![0.0f32; d_ff * d_model];
+            let mut x = vec![0.0f32; d_model];
+            fill_deterministic(&mut gate, 1 + idx as u64);
+            fill_deterministic(&mut up, 1001 + idx as u64);
+            fill_deterministic(&mut x, 2003 + idx as u64);
+
+            let mut out_blas = vec![0.0f32; d_ff];
+            gate_up_swiglu(&gate, &up, &x, &mut out_blas, d_model);
+
+            let mut out_ref = vec![0.0f32; d_ff];
+            gate_up_swiglu_reference(&gate, &up, &x, &mut out_ref, d_model);
+
+            assert_eq!(out_blas.len(), out_ref.len());
+            for i in 0..d_ff {
+                assert!(
+                    out_blas[i].is_finite() && out_ref[i].is_finite(),
+                    "non-finite output at case {idx}, index {i}"
+                );
+                let diff = (out_blas[i] - out_ref[i]).abs();
+                let tol = 1e-4 * out_ref[i].abs().max(1.0);
+                assert!(
+                    diff <= tol,
+                    "blas vs scalar mismatch at case {idx}, idx {i}: \
+                     blas={} ref={} diff={diff} tol={tol}",
+                    out_blas[i], out_ref[i]
+                );
+            }
+        }
+    }
 }

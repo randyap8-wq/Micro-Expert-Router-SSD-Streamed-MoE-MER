@@ -243,9 +243,17 @@ fn zeroize_blocks(blocks: &mut [Box<[f32]>]) {
     for block in blocks.iter_mut() {
         let ptr = block.as_mut_ptr();
         let len = block.len();
-        // Safety: `ptr` is the start of a `Vec<f32>` of length `len`,
-        // every offset 0..len is in-bounds, properly aligned, and
-        // exclusively borrowed via `&mut block`.
+        // Safety: `block` is a `Box<[f32]>` (boxed slice) of length
+        // `len`. If `len == 0`, the loop below executes zero times,
+        // so `ptr` is never dereferenced; this remains valid even if
+        // an empty boxed slice uses a dangling but properly aligned
+        // non-null pointer and performs no allocation. If `len > 0`,
+        // `ptr` points to the start of the slice's contiguous
+        // storage, so every offset `0..len` is in-bounds and
+        // properly aligned for `f32`. The slice is uniquely borrowed
+        // via `&mut block`, so no other thread or reference can
+        // observe or mutate these bytes for the duration of the
+        // loop.
         for i in 0..len {
             unsafe { std::ptr::write_volatile(ptr.add(i), 0.0f32) };
         }
@@ -1029,5 +1037,33 @@ mod tests {
         assert_eq!(kv.seq_len, xs.len());
         assert_eq!(kv.num_blocks(), 2);
         assert!(last.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn zeroize_blocks_clears_every_element() {
+        // Mix block sizes (including empty and non-power-of-two
+        // lengths) to exercise the inner `for i in 0..len` loop's
+        // bounds and the iteration over multiple blocks.
+        let mut blocks: Vec<Box<[f32]>> = vec![
+            vec![1.0f32; 16].into_boxed_slice(),
+            vec![-2.5f32; 7].into_boxed_slice(),
+            vec![f32::INFINITY; 1].into_boxed_slice(),
+            Vec::<f32>::new().into_boxed_slice(),
+            vec![3.14f32; 33].into_boxed_slice(),
+        ];
+        // Sanity: at least one non-zero element exists before zeroising.
+        assert!(blocks.iter().any(|b| b.iter().any(|&v| v != 0.0)));
+
+        zeroize_blocks(&mut blocks);
+
+        for (i, b) in blocks.iter().enumerate() {
+            for (j, &v) in b.iter().enumerate() {
+                assert_eq!(
+                    v.to_bits(),
+                    0.0f32.to_bits(),
+                    "block {i} element {j} not zeroised: {v}"
+                );
+            }
+        }
     }
 }

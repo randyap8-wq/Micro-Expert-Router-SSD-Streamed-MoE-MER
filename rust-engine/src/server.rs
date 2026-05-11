@@ -1374,6 +1374,85 @@ mod tests {
         assert!(s.contains("mer_tokens_generated_total"));
     }
 
+    /// When `MiddlewareState.api_keys` is configured (non-empty), the
+    /// router must continue to expose `/health` and `/metrics` without
+    /// any authentication so Kubernetes liveness/readiness probes and
+    /// Prometheus scrapers keep working, while every `/v1/...` route
+    /// is gated behind the API-key check and returns
+    /// `401 Unauthorized` when no valid key is presented.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_endpoints_bypass_api_key_gate_while_protected_routes_require_it() {
+        let (mut state, _tmp) = make_state().await;
+        // Enable the API-key gate with a single key the test will
+        // (deliberately) not present on the protected request.
+        state.middleware.api_keys =
+            crate::middleware::ApiKeyGate::new(&["sekret".to_string()]);
+        let app = build_router(state);
+
+        // /health: no auth header, must succeed.
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/health must be reachable without an API key"
+        );
+
+        // /metrics: no auth header, must succeed.
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/metrics must be reachable without an API key"
+        );
+
+        // Protected /v1/... route without a key → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"prompt\":\"hi\",\"max_tokens\":1}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/v1/completions must reject requests without a valid API key"
+        );
+
+        // And with the correct key the protected route is reachable
+        // again (sanity-check that the gate isn't simply broken).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer sekret")
+                    .body(Body::from("{\"prompt\":\"hi\",\"max_tokens\":1}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/v1/completions must succeed when a valid API key is presented"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn empty_prompt_returns_400() {
         let (state, _tmp) = make_state().await;
