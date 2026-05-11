@@ -1631,7 +1631,8 @@ mod tests {
                 expert_size,
                 block_align,
                 // tmpfs / overlayfs (typical for CI) doesn't support O_DIRECT.
-                use_direct_io: false, num_experts_per_layer: None,
+                use_direct_io: false,
+                num_experts_per_layer: None,
             })
             .expect("storage init"),
         );

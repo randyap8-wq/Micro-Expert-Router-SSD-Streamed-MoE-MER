@@ -828,7 +828,8 @@ mod tests {
                 base_path: d0.clone(),
                 expert_size,
                 block_align: block,
-                use_direct_io: false, num_experts_per_layer: None,
+                use_direct_io: false,
+                num_experts_per_layer: None,
             },
             vec![d0.clone(), d1.clone()],
         )
@@ -864,7 +865,8 @@ mod tests {
             base_path: dir.clone(),
             expert_size,
             block_align: block,
-            use_direct_io: false, num_experts_per_layer: None,
+            use_direct_io: false,
+                num_experts_per_layer: None,
         })
         .unwrap();
 

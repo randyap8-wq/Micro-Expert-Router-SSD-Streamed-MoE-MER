@@ -554,7 +554,8 @@ mod tests {
                 base_path: dir.path.clone(),
                 expert_size,
                 block_align: block,
-                use_direct_io: false, num_experts_per_layer: None,
+                use_direct_io: false,
+                num_experts_per_layer: None,
             })
             .unwrap(),
         );

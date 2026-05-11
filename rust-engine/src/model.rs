@@ -723,7 +723,8 @@ mod tests {
                 base_path: dir.to_path_buf(),
                 expert_size,
                 block_align: block,
-                use_direct_io: false, num_experts_per_layer: None,
+                use_direct_io: false,
+                num_experts_per_layer: None,
             })
             .expect("storage"),
         );
