@@ -334,6 +334,11 @@ impl Engine {
     /// speculator's prediction with the predictor's Markov chain hint
     /// when issuing speculative prefetches.
     pub fn with_speculator(mut self, spec: Arc<NeuralSpeculator>, top_k: usize) -> Self {
+        // Spawn the off-path training worker (idempotent: no-op if
+        // already running). Background SGD updates then flow through
+        // `NeuralSpeculator::queue_train` without blocking the
+        // engine's per-token critical path.
+        spec.spawn_training_worker();
         self.speculator = Some(spec);
         self.speculator_topk = top_k.max(1);
         self
@@ -808,8 +813,13 @@ impl Engine {
             m.record_speculator(hits, misses);
             m.record_speculator_top1(top1_match);
         }
-        // Online SGD step against the *actual* gate decision.
-        let _loss = spec.train_step(x, target, NeuralSpeculator::DEFAULT_LR);
+        // Off-path SGD: queue the (hidden_state, actual_top_k)
+        // sample to the speculator's background training worker
+        // instead of running the update inline. This keeps the
+        // per-token engine step free of model-weight write locks;
+        // see `NeuralSpeculator::spawn_training_worker` for the
+        // worker's reader-preferring lock policy.
+        spec.queue_train(x, target, NeuralSpeculator::DEFAULT_LR);
         preds
     }
 

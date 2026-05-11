@@ -784,6 +784,17 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
+            // Best-effort: detect which NUMA node the data dir's
+            // backing block device sits on, and ask the io_uring
+            // backend to pin its constructing thread there. The
+            // detection function is a no-op on systems where the
+            // sysfs entries are missing — it just leaves
+            // `numa_node = None` and `IoUringStorage::new` skips
+            // pinning entirely.
+            let numa_node = detect_data_dir_numa_node(&args.data_dir);
+            if let Some(n) = numa_node {
+                info!(numa_node = n, "detected NUMA node for data dir; will pin io_uring");
+            }
             // Build the backend from the same pool we'll hand the
             // engine; the registration happens inside ::new(). We log
             // the result and then continue with the portable backend
@@ -804,6 +815,7 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                     expert_size: args.expert_size,
                     block_align: args.block_align,
                     queue_depth: 64,
+                    numa_node,
                 },
                 &probe_pool,
             ) {
@@ -1334,6 +1346,42 @@ fn read_local_node_cpus() -> Option<Vec<usize>> {
         }
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// Detect the NUMA node of the block device backing `data_dir`.
+///
+/// Returns `Some(node)` when both probes succeed:
+///   1. `stat(2)` on `data_dir` yields a device id whose major/minor
+///      we map to `/sys/dev/block/MAJ:MIN/device/numa_node`.
+///   2. The contents of that sysfs entry parse to a non-negative integer.
+///
+/// Any failure (non-Linux build, sysfs entry missing, NUMA disabled in
+/// the kernel which reports `-1`, permission errors) returns `None`
+/// and lets the caller continue without NUMA pinning. This is a
+/// *hint*; it must never block startup.
+pub fn detect_data_dir_numa_node(data_dir: &std::path::Path) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(data_dir).ok()?;
+        // st_dev is encoded as major:minor; major = (dev >> 8) & 0xfff
+        // for the legacy layout but Linux uses a more flexible
+        // encoding. libc::major()/minor() handle both.
+        let dev = md.dev();
+        // SAFETY: makedev / major / minor are pure macros; we use libc.
+        let major = unsafe { libc::major(dev) } as u32;
+        let minor = unsafe { libc::minor(dev) } as u32;
+        let sys_path = format!("/sys/dev/block/{}:{}/device/numa_node", major, minor);
+        let body = std::fs::read_to_string(&sys_path).ok()?;
+        let node: i32 = body.trim().parse().ok()?;
+        // Kernel reports `-1` when NUMA is disabled or unknown.
+        if node < 0 { None } else { Some(node) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = data_dir;
+        None
+    }
 }
 
 #[cfg(test)]

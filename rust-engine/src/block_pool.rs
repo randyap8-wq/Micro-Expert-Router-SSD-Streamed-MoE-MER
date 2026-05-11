@@ -46,9 +46,27 @@ use parking_lot::Mutex;
 /// block contained on a single MMU page boundary.
 pub const POOL_BLOCK_TOKENS: usize = 16;
 
+/// High bit of [`BlockId`] reserved to distinguish the **primary**
+/// pre-allocated slab (bit clear) from the **overflow** heap-backed
+/// slab (bit set). Sentinel placed at `1 << 31` so the low 31 bits
+/// remain a normal block index up to ~2 G blocks — far beyond any
+/// realistic deployment.
+///
+/// Callers should treat [`BlockId`] as opaque; this constant exists so
+/// the pool's allocator and reader paths can route to the correct
+/// slab without an additional lookup.
+pub(crate) const OVERFLOW_BIT: u32 = 1 << 31;
+
 /// Opaque handle to one physical block in a [`BlockPool`]. The pool's
 /// free list stores these as raw `u32`s to keep the per-request block
 /// table compact (`Vec<u32>` rather than `Vec<usize>`).
+///
+/// The high bit ([`OVERFLOW_BIT`]) discriminates between blocks in
+/// the primary pre-allocated slab (bit clear) and the heap-backed
+/// overflow slab (bit set) that grows on demand when the primary is
+/// exhausted. Within each slab the low 31 bits are a 0-based block
+/// index. Use [`BlockId::is_overflow`] and [`BlockId::index`] when
+/// you need to introspect the discriminator.
 ///
 /// Note: `BlockId` is *not* a `Drop` type — leaking one is harmless
 /// (the pool just permanently loses a slot) but the per-request
@@ -57,8 +75,24 @@ pub const POOL_BLOCK_TOKENS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u32);
 
+impl BlockId {
+    /// `true` if this id refers to the heap-backed overflow slab.
+    #[inline]
+    pub fn is_overflow(self) -> bool {
+        (self.0 & OVERFLOW_BIT) != 0
+    }
+
+    /// Slab-local block index (high bit masked off).
+    #[inline]
+    pub fn index(self) -> usize {
+        (self.0 & !OVERFLOW_BIT) as usize
+    }
+}
+
 /// A shared **physical** block pool: one big f32 slab carved into
-/// fixed-size blocks plus a free list of unused block ids.
+/// fixed-size blocks plus a free list of unused block ids, optionally
+/// backed by a secondary **overflow** slab that grows on demand when
+/// the primary slab is exhausted.
 ///
 /// Every block holds `POOL_BLOCK_TOKENS * kv_dim` floats. The pool
 /// also owns a parallel "values" half — a single block id therefore
@@ -67,12 +101,26 @@ pub struct BlockId(pub u32);
 /// stride together), so we never want to allocate keys and values
 /// separately.
 ///
+/// ## Dynamic scaling
+///
+/// The primary slab is pre-allocated to `capacity` blocks at
+/// construction time and never re-allocated; allocation from it is
+/// O(1) (a single free-list pop) and the working set stays
+/// block-aligned in DRAM. When that slab is empty, the pool falls
+/// back to a heap-backed overflow slab: each overflow allocation
+/// extends two parallel `Vec<f32>`s (keys + values) by one block's
+/// worth of floats and returns a [`BlockId`] with the
+/// [`OVERFLOW_BIT`] flag set. Releases from the overflow slab go to
+/// its own LIFO free list so the bytes are reused before any further
+/// growth — i.e. the overflow slab acts as a high-water-mark cache,
+/// not a leak. The scheduler can detect overflow with
+/// [`Self::overflow_in_use`] and log / throttle accordingly.
+///
 /// The pool is `Sync` and is intended to be wrapped in `Arc`. Free
 /// list mutations take a short `parking_lot::Mutex`, and the backing
-/// key/value slabs are also protected by `Mutex<Vec<f32>>`. The slab
-/// storage is fixed at construction time and never re-allocated, but
-/// reads and writes still synchronize through those mutexes in the
-/// current implementation.
+/// key/value slabs are also protected by `Mutex<Vec<f32>>`. Overflow
+/// growth happens under those same mutexes so reads observing a
+/// freshly-allocated overflow block see initialised zeros.
 pub struct BlockPool {
     kv_dim: usize,
     capacity: usize,
@@ -87,6 +135,19 @@ pub struct BlockPool {
     /// LIFO free list of block ids currently available for
     /// allocation. Pre-populated with `0..capacity` at construction.
     free: Mutex<Vec<u32>>,
+    /// Heap-backed overflow slab — grown on demand when [`Self::free`]
+    /// is empty. The two `Vec`s grow in lock-step (always
+    /// `overflow_capacity * block_floats` floats long); the free list
+    /// holds slab-local block indices (no [`OVERFLOW_BIT`] flag —
+    /// that's applied when constructing the public [`BlockId`]).
+    overflow_keys: Mutex<Vec<f32>>,
+    overflow_values: Mutex<Vec<f32>>,
+    overflow_free: Mutex<Vec<u32>>,
+    /// Monotonically tracks the high-water mark of the overflow slab
+    /// (= the number of distinct blocks ever materialised). The
+    /// **in-use** count is `overflow_capacity - overflow_free.len()`,
+    /// exposed via [`Self::overflow_in_use`].
+    overflow_capacity: Mutex<usize>,
 }
 
 impl std::fmt::Debug for BlockPool {
@@ -96,6 +157,8 @@ impl std::fmt::Debug for BlockPool {
             .field("capacity", &self.capacity)
             .field("block_floats", &self.block_floats)
             .field("free_blocks", &self.free.lock().len())
+            .field("overflow_capacity", &*self.overflow_capacity.lock())
+            .field("overflow_free", &self.overflow_free.lock().len())
             .finish()
     }
 }
@@ -104,7 +167,9 @@ impl BlockPool {
     /// Build a pool that can hold up to `capacity` blocks of
     /// `POOL_BLOCK_TOKENS * kv_dim` floats each (× 2 for keys+values).
     /// Both slabs are pre-allocated and zeroed up front; allocation
-    /// during the per-token hot path never grows them.
+    /// from the primary slab during the per-token hot path never
+    /// grows them. The overflow slab starts empty and is only
+    /// materialised on demand.
     pub fn new(kv_dim: usize, capacity: usize) -> Arc<Self> {
         assert!(kv_dim > 0, "BlockPool kv_dim must be > 0");
         let block_floats = POOL_BLOCK_TOKENS * kv_dim;
@@ -114,6 +179,12 @@ impl BlockPool {
         // Free list initialised in *reverse* so allocation hands out
         // ids 0, 1, 2, … in order — easier to reason about in tests.
         let free: Vec<u32> = (0..capacity as u32).rev().collect();
+        // Sanity-check: primary capacity must fit in 31 bits so the
+        // overflow discriminator (`OVERFLOW_BIT`) is always reserved.
+        assert!(
+            (capacity as u32) <= !OVERFLOW_BIT,
+            "BlockPool primary capacity exceeds 31-bit BlockId space"
+        );
         Arc::new(Self {
             kv_dim,
             capacity,
@@ -121,14 +192,54 @@ impl BlockPool {
             keys: Mutex::new(keys),
             values: Mutex::new(values),
             free: Mutex::new(free),
+            overflow_keys: Mutex::new(Vec::new()),
+            overflow_values: Mutex::new(Vec::new()),
+            overflow_free: Mutex::new(Vec::new()),
+            overflow_capacity: Mutex::new(0),
         })
     }
 
-    /// Pop one block id from the free list. Returns `None` if the
-    /// pool is exhausted (the scheduler typically responds by
-    /// queuing the request or aborting it).
+    /// Pop one block id from the free list. Allocation is always
+    /// O(1): first the primary slab's free list, then the overflow
+    /// slab's free list, and finally a fresh overflow extension. This
+    /// method never returns `None` (allocation is infallible from the
+    /// pool's perspective); callers that want to refuse / queue
+    /// requests *before* hitting the heap-backed overflow should
+    /// consult [`Self::free_blocks`] first.
+    ///
+    /// The historical signature returns `Option<BlockId>` for source
+    /// compatibility, but `None` is now unreachable in the absence of
+    /// `OOM` from the global allocator (in which case the `Vec` grow
+    /// inside will itself panic before we ever return).
     pub fn allocate(&self) -> Option<BlockId> {
-        self.free.lock().pop().map(BlockId)
+        // Fast path: O(1) primary slab pop.
+        if let Some(idx) = self.free.lock().pop() {
+            return Some(BlockId(idx));
+        }
+        // Overflow path. First try the overflow slab's free list;
+        // only grow the underlying `Vec`s when there's no recycled
+        // slot waiting.
+        if let Some(idx) = self.overflow_free.lock().pop() {
+            return Some(BlockId(idx | OVERFLOW_BIT));
+        }
+        // Grow by exactly one block. We hold the keys/values/capacity
+        // mutexes in a consistent order so two concurrent allocators
+        // can't observe a half-grown slab.
+        let mut keys = self.overflow_keys.lock();
+        let mut values = self.overflow_values.lock();
+        let mut cap = self.overflow_capacity.lock();
+        let new_idx = *cap as u32;
+        assert!(
+            (new_idx & OVERFLOW_BIT) == 0,
+            "overflow slab exceeded 31-bit BlockId space ({} blocks)",
+            *cap
+        );
+        let new_keys_len = keys.len() + self.block_floats;
+        let new_values_len = values.len() + self.block_floats;
+        keys.resize(new_keys_len, 0.0);
+        values.resize(new_values_len, 0.0);
+        *cap += 1;
+        Some(BlockId(new_idx | OVERFLOW_BIT))
     }
 
     /// Return one block id to the free list. The block's contents
@@ -136,23 +247,47 @@ impl BlockPool {
     /// the bytes it cares about via [`Self::write_token`], and reads
     /// past `seq_len` are guaranteed unreachable by callers.
     pub fn release(&self, id: BlockId) {
-        debug_assert!(
-            (id.0 as usize) < self.capacity,
-            "released block id {} >= capacity {}",
-            id.0,
-            self.capacity
-        );
-        self.free.lock().push(id.0);
+        if id.is_overflow() {
+            let idx = id.index();
+            debug_assert!(
+                idx < *self.overflow_capacity.lock(),
+                "released overflow block index {} >= overflow capacity",
+                idx
+            );
+            // Store the bare slab-local index; the OVERFLOW_BIT is
+            // re-applied on allocate().
+            self.overflow_free.lock().push(idx as u32);
+        } else {
+            debug_assert!(
+                (id.0 as usize) < self.capacity,
+                "released block id {} >= capacity {}",
+                id.0,
+                self.capacity
+            );
+            self.free.lock().push(id.0);
+        }
     }
 
-    /// Number of blocks currently free. Snapshot-only; the value can
-    /// race with concurrent allocators.
+    /// Number of blocks currently free **in the primary slab only**.
+    /// The overflow slab is conceptually unbounded (modulo system
+    /// memory), so it doesn't contribute to this count. Snapshot-only;
+    /// the value can race with concurrent allocators.
     pub fn free_blocks(&self) -> usize {
         self.free.lock().len()
     }
 
-    /// Total physical capacity, in blocks (constant for the pool's
-    /// lifetime).
+    /// Number of overflow blocks currently in use (i.e. allocated and
+    /// not yet released). `> 0` means the primary slab was at some
+    /// point exhausted and the pool is now servicing requests out of
+    /// the heap-backed fallback. Snapshot-only; can race.
+    pub fn overflow_in_use(&self) -> usize {
+        let cap = *self.overflow_capacity.lock();
+        cap.saturating_sub(self.overflow_free.lock().len())
+    }
+
+    /// Total physical capacity of the **primary** slab, in blocks
+    /// (constant for the pool's lifetime). The overflow slab is
+    /// reported separately by [`Self::overflow_in_use`].
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -165,24 +300,35 @@ impl BlockPool {
     /// Write the `(k, v)` pair for one token into block `id` at
     /// offset `in_block`. Panics on out-of-range indices, since the
     /// pool is the lowest layer and any out-of-range write is a bug
-    /// in the caller.
+    /// in the caller. Transparently routes primary vs. overflow
+    /// blocks based on [`BlockId::is_overflow`].
     pub fn write_token(&self, id: BlockId, in_block: usize, k: &[f32], v: &[f32]) {
         assert_eq!(k.len(), self.kv_dim, "k length must equal kv_dim");
         assert_eq!(v.len(), self.kv_dim, "v length must equal kv_dim");
         assert!(in_block < POOL_BLOCK_TOKENS, "in_block {} >= POOL_BLOCK_TOKENS", in_block);
-        let block_off = (id.0 as usize) * self.block_floats + in_block * self.kv_dim;
-        let mut keys = self.keys.lock();
-        keys[block_off..block_off + self.kv_dim].copy_from_slice(k);
-        drop(keys);
-        let mut values = self.values.lock();
-        values[block_off..block_off + self.kv_dim].copy_from_slice(v);
+        let idx = id.index();
+        let block_off = idx * self.block_floats + in_block * self.kv_dim;
+        if id.is_overflow() {
+            let mut keys = self.overflow_keys.lock();
+            keys[block_off..block_off + self.kv_dim].copy_from_slice(k);
+            drop(keys);
+            let mut values = self.overflow_values.lock();
+            values[block_off..block_off + self.kv_dim].copy_from_slice(v);
+        } else {
+            let mut keys = self.keys.lock();
+            keys[block_off..block_off + self.kv_dim].copy_from_slice(k);
+            drop(keys);
+            let mut values = self.values.lock();
+            values[block_off..block_off + self.kv_dim].copy_from_slice(v);
+        }
     }
 
     /// Read the cached key vector for one token slot. Returns an
     /// owned `Vec<f32>` (the pool slab is behind a `Mutex`, so we
     /// can't safely hand out a borrow into it). Hot-path attention
-    /// callers should use [`PooledKvCache::key_into`] which writes
-    /// into a caller-supplied buffer to avoid per-token allocations.
+    /// callers should use [`Self::read_key_into`] (or, at the
+    /// manager level, [`BlockManager::key_into`]) which writes into a
+    /// caller-supplied buffer to avoid per-token allocations.
     pub fn read_key(&self, id: BlockId, in_block: usize) -> Vec<f32> {
         let mut out = vec![0.0f32; self.kv_dim];
         self.read_key_into(id, in_block, &mut out);
@@ -202,18 +348,30 @@ impl BlockPool {
     pub fn read_key_into(&self, id: BlockId, in_block: usize, dst: &mut [f32]) {
         assert_eq!(dst.len(), self.kv_dim);
         assert!(in_block < POOL_BLOCK_TOKENS);
-        let block_off = (id.0 as usize) * self.block_floats + in_block * self.kv_dim;
-        let keys = self.keys.lock();
-        dst.copy_from_slice(&keys[block_off..block_off + self.kv_dim]);
+        let idx = id.index();
+        let block_off = idx * self.block_floats + in_block * self.kv_dim;
+        if id.is_overflow() {
+            let keys = self.overflow_keys.lock();
+            dst.copy_from_slice(&keys[block_off..block_off + self.kv_dim]);
+        } else {
+            let keys = self.keys.lock();
+            dst.copy_from_slice(&keys[block_off..block_off + self.kv_dim]);
+        }
     }
 
     /// Borrow-free value read.
     pub fn read_value_into(&self, id: BlockId, in_block: usize, dst: &mut [f32]) {
         assert_eq!(dst.len(), self.kv_dim);
         assert!(in_block < POOL_BLOCK_TOKENS);
-        let block_off = (id.0 as usize) * self.block_floats + in_block * self.kv_dim;
-        let values = self.values.lock();
-        dst.copy_from_slice(&values[block_off..block_off + self.kv_dim]);
+        let idx = id.index();
+        let block_off = idx * self.block_floats + in_block * self.kv_dim;
+        if id.is_overflow() {
+            let values = self.overflow_values.lock();
+            dst.copy_from_slice(&values[block_off..block_off + self.kv_dim]);
+        } else {
+            let values = self.values.lock();
+            dst.copy_from_slice(&values[block_off..block_off + self.kv_dim]);
+        }
     }
 }
 
@@ -245,8 +403,15 @@ impl BlockManager {
 
     /// Append one token's `(k, v)` to the cache. Allocates a fresh
     /// block from the pool whenever the trailing block fills up.
-    /// Returns `Err` (without partially mutating state) if the pool
-    /// is exhausted at a block boundary.
+    ///
+    /// With dynamic-scaling enabled, [`BlockPool::allocate`] is
+    /// effectively infallible (it falls back to a heap-backed
+    /// overflow slab when the primary slab is empty), so this method
+    /// only returns `Err(BlockAllocError::Exhausted)` if the global
+    /// allocator itself fails — in practice the `Vec` resize inside
+    /// `allocate` will panic first. The `Result` return is kept for
+    /// source-level back-compat with callers that distinguished the
+    /// exhausted case before overflow existed.
     pub fn append(&mut self, k: &[f32], v: &[f32]) -> Result<(), BlockAllocError> {
         let pos = self.seq_len;
         let block_idx = pos / POOL_BLOCK_TOKENS;
@@ -358,17 +523,26 @@ mod tests {
         let a = pool.allocate().unwrap();
         let b = pool.allocate().unwrap();
         let c = pool.allocate().unwrap();
-        assert!(pool.allocate().is_none(), "fourth allocate must exhaust");
+        // Primary slab is now empty; further allocations spill into
+        // the heap-backed overflow slab. They are still allocations,
+        // not `None` returns — the pool grows dynamically.
         assert_eq!(pool.free_blocks(), 0);
+        assert_eq!(pool.overflow_in_use(), 0);
+        let d = pool.allocate().unwrap();
+        assert!(d.is_overflow(), "fourth allocate must come from overflow slab");
+        assert_eq!(pool.overflow_in_use(), 1);
         // Distinct ids.
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
+        assert!(!a.is_overflow() && !b.is_overflow() && !c.is_overflow());
 
         pool.release(a);
         pool.release(b);
         pool.release(c);
+        pool.release(d);
         assert_eq!(pool.free_blocks(), 3);
+        assert_eq!(pool.overflow_in_use(), 0);
     }
 
     #[test]
@@ -414,21 +588,50 @@ mod tests {
     }
 
     #[test]
-    fn manager_exhaustion_returns_error() {
-        // capacity=1 → only one block (16 tokens) before exhaustion.
+    fn manager_overflow_succeeds_when_primary_exhausted() {
+        // capacity=1 → one primary block (16 tokens). Beyond that
+        // every additional block transparently comes from the
+        // heap-backed overflow slab — `append` keeps succeeding.
         let pool = BlockPool::new(2, 1);
         let mut m = BlockManager::new(pool.clone());
         for _ in 0..POOL_BLOCK_TOKENS {
             m.append(&[1.0, 1.0], &[1.0, 1.0]).unwrap();
         }
-        // 17th token needs a new block — pool is empty.
-        let err = m.append(&[1.0, 1.0], &[1.0, 1.0]);
-        assert_eq!(err, Err(BlockAllocError::Exhausted));
-        // seq_len did NOT advance on the failed append.
-        assert_eq!(m.seq_len(), POOL_BLOCK_TOKENS);
-        // No partial allocation either.
-        assert_eq!(m.num_blocks(), 1);
+        // Primary slab is now full.
         assert_eq!(pool.free_blocks(), 0);
+        assert_eq!(pool.overflow_in_use(), 0);
+        // 17th token needs a new block — pool falls back to overflow.
+        m.append(&[2.0, 2.0], &[2.0, 2.0]).unwrap();
+        assert_eq!(m.seq_len(), POOL_BLOCK_TOKENS + 1);
+        assert_eq!(m.num_blocks(), 2);
+        assert!(m.block_table()[1].is_overflow(), "second block must come from overflow slab");
+        assert_eq!(pool.overflow_in_use(), 1);
+        // The cached value round-trips through the overflow slab.
+        assert_eq!(m.key(POOL_BLOCK_TOKENS), vec![2.0, 2.0]);
+        assert_eq!(m.value(POOL_BLOCK_TOKENS), vec![2.0, 2.0]);
+        // Releasing returns the overflow block to its own free list.
+        drop(m);
+        assert_eq!(pool.overflow_in_use(), 0);
+        assert_eq!(pool.free_blocks(), 1);
+    }
+
+    #[test]
+    fn overflow_blocks_recycle_before_growing_slab() {
+        // Hammer the overflow path: every block past the primary
+        // slab's capacity comes from overflow, but a released
+        // overflow block must be re-handed out before the slab grows.
+        let pool = BlockPool::new(2, 1);
+        let _primary = pool.allocate().unwrap();
+        let o1 = pool.allocate().unwrap();
+        let o2 = pool.allocate().unwrap();
+        assert!(o1.is_overflow() && o2.is_overflow());
+        assert_eq!(pool.overflow_in_use(), 2);
+        pool.release(o1);
+        // Next overflow alloc should reuse o1's slot, not grow.
+        let o3 = pool.allocate().unwrap();
+        assert!(o3.is_overflow());
+        assert_eq!(o3, o1, "released overflow id should be recycled");
+        assert_eq!(pool.overflow_in_use(), 2);
     }
 
     #[test]
