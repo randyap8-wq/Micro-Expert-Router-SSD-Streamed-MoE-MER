@@ -35,77 +35,115 @@ all `N` experts you have two options:
    its own file, read it with `O_DIRECT` `pread(2)` (dispatched off the
    Tokio runtime via `block_in_place`) so the bytes go
    directly from the NVMe DMA engine into a page-aligned RAM buffer, and run
-   a custom LRU + speculative prefetcher driven by the router's own
-   activation history.
+   a custom LRU + a **three-signal predictive controller** that fuses a
+   2nd-order Markov chain, a sliding-window locality monitor, and a
+   small online-trained neural speculator into one speculative-I/O
+   fetch set.
 
 ### End-to-end pipeline
 
 ```
-        +-----------+     +-------------+     +-----------+     +------------------+
-token → |  Router   | →  | Expert IDs   | →  | LRU Cache | →  | SwiGLU FFN       |
-        |  (top-K)  |    |  e.g. [3,7]  |    +-----+-----+     | per expert,      |
-        +-----------+    +--------------+         | miss       | combine outputs  |
-                                                  ↓            +------------------+
-                                         +------------------+
-                                         | BufferPool slot  | ←───┐
-                                         |  (aligned, pre-  |     │
-                                         |   allocated)     |     │
-                                         +--------+---------+     │
-                                                  ↓               │
-                                         +------------------+     │ on Arc drop
-                                         |  pread(2) read   |     │ (LRU evict
-                                         |  O_DIRECT, no    |     │  or buffer
-                                         |  page cache      |     │  release)
-                                         +--------+---------+     │
-                                                  ↓               │
-                                         NVMe SSD → DMA → RAM ────┘
-                                                  ↓
-                                         bytes reinterpreted as
-                                         f32 weights → matmul
+        +------------+    +-------------+    +-----------+    +------------------+
+token → |   Router   | → | Expert IDs   | → | LRU Cache | → | SwiGLU FFN        |
+        | LinearGate |   |  e.g. [3,7]  |   +-----+-----+    | per expert,       |
+        |  or Markov |   +------+-------+         | miss     | gate-weighted sum |
+        +-----+------+          |                 ↓          +------------------+
+              │                 │        +------------------+
+              │ hidden state    │        | BufferPool slot  | ←─────┐
+              ↓                 │        |  (aligned, pre-  |       │
+   +------------------------+   │        |   allocated)     |       │
+   | Predictive controller  |   │        +--------+---------+       │
+   |   S = 2nd-order Markov |   │                 ↓                 │
+   |   L = LocalityMonitor  | → │        +------------------+       │ on Arc drop
+   |   M = NeuralSpeculator |   │        |  pread(2) read   |       │ (LRU evict
+   |   E = S ∪ L ∪ M        |   │        |  O_DIRECT + (opt)|       │  or buffer
+   +-----------+------------+   │        |  io_uring fixed  |       │  release)
+               │                │        +--------+---------+       │
+               ↓                ↓                 ↓                 │
+       non-evicting prefetches             NVMe SSD → DMA → RAM ────┘
+                                                   ↓
+                                          bytes reinterpreted as
+                                          f32 / f16 / int8 / Q4_K_M /
+                                          Q4_0 weights → matmul
 ```
 
-After every token the engine also updates a first-order **Markov model** of
-expert transitions and uses it to **speculatively prefetch** the most likely
-next experts on the side. The prefetch path is non-blocking and
-non-evicting — it never starves a real cache miss.
+After every token the engine updates **three predictors in parallel**:
 
-The router *itself* is also a deterministic first-order Markov chain over
-expert ids — not a random uniform top-K sampler. Synthetic runs use
-**clustered locality** (4 expert groups, 0.9 in-cluster transition
-probability) so the prefetcher has signal to learn from; real Mixtral
-routing traces can be loaded directly via `--router-matrix`. See the
-[Routing model](#routing-model--markov-chain-over-expert-ids) section.
+* **S — a sparse 2nd-order Markov model** over `(prev_prev, prev) → next`
+  (with a 1st-order fallback). Smoothed with a Laplace prior so cold
+  rows still return a valid distribution.
+* **L — a `LocalityMonitor`** keeping a sliding-window heat map of the
+  most recently activated experts. Hot experts are **pinned** in the
+  LRU cache for as long as their count stays above the threshold —
+  the LRU cannot evict them even if cold experts arrive in a flurry.
+* **M — a `NeuralSpeculator`**: a 2-layer MLP
+  (`d_model → hidden → num_experts`, ReLU + softmax) trained online by
+  SGD against the gate's actual top-K. Training is dispatched to an
+  **off-path background worker** through a bounded `mpsc` queue, so
+  the inference critical path never blocks on backprop.
+
+All three feed `PredictiveLoader::predict_unified`, which sums a
+weighted score per candidate id (Markov × 0.5, locality × 0.3,
+speculator × 0.4) and returns the top-fanout union `E = S ∪ L ∪ M` for
+speculative I/O. Prefetches use `try_acquire` only and **never evict
+a resident slot** — speculation can't starve real work.
+
+The **router** itself is either the legacy `TopKRouter`
+(deterministic Markov chain over expert ids — clustered locality by
+default, or load a precomputed `N×N` transition matrix via
+`--router-matrix`) or, when `[real_transformer].enabled = true`, the
+production `LinearGate` (`softmax(W_gate · x) → top-K`, the exact
+routing equation Mixtral / Llama-MoE uses). Both produce the same
+`RoutingDecision { experts, weights }` shape; the experts are still
+streamed from the SSD by the same cache regardless.
 
 ### What "running" actually does
 
 For each token, the engine:
 
-1. asks the **Markov-chain router** for K distinct expert ids (sampled from
-   `P(next | last_expert)` under the configured transition matrix —
-   either generated with cluster locality or loaded from a file);
+1. asks the **router** for K distinct expert ids — either
+   `softmax(W_gate · x) → top-K` (real-transformer path) or
+   `P(next | last_expert)` from the Markov chain (benchmark path);
 2. for each id, hits the LRU cache or streams the expert file off the
-   NVMe drive into a page-aligned pool buffer via `O_DIRECT`;
-3. **reinterprets the buffer as `f32` weight matrices** (`gate_proj`,
-   `up_proj`, `down_proj`, in that order, row-major — the standard
-   Mixtral / Llama / DeepSeek FFN layout);
+   NVMe drive into a page-aligned pool buffer via `O_DIRECT` (one
+   `pread(2)` per miss, or one fused `io_uring_enter` for the whole
+   batch with `--io-uring`);
+3. **reinterprets the buffer as weight matrices** in the configured
+   dtype (`F32`, `F16`, `Int8`, `Q4_K_M`, or `Q4_0` — see
+   [Quantization](#1-on-disk-quantization---dtype)). For the
+   floating-point dtypes this is a zero-copy reinterpretation; for
+   the integer / block-quantised dtypes a small per-fetch
+   dequantisation runs over the bytes that just arrived. Layout is
+   always `gate_proj || up_proj || down_proj`, row-major — the
+   standard Mixtral / Llama / DeepSeek FFN layout;
 4. runs a real **SwiGLU FFN forward pass**:
    `y = down_proj · ( silu(gate_proj · x) ⊙ (up_proj · x) )`
    — or, with `--io-only`, XOR-checksums every read byte instead, to
    isolate pure SSD-streaming cost from FFN compute;
-5. averages the K expert outputs (mock combine — a real router would do a
-   weighted sum using its softmax gates);
-6. updates the Markov predictor and kicks off speculative prefetches.
-   With the predictive architecture's L / M arms enabled (see
-   [Predictive architecture](#7-predictive-architecture-s--l--m-speculative-io)),
-   the prefetch set is the union `E = S ∪ L ∪ M` of the Markov-chain hint
-   `S`, the locality monitor's hot set `L`, and the neural speculator's
-   top-K `M`.
+5. combines the K expert outputs. Under `[real_transformer]` this is
+   the gate's softmax-weighted sum (the actual Mixtral combine);
+   under the legacy benchmark path it is a uniform average;
+6. observes the routing decision into all three predictors and kicks
+   off the speculative `E = S ∪ L ∪ M` prefetch union, deduplicated
+   against ids already resident or in flight.
 
-The forward pass is plain scalar `f32` Rust — no BLAS, no SIMD, no GPU.
-That's deliberate: the project's thesis is about **storage bandwidth**,
-not compute, so the kernel is just real enough to exercise every byte
-that came off the drive (compiler can't fold it away) and to surface a
-believable compute-vs-I/O latency picture in the per-token logs.
+The forward pass is **scalar `f32` Rust by default** — no BLAS, no
+SIMD, no GPU — because the project's thesis is about **storage
+bandwidth**, not compute. Two opt-in cargo features escalate the
+dense-matmul kernel without touching call sites:
+
+* `--features simd` routes the dense projections inside
+  `TransformerLayer` / `LMHead` through a `std::thread::scope`-based
+  **row-parallel** matmul (no extra crate dep).
+* `--features blas` swaps in the **`matrixmultiply` SGEMV
+  microkernel** (the same hand-tuned BLAS-shaped path `ndarray` uses
+  for its `dot` op). Mutually exclusive with `simd`; a static
+  `compile_error!` enforces this in `transformer.rs`.
+
+The SwiGLU expert kernel itself stays plain scalar — it just has to
+be real enough to exercise every byte that came off the drive
+(compiler can't fold it away) and surface a believable
+compute-vs-I/O latency picture in the per-token logs.
 
 ---
 
@@ -116,13 +154,28 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | Module | Responsibility |
 |---|---|
 | `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. |
-| `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s. Hands out `PooledBuffer` RAII guards; dropping a guard returns the buffer to the free list and notifies waiters. This is the literal "pre-allocated RAM buffer" the spec asks for. |
-| `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
-| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`). Includes a `gen-data` helper to create synthetic test files and a portable Unix fallback for development on macOS. |
-| `router` | `TopKRouter` (deterministic first-order Markov chain over expert ids — clustered locality by default, or load a precomputed `N×N` transition matrix via `--router-matrix`), `PredictiveLoader` (online sparse first-order **and** second-order Markov predictor over observed transitions, smoothed with a uniform Laplace prior), `LocalityMonitor` (sliding-window heat map — the **L** arm of the speculative `S ∪ L ∪ M` union-fetch), and `NeuralSpeculator` (tiny 2-layer MLP trained online against the gate's actual top-K — the **M** arm of the same union). |
-| `inference` | Real SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`) computed in scalar `f32` directly over the bytes streamed off NVMe. Reinterprets each pool buffer as three weight matrices (no copy). Replace with `tch`/`candle`/`cudarc` for SIMD / GPU. |
-| `engine` | Top-level orchestrator. Owns the router/predictor/cache/pool/storage, drives the per-token cycle, schedules prefetches, records HDR histograms. |
-| `main` | `clap`-based CLI with `gen-data` and `run` subcommands, structured `tracing` logs, `--first-token 3,7` to reproduce the spec example, `--io-only` for pure-I/O benchmarking, `--force-ssd` to refuse page-cache shortcuts, and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py`) so a real Mixtral checkpoint runs with no further flags. |
+| `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s. Hands out `PooledBuffer` RAII guards; dropping a guard returns the buffer to the free list and notifies waiters. The literal "pre-allocated RAM buffer" the spec asks for. |
+| `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
+| `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. |
+| `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. |
+| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`). Supports **multi-drive striping** (`NvmeStorage::striped`) — experts are sharded across `N` mountpoints by `id % N`. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
+| `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point. Built behind the `io_uring` cargo feature. |
+| `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router — clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API), `LocalityMonitor` (sliding-window heat map — the **L** arm), and `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread — the **M** arm). |
+| `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically — `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
+| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), implemented per dtype: `run_inference` (F32, zero-copy reinterpret), `run_inference_f16` / `_int8` / `_q4k` / `_q4_0` (dequantise then scalar `f32` matmul), and `run_inference_partial` (load only the top-M input columns by magnitude). All variants run directly over the bytes streamed off NVMe. |
+| `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch (scalar / `simd` / `blas`). |
+| `model` | `RealModel` — full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. |
+| `sampling` | OpenAI-compatible next-token sampler — temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
+| `tokenizer` | HuggingFace `tokenizers` crate when the `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured; deterministic byte-level fallback otherwise. |
+| `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. |
+| `batch_scheduler` | **Continuous batching.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token — never the full `Vec<KvCache>` — and optionally owns the shared `BlockPool` for paged KV. |
+| `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. |
+| `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`. Used by `gguf-convert` to migrate llama.cpp / Ollama Mixtral checkpoints into the engine's per-expert format. |
+| `gguf_loader` | Glue from a parsed `GgufFile` → per-expert `.bin` files + `metadata.json` + dense weight files (one tensor per file or a single `.safetensors` shard). Driven by the `gguf-convert` subcommand. |
+| `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
+| `config` | TOML schema for `serve --config`: `[server]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`. Validated at startup. |
+| `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`. |
+| `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-predictor`, and `serve` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2,…` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
 
 ### Key design decisions
 
@@ -135,19 +188,25 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
   work. Prefetches use `try_acquire` only and skip if the pool is busy. The
   pool is sized as `cache_slots + predict_fanout` so there is always
   headroom for in-flight prefetches without growing the resident set.
-- **Online sparse Markov predictor with prior.** Per-row sparse maps of
-  observed `(from, to)` counts plus a uniform Laplace prior (every cell
-  starts at an implicit count of 1). On every token transition we
-  increment `counts[from][to]`. `predict_next` returns
-  `(count + prior) / row_total`, sorted descending and filtered by
-  `min_prob`. Sparse-by-row means memory scales with the number of
-  *visited* `(from, to)` pairs, not `O(N²)` up front — important once
-  `N` reaches Mixtral 8x22B / DeepSeek-V3 expert counts.
-- **Deterministic Markov-chain router.** The router itself samples from
-  `P(next | last_expert)` under a fixed `N×N` transition matrix that is
-  either generated with structured cluster locality
-  (`--router-clusters`, `--router-intra-p`) or loaded from a file
-  (`--router-matrix`). Given a `--seed`, an entire run is reproducible.
+- **Online sparse 1st + 2nd-order Markov predictor with prior.** Per-row
+  sparse maps of observed `(from, to)` counts and `(prev_prev, prev) → to`
+  counts plus a uniform Laplace prior (every cell starts at an implicit
+  count of 1). `predict_next2` blends the 2nd-order row 50/50 with its
+  1st-order fallback, and `predict_unified` further fuses Markov,
+  locality, and speculator signals into a single weighted ranking
+  (Markov × 0.5 + locality × 0.3 + speculator × 0.4). Sparse-by-row
+  means memory scales with the number of *visited* pairs, not `O(N²)`
+  or `O(N³)` up front — important once `N` reaches Mixtral 8x22B /
+  DeepSeek-V3 expert counts.
+- **Pluggable router.** The legacy `TopKRouter` is a deterministic
+  Markov chain over expert ids — useful for benchmarks where you want
+  a fixed routing distribution independent of the model weights. The
+  production `LinearGate` (in `gating.rs`) computes
+  `softmax(W_gate · x) → top-K` from the actual hidden state, and is
+  the path `[real_transformer].enabled = true` selects. Both produce
+  the same `RoutingDecision { experts, weights }`; the experts are
+  still streamed by the same SSD-backed `ExpertCache`. Given a
+  `--seed`, either path is reproducible.
 - **Pluggable I/O backend.** The hot path uses `tokio::task::block_in_place`
   to dispatch a synchronous `pread(2)` (via `std::os::unix::fs::FileExt::read_at`)
   on the current Tokio worker; the runtime donates that worker to blocking
@@ -210,7 +269,7 @@ the server:
 docker compose up --build
 
 # 3. smoke test
-curl -sS http://localhost:8080/healthz
+curl -sS http://localhost:8080/health
 curl -sS -X POST http://localhost:8080/v1/completions \
   -H 'content-type: application/json' \
   -d '{"prompt":"Hello","max_tokens":4,"stream":true}'
@@ -223,10 +282,9 @@ file is bind-mounted read-only into `/etc/mer/config.toml`.
 
 ### Prerequisites
 
-- **Linux kernel ≥ 3.0** is enough for the default `pread(2)` +
-  `O_DIRECT` I/O path. The optional `--features io_uring` backend
-  needs **kernel ≥ 5.6** (and a sandbox that doesn't filter
-  `io_uring_setup`).
+- **Linux** for the default `pread(2)` + `O_DIRECT` I/O path on real
+  NVMe. The optional `--features io_uring` backend needs **kernel ≥
+  5.6** (and a sandbox that doesn't filter `io_uring_setup`).
 - **Rust 1.74+** (uses `clap 4`, edition 2021).
 - A real **block-device-backed filesystem** (ext4, xfs, btrfs on NVMe) for
   the `O_DIRECT` path. tmpfs / overlayfs / many FUSE mounts return `EINVAL`
@@ -247,9 +305,16 @@ file is bind-mounted read-only into `/etc/mer/config.toml`.
 
 ```bash
 cd rust-engine
-cargo build --release                    # default, portable
-cargo build --release --features io_uring  # Linux: enables IoUringStorage
+cargo build --release                       # default, portable, scalar
+cargo build --release --features io_uring   # Linux: enables IoUringStorage
+cargo build --release --features simd       # row-parallel dense matmul (std::thread::scope)
+cargo build --release --features blas       # matrixmultiply SGEMV microkernel (mutually exclusive with `simd`)
+cargo build --release --features tokenizer  # real HuggingFace tokenizer (pulls in `onig`)
 ```
+
+Features compose freely except `simd` and `blas`, which are mutually
+exclusive (enforced at compile time by a `compile_error!` in
+`transformer.rs`).
 
 ### Generate synthetic expert files
 
@@ -322,7 +387,7 @@ Endpoints:
 | method   | path                       | purpose                                            |
 | -------- | -------------------------- | -------------------------------------------------- |
 | `GET`    | `/health`                  | liveness probe (`{"status":"ok",...}`)             |
-| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and — when the predictive arms are enabled — `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, and the `mer_ssd_stall_seconds` histogram |
+| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and — when the predictive arms are enabled — `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, `mer_speculator_accuracy_total`, and the `mer_ssd_stall_seconds` histogram |
 | `POST`   | `/v1/completions`          | OpenAI text-completion shape (`prompt`, `max_tokens`, …) |
 | `POST`   | `/v1/chat/completions`     | OpenAI chat-completion shape (`messages`, …)       |
 | `DELETE` | `/v1/sessions/{id}`        | explicitly drop a saved KV-cache session (see [Session API](#session-api)) |
@@ -501,13 +566,25 @@ the same hits / misses / I/O wait counters get populated regardless of
 which path drives the loop.
 
 The dense (resident) weights — embedding, attention projections, MoE
-gate, RMSNorm gains, LM head — are loaded from the directory in
-`real_transformer.weights_dir` (one `.bin` file per tensor, raw
-little-endian `f32`; see `RealModel::from_dir` for the file-name
-schema). Tensors that aren't present fall back to a deterministic
-seeded initialisation, so the engine always has an end-to-end runnable
-path even without real model files. Multi-layer experts share the
-existing single-namespace cache via the global addressing scheme
+gate, RMSNorm gains, LM head — are loaded by `RealModel::from_dir_auto`,
+which transparently picks the right format:
+
+* **HuggingFace `safetensors`** (`model.safetensors` or sharded
+  `model-00001-of-00002.safetensors` etc.) — keyed by the standard
+  `model.layers.{L}.self_attn.{q,k,v,o}_proj.weight` /
+  `model.layers.{L}.block_sparse_moe.gate.weight` names; `bf16` /
+  `f16` shards are dequantised to `f32` at load time.
+* **Per-tensor `.bin` files** (one little-endian `f32` per file —
+  `embed.bin`, `attn_<L>_q.bin`, `gate_<L>.bin`, …) — written by
+  `gguf-convert` or by a custom extractor.
+
+Either way, **expert FFN weights are not loaded here** — they live
+on disk in `expert_<id>.bin` (single-layer) or `expert_<L>_<id>.bin`
+(multi-layer) and stream through the cache on demand. Tensors that
+aren't present fall back to a deterministic seeded initialisation,
+so the engine always has an end-to-end runnable path even without
+real model files. Multi-layer experts share the existing
+single-namespace cache via the global addressing scheme
 `global_id = layer * num_experts + local_id` — so the run summary
 statistics are populated by the same instrumentation regardless of
 layer count.
@@ -521,21 +598,46 @@ vocab_size = 256          # match the tokenizer (256 for the byte fallback)
 num_heads = 8
 num_kv_heads = 2          # 0 = MHA (auto-set to num_heads); GQA otherwise
 head_dim = 0              # 0 = auto (d_model / num_heads)
-rope_base = 10000.0
+rope_base = 10000.0       # Llama-3.1 long-context: 500000.0
 rms_eps = 1e-6
+window_size = 0           # 0 = full causal; Mixtral uses 4096 (sliding-window attention)
 seed = 0xC0FFEE
+max_batch_size = 8        # continuous batching (see below)
+batch_timeout_ms = 5
 ```
 
-#### Optional row-parallel matmul (`simd` feature)
+##### Paged KV cache (block pool)
+
+When the real-transformer pipeline is enabled the per-layer KV
+caches can be backed by a **shared physical block pool**
+(`block_pool::BlockPool`) instead of allocating a new
+`Vec<Box<[f32]>>` per request. The pool uses a pre-allocated slab
+plus a heap-backed overflow slab that grows on demand, with O(1)
+free-list alloc/release. Each request gets a thin `BlockManager`
+that records the block ids it owns and auto-returns every block to
+the pool on `Drop`. The scheduler picks block-pool sizing up via
+`BatchConfig::block_pool_capacity` and `block_pool_kv_dim` and logs
+a warning the first time a request touches the overflow slab so
+operators can size the primary capacity for steady-state workloads
+while staying safe under bursts.
+
+#### Optional row-parallel / BLAS matmul (`simd` / `blas` features)
 
 The dense projections inside `TransformerLayer` and `LMHead` are routed
-through `transformer::matmul_row_major`. With the `simd` cargo feature
-enabled, that function dispatches to a `std::thread::scope`-based
-row-parallel implementation (no extra crate dep — output rows are
-disjoint, so no synchronisation is needed):
+through `transformer::matmul_row_major`, which is feature-gated:
+
+* **default** (no features): scalar fused-loop matmul, single-threaded.
+* `--features simd`: dispatches to a `std::thread::scope`-based
+  row-parallel implementation (no extra crate dep — output rows are
+  disjoint, so no synchronisation is needed).
+* `--features blas`: routes through `matrixmultiply`'s hand-tuned
+  SGEMV microkernel — the same BLAS-shaped path `ndarray::dot` uses.
+  Mutually exclusive with `simd` (a static `compile_error!` in
+  `transformer.rs` enforces this).
 
 ```bash
-cargo build --release --features simd
+cargo build --release --features simd     # row-parallel
+cargo build --release --features blas     # matrixmultiply SGEMV
 ```
 
 The call sites are unchanged, so a future PR can swap the body for a
@@ -607,6 +709,13 @@ INFO compute:       p50=3435us  p95=3521us  p99=3617us  (SwiGLU FFN per token)
 INFO cycle latency: p50=3451us  p95=5643us  p99=6915us  max=6915us
 INFO per-token avg: io_wait=572.4us  compute=3478.0us  (over 30 tokens)
 INFO I/O share:     14.13% of token cycle time spent waiting on SSD reads
+INFO energy knobs:  dtype=f32  partial_load_fraction=1.00  pinned=0  alias_redirects=0
+```
+
+When the predictive `L` / `M` arms are enabled, one extra line is appended:
+
+```
+INFO predictive:    locality=on (hit_rate=64.32%)  speculator=on (accuracy=58.10%)  ssd_stall=12.4ms
 ```
 
 The `compute` row is the actual SwiGLU forward pass (per-token, summed
@@ -635,10 +744,15 @@ micro-expert-router gen-data
   --expert-size <BYTES>      Bytes per file, multiple of 4096 (default 16 MiB)
   --d-model <N>              FFN hidden dim (default 512)
   --d-ff <N>                 FFN intermediate dim (default 2048)
+  --block-align <BYTES>      O_DIRECT alignment (default 4096)
+  --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 (default f32)
 
 micro-expert-router run
   --data-dir <PATH>          Directory with expert_<id>.bin files
-                              (auto-loads metadata.json if present)
+                              (auto-loads metadata.json if present).
+                              Accepts a comma-separated list to shard
+                              across multiple NVMe mountpoints — see
+                              "Multi-drive striping" below.
   --num-experts <N>          Total experts in the model
   --expert-size <BYTES>      Must match gen-data
   --d-model <N>              Must match gen-data
@@ -646,8 +760,19 @@ micro-expert-router run
   --cache-slots <N>          Resident experts (default 4; warns if > 16)
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
+  --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 (default f32).
+                              Must match gen-data / the offline extractor.
   --predict-fanout <N>       Prefetch candidates per token (default 2)
   --predict-min-prob <P>     Skip prefetch below this probability (default 0.05)
+  --partial-load-fraction <F>  Fraction (0.1..=1.0) of input dimensions
+                              loaded per expert. 1.0 (default) loads the
+                              full expert.
+  --pin-after-observations <N>  After N routing observations, pin the
+                              expert permanently in the cache (0 disables).
+  --alias-map <PATH>         JSON map {"src_id": canonical_id, ...} from
+                              `scripts/compute_expert_aliases.py`: pairs
+                              of near-identical experts share one
+                              resident copy.
   --no-direct                Disable O_DIRECT (use page cache; CI / tmpfs / macOS)
   --block-align <BYTES>      O_DIRECT alignment, default 4096
   --first-token <IDS>        Comma-separated expert ids to warm into cache
@@ -698,8 +823,12 @@ micro-expert-router validate-predictor
 
 ### Running on real Mixtral weights
 
+There are **three** ways to feed real Mixtral / Llama-MoE weights into
+the engine, depending on what format you have them in:
+
+**1. From a Hugging Face checkpoint (per-expert `.bin` files).**
 `scripts/extract_mixtral_experts.py` dumps a single transformer
-layer's expert FFNs from a Hugging Face Mixtral checkpoint into the
+layer's expert FFNs from a HuggingFace Mixtral checkpoint into the
 on-disk format the engine expects (`expert_<id>.bin` blobs +
 `metadata.json`):
 
@@ -713,32 +842,67 @@ cargo run --release --manifest-path rust-engine/Cargo.toml -- \
     run --data-dir ./mixtral-data --tokens 200
 ```
 
-The `metadata.json` written by the script lets `run` auto-fill
-`--num-experts`, `--d-model`, `--d-ff`, `--top-k`, and `--expert-size`
-so the second command needs no further flags. Each Mixtral 8x7B expert
-is ~88 MiB (zero-padded to a 4 KiB multiple) — ~700 MiB on disk for
-one layer, fully streamable from any modern NVMe.
+**2. From a GGUF checkpoint (`gguf-convert`).** No Python required —
+the engine's built-in GGUF reader handles llama.cpp / Ollama-style
+files directly. Supports `F32`, `F16`, `Q4_0`, `Q4_K_M` natively;
+`Q6_K` tensors are recognised but fall back to seeded init (the
+engine doesn't dequantise Q6_K). The output directory has the same
+shape as the Mixtral extractor's: `expert_<layer>_<id>.bin` blobs +
+`metadata.json` + per-tensor dense weight files.
 
-### Routing model — Markov chain over expert ids
+```bash
+./target/release/micro-expert-router gguf-convert \
+    --gguf-path ./mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf \
+    --out-dir   ./mixtral-data
 
-The router is a **deterministic first-order Markov chain**, not a
-random uniform top-K sampler: this is the property that makes the
-prefetcher worth running. Two ways to build the chain:
+./target/release/micro-expert-router run --data-dir ./mixtral-data
+```
 
-1. **Generated** (default): experts are partitioned into
+**3. From HuggingFace `safetensors` shards.** When
+`real_transformer.weights_dir` points at a directory containing
+`model.safetensors` (or sharded `model-00001-of-00002.safetensors`
+files), `RealModel::from_safetensors` picks them up automatically.
+Tensor names follow the standard
+`model.layers.{L}.self_attn.{q,k,v,o}_proj.weight` /
+`model.layers.{L}.block_sparse_moe.gate.weight` convention; `bf16`
+and `f16` shards are dequantised to `f32` at load time. Expert FFN
+weights still come through the SSD-streaming path
+(`expert_<id>.bin`) — `from_safetensors` only handles the dense
+(resident) tensors. `RealModel::from_dir_auto` will pick the right
+loader.
+
+The `metadata.json` written by `extract_mixtral_experts.py` or
+`gguf-convert` lets `run` auto-fill `--num-experts`, `--d-model`,
+`--d-ff`, `--top-k`, and `--expert-size` so the subsequent commands
+need no further flags. Each Mixtral 8x7B expert is ~88 MiB at `f16`
+(zero-padded to a 4 KiB multiple) — ~700 MiB on disk for one layer,
+fully streamable from any modern NVMe; at `q4_0` / `q4k` the same
+expert is ~25 MiB.
+
+### Routing model — Markov chain, transition matrix, or LinearGate
+
+Three routers are available, all reproducible given `--seed`:
+
+1. **Clustered Markov (default `run` path).** A deterministic 1st-order
+   Markov chain over expert ids. Experts are partitioned into
    `--router-clusters` groups (by `id % cluster_count`) and the chain
    stays inside its current cluster with probability
-   `--router-intra-p` (default `0.9`). This produces the same
-   "topic-sticky" behaviour real MoE traces show — the predictor
-   converges quickly and prefetch hit rate climbs above 60%.
-2. **Loaded** (`--router-matrix path.txt`): supply a whitespace-separated
-   `num_experts × num_experts` matrix of `f64` transition probabilities,
-   row-major. Rows are normalised to sum to 1. Use this to feed a real
-   Mixtral routing trace (e.g. produced by hooking `block_sparse_moe`'s
-   gate softmax during a Hugging Face inference run) directly into the
-   engine.
-
-Given a fixed `--seed`, the routed sequence is fully reproducible.
+   `--router-intra-p` (default `0.9`). Produces the "topic-sticky"
+   behaviour real MoE traces show — the predictor converges quickly
+   and prefetch hit rate climbs above 60%.
+2. **Loaded transition matrix (`--router-matrix path.txt`).** Supply a
+   whitespace-separated `num_experts × num_experts` matrix of `f64`
+   transition probabilities, row-major. Rows are normalised to sum to
+   1. Use this to feed a real Mixtral routing trace (e.g. produced by
+   hooking `block_sparse_moe`'s gate softmax during a HuggingFace
+   inference run) directly into the engine.
+3. **Real `LinearGate` (`--gate-weights path.bin` or
+   `[real_transformer].enabled = true`).** Load a real gating-network
+   weight matrix (`[num_experts × d_model]` little-endian `f32`,
+   row-major, no header) and route by `softmax(W_gate · x) → top-K`
+   from the actual hidden state at each token. This is the same
+   routing equation production Mixtral / Llama-MoE inference uses;
+   the experts are still streamed from the SSD by the same cache.
 
 ### macOS
 
@@ -901,10 +1065,12 @@ Covers:
 - the **Markov-chain router** produces distinct top-K ids, is fully
   reproducible given a `--seed`, prefers in-cluster transitions for the
   generated locality, and round-trips a transition matrix from disk,
-- the **predictor** (sparse first-order Markov) learns simple
+- the **predictor** (sparse 1st- + 2nd-order Markov) learns simple
   transitions, respects `min_prob`, falls back to the Laplace prior
-  when nothing has been observed, counts only real observations, and
-  handles zero fanout,
+  when nothing has been observed, counts only real observations,
+  handles zero fanout, and the unified `predict_unified(S ∪ L ∪ M)`
+  ranker fuses Markov / locality / speculator contributions
+  deterministically,
 - the `f32` weight-view partitions buffers correctly,
 - the SwiGLU forward pass produces finite, deterministic outputs of the
   correct shape, and zeroed weights yield a zero output,
@@ -973,25 +1139,34 @@ of token cycle time the CPU sits waiting on SSD, multiplying its idle
 energy), `pinned_count`, and `alias_redirects`. Each subsection below
 explains which of these the change moves and why.
 
-### 1. fp16 quantization on disk (`--dtype f16`)
+### 1. On-disk quantization (`--dtype`)
 
-Each weight is stored as a 2-byte little-endian `f16` instead of a
-4-byte `f32`. The engine dequantises on the fly via
-`OwnedExpertWeights::from_bytes_f16` and runs the same SwiGLU forward
-pass on the resulting `Vec<f32>`.
+The engine reads weight bytes straight off the SSD; halving — or
+quartering — the byte width of each weight halves / quarters every
+read. Five on-disk dtypes are first-class:
+
+| `--dtype` | Bytes / weight | Per-blob header | Dequant kernel | Use |
+|---|---:|:---:|---|---|
+| `f32` | 4 | none | zero-copy reinterpret | reference / highest fidelity |
+| `f16` | 2 | none | per-fetch `f16 → f32` | ~2× less SSD energy than `f32` |
+| `int8` | 1 | 12 B (`[gate, up, down]: [f32; 3]` per-tensor scales) | symmetric per-tensor dequant | ~4× less SSD energy than `f32` |
+| `q4k` | ~0.5625 | none (block-internal) | `Q4_K_M` 256-block (f16 super-scale + 6-bit sub-scales + 4-bit weights) | GGUF-compatible 4-bit |
+| `q4_0` | ~0.5625 | none (block-internal) | `Q4_0` 32-block (f16 scale, symmetric 4-bit nibbles) | the most widely-used 4-bit format; chosen by the predictive-controller spec |
+
+Selectable on **`gen-data`** (synthetic data — every dtype has a
+matching generator arm), on **`gguf-convert`** (input format detected
+from the GGUF tensor dtype, output written in the same dtype), and on
+**`run` / `serve`** (must match the on-disk files). The forward pass
+dispatches to `inference::run_inference_*` per dtype, all producing
+the same scalar `f32` SwiGLU output — so a benchmark run is a
+one-flag diff.
 
 **How this saves energy.** Every cache miss reads
-`3 · d_model · d_ff` weights off the SSD. Halving the byte width
-halves the bytes the NVMe controller has to deliver, halves the PCIe
-traffic, and halves the DRAM writes — roughly a **2× reduction in
-SSD-read energy per miss**. That is by far the dominant term in any
-benchmark with a non-trivial miss rate. The dequantisation step is
-~`d_model · d_ff` cheap `f16 -> f32` conversions per expert; on modern
-SIMD this is far less energy than the bytes-moved savings recover.
-
-`gen-data` and the offline extractor both accept `--dtype`, so you can
-choose per-run whether to spend the disk space on f32 (highest
-fidelity) or f16 (lowest energy).
+`3 · d_model · d_ff` weights off the SSD. Going from `f32` → `f16`
+halves NVMe bandwidth and DRAM writes; `int8` quarters them; `q4k` /
+`q4_0` get an additional ~30% on top. The dequantisation step is
+`d_model · d_ff` cheap scalar ops per expert; on modern SIMD this is
+far less energy than the bytes-moved savings recover.
 
 ### 2. 2nd-order Markov + gate-lookahead prefetching
 
@@ -1132,22 +1307,33 @@ set `E = S ∪ L ∪ M`:
   gate's actual top-K decision at each token. Cheap enough to run
   on the critical path, with He-uniform init, gradient clipping at
   `±1`, and a `clamp_finite` weight guard so a stuck speculator
-  never NaNs out the predictor.
+  never NaNs out the predictor. Training is dispatched to a
+  dedicated **off-path worker thread** through a bounded `mpsc`
+  queue: `predict_topk` on the hot path takes a read-lock snapshot
+  of `(W1, b1, W2, b2)`; the worker drains the queue and writes new
+  weights with `try_write_for` so the predictor is never blocked by
+  backprop. The queue is bounded so a runaway producer can't pin
+  unbounded memory — when full, the newest sample is dropped
+  (training is a *prefetch hint*; the real routing still flows
+  through the gate downstream).
 
 Both arms are wired into `Engine::union_prefetch`: per token, the
 engine builds the union of (a) the predictor's `predict_next2(prev_prev,
 prev)` Markov hint `S`, (b) the locality monitor's `hot_set(threshold)`
 `L`, and (c) the speculator's `predict_topk(hidden_state)` `M`,
 deduplicates against ids already in flight or already resident,
-and spawns prefetches for the rest. Per-id Markov probabilities
-are preserved when available; ids that come only from `L` or `M`
-borrow a `0.5` "best guess" so they clear typical
-`predict_min_prob` budgets but stay distinguishable in the logs.
+and spawns prefetches for the rest. The unified ranking is computed by
+`PredictiveLoader::predict_unified`, which combines all three signals
+with weights `0.5 · markov + 0.3 · locality + 0.4 · speculator` and
+returns the top-fanout ids; an expert that lights up in every arm is
+therefore prioritised over one that lights up in only one.
 
-Online speculator training is interleaved with prediction in a
-single `RwLock` critical section so a `predict()` always sees a
-consistent `(W1, b1, W2, b2)` snapshot — the predictor never reads
-half-updated weights mid-SGD-step.
+Online speculator training is **dispatched to an off-path worker
+thread** through a bounded queue, so a `predict_topk` on the hot
+path never blocks on backprop — it takes a brief read-lock on the
+current `(W1, b1, W2, b2)` snapshot, the worker takes a
+`try_write_for` (and drops the sample if the lock isn't immediately
+available) so the predictor is never starved.
 
 **How this saves energy.** `S` alone misses two failure modes:
 prefetches **wasted** when the chain wanders out of the active
@@ -1175,6 +1361,7 @@ counters / a histogram on `/metrics`:
 |---|---|
 | `mer_speculator_hits_total` | Per-token speculator predictions that intersected the gate's actual top-K. |
 | `mer_speculator_misses_total` | Per-token speculator predictions that did not. The ratio is the speculator's running accuracy. |
+| `mer_speculator_accuracy_total` | Tokens for which the speculator's **top-1** prediction matched the gate's actual top-1 routed expert. The primary quality signal called out by the Omniscient Predictive Architecture spec; divide by tokens-generated to read accuracy as a fraction. |
 | `mer_locality_hits_total` | Routed experts that were already in the locality monitor's hot set at routing time (would-be cache miss avoided by pinning). |
 | `mer_locality_misses_total` | Routed experts that were not. |
 | `mer_ssd_stall_seconds` | Histogram of cumulative SSD critical-path stall time per token — the wall-clock window the engine spent blocked waiting for cache-miss reads to land. The headline number the L / M arms aim to drive down. |
@@ -1232,34 +1419,24 @@ you can verify the energy-saving paths actually engaged.
 
 ## Limitations / next steps
 
-- **Scalar `f32` matmul.** The expert FFN runs as a plain triple-nested
-  scalar loop; the `simd` cargo feature parallelises the gate/up/down
-  matmuls across rayon-style scopes but a real serving deployment
-  would still drop in BLAS / a CUDA kernel via `tch` / `candle` /
-  `cudarc`. The byte→`f32` view in
+- **Scalar `f32` expert kernel.** The SwiGLU FFN itself still runs as
+  a plain triple-nested scalar loop. The `simd` and `blas` cargo
+  features parallelise the dense `transformer` projections (attention
+  Q/K/V/O, RMSNorm, LM head) but the per-expert kernel stays scalar.
+  A real serving deployment would drop in BLAS / a CUDA kernel via
+  `tch` / `candle` / `cudarc`. The byte→`f32` view in
   `inference::ExpertWeights::from_bytes` already does zero-copy
   reinterpretation, so any of those backends slot in cleanly.
-- **Continuous batching is now in place.** The HTTP server wires a
-  `BatchScheduler` (see `src/batch_scheduler.rs`) in front of
-  `RealModel::step` whenever `[real_transformer] enabled = true`. Each
-  in-flight request submits one decoder step at a time over an
-  `mpsc` channel; the scheduler fuses up to `max_batch_size` requests
-  (or whatever has arrived within `batch_timeout_ms`) into a single
-  batch and runs their steps concurrently on the shared `Engine`,
-  so the SSD-streamed MoE compute is amortised across all of them.
-  Per-request KV caches are moved into the scheduler and back, so
-  attention state stays strictly per-request. Both streaming (SSE)
-  and non-streaming requests use the same path. The two knobs live
-  under `[real_transformer]`:
-  ```toml
-  max_batch_size  = 8   # max concurrent requests fused per step (1 disables batching)
-  batch_timeout_ms = 5  # how long to wait for more requests to join a partial batch
-  ```
 - **Picking a NUMA budget.** `MER_PIN_CORES=N` is honoured at
   startup to `sched_setaffinity(2)` the process to the first `N`
   CPUs of NUMA node 0 (best-effort, Linux only). Real per-ring
   per-node pinning would need one io_uring ring per node and
   per-node buffer pools — a deeper refactor.
+- **Streaming GGUF reader.** `gguf-convert` reads the entire source
+  GGUF into memory before slicing tensors out. Fine for the offline
+  conversion path (the engine itself never opens GGUFs on the
+  inference hot path), but a streaming reader would be a strict win
+  for ≥ 100 GB checkpoints.
 
 ## License
 
