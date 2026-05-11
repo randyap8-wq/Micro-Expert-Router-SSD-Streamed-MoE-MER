@@ -485,19 +485,87 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     let total_experts: u32 =
         (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts).max(cfg.model.num_experts);
 
-    let router = Arc::new(TopKRouter::clustered(
-        total_experts,
-        cfg.model.top_k,
-        4,
-        0.9,
-        0xC0FFEE,
-    ));
     let predictor = Arc::new(PredictiveLoader::new(
         total_experts,
         cfg.storage.predict_fanout,
         cfg.storage.predict_min_prob,
         0xC0FFEE,
     ));
+
+    // Build the real transformer (if enabled) *before* the engine so
+    // its per-layer `LinearGate` can be wired into the engine as the
+    // production routing path. When `[real_transformer].enabled =
+    // true`, the engine holds `Router::Linear` from the loaded
+    // model's first-layer gate — that is the path
+    // `Engine::generate` will exercise on the benchmark / warmup
+    // surfaces. The per-token `RealModel::step` loop in serve mode
+    // routes each MoE layer through *its own* layer-local gate
+    // (`TransformerLayer::moe_pre`) and calls `engine.moe_step` with
+    // the already-routed ids, so the engine's router does not
+    // override per-layer routing — but it does mean the engine's
+    // self-reported `num_experts` / `top_k` now reflect the actual
+    // gate shape rather than the legacy Markov stand-in, which is
+    // the gist's "wire `LinearGate` into `serve`" ask.
+    let real_model: Option<Arc<crate::model::RealModel>> = if cfg.real_transformer.enabled {
+        let rt = &cfg.real_transformer;
+        let head_dim = if rt.head_dim == 0 {
+            cfg.model.d_model / rt.num_heads
+        } else {
+            rt.head_dim
+        };
+        let num_kv_heads = if rt.num_kv_heads == 0 { rt.num_heads } else { rt.num_kv_heads };
+        let model_cfg = crate::model::RealModelConfig {
+            d_model: cfg.model.d_model,
+            d_ff: cfg.model.d_ff,
+            num_heads: rt.num_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size: rt.vocab_size,
+            num_layers: cfg.model.num_layers,
+            num_experts: cfg.model.num_experts as usize,
+            top_k: cfg.model.top_k,
+            rope_base: rt.rope_base,
+            rms_eps: rt.rms_eps,
+            window_size: if rt.window_size == 0 { None } else { Some(rt.window_size) },
+        };
+        let m = match rt.weights_dir.as_ref() {
+            Some(dir) => crate::model::RealModel::from_dir_auto(model_cfg, dir, rt.seed)?,
+            None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),
+        };
+        Some(Arc::new(m))
+    } else {
+        None
+    };
+
+    let router = if let Some(ref m) = real_model {
+        // Production routing path: the engine's `route()` runs the
+        // first layer's `softmax(W_gate · x) → top-K` (Mixtral-style)
+        // instead of the legacy deterministic Markov chain. Per-layer
+        // gates still drive per-layer routing inside `RealModel::step`
+        // — this engine-level gate is what `Engine::generate` and
+        // anything else that asks the engine for a routing decision
+        // sees.
+        info!(
+            num_experts = m.layers[0].gate.num_experts,
+            d_model = m.layers[0].gate.d_model,
+            top_k = m.layers[0].gate.top_k,
+            "engine routing: LinearGate (production softmax-gated path) wired from real model"
+        );
+        crate::gating::Router::Linear(Arc::new(m.layers[0].gate.clone()))
+    } else {
+        info!(
+            total_experts,
+            clusters = 4,
+            "engine routing: clustered Markov chain (no real model loaded)"
+        );
+        crate::gating::Router::Markov(Arc::new(TopKRouter::clustered(
+            total_experts,
+            cfg.model.top_k,
+            4,
+            0.9,
+            0xC0FFEE,
+        )))
+    };
 
     let mut engine_builder = Engine::with_options(
         cache,
@@ -563,7 +631,10 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // runs `embedding -> stacked layers (each with SSD-streamed MoE) ->
     // LM head -> argmax`; when disabled, the legacy benchmark generator
     // is used (the engine still streams expert FFN compute either way).
-    let (real_model, batch_scheduler) = if cfg.real_transformer.enabled {
+    // Note: `real_model` was constructed above so its per-layer gate
+    // could be wired into the engine; here we just spawn the
+    // continuous-batching scheduler against the already-built model.
+    let (real_model, batch_scheduler) = if let Some(model_arc) = real_model {
         let rt = &cfg.real_transformer;
         let head_dim = if rt.head_dim == 0 {
             cfg.model.d_model / rt.num_heads
@@ -571,25 +642,6 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             rt.head_dim
         };
         let num_kv_heads = if rt.num_kv_heads == 0 { rt.num_heads } else { rt.num_kv_heads };
-        let model_cfg = crate::model::RealModelConfig {
-            d_model: cfg.model.d_model,
-            d_ff: cfg.model.d_ff,
-            num_heads: rt.num_heads,
-            num_kv_heads,
-            head_dim,
-            vocab_size: rt.vocab_size,
-            num_layers: cfg.model.num_layers,
-            num_experts: cfg.model.num_experts as usize,
-            top_k: cfg.model.top_k,
-            rope_base: rt.rope_base,
-            rms_eps: rt.rms_eps,
-            window_size: if rt.window_size == 0 { None } else { Some(rt.window_size) },
-        };
-        let m = match rt.weights_dir.as_ref() {
-            Some(dir) => crate::model::RealModel::from_dir_auto(model_cfg, dir, rt.seed)?,
-            None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),
-        };
-        let model_arc = Arc::new(m);
         let batch_cfg = crate::batch_scheduler::BatchConfig {
             max_batch_size: rt.max_batch_size,
             batch_timeout: std::time::Duration::from_millis(rt.batch_timeout_ms),
@@ -1031,7 +1083,7 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             cache.clone(),
             pool.clone(),
             storage.clone(),
-            router.clone(),
+            crate::gating::Router::Markov(router.clone()),
             predictor.clone(),
             ModelShape {
                 d_model: args.d_model,

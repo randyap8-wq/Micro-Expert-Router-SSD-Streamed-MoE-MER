@@ -83,10 +83,15 @@ After every token the engine updates **three predictors in parallel**:
   the inference critical path never blocks on backprop.
 
 All three feed `PredictiveLoader::predict_unified`, which sums a
-weighted score per candidate id (Markov × 0.5, locality × 0.3,
-speculator × 0.4) and returns the top-fanout union `E = S ∪ L ∪ M` for
-speculative I/O. Prefetches use `try_acquire` only and **never evict
-a resident slot**, speculation can't starve real work.
+weighted score per candidate id (speculator × 0.42, Markov × 0.33,
+locality × 0.25) and returns the top-fanout union `E = S ∪ L ∪ M` for
+speculative I/O. The weights encode the intent that the **speculator
+is the strongest signal** (it conditions on the actual hidden state),
+the **Markov chain is next** (statistical smoothing of transitions),
+and **locality is the weakest tiebreaker** (a coarse "recently hot"
+prior); see `PredictiveLoader::predict_unified` in `router.rs` for
+the canonical constants. Prefetches use `try_acquire` only and
+**never evict a resident slot**, speculation can't starve real work.
 
 The **router** itself is either the legacy `TopKRouter`
 (deterministic Markov chain over expert ids, clustered locality by
@@ -194,7 +199,10 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
   count of 1). `predict_next2` blends the 2nd-order row 50/50 with its
   1st-order fallback, and `predict_unified` further fuses Markov,
   locality, and speculator signals into a single weighted ranking
-  (Markov × 0.5 + locality × 0.3 + speculator × 0.4). Sparse-by-row
+  (speculator × 0.42 + Markov × 0.33 + locality × 0.25 — speculator
+  is strongest because it conditions on the actual hidden state,
+  Markov is next as a statistical smoother of transitions, locality
+  is a coarse tiebreaker). Sparse-by-row
   means memory scales with the number of *visited* pairs, not `O(N²)`
   or `O(N³)` up front, important once `N` reaches Mixtral 8x22B /
   DeepSeek-V3 expert counts.
@@ -1324,9 +1332,13 @@ prev)` Markov hint `S`, (b) the locality monitor's `hot_set(threshold)`
 deduplicates against ids already in flight or already resident,
 and spawns prefetches for the rest. The unified ranking is computed by
 `PredictiveLoader::predict_unified`, which combines all three signals
-with weights `0.5 · markov + 0.3 · locality + 0.4 · speculator` and
+with weights `0.42 · speculator + 0.33 · markov + 0.25 · locality` and
 returns the top-fanout ids; an expert that lights up in every arm is
-therefore prioritised over one that lights up in only one.
+therefore prioritised over one that lights up in only one. The
+weighting encodes "speculator is the strongest signal, Markov is
+next, locality is the weakest tiebreaker" — see
+`PredictiveLoader::predict_unified` in `router.rs` for the canonical
+constants.
 
 Online speculator training is **dispatched to an off-path worker
 thread** through a bounded queue, so a `predict_topk` on the hot

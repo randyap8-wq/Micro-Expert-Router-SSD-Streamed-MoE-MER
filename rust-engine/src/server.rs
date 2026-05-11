@@ -1149,7 +1149,7 @@ mod tests {
         );
         let cache = Arc::new(ExpertCache::new(2));
         let pool = BufferPool::new(3, expert_size, block);
-        let router = Arc::new(TopKRouter::clustered(num_experts, 2, 2, 0.9, 1));
+        let router = crate::gating::Router::Markov(Arc::new(TopKRouter::clustered(num_experts, 2, 2, 0.9, 1)));
         let predictor = Arc::new(PredictiveLoader::new(num_experts, 1, 0.05, 1));
         let engine = Arc::new(Engine::with_options(
             cache, pool, storage, router, predictor,
@@ -1392,7 +1392,7 @@ mod tests {
         );
         let cache = Arc::new(ExpertCache::new((total as usize).max(2)));
         let pool = BufferPool::new(total as usize + 2, expert_size, block);
-        let router = Arc::new(TopKRouter::new(total, cfg.top_k, 1));
+        let router = crate::gating::Router::Markov(Arc::new(TopKRouter::new(total, cfg.top_k, 1)));
         let predictor = Arc::new(PredictiveLoader::new(total, 0, 0.05, 1));
         let engine = Arc::new(Engine::with_options(
             cache,

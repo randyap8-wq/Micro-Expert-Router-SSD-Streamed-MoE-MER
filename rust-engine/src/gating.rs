@@ -23,11 +23,11 @@
 
 //! `LinearGate` is the production routing path; `Router::Markov` keeps
 //! the existing benchmark behaviour. Both are exercised by unit tests
-//! below; the `serve` command currently wires the `Markov` variant
-//! directly into `Engine`. `dead_code` is allowed at module scope so the
-//! production-path API stays greppable until the full transformer
-//! wiring (which will replace the engine's internal router) lands.
-#![allow(dead_code)]
+//! below. The `serve` command instantiates `Router::Linear` from the
+//! loaded model's per-layer gate weights when
+//! `[real_transformer].enabled = true`, and falls back to
+//! `Router::Markov` (over a clustered `TopKRouter`) for the
+//! benchmark / `--io-only` path that has no real gating network.
 
 use crate::router::TopKRouter;
 use crate::transformer::{matmul_row_major, softmax_inplace};

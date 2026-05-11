@@ -29,6 +29,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -839,6 +840,29 @@ impl LocalityMonitor {
     }
 }
 
+/// Scale `grad` in place so its L2 norm is at most `max_norm`. Skips
+/// when the norm is already within bounds or when it is zero / not
+/// finite (the per-element NaN guard above already replaced
+/// non-finite entries with `0.0`, but we keep the defensive check so
+/// future callers can't trip a divide-by-zero or `NaN / NaN`).
+fn clip_grad_norm_(grad: &mut [f32], max_norm: f32) {
+    let mut sumsq = 0.0f32;
+    for &g in grad.iter() {
+        sumsq += g * g;
+    }
+    if !sumsq.is_finite() || sumsq <= max_norm * max_norm {
+        return;
+    }
+    let norm = sumsq.sqrt();
+    if !norm.is_finite() || norm <= 0.0 {
+        return;
+    }
+    let scale = max_norm / norm;
+    for v in grad.iter_mut() {
+        *v *= scale;
+    }
+}
+
 /// Tiny **Neural Speculator** — the semantic-intent arm of the dual-path
 /// predictive controller.
 ///
@@ -861,11 +885,17 @@ impl LocalityMonitor {
 ///
 /// Initialisation uses He-uniform scaling (the standard ReLU init) with
 /// a deterministic seed so identical runs produce identical predictions.
-/// All numerical paths are `f32`; gradient clipping at `±1.0` and a
-/// `clamp_finite` guard on every weight write keep a stuck model from
-/// producing NaN/Inf — the predictor never tearing down the engine
-/// (this is a *prefetch hint*; correctness still flows through the real
-/// gate downstream).
+/// All numerical paths are `f32`. Stability is enforced by three
+/// stacked safeguards: a **global L2-norm gradient cap** at
+/// [`Self::MAX_GRAD_NORM`] on both `dlogits` and the back-propagated
+/// `dh`, a per-element `±MAX_GRAD_NORM` clamp as a belt-and-braces
+/// guard, and a `clamp_finite` check on every weight write. The
+/// effective learning rate decays inverse-time against the
+/// cumulative step counter (see [`Self::LR_DECAY_RATE`]) so a sudden
+/// topic shift late in a long run can't dominate the model. The
+/// predictor is a *prefetch hint*; correctness still flows through
+/// the real gate downstream, so even a pathological speculator can
+/// only degrade prefetch accuracy, never engine correctness.
 pub struct NeuralSpeculator {
     d_model: usize,
     hidden: usize,
@@ -880,6 +910,13 @@ pub struct NeuralSpeculator {
     /// lock, so the hot-path `predict_topk` is never blocked by
     /// background SGD compute.
     weights: RwLock<SpeculatorWeights>,
+    /// Cumulative count of SGD updates applied to `weights`. Drives
+    /// the inverse-time learning-rate schedule (see [`Self::effective_lr`])
+    /// so the speculator stops chasing fresh routing distributions
+    /// aggressively after a long adaptation window — a sudden topic
+    /// shift in a long document can otherwise spike the gradient and
+    /// degrade prefetch accuracy until the new distribution stabilises.
+    train_steps: AtomicU64,
     /// Asynchronous training queue. Set on first call to
     /// [`Self::spawn_training_worker`] (idempotent) and consumed by a
     /// dedicated background thread. The queue is bounded so a
@@ -929,6 +966,24 @@ impl NeuralSpeculator {
     /// the gradient magnitude.
     pub const WEIGHT_DECAY: f32 = 1e-4;
 
+    /// Global L2-norm cap on the per-step gradient (the reviewer's
+    /// `if grad_norm > threshold { grad /= grad_norm }` suggestion).
+    /// Applied to both `dlogits` and the back-propagated `dh` so a
+    /// single noisy sample — typical during a topic shift in a long
+    /// document — can't blow up the weight update beyond the same
+    /// per-element clip the spec already enforces. Picked to match
+    /// the existing per-element clamp magnitude, so well-behaved
+    /// gradients are unaffected and only the tail is scaled down.
+    pub const MAX_GRAD_NORM: f32 = 1.0;
+
+    /// Inverse-time learning-rate decay: `lr_eff = lr / (1 + steps *
+    /// LR_DECAY_RATE)`. With `1e-5` the effective LR is halved after
+    /// roughly 100k SGD updates, ten-times-down after ~1M — slow
+    /// enough that the speculator still tracks routing-distribution
+    /// drift, but fast enough that an outlier sample late in a long
+    /// run can't dominate. Set to zero to disable decay entirely.
+    pub const LR_DECAY_RATE: f32 = 1e-5;
+
     /// Build a fresh speculator with He-uniform initialisation.
     pub fn new(d_model: usize, hidden: usize, num_experts: u32, seed: u64) -> Self {
         assert!(d_model > 0 && hidden > 0 && num_experts > 0);
@@ -950,7 +1005,22 @@ impl NeuralSpeculator {
             hidden,
             num_experts,
             weights: RwLock::new(SpeculatorWeights { w1, b1, w2, b2 }),
+            train_steps: AtomicU64::new(0),
             train_queue: OnceLock::new(),
+        }
+    }
+
+    /// Effective per-step learning rate: the caller-supplied `lr`
+    /// scaled by an inverse-time decay against
+    /// [`Self::train_steps`]. Made `pub(crate)` so tests can assert
+    /// the schedule without going through `train_step`.
+    pub(crate) fn effective_lr(&self, lr: f32) -> f32 {
+        let steps = self.train_steps.load(Ordering::Relaxed) as f32;
+        let denom = 1.0 + steps * Self::LR_DECAY_RATE;
+        if denom > 0.0 && denom.is_finite() {
+            lr / denom
+        } else {
+            lr
         }
     }
 
@@ -1089,6 +1159,14 @@ impl NeuralSpeculator {
         actual_top_k: &[u32],
         lr: f32,
     ) -> f32 {
+        // Inverse-time LR decay against the cumulative step counter.
+        // Callers pass a *base* lr (typically `DEFAULT_LR`); the
+        // effective rate falls off so the speculator stops chasing
+        // outlier samples late in a long run. `lr == 0.0` (the
+        // "measure loss only" idiom used in tests) still produces
+        // `lr_eff == 0.0`.
+        let lr_eff = self.effective_lr(lr);
+
         // Build the target distribution.
         let n = self.num_experts as usize;
         let mut target = vec![0.0f32; n];
@@ -1160,13 +1238,29 @@ impl NeuralSpeculator {
         let mut dlogits = probs;
         for i in 0..n {
             dlogits[i] -= target[i];
-            // Per-element gradient clipping.
-            if dlogits[i] > 1.0 {
-                dlogits[i] = 1.0;
-            } else if dlogits[i] < -1.0 {
-                dlogits[i] = -1.0;
-            } else if !dlogits[i].is_finite() {
+            // Replace non-finite entries early so the norm below is
+            // well-defined; the per-element clip below would otherwise
+            // be poisoned by a single NaN.
+            if !dlogits[i].is_finite() {
                 dlogits[i] = 0.0;
+            }
+        }
+        // Global gradient-norm cap: `if ||g|| > τ { g *= τ / ||g|| }`.
+        // This is the reviewer's requested protection against a
+        // topic shift spiking the per-step update — distinct from
+        // (and applied *before*) the per-element clamp, which only
+        // bounds individual coordinates.
+        clip_grad_norm_(&mut dlogits, Self::MAX_GRAD_NORM);
+        // Per-element clamp as a belt-and-braces guard. After the
+        // norm cap above, well-behaved samples are unaffected; only
+        // pathological coordinates (e.g. residue of an out-of-range
+        // gradient that survived the norm scaling because the rest
+        // of the vector was near-zero) are pinned to ±1.
+        for v in dlogits.iter_mut() {
+            if *v > 1.0 {
+                *v = 1.0;
+            } else if *v < -1.0 {
+                *v = -1.0;
             }
         }
 
@@ -1187,13 +1281,19 @@ impl NeuralSpeculator {
             if h_pre[j] <= 0.0 {
                 dh[j] = 0.0;
             }
-            // Clip again post-mask (the multiplication by W2 can blow up).
-            if dh[j] > 1.0 {
-                dh[j] = 1.0;
-            } else if dh[j] < -1.0 {
-                dh[j] = -1.0;
-            } else if !dh[j].is_finite() {
+            if !dh[j].is_finite() {
                 dh[j] = 0.0;
+            }
+        }
+        // Global norm cap on the hidden-layer gradient too — the
+        // multiplication by `W2` can blow up the magnitude even when
+        // `dlogits` itself was bounded.
+        clip_grad_norm_(&mut dh, Self::MAX_GRAD_NORM);
+        for v in dh.iter_mut() {
+            if *v > 1.0 {
+                *v = 1.0;
+            } else if *v < -1.0 {
+                *v = -1.0;
             }
         }
 
@@ -1205,7 +1305,7 @@ impl NeuralSpeculator {
         // arbitrarily large logits over an infinite training run.
         // Biases are intentionally not decayed (standard practice;
         // they don't suffer from the same scale-blowup pathology).
-        let decay = 1.0 - lr * Self::WEIGHT_DECAY;
+        let decay = 1.0 - lr_eff * Self::WEIGHT_DECAY;
         if decay > 0.0 && decay < 1.0 {
             for v in w.w2.iter_mut() {
                 let new = *v * decay;
@@ -1229,11 +1329,11 @@ impl NeuralSpeculator {
             }
             let row = &mut w.w2[i * self.hidden..(i + 1) * self.hidden];
             for j in 0..self.hidden {
-                let upd = lr * g * h[j];
+                let upd = lr_eff * g * h[j];
                 let new = row[j] - upd;
                 row[j] = if new.is_finite() { new } else { row[j] };
             }
-            let new_b = w.b2[i] - lr * g;
+            let new_b = w.b2[i] - lr_eff * g;
             w.b2[i] = if new_b.is_finite() { new_b } else { w.b2[i] };
         }
         // Update W1 / b1.
@@ -1244,13 +1344,20 @@ impl NeuralSpeculator {
             }
             let row = &mut w.w1[i * self.d_model..(i + 1) * self.d_model];
             for j in 0..self.d_model {
-                let upd = lr * g * x[j];
+                let upd = lr_eff * g * x[j];
                 let new = row[j] - upd;
                 row[j] = if new.is_finite() { new } else { row[j] };
             }
-            let new_b = w.b1[i] - lr * g;
+            let new_b = w.b1[i] - lr_eff * g;
             w.b1[i] = if new_b.is_finite() { new_b } else { w.b1[i] };
         }
+
+        // Count this step *after* a successful update so the LR
+        // schedule advances monotonically. `train_step_locked` is the
+        // single point of entry for weight writes (both inline
+        // `train_step` and the off-path worker funnel through here),
+        // so the counter cannot double-bump.
+        self.train_steps.fetch_add(1, Ordering::Relaxed);
 
         loss
     }
