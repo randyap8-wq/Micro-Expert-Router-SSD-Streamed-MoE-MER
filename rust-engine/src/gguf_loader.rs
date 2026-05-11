@@ -182,10 +182,17 @@ pub fn extract_experts_from_gguf(
 
     for layer in 0..num_layers {
         info!(layer, "extracting layer experts");
-        for e in 0..num_experts {
+        // Decode each interleaved expert tensor at most once per
+        // layer, then slice every expert from the cached f32 buffer.
+        // Previously each `load_expert_matrices` call re-decoded the
+        // full gate/up/down tensors, so a layer with N experts paid
+        // for 3N redundant full-tensor decodes — prohibitive on real
+        // Mixtral checkpoints. `load_layer_expert_matrices` does the
+        // work once per layer instead.
+        let per_expert =
+            load_layer_expert_matrices(gguf, layer, num_experts, d_model, d_ff)?;
+        for (e, (gate, up, down)) in per_expert.into_iter().enumerate() {
             let global_id = layer * num_experts + e;
-            let (gate, up, down) =
-                load_expert_matrices(gguf, layer, e, num_experts, d_model, d_ff)?;
             let path = out_dir.join(format!("expert_{global_id}.bin"));
             let bytes = pack_expert_f32(&gate, &up, &down, expert_size);
             write_file(&path, &bytes)?;
@@ -406,6 +413,155 @@ fn bytes_to_f32(data: &[u8], dtype: u32, elems: usize, name: &str) -> io::Result
     }
 }
 
+/// Load the (gate, up, down) matrices for **every** expert in one
+/// layer. Returns a `Vec` of length `num_experts`, where each element is
+/// `(gate, up, down)` shaped as `Engine` expects: gate/up are
+/// `[d_ff, d_model]`, down is `[d_model, d_ff]`, all row-major.
+///
+/// This is the per-layer counterpart of `load_expert_matrices`: it
+/// dequantises each interleaved tensor at most **once** per layer
+/// (`O(1)` full-tensor decodes instead of `O(num_experts)`) and slices
+/// each expert's stride from the cached f32 buffer.
+///
+/// Fallbacks mirror `load_expert_matrices`:
+/// * If a layer has neither interleaved nor per-expert tensors,
+///   `num_experts` deterministic-zero triples are produced (the engine
+///   reseeds these at runtime).
+/// * If a tensor uses a dtype `bytes_to_f32` doesn't understand yet
+///   (e.g. some Q6_K/Q8_0 variants), the whole layer falls back to
+///   zero blobs — matching the documented "recognised for sizing only"
+///   behaviour. The convert never aborts on a single unsupported
+///   layer.
+fn load_layer_expert_matrices(
+    gguf: &GgufFile,
+    layer: usize,
+    num_experts: usize,
+    d_model: usize,
+    d_ff: usize,
+) -> io::Result<Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>> {
+    let interleaved_gate_name = format!("blk.{layer}.ffn_gate_exps.weight");
+    let interleaved_up_name = format!("blk.{layer}.ffn_up_exps.weight");
+    let interleaved_down_name = format!("blk.{layer}.ffn_down_exps.weight");
+    let per_expert_gate0 = format!("blk.{layer}.ffn_gate.0.weight");
+
+    let zero_layer = |reason: &str| {
+        warn!(layer, reason, "emitting zero blob for layer experts");
+        (0..num_experts)
+            .map(|_| {
+                (
+                    vec![0.0f32; d_ff * d_model],
+                    vec![0.0f32; d_ff * d_model],
+                    vec![0.0f32; d_model * d_ff],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if gguf.tensors.contains_key(&interleaved_gate_name) {
+        // Decode each interleaved tensor exactly once and reuse it for
+        // all experts in the layer.
+        let gate_all = match dense_layer_tensor_f32(
+            gguf,
+            &interleaved_gate_name,
+            num_experts * d_ff * d_model,
+        ) {
+            Ok(v) => v,
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                return Ok(zero_layer("unsupported dtype in interleaved gate tensor"));
+            }
+            Err(err) => return Err(err),
+        };
+        let up_all = match dense_layer_tensor_f32(
+            gguf,
+            &interleaved_up_name,
+            num_experts * d_ff * d_model,
+        ) {
+            Ok(v) => v,
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                return Ok(zero_layer("unsupported dtype in interleaved up tensor"));
+            }
+            Err(err) => return Err(err),
+        };
+        let down_all = match dense_layer_tensor_f32(
+            gguf,
+            &interleaved_down_name,
+            num_experts * d_model * d_ff,
+        ) {
+            Ok(v) => v,
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                return Ok(zero_layer("unsupported dtype in interleaved down tensor"));
+            }
+            Err(err) => return Err(err),
+        };
+
+        let per_gate_up = d_ff * d_model;
+        let per_down = d_model * d_ff;
+        let mut out = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let gs = e * per_gate_up;
+            let us = e * per_gate_up;
+            let ds = e * per_down;
+            out.push((
+                gate_all[gs..gs + per_gate_up].to_vec(),
+                up_all[us..us + per_gate_up].to_vec(),
+                down_all[ds..ds + per_down].to_vec(),
+            ));
+        }
+        Ok(out)
+    } else if gguf.tensors.contains_key(&per_expert_gate0) {
+        // Per-expert tensors: each expert's tensors are already
+        // separate, so a layer-level cache buys nothing — just dispatch
+        // to `load_expert_matrices`, catching Unsupported per expert.
+        let mut out = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            match load_expert_matrices(gguf, layer, e, num_experts, d_model, d_ff) {
+                Ok(triple) => out.push(triple),
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                    warn!(
+                        layer,
+                        expert = e,
+                        "unsupported dtype in per-expert tensor; emitting zero blob"
+                    );
+                    out.push((
+                        vec![0.0f32; d_ff * d_model],
+                        vec![0.0f32; d_ff * d_model],
+                        vec![0.0f32; d_model * d_ff],
+                    ));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(out)
+    } else {
+        warn!(layer, "no expert weight tensor found in GGUF; emitting zero blobs");
+        Ok(zero_layer("no expert weight tensor"))
+    }
+}
+
+/// Decode a dense tensor by name and validate it has exactly the
+/// expected number of f32 elements. Errors with `InvalidData` on size
+/// mismatch and propagates `Unsupported` from `bytes_to_f32`.
+fn dense_layer_tensor_f32(
+    gguf: &GgufFile,
+    name: &str,
+    expected: usize,
+) -> io::Result<Vec<f32>> {
+    let info = gguf.tensors.get(name).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("tensor {name} missing"))
+    })?;
+    let v = dense_tensor_to_f32(gguf, info)?;
+    if v.len() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "tensor {name} has {} elements, expected {expected}",
+                v.len()
+            ),
+        ));
+    }
+    Ok(v)
+}
+
 /// Load the (gate, up, down) matrices for one expert. Returns each as a
 /// flat row-major `Vec<f32>` in the engine's expected layout: gate / up
 /// are `[d_ff, d_model]`, down is `[d_model, d_ff]`.
@@ -417,6 +573,10 @@ fn bytes_to_f32(data: &[u8], dtype: u32, elems: usize, name: &str) -> io::Result
 /// Per-expert tensor shapes:
 ///   `ffn_gate.{e}.weight`: `[d_model, d_ff]` (gate, up)
 ///   `ffn_down.{e}.weight`: `[d_ff,    d_model]` (down)
+///
+/// Prefer `load_layer_expert_matrices` for whole-layer extraction: it
+/// caches each decoded interleaved tensor so the per-expert slicing is
+/// not `O(num_experts)` redundant decodes.
 fn load_expert_matrices(
     gguf: &GgufFile,
     layer: usize,

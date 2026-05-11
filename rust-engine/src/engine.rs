@@ -41,17 +41,26 @@ use tracing::{debug, info, warn};
 /// against real routing distributions. See gist Phase 6.
 pub struct TraceWriter {
     file: parking_lot::Mutex<std::io::BufWriter<std::fs::File>>,
+    /// Set to `true` the first time a write fails so subsequent failures
+    /// stay silent. Without this guard a sticky I/O error (full disk,
+    /// unwritable path) would emit a `warn!` on *every* record and
+    /// drown the rest of the logs.
+    write_failed_once: std::sync::atomic::AtomicBool,
 }
 
 impl TraceWriter {
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        // Append semantics: documented as "appends one record per
+        // token", so existing trace files must be preserved across
+        // invocations. `create(true)` still creates the file if it
+        // doesn't already exist.
         let f = std::fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
-            .write(true)
+            .append(true)
             .open(path)?;
         Ok(Self {
             file: parking_lot::Mutex::new(std::io::BufWriter::new(f)),
+            write_failed_once: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -77,9 +86,16 @@ impl TraceWriter {
         s.push_str("]}\n");
         let mut g = self.file.lock();
         // Best-effort: a write failure on trace I/O must not abort the
-        // hot path. Log once and continue.
+        // hot path. Log once (latched via `write_failed_once`) and
+        // continue — subsequent failures stay silent so a sticky error
+        // can't spam the log.
         if let Err(e) = g.write_all(s.as_bytes()) {
-            warn!(error = %e, "trace writer failed; subsequent records may be lost");
+            if !self
+                .write_failed_once
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                warn!(error = %e, "trace writer failed; subsequent records may be lost (further failures suppressed)");
+            }
         }
     }
 
@@ -507,8 +523,8 @@ impl Engine {
         // Emit a trace record after we know which experts were chosen
         // and which were already resident. Layer is `0` for the
         // single-namespace flat router path; the multi-layer path
-        // (`moe_step`) carries its own layer id and would call into a
-        // future `trace_writer.write_record(token, layer, …)` directly.
+        // (`moe_step`) emits its own record with the caller-supplied
+        // layer id.
         if let Some(tw) = self.trace_writer.read().as_ref() {
             tw.write_record(token_idx, 0, &target, &cache_hits_per_expert);
         }
@@ -1005,6 +1021,7 @@ impl Engine {
     pub async fn moe_step(
         self: &Arc<Self>,
         token_idx: u64,
+        layer: u32,
         x: &HiddenState,
         experts: &[u32],
     ) -> Vec<HiddenState> {
@@ -1070,15 +1087,26 @@ impl Engine {
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
         let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
             Vec::new();
+        let mut cache_hits_per_expert: Vec<bool> = Vec::with_capacity(target.len());
         for (i, &id) in target.iter().enumerate() {
             if let Some(r) = self.cache.get(id) {
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 residents[i] = Some(r);
+                cache_hits_per_expert.push(true);
             } else {
                 self.counters.misses.fetch_add(1, Ordering::Relaxed);
                 let me = self.clone();
                 miss_handles.push((i, tokio::spawn(async move { me.fetch(id).await })));
+                cache_hits_per_expert.push(false);
             }
+        }
+        // Emit one routing-trace record per `moe_step` call — same
+        // contract as `generate`, but with the real per-layer index
+        // supplied by the caller. This is what makes `--trace-out`
+        // useful for the `--gate-weights` and real-transformer paths
+        // (which go through `moe_step`, not `generate`).
+        if let Some(tw) = self.trace_writer.read().as_ref() {
+            tw.write_record(token_idx, layer, &target, &cache_hits_per_expert);
         }
         let had_misses = !miss_handles.is_empty();
         for (i, h) in miss_handles {

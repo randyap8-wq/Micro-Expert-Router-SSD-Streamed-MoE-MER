@@ -821,7 +821,7 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // experts across the listed directories by `id % n_drives`. The
     // single-dir path is unchanged. Done early because the io_uring
     // NUMA probe below also takes the (canonical) data dir.
-    let data_dirs: Vec<PathBuf> = parse_striped_data_dir(&args.data_dir);
+    let data_dirs: Vec<PathBuf> = parse_striped_data_dir(&args.data_dir)?;
     let primary_dir = data_dirs.first().cloned().unwrap_or_else(|| args.data_dir.clone());
     for d in &data_dirs {
         if !d.is_dir() {
@@ -1100,7 +1100,7 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             let pre_hits = engine.report().hits;
             let pre_misses = engine.report().misses;
             let pre_bytes = engine.report().bytes_read;
-            let _ = engine.moe_step(t, &hidden, &dec.experts).await;
+            let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
             let post = engine.report();
             crate::engine::CycleStats {
                 hits: post.hits.saturating_sub(pre_hits),
@@ -1490,16 +1490,28 @@ pub fn detect_data_dir_numa_node(data_dir: &std::path::Path) -> Option<i32> {
 /// Parse `--data-dir` into a list of directories. If the path
 /// stringifies to a comma-separated list, split it; otherwise return a
 /// single-element vec. Used by gist Phase 4 (multi-drive striping).
-fn parse_striped_data_dir(p: &std::path::Path) -> Vec<PathBuf> {
+fn parse_striped_data_dir(
+    p: &std::path::Path,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let s = p.to_string_lossy();
     if s.contains(',') {
-        s.split(',')
+        let dirs: Vec<PathBuf> = s
+            .split(',')
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(PathBuf::from)
-            .collect()
+            .collect();
+        if dirs.is_empty() {
+            return Err(format!(
+                "invalid --data-dir '{}': comma-separated list must contain at least one \
+                 non-empty directory path",
+                p.display()
+            )
+            .into());
+        }
+        Ok(dirs)
     } else {
-        vec![p.to_path_buf()]
+        Ok(vec![p.to_path_buf()])
     }
 }
 
@@ -1573,29 +1585,41 @@ async fn cmd_validate_predictor(
         tokens_per_layer.entry(layer).or_default().push(experts);
     }
 
-    // Per-cache-size simulation: maintain a tiny LRU and count hits.
+    // Per-cache-size simulation: maintain a single LRU shared across
+    // *all* layers in the trace and count hits. This matches
+    // `scripts/compute_transition_matrix.py::simulate_lru`, which
+    // replays the trace through one global LRU rather than per-layer
+    // caches — having both lets the Rust and Python paths produce
+    // identical hit-rate numbers for the same trace.
     let ks: Vec<usize> = if cache_slots.is_empty() {
         vec![2, 4, 8, 16]
     } else {
         cache_slots.to_vec()
     };
+    // Flatten the per-layer sequences in token order so the LRU sees
+    // the *same* token stream the engine produced. `tokens_per_layer`
+    // is keyed by layer but the original record order is preserved
+    // within each layer's bucket; concatenating in layer order
+    // reproduces the per-token-per-layer interleaving for a given run.
+    let flat_seq: Vec<&Vec<u32>> = tokens_per_layer
+        .values()
+        .flat_map(|v| v.iter())
+        .collect();
     println!("validate-predictor: trace={}", trace_path.display());
     for k in &ks {
         let mut hits = 0u64;
         let mut total = 0u64;
-        for (_layer, seq) in tokens_per_layer.iter() {
-            let mut lru: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
-            for experts in seq {
-                for &e in experts {
-                    if lru.iter().any(|&x| x == e) {
-                        hits += 1;
-                        lru.retain(|&x| x != e);
-                    } else if lru.len() == *k {
-                        lru.pop_front();
-                    }
-                    lru.push_back(e);
-                    total += 1;
+        let mut lru: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        for experts in &flat_seq {
+            for &e in experts.iter() {
+                if lru.iter().any(|&x| x == e) {
+                    hits += 1;
+                    lru.retain(|&x| x != e);
+                } else if lru.len() == *k {
+                    lru.pop_front();
                 }
+                lru.push_back(e);
+                total += 1;
             }
         }
         let rate = if total > 0 {

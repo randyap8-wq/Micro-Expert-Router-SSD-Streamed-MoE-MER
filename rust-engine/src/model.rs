@@ -555,7 +555,9 @@ impl RealModel {
             // already baked into RoPE inside `attn_block`.
             let token_idx = (pos as u64).wrapping_mul(self.config.num_layers as u64)
                 + layer_idx as u64;
-            let expert_outs = engine.moe_step(token_idx, &normed, &global_ids).await;
+            let expert_outs = engine
+                .moe_step(token_idx, layer_idx as u32, &normed, &global_ids)
+                .await;
             debug_assert_eq!(expert_outs.len(), routing.weights.len());
             x = layer.moe_combine(&x, &expert_outs, &routing.weights);
         }
