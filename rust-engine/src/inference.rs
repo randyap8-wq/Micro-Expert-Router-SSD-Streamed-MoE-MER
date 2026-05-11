@@ -821,27 +821,48 @@ fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_mode
         // (same one ndarray uses for `dot`) gives ~5–10× over the
         // scalar loop on dense f32 weights, which is the largest
         // win available in this codebase aside from quantising.
+        //
+        // We avoid two per-call `Vec<f32>` allocations on this
+        // per-token / per-expert hot path:
+        //   * `g` is written *directly* into the caller-supplied
+        //     `gated` slot, then later overwritten in place with
+        //     `silu(gated[i]) * u[i]`.
+        //   * `u` is written into a thread-local scratch buffer that
+        //     is grown to `d_ff` on first use and reused on every
+        //     subsequent call.
         let d_ff = gated.len();
-        let mut g_vec = vec![0.0f32; d_ff];
-        let mut u_vec = vec![0.0f32; d_ff];
-        // Safety: SGEMM contract — row-major (m × k) · (k × n) → (m × n).
-        unsafe {
-            matrixmultiply::sgemm(
-                d_ff, d_model, 1, 1.0,
-                gate.as_ptr(), d_model as isize, 1,
-                x.as_ptr(), 1, 1,
-                0.0, g_vec.as_mut_ptr(), 1, 1,
-            );
-            matrixmultiply::sgemm(
-                d_ff, d_model, 1, 1.0,
-                up.as_ptr(), d_model as isize, 1,
-                x.as_ptr(), 1, 1,
-                0.0, u_vec.as_mut_ptr(), 1, 1,
-            );
+        thread_local! {
+            static SGEMM_SCRATCH: std::cell::RefCell<Vec<f32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
-        for i in 0..d_ff {
-            gated[i] = silu(g_vec[i]) * u_vec[i];
-        }
+        SGEMM_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            if scratch.len() < d_ff {
+                scratch.resize(d_ff, 0.0);
+            }
+            let u_vec = &mut scratch[..d_ff];
+            // Safety: SGEMM contract — row-major (m × k) · (k × n) → (m × n).
+            // `gated` and `u_vec` are disjoint (one is the caller's
+            // output buffer, the other is a thread-local scratch),
+            // and neither aliases `gate`, `up`, or `x`.
+            unsafe {
+                matrixmultiply::sgemm(
+                    d_ff, d_model, 1, 1.0,
+                    gate.as_ptr(), d_model as isize, 1,
+                    x.as_ptr(), 1, 1,
+                    0.0, gated.as_mut_ptr(), 1, 1,
+                );
+                matrixmultiply::sgemm(
+                    d_ff, d_model, 1, 1.0,
+                    up.as_ptr(), d_model as isize, 1,
+                    x.as_ptr(), 1, 1,
+                    0.0, u_vec.as_mut_ptr(), 1, 1,
+                );
+            }
+            for i in 0..d_ff {
+                gated[i] = silu(gated[i]) * u_vec[i];
+            }
+        });
         return;
     }
 

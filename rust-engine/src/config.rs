@@ -71,17 +71,19 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub rate_limit_burst: u32,
 
-    /// Path to a PEM-encoded TLS certificate. When both `tls_cert`
-    /// and `tls_key` are set, the server starts in HTTPS mode using
-    /// rustls. **Production setups should usually terminate TLS at a
-    /// reverse proxy** (nginx, Envoy, AWS ALB) — this knob exists for
-    /// closed-network deployments where the engine binary needs to
-    /// serve HTTPS directly. See `docs/production.md`.
+    /// Path to a PEM-encoded TLS certificate. **Production setups
+    /// should usually terminate TLS at a reverse proxy** (nginx,
+    /// Envoy, AWS ALB) — these knobs exist to document the intended
+    /// HTTPS deployment shape for closed-network setups where the
+    /// engine binary needs to serve HTTPS directly. See
+    /// `docs/production.md`.
     ///
-    /// This release does *not* link rustls into the binary; the field
-    /// is honoured by [`Config::validate`] and a clear error is
-    /// emitted at startup if it is set. Wiring rustls is a one-line
-    /// `axum_server::bind_rustls` once the deployment is ready.
+    /// This release does *not* link rustls into the binary. When both
+    /// `tls_cert` and `tls_key` are set, [`Config::validate`] logs a
+    /// `WARN` and the server continues to bind plain HTTP. Setting
+    /// only one of the two is a hard validation error. Wiring rustls
+    /// is a one-line `axum_server::bind_rustls` once the deployment
+    /// is ready.
     #[serde(default)]
     pub tls_cert: Option<PathBuf>,
     #[serde(default)]
