@@ -564,7 +564,7 @@ mod tests {
         // serialisation.
         let cache = Arc::new(ExpertCache::new((total as usize).max(2)));
         let pool = BufferPool::new(total as usize + 4, expert_size, block);
-        let router = Arc::new(TopKRouter::new(total, cfg.top_k, 1));
+        let router = crate::gating::Router::Markov(Arc::new(TopKRouter::new(total, cfg.top_k, 1)));
         let predictor = Arc::new(PredictiveLoader::new(total, 0, 0.05, 1));
         let engine = Arc::new(Engine::with_options(
             cache,

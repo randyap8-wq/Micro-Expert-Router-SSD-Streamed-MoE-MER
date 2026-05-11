@@ -734,7 +734,7 @@ mod tests {
         // The engine's TopKRouter is unused by `moe_step` (the gate
         // produces ids directly), but the engine constructor still
         // requires one.
-        let router = Arc::new(TopKRouter::new(total, cfg.top_k, 1));
+        let router = crate::gating::Router::Markov(Arc::new(TopKRouter::new(total, cfg.top_k, 1)));
         let predictor = Arc::new(PredictiveLoader::new(total, 0, 0.05, 1));
         Arc::new(Engine::with_options(
             cache,

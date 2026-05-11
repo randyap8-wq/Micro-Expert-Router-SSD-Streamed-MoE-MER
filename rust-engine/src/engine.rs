@@ -15,6 +15,7 @@
 
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
+use crate::gating::Router;
 use crate::inference::{
     combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4_0,
     run_inference_q4k, synth_hidden_state,
@@ -23,7 +24,7 @@ use crate::inference::{
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
-use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter};
+use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader};
 use hdrhistogram::Histogram;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -320,7 +321,16 @@ pub struct Engine {
     cache: Arc<ExpertCache>,
     pool: BufferPool,
     storage: Arc<NvmeStorage>,
-    router: Arc<TopKRouter>,
+    /// Routing strategy. `Router::Linear` runs the production
+    /// `LinearGate` (`softmax(W_gate · x) → top-K`) and is the path
+    /// `cmd_serve` wires up when `[real_transformer].enabled = true`
+    /// and the loaded model exposes per-layer gate weights;
+    /// `Router::Markov` runs the legacy deterministic `TopKRouter`
+    /// over expert ids and is the benchmark / `--io-only` fallback.
+    /// Both are exercised by the engine through the same call site,
+    /// so swapping them does not change cache / I/O / hit-rate
+    /// telemetry shape, only which expert ids are selected.
+    router: Router,
     predictor: Arc<PredictiveLoader>,
     shape: ModelShape,
     options: EngineOptions,
@@ -423,7 +433,7 @@ impl Engine {
         cache: Arc<ExpertCache>,
         pool: BufferPool,
         storage: Arc<NvmeStorage>,
-        router: Arc<TopKRouter>,
+        router: Router,
         predictor: Arc<PredictiveLoader>,
         shape: ModelShape,
     ) -> Self {
@@ -434,12 +444,12 @@ impl Engine {
         cache: Arc<ExpertCache>,
         pool: BufferPool,
         storage: Arc<NvmeStorage>,
-        router: Arc<TopKRouter>,
+        router: Router,
         predictor: Arc<PredictiveLoader>,
         shape: ModelShape,
         options: EngineOptions,
     ) -> Self {
-        let speculator_topk_default = router.k();
+        let speculator_topk_default = router.top_k();
         Self {
             cache,
             pool,
@@ -570,7 +580,16 @@ impl Engine {
     /// update predictor, and kick off prefetches. Returns one [`CycleStats`].
     pub async fn generate(self: &Arc<Self>, token_idx: u64) -> CycleStats {
         let cycle_start = Instant::now();
-        let raw_target = self.router.route(token_idx);
+        // Compute the residual-stream hidden state up front. The
+        // production `Router::Linear` path needs it to compute the
+        // gate's softmax logits; the legacy `Router::Markov` path
+        // ignores it. Either way the value is re-used by the FFN
+        // forward pass below, so this is at worst the same single
+        // `synth_hidden_state` call the legacy path always made.
+        let hidden: HiddenState =
+            synth_hidden_state(token_idx, self.shape.d_model, self.shape.hidden_seed);
+        let decision = self.router.route(&hidden, token_idx);
+        let raw_target = decision.experts;
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids. This is what makes deduplicated
         // experts share one resident copy.
@@ -717,19 +736,23 @@ impl Engine {
             us
         } else {
             // Real expert FFN forward pass over weights streamed from SSD.
-            // `synth_hidden_state` mocks the residual-stream activation that
-            // would normally come from the previous transformer layer.
-            let x: HiddenState =
-                synth_hidden_state(token_idx, self.shape.d_model, self.shape.hidden_seed);
+            // `hidden` is the residual-stream activation already
+            // computed at the top of `generate`; under
+            // `Router::Linear` it is *the same* tensor that drove the
+            // routing decision, so the FFN sees the exact gate
+            // input (the production path), and under `Router::Markov`
+            // it stays the synthetic placeholder the benchmark path
+            // has always used.
+            let x: &HiddenState = &hidden;
             let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
             let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
             for r in &residents {
                 let res = match self.options.dtype {
-                    WeightDtype::F32 => run_inference(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
-                    WeightDtype::F16 => run_inference_f16(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
-                    WeightDtype::Int8 => run_inference_int8(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
-                    WeightDtype::Q4K => run_inference_q4k(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
-                    WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, &x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::F32 => run_inference(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                    WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
                 };
                 match res {
                     Ok((out, y)) => {
@@ -796,12 +819,11 @@ impl Engine {
                 None => self.predictor.predict_next(seed),
             };
             drop(last_last);
-            // Speculator: predict + train on the synthetic hidden state
-            // (when the speculator's d_model matches; otherwise this is
+            // Speculator: predict + train on the residual-stream
+            // hidden state computed at the top of `generate` (when
+            // the speculator's d_model matches; otherwise this is
             // a no-op — see `speculator_predict_and_train`).
-            let x_for_spec: HiddenState =
-                synth_hidden_state(token_idx, self.shape.d_model, self.shape.hidden_seed);
-            let m_speculator = self.speculator_predict_and_train(&x_for_spec, &target);
+            let m_speculator = self.speculator_predict_and_train(&hidden, &target);
             self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
         }
 
@@ -1390,7 +1412,7 @@ impl Engine {
             cache_capacity: self.cache.capacity(),
             pool_capacity: self.pool.capacity(),
             num_experts: self.router.num_experts(),
-            top_k: self.router.k(),
+            top_k: self.router.top_k(),
             d_model: self.shape.d_model,
             d_ff: self.shape.d_ff,
             predictor_observations: self.predictor.observations(),
@@ -1643,7 +1665,7 @@ mod tests {
         let pool_slots = cache_slots + predict_fanout.max(1);
         let pool = BufferPool::new(pool_slots, expert_size, block_align);
         let cache = Arc::new(ExpertCache::new(cache_slots));
-        let router = Arc::new(TopKRouter::new(num_experts, top_k, seed));
+        let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, top_k, seed)));
         let predictor = Arc::new(PredictiveLoader::new(num_experts, predict_fanout, 0.05, seed));
 
         Arc::new(Engine::new(
