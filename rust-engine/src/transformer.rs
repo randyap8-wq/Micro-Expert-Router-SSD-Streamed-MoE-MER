@@ -244,13 +244,16 @@ fn zeroize_blocks(blocks: &mut [Box<[f32]>]) {
         let ptr = block.as_mut_ptr();
         let len = block.len();
         // Safety: `block` is a `Box<[f32]>` (boxed slice) of length
-        // `len`. `ptr` is the start of its single, contiguous heap
-        // allocation, so every offset `0..len` is in-bounds and
-        // properly aligned for `f32` (the allocator returns a
-        // pointer aligned for the slice's element type). The slice
-        // is uniquely borrowed via `&mut block`, so no other thread
-        // or reference can observe or mutate these bytes for the
-        // duration of the loop.
+        // `len`. If `len == 0`, the loop below executes zero times,
+        // so `ptr` is never dereferenced; this remains valid even if
+        // an empty boxed slice uses a dangling but properly aligned
+        // non-null pointer and performs no allocation. If `len > 0`,
+        // `ptr` points to the start of the slice's contiguous
+        // storage, so every offset `0..len` is in-bounds and
+        // properly aligned for `f32`. The slice is uniquely borrowed
+        // via `&mut block`, so no other thread or reference can
+        // observe or mutate these bytes for the duration of the
+        // loop.
         for i in 0..len {
             unsafe { std::ptr::write_volatile(ptr.add(i), 0.0f32) };
         }
