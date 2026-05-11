@@ -413,7 +413,7 @@ pub const Q4_0_BLOCK_ELEMS: usize = 32;
 /// ```text
 ///   d   : f16 (2 bytes)         — block scale
 ///   qs  : 16 bytes              — 32x 4-bit symmetric weights
-///                                 (low nibble first; q ∈ 0..16,
+///                                 (low nibble first; q ∈ 0..=15,
 ///                                 dequantised as `d * (q - 8)`).
 /// ```
 /// Total: `2 + 16 = 18` bytes. Effective bytes-per-weight = 18/32

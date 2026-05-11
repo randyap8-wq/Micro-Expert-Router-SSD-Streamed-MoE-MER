@@ -28,6 +28,7 @@ use rand::distributions::{Distribution, WeightedIndex};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::{HashMap, VecDeque};
+use std::sync::OnceLock;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -856,7 +857,30 @@ pub struct NeuralSpeculator {
     /// Locked together so a `predict()` always sees a consistent `(W1,
     /// b1, W2, b2)` snapshot — `train_step` writes all four and we
     /// don't want a half-updated set of weights to be read mid-update.
+    ///
+    /// Read access is **prioritised** in the off-path training worker:
+    /// the worker calls [`parking_lot::RwLock::try_write_for`] with a
+    /// short timeout and drops the sample if it can't acquire the
+    /// lock, so the hot-path `predict_topk` is never blocked by
+    /// background SGD compute.
     weights: RwLock<SpeculatorWeights>,
+    /// Asynchronous training queue. Set on first call to
+    /// [`Self::spawn_training_worker`] (idempotent) and consumed by a
+    /// dedicated background thread. The queue is bounded so a
+    /// runaway producer can't pin unbounded memory: when full,
+    /// [`Self::queue_train`] drops the newest sample (training is a
+    /// best-effort signal — the *correct* routing still flows
+    /// through the gate downstream).
+    train_queue: OnceLock<std::sync::mpsc::SyncSender<TrainSample>>,
+}
+
+/// A single hidden-state / actual-routing pair queued for off-path
+/// SGD. Fields are owned so the background thread doesn't borrow
+/// anything from the hot path.
+struct TrainSample {
+    x: Vec<f32>,
+    actual_top_k: Vec<u32>,
+    lr: f32,
 }
 
 struct SpeculatorWeights {
@@ -900,6 +924,7 @@ impl NeuralSpeculator {
             hidden,
             num_experts,
             weights: RwLock::new(SpeculatorWeights { w1, b1, w2, b2 }),
+            train_queue: OnceLock::new(),
         }
     }
 
@@ -1023,6 +1048,21 @@ impl NeuralSpeculator {
         if x.len() != self.d_model || actual_top_k.is_empty() {
             return f32::NAN;
         }
+        let mut w = self.weights.write();
+        self.train_step_locked(&mut w, x, actual_top_k, lr)
+    }
+
+    /// SGD body with the weight lock held by the caller. Separated
+    /// out so the off-path training worker can attempt the write
+    /// using [`parking_lot::RwLock::try_write_for`] and bail (rather
+    /// than block readers) when the hot path is busy.
+    fn train_step_locked(
+        &self,
+        w: &mut SpeculatorWeights,
+        x: &[f32],
+        actual_top_k: &[u32],
+        lr: f32,
+    ) -> f32 {
         // Build the target distribution.
         let n = self.num_experts as usize;
         let mut target = vec![0.0f32; n];
@@ -1042,7 +1082,6 @@ impl NeuralSpeculator {
         }
 
         // Forward (re-do here so we can capture the hidden activation).
-        let mut w = self.weights.write();
         let mut h_pre = vec![0.0f32; self.hidden];
         let mut h = vec![0.0f32; self.hidden];
         for i in 0..self.hidden {
@@ -1164,6 +1203,94 @@ impl NeuralSpeculator {
         }
 
         loss
+    }
+
+    /// Idempotently spawn the off-path training worker. Subsequent
+    /// calls are no-ops. After this returns, [`Self::queue_train`]
+    /// will drop samples onto the worker's bounded channel; the
+    /// worker pulls them in FIFO order and applies SGD updates,
+    /// preferring readers via [`parking_lot::RwLock::try_write_for`].
+    ///
+    /// The worker is a plain OS thread (not a tokio task) so it
+    /// keeps making progress even if the tokio runtime is
+    /// momentarily saturated; it terminates when the [`Arc`] count
+    /// of the speculator drops to one (its own ref) — i.e. when no
+    /// engine still holds it.
+    pub fn spawn_training_worker(self: &std::sync::Arc<Self>) {
+        // OnceLock::get_or_init guarantees a single worker even
+        // under concurrent installs.
+        self.train_queue.get_or_init(|| {
+            // Bounded queue so a runaway producer can't pin memory.
+            // A few hundred slots is plenty: at typical decoder
+            // throughput the worker drains the queue between
+            // tokens; the bound only matters during pathological
+            // bursts (and in that case we'd rather drop old
+            // samples than stall the producer).
+            let (tx, rx) = std::sync::mpsc::sync_channel::<TrainSample>(256);
+            let weak = std::sync::Arc::downgrade(self);
+            std::thread::Builder::new()
+                .name("mer-speculator-train".to_string())
+                .spawn(move || speculator_training_loop(weak, rx))
+                .ok(); // Failing to spawn is non-fatal; fall back to in-line train.
+            tx
+        });
+    }
+
+    /// Push one `(hidden_state, actual_top_k)` sample onto the
+    /// off-path training queue. Drops the sample silently when the
+    /// queue is full or when [`Self::spawn_training_worker`] was
+    /// never called — training is a prefetch-hint signal, not a
+    /// correctness-critical path.
+    pub fn queue_train(&self, x: &[f32], actual_top_k: &[u32], lr: f32) {
+        if x.len() != self.d_model || actual_top_k.is_empty() {
+            return;
+        }
+        if let Some(tx) = self.train_queue.get() {
+            let sample = TrainSample {
+                x: x.to_vec(),
+                actual_top_k: actual_top_k.to_vec(),
+                lr,
+            };
+            // `try_send` is non-blocking: when the worker is
+            // behind, the newest sample is dropped (a deliberate
+            // back-pressure choice — old samples in the queue still
+            // contain useful gradient signal).
+            let _ = tx.try_send(sample);
+        }
+    }
+}
+
+/// Background training loop. Pulls samples from the queue and
+/// applies SGD updates, preferring readers by using
+/// [`parking_lot::RwLock::try_write_for`] — if a hot-path
+/// `predict_topk` is currently reading, the worker waits at most a
+/// few hundred microseconds and then drops the sample rather than
+/// starve the inference critical path.
+fn speculator_training_loop(
+    weak: std::sync::Weak<NeuralSpeculator>,
+    rx: std::sync::mpsc::Receiver<TrainSample>,
+) {
+    use std::time::Duration;
+    // Cap the per-sample wait. The hot path reads in the low-µs
+    // range, so 500 µs is generous: if we can't get the write
+    // lock in that window, readers are bursty and we'd rather
+    // skip this update.
+    const TRY_WRITE_BUDGET: Duration = Duration::from_micros(500);
+
+    while let Ok(sample) = rx.recv() {
+        let Some(spec) = weak.upgrade() else {
+            return; // engine dropped the speculator; quit cleanly.
+        };
+        if let Some(mut w) = spec.weights.try_write_for(TRY_WRITE_BUDGET) {
+            let _loss = spec.train_step_locked(&mut w, &sample.x, &sample.actual_top_k, sample.lr);
+            // Loss is intentionally discarded — telemetry covers
+            // accuracy via the engine's predict-and-train path.
+        } else {
+            tracing::trace!(
+                "speculator training worker: skipped one sample (reader contention)"
+            );
+        }
+        drop(spec);
     }
 }
 

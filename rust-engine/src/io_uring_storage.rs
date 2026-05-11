@@ -52,6 +52,31 @@ pub struct IoUringConfig {
     /// Submission queue depth. Tracking expert top-K * cache_slots is
     /// usually enough; 64 is a safe default for small models.
     pub queue_depth: u32,
+    /// Optional NUMA node hint. When `Some(n)` and the build target
+    /// is Linux, the **constructing thread's** CPU affinity is pinned
+    /// to the CPUs that belong to NUMA node `n` (as reported by
+    /// `/sys/devices/system/node/node{n}/cpulist`) before
+    /// `io_uring_register` is called. Because `register_buffers` and
+    /// the per-ring kernel memory the kernel allocates during ring
+    /// creation are charged to the calling thread's NUMA locality,
+    /// this keeps the ring's metadata co-located with the buffers and
+    /// the SSD's DMA target. Failures are best-effort: an unknown
+    /// node id, missing sysfs entries, or a denied `sched_setaffinity`
+    /// call all degrade silently (logged at WARN) rather than fail
+    /// the construction.
+    pub numa_node: Option<i32>,
+}
+
+impl Default for IoUringConfig {
+    fn default() -> Self {
+        Self {
+            base_path: PathBuf::from("."),
+            expert_size: 0,
+            block_align: 4096,
+            queue_depth: 64,
+            numa_node: None,
+        }
+    }
 }
 
 /// `io_uring` storage backend.
@@ -258,6 +283,29 @@ mod linux_impl {
             cfg: &super::IoUringConfig,
             iovecs: Vec<(*mut u8, usize)>,
         ) -> io::Result<Self> {
+            // Best-effort NUMA pinning before ring creation so the
+            // kernel allocates the ring's metadata on a node close
+            // to the buffers and (typically) the NVMe device.
+            // Failures are logged and ignored — pinning is a perf
+            // hint, never a correctness requirement.
+            if let Some(node) = cfg.numa_node {
+                if let Err(e) = pin_thread_to_numa_node(node) {
+                    tracing::warn!(
+                        node,
+                        error = %e,
+                        "io_uring: NUMA pinning to node {} failed; ring will be created \
+                         with default affinity",
+                        node
+                    );
+                } else {
+                    tracing::info!(
+                        node,
+                        "io_uring: pinned constructing thread to NUMA node {} \
+                         before ring registration",
+                        node
+                    );
+                }
+            }
             let ring = IoUring::new(cfg.queue_depth)?;
             let raw_iovecs: Vec<libc::iovec> = iovecs
                 .iter()
@@ -390,6 +438,90 @@ mod linux_impl {
             Ok(total)
         }
     }
+
+    /// Best-effort: pin the calling thread to the CPUs reported by
+    /// `/sys/devices/system/node/node{n}/cpulist`. Returns the
+    /// underlying io::Error on syscall failure or `InvalidInput` when
+    /// the sysfs entry is missing / unparseable so the caller can
+    /// emit a structured warning. The pin is *thread-local* — it
+    /// does not affect the rest of the process.
+    pub(super) fn pin_thread_to_numa_node(node: i32) -> io::Result<()> {
+        if node < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "numa node must be non-negative",
+            ));
+        }
+        let path = format!("/sys/devices/system/node/node{}/cpulist", node);
+        let body = std::fs::read_to_string(&path).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("could not read {path}: {e}"),
+            )
+        })?;
+        let cpus = parse_cpulist(&body).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("could not parse cpulist {:?}", body),
+            )
+        })?;
+        if cpus.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "numa node has empty cpulist",
+            ));
+        }
+        // SAFETY: cpu_set_t is a POD bitset; we zero it via
+        // mem::zeroed, fill in bits with libc helpers, and call
+        // pthread_setaffinity_np on the current thread (gettid()
+        // analogue) — the syscall only reads our buffer.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            for cpu in &cpus {
+                libc::CPU_SET(*cpu, &mut set);
+            }
+            // sched_setaffinity(0, ...) pins the *calling thread*
+            // (not the whole process) when CLONE_THREAD semantics
+            // are in effect, which is the case for every tokio /
+            // std::thread spawn. This matches what we want: only
+            // this io_uring construction thread is pinned; tokio
+            // workers and the engine's matmul thread pool remain
+            // free to schedule wherever the OS prefers.
+            let rc = libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &set as *const _,
+            );
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a kernel cpulist string (`"0-3,8,10-11"`) into a flat
+    /// vector of cpu ids. Returns `None` on parse error.
+    fn parse_cpulist(body: &str) -> Option<Vec<usize>> {
+        let mut out: Vec<usize> = Vec::new();
+        for part in body.trim().split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((lo, hi)) = part.split_once('-') {
+                let lo: usize = lo.parse().ok()?;
+                let hi: usize = hi.parse().ok()?;
+                if hi < lo {
+                    return None;
+                }
+                out.extend(lo..=hi);
+            } else {
+                out.push(part.parse().ok()?);
+            }
+        }
+        Some(out)
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +537,7 @@ mod tests {
                 expert_size: 4096,
                 block_align: 4096,
                 queue_depth: 8,
+                numa_node: None,
             },
             &pool,
         );
@@ -432,6 +565,7 @@ mod tests {
                 expert_size: 4096,
                 block_align: 4096,
                 queue_depth: 0,
+                numa_node: None,
             },
             &pool,
         );
@@ -467,6 +601,7 @@ mod tests {
                 expert_size,
                 block_align: block,
                 queue_depth: 8,
+                numa_node: None,
             },
             &pool,
         ) {

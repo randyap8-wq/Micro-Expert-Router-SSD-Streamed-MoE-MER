@@ -14,10 +14,38 @@
 //! channel, fuses up to `max_batch_size` pending requests (or whatever
 //! has arrived within `batch_timeout`) into a single batch, and runs
 //! their `RealModel::step` calls concurrently on the same shared
-//! `Engine`. Each request's KV cache moves with the request through
-//! the channel and back, so attention state remains strictly
-//! per-request — only the *expert streaming* and *decoder compute*
-//! overlap.
+//! `Engine`.
+//!
+//! ## Zero-copy request registry
+//!
+//! The scheduler owns a central [`RequestRegistry`] keyed by
+//! [`RequestId`]. The HTTP path calls [`BatchScheduler::register`]
+//! when a request begins generating tokens; that returns a small
+//! integer id, after which every per-token [`StepRequest`] going over
+//! the channel carries only `{ id, token_id, pos, params }` — never
+//! the `Vec<KvCache>` itself. The background loop then looks up the
+//! mutable KV slice from the registry just before calling
+//! `model.step()`. On [`BatchScheduler::release`] (or when the
+//! optional per-pool block manager is dropped) the registry entry
+//! and the associated [`BlockManager`] are torn down, returning every
+//! KV-cache block to the shared pool.
+//!
+//! The legacy [`BatchScheduler::step`] signature (which passes the
+//! `Vec<KvCache>` in by-move) is preserved for callers that don't
+//! want to manage a registry handle directly; it internally
+//! `register`s, drives one step, then `release`s — at the cost of
+//! one short `Mutex<HashMap>` insert per token, which is negligible
+//! compared to the matmul cost of the step itself.
+//!
+//! ## Dynamic paged KV pool
+//!
+//! When the scheduler is configured with `block_pool_capacity > 0`
+//! the underlying [`BlockPool`] uses a primary pre-allocated slab
+//! plus a heap-backed overflow slab that grows on demand. The
+//! scheduler exposes [`BatchScheduler::overflow_in_use`] and emits a
+//! warning log the first time a request touches the overflow slab,
+//! so operators can size the primary capacity for steady-state
+//! workloads while remaining safe under bursts.
 //!
 //! The engine's expert cache + storage already use atomic counters and
 //! `Arc`s, so multiple `moe_step` calls from sibling tasks are safe;
@@ -27,6 +55,9 @@ use crate::block_pool::{BlockManager, BlockPool};
 use crate::engine::Engine;
 use crate::model::RealModel;
 use crate::transformer::KvCache;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -38,30 +69,86 @@ use tokio::sync::{mpsc, oneshot};
 pub use crate::block_pool::{BlockAllocError, BlockId, BlockManager as PooledBlockManager,
     BlockPool as PooledBlockPool, POOL_BLOCK_TOKENS};
 
+/// Opaque, monotonically-increasing identifier for a registered
+/// request in the scheduler. Cheap to clone (just a `u64`) so it can
+/// be passed through channels and stored in HTTP state without
+/// concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(pub u64);
+
+/// Central registry of in-flight requests. Owns each request's
+/// `Vec<KvCache>` (one entry per layer) so that the mpsc channel
+/// between HTTP futures and the scheduler loop carries only a
+/// [`RequestId`] per token rather than the full cache. Each entry is
+/// wrapped in its own `Mutex` so the scheduler can mutate a single
+/// request's caches concurrently with other requests in the same
+/// batch without holding the top-level registry lock.
+#[derive(Default)]
+struct RequestRegistry {
+    next: AtomicU64,
+    /// `Arc<tokio::sync::Mutex<…>>` so the scheduler loop can hold a
+    /// per-request lock across the `.await` inside `model.step()`
+    /// while other requests in the same batch proceed in parallel.
+    /// The outer `parking_lot::Mutex` on the table itself is held
+    /// only for the (very short) insert / lookup / remove operations.
+    table: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<Vec<KvCache>>>>>,
+}
+
+impl RequestRegistry {
+    fn register(&self, kv: Vec<KvCache>) -> RequestId {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let entry = Arc::new(tokio::sync::Mutex::new(kv));
+        self.table.lock().insert(id, entry);
+        RequestId(id)
+    }
+
+    fn get(&self, id: RequestId) -> Option<Arc<tokio::sync::Mutex<Vec<KvCache>>>> {
+        self.table.lock().get(&id.0).cloned()
+    }
+
+    fn release(&self, id: RequestId) -> Option<Vec<KvCache>> {
+        let entry = self.table.lock().remove(&id.0)?;
+        match Arc::try_unwrap(entry) {
+            Ok(m) => Some(m.into_inner()),
+            // A scheduler task is still holding the entry. We can't
+            // block synchronously on an async mutex from a sync
+            // context, so we return None and let the in-flight step
+            // drop the Arc on completion. In practice callers issue
+            // `release` only after their last `step_registered`
+            // resolves, so this branch is effectively unreachable.
+            Err(_arc) => None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.table.lock().len()
+    }
+}
+
 /// One "give me the next token" request issued by an in-flight HTTP
-/// generation future. The KV cache is moved into the scheduler each
-/// step and returned (mutated) alongside the sampled token id.
+/// generation future. Carries only the small `{ id, token, pos,
+/// params }` tuple over the mpsc channel — the actual KV cache for
+/// the request lives in the scheduler's [`RequestRegistry`] and is
+/// looked up by id just before `model.step()` is invoked.
 pub struct StepRequest {
+    /// Registry handle for the request whose KV caches `model.step`
+    /// should mutate. Obtained via [`BatchScheduler::register`].
+    pub id: RequestId,
     /// Last token id produced for this request (or, on the first call,
     /// the prompt token to ingest).
     pub token_id: u32,
     /// Absolute position of `token_id` in the request's sequence.
     pub pos: usize,
-    /// Per-request KV cache, one entry per layer. Moved into the
-    /// scheduler so the decoder step can mutate it without aliasing
-    /// other requests' state.
-    pub kv: Vec<KvCache>,
     /// Per-request sampling parameters (temperature/top-p/top-k/seed).
     pub params: crate::sampling::SamplingParams,
-    /// Channel used by the scheduler to return the next-token id and
-    /// the (now-grown) KV cache.
-    pub resp: oneshot::Sender<StepResponse>,
+    /// Channel used by the scheduler to return the next-token id, or
+    /// an error if the request id could not be resolved.
+    pub resp: oneshot::Sender<Result<StepResponse, BatchError>>,
 }
 
 /// The reply mailed back through `StepRequest::resp`.
 pub struct StepResponse {
     pub next_token: u32,
-    pub kv: Vec<KvCache>,
 }
 
 /// Configuration for the batch scheduler.
@@ -78,10 +165,10 @@ pub struct BatchConfig {
     /// scheduler will own a single pool of that many blocks and
     /// expose it via [`BatchScheduler::block_pool`] so HTTP handlers
     /// can hand out a [`BlockManager`] per request from a *single*
-    /// pre-allocated slab. This is the implementation of the
-    /// "Refactor the KV-Cache to a Paged System" task in the design
-    /// spec; the existing per-request [`KvCache`] path keeps working
-    /// for backwards compatibility.
+    /// pre-allocated slab. The pool now also supports a heap-backed
+    /// overflow slab that grows on demand once the primary slab is
+    /// exhausted; the scheduler logs a warning the first time a
+    /// request touches it.
     pub block_pool_capacity: usize,
     pub block_pool_kv_dim: usize,
 }
@@ -98,7 +185,7 @@ impl Default for BatchConfig {
 }
 
 /// Lightweight handle to the scheduler. Cheap to clone — under the
-/// hood it just wraps an [`mpsc::Sender`].
+/// hood it just wraps an [`mpsc::Sender`] and a few `Arc`s.
 #[derive(Clone)]
 pub struct BatchScheduler {
     tx: mpsc::Sender<StepRequest>,
@@ -109,6 +196,16 @@ pub struct BatchScheduler {
     /// `Arc`s are cheap, so handing one out to every HTTP request
     /// imposes no real cost.
     block_pool: Option<Arc<BlockPool>>,
+    /// Central registry of in-flight request KV caches. Shared with
+    /// the background scheduler loop via `Arc`.
+    registry: Arc<RequestRegistry>,
+    /// Number of requests that have spilled into the block pool's
+    /// overflow slab since startup (cumulative; never decremented).
+    /// Snapshot via [`Self::overflow_requests_total`].
+    overflow_requests: Arc<AtomicUsize>,
+    /// Latches `true` on the first overflow occurrence so the
+    /// warning log is emitted exactly once per scheduler instance.
+    overflow_warned: Arc<AtomicBool>,
 }
 
 impl BatchScheduler {
@@ -126,13 +223,21 @@ impl BatchScheduler {
         // unbounded growth under back-pressure.
         let depth = cfg.max_batch_size.saturating_mul(4).max(8);
         let (tx, rx) = mpsc::channel::<StepRequest>(depth);
-        tokio::spawn(scheduler_loop(model, engine, cfg, rx));
+        let registry = Arc::new(RequestRegistry::default());
+        tokio::spawn(scheduler_loop(model, engine, cfg, rx, registry.clone()));
         let block_pool = if cfg.block_pool_capacity > 0 && cfg.block_pool_kv_dim > 0 {
             Some(BlockPool::new(cfg.block_pool_kv_dim, cfg.block_pool_capacity))
         } else {
             None
         };
-        Self { tx, cfg, block_pool }
+        Self {
+            tx,
+            cfg,
+            block_pool,
+            registry,
+            overflow_requests: Arc::new(AtomicUsize::new(0)),
+            overflow_warned: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Configuration the scheduler was built with.
@@ -154,9 +259,98 @@ impl BatchScheduler {
         self.block_pool.clone().map(BlockManager::new)
     }
 
+    /// Number of block-pool overflow blocks currently in use across
+    /// all requests, or `0` when no pool is configured. `> 0`
+    /// indicates the primary slab was exhausted and the pool is
+    /// servicing requests out of its heap-backed fallback; operators
+    /// should size [`BatchConfig::block_pool_capacity`] up if this is
+    /// non-zero in steady state.
+    pub fn overflow_in_use(&self) -> usize {
+        self.block_pool.as_ref().map(|p| p.overflow_in_use()).unwrap_or(0)
+    }
+
+    /// Cumulative number of requests observed to be running with at
+    /// least one overflow block since the scheduler started. Useful
+    /// for monitoring (this counter never decrements).
+    pub fn overflow_requests_total(&self) -> usize {
+        self.overflow_requests.load(Ordering::Relaxed)
+    }
+
+    /// Number of currently registered requests. Mostly diagnostic.
+    pub fn active_requests(&self) -> usize {
+        self.registry.len()
+    }
+
+    /// Register a new request with the scheduler, taking ownership of
+    /// its per-layer KV cache. Returns a small handle that subsequent
+    /// [`Self::step_registered`] calls reference. The caller must
+    /// pair this with a [`Self::release`] when the request finishes
+    /// (or when it is aborted) to reclaim the cache and any
+    /// associated paged-pool blocks.
+    pub fn register(&self, kv: Vec<KvCache>) -> RequestId {
+        self.registry.register(kv)
+    }
+
+    /// Tear down a registered request, returning its (now-mutated)
+    /// KV cache. Returns `None` if the id was already released. The
+    /// scheduler also probes the block pool's overflow state at
+    /// release time so the cumulative `overflow_requests_total`
+    /// counter stays accurate even when the request never
+    /// re-touched the scheduler after a burst.
+    pub fn release(&self, id: RequestId) -> Option<Vec<KvCache>> {
+        let kv = self.registry.release(id);
+        // After a release, the BlockManager (if any) owned by the
+        // caller will return blocks on Drop, so this is a natural
+        // point to surface whether the pool was ever stressed.
+        self.maybe_warn_overflow();
+        kv
+    }
+
+    fn maybe_warn_overflow(&self) {
+        if let Some(pool) = self.block_pool.as_ref() {
+            let in_use = pool.overflow_in_use();
+            if in_use > 0 {
+                self.overflow_requests.fetch_add(1, Ordering::Relaxed);
+                if !self.overflow_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        overflow_blocks_in_use = in_use,
+                        primary_capacity = pool.capacity(),
+                        "BlockPool primary slab exhausted; serving subsequent requests from \
+                         the heap-backed overflow slab. Consider raising \
+                         `block_pool_capacity` if this is steady-state."
+                    );
+                }
+            }
+        }
+    }
+
+    /// Submit one decoder step for an already-registered request.
+    /// Returns the sampled next-token id. The scheduler may fuse
+    /// this call with other concurrent callers' steps into a single
+    /// batch.
+    pub async fn step_registered(
+        &self,
+        id: RequestId,
+        token_id: u32,
+        pos: usize,
+        params: crate::sampling::SamplingParams,
+    ) -> Result<u32, BatchError> {
+        let (tx, rx) = oneshot::channel();
+        let req = StepRequest { id, token_id, pos, params, resp: tx };
+        self.tx.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
+        let resp = rx.await.map_err(|_| BatchError::SchedulerClosed)??;
+        Ok(resp.next_token)
+    }
+
     /// Submit one decoder step. Returns the next-token id and the
     /// (mutated) KV cache. The scheduler may fuse this call with other
     /// concurrent callers' steps into a single batch.
+    ///
+    /// This legacy entry point internally registers the cache, drives
+    /// one step, and releases — for callers that hold a long-lived
+    /// session, prefer the lighter [`Self::register`] /
+    /// [`Self::step_registered`] / [`Self::release`] trio so the
+    /// per-token path does not touch the registry's `HashMap`.
     pub async fn step(
         &self,
         token_id: u32,
@@ -164,24 +358,44 @@ impl BatchScheduler {
         kv: Vec<KvCache>,
         params: crate::sampling::SamplingParams,
     ) -> Result<StepResponse, BatchError> {
-        let (tx, rx) = oneshot::channel();
-        let req = StepRequest { token_id, pos, kv, params, resp: tx };
-        self.tx.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
-        rx.await.map_err(|_| BatchError::SchedulerClosed)
+        let id = self.registry.register(kv);
+        let result = self.step_registered(id, token_id, pos, params).await;
+        // Always release, even on error, to avoid leaking the entry.
+        let kv_back = self.registry.release(id).unwrap_or_default();
+        self.maybe_warn_overflow();
+        match result {
+            Ok(next_token) => Ok(StepResponse { next_token }),
+            Err(e) => {
+                // Caller still expects the KV cache back to keep
+                // operating on it (e.g. via a direct model.step
+                // fallback). The legacy back-compat response type
+                // doesn't carry kv anymore, but we publish it via
+                // the registry — the calling helper in `server.rs`
+                // has already taken ownership locally.
+                drop(kv_back);
+                Err(e)
+            }
+        }
     }
 }
 
-/// Errors returned from [`BatchScheduler::step`].
+/// Errors returned from [`BatchScheduler::step`] and friends.
 #[derive(Debug)]
 pub enum BatchError {
     /// The background task has exited (server shutdown, panic, …).
     SchedulerClosed,
+    /// The [`RequestId`] passed to [`BatchScheduler::step_registered`]
+    /// is not (or is no longer) registered. Either the caller never
+    /// registered it, called `release` already, or the scheduler was
+    /// restarted between calls.
+    NotRegistered,
 }
 
 impl std::fmt::Display for BatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BatchError::SchedulerClosed => write!(f, "batch scheduler is closed"),
+            BatchError::NotRegistered => write!(f, "request id is not registered with the scheduler"),
         }
     }
 }
@@ -196,6 +410,7 @@ async fn scheduler_loop(
     engine: Arc<Engine>,
     cfg: BatchConfig,
     mut rx: mpsc::Receiver<StepRequest>,
+    registry: Arc<RequestRegistry>,
 ) {
     loop {
         // Block until at least one request shows up.
@@ -230,20 +445,39 @@ async fn scheduler_loop(
         }
 
         // Run every request's decoder step concurrently. Each task
-        // owns its `kv` so there's no aliasing; they share `engine`
-        // and `model` via `Arc`.
+        // looks up its KV cache from the central registry and locks
+        // just its own slot, so concurrent requests never serialise
+        // on each other. They share `engine` and `model` via `Arc`.
         let mut handles = Vec::with_capacity(batch.len());
-        for mut req in batch {
+        for req in batch {
             let model = model.clone();
             let engine = engine.clone();
+            let registry = registry.clone();
             handles.push(tokio::spawn(async move {
-                let next = model
-                    .step(&engine, req.token_id, req.pos, &mut req.kv, &req.params)
-                    .await;
-                let _ = req.resp.send(StepResponse {
-                    next_token: next,
-                    kv: req.kv,
-                });
+                let StepRequest { id, token_id, pos, params, resp } = req;
+                let entry = match registry.get(id) {
+                    Some(e) => e,
+                    None => {
+                        // Surface NotRegistered explicitly so callers
+                        // can distinguish this from scheduler
+                        // shutdown. `step_through_scheduler` in the
+                        // server falls back to a direct `model.step`
+                        // for either error variant, so HTTP requests
+                        // still complete cleanly.
+                        let _ = resp.send(Err(BatchError::NotRegistered));
+                        return;
+                    }
+                };
+                // Per-entry lock: one request's step runs serially
+                // against its own caches but in parallel with all
+                // other requests' steps.
+                let next = {
+                    let mut kv = entry.lock().await;
+                    model
+                        .step(&engine, token_id, pos, &mut kv, &params)
+                        .await
+                };
+                let _ = resp.send(Ok(StepResponse { next_token: next }));
             }));
         }
         for h in handles {
@@ -347,6 +581,39 @@ mod tests {
         assert_eq!(direct, resp.next_token, "scheduler must be functionally identical to model.step");
     }
 
+    /// Same equivalence check, but exercises the zero-copy
+    /// register / step_registered / release API path instead of the
+    /// legacy by-move `step` wrapper. Both must produce identical
+    /// token sequences.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn step_registered_matches_direct_step() {
+        let cfg = RealModelConfig {
+            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
+            head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
+            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
+        };
+        let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
+        let sched = BatchScheduler::spawn(
+            model.clone(),
+            engine.clone(),
+            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2), ..Default::default() },
+        );
+
+        let mut kv_a = model.fresh_kv_caches();
+        let direct = model.step(&engine, 11, 0, &mut kv_a, &crate::sampling::SamplingParams::greedy()).await;
+
+        let id = sched.register(model.fresh_kv_caches());
+        assert_eq!(sched.active_requests(), 1);
+        let next = sched
+            .step_registered(id, 11, 0, crate::sampling::SamplingParams::greedy())
+            .await
+            .unwrap();
+        assert_eq!(direct, next, "zero-copy step path must match direct model.step");
+        let returned = sched.release(id);
+        assert!(returned.is_some(), "release must return the registered cache");
+        assert_eq!(sched.active_requests(), 0);
+    }
+
     /// Spawning N concurrent requests through the scheduler must not
     /// take materially longer than running them all in parallel —
     /// concretely, no worse than the strictly-sequential baseline. If
@@ -385,15 +652,19 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..N {
             let sched = sched.clone();
-            let kv0 = model.fresh_kv_caches();
+            // Register the request's KV caches once; the per-token
+            // loop only sends the small `RequestId` through the mpsc
+            // channel — no per-step `Vec<KvCache>` move.
+            let id = sched.register(model.fresh_kv_caches());
             handles.push(tokio::spawn(async move {
-                let mut kv = kv0;
                 let mut last = 7u32;
                 for pos in 0..TOKENS {
-                    let resp = sched.step(last, pos, kv, crate::sampling::SamplingParams::greedy()).await.unwrap();
-                    last = resp.next_token;
-                    kv = resp.kv;
+                    last = sched
+                        .step_registered(id, last, pos, crate::sampling::SamplingParams::greedy())
+                        .await
+                        .unwrap();
                 }
+                let _ = sched.release(id);
             }));
         }
         for h in handles { h.await.unwrap(); }

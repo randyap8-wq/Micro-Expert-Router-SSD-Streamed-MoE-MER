@@ -542,22 +542,26 @@ async fn step_through_scheduler(
     params: &crate::sampling::SamplingParams,
 ) -> u32 {
     if let Some(sched) = state.batch_scheduler.as_ref() {
-        // Move the KV cache through the scheduler. `mem::take` leaves
-        // an empty Vec in its place; the response brings the (now-
-        // grown) Vec back. If the scheduler has shut down (server
+        // Hand the KV caches to the scheduler's registry for the
+        // duration of one step; the scheduler returns the next
+        // token (the cache stays owned by the registry across the
+        // mpsc channel, so no `Vec<KvCache>` clone happens on the
+        // hot path). When the scheduler has shut down (server
         // teardown) we fall back to a direct call against a freshly
         // allocated KV cache so the request can finish — losing
         // history is the price of a clean shutdown path here.
         let owned = std::mem::take(kv);
-        match sched.step(token_id, pos, owned, *params).await {
-            Ok(resp) => {
-                *kv = resp.kv;
-                resp.next_token
-            }
-            Err(_) => {
-                *kv = model.fresh_kv_caches();
-                model.step(&state.engine, token_id, pos, kv, params).await
-            }
+        let id = sched.register(owned);
+        let result = sched.step_registered(id, token_id, pos, *params).await;
+        // Always reclaim the cache, even on error, so the registry
+        // doesn't leak entries.
+        match sched.release(id) {
+            Some(returned) => *kv = returned,
+            None => *kv = model.fresh_kv_caches(),
+        }
+        match result {
+            Ok(next_token) => next_token,
+            Err(_) => model.step(&state.engine, token_id, pos, kv, params).await,
         }
     } else {
         model.step(&state.engine, token_id, pos, kv, params).await
