@@ -65,6 +65,12 @@ pub struct StorageConfig {
 pub struct NvmeStorage {
     cfg: StorageConfig,
     files: RwLock<HashMap<u32, Arc<File>>>,
+    /// Optional multi-drive layout. When non-empty, expert `id` lives at
+    /// `extra_paths[id as usize % extra_paths.len()] / expert_<id>.bin`
+    /// (with `cfg.base_path` *included* as `extra_paths[0]`). When
+    /// empty, only `cfg.base_path` is consulted — the legacy single-
+    /// drive layout. Gist Phase 4 (multi-drive striping).
+    striped_paths: Vec<PathBuf>,
 }
 
 impl NvmeStorage {
@@ -80,7 +86,42 @@ impl NvmeStorage {
         Ok(Self {
             cfg,
             files: RwLock::new(HashMap::new()),
+            striped_paths: Vec::new(),
         })
+    }
+
+    /// Construct a multi-drive striped storage. Experts are distributed
+    /// across `dirs` by `id % dirs.len()`, so cache-miss reads issued
+    /// concurrently for distinct expert ids hit *different* NVMe
+    /// devices in the common case — the queue-depth advantage scales
+    /// linearly with `dirs.len()` until the host PCIe link saturates.
+    ///
+    /// Layout invariants the rest of the engine relies on are
+    /// preserved: every expert file is still `expert_size` bytes
+    /// aligned to `block_align`, and `read_expert` returns the same
+    /// `PooledBuffer` shape. The fd cache is shared across all drives.
+    ///
+    /// Compatible single-drive behaviour: when `dirs.len() == 1`, this
+    /// is equivalent to [`Self::new`] with `cfg.base_path =
+    /// dirs[0]`.
+    pub fn striped(cfg: StorageConfig, dirs: Vec<PathBuf>) -> io::Result<Self> {
+        if dirs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NvmeStorage::striped requires at least one directory",
+            ));
+        }
+        let mut cfg = cfg;
+        cfg.base_path = dirs[0].clone();
+        let mut s = Self::new(cfg)?;
+        s.striped_paths = dirs;
+        Ok(s)
+    }
+
+    /// Number of drives this storage is striped across. `1` for the
+    /// legacy single-drive layout.
+    pub fn num_drives(&self) -> usize {
+        self.striped_paths.len().max(1)
     }
 
     pub fn config(&self) -> &StorageConfig {
@@ -89,7 +130,13 @@ impl NvmeStorage {
 
     /// Path of the file backing a given expert id.
     pub fn expert_path(&self, id: u32) -> PathBuf {
-        self.cfg.base_path.join(format!("expert_{id}.bin"))
+        if self.striped_paths.is_empty() {
+            self.cfg.base_path.join(format!("expert_{id}.bin"))
+        } else {
+            let n = self.striped_paths.len();
+            let dir = &self.striped_paths[(id as usize) % n];
+            dir.join(format!("expert_{id}.bin"))
+        }
     }
 
     fn open_one(&self, id: u32) -> io::Result<Arc<File>> {
@@ -691,9 +738,60 @@ mod tests {
         path
     }
 
+    /// Striping smoke test: when `NvmeStorage::striped` is constructed
+    /// with N directories, `expert_path(id)` selects directory
+    /// `id % N`, and `read_expert` returns the same bytes the file
+    /// behind that path contains.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn read_experts_batch_returns_same_bytes_as_single_reads() {
-        let dir = tempdir("batch");
+    async fn striped_storage_shards_by_id_modulo_drives() {
+        let d0 = tempdir("stripe-a");
+        let d1 = tempdir("stripe-b");
+        let num_experts = 4u32;
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let block = 4096usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let expert_size = weight_bytes.div_ceil(block) * block;
+        // Even ids -> d0; odd ids -> d1.
+        for id in 0..num_experts {
+            let dir = if id % 2 == 0 { &d0 } else { &d1 };
+            let path = dir.join(format!("expert_{id}.bin"));
+            // Distinct fill byte per expert so reads can be verified.
+            let mut blob = vec![0u8; expert_size];
+            for b in blob.iter_mut() {
+                *b = (id as u8).wrapping_add(0x10);
+            }
+            std::fs::write(&path, &blob).unwrap();
+        }
+        let storage = NvmeStorage::striped(
+            StorageConfig {
+                base_path: d0.clone(),
+                expert_size,
+                block_align: block,
+                use_direct_io: false,
+            },
+            vec![d0.clone(), d1.clone()],
+        )
+        .unwrap();
+        assert_eq!(storage.num_drives(), 2);
+        // expert_0 / expert_2 must resolve to d0; expert_1 / expert_3 to d1.
+        assert_eq!(storage.expert_path(0), d0.join("expert_0.bin"));
+        assert_eq!(storage.expert_path(1), d1.join("expert_1.bin"));
+        assert_eq!(storage.expert_path(2), d0.join("expert_2.bin"));
+        assert_eq!(storage.expert_path(3), d1.join("expert_3.bin"));
+
+        let pool = BufferPool::new(num_experts as usize, expert_size, block);
+        for id in 0..num_experts {
+            let mut buf = pool.acquire().await;
+            storage.read_expert(id, &mut buf).await.unwrap();
+            assert_eq!(buf.as_slice()[0], (id as u8).wrapping_add(0x10));
+        }
+        let _ = std::fs::remove_dir_all(&d0);
+        let _ = std::fs::remove_dir_all(&d1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_experts_batch_returns_same_bytes_as_single_reads() {        let dir = tempdir("batch");
         let num_experts = 4u32;
         let d_model = 8usize;
         let d_ff = 16usize;

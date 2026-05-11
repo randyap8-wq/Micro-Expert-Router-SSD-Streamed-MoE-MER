@@ -816,13 +816,33 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    if !args.data_dir.is_dir() {
-        return Err(format!(
-            "data dir {} does not exist; run `gen-data` first",
-            args.data_dir.display()
-        )
-        .into());
+    // Multi-drive striping (gist Phase 4). If `--data-dir` contains
+    // commas (e.g. `--data-dir /mnt/nvme0,/mnt/nvme1`), we shard
+    // experts across the listed directories by `id % n_drives`. The
+    // single-dir path is unchanged. Done early because the io_uring
+    // NUMA probe below also takes the (canonical) data dir.
+    let data_dirs: Vec<PathBuf> = parse_striped_data_dir(&args.data_dir);
+    let primary_dir = data_dirs.first().cloned().unwrap_or_else(|| args.data_dir.clone());
+    for d in &data_dirs {
+        if !d.is_dir() {
+            return Err(format!(
+                "data dir {} does not exist; run `gen-data` first",
+                d.display()
+            )
+            .into());
+        }
     }
+    if data_dirs.len() > 1 {
+        info!(
+            drives = data_dirs.len(),
+            dirs = ?data_dirs,
+            "multi-drive striping enabled (experts sharded by id % n_drives)"
+        );
+    }
+    // Treat the first dir as the canonical metadata source for any
+    // `metadata.json` / `alias-map` lookups downstream. The other
+    // directories only need to contain `expert_<id>.bin`.
+    args.data_dir = primary_dir.clone();
 
     if args.io_uring {
         // Best-effort affinity: keep the engine on the NUMA node that
@@ -902,12 +922,17 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let storage = Arc::new(NvmeStorage::new(StorageConfig {
-        base_path: args.data_dir.clone(),
+    let storage_cfg = StorageConfig {
+        base_path: primary_dir.clone(),
         expert_size: args.expert_size,
         block_align: args.block_align,
         use_direct_io: !args.no_direct,
-    })?);
+    };
+    let storage = Arc::new(if data_dirs.len() > 1 {
+        NvmeStorage::striped(storage_cfg, data_dirs.clone())?
+    } else {
+        NvmeStorage::new(storage_cfg)?
+    });
     storage.warmup_fds(0..args.num_experts)?;
 
     let prefetch_headroom = if args.no_prefetch { 0 } else { args.predict_fanout.max(1) };
@@ -1462,6 +1487,22 @@ pub fn detect_data_dir_numa_node(data_dir: &std::path::Path) -> Option<i32> {
     }
 }
 
+/// Parse `--data-dir` into a list of directories. If the path
+/// stringifies to a comma-separated list, split it; otherwise return a
+/// single-element vec. Used by gist Phase 4 (multi-drive striping).
+fn parse_striped_data_dir(p: &std::path::Path) -> Vec<PathBuf> {
+    let s = p.to_string_lossy();
+    if s.contains(',') {
+        s.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    } else {
+        vec![p.to_path_buf()]
+    }
+}
+
 fn cmd_gguf_convert(
     gguf_path: &PathBuf,
     out_dir: &PathBuf,
@@ -1602,30 +1643,27 @@ async fn cmd_validate_predictor(
     Ok(())
 }
 
-/// Lightweight JSON helpers — the existing `parse_json_number` only
-/// handles flat numeric fields. These two read a numeric field and a
-/// `[..]` integer array respectively, sufficient for the JSONL trace
-/// format the engine writes. Avoids pulling in `serde_json` here just
-/// for one record format.
+/// Pull a numeric field and a `[..]` u32 array out of one JSONL line.
+/// The trace records have a fixed schema (`{token, layer, experts,
+/// cache_hit}`), so we route through `serde_json::Value` for safety
+/// without paying the cost of deriving a full type.
 fn json_get_u64(line: &str, key: &str) -> Option<u64> {
-    parse_json_number(line, key).map(|v| v as u64)
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v.get(key).and_then(|x| x.as_u64())
 }
 
 fn json_get_u32_array(line: &str, key: &str) -> Vec<u32> {
-    let needle = format!("\"{key}\"");
-    let mut out = Vec::new();
-    let Some(pos) = line.find(&needle) else { return out };
-    let rest = &line[pos + needle.len()..];
-    let Some(open) = rest.find('[') else { return out };
-    let Some(close) = rest[open..].find(']') else { return out };
-    let body = &rest[open + 1..open + close];
-    for token in body.split(',') {
-        let t = token.trim();
-        if let Ok(v) = t.parse::<u32>() {
-            out.push(v);
-        }
-    }
-    out
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

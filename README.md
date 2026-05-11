@@ -674,6 +674,26 @@ micro-expert-router run
                               MER_PIN_CORES env var).
   --token-pause-us <N>       Sleep between tokens to throttle the stream
   --seed <U64>               PRNG seed for reproducibility
+  --trace-out <PATH>         Append a JSONL routing trace (one record per
+                              token). Feed into `validate-predictor` or
+                              `scripts/compute_transition_matrix.py`.
+
+  # Multi-drive striping (gist Phase 4):
+  --data-dir <DIR1,DIR2,...> Comma-separated list of mountpoints shards
+                              experts across N NVMe drives by `id % N`.
+                              Use `scripts/gen_striped_data.sh` to lay
+                              out an existing dataset across drives.
+
+micro-expert-router gguf-convert
+  --gguf-path <PATH>         Source GGUF (Mixtral-style) checkpoint
+  --out-dir <PATH>           Output dir for expert_<id>.bin + metadata.json
+                              + dense weight files
+  --num-layers <N>           Override (defaults to llama.block_count)
+  --num-experts <N>          Experts per layer (defaults to llama.expert_count)
+
+micro-expert-router validate-predictor
+  --trace <PATH>             JSONL trace from `run --trace-out`
+  --cache-slots <N>...       Cache sizes to sweep (default: 2 4 8 16)
 ```
 
 ### Running on real Mixtral weights

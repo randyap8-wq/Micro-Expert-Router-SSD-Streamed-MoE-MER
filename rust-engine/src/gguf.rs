@@ -339,9 +339,6 @@ impl<'a> Cursor<'a> {
     fn pos(&self) -> usize {
         self.pos
     }
-    fn remaining(&self) -> &'a [u8] {
-        &self.buf[self.pos..]
-    }
     fn advance(&mut self, n: usize) -> io::Result<()> {
         if self.pos.checked_add(n).map_or(true, |p| p > self.buf.len()) {
             return Err(io::Error::new(
@@ -423,9 +420,8 @@ fn read_value_typed<'a>(cur: &mut Cursor<'a>, version: u32, ty: u32) -> io::Resu
             GgufValue::Array(out)
         }
         other => {
-            // Skip unknown but well-typed values. Without knowing the
-            // width we can't continue safely, so error out instead.
-            let _ = cur.remaining();
+            // Unknown well-typed value. Without knowing the width we
+            // can't safely skip and continue, so surface as an error.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("GGUF: unknown value type code {other}"),
