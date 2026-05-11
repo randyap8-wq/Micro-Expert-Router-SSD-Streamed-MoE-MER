@@ -791,7 +791,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn read_experts_batch_returns_same_bytes_as_single_reads() {        let dir = tempdir("batch");
+    async fn read_experts_batch_returns_same_bytes_as_single_reads() {
+        let dir = tempdir("batch");
         let num_experts = 4u32;
         let d_model = 8usize;
         let d_ff = 16usize;
