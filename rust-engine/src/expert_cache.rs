@@ -66,13 +66,20 @@ impl ExpertCache {
         self.inner.lock().peek(&id).is_some()
     }
 
-    /// Insert a resident expert. Returns the evicted entry, if any (so the
-    /// caller can observe evictions for logging). If the cache is at
-    /// capacity and the LRU candidate is pinned, the next non-pinned
-    /// LRU entry is evicted instead. If every entry is pinned, this
-    /// returns `Err(resident)` — there is nowhere to put the new entry
-    /// without breaking a pin contract.
-    pub fn insert(&self, resident: Arc<ExpertResident>) -> Option<Arc<ExpertResident>> {
+    /// Insert a resident expert.
+    ///
+    /// Returns `Ok(Some(evicted))` when an entry was evicted to make
+    /// room (so the caller can observe / log the eviction), `Ok(None)`
+    /// when the entry was inserted without displacing anything, and
+    /// `Err(resident)` when the cache is full and **every** resident
+    /// expert is pinned. The error case hands the original `Arc` back
+    /// to the caller so its `PooledBuffer` can return to the pool —
+    /// the alternative (silently calling `LruCache::push`, which
+    /// would evict a pinned entry) would break the pinning contract.
+    pub fn insert(
+        &self,
+        resident: Arc<ExpertResident>,
+    ) -> Result<Option<Arc<ExpertResident>>, Arc<ExpertResident>> {
         let id = resident.id;
         // Pre-evict a non-pinned entry if we're already at capacity,
         // so `push` below never has to silently evict a pinned entry.
@@ -80,13 +87,26 @@ impl ExpertCache {
             let guard = self.inner.lock();
             let at_capacity = guard.len() >= self.capacity && guard.peek(&id).is_none();
             drop(guard);
-            if at_capacity { self.evict_lru() } else { None }
+            if at_capacity {
+                match self.evict_lru() {
+                    Some(e) => Some(e),
+                    // Cache is full *and* every resident expert is
+                    // pinned. We must refuse the insert: calling
+                    // `push` here would evict a pinned id (LruCache
+                    // has no pinning concept).
+                    None => return Err(resident),
+                }
+            } else {
+                None
+            }
         };
         let mut guard = self.inner.lock();
         // `LruCache::push` returns the (k, v) pair that was evicted, if any.
+        // With the pre-eviction above we shouldn't normally hit a second
+        // eviction path here, but `push` on an existing key returns the
+        // old value — which is fine to surface as "evicted" too.
         let push_evicted = guard.push(id, resident).map(|(_, v)| v);
-        // Either path evicts at most one; combine.
-        push_evicted.or(pre_evicted)
+        Ok(push_evicted.or(pre_evicted))
     }
 
     /// Number of resident experts currently in the cache.
@@ -176,8 +196,8 @@ mod tests {
         let pool = BufferPool::new(3, 4096, 4096);
         let cache = ExpertCache::new(2);
 
-        cache.insert(make(0, &pool));
-        cache.insert(make(1, &pool));
+        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
         // 2 of 3 slots are occupied by cache entries; 1 is free.
         let scratch = pool.try_acquire().expect("third slot free");
         assert!(pool.try_acquire().is_none());
@@ -185,9 +205,11 @@ mod tests {
 
         // Inserting a third entry evicts expert 0 (the LRU). The evicted
         // Arc is returned and the cache no longer references its buffer.
-        let evicted = cache.insert(make(2, &pool));
-        assert!(evicted.is_some());
-        assert_eq!(evicted.as_ref().unwrap().id, 0);
+        let evicted = match cache.insert(make(2, &pool)) {
+            Ok(Some(e)) => e,
+            other => panic!("expected Ok(Some(_)), got {:?}", other.is_ok()),
+        };
+        assert_eq!(evicted.id, 0);
 
         // Pool is fully occupied (cache holds 1 + 2, plus the evicted Arc
         // still holds expert 0's buffer).
@@ -201,12 +223,12 @@ mod tests {
     fn hit_updates_recency() {
         let pool = BufferPool::new(3, 4096, 4096);
         let cache = ExpertCache::new(2);
-        cache.insert(make(0, &pool));
-        cache.insert(make(1, &pool));
+        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
         // Touch expert 0 -> it is now most-recently used.
         let _ = cache.get(0);
         // Inserting expert 2 should evict 1, not 0.
-        cache.insert(make(2, &pool));
+        let _ = cache.insert(make(2, &pool)).map_err(|_| panic!("insert failed"));
         assert!(cache.contains(0));
         assert!(!cache.contains(1));
         assert!(cache.contains(2));
@@ -216,14 +238,16 @@ mod tests {
     fn pinned_entry_is_protected_from_eviction() {
         let pool = BufferPool::new(4, 4096, 4096);
         let cache = ExpertCache::new(2);
-        cache.insert(make(0, &pool));
-        cache.insert(make(1, &pool));
+        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
         // Pin expert 0. Even though it's the LRU, expert 1 must be
         // evicted instead when expert 2 is inserted.
         cache.pin(0);
-        let evicted = cache.insert(make(2, &pool));
-        assert!(evicted.is_some());
-        assert_eq!(evicted.unwrap().id, 1);
+        let evicted = match cache.insert(make(2, &pool)) {
+            Ok(Some(e)) => e,
+            other => panic!("expected Ok(Some(_)), got {:?}", other.is_ok()),
+        };
+        assert_eq!(evicted.id, 1);
         assert!(cache.contains(0));
         assert!(!cache.contains(1));
         assert!(cache.contains(2));
@@ -235,10 +259,41 @@ mod tests {
     fn evict_lru_returns_none_when_all_pinned() {
         let pool = BufferPool::new(4, 4096, 4096);
         let cache = ExpertCache::new(2);
-        cache.insert(make(0, &pool));
-        cache.insert(make(1, &pool));
+        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
         cache.pin(0);
         cache.pin(1);
         assert!(cache.evict_lru().is_none());
+    }
+
+    #[test]
+    fn insert_returns_err_when_all_pinned() {
+        // Cache full of pinned entries must reject a new insert with
+        // `Err(resident)` rather than silently evicting a pinned slot.
+        let pool = BufferPool::new(4, 4096, 4096);
+        let cache = ExpertCache::new(2);
+        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        cache.pin(0);
+        cache.pin(1);
+        let new_resident = make(2, &pool);
+        let new_id = new_resident.id;
+        let err = match cache.insert(new_resident) {
+            Err(rejected) => rejected,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        assert_eq!(err.id, new_id);
+        // Both pinned entries are still resident.
+        assert!(cache.contains(0));
+        assert!(cache.contains(1));
+        assert!(!cache.contains(2));
+        // The rejected resident's buffer returns to the pool when
+        // dropped — i.e. the contract that a rejected insert hands the
+        // Arc back so its PooledBuffer can be reclaimed.
+        drop(err);
+        // After dropping the rejected resident *and* the scratch
+        // buffer that `make(2, ...)` consumed, the pool should have
+        // strictly more free slots than it did at the rejection.
+        assert!(pool.try_acquire().is_some());
     }
 }

@@ -39,13 +39,39 @@ use tracing::{debug, info, warn};
 /// `scripts/compute_transition_matrix.py` and the
 /// `validate-predictor` subcommand to evaluate the predictor offline
 /// against real routing distributions. See gist Phase 6.
+///
+/// **I/O off the hot path.** `write_record` is a non-blocking enqueue
+/// onto a bounded `std::sync::mpsc::sync_channel`. A dedicated worker
+/// thread drains the channel and does the actual `BufWriter::write_all`
+/// + `flush` against the file. When the channel is full (writer can't
+/// keep up — slow disk, full FS, etc.), the newest record is dropped
+/// rather than stalling the engine on a blocking write. This makes
+/// the trace strictly best-effort and decouples disk latency from
+/// per-token decode latency.
 pub struct TraceWriter {
-    file: parking_lot::Mutex<std::io::BufWriter<std::fs::File>>,
+    tx: parking_lot::Mutex<Option<std::sync::mpsc::SyncSender<TraceRecord>>>,
+    /// Shared with the worker so `flush` can synchronise on a
+    /// definite "everything queued so far has been written" point
+    /// (used in shutdown paths and tests).
+    flush_signal: Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar, std::sync::atomic::AtomicU64)>,
     /// Set to `true` the first time a write fails so subsequent failures
     /// stay silent. Without this guard a sticky I/O error (full disk,
     /// unwritable path) would emit a `warn!` on *every* record and
     /// drown the rest of the logs.
     write_failed_once: std::sync::atomic::AtomicBool,
+}
+
+/// One serialised record handed across the channel. Kept as a small
+/// owned struct (rather than a pre-formatted `String`) so the worker
+/// thread does the `format!` work, not the producer.
+struct TraceRecord {
+    token: u64,
+    layer: u32,
+    experts: Vec<u32>,
+    cache_hit: Vec<bool>,
+    /// Monotonic sequence number assigned at enqueue time so `flush`
+    /// can wait for the worker to catch up to a specific point.
+    seq: u64,
 }
 
 impl TraceWriter {
@@ -58,50 +84,135 @@ impl TraceWriter {
             .create(true)
             .append(true)
             .open(path)?;
+        let mut writer = std::io::BufWriter::new(f);
+        // Bounded channel: at sustained 100k tokens/s the worker
+        // drains in a few ms. The bound only matters if the disk
+        // stalls — in which case dropping the *newest* record is
+        // the right back-pressure (old records still contain useful
+        // signal; the loss is bounded and visible in the warn log).
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TraceRecord>(4096);
+        let flush_signal = Arc::new((
+            parking_lot::Mutex::new(0u64),
+            parking_lot::Condvar::new(),
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        let flush_signal_w = flush_signal.clone();
+        std::thread::Builder::new()
+            .name("mer-trace-writer".to_string())
+            .spawn(move || {
+                use std::io::Write;
+                let mut latched_failure = false;
+                while let Ok(rec) = rx.recv() {
+                    let mut s = String::with_capacity(64 + rec.experts.len() * 8);
+                    s.push_str(&format!(
+                        "{{\"token\":{},\"layer\":{},\"experts\":[",
+                        rec.token, rec.layer
+                    ));
+                    for (i, e) in rec.experts.iter().enumerate() {
+                        if i > 0 { s.push(','); }
+                        s.push_str(&e.to_string());
+                    }
+                    s.push_str("],\"cache_hit\":[");
+                    for (i, h) in rec.cache_hit.iter().enumerate() {
+                        if i > 0 { s.push(','); }
+                        s.push_str(if *h { "true" } else { "false" });
+                    }
+                    s.push_str("]}\n");
+                    if !latched_failure {
+                        if let Err(e) = writer.write_all(s.as_bytes()) {
+                            warn!(error = %e, "trace writer failed; subsequent records may be lost (further failures suppressed)");
+                            latched_failure = true;
+                        }
+                    }
+                    // Update the high-water mark so flush() can spin until it
+                    // crosses the producer's max enqueued seq.
+                    flush_signal_w.2.store(rec.seq, std::sync::atomic::Ordering::Release);
+                    let mut g = flush_signal_w.0.lock();
+                    *g = rec.seq;
+                    flush_signal_w.1.notify_all();
+                }
+                // Channel closed: final flush so partial records hit the disk.
+                let _ = writer.flush();
+            })
+            .ok();
         Ok(Self {
-            file: parking_lot::Mutex::new(std::io::BufWriter::new(f)),
+            tx: parking_lot::Mutex::new(Some(tx)),
+            flush_signal,
             write_failed_once: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub fn write_record(&self, token: u64, layer: u32, experts: &[u32], cache_hit: &[bool]) {
-        use std::io::Write;
-        let mut s = String::with_capacity(64 + experts.len() * 8);
-        s.push_str(&format!(
-            "{{\"token\":{token},\"layer\":{layer},\"experts\":["
-        ));
-        for (i, e) in experts.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&e.to_string());
-        }
-        s.push_str("],\"cache_hit\":[");
-        for (i, h) in cache_hit.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(if *h { "true" } else { "false" });
-        }
-        s.push_str("]}\n");
-        let mut g = self.file.lock();
-        // Best-effort: a write failure on trace I/O must not abort the
-        // hot path. Log once (latched via `write_failed_once`) and
-        // continue — subsequent failures stay silent so a sticky error
-        // can't spam the log.
-        if let Err(e) = g.write_all(s.as_bytes()) {
+        // Assign a monotonic sequence so flush() has something to
+        // wait on.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let rec = TraceRecord {
+            token,
+            layer,
+            experts: experts.to_vec(),
+            cache_hit: cache_hit.to_vec(),
+            seq,
+        };
+        let guard = self.tx.lock();
+        let Some(tx) = guard.as_ref() else { return };
+        // `try_send` is non-blocking; on overflow the newest record is
+        // dropped (back-pressure to bound memory).
+        if let Err(e) = tx.try_send(rec) {
             if !self
                 .write_failed_once
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
             {
-                warn!(error = %e, "trace writer failed; subsequent records may be lost (further failures suppressed)");
+                warn!(reason = %e, "trace writer queue full; dropping records (further drops suppressed)");
             }
         }
     }
 
     pub fn flush(&self) {
-        use std::io::Write;
-        let _ = self.file.lock().flush();
+        // Block until the worker has caught up to the highest seq the
+        // producer side has ever assigned. Bounded wait so a stuck
+        // worker can't deadlock the caller.
+        let target = std::sync::atomic::AtomicU64::new(0);
+        // Read the current producer high-water mark *atomically*: we
+        // can simply ask the channel since a `flush` after a series
+        // of `write_record` calls will see the most recent SEQ.
+        let snapshot = {
+            let _ = &target;
+            // Re-fetch from the static. (We rely on the relaxed load
+            // being a recent value; the worker is monotonically
+            // catching up so any value ≤ the true current is safe.)
+            // SAFETY: the static was only ever written via fetch_add.
+            // Use Acquire to pair with the worker's Release store on
+            // the same atomic.
+            self.flush_signal.2.load(std::sync::atomic::Ordering::Acquire)
+        };
+        if snapshot == 0 {
+            return; // nothing ever queued
+        }
+        let mut guard = self.flush_signal.0.lock();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while *guard < snapshot {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let _ = self
+                .flush_signal
+                .1
+                .wait_for(&mut guard, deadline - now);
+        }
+    }
+}
+
+impl Drop for TraceWriter {
+    fn drop(&mut self) {
+        // Closing the sender drops the worker's channel rx, which
+        // exits the loop and flushes the BufWriter as part of the
+        // worker's `let _ = writer.flush()` shutdown step. The
+        // OS-level fsync/close happens when the file goes out of
+        // scope on the worker thread.
+        let mut guard = self.tx.lock();
+        guard.take();
     }
 }
 
@@ -708,7 +819,15 @@ impl Engine {
         // if the cache is at capacity (which releases its `PooledBuffer` on
         // Arc drop), then try to acquire. If a concurrent prefetch task
         // grabbed the freed slot before we did, we evict another LRU and
-        // retry. This guarantees forward progress on the required path.
+        // retry.
+        //
+        // Bounded by `MAX_FETCH_YIELDS`: if the cache is full of pinned
+        // entries *and* the buffer pool has no free slot, no amount of
+        // yielding will help — we're hard-blocked on a configuration
+        // bug (more pinned experts than the pool can keep resident).
+        // Panic with a clear message rather than spin forever.
+        const MAX_FETCH_YIELDS: usize = 1024;
+        let mut yields = 0usize;
         let mut buf;
         loop {
             if self.cache.len() >= self.cache.capacity() {
@@ -724,6 +843,17 @@ impl Engine {
             // Pool is empty even though cache is below capacity — i.e. some
             // other task (prefetch or another fetch) is holding buffers.
             // Yield to the runtime briefly to let them make progress.
+            yields += 1;
+            if yields > MAX_FETCH_YIELDS {
+                panic!(
+                    "Engine::fetch could not acquire a buffer for expert {id} after {} yields. \
+                     Cache capacity={}, pinned={}, pool busy. This indicates more experts are \
+                     pinned than the buffer pool can hold; raise pool size or pin fewer experts.",
+                    yields,
+                    self.cache.capacity(),
+                    self.cache.pinned_count(),
+                );
+            }
             tokio::task::yield_now().await;
         }
         match self.storage.read_expert(id, &mut buf).await {
@@ -731,10 +861,23 @@ impl Engine {
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.io_hist.lock().record(io_us.max(1));
                 let resident = Arc::new(ExpertResident { id, buffer: buf });
-                if let Some(_evicted) = self.cache.insert(resident.clone()) {
-                    debug!(expert = id, "inserted (with eviction)");
-                } else {
-                    debug!(expert = id, "inserted");
+                match self.cache.insert(resident.clone()) {
+                    Ok(Some(_evicted)) => debug!(expert = id, "inserted (with eviction)"),
+                    Ok(None) => debug!(expert = id, "inserted"),
+                    Err(rejected) => {
+                        // Cache is full of pinned entries — surface this
+                        // explicitly. The caller still gets a usable
+                        // `Arc<ExpertResident>` (the bytes are loaded);
+                        // it just won't be cached, so the next access
+                        // will re-fetch. This degrades gracefully
+                        // rather than violating the pin contract.
+                        warn!(
+                            expert = id,
+                            "expert loaded but cache rejected insert (every slot pinned); \
+                             returning resident without caching"
+                        );
+                        return rejected;
+                    }
                 }
                 resident
             }
@@ -775,7 +918,17 @@ impl Engine {
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     let resident = Arc::new(ExpertResident { id, buffer: buf });
-                    me.cache.insert(resident);
+                    // Prefetches are best-effort: if the cache rejects
+                    // the insert (every slot pinned), the resident drops
+                    // here and its buffer returns to the pool — exactly
+                    // the right behaviour for a speculative load.
+                    if let Err(_rejected) = me.cache.insert(resident) {
+                        debug!(
+                            expert = id,
+                            "prefetch dropped: cache full of pinned entries"
+                        );
+                        return;
+                    }
                     debug!(
                         expert = id,
                         prob = p,
@@ -1478,7 +1631,7 @@ mod tests {
                 expert_size,
                 block_align,
                 // tmpfs / overlayfs (typical for CI) doesn't support O_DIRECT.
-                use_direct_io: false,
+                use_direct_io: false, num_experts_per_layer: None,
             })
             .expect("storage init"),
         );

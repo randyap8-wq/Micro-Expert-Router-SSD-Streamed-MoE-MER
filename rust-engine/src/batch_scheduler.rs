@@ -110,13 +110,35 @@ impl RequestRegistry {
         let entry = self.table.lock().remove(&id.0)?;
         match Arc::try_unwrap(entry) {
             Ok(m) => Some(m.into_inner()),
-            // A scheduler task is still holding the entry. We can't
-            // block synchronously on an async mutex from a sync
-            // context, so we return None and let the in-flight step
-            // drop the Arc on completion. In practice callers issue
-            // `release` only after their last `step_registered`
-            // resolves, so this branch is effectively unreachable.
-            Err(_arc) => None,
+            Err(arc) => {
+                // A scheduler task is still holding the entry. We
+                // can't synchronously block on a `tokio::sync::Mutex`
+                // from a sync context, so spawn a tiny detached task
+                // that waits for the in-flight step to finish, locks
+                // the entry one last time, takes ownership of the KV
+                // vector, and lets the Arc drop. The caller pays
+                // nothing here (the spawn is cheap and only happens
+                // on the rare race window between submit and reply);
+                // it also gets `None` back, which `step_through_scheduler`
+                // already handles by allocating a fresh KV cache for
+                // continued use. Crucially, this path no longer
+                // *leaks* — the registry entry is already removed and
+                // the Arc + its inner Vec are reclaimed by the
+                // detached task.
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::spawn(async move {
+                        let _ = arc.lock().await; // wait for the in-flight step
+                        // Arc drops here → KV memory reclaimed.
+                    });
+                } else {
+                    // No tokio runtime (test environment with a sync
+                    // shutdown path). Drop the Arc and rely on the
+                    // borrowing task to drop its clone — no leak,
+                    // just deferred reclaim.
+                    drop(arc);
+                }
+                None
+            }
         }
     }
 
@@ -532,7 +554,7 @@ mod tests {
                 base_path: dir.path.clone(),
                 expert_size,
                 block_align: block,
-                use_direct_io: false,
+                use_direct_io: false, num_experts_per_layer: None,
             })
             .unwrap(),
         );

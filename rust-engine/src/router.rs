@@ -508,15 +508,22 @@ impl PredictiveLoader {
     /// Scoring (in `[0, 1]`):
     /// * Markov contribution: probability from
     ///   [`Self::predict_next2`] (or [`Self::predict_next`] when
-    ///   `prev_prev` is `None`), weighted **0.5** — so a near-certain
-    ///   transition adds up to 0.5 to an expert's score.
-    /// * Locality contribution: a flat **0.3** for every expert in
-    ///   `monitor.get_hot_experts(threshold_pct)` — these are
+    ///   `prev_prev` is `None`), weighted **W_MARKOV**.
+    /// * Locality contribution: a flat **W_LOCALITY** for every expert
+    ///   in `monitor.get_hot_experts(threshold_pct)` — these are
     ///   temporally stable hot experts and we want them in the
     ///   prefetch set even when the Markov chain is uncertain.
-    /// * Speculator contribution: a flat **0.4** for every expert in
-    ///   `speculator.predict_topk(hidden, speculator_k)` — semantic
-    ///   intent is the strongest single signal in the design.
+    /// * Speculator contribution: a flat **W_SPECULATOR** for every
+    ///   expert in `speculator.predict_topk(hidden, speculator_k)` —
+    ///   semantic intent is the strongest single signal in the design.
+    ///
+    /// The three constants sum to **1.0**, so an expert hit by all
+    /// three arms with maximal Markov probability tops out at exactly
+    /// `1.0` rather than overshooting (the previous design summed to
+    /// 1.2, which made the score ill-defined as a probability and
+    /// made cross-arm comparisons against `[0, 1]` thresholds
+    /// awkward). Their relative weighting still encodes the design
+    /// intent: speculator > Markov > locality.
     ///
     /// The three contributions sum, then the result is sorted by
     /// descending score (ties broken by ascending id for determinism)
@@ -537,12 +544,21 @@ impl PredictiveLoader {
         hidden: &[f32],
         speculator_k: usize,
     ) -> Vec<(u32, f32)> {
-        // Weights for each predictive arm. Tuned so that an expert
-        // hit by all three arms tops out at ~1.2 (over-budget by
-        // design — those are the experts we *really* want pinned).
-        const W_MARKOV: f32 = 0.5;
-        const W_LOCALITY: f32 = 0.3;
-        const W_SPECULATOR: f32 = 0.4;
+        // Weights for each predictive arm. Normalised so a unanimous
+        // expert (Markov p=1, locality hot, speculator top-K) tops
+        // out at exactly 1.0. Relative ordering: the speculator is
+        // the strongest signal (semantic intent → likely to be
+        // correct), Markov is next (statistical smoothing of
+        // observed transitions), and locality is the weakest tie-
+        // breaker (a flat "this expert is generally hot lately").
+        const W_SPECULATOR: f32 = 0.42;
+        const W_MARKOV: f32 = 0.33;
+        const W_LOCALITY: f32 = 0.25;
+        // Compile-time invariant: the weights sum to 1.0 (within
+        // f32 epsilon). Kept as a debug_assert so a future tweak
+        // that breaks the contract trips a test rather than
+        // silently producing >1 scores.
+        debug_assert!((W_SPECULATOR + W_MARKOV + W_LOCALITY - 1.0).abs() < 1e-6);
 
         let mut combined: HashMap<u32, f32> = HashMap::new();
 
@@ -903,6 +919,16 @@ impl NeuralSpeculator {
     /// large lr would let occasional outlier routings dominate.
     pub const DEFAULT_LR: f32 = 1e-3;
 
+    /// L2 weight-decay coefficient applied per SGD step. Small so it
+    /// only nudges idle weights toward zero (preventing unbounded
+    /// drift when the same expert id never re-appears) without
+    /// fighting the gradient signal on actively-routed experts. The
+    /// per-step update applies `w := w * (1 - lr * WEIGHT_DECAY)`
+    /// before the gradient step (the standard "decoupled weight
+    /// decay" / AdamW-style ordering) so the decay is independent of
+    /// the gradient magnitude.
+    pub const WEIGHT_DECAY: f32 = 1e-4;
+
     /// Build a fresh speculator with He-uniform initialisation.
     pub fn new(d_model: usize, hidden: usize, num_experts: u32, seed: u64) -> Self {
         assert!(d_model > 0 && hidden > 0 && num_experts > 0);
@@ -1168,6 +1194,30 @@ impl NeuralSpeculator {
                 dh[j] = -1.0;
             } else if !dh[j].is_finite() {
                 dh[j] = 0.0;
+            }
+        }
+
+        // Decoupled weight decay (AdamW-style): shrink every weight by
+        // `(1 - lr * WEIGHT_DECAY)` *before* the gradient step. This
+        // bounds the magnitude of weights for experts/features that
+        // never appear in `actual_top_k` (whose gradient through this
+        // step is zero), so the speculator can't drift toward
+        // arbitrarily large logits over an infinite training run.
+        // Biases are intentionally not decayed (standard practice;
+        // they don't suffer from the same scale-blowup pathology).
+        let decay = 1.0 - lr * Self::WEIGHT_DECAY;
+        if decay > 0.0 && decay < 1.0 {
+            for v in w.w2.iter_mut() {
+                let new = *v * decay;
+                if new.is_finite() {
+                    *v = new;
+                }
+            }
+            for v in w.w1.iter_mut() {
+                let new = *v * decay;
+                if new.is_finite() {
+                    *v = new;
+                }
             }
         }
 
@@ -1661,11 +1711,18 @@ mod tests {
 
     #[test]
     fn predict_unified_handles_no_optional_arms() {
-        // With monitor=None and speculator=None the result should be
-        // identical to the Markov-only `predict_next` (modulo weight
-        // scaling and the f64->f32 cast).
+        // With monitor=None and speculator=None the unified ranking
+        // should preserve the Markov-only `predict_next` ordering. We
+        // use *distinct* observation counts so there are no
+        // probability ties — `predict_next` and `predict_unified`
+        // break ties slightly differently (the latter uses ascending
+        // id as a deterministic tiebreaker, the former is stable in
+        // input order), which would otherwise be a benign reordering
+        // that this test isn't trying to assert against.
         let p = PredictiveLoader::new(4, 4, 0.0, 42);
-        for _ in 0..10 { p.observe(0, 1); p.observe(0, 2); }
+        for _ in 0..15 { p.observe(0, 1); }
+        for _ in 0..7 { p.observe(0, 2); }
+        for _ in 0..3 { p.observe(0, 3); }
         let unified = p.predict_unified(
             None,
             0,
@@ -1680,5 +1737,45 @@ mod tests {
         for ((id_u, _), (id_m, _)) in unified.iter().zip(markov.iter()) {
             assert_eq!(id_u, id_m);
         }
+        // And — the headline guarantee of the normalised weights —
+        // a 100%-Markov hit (no arms missing, p≈1) cannot exceed
+        // 1.0. Here the top expert has p≈15/25=0.6 and the only
+        // contribution is W_MARKOV * p = 0.33 * 0.6 ≈ 0.198, so
+        // every score is comfortably below 1.
+        for &(_, s) in &unified {
+            assert!(s >= 0.0 && s <= 1.0, "score {s} outside [0,1]");
+        }
+    }
+
+    #[test]
+    fn predict_unified_score_is_bounded_by_one() {
+        // A unanimous expert (p=1 Markov, hot in locality, top of the
+        // speculator) must score ≤ 1.0 under the normalised weights —
+        // this is the headline guarantee of the new design.
+        let p = PredictiveLoader::new(4, 4, 0.0, 42);
+        // Make Markov certain that 0 -> 1 (every observation is the
+        // same transition).
+        for _ in 0..200 { p.observe(0, 1); }
+        let monitor = LocalityMonitor::new(4, 8);
+        // Saturate locality so id=1 is well above the 10% threshold.
+        for _ in 0..16 { monitor.observe_one(1); }
+        let speculator = NeuralSpeculator::new(4, 8, 4, 7);
+        let hidden = vec![0.5f32, -0.2, 0.3, 0.1];
+        // Train the speculator hard so id=1 dominates the top-K for `hidden`.
+        for _ in 0..400 { speculator.train_step(&hidden, &[1], 0.1); }
+        let unified = p.predict_unified(
+            None,
+            0,
+            Some(&monitor),
+            0.10,
+            Some(&speculator),
+            &hidden,
+            1,
+        );
+        // id=1 should be the top entry and its score must respect the
+        // [0, 1] bound.
+        let top = unified.first().expect("non-empty result");
+        assert_eq!(top.0, 1);
+        assert!(top.1 <= 1.0 + 1e-6, "top score {} exceeded 1.0", top.1);
     }
 }
