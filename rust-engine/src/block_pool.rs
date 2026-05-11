@@ -373,6 +373,44 @@ impl BlockPool {
             dst.copy_from_slice(&values[block_off..block_off + self.kv_dim]);
         }
     }
+
+    /// Reclaim the overflow slab when nothing currently in flight is
+    /// using it. Returns the number of blocks reclaimed (= the
+    /// pre-call overflow capacity, when the call did anything).
+    ///
+    /// This is the cleanup half of the dynamic-overflow design: a
+    /// transient burst grows the heap-backed slab, but once every
+    /// request that touched overflow has released its blocks the
+    /// memory should go back to the allocator rather than staying
+    /// pinned at the high-water mark forever. Operators can call
+    /// this on a low-frequency timer (e.g. once a minute) from the
+    /// scheduler. It is a no-op when any overflow block is still in
+    /// use, so it is always safe to call.
+    pub fn shrink_overflow_to_fit(&self) -> usize {
+        // Acquire the three overflow mutexes in a fixed order to
+        // avoid lock-ordering deadlocks with `allocate`.
+        let mut keys = self.overflow_keys.lock();
+        let mut values = self.overflow_values.lock();
+        let mut cap = self.overflow_capacity.lock();
+        let mut free = self.overflow_free.lock();
+        if free.len() < *cap {
+            // Some overflow block is still in use; reclaiming would
+            // invalidate its BlockId. Bail.
+            return 0;
+        }
+        let reclaimed = *cap;
+        if reclaimed == 0 {
+            return 0;
+        }
+        keys.clear();
+        keys.shrink_to_fit();
+        values.clear();
+        values.shrink_to_fit();
+        free.clear();
+        free.shrink_to_fit();
+        *cap = 0;
+        reclaimed
+    }
 }
 
 /// Per-request **block manager**: owns the request's block table and
@@ -658,5 +696,32 @@ mod tests {
         assert_eq!(buf, vec![1.0, 2.0, 3.0, 4.0]);
         m.value_into(0, &mut buf);
         assert_eq!(buf, vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn shrink_overflow_to_fit_reclaims_after_burst() {
+        // capacity=1 primary slab → second alloc forces overflow.
+        let pool = BlockPool::new(2, 1);
+        let _primary = pool.allocate().unwrap();
+        let o1 = pool.allocate().unwrap();
+        let o2 = pool.allocate().unwrap();
+        assert!(o1.is_overflow() && o2.is_overflow());
+
+        // Cannot shrink while overflow is in use.
+        assert_eq!(pool.shrink_overflow_to_fit(), 0);
+        assert!(pool.overflow_in_use() > 0);
+
+        // Release both overflow blocks, then shrink: capacity drops to 0.
+        pool.release(o1);
+        pool.release(o2);
+        assert_eq!(pool.overflow_in_use(), 0);
+        let reclaimed = pool.shrink_overflow_to_fit();
+        assert_eq!(reclaimed, 2);
+
+        // After shrinking, the overflow slab is empty and a fresh
+        // overflow alloc starts from index 0 again.
+        let o3 = pool.allocate().unwrap();
+        assert!(o3.is_overflow());
+        assert_eq!(o3.index(), 0);
     }
 }

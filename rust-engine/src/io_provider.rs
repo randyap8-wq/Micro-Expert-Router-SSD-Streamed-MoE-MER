@@ -51,7 +51,9 @@ use std::os::unix::fs::OpenOptionsExt;
 /// Configuration for the storage layer.
 #[derive(Clone, Debug)]
 pub struct StorageConfig {
-    /// Directory containing `expert_<id>.bin` files.
+    /// Directory containing `expert_<id>.bin` files (or
+    /// `expert_<layer>_<local_id>.bin` when [`Self::num_experts_per_layer`]
+    /// is set; see also [`NvmeStorage::expert_path`]).
     pub base_path: PathBuf,
     /// Size (bytes) of every expert file. Must be a multiple of `block_align`.
     pub expert_size: usize,
@@ -59,6 +61,29 @@ pub struct StorageConfig {
     pub block_align: usize,
     /// Whether to open files with `O_DIRECT` and bypass the page cache.
     pub use_direct_io: bool,
+    /// Optional: number of experts per MoE layer in a multi-layer
+    /// model. When `Some(n)` and `n > 0`, [`NvmeStorage::expert_path`]
+    /// resolves the global expert id `g` to
+    /// `expert_<g / n>_<g % n>.bin` whenever the legacy single-namespace
+    /// `expert_<g>.bin` file does not exist. This makes the storage
+    /// layer compatible with both the legacy GGUF-converter naming
+    /// (single global namespace) **and** the multi-layer HF extractor
+    /// naming (per-layer namespace) without requiring a second copy
+    /// of the weight files. `None` (default) preserves the original
+    /// single-namespace behaviour exactly.
+    pub num_experts_per_layer: Option<u32>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            base_path: PathBuf::new(),
+            expert_size: 0,
+            block_align: 4096,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        }
+    }
 }
 
 /// NVMe-backed storage with a per-expert fd cache.
@@ -129,14 +154,44 @@ impl NvmeStorage {
     }
 
     /// Path of the file backing a given expert id.
+    ///
+    /// Resolution order:
+    ///
+    /// 1. The legacy single-namespace path
+    ///    `<dir>/expert_<id>.bin` (compatible with the GGUF
+    ///    converter and the engine's synthetic generators).
+    /// 2. If [`StorageConfig::num_experts_per_layer`] is set and the
+    ///    legacy file does not exist, the multi-layer extractor path
+    ///    `<dir>/expert_<id / n>_<id % n>.bin` (matching
+    ///    `scripts/extract_mixtral_experts.py`'s multi-layer dump).
+    ///
+    /// `<dir>` is `cfg.base_path` for the single-drive layout, or
+    /// `striped_paths[id % n_drives]` for striped multi-drive layouts.
     pub fn expert_path(&self, id: u32) -> PathBuf {
-        if self.striped_paths.is_empty() {
-            self.cfg.base_path.join(format!("expert_{id}.bin"))
+        let dir = if self.striped_paths.is_empty() {
+            self.cfg.base_path.clone()
         } else {
             let n = self.striped_paths.len();
-            let dir = &self.striped_paths[(id as usize) % n];
-            dir.join(format!("expert_{id}.bin"))
+            self.striped_paths[(id as usize) % n].clone()
+        };
+        let primary = dir.join(format!("expert_{id}.bin"));
+        // Fast path: the legacy single-namespace file exists. Use
+        // metadata() rather than try_exists() so we behave the same
+        // as `open_one` would on permission / I/O errors (those still
+        // bubble up to the caller).
+        if std::fs::metadata(&primary).is_ok() {
+            return primary;
         }
+        // Multi-layer fallback: resolve to `expert_<layer>_<local>.bin`
+        // when the operator told us the per-layer count.
+        if let Some(n) = self.cfg.num_experts_per_layer {
+            if n > 0 {
+                let layer = id / n;
+                let local = id % n;
+                return dir.join(format!("expert_{layer}_{local}.bin"));
+            }
+        }
+        primary
     }
 
     fn open_one(&self, id: u32) -> io::Result<Arc<File>> {
@@ -361,23 +416,28 @@ impl NvmeStorage {
         // workers, so we don't stall the runtime; we also avoid the
         // `'static` requirement of `spawn_blocking`, which lets us keep
         // the borrow on `buf`.
-        let len = buf.len();
+        //
+        // We *must* return the byte count `read_at` reports, not
+        // `buf.len()`: a truncated expert file (or any short read on a
+        // network-mounted FS) would otherwise look like a full read and
+        // the caller's "got `n` bytes, expected …" check would never
+        // fire. See `read_expert` / `read_experts_batch` for the
+        // surface-level validation that depends on this.
         tokio::task::block_in_place(|| {
             // `read_at` is a positional read (`pread`) that does not touch
             // the file offset, so concurrent reads against the same fd
             // from multiple workers are safe.
             file.read_at(buf.as_mut_slice(), 0)
-        })?;
-        Ok(len)
+        })
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
     async fn read_into(&self, file: &File, buf: &mut PooledBuffer) -> io::Result<usize> {
         // Same logic on macOS for development. `O_DIRECT` is unavailable;
         // the user is expected to pass `--no-direct` on those hosts.
-        let len = buf.len();
-        tokio::task::block_in_place(|| file.read_at(buf.as_mut_slice(), 0))?;
-        Ok(len)
+        // As on Linux, return the actual count from `read_at` so short
+        // reads are surfaced — see the Linux branch's note.
+        tokio::task::block_in_place(|| file.read_at(buf.as_mut_slice(), 0))
     }
 
     #[cfg(not(unix))]
@@ -769,6 +829,7 @@ mod tests {
                 expert_size,
                 block_align: block,
                 use_direct_io: false,
+                num_experts_per_layer: None,
             },
             vec![d0.clone(), d1.clone()],
         )
@@ -805,6 +866,7 @@ mod tests {
             expert_size,
             block_align: block,
             use_direct_io: false,
+                num_experts_per_layer: None,
         })
         .unwrap();
 
@@ -832,6 +894,56 @@ mod tests {
         }
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_layer_naming_fallback_resolves_layered_files() {
+        // The multi-layer HF extractor writes `expert_<layer>_<id>.bin`;
+        // the storage layer must transparently resolve a global expert
+        // id to the corresponding `(layer, local)` file when the
+        // legacy single-namespace file is missing.
+        let dir = tempdir("multilayer");
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let block = 4096usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let expert_size = ((weight_bytes + block - 1) / block) * block;
+        // 2 layers × 3 experts. Write only the layered names — the
+        // legacy `expert_<global>.bin` files do *not* exist.
+        let n = 3u32;
+        for layer in 0..2u32 {
+            for local in 0..n {
+                let path = dir.join(format!("expert_{layer}_{local}.bin"));
+                let mut blob = vec![0u8; expert_size];
+                for b in blob.iter_mut() {
+                    *b = ((layer * n + local) as u8).wrapping_add(0x40);
+                }
+                std::fs::write(&path, &blob).unwrap();
+            }
+        }
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+            num_experts_per_layer: Some(n),
+        })
+        .unwrap();
+        // Global id → (id/n, id%n).
+        assert_eq!(storage.expert_path(0), dir.join("expert_0_0.bin"));
+        assert_eq!(storage.expert_path(2), dir.join("expert_0_2.bin"));
+        assert_eq!(storage.expert_path(3), dir.join("expert_1_0.bin"));
+        assert_eq!(storage.expert_path(5), dir.join("expert_1_2.bin"));
+        // And the bytes round-trip through `read_expert`, which is
+        // what the engine's miss path actually calls.
+        let pool = BufferPool::new(2, expert_size, block);
+        let mut buf = pool.acquire().await;
+        let bytes = storage.read_expert(4, &mut buf).await.unwrap();
+        assert_eq!(bytes, expert_size);
+        // Layer=1, local=1 → fill byte = (1*3 + 1) + 0x40 = 0x44.
+        assert_eq!(buf.as_slice()[0], 0x44);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

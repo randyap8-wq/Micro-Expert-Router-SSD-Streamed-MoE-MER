@@ -1143,6 +1143,7 @@ mod tests {
                 expert_size,
                 block_align: block,
                 use_direct_io: false, // tmpfs
+                num_experts_per_layer: None,
             })
             .unwrap(),
         );
@@ -1385,6 +1386,7 @@ mod tests {
                 expert_size,
                 block_align: block,
                 use_direct_io: false,
+                num_experts_per_layer: None,
             })
             .unwrap(),
         );

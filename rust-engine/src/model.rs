@@ -724,6 +724,7 @@ mod tests {
                 expert_size,
                 block_align: block,
                 use_direct_io: false,
+                num_experts_per_layer: None,
             })
             .expect("storage"),
         );

@@ -451,28 +451,49 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         .into());
     }
 
+    // Wire the multi-layer extractor naming when num_layers > 1, so
+    // either `expert_<id>.bin` or `expert_<layer>_<local>.bin` works.
     let storage = Arc::new(NvmeStorage::new(StorageConfig {
         base_path: cfg.model.data_dir.clone(),
         expert_size: cfg.model.expert_size,
         block_align: cfg.storage.block_align,
         use_direct_io: !cfg.storage.no_direct,
+        num_experts_per_layer: if cfg.model.num_layers > 1 {
+            Some(cfg.model.num_experts)
+        } else {
+            None
+        },
     })?);
-    storage.warmup_fds(0..cfg.model.num_experts)?;
+    // Warm fds across the whole multi-layer namespace (one global id
+    // per (layer, local_expert) pair) so the steady-state path never
+    // pays the open() cost.
+    let total_experts = (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts);
+    storage.warmup_fds(0..total_experts)?;
 
     let prefetch_headroom = cfg.storage.predict_fanout.max(1);
     let pool_slots = cfg.storage.cache_slots + prefetch_headroom;
     let pool = BufferPool::new(pool_slots, cfg.model.expert_size, cfg.storage.block_align);
     let cache = Arc::new(ExpertCache::new(cfg.storage.cache_slots));
 
+    // Multi-layer addressing: the engine's expert cache uses a single
+    // global namespace `(layer * num_experts_per_layer) + local`, so
+    // the router / predictor / locality monitor / speculator must all
+    // be sized against the *total* expert count, not the per-layer
+    // count. Otherwise layer-≥1 ids silently fall outside the
+    // predictor's row table and the locality monitor's `is_hot` always
+    // returns false for them.
+    let total_experts: u32 =
+        (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts).max(cfg.model.num_experts);
+
     let router = Arc::new(TopKRouter::clustered(
-        cfg.model.num_experts,
+        total_experts,
         cfg.model.top_k,
         4,
         0.9,
         0xC0FFEE,
     ));
     let predictor = Arc::new(PredictiveLoader::new(
-        cfg.model.num_experts,
+        total_experts,
         cfg.storage.predict_fanout,
         cfg.storage.predict_min_prob,
         0xC0FFEE,
@@ -497,10 +518,12 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         },
     );
     // Attach the speculative-architecture components requested via
-    // the `[predictive]` config section.
+    // the `[predictive]` config section. Sized against the global
+    // expert namespace (see `total_experts` above) so multi-layer
+    // models don't silently drop layer-≥1 ids on the floor.
     if cfg.predictive.locality_enabled {
         let monitor = Arc::new(LocalityMonitor::new(
-            cfg.model.num_experts,
+            total_experts,
             cfg.predictive.locality_window,
         ));
         engine_builder = engine_builder
@@ -515,7 +538,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let spec = Arc::new(NeuralSpeculator::new(
             cfg.model.d_model,
             cfg.predictive.speculator_hidden_dim,
-            cfg.model.num_experts,
+            total_experts,
             0xC0FFEE,
         ));
         engine_builder = engine_builder.with_speculator(spec, top_k);
@@ -927,6 +950,10 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         expert_size: args.expert_size,
         block_align: args.block_align,
         use_direct_io: !args.no_direct,
+        // The CLI `generate` path is a single-namespace benchmark
+        // (`gen-data` produces `expert_<id>.bin`); the multi-layer
+        // fallback is only relevant to the `serve` HF-extractor path.
+        num_experts_per_layer: None,
     };
     let storage = Arc::new(if data_dirs.len() > 1 {
         NvmeStorage::striped(storage_cfg, data_dirs.clone())?
