@@ -845,7 +845,7 @@ impl LocalityMonitor {
 /// finite (the per-element NaN guard above already replaced
 /// non-finite entries with `0.0`, but we keep the defensive check so
 /// future callers can't trip a divide-by-zero or `NaN / NaN`).
-fn clip_grad_norm_(grad: &mut [f32], max_norm: f32) {
+fn clip_gradient_norm(grad: &mut [f32], max_norm: f32) {
     let mut sumsq = 0.0f32;
     for &g in grad.iter() {
         sumsq += g * g;
@@ -1250,7 +1250,7 @@ impl NeuralSpeculator {
         // topic shift spiking the per-step update — distinct from
         // (and applied *before*) the per-element clamp, which only
         // bounds individual coordinates.
-        clip_grad_norm_(&mut dlogits, Self::MAX_GRAD_NORM);
+        clip_gradient_norm(&mut dlogits, Self::MAX_GRAD_NORM);
         // Per-element clamp as a belt-and-braces guard. After the
         // norm cap above, well-behaved samples are unaffected; only
         // pathological coordinates (e.g. residue of an out-of-range
@@ -1288,7 +1288,7 @@ impl NeuralSpeculator {
         // Global norm cap on the hidden-layer gradient too — the
         // multiplication by `W2` can blow up the magnitude even when
         // `dlogits` itself was bounded.
-        clip_grad_norm_(&mut dh, Self::MAX_GRAD_NORM);
+        clip_gradient_norm(&mut dh, Self::MAX_GRAD_NORM);
         for v in dh.iter_mut() {
             if *v > 1.0 {
                 *v = 1.0;
