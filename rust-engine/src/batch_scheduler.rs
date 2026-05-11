@@ -141,8 +141,9 @@ pub struct StepRequest {
     pub pos: usize,
     /// Per-request sampling parameters (temperature/top-p/top-k/seed).
     pub params: crate::sampling::SamplingParams,
-    /// Channel used by the scheduler to return the next-token id.
-    pub resp: oneshot::Sender<StepResponse>,
+    /// Channel used by the scheduler to return the next-token id, or
+    /// an error if the request id could not be resolved.
+    pub resp: oneshot::Sender<Result<StepResponse, BatchError>>,
 }
 
 /// The reply mailed back through `StepRequest::resp`.
@@ -337,7 +338,7 @@ impl BatchScheduler {
         let (tx, rx) = oneshot::channel();
         let req = StepRequest { id, token_id, pos, params, resp: tx };
         self.tx.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
-        let resp = rx.await.map_err(|_| BatchError::SchedulerClosed)?;
+        let resp = rx.await.map_err(|_| BatchError::SchedulerClosed)??;
         Ok(resp.next_token)
     }
 
@@ -457,11 +458,13 @@ async fn scheduler_loop(
                 let entry = match registry.get(id) {
                     Some(e) => e,
                     None => {
-                        // Caller dropped or never registered; surface
-                        // a closed-scheduler error to the oneshot —
-                        // we can't produce a valid token without a
-                        // KV cache to mutate.
-                        let _ = resp;
+                        // Surface NotRegistered explicitly so callers
+                        // can distinguish this from scheduler
+                        // shutdown. `step_through_scheduler` in the
+                        // server falls back to a direct `model.step`
+                        // for either error variant, so HTTP requests
+                        // still complete cleanly.
+                        let _ = resp.send(Err(BatchError::NotRegistered));
                         return;
                     }
                 };
@@ -474,7 +477,7 @@ async fn scheduler_loop(
                         .step(&engine, token_id, pos, &mut kv, &params)
                         .await
                 };
-                let _ = resp.send(StepResponse { next_token: next });
+                let _ = resp.send(Ok(StepResponse { next_token: next }));
             }));
         }
         for h in handles {
