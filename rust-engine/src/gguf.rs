@@ -582,7 +582,16 @@ impl GgufStreamReader {
                 ),
             ));
         }
-        let mut out = vec![0u8; info.byte_len as usize];
+        let byte_len: usize = info.byte_len.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "tensor {name} byte length {} is too large for this platform",
+                    info.byte_len
+                ),
+            )
+        })?;
+        let mut out = vec![0u8; byte_len];
         let mut f = self.file.lock();
         use std::io::{Seek, SeekFrom};
         f.seek(SeekFrom::Start(start))?;
