@@ -70,10 +70,13 @@ expert_size = 16777216
 # Number of transformer layers. 1 for the legacy single-layer benchmark
 # data; 32 for full Mixtral-8x7B.
 num_layers = 1
-# On-disk weight dtype: "f32" (4 B/weight, default, legacy) or "f16"
-# (2 B/weight). f16 halves SSD bytes per expert read, the dominant
-# energy term in this engine. Must match what `extract_mixtral_experts.py`
-# (or `gen-data`) was invoked with.
+# On-disk weight dtype: "f32" (4 B/weight, default, legacy), "f16"
+# (2 B/weight), "int8" (1 B/weight + per-tensor scales), "q4k" (Q4_K_M
+# 256-block, GGUF-compatible 4-bit), or "q4_0" (Q4_0 32-block, 4-bit).
+# Lower-precision dtypes halve/quarter SSD bytes per expert read, the
+# dominant energy term in this engine. Must match what
+# `extract_mixtral_experts.py` / `gguf-convert` / `gen-data` was invoked
+# with.
 dtype = "f32"
 
 [storage]
@@ -106,12 +109,12 @@ pin_after_observations = 0
 # Mixtral). Comment out / delete to use the byte-level fallback.
 # path = "./data/tokenizer.json"
 
-# Real transformer pipeline (gist Phase 5/6). When `enabled = false`
+# Real transformer pipeline. When `enabled = false`
 # (the default), the server uses the legacy benchmark generator and
 # synthesises next-token ids from `Engine::generate` cycle stats — the
 # SSD-streaming substrate is exercised identically. When `enabled =
 # true`, requests run the full decoder forward (`embedding -> stacked
-# layers (each with SSD-streamed MoE) -> LM head -> argmax`) and the
+# layers (each with SSD-streamed MoE) -> LM head -> sample`) and the
 # response text is sampled from real logits.
 [real_transformer]
 enabled = false

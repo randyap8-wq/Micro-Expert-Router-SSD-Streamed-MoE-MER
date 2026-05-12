@@ -3,7 +3,6 @@ name = "micro-expert-router"
 version = "0.1.0"
 edition = "2021"
 description = "MoE execution engine that streams experts from NVMe into RAM with O_DIRECT, an LRU expert cache, and a learned predictive prefetcher"
-license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Tokio drives the orchestration (scheduling, prefetch tasks, channels).
@@ -63,7 +62,7 @@ safetensors = "0.4"
 
 # Optional BLAS-equivalent dense matmul backend. Pulled in only when
 # the `blas` cargo feature is enabled. We use `matrixmultiply` rather
-# than `cblas-sys` + `blas-src` (the gist's nominal choice) because it:
+# than `cblas-sys` + `blas-src` because it:
 #   * is pure Rust — no `system OpenBLAS` install required, so CI and
 #     `cargo test` keep working out of the box;
 #   * provides the same hand-tuned-microkernel SGEMM/SGEMV used by
@@ -99,7 +98,7 @@ tokenizer = ["dep:tokenizers"]
 io_uring = ["dep:io-uring"]
 # Row-parallel matmul (uses `std::thread::scope`, no extra crate dep) for
 # the dense projections inside `TransformerLayer` and the LM head. This
-# stands in for the rayon / candle / cudarc backend the gist mentions —
+# stands in for a future rayon / candle / cudarc backend —
 # the call sites are already routed through `matmul_row_major`, so a
 # future PR can swap the body for a CUDA kernel without touching callers.
 simd = []

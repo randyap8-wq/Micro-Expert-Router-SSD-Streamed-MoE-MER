@@ -49,8 +49,8 @@ single-process `combine_moe_outputs` does today. Top-K is small
   active/standby) since losing one shard otherwise loses
   `1/num_nodes` of the experts.
 
-## Out of scope for this PR
+## Status
 
-The gist asks to *document* the distributed path, not to implement
-it. The intent is to keep the surface area visible so a follow-up
-PR can land it without re-deriving the design.
+This document captures the design so a follow-up change can implement
+it without re-deriving it; the partitioning surface area is recorded
+here on purpose, ahead of the implementation.
