@@ -3,6 +3,12 @@ name = "micro-expert-router"
 version = "0.1.0"
 edition = "2021"
 description = "MoE execution engine that streams experts from NVMe into RAM with O_DIRECT, an LRU expert cache, and a learned predictive prefetcher"
+# This crate is intentionally not published to crates.io. The `license`
+# field has been removed, and without it `cargo publish` would refuse to
+# upload the crate anyway; setting `publish = false` makes that intent
+# explicit and prevents accidental publish attempts from CI or `cargo
+# release` workflows.
+publish = false
 
 [dependencies]
 # Tokio drives the orchestration (scheduling, prefetch tasks, channels).
