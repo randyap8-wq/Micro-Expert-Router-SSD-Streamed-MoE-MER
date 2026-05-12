@@ -82,7 +82,7 @@ pub enum WeightDtype {
     /// Per-tensor symmetric `int8`, 1 byte per weight, with a 12-byte
     /// header (`[gate_scale, up_scale, down_scale]: [f32; 3]`) at the
     /// start of every expert blob. Dequantised to `f32` at fetch time.
-    #[serde(alias = "Int8", alias = "i8", alias = "q8")]
+    #[serde(alias = "Int8", alias = "i8", alias = "q8", alias = "Q8")]
     Int8,
     /// **GGUF-style Q4_K_M block quantisation.** Each 256-weight
     /// super-block occupies 144 bytes: an `f16` super-scale `d`, an

@@ -1,0 +1,53 @@
+//! Scalar reference kernels — the always-available fallback that every
+//! SIMD / AMX path is validated against.
+//!
+//! These are kept obviously-correct and `#[inline]`-friendly; the
+//! optimizer is responsible for autovectorising them on toolchains
+//! where the SIMD cargo features are not enabled.
+
+/// `sum_i a[i] * b[i]`. Length checked in debug builds.
+#[inline]
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = 0.0f32;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+/// Fused symmetric-int8 dequant + dot: `sum_i scale * q[i] * x[i]`.
+///
+/// This is the *kernel* used inside the streaming int8 expert path:
+/// the on-disk weights stay `i8` until they reach this fused loop,
+/// so the per-byte SSD cost translates directly into MACs without a
+/// stop in an owned `Vec<f32>` (compare the existing
+/// `OwnedExpertWeights::from_bytes_int8` path which materialises one).
+#[inline]
+pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
+    debug_assert_eq!(q.len(), x.len());
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        acc += (q[i] as f32) * x[i];
+    }
+    acc * scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_f32_basic() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [4.0, 5.0, 6.0];
+        assert_eq!(dot_f32(&a, &b), 1.0 * 4.0 + 2.0 * 5.0 + 3.0 * 6.0);
+    }
+
+    #[test]
+    fn dequant_int8_dot_basic() {
+        let q = [1i8, -2, 3];
+        let x = [1.0f32, 1.0, 1.0];
+        assert!((dequant_int8_dot(0.5, &q, &x) - (1.0 - 2.0 + 3.0) * 0.5).abs() < 1e-6);
+    }
+}

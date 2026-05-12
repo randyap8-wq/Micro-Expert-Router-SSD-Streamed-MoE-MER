@@ -19,14 +19,17 @@ mod inference;
 mod io_provider;
 #[cfg(all(feature = "io_uring", target_os = "linux"))]
 mod io_uring_storage;
+mod kernels;
 mod metrics;
 mod middleware;
 mod model;
 mod multi_layer_cache;
+mod numa;
 mod router;
 mod sampling;
 mod server;
 mod session;
+mod tensor_header;
 mod tokenizer;
 mod transformer;
 
@@ -308,6 +311,19 @@ fn init_logging(filter: &str) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     init_logging(&cli.log);
+
+    // Best-effort NUMA pinning: honoured before any tokio runtime or
+    // background thread spawns so child threads inherit the affinity
+    // mask. See `numa::apply_mer_pin_cores_env` for the contract.
+    let pin = crate::numa::apply_mer_pin_cores_env();
+    info!("{}", pin.as_log_line());
+
+    // Log the selected math kernel backend once. The dispatcher itself
+    // is lazy, but emitting this at startup gives ops a single line in
+    // the journal that tells them "you're running the scalar path"
+    // before they go looking for missing AVX-512 perf.
+    crate::kernels::log_backend();
+
     match cli.cmd {
         Cmd::GenData {
             data_dir,

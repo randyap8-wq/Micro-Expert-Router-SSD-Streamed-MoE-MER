@@ -116,3 +116,15 @@ simd = []
 # misconfigured `--features simd,blas` build fails fast rather than
 # silently picking one branch).
 blas = ["dep:matrixmultiply"]
+# Build the AVX-512 dispatcher in `kernels/avx512.rs`. Stable on
+# x86_64; the actual code is `#[target_feature]`-gated and only
+# executed when the runtime probe in `kernels::detect()` confirms the
+# CPU supports AVX-512F + AVX-512BW. Off by default to keep portable
+# builds buildable on toolchains pinned to a non-AVX-512 baseline.
+avx512 = []
+# Build the AMX skeleton in `kernels/amx.rs`. AMX intrinsics are
+# nightly-only as of Rust 1.84, so this feature today builds in the
+# runtime detector + tile-hint plumbing but the executor still falls
+# through to AVX-512 / scalar. A follow-up PR (or a nightly build)
+# can drop a real tile-based body in without touching call sites.
+amx = []
