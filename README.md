@@ -873,7 +873,7 @@ out for compatibility with consumers that pre-date the header.
 ```bash
 ./target/release/micro-expert-router gguf-convert \
     --gguf-path ./mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf \
-    --out-dir   ./mixtral-data
+    --out-dir   ./mixtral-data \
     # add --no-uth and/or --legacy-eager if your tooling needs them
 
 ./target/release/micro-expert-router run --data-dir ./mixtral-data
