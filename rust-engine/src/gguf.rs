@@ -195,6 +195,12 @@ impl GgufFile {
         self.metadata.get("general.architecture").and_then(|v| v.as_str())
     }
 
+    /// Whether the named tensor exists in this GGUF.
+    #[allow(dead_code)]
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
     // -------------------------- parser -----------------------------
 
     fn parse(bytes: Vec<u8>) -> io::Result<Self> {
@@ -430,6 +436,280 @@ fn read_value_typed<'a>(cur: &mut Cursor<'a>, version: u32, ty: u32) -> io::Resu
     })
 }
 
+// -----------------------------------------------------------------------
+// Streaming reader.
+// -----------------------------------------------------------------------
+
+/// A GGUF reader that only parses the **header** (magic + KV table + tensor
+/// info table) into memory and reads tensor bodies on demand by seeking
+/// the still-open `File`. The eager [`GgufFile::open`] entry point is
+/// retained for tests and for very small fixtures where slurping the
+/// whole file is genuinely simpler; everything that operates on
+/// production-scale Mixtral checkpoints (10s of GB to >100 GB) should
+/// use this type instead — see [`crate::gguf_loader`].
+///
+/// The implementation is deliberately straightforward: it does a single
+/// streaming read of the header (which is bounded — typically a few
+/// hundred KB even on a 100 GB GGUF, since tensor *bodies* dominate),
+/// then satisfies each `read_tensor_data` call with one
+/// `seek` + `read_exact` on the original `File`. There is no `mmap`
+/// dependency and no `unsafe`. Concurrent reads are guarded by a
+/// `Mutex<File>` so the reader is `Send + Sync`.
+pub struct GgufStreamReader {
+    pub version: u32,
+    pub metadata: HashMap<String, GgufValue>,
+    pub tensors: HashMap<String, GgufTensorInfo>,
+    /// File handle, kept open for tensor-data seeks.
+    file: parking_lot::Mutex<File>,
+    /// Byte offset (from the start of the file) of the tensor-data
+    /// region. Tensor `offset` fields are relative to this.
+    tensor_data_start: u64,
+    /// Total file size in bytes (cached at open).
+    file_len: u64,
+}
+
+impl GgufStreamReader {
+    /// Open `path` and parse only the header. The tensor data is **not**
+    /// read into memory; call [`Self::read_tensor_data`] for each
+    /// tensor you actually need.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let mut f = File::open(path)?;
+        let file_len = f.metadata()?.len();
+
+        // Step 1: read the fixed header preamble (magic + version + counts).
+        let mut hdr = [0u8; 24];
+        f.read_exact(&mut hdr[..4])?;
+        if &hdr[..4] != GGUF_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("not a GGUF file (magic = {:?})", &hdr[..4]),
+            ));
+        }
+        f.read_exact(&mut hdr[4..8])?;
+        let version = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        if version == 0 || version > 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported GGUF version {version}; supported = 1, 2, 3"),
+            ));
+        }
+        let (tensor_count_bytes, kv_count_bytes) = if version == 1 { (4, 4) } else { (8, 8) };
+        let mut count_buf = [0u8; 16];
+        f.read_exact(&mut count_buf[..tensor_count_bytes + kv_count_bytes])?;
+        let tensor_count = read_count_bytes(&count_buf[..tensor_count_bytes], version);
+        let kv_count = read_count_bytes(
+            &count_buf[tensor_count_bytes..tensor_count_bytes + kv_count_bytes],
+            version,
+        );
+
+        // Step 2: read the rest of the header into memory. The header
+        // size is bounded by `tensor_count * (string + shape + 12 bytes)`
+        // plus the KV table — both are tiny relative to the body.
+        // We do this by streaming the file from its current position
+        // until we have enough to parse the tensor table; because we
+        // don't know the exact size ahead of time we read in 4 MiB
+        // chunks until parsing succeeds, then stop. In practice one
+        // chunk is enough for every published Mixtral checkpoint.
+        let header_preamble_len = (4 + 4 + tensor_count_bytes + kv_count_bytes) as u64;
+        let mut header_bytes = Vec::with_capacity(4 * 1024 * 1024);
+        header_bytes.extend_from_slice(&hdr[..8]);
+        header_bytes.extend_from_slice(&count_buf[..tensor_count_bytes + kv_count_bytes]);
+        let mut chunk = vec![0u8; 4 * 1024 * 1024];
+        loop {
+            let n = f.read(&mut chunk)?;
+            if n == 0 {
+                // Reached EOF without finding the tensor-data section —
+                // surfaces below as an `UnexpectedEof` error.
+                break;
+            }
+            header_bytes.extend_from_slice(&chunk[..n]);
+            // Try to parse the header from the bytes accumulated so far.
+            // On success we'll know `tensor_data_start` and can stop
+            // pulling header bytes.
+            if let Some(parsed) = Self::try_parse_header(
+                &header_bytes,
+                version,
+                tensor_count,
+                kv_count,
+                header_preamble_len,
+            ) {
+                return Ok(Self {
+                    version: parsed.version,
+                    metadata: parsed.metadata,
+                    tensors: parsed.tensors,
+                    file: parking_lot::Mutex::new(f),
+                    tensor_data_start: parsed.tensor_data_start,
+                    file_len,
+                });
+            }
+            // Bail if the header is patently malformed — refuse to grow
+            // the buffer unboundedly on a corrupt file. Real GGUF
+            // headers are at most a few hundred MiB even at extreme
+            // tensor counts.
+            if header_bytes.len() > 512 * 1024 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GGUF header exceeds 512 MiB; refusing to grow further",
+                ));
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "GGUF file ended before the tensor-data section was reachable",
+        ))
+    }
+
+    /// Read the raw bytes of a tensor by name into an owned `Vec<u8>`.
+    /// Returns `None` if the tensor is not present in this file.
+    pub fn read_tensor_data(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        let info = match self.tensors.get(name) {
+            Some(i) => i.clone(),
+            None => return Ok(None),
+        };
+        let start = self
+            .tensor_data_start
+            .checked_add(info.offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tensor offset overflow"))?;
+        let end = start
+            .checked_add(info.byte_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tensor end overflow"))?;
+        if end > self.file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "tensor {name} declares range {start}..{end} past end of file ({})",
+                    self.file_len
+                ),
+            ));
+        }
+        let mut out = vec![0u8; info.byte_len as usize];
+        let mut f = self.file.lock();
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut out)?;
+        Ok(Some(out))
+    }
+
+    /// Look up tensor info (shape, dtype, offset) by name without
+    /// reading any body bytes.
+    pub fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
+        self.tensors.get(name)
+    }
+
+    /// Map this tensor's GGML dtype onto the engine's [`WeightDtype`].
+    pub fn tensor_dtype(&self, name: &str) -> Option<WeightDtype> {
+        let info = self.tensors.get(name)?;
+        ggml_to_weight_dtype(info.ggml_dtype)
+    }
+
+    /// `general.architecture`, if present.
+    pub fn architecture(&self) -> Option<&str> {
+        self.metadata.get("general.architecture").and_then(|v| v.as_str())
+    }
+
+    /// Try to parse the full header out of `bytes`. Returns `None` if
+    /// `bytes` is too short to contain the full header yet — the caller
+    /// should pull more bytes and retry.
+    fn try_parse_header(
+        bytes: &[u8],
+        _version: u32,
+        _tensor_count: u64,
+        _kv_count: u64,
+        _preamble_len: u64,
+    ) -> Option<ParsedGgufHeader> {
+        // We can't easily know "is this enough?" without partially
+        // parsing — so reuse the existing eager parser. If it succeeds
+        // we extract the header fields and discard the body bytes the
+        // caller accidentally pulled in (they were a small overshoot
+        // bounded by the 4 MiB read chunk).
+        //
+        // The eager parser takes ownership of `Vec<u8>`. Clone the
+        // accumulated header buffer here — the cost is O(header size),
+        // which is tiny relative to a real GGUF body. Doing this once
+        // when we converge on a parseable header is fine.
+        let parsed = match GgufFile::parse(bytes.to_vec()) {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
+        Some(ParsedGgufHeader {
+            version: parsed.version,
+            metadata: parsed.metadata,
+            tensors: parsed.tensors,
+            tensor_data_start: parsed.tensor_data_start as u64,
+        })
+    }
+}
+
+struct ParsedGgufHeader {
+    version: u32,
+    metadata: HashMap<String, GgufValue>,
+    tensors: HashMap<String, GgufTensorInfo>,
+    tensor_data_start: u64,
+}
+
+fn read_count_bytes(bytes: &[u8], version: u32) -> u64 {
+    if version == 1 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
+    } else {
+        u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    }
+}
+
+// -----------------------------------------------------------------------
+// `GgufSource` — uniform abstraction over the eager and streaming readers.
+// -----------------------------------------------------------------------
+
+/// Read-only view over a GGUF file. The `gguf_loader` module is
+/// parametrised over this trait so it can drive either the eager
+/// in-memory [`GgufFile`] (used by the tests and small fixtures) or
+/// the on-disk streaming [`GgufStreamReader`] (used by `gguf-convert`
+/// at production scale).
+pub trait GgufSource {
+    fn metadata(&self) -> &HashMap<String, GgufValue>;
+    fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo>;
+    /// Read a tensor's body into an owned `Vec<u8>`. Returns `Ok(None)`
+    /// when the tensor is not present (matches the legacy
+    /// `GgufFile::tensor_data` behaviour for the missing case).
+    fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>>;
+    /// Map this tensor's GGML dtype onto the engine's [`WeightDtype`].
+    fn tensor_dtype(&self, name: &str) -> Option<WeightDtype> {
+        let info = self.tensor_info(name)?;
+        ggml_to_weight_dtype(info.ggml_dtype)
+    }
+    fn architecture(&self) -> Option<&str> {
+        self.metadata().get("general.architecture").and_then(|v| v.as_str())
+    }
+    fn has_tensor(&self, name: &str) -> bool {
+        self.tensor_info(name).is_some()
+    }
+}
+
+impl GgufSource for GgufFile {
+    fn metadata(&self) -> &HashMap<String, GgufValue> {
+        &self.metadata
+    }
+    fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
+        self.tensors.get(name)
+    }
+    fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.tensor_data(name).map(<[u8]>::to_vec))
+    }
+}
+
+impl GgufSource for GgufStreamReader {
+    fn metadata(&self) -> &HashMap<String, GgufValue> {
+        &self.metadata
+    }
+    fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
+        self.tensors.get(name)
+    }
+    fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        self.read_tensor_data(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,5 +797,43 @@ mod tests {
         // can skip / fall back to seeded init.
         assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q6_K), None);
         assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q8_0), None);
+    }
+
+    #[test]
+    fn stream_reader_parses_header_and_reads_body_on_demand() {
+        // Write the synthetic GGUF to a tempfile and open it
+        // through `GgufStreamReader`. The streaming path must
+        // surface the same metadata, tensor info, and body bytes
+        // as the eager `GgufFile::parse` path.
+        let bytes = synth_gguf();
+        let dir = std::env::temp_dir().join(format!(
+            "gguf-stream-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synth.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let r = GgufStreamReader::open(&path).expect("stream open");
+        assert_eq!(r.version, 3);
+        assert_eq!(r.architecture(), Some("llama"));
+        let info = r.tensor_info("t").expect("tensor info");
+        assert_eq!(info.shape, vec![4]);
+        assert_eq!(info.byte_len, 16);
+        assert_eq!(r.tensor_dtype("t"), Some(WeightDtype::F32));
+
+        let body = r.read_tensor_data("t").unwrap().expect("body present");
+        assert_eq!(body.len(), 16);
+        let v: Vec<f32> = body
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0]);
+
+        // Missing tensor → Ok(None), not an error.
+        assert!(r.read_tensor_data("missing").unwrap().is_none());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

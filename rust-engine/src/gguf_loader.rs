@@ -25,10 +25,11 @@
 //! (`expert_size` is the same for every expert, the file is page-padded,
 //! and `metadata.json::dtype` correctly describes the contents).
 
-use crate::gguf::{ggml_dtype, GgufFile, GgufTensorInfo};
+use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo};
 use crate::inference::{
     dequantize_f16_to_f32, expert_weight_bytes_for, WeightDtype,
 };
+use crate::tensor_header::TensorHeader;
 use serde::Serialize;
 use std::fs;
 use std::io::{self, Write};
@@ -92,18 +93,62 @@ pub const DEFAULT_BLOCK_ALIGN: usize = 4096;
 ///
 /// If `num_layers` / `num_experts_per_layer` are 0, they're auto-detected
 /// from the GGUF metadata (`llama.block_count`, `llama.expert_count`).
+///
+/// This is the legacy eager entry point — see
+/// [`extract_experts_from_source`] for the streaming-friendly variant
+/// that also lets the caller opt-in to the Unified Tensor Header.
 pub fn extract_experts_from_gguf(
     gguf: &GgufFile,
     out_dir: &Path,
     num_layers_hint: usize,
     num_experts_hint: usize,
 ) -> io::Result<ExtractionReport> {
+    extract_experts_from_source(
+        gguf,
+        out_dir,
+        num_layers_hint,
+        num_experts_hint,
+        ExtractOptions::default(),
+    )
+}
+
+/// Per-call knobs for [`extract_experts_from_source`].
+#[derive(Debug, Clone)]
+pub struct ExtractOptions {
+    /// If true, prepend the 64-byte Unified Tensor Header to every
+    /// expert file. The header is page-padded so the payload still
+    /// starts at the configured `block_align` (4 KiB), preserving the
+    /// engine's `O_DIRECT` invariants and per-expert `expert_size`
+    /// contract. Default `true`.
+    pub emit_uth: bool,
+}
+
+impl Default for ExtractOptions {
+    fn default() -> Self {
+        Self { emit_uth: true }
+    }
+}
+
+/// Streaming-friendly variant of [`extract_experts_from_gguf`].
+///
+/// Accepts anything that implements [`GgufSource`] so callers can pass
+/// either the eager [`GgufFile`] (which slurps the file into memory at
+/// open) or [`crate::gguf::GgufStreamReader`] (which keeps only the
+/// header resident and seeks tensor bodies on demand). For checkpoints
+/// ≥ ~10 GB the streaming reader is the right default.
+pub fn extract_experts_from_source(
+    gguf: &dyn GgufSource,
+    out_dir: &Path,
+    num_layers_hint: usize,
+    num_experts_hint: usize,
+    opts: ExtractOptions,
+) -> io::Result<ExtractionReport> {
     fs::create_dir_all(out_dir)?;
 
     let num_layers = if num_layers_hint > 0 {
         num_layers_hint
     } else {
-        gguf.metadata
+        gguf.metadata()
             .get("llama.block_count")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
@@ -116,7 +161,7 @@ pub fn extract_experts_from_gguf(
     let num_experts = if num_experts_hint > 0 {
         num_experts_hint
     } else {
-        gguf.metadata
+        gguf.metadata()
             .get("llama.expert_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize
@@ -130,21 +175,21 @@ pub fn extract_experts_from_gguf(
 
     // Required shape parameters.
     let d_model = gguf
-        .metadata
+        .metadata()
         .get("llama.embedding_length")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "GGUF missing llama.embedding_length")
         })? as usize;
     let d_ff = gguf
-        .metadata
+        .metadata()
         .get("llama.feed_forward_length")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "GGUF missing llama.feed_forward_length")
         })? as usize;
     let top_k = gguf
-        .metadata
+        .metadata()
         .get("llama.expert_used_count")
         .and_then(|v| v.as_u64())
         .unwrap_or(2) as usize;
@@ -155,6 +200,7 @@ pub fn extract_experts_from_gguf(
         d_model,
         d_ff,
         top_k,
+        emit_uth = opts.emit_uth,
         "gguf-convert: extracting experts"
     );
 
@@ -175,26 +221,32 @@ pub fn extract_experts_from_gguf(
     // slicing them at byte granularity isn't possible without unpacking.
     // Dequantising at extract time gives the engine the simplest input
     // and preserves accuracy.
-    let expert_size = align_up(
+    //
+    // When `opts.emit_uth` is set, each expert file is prefixed with a
+    // 64-byte U.T.H., page-padded to DEFAULT_BLOCK_ALIGN so the weight
+    // payload still starts at a 4 KiB boundary. The total file size
+    // therefore grows by exactly one block (4 KiB) per expert.
+    let payload_size = align_up(
         expert_weight_bytes_for(d_model, d_ff, WeightDtype::F32),
         DEFAULT_BLOCK_ALIGN,
     );
+    let header_overhead = if opts.emit_uth { DEFAULT_BLOCK_ALIGN } else { 0 };
+    let expert_size = payload_size + header_overhead;
 
     for layer in 0..num_layers {
         info!(layer, "extracting layer experts");
-        // Decode each interleaved expert tensor at most once per
-        // layer, then slice every expert from the cached f32 buffer.
-        // Previously each `load_expert_matrices` call re-decoded the
-        // full gate/up/down tensors, so a layer with N experts paid
-        // for 3N redundant full-tensor decodes — prohibitive on real
-        // Mixtral checkpoints. `load_layer_expert_matrices` does the
-        // work once per layer instead.
         let per_expert =
             load_layer_expert_matrices(gguf, layer, num_experts, d_model, d_ff)?;
         for (e, (gate, up, down)) in per_expert.into_iter().enumerate() {
             let global_id = layer * num_experts + e;
             let path = out_dir.join(format!("expert_{global_id}.bin"));
-            let bytes = pack_expert_f32(&gate, &up, &down, expert_size);
+            let mut bytes = Vec::with_capacity(expert_size);
+            if opts.emit_uth {
+                TensorHeader::for_swiglu_expert(WeightDtype::F32, d_model, d_ff)
+                    .write_padded(DEFAULT_BLOCK_ALIGN, &mut bytes);
+                debug_assert_eq!(bytes.len(), DEFAULT_BLOCK_ALIGN);
+            }
+            append_expert_f32(&mut bytes, &gate, &up, &down, expert_size);
             write_file(&path, &bytes)?;
             report.experts_written += 1;
             report.total_bytes += bytes.len() as u64;
@@ -213,8 +265,8 @@ pub fn extract_experts_from_gguf(
         ("output.weight", &["lm_head.bin"], vec![d_model as u64, 0]),
     ];
     for (gname, aliases, _) in &dense_specs {
-        if let Some(info) = gguf.tensors.get(*gname) {
-            match dense_tensor_to_f32(gguf, info) {
+        if let Some(info) = gguf.tensor_info(gname).cloned() {
+            match dense_tensor_to_f32(gguf, &info) {
                 Ok(f32s) => {
                     for alias in *aliases {
                         let path = out_dir.join(alias);
@@ -237,8 +289,8 @@ pub fn extract_experts_from_gguf(
     // Per-layer dense tensors.
     for layer in 0..num_layers {
         let mut emit = |gname: String, aliases: Vec<String>| -> io::Result<()> {
-            if let Some(info) = gguf.tensors.get(&gname) {
-                match dense_tensor_to_f32(gguf, info) {
+            if let Some(info) = gguf.tensor_info(&gname).cloned() {
+                match dense_tensor_to_f32(gguf, &info) {
                     Ok(f32s) => {
                         let bytes = f32_vec_to_le_bytes(&f32s);
                         for alias in &aliases {
@@ -296,7 +348,7 @@ pub fn extract_experts_from_gguf(
 
     // metadata.json
     let model_name = gguf
-        .metadata
+        .metadata()
         .get("general.name")
         .and_then(|v| v.as_str())
         .unwrap_or("gguf-extracted");
@@ -348,26 +400,45 @@ fn f32_vec_to_le_bytes(v: &[f32]) -> Vec<u8> {
 
 /// Pack one expert's matrices into the engine's on-disk layout:
 /// `gate || up || down` row-major f32, padded to `target_size`.
+///
+/// Used by the legacy non-UTH path. The streaming UTH path uses
+/// [`append_expert_f32`] instead which writes into an existing buffer.
+#[cfg(test)]
 fn pack_expert_f32(gate: &[f32], up: &[f32], down: &[f32], target_size: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(target_size);
+    append_expert_f32(&mut out, gate, up, down, target_size);
+    out
+}
+
+/// Append `gate || up || down` row-major f32 bytes to `out`, then pad
+/// the *total* length of `out` to `target_size`. This is the
+/// UTH-aware counterpart of `pack_expert_f32`: the caller has already
+/// pushed the header + page padding into `out`, so we just continue
+/// from wherever `out.len()` currently is.
+fn append_expert_f32(
+    out: &mut Vec<u8>,
+    gate: &[f32],
+    up: &[f32],
+    down: &[f32],
+    target_size: usize,
+) {
     for v in gate.iter().chain(up.iter()).chain(down.iter()) {
         out.extend_from_slice(&v.to_le_bytes());
     }
     if out.len() < target_size {
         out.resize(target_size, 0);
     }
-    out
 }
 
 /// Convert any supported dense tensor to a flat row-major `Vec<f32>`.
-fn dense_tensor_to_f32(gguf: &GgufFile, info: &GgufTensorInfo) -> io::Result<Vec<f32>> {
-    let data = gguf.tensor_data(&info.name).ok_or_else(|| {
+fn dense_tensor_to_f32(gguf: &dyn GgufSource, info: &GgufTensorInfo) -> io::Result<Vec<f32>> {
+    let data = gguf.read_tensor_owned(&info.name)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("tensor {} has no data slice", info.name),
         )
     })?;
-    bytes_to_f32(data, info.ggml_dtype, info.elem_count() as usize, &info.name)
+    bytes_to_f32(&data, info.ggml_dtype, info.elem_count() as usize, &info.name)
 }
 
 fn bytes_to_f32(data: &[u8], dtype: u32, elems: usize, name: &str) -> io::Result<Vec<f32>> {
@@ -433,7 +504,7 @@ fn bytes_to_f32(data: &[u8], dtype: u32, elems: usize, name: &str) -> io::Result
 ///   behaviour. The convert never aborts on a single unsupported
 ///   layer.
 fn load_layer_expert_matrices(
-    gguf: &GgufFile,
+    gguf: &dyn GgufSource,
     layer: usize,
     num_experts: usize,
     d_model: usize,
@@ -457,7 +528,7 @@ fn load_layer_expert_matrices(
             .collect::<Vec<_>>()
     };
 
-    if gguf.tensors.contains_key(&interleaved_gate_name) {
+    if gguf.has_tensor(&interleaved_gate_name) {
         // Decode each interleaved tensor exactly once and reuse it for
         // all experts in the layer.
         let gate_all = match dense_layer_tensor_f32(
@@ -508,7 +579,7 @@ fn load_layer_expert_matrices(
             ));
         }
         Ok(out)
-    } else if gguf.tensors.contains_key(&per_expert_gate0) {
+    } else if gguf.has_tensor(&per_expert_gate0) {
         // Per-expert tensors: each expert's tensors are already
         // separate, so a layer-level cache buys nothing — just dispatch
         // to `load_expert_matrices`, catching Unsupported per expert.
@@ -542,14 +613,14 @@ fn load_layer_expert_matrices(
 /// expected number of f32 elements. Errors with `InvalidData` on size
 /// mismatch and propagates `Unsupported` from `bytes_to_f32`.
 fn dense_layer_tensor_f32(
-    gguf: &GgufFile,
+    gguf: &dyn GgufSource,
     name: &str,
     expected: usize,
 ) -> io::Result<Vec<f32>> {
-    let info = gguf.tensors.get(name).ok_or_else(|| {
+    let info = gguf.tensor_info(name).cloned().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("tensor {name} missing"))
     })?;
-    let v = dense_tensor_to_f32(gguf, info)?;
+    let v = dense_tensor_to_f32(gguf, &info)?;
     if v.len() != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -578,7 +649,7 @@ fn dense_layer_tensor_f32(
 /// caches each decoded interleaved tensor so the per-expert slicing is
 /// not `O(num_experts)` redundant decodes.
 fn load_expert_matrices(
-    gguf: &GgufFile,
+    gguf: &dyn GgufSource,
     layer: usize,
     expert: usize,
     num_experts: usize,
@@ -588,7 +659,7 @@ fn load_expert_matrices(
     let interleaved_gate = format!("blk.{layer}.ffn_gate_exps.weight");
     let per_expert_gate = format!("blk.{layer}.ffn_gate.{expert}.weight");
 
-    if gguf.tensors.contains_key(&interleaved_gate) {
+    if gguf.has_tensor(&interleaved_gate) {
         let gate = slice_expert_matrix(
             gguf,
             &interleaved_gate,
@@ -614,7 +685,7 @@ fn load_expert_matrices(
             d_ff,
         )?;
         Ok((gate, up, down))
-    } else if gguf.tensors.contains_key(&per_expert_gate) {
+    } else if gguf.has_tensor(&per_expert_gate) {
         let gate = load_per_expert_matrix(gguf, &per_expert_gate, d_ff, d_model)?;
         let up = load_per_expert_matrix(
             gguf,
@@ -646,15 +717,15 @@ fn load_expert_matrices(
 /// Read a single per-expert dense tensor and return it as a flat f32 vec
 /// matching the engine's `[rows, cols]` row-major layout.
 fn load_per_expert_matrix(
-    gguf: &GgufFile,
+    gguf: &dyn GgufSource,
     name: &str,
     rows: usize,
     cols: usize,
 ) -> io::Result<Vec<f32>> {
-    let info = gguf.tensors.get(name).ok_or_else(|| {
+    let info = gguf.tensor_info(name).cloned().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("tensor {name} missing"))
     })?;
-    let v = dense_tensor_to_f32(gguf, info)?;
+    let v = dense_tensor_to_f32(gguf, &info)?;
     let expected = rows * cols;
     if v.len() != expected {
         return Err(io::Error::new(
@@ -678,17 +749,17 @@ fn load_per_expert_matrix(
 /// expert-interleaved layout). We dequantise the whole tensor once,
 /// then slice the expert's rows × cols stride.
 fn slice_expert_matrix(
-    gguf: &GgufFile,
+    gguf: &dyn GgufSource,
     name: &str,
     expert: usize,
     num_experts: usize,
     rows: usize,
     cols: usize,
 ) -> io::Result<Vec<f32>> {
-    let info = gguf.tensors.get(name).ok_or_else(|| {
+    let info = gguf.tensor_info(name).cloned().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("tensor {name} missing"))
     })?;
-    let all = dense_tensor_to_f32(gguf, info)?;
+    let all = dense_tensor_to_f32(gguf, &info)?;
     let per_expert = rows * cols;
     let want = num_experts * per_expert;
     if all.len() != want {
@@ -790,6 +861,81 @@ mod tests {
         assert_eq!(meta["d_ff"], 8);
         assert_eq!(meta["num_experts"], 2);
         assert_eq!(meta["dtype"], "f32");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Verify the U.T.H. round-trip:
+    ///   * `extract_experts_from_source` with default options writes a
+    ///     header at byte 0 of every expert file
+    ///   * `TensorHeader::strip` returns the bytes the engine cares
+    ///     about (so `ExpertResident::data()` stays a transparent
+    ///     view onto the payload)
+    ///   * `--no-uth` opts out cleanly: the legacy bare-payload layout
+    ///     is recovered and the header probe returns `None`
+    #[test]
+    fn extract_emits_uth_by_default_and_strips_cleanly() {
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let num_experts = 2usize;
+        let bytes = build_synth_gguf(d_model, d_ff, num_experts);
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+
+        // Default options → UTH present.
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+        let out = tmp.join("with-uth");
+        let _ = extract_experts_from_source(
+            &gguf,
+            &out,
+            1,
+            num_experts,
+            ExtractOptions::default(),
+        )
+        .expect("extract");
+        for e in 0..num_experts {
+            let path = out.join(format!("expert_{e}.bin"));
+            let buf = fs::read(&path).unwrap();
+            let header = crate::tensor_header::TensorHeader::probe(&buf)
+                .expect("U.T.H. must be present");
+            assert_eq!(header.dtype.to_weight(), WeightDtype::F32);
+            assert_eq!(header.shape[0] as usize, d_ff);
+            // After stripping, the first byte must be at a 4 KiB offset.
+            let (_, payload) = crate::tensor_header::TensorHeader::strip(
+                &buf,
+                DEFAULT_BLOCK_ALIGN,
+            );
+            assert_eq!(buf.len() - payload.len(), DEFAULT_BLOCK_ALIGN);
+            // Payload is still a whole number of pages.
+            assert_eq!(payload.len() % DEFAULT_BLOCK_ALIGN, 0);
+        }
+
+        // `--no-uth` → bare-payload layout.
+        let out2 = tmp.join("no-uth");
+        let _ = extract_experts_from_source(
+            &gguf,
+            &out2,
+            1,
+            num_experts,
+            ExtractOptions { emit_uth: false },
+        )
+        .expect("extract no-uth");
+        for e in 0..num_experts {
+            let path = out2.join(format!("expert_{e}.bin"));
+            let buf = fs::read(&path).unwrap();
+            assert!(
+                crate::tensor_header::TensorHeader::probe(&buf).is_none(),
+                "no-uth file must not carry a header"
+            );
+            // strip() must be a no-op when no header is present.
+            let (h, payload) = crate::tensor_header::TensorHeader::strip(
+                &buf,
+                DEFAULT_BLOCK_ALIGN,
+            );
+            assert!(h.is_none());
+            assert_eq!(payload.len(), buf.len());
+        }
+
         let _ = fs::remove_dir_all(&tmp);
     }
 

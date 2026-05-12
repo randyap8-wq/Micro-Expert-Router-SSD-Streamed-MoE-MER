@@ -37,24 +37,27 @@ pub fn cpu_supports_amx() -> bool {
     // useful executors. We require at least `amx-tile + amx-int8`
     // because the int8 dequant kernel is the one we'd actually drop
     // in here first.
-    //
-    // `is_x86_feature_detected!` is a macro — it must be invoked with
-    // a literal string. Wrap it in a helper closure so unsupported
-    // toolchains can still compile (the strings were stabilised
-    // together in 1.75).
-    let tile = {
-        #[allow(unexpected_cfgs)]
-        {
-            std::is_x86_feature_detected!("amx-tile")
-        }
+    // `is_x86_feature_detected!` on stable Rust does not recognise the
+    // `"amx-tile"` / `"amx-int8"` strings until those features are
+    // stabilised (they were added under the unstable
+    // `x86_amx_intrinsics` gate). Until then, fall back to a runtime
+    // /proc/cpuinfo probe so the `amx` cargo feature builds on stable.
+    cpuinfo_has_flag("amx_tile") && cpuinfo_has_flag("amx_int8")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cpuinfo_has_flag(flag: &str) -> bool {
+    use std::io::Read;
+    let mut s = String::new();
+    let Ok(mut f) = std::fs::File::open("/proc/cpuinfo") else {
+        return false;
     };
-    let int8 = {
-        #[allow(unexpected_cfgs)]
-        {
-            std::is_x86_feature_detected!("amx-int8")
-        }
-    };
-    tile && int8
+    if f.read_to_string(&mut s).is_err() {
+        return false;
+    }
+    s.lines()
+        .filter(|l| l.starts_with("flags") || l.starts_with("Features"))
+        .any(|l| l.split_whitespace().any(|tok| tok == flag))
 }
 
 #[cfg(not(target_arch = "x86_64"))]

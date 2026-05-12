@@ -159,7 +159,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | Module | Responsibility |
 |---|---|
 | `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. |
-| `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s. Hands out `PooledBuffer` RAII guards; dropping a guard returns the buffer to the free list and notifies waiters. The literal "pre-allocated RAM buffer" the spec asks for. |
+| `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s, optionally split into **primary** + **shadow** halves sharing one `Notify`. Hands out `PooledBuffer` RAII guards; `try_acquire`/`try_acquire_shadow` route to the corresponding free list; dropping a guard returns the buffer to its originating list and wakes waiters. `promote_shadow` does the zero-copy slot-tag swap when a speculative prefetch is confirmed. The literal "pre-allocated RAM buffer" the spec asks for. |
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. |
 | `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. |
@@ -175,8 +175,11 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. |
 | `batch_scheduler` | **Continuous batching.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. |
 | `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. |
-| `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`. Used by `gguf-convert` to migrate llama.cpp / Ollama Mixtral checkpoints into the engine's per-expert format. |
-| `gguf_loader` | Glue from a parsed `GgufFile` → per-expert `.bin` files + `metadata.json` + dense weight files (one tensor per file or a single `.safetensors` shard). Driven by the `gguf-convert` subcommand. |
+| `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`. Two readers ship side-by-side: `GgufFile::open` (eager — slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming — keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
+| `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Driven by the `gguf-convert` subcommand. |
+| `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
+| `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()`), with `scalar.rs` (always on), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The selected backend is logged once at startup. |
+| `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`. Validated at startup. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`. |
@@ -858,10 +861,20 @@ engine doesn't dequantise Q6_K). The output directory has the same
 shape as the Mixtral extractor's: `expert_<layer>_<id>.bin` blobs +
 `metadata.json` + per-tensor dense weight files.
 
+`gguf-convert` defaults to a **streaming reader** that parses only
+the GGUF header and seeks each tensor body on demand — a strict win
+for ≥ 100 GB checkpoints. Pass `--legacy-eager` to fall back to the
+in-memory reader. By default every `expert_<id>.bin` is prefixed with
+a 64-byte **Unified Tensor Header** (dtype + shape + AMX tile hint +
+quant-scale offset) padded to 4 KiB so the weight payload still
+starts at an `O_DIRECT`-friendly boundary; pass `--no-uth` to opt
+out for compatibility with consumers that pre-date the header.
+
 ```bash
 ./target/release/micro-expert-router gguf-convert \
     --gguf-path ./mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf \
     --out-dir   ./mixtral-data
+    # add --no-uth and/or --legacy-eager if your tooling needs them
 
 ./target/release/micro-expert-router run --data-dir ./mixtral-data
 ```
@@ -1431,22 +1444,46 @@ you can verify the energy-saving paths actually engaged.
 
 ## Limitations / next steps
 
-- **Scalar `f32` expert kernel.** The SwiGLU FFN itself still runs as
-  a plain triple-nested scalar loop. The `simd` and `blas` cargo
-  features parallelise the dense `transformer` projections (attention
-  Q/K/V/O, RMSNorm, LM head) but the per-expert kernel stays scalar.
-  A real serving deployment would drop in BLAS / a CUDA kernel via
-  `tch` / `candle` / `cudarc`. The byte→`f32` view in
-  `inference::ExpertWeights::from_bytes` already does zero-copy
-  reinterpretation, so any of those backends slot in cleanly.
-- **Picking a NUMA budget.** `MER_PIN_CORES=N` is honoured at
-  startup to `sched_setaffinity(2)` the process to the first `N`
-  CPUs of NUMA node 0 (best-effort, Linux only). Real per-ring
-  per-node pinning would need one io_uring ring per node and
-  per-node buffer pools, a deeper refactor.
-- **Streaming GGUF reader.** `gguf-convert` reads the entire source
-  GGUF into memory before slicing tensors out. Fine for the offline
-  conversion path (the engine itself never opens GGUFs on the
-  inference hot path), but a streaming reader would be a strict win
-  for ≥ 100 GB checkpoints.
+- **Per-expert kernel dispatcher.** The engine ships a runtime
+  CPU-feature dispatcher (`src/kernels/`) that selects between a
+  scalar reference path (always on), an AVX-512 fused
+  int8-dequant + dot path (`--features avx512`), and an Intel AMX
+  tile skeleton (`--features amx`, currently routes back to scalar
+  on stable Rust until the tile intrinsics stabilise). The chosen
+  backend is logged once at startup. The dense `transformer`
+  projections additionally benefit from the existing `simd` /
+  `blas` features. Dropping in BLAS / a CUDA kernel via `tch` /
+  `candle` / `cudarc` for the SwiGLU FFN remains a clean
+  extension — `inference::ExpertWeights::from_bytes` already does
+  zero-copy reinterpretation of the buffer.
+- **NUMA budget.** `MER_PIN_CORES=N` is honoured at startup to
+  `sched_setaffinity(2)` the process to the first `N` CPUs of
+  NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere).
+  See `src/numa.rs`. Real per-ring per-node pinning would still
+  need one io_uring ring per node and per-node buffer pools, a
+  deeper refactor.
+- **Streaming GGUF reader.** `gguf-convert` defaults to a streaming
+  reader (`crate::gguf::GgufStreamReader`) that parses only the
+  header + tensor-info table into memory and reads each tensor
+  body on demand with `seek + read_exact`. Pass `--legacy-eager`
+  to fall back to the in-memory `GgufFile::open` reader for
+  small fixtures or compatibility testing. The streaming path is
+  a strict win for ≥ 100 GB checkpoints.
+- **Unified Tensor Header (U.T.H.).** Every `expert_<id>.bin`
+  produced by `gguf-convert` is prefixed by default with a
+  64-byte U.T.H. (`UTH1` magic + dtype + shape + quant-scale
+  offset + AMX tile hint + flags), page-padded to 4 KiB so the
+  weight payload still starts at a `O_DIRECT`-friendly boundary.
+  Older consumers that need the legacy bare-payload layout can
+  pass `--no-uth`. The runtime
+  (`ExpertResident::data()` / `expert_cache.rs`) transparently
+  strips the header when present, so the rest of the engine sees
+  exactly the same bytes as before.
+- **Primary / Shadow buffer pool.** `BufferPool::new_with_shadow`
+  carves the pool into a primary half (resident LRU) and an
+  optional shadow half reserved for speculative prefetches.
+  Speculation calls `try_acquire_shadow` so it can never starve
+  primary work; on confirmation, `promote_shadow` does a
+  zero-copy slot-tag swap so the same backing memory becomes a
+  resident without re-reading the SSD.
 

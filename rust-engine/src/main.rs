@@ -268,6 +268,22 @@ enum Cmd {
         /// `llama.expert_count` from the GGUF metadata).
         #[arg(long, default_value_t = 0)]
         num_experts: usize,
+        /// Skip the Unified Tensor Header (U.T.H.) prefix on every
+        /// `expert_<id>.bin`. By default the converter emits a 64-byte
+        /// page-padded UTH so the loader knows the dtype + shape +
+        /// tile-hint before reading any weight bytes; pass this flag
+        /// to produce legacy bare-payload files for compatibility
+        /// with consumers that pre-date UTH support.
+        #[arg(long, default_value_t = false)]
+        no_uth: bool,
+        /// Use the legacy eager GGUF reader (slurps the entire file
+        /// into RAM before slicing tensors out). The default is the
+        /// streaming reader which keeps only the header + tensor
+        /// info table resident — a strict win for ≥ 100 GB
+        /// checkpoints. The eager path is still useful in tests and
+        /// for small fixtures.
+        #[arg(long, default_value_t = false)]
+        legacy_eager: bool,
     },
 
     /// Replay a routing trace through the predictive prefetcher and
@@ -419,7 +435,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             out_dir,
             num_layers,
             num_experts,
-        } => cmd_gguf_convert(&gguf_path, &out_dir, num_layers, num_experts),
+            no_uth,
+            legacy_eager,
+        } => cmd_gguf_convert(&gguf_path, &out_dir, num_layers, num_experts, !no_uth, legacy_eager),
         Cmd::ValidatePredictor { trace, cache_slots } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1768,14 +1786,51 @@ fn cmd_gguf_convert(
     out_dir: &PathBuf,
     num_layers: usize,
     num_experts: usize,
+    emit_uth: bool,
+    legacy_eager: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!(path = %gguf_path.display(), "opening GGUF file");
-    let gguf = crate::gguf::GgufFile::open(gguf_path)?;
-    if let Some(arch) = gguf.architecture() {
-        info!(architecture = arch, version = gguf.version, "GGUF parsed");
-    }
-    let report =
-        crate::gguf_loader::extract_experts_from_gguf(&gguf, out_dir, num_layers, num_experts)?;
+    info!(
+        path = %gguf_path.display(),
+        emit_uth,
+        legacy_eager,
+        "opening GGUF file"
+    );
+    let opts = crate::gguf_loader::ExtractOptions { emit_uth };
+    let report = if legacy_eager {
+        // Eager path: slurps the file into memory before slicing.
+        // Retained for compatibility and small fixtures.
+        let gguf = crate::gguf::GgufFile::open(gguf_path)?;
+        if let Some(arch) = gguf.architecture() {
+            info!(architecture = arch, version = gguf.version, "GGUF parsed (eager)");
+        }
+        crate::gguf_loader::extract_experts_from_source(
+            &gguf,
+            out_dir,
+            num_layers,
+            num_experts,
+            opts,
+        )?
+    } else {
+        // Streaming path: only the header (KV + tensor info table)
+        // is parsed up front; each tensor body is read on demand
+        // via `seek + read_exact`. This is the strict-win path for
+        // ≥ 100 GB checkpoints.
+        let reader = crate::gguf::GgufStreamReader::open(gguf_path)?;
+        if let Some(arch) = reader.architecture() {
+            info!(
+                architecture = arch,
+                version = reader.version,
+                "GGUF parsed (streaming)"
+            );
+        }
+        crate::gguf_loader::extract_experts_from_source(
+            &reader,
+            out_dir,
+            num_layers,
+            num_experts,
+            opts,
+        )?
+    };
     let total_gib = report.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let read_time_at_7gbps = report.total_bytes as f64 / (7.0 * 1024.0 * 1024.0 * 1024.0);
     info!(
