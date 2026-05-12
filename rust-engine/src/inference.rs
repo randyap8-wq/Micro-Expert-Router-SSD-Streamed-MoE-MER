@@ -71,14 +71,18 @@ use std::fmt;
 /// over F32 (and 2× over F16) is the dominant SSD-bandwidth win for
 /// the Mixtral-scale workloads this engine targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WeightDtype {
     /// Little-endian `f32`, 4 bytes per weight.
+    #[serde(alias = "F32", alias = "fp32")]
     F32,
     /// Little-endian IEEE-754 `f16` (`half::f16`), 2 bytes per weight.
+    #[serde(alias = "F16", alias = "fp16", alias = "half")]
     F16,
     /// Per-tensor symmetric `int8`, 1 byte per weight, with a 12-byte
     /// header (`[gate_scale, up_scale, down_scale]: [f32; 3]`) at the
     /// start of every expert blob. Dequantised to `f32` at fetch time.
+    #[serde(alias = "Int8", alias = "i8", alias = "q8")]
     Int8,
     /// **GGUF-style Q4_K_M block quantisation.** Each 256-weight
     /// super-block occupies 144 bytes: an `f16` super-scale `d`, an
@@ -89,6 +93,7 @@ pub enum WeightDtype {
     /// in a given RAM budget versus `F16`. See [`Q4K_BLOCK_BYTES`] /
     /// [`Q4K_BLOCK_ELEMS`] for the layout constants and
     /// [`dequantize_q4k_block`] for the inverse kernel.
+    #[serde(alias = "Q4K", alias = "q4_k", alias = "q4_k_m", alias = "q4km")]
     Q4K,
     /// **GGUF-style Q4_0 block quantisation.** Each 32-weight block
     /// occupies 18 bytes: an `f16` block scale `d` followed by 16
@@ -101,6 +106,7 @@ pub enum WeightDtype {
     /// design spec. See [`Q4_0_BLOCK_BYTES`] / [`Q4_0_BLOCK_ELEMS`] for
     /// the layout constants and [`dequantize_q4_0_block`] for the
     /// inverse kernel.
+    #[serde(alias = "Q4_0", alias = "q40", alias = "q4")]
     Q4_0,
 }
 

@@ -626,6 +626,40 @@ mod tests {
         assert_eq!(back.server.bind, c.server.bind);
     }
 
+    /// `config.toml` documents weight dtypes using lowercase strings
+    /// (`"f32"`, `"f16"`, `"int8"`, `"q4k"`, `"q4_0"`). Deserializing a
+    /// `ModelConfig` must accept each of those spellings, plus the
+    /// legacy PascalCase variant names, otherwise users following the
+    /// in-tree documentation will hit confusing parse errors.
+    #[test]
+    fn model_dtype_accepts_documented_spellings() {
+        let cases: &[(&str, WeightDtype)] = &[
+            ("f32", WeightDtype::F32),
+            ("F32", WeightDtype::F32),
+            ("f16", WeightDtype::F16),
+            ("F16", WeightDtype::F16),
+            ("int8", WeightDtype::Int8),
+            ("Int8", WeightDtype::Int8),
+            ("q4k", WeightDtype::Q4K),
+            ("Q4K", WeightDtype::Q4K),
+            ("q4_0", WeightDtype::Q4_0),
+            ("Q4_0", WeightDtype::Q4_0),
+        ];
+        for (spelling, expected) in cases {
+            let toml_src = format!(
+                "data_dir = \"./data\"\n\
+                 num_experts = 8\n\
+                 d_model = 64\n\
+                 d_ff = 256\n\
+                 expert_size = 4096\n\
+                 dtype = \"{spelling}\"\n"
+            );
+            let m: ModelConfig = toml::from_str(&toml_src)
+                .unwrap_or_else(|e| panic!("dtype={spelling:?} should parse: {e}"));
+            assert_eq!(m.dtype, *expected, "dtype={spelling:?}");
+        }
+    }
+
     #[test]
     fn predictive_section_defaults_to_disabled() {
         let c = minimal_cfg();
