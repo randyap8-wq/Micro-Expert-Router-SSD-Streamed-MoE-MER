@@ -9,6 +9,19 @@
 //! bytes and hand them out as [`PooledBuffer`] guards. When a guard is dropped
 //! its buffer is returned to the pool's free list — so the LRU eviction of an
 //! expert automatically frees a slot for the next miss.
+//!
+//! # Primary / Shadow split (gist Phase 1, "zero-stall pipeline")
+//!
+//! When the engine wants to overlap the current token's compute with the
+//! *next* token's speculative prefetch, the primary pool — which backs the
+//! resident LRU — must never be raided by speculation. The pool therefore
+//! supports an optional **shadow** half: a second free-list of the same
+//! size buffers, served by [`BufferPool::try_acquire_shadow`]. Speculative
+//! prefetches go there; on confirmation the engine calls
+//! [`BufferPool::promote_shadow`] to atomically swap the shadow buffer
+//! into the primary half so the cache can install it as a resident
+//! without re-reading the SSD. The two halves share one [`Notify`], so
+//! a `Drop` on either side wakes any waiter on the other.
 
 use crate::aligned_buffer::AlignedBuffer;
 use parking_lot::Mutex;
@@ -16,9 +29,14 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 struct Inner {
+    /// Primary free list — slots backing the resident LRU.
     free: Mutex<Vec<AlignedBuffer>>,
+    /// Optional shadow free list — slots backing speculative prefetches.
+    /// `None` keeps the legacy single-pool semantics with zero overhead.
+    shadow: Option<Mutex<Vec<AlignedBuffer>>>,
     notify: Notify,
-    slots: usize,
+    primary_slots: usize,
+    shadow_slots: usize,
     buffer_size: usize,
     align: usize,
 }
@@ -32,25 +50,59 @@ pub struct BufferPool {
 impl BufferPool {
     /// Pre-allocate `slots` buffers of `buffer_size` bytes each, aligned to `align`.
     pub fn new(slots: usize, buffer_size: usize, align: usize) -> Self {
-        assert!(slots > 0, "pool must have at least one slot");
-        let mut free = Vec::with_capacity(slots);
-        for _ in 0..slots {
+        Self::new_with_shadow(slots, 0, buffer_size, align)
+    }
+
+    /// Pre-allocate `primary_slots + shadow_slots` aligned buffers. The
+    /// **primary** half backs the resident LRU; the **shadow** half is
+    /// reserved for speculative prefetches (see [`Self::try_acquire_shadow`]).
+    /// Pass `shadow_slots == 0` to disable the shadow path entirely —
+    /// `try_acquire_shadow` then always returns `None` and the engine's
+    /// prefetch path falls back to its previous "non-evicting `try_acquire`
+    /// against the primary pool" behaviour.
+    pub fn new_with_shadow(
+        primary_slots: usize,
+        shadow_slots: usize,
+        buffer_size: usize,
+        align: usize,
+    ) -> Self {
+        assert!(primary_slots > 0, "primary pool must have at least one slot");
+        let mut free = Vec::with_capacity(primary_slots);
+        for _ in 0..primary_slots {
             free.push(AlignedBuffer::new(buffer_size, align));
         }
+        let shadow = if shadow_slots > 0 {
+            let mut s = Vec::with_capacity(shadow_slots);
+            for _ in 0..shadow_slots {
+                s.push(AlignedBuffer::new(buffer_size, align));
+            }
+            Some(Mutex::new(s))
+        } else {
+            None
+        };
         Self {
             inner: Arc::new(Inner {
                 free: Mutex::new(free),
+                shadow,
                 notify: Notify::new(),
-                slots,
+                primary_slots,
+                shadow_slots,
                 buffer_size,
                 align,
             }),
         }
     }
 
-    /// Total number of slots in the pool.
+    /// Total number of **primary** slots in the pool. Preserved across
+    /// the primary/shadow refactor so existing callers (cache sizing,
+    /// iovec registration) keep working.
     pub fn capacity(&self) -> usize {
-        self.inner.slots
+        self.inner.primary_slots
+    }
+
+    /// Number of **shadow** slots, or 0 if the shadow path is disabled.
+    pub fn shadow_capacity(&self) -> usize {
+        self.inner.shadow_slots
     }
 
     /// Size of each buffer in the pool, in bytes.
@@ -63,7 +115,9 @@ impl BufferPool {
         self.inner.align
     }
 
-    /// Snapshot the raw `(ptr, len)` of every currently-free buffer.
+    /// Snapshot the raw `(ptr, len)` of every currently-free buffer
+    /// (primary **and** shadow, in that order).
+    ///
     /// Intended for the `io_uring` registered-fixed-buffers path: at
     /// startup, callers register every pool buffer with the kernel
     /// once, then submit reads referencing buffer indices instead of
@@ -77,18 +131,41 @@ impl BufferPool {
     /// once at startup, before any `acquire()` call, and never modify
     /// the pool's free-list contents while reads are in flight.
     pub fn raw_iovecs(&self) -> Vec<(*mut u8, usize)> {
-        let mut g = self.inner.free.lock();
-        g.iter_mut()
-            .map(|b| (b.as_mut_slice().as_mut_ptr(), b.len()))
-            .collect()
+        let mut out = Vec::with_capacity(self.inner.primary_slots + self.inner.shadow_slots);
+        {
+            let mut g = self.inner.free.lock();
+            out.extend(g.iter_mut().map(|b| (b.as_mut_slice().as_mut_ptr(), b.len())));
+        }
+        if let Some(s) = &self.inner.shadow {
+            let mut g = s.lock();
+            out.extend(g.iter_mut().map(|b| (b.as_mut_slice().as_mut_ptr(), b.len())));
+        }
+        out
     }
 
-    /// Try to pop a free buffer immediately. Returns `None` if the pool is empty.
+    /// Try to pop a free **primary** buffer immediately. Returns `None`
+    /// if the primary pool is empty.
     pub fn try_acquire(&self) -> Option<PooledBuffer> {
         let buf = self.inner.free.lock().pop()?;
         Some(PooledBuffer {
             buffer: Some(buf),
             pool: self.inner.clone(),
+            slot: Slot::Primary,
+        })
+    }
+
+    /// Try to pop a free **shadow** buffer immediately. Returns `None`
+    /// if the shadow pool is disabled (`shadow_capacity() == 0`) **or**
+    /// fully in flight. Speculative prefetches should always use this
+    /// entry point so they cannot starve real work on the primary
+    /// pool.
+    pub fn try_acquire_shadow(&self) -> Option<PooledBuffer> {
+        let shadow = self.inner.shadow.as_ref()?;
+        let buf = shadow.lock().pop()?;
+        Some(PooledBuffer {
+            buffer: Some(buf),
+            pool: self.inner.clone(),
+            slot: Slot::Shadow,
         })
     }
 
@@ -110,6 +187,51 @@ impl BufferPool {
             notified.await;
         }
     }
+
+    /// Wait asynchronously for a free **shadow** buffer. Returns `None`
+    /// immediately if the shadow pool is disabled, so callers can
+    /// branch deterministically.
+    #[allow(dead_code)]
+    pub async fn acquire_shadow(&self) -> Option<PooledBuffer> {
+        if self.inner.shadow.is_none() {
+            return None;
+        }
+        loop {
+            if let Some(b) = self.try_acquire_shadow() {
+                return Some(b);
+            }
+            let notified = self.inner.notify.notified();
+            if let Some(b) = self.try_acquire_shadow() {
+                return Some(b);
+            }
+            notified.await;
+        }
+    }
+
+    /// Promote a [`PooledBuffer`] previously acquired from the shadow
+    /// pool into the **primary** pool, by reassigning the slot tag on
+    /// drop. This is the zero-copy hand-off that turns a speculative
+    /// prefetch into a confirmed resident: the caller passes the
+    /// buffer in, gets the same backing memory back, but on `Drop` it
+    /// returns to the primary half (where the LRU's `Arc` lives) so
+    /// the resident count is accounted correctly.
+    ///
+    /// If `buf` was already primary, this is a no-op. If the shadow
+    /// half is disabled (capacity 0), promotion is also a no-op
+    /// because there is nothing meaningful to swap.
+    pub fn promote_shadow(&self, mut buf: PooledBuffer) -> PooledBuffer {
+        if buf.slot == Slot::Shadow {
+            buf.slot = Slot::Primary;
+        }
+        buf
+    }
+}
+
+/// Which free-list a [`PooledBuffer`] returns to on drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Primary,
+    Shadow,
 }
 
 /// RAII guard wrapping an [`AlignedBuffer`] borrowed from a [`BufferPool`].
@@ -120,6 +242,7 @@ impl BufferPool {
 pub struct PooledBuffer {
     buffer: Option<AlignedBuffer>,
     pool: Arc<Inner>,
+    slot: Slot,
 }
 
 impl PooledBuffer {
@@ -136,6 +259,16 @@ impl PooledBuffer {
     #[inline]
     pub fn len(&self) -> usize {
         self.buffer.as_ref().expect("PooledBuffer must hold a buffer until Drop").len()
+    }
+
+    /// Whether this buffer was acquired from the shadow (speculative)
+    /// half. Used by the engine to decide whether a confirmed
+    /// prefetch needs `BufferPool::promote_shadow` before becoming
+    /// resident.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn is_shadow(&self) -> bool {
+        self.slot == Slot::Shadow
     }
 }
 
@@ -161,7 +294,23 @@ impl AsMut<[u8]> for PooledBuffer {
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if let Some(buf) = self.buffer.take() {
-            self.pool.free.lock().push(buf);
+            match self.slot {
+                Slot::Primary => {
+                    self.pool.free.lock().push(buf);
+                }
+                Slot::Shadow => {
+                    // Shadow only exists when the pool was built with
+                    // `new_with_shadow(_, shadow > 0, ...)`. If a buffer
+                    // was tagged Shadow but the shadow list is gone we
+                    // fall back to primary — safer than leaking the
+                    // allocation.
+                    if let Some(s) = &self.pool.shadow {
+                        s.lock().push(buf);
+                    } else {
+                        self.pool.free.lock().push(buf);
+                    }
+                }
+            }
             self.pool.notify.notify_one();
         }
     }
@@ -206,5 +355,58 @@ mod tests {
             assert!(!p.is_null());
             assert_eq!(l, 4096);
         }
+    }
+
+    // ---------------------- shadow-pool tests --------------------------
+
+    #[tokio::test]
+    async fn shadow_pool_independent_of_primary() {
+        let pool = BufferPool::new_with_shadow(2, 2, 4096, 4096);
+        assert_eq!(pool.capacity(), 2);
+        assert_eq!(pool.shadow_capacity(), 2);
+
+        // Drain primary; shadow stays full.
+        let _a = pool.acquire().await;
+        let _b = pool.acquire().await;
+        assert!(pool.try_acquire().is_none());
+
+        // Drain both shadow slots; primary stays exhausted independently.
+        let _s1 = pool.try_acquire_shadow().expect("first shadow free");
+        let _s2 = pool.try_acquire_shadow().expect("second shadow free");
+        assert!(pool.try_acquire_shadow().is_none());
+        assert!(pool.try_acquire().is_none());
+    }
+
+    #[test]
+    fn shadow_disabled_returns_none() {
+        let pool = BufferPool::new(2, 4096, 4096);
+        assert_eq!(pool.shadow_capacity(), 0);
+        assert!(pool.try_acquire_shadow().is_none());
+    }
+
+    #[tokio::test]
+    async fn promote_shadow_routes_drop_to_primary() {
+        let pool = BufferPool::new_with_shadow(1, 1, 4096, 4096);
+        // Hold the only primary slot so we can observe where the
+        // promoted shadow buffer lands on drop.
+        let _hold = pool.acquire().await;
+        let s = pool.try_acquire_shadow().expect("shadow free");
+        assert!(s.is_shadow());
+        let promoted = pool.promote_shadow(s);
+        assert!(!promoted.is_shadow());
+        // Dropping the promoted buffer must return it to *primary*,
+        // not shadow, so the shadow slot is now exhausted.
+        drop(promoted);
+        // Primary now has one free buffer (the just-dropped, promoted one).
+        let _p = pool.try_acquire().expect("primary should have the promoted buffer");
+        // Shadow remains empty because we promoted its only slot.
+        assert!(pool.try_acquire_shadow().is_none());
+    }
+
+    #[test]
+    fn raw_iovecs_includes_shadow_buffers() {
+        let pool = BufferPool::new_with_shadow(3, 2, 4096, 4096);
+        let iovecs = pool.raw_iovecs();
+        assert_eq!(iovecs.len(), 5);
     }
 }

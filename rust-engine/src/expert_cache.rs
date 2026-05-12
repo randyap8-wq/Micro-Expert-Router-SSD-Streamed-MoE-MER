@@ -4,8 +4,17 @@
 //! [`BufferPool`](crate::buffer_pool::BufferPool). Eviction simply drops the
 //! `Arc`; once any in-flight inference also drops its handle, the underlying
 //! `PooledBuffer` returns to the pool's free list automatically.
+//!
+//! When the on-disk expert file was produced by `gguf-convert` (its default
+//! mode), the buffer starts with a 64-byte Unified Tensor Header padded out
+//! to one block. [`ExpertResident::data`] transparently strips that prefix
+//! so every consumer downstream sees only the bare weight payload —
+//! existing code paths (the SwiGLU kernels, the cache verifier, the
+//! synthetic-expert fixtures) don't need to learn about UTH.
 
 use crate::buffer_pool::PooledBuffer;
+use crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
+use crate::tensor_header::TensorHeader;
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -19,8 +28,29 @@ pub struct ExpertResident {
 }
 
 impl ExpertResident {
+    /// Bare weight bytes — i.e. the buffer with any leading Unified
+    /// Tensor Header stripped. The vast majority of callers want this.
     pub fn data(&self) -> &[u8] {
+        let raw = self.buffer.as_slice();
+        let (_, payload) = TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN);
+        payload
+    }
+
+    /// Raw buffer bytes, including any U.T.H. prefix. Used by paths
+    /// that need the literal on-disk image (e.g. the cache-integrity
+    /// verifier, the dump tools).
+    #[allow(dead_code)]
+    pub fn raw(&self) -> &[u8] {
         self.buffer.as_slice()
+    }
+
+    /// Parsed Unified Tensor Header, if one is present at the start of
+    /// the buffer. Returns `None` for legacy files (and for the
+    /// synthetic-expert fixtures, which deliberately omit the header).
+    #[allow(dead_code)]
+    pub fn header(&self) -> Option<TensorHeader> {
+        let raw = self.buffer.as_slice();
+        TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN).0
     }
 }
 
