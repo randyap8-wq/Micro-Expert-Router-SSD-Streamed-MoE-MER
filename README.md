@@ -553,7 +553,7 @@ counters on `/metrics`. The schema is validated at startup
 == 0`, `locality_threshold_pct` outside `(0, 1]`, `speculator_top_k >
 num_experts`, etc.
 
-#### Real-transformer pipeline (gist Phase 5/6)
+#### Real-transformer pipeline
 
 By default the server runs the **legacy benchmark generator**: each
 request drives `Engine::generate` for `max_tokens` cycles and synthesises
@@ -566,7 +566,7 @@ through the **full decoder forward pass**:
 ```
 embedding → for each layer: ( RMSNorm → MultiHeadSelfAttention → +
                               RMSNorm → LinearGate.route → moe_step → +)
-            → final RMSNorm → LMHead → argmax
+            → final RMSNorm → LMHead → sample
 ```
 
 `moe_step` is what reads expert weights from SSD via the LRU cache, so
@@ -811,7 +811,7 @@ micro-expert-router run
                               token). Feed into `validate-predictor` or
                               `scripts/compute_transition_matrix.py`.
 
-  # Multi-drive striping (gist Phase 4):
+  # Multi-drive striping:
   --data-dir <DIR1,DIR2,...> Comma-separated list of mountpoints shards
                               experts across N NVMe drives by `id % N`.
                               Use `scripts/gen_striped_data.sh` to lay
@@ -1449,8 +1449,4 @@ you can verify the energy-saving paths actually engaged.
   conversion path (the engine itself never opens GGUFs on the
   inference hot path), but a streaming reader would be a strict win
   for ≥ 100 GB checkpoints.
-
-## License
-
-Licensed under either of MIT or Apache-2.0 at your option.
 

@@ -244,10 +244,9 @@ documented patterns for sharding it:
 
 2. **Expert partitioning** (planned, not yet wired): shard expert ids
    `id % num_nodes`; each node holds its slice of the expert files
-   and the gating layer dispatches over RPC. The sketch is captured
-   in `docs/distributed.md` and is an intentional design out-of-scope
-   of the current PR: the gist asks to *document* it, not to
-   implement it.
+   and the gating layer dispatches over RPC. The design is captured
+   in `docs/distributed.md` and is intentionally documented ahead of
+   the implementation so the surface area is visible to operators.
 
 A starter Helm chart with replication and HPA against
 `mer_requests_total` lives at `deploy/helm/mer/`.
