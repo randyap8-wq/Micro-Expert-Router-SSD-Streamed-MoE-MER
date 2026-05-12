@@ -334,6 +334,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pin = crate::numa::apply_mer_pin_cores_env();
     info!("{}", pin.as_log_line());
 
+    // `MER_PIN_CORES` is now consumed centrally at process start via the
+    // `numa` module. Clear it so any legacy later parsing in subcommands
+    // (for example, `cmd_serve`) does not attempt to re-apply affinity
+    // and drift from the startup contract.
+    std::env::remove_var("MER_PIN_CORES");
+
     // Log the selected math kernel backend once. The dispatcher itself
     // is lazy, but emitting this at startup gives ops a single line in
     // the journal that tells them "you're running the scalar path"
