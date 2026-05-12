@@ -204,7 +204,7 @@ impl TensorHeader {
         }
         let dtype = UthDtypeId::from_u8(bytes[6])?;
         let shape_rank = bytes[7];
-        if shape_rank as usize > UTH_MAX_RANK {
+        if shape_rank == 0 || shape_rank as usize > UTH_MAX_RANK {
             return None;
         }
         let mut shape = [0u32; UTH_MAX_RANK];
