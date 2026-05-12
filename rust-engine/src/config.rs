@@ -627,22 +627,36 @@ mod tests {
     }
 
     /// `config.toml` documents weight dtypes using lowercase strings
-    /// (`"f32"`, `"f16"`, `"int8"`, `"q4k"`, `"q4_0"`). Deserializing a
-    /// `ModelConfig` must accept each of those spellings, plus the
-    /// legacy PascalCase variant names, otherwise users following the
-    /// in-tree documentation will hit confusing parse errors.
+    /// (`"f32"`, `"f16"`, `"int8"`, `"q4k"`, `"q4_0"`), and the serde
+    /// layer also accepts additional aliases (for example `"fp32"`,
+    /// `"fp16"`, `"half"`, `"i8"`, `"q8"`, `"q4_k_m"`, `"q4km"`,
+    /// `"q40"`, `"q4"`). Deserializing a `ModelConfig` must accept
+    /// each supported spelling, plus the legacy variant names,
+    /// otherwise users following the in-tree documentation will hit
+    /// confusing parse errors.
     #[test]
     fn model_dtype_accepts_documented_spellings() {
         let cases: &[(&str, WeightDtype)] = &[
             ("f32", WeightDtype::F32),
+            ("fp32", WeightDtype::F32),
             ("F32", WeightDtype::F32),
             ("f16", WeightDtype::F16),
+            ("fp16", WeightDtype::F16),
+            ("half", WeightDtype::F16),
             ("F16", WeightDtype::F16),
             ("int8", WeightDtype::Int8),
+            ("i8", WeightDtype::Int8),
             ("Int8", WeightDtype::Int8),
+            ("q8", WeightDtype::Q8),
+            ("Q8", WeightDtype::Q8),
             ("q4k", WeightDtype::Q4K),
             ("Q4K", WeightDtype::Q4K),
+            ("q4_k_m", WeightDtype::Q4_K_M),
+            ("q4km", WeightDtype::Q4_K_M),
+            ("Q4_K_M", WeightDtype::Q4_K_M),
             ("q4_0", WeightDtype::Q4_0),
+            ("q40", WeightDtype::Q4_0),
+            ("q4", WeightDtype::Q4_0),
             ("Q4_0", WeightDtype::Q4_0),
         ];
         for (spelling, expected) in cases {
