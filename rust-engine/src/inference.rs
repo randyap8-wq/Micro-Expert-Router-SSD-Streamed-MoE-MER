@@ -93,7 +93,7 @@ pub enum WeightDtype {
     /// in a given RAM budget versus `F16`. See [`Q4K_BLOCK_BYTES`] /
     /// [`Q4K_BLOCK_ELEMS`] for the layout constants and
     /// [`dequantize_q4k_block`] for the inverse kernel.
-    #[serde(alias = "Q4K", alias = "q4_k", alias = "q4_k_m", alias = "q4km")]
+    #[serde(alias = "Q4K", alias = "Q4_K", alias = "Q4_K_M", alias = "q4_k", alias = "q4_k_m", alias = "q4km")]
     Q4K,
     /// **GGUF-style Q4_0 block quantisation.** Each 32-weight block
     /// occupies 18 bytes: an `f16` block scale `d` followed by 16
