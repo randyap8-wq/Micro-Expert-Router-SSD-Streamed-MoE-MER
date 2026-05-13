@@ -45,10 +45,12 @@ impl ExpertResident {
         let payload_offset = {
             let raw = buffer.as_slice();
             let (_, payload) = TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN);
-            // `payload` is a subslice of `raw`; recover the offset via
-            // pointer arithmetic. This is sound because `strip` either
-            // returns `raw` unchanged (offset 0) or a subslice of it.
-            (payload.as_ptr() as usize).saturating_sub(raw.as_ptr() as usize)
+            // `payload` is either `raw` unchanged (offset 0) or a suffix
+            // subslice of it; derive the offset directly from the slice
+            // lengths rather than via pointer arithmetic.
+            let payload_offset = raw.len() - payload.len();
+            debug_assert!(payload_offset <= raw.len());
+            payload_offset
         };
         Self {
             id,
