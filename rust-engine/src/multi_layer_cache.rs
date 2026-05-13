@@ -96,10 +96,10 @@ mod tests {
         let mlc = MultiLayerExpertCache::with_uniform_capacity(2, 2);
 
         // Insert expert 0 into layer 0.
-        let resident = Arc::new(ExpertResident {
-            id: 0,
-            buffer: pool.try_acquire().unwrap(),
-        });
+        let resident = Arc::new(ExpertResident::new(
+            0,
+            pool.try_acquire().unwrap(),
+        ));
         mlc.cache_for_layer(0).insert(resident);
 
         assert!(mlc.contains(ExpertKey::new(0, 0)));
