@@ -22,18 +22,49 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// One resident expert: id + the bytes loaded from the SSD.
+///
+/// The optional Unified Tensor Header prefix is parsed **once** at
+/// construction time (see [`ExpertResident::new`]); the resulting
+/// `payload_offset` is cached so that [`Self::data`] — which sits on
+/// the inference + `--io-only` hot paths — is a cheap subslice
+/// operation with no re-parsing.
 pub struct ExpertResident {
     pub id: u32,
     pub buffer: PooledBuffer,
+    /// Byte offset within `buffer` at which the bare weight payload
+    /// begins. `0` for legacy blobs and synthetic fixtures (no UTH);
+    /// `UTH_BYTES + page padding` for `gguf-convert` blobs.
+    payload_offset: usize,
 }
 
 impl ExpertResident {
+    /// Construct a resident expert, computing and caching the UTH
+    /// payload offset once. Subsequent calls to [`Self::data`] do not
+    /// re-probe the header.
+    pub fn new(id: u32, buffer: PooledBuffer) -> Self {
+        let payload_offset = {
+            let raw = buffer.as_slice();
+            let (_, payload) = TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN);
+            // `payload` is a subslice of `raw`; recover the offset via
+            // pointer arithmetic. This is sound because `strip` either
+            // returns `raw` unchanged (offset 0) or a subslice of it.
+            (payload.as_ptr() as usize).saturating_sub(raw.as_ptr() as usize)
+        };
+        Self {
+            id,
+            buffer,
+            payload_offset,
+        }
+    }
+
     /// Bare weight bytes — i.e. the buffer with any leading Unified
     /// Tensor Header stripped. The vast majority of callers want this.
+    ///
+    /// O(1): uses the cached `payload_offset` computed in [`Self::new`],
+    /// so the UTH is **not** reparsed on each call.
+    #[inline]
     pub fn data(&self) -> &[u8] {
-        let raw = self.buffer.as_slice();
-        let (_, payload) = TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN);
-        payload
+        &self.buffer.as_slice()[self.payload_offset..]
     }
 
     /// Raw buffer bytes, including any U.T.H. prefix. Used by paths
@@ -47,6 +78,10 @@ impl ExpertResident {
     /// Parsed Unified Tensor Header, if one is present at the start of
     /// the buffer. Returns `None` for legacy files (and for the
     /// synthetic-expert fixtures, which deliberately omit the header).
+    ///
+    /// This is a cold-path accessor (used by dump/diagnostic tools);
+    /// the header is re-probed here rather than stored to keep the
+    /// resident struct small.
     #[allow(dead_code)]
     pub fn header(&self) -> Option<TensorHeader> {
         let raw = self.buffer.as_slice();
@@ -218,7 +253,7 @@ mod tests {
 
     fn make(id: u32, pool: &BufferPool) -> Arc<ExpertResident> {
         let buffer = pool.try_acquire().unwrap();
-        Arc::new(ExpertResident { id, buffer })
+        Arc::new(ExpertResident::new(id, buffer))
     }
 
     #[test]

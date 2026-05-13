@@ -15,8 +15,8 @@
 //!     6      1    dtype_id (u8)          mirrors WeightDtype discriminant
 //!     7      1    shape_rank (u8)        1..=4
 //!     8     16    shape[4] (u32 LE)      0-padded; row-major
-//!    24      4    quant_scale_offset     bytes from start of payload
-//!    28      4    quant_scale_count      number of scales (u32 each), 0 if none
+//!    24      4    quant_scale_offset     bytes from start of payload to scales
+//!    28      4    quant_scale_count      number of f32 scales, 0 if none/inline
 //!    32      4    amx_tile_hint_m (u32)  preferred AMX tile dims
 //!    36      4    amx_tile_hint_n (u32)
 //!    40      4    amx_tile_hint_k (u32)
@@ -130,22 +130,36 @@ impl TensorHeader {
     /// The shape is recorded as `[d_ff, d_model, 3, 0]` — three
     /// `[d_ff × d_model]` (or `[d_model × d_ff]` for `down`) matrices
     /// stacked in the canonical `gate || up || down` order.
+    ///
+    /// `quant_scale_offset` addresses the **scale region** (not the
+    /// start of weights). For `Int8`, the three f32 per-tensor scales
+    /// live in the first 12 bytes of the payload (see
+    /// [`WeightDtype::header_bytes`]), so the offset is `0` and the
+    /// count is `3`. For the float dtypes there are no scales; for
+    /// `Q4K` / `Q4_0` the scales are kept inline per-block and cannot
+    /// be addressed by a single offset, so the count is reported as
+    /// `0` and readers must inspect blocks directly. In both of these
+    /// no-global-scales cases the offset value is meaningless and is
+    /// left as `0`.
     pub fn for_swiglu_expert(dtype: WeightDtype, d_model: usize, d_ff: usize) -> Self {
         // Tile hints are advisory; pick the AMX-tile-friendly default
         // 16×16×64 BF16 hint (a no-op on non-AMX backends).
+        let (quant_scale_offset, quant_scale_count) = match dtype {
+            // Int8: three f32 per-tensor scales sit at the very start
+            // of the payload (offset 0), followed by the weight stream
+            // at offset `dtype.header_bytes()`.
+            WeightDtype::Int8 => (0u32, 3u32),
+            // No global scale region — `quant_scale_offset` is unused
+            // when `quant_scale_count == 0`.
+            WeightDtype::F32 | WeightDtype::F16 | WeightDtype::Q4K | WeightDtype::Q4_0 => (0, 0),
+        };
         Self {
             version: UTH_VERSION,
             dtype: UthDtypeId::from_weight(dtype),
             shape: [d_ff as u32, d_model as u32, 3, 0],
             shape_rank: 3,
-            quant_scale_offset: dtype.header_bytes() as u32,
-            quant_scale_count: match dtype {
-                // Int8 stores 3 f32 scales (gate, up, down) in its 12-byte header.
-                WeightDtype::Int8 => 3,
-                // Q4K / Q4_0 keep scales inline per-block — not addressed by a
-                // single offset. Report 0 here; readers must inspect blocks.
-                _ => 0,
-            },
+            quant_scale_offset,
+            quant_scale_count,
             amx_tile_m: 16,
             amx_tile_n: 16,
             amx_tile_k: 64,

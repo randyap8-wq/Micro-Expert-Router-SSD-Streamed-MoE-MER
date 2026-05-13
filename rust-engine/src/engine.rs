@@ -1009,7 +1009,7 @@ impl Engine {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.io_hist.lock().record(io_us.max(1));
-                let resident = Arc::new(ExpertResident { id, buffer: buf });
+                let resident = Arc::new(ExpertResident::new(id, buf));
                 match self.cache.insert(resident.clone()) {
                     Ok(Some(_evicted)) => debug!(expert = id, "inserted (with eviction)"),
                     Ok(None) => debug!(expert = id, "inserted"),
@@ -1062,7 +1062,7 @@ impl Engine {
                     me.counters
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
-                    let resident = Arc::new(ExpertResident { id, buffer: buf });
+                    let resident = Arc::new(ExpertResident::new(id, buf));
                     // Prefetches are best-effort: if the cache rejects
                     // the insert (every slot pinned), the resident drops
                     // here and its buffer returns to the pool — exactly
