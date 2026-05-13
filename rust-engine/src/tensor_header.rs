@@ -327,6 +327,32 @@ mod tests {
     }
 
     #[test]
+    fn swiglu_header_quant_scale_metadata_per_dtype() {
+        // Int8 stores three f32 per-tensor scales at the start of the
+        // payload, so the header must advertise offset 0 / count 3.
+        let h = TensorHeader::for_swiglu_expert(WeightDtype::Int8, 512, 2048);
+        assert_eq!(h.quant_scale_offset, 0);
+        assert_eq!(h.quant_scale_count, 3);
+
+        // All other dtypes have no global scale region — count must be
+        // 0 and offset is unused (left as 0 by convention).
+        for dtype in [
+            WeightDtype::F32,
+            WeightDtype::F16,
+            WeightDtype::Q4K,
+            WeightDtype::Q4_0,
+        ] {
+            let h = TensorHeader::for_swiglu_expert(dtype, 512, 2048);
+            assert_eq!(
+                (h.quant_scale_offset, h.quant_scale_count),
+                (0, 0),
+                "unexpected quant scale metadata for {:?}",
+                dtype
+            );
+        }
+    }
+
+    #[test]
     fn write_padded_aligns_payload() {
         let h = TensorHeader::for_swiglu_expert(WeightDtype::F32, 8, 16);
         let mut buf = Vec::new();
