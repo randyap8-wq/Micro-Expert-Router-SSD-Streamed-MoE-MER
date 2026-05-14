@@ -132,10 +132,10 @@ For each token, the engine:
    off the speculative `E = S ∪ L ∪ M` prefetch union, deduplicated
    against ids already resident or in flight.
 
-The forward pass is **scalar `f32` Rust by default**, no BLAS, no
-SIMD, no GPU, because the project's thesis is about **storage
-bandwidth**, not compute. Two opt-in cargo features escalate the
-dense-matmul kernel without touching call sites:
+The forward pass for the dense decoder pieces is **scalar `f32` Rust by
+default**, no BLAS, no SIMD, no GPU, because the project's thesis is
+about **storage bandwidth**, not compute. Two opt-in cargo features
+escalate the dense-matmul kernel without touching call sites:
 
 * `--features simd` routes the dense projections inside
   `TransformerLayer` / `LMHead` through a `std::thread::scope`-based
@@ -145,10 +145,14 @@ dense-matmul kernel without touching call sites:
   for its `dot` op). Mutually exclusive with `simd`; a static
   `compile_error!` enforces this in `transformer.rs`.
 
-The SwiGLU expert kernel itself stays plain scalar, it just has to
-be real enough to exercise every byte that came off the drive
-(compiler can't fold it away) and surface a believable
-compute-vs-I/O latency picture in the per-token logs.
+The **per-expert SwiGLU FFN itself** runs through Hugging Face
+[`candle-core`](https://github.com/huggingface/candle) (CPU only — no
+`candle-nn`, no GPU backends). The page-aligned `&[u8]` returned by
+`ExpertResident::data()` is reinterpreted as `&[f32]` and bridged into
+`candle_core::Tensor`s via `ExpertWeights::to_candle_tensors`; the
+matmuls and `silu` activation use Candle's built-in kernels. The
+proprietary I/O substrate (`expert_cache`, `buffer_pool`, `io_provider`,
+the O_DIRECT `pread(2)` path) is strictly preserved.
 
 ---
 
@@ -167,7 +171,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point. Built behind the `io_uring` cargo feature. |
 | `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API), `LocalityMonitor` (sliding-window heat map, the **L** arm), and `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
-| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), implemented per dtype: `run_inference` (F32, zero-copy reinterpret), `run_inference_f16` / `_int8` / `_q4k` / `_q4_0` (dequantise then scalar `f32` matmul), and `run_inference_partial` (load only the top-M input columns by magnitude). All variants run directly over the bytes streamed off NVMe. |
+| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q4k` / `_q4_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
 | `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch (scalar / `simd` / `blas`). |
 | `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. |
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |

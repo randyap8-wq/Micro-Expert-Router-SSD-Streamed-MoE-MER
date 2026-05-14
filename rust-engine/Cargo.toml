@@ -87,6 +87,14 @@ half = { version = "2", features = ["bytemuck"] }
 # cargo feature). The default build does not require this crate.
 io-uring = { version = "0.6", optional = true }
 
+# Hugging Face Candle tensor library — used as the industrial-grade math
+# backend for the per-expert SwiGLU forward pass. We pull in only the
+# core crate (no `candle-nn`, no GPU backends): the expert weights still
+# arrive page-aligned out of NVMe via our O_DIRECT pipeline and are
+# bridged into `Tensor`s in `inference.rs`. `default-features = false`
+# keeps the dependency lean (CPU only, no Accelerate / MKL / CUDA).
+candle-core = { version = "0.10", default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
