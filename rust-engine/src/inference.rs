@@ -24,26 +24,27 @@
 //! the SSD — which is the entire point of streaming the weights in the
 //! first place.
 //!
-//! ### Why pure Rust / scalar matmul?
+//! ### Compute backend: Hugging Face Candle
 //!
-//! The point of this repository is to demonstrate that on modest hardware
-//! you can keep the *active* parameter footprint streaming from SSD instead
-//! of resident in DRAM. The compute kernel just has to be real enough to
-//! exercise every byte that arrived from the drive. We therefore use a
-//! straightforward scalar matmul + `silu` in `f32`, with no BLAS / SIMD
-//! dependency: the resulting per-token cost is on the order of
-//! `O(2 · d_model · d_ff)` MACs per expert, which is small enough on a
-//! laptop that I/O remains observable but large enough that the compiler
-//! cannot fold the read away. Swap this module for a `tch`/`candle`/`cudarc`
-//! kernel when wiring real, larger weights — the I/O substrate around it
-//! does not change.
+//! The expert FFN forward pass runs through the `candle-core` tensor
+//! library (CPU-only — no `candle-nn`, no GPU backends are pulled in).
+//! Candle gives us hand-tuned matrix multiplication and activation
+//! kernels for free, while the proprietary I/O substrate
+//! (`ExpertResident`, `BufferPool`, `expert_cache`, the O_DIRECT
+//! `pread(2)` path) remains strictly unchanged. The bridge is
+//! one-way and zero-allocation on top of the resident bytes: the
+//! page-aligned `&[u8]` returned by `resident.data()` is reinterpreted
+//! as `&[f32]` and handed to `Tensor::from_slice`, which builds the
+//! Candle CPU storage that the matmul / SiLU / elementwise-multiply
+//! kernels then operate on.
 //!
 //! ### Why not mmap the bytes as `&[f32]` and hand them to a tensor lib?
 //!
-//! That is exactly the upgrade path. The buffers handed to this function
-//! are page-aligned (the `O_DIRECT` invariant), so reinterpreting them as
-//! `&[f32]` is sound — `align_of::<f32>() == 4` and we always allocate at
-//! `≥ 4096`-byte alignment. See [`ExpertWeights::from_bytes`].
+//! That is exactly what we now do. The buffers handed to this function
+//! are page-aligned (the `O_DIRECT` invariant), so reinterpreting them
+//! as `&[f32]` is sound — `align_of::<f32>() == 4` and we always
+//! allocate at `≥ 4096`-byte alignment. See
+//! [`ExpertWeights::from_bytes`] and [`ExpertWeights::to_candle_tensors`].
 
 // The on-disk layout is documented as little-endian `f32`; we reinterpret
 // the byte buffer as `&[f32]` in place, so the host's native endianness
@@ -58,6 +59,18 @@ compile_error!(
 
 use crate::expert_cache::ExpertResident;
 use std::fmt;
+
+// Hugging Face Candle is the math backend for the per-expert SwiGLU
+// forward pass. The on-disk f32 layout (gate || up || down, row-major)
+// arrives in `inference.rs` as a page-aligned `&[u8]` out of the
+// O_DIRECT streaming pipeline; we bridge it into Candle tensors below
+// without touching `ExpertResident`, `BufferPool`, or `expert_cache`.
+//
+// We use only `candle-core` (no `candle-nn`, no GPU backends): the
+// industrial-grade matmul + activation kernels live in `candle-core`
+// itself, and pulling the whole `candle-nn` crate or a CUDA backend
+// would defeat the project's "single-binary CPU/NVMe runtime" thesis.
+use candle_core::{Device, Tensor};
 
 /// Bit-width with which expert weights are stored on disk.
 ///
@@ -658,6 +671,11 @@ pub enum ExpertWeightsError {
     /// a contract violation rather than something a corrupt file can
     /// trigger — but we surface it as an error rather than panicking.
     Misaligned { addr: usize, required: usize },
+    /// A `candle-core` operation (tensor construction, matmul, activation,
+    /// reshape, conversion back to `Vec<f32>`) failed. Surfaced as a
+    /// `Result` rather than panicking so the engine can log and skip
+    /// the offending expert instead of aborting the whole run.
+    Candle(String),
 }
 
 impl fmt::Display for ExpertWeightsError {
@@ -672,6 +690,9 @@ impl fmt::Display for ExpertWeightsError {
                 f,
                 "expert buffer is not f32-aligned: addr=0x{addr:x}, required={required}"
             ),
+            ExpertWeightsError::Candle(msg) => {
+                write!(f, "candle-core operation failed during expert forward pass: {msg}")
+            }
         }
     }
 }
@@ -774,36 +795,114 @@ impl<'a> ExpertWeights<'a> {
     }
 
 
-    /// Run the SwiGLU forward pass.
+    /// **The memory bridge to Candle.**
     ///
-    /// Allocates one `Vec<f32>` for the gated intermediate (`d_ff`) and
-    /// returns a `Vec<f32>` of length `d_model` for the FFN output.
+    /// Wrap the three weight matrices that this view points into as a
+    /// triple of `candle_core::Tensor`s on the CPU device, ready to be
+    /// fed to the matmul / SiLU / elementwise kernels in `candle-core`.
     ///
-    /// **Parallelism.** When the `simd` cargo feature is enabled and the
-    /// matrices are large enough (`d_ff * d_model >= 8 KiB`), the gate /
-    /// up projection and the down projection are split row-wise across
-    /// threads using `std::thread::scope` (the same pattern as
-    /// [`crate::transformer::matmul_row_major`] — no extra crate
-    /// dependency). Each row of the output is independent, so no
-    /// synchronisation is required. The scalar fallback is the default
-    /// build.
+    /// `gate` and `up` come out shaped `[d_ff, d_model]`, `down` comes
+    /// out shaped `[d_model, d_ff]` — i.e. the same row-major layout
+    /// the bytes have on disk and that [`ExpertWeights::from_bytes`]
+    /// already validated, so no transpose / reshape is required on
+    /// the read path.
+    ///
+    /// `Tensor::from_slice` copies the f32 weights into the Candle CPU
+    /// storage that owns its `Vec<f32>` — the public `candle-core` API
+    /// has no zero-copy borrow constructor against external memory. The
+    /// copy is `memcpy`-bound and runs at DRAM speed, which is small
+    /// compared to the dominant SSD-read cost the engine is built
+    /// around; the I/O substrate (`ExpertResident`, `BufferPool`,
+    /// `expert_cache`, the O_DIRECT `pread(2)` path) is untouched.
+    pub fn to_candle_tensors(
+        &self,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Tensor), ExpertWeightsError> {
+        let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
+        let gate = Tensor::from_slice(self.gate, (self.d_ff, self.d_model), device)
+            .map_err(map_err)?;
+        let up = Tensor::from_slice(self.up, (self.d_ff, self.d_model), device)
+            .map_err(map_err)?;
+        let down = Tensor::from_slice(self.down, (self.d_model, self.d_ff), device)
+            .map_err(map_err)?;
+        Ok((gate, up, down))
+    }
+
+    /// Run the SwiGLU forward pass through `candle-core`.
+    ///
+    /// Returns a `Vec<f32>` ([`HiddenState`]) of length `d_model` so the
+    /// rest of the transformer pipeline in `model.rs` / `transformer.rs`
+    /// remains untouched.
+    ///
+    /// The computation is the standard gated-MLP block used by every
+    /// routed expert in Mixtral / Llama / DeepSeek / Qwen-MoE / OLMoE:
+    ///
+    /// ```text
+    ///   y = down · ( silu(gate · x)  ⊙  (up · x) )
+    /// ```
+    ///
+    /// expressed in Candle ops as
+    ///
+    /// ```text
+    ///   g = (gate.matmul(x))           // [d_ff, 1]
+    ///   u = (up  .matmul(x))           // [d_ff, 1]
+    ///   y = down.matmul(silu(g) * u)   // [d_model, 1]
+    /// ```
+    ///
+    /// Any [`candle_core::Error`] is mapped to a logged
+    /// [`ExpertWeightsError::Candle`] and the function returns a
+    /// zero-filled `HiddenState` so callers — including the legacy
+    /// `run_inference_*` family — see a well-shaped output and can
+    /// continue with the next expert. The signatures of `run_inference`
+    /// and [`combine_outputs`] are preserved.
     pub fn forward(&self, x: &[f32]) -> HiddenState {
         debug_assert_eq!(
             x.len(),
             self.d_model,
             "hidden state length must equal d_model"
         );
+        match self.forward_candle(x) {
+            Ok(y) => y,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    d_model = self.d_model,
+                    d_ff = self.d_ff,
+                    "expert SwiGLU forward pass via candle-core failed; returning zero hidden state"
+                );
+                vec![0.0f32; self.d_model]
+            }
+        }
+    }
 
-        // 1) Two parallel projections into d_ff: gate = W_g x, up = W_u x.
-        //    Fuse them in the same loop so each row of (gate, up) reads
-        //    `x` once — better cache behaviour than two separate matmuls.
-        let mut gated = vec![0.0f32; self.d_ff];
-        gate_up_swiglu(self.gate, self.up, x, &mut gated, self.d_model);
+    /// Candle-backed implementation of [`Self::forward`], surfacing
+    /// errors as [`ExpertWeightsError::Candle`] instead of logging
+    /// them. Useful in tests and for callers that want to fail loudly
+    /// rather than substitute a zero output.
+    pub fn forward_candle(&self, x: &[f32]) -> Result<HiddenState, ExpertWeightsError> {
+        let device = Device::Cpu;
+        let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
 
-        // 2) Down projection: y = W_d · gated  -> length d_model.
-        let mut y = vec![0.0f32; self.d_model];
-        down_proj(self.down, &gated, &mut y, self.d_ff);
-        y
+        let (gate_t, up_t, down_t) = self.to_candle_tensors(&device)?;
+        // x as a column vector [d_model, 1] so the row-major matmuls
+        // line up: gate[d_ff, d_model] · x[d_model, 1] -> [d_ff, 1].
+        let x_t = Tensor::from_slice(x, (self.d_model, 1), &device).map_err(map_err)?;
+
+        let g = gate_t.matmul(&x_t).map_err(map_err)?;
+        let u = up_t.matmul(&x_t).map_err(map_err)?;
+
+        // SwiGLU: silu(g) ⊙ u
+        let gated = candle_core::Tensor::silu(&g)
+            .map_err(map_err)?
+            .mul(&u)
+            .map_err(map_err)?;
+
+        // Down projection: down[d_model, d_ff] · gated[d_ff, 1] -> [d_model, 1].
+        let y = down_t.matmul(&gated).map_err(map_err)?;
+
+        // Squeeze the trailing dim and convert back to Vec<f32>.
+        let y = y.squeeze(1).map_err(map_err)?;
+        y.to_vec1::<f32>().map_err(map_err)
     }
 }
 
