@@ -655,9 +655,11 @@ cargo build --release --features simd     # row-parallel
 cargo build --release --features blas     # matrixmultiply SGEMV
 ```
 
-The call sites are unchanged, so a future PR can swap the body for a
-`candle::Tensor` op or a CUDA kernel without touching the layer
-definitions.
+The call sites are unchanged, so a future PR can swap the body for
+a GPU-enabled `candle::Tensor` op or a CUDA kernel without touching
+the layer definitions. (The per-expert SwiGLU FFN already runs
+through `candle-core`; this `matmul_row_major` dispatch governs the
+**dense** decoder projections — attention QKV/O, LM head — only.)
 
 Tokenization is via the [`tokenizers`] crate when the optional
 `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured,
@@ -987,11 +989,17 @@ What is **still synthetic by default**:
 
 So: the engine demonstrates **the per-token forward pass of a sparse
 MoE transformer**, end-to-end, with experts paged off the SSD and
-real logit-driven token sampling. The expected drop-in path for
-production use is to replace `inference::run_inference` with a call
-into a tensor library such as `candle`, `tch`, or `cudarc`; the
-byte→`f32` view at `inference::ExpertWeights::from_bytes` already
-does zero-copy reinterpretation, so the swap is cleanly localised.
+real logit-driven token sampling. The per-expert SwiGLU forward pass
+**already runs through the Hugging Face [`candle-core`](https://github.com/huggingface/candle)
+tensor backend** (CPU-only — no `candle-nn`, no GPU backends pulled
+in); the page-aligned `&[u8]` returned by `ExpertResident::data()` is
+reinterpreted by `inference::ExpertWeights::from_bytes` and bridged
+into `candle_core::Tensor`s via `ExpertWeights::to_candle_tensors`,
+so the SSD-streaming substrate (`expert_cache`, `buffer_pool`,
+`io_provider`, the O_DIRECT `pread(2)` path) is preserved unchanged
+while the matmul + `silu` activation use Candle's built-in kernels.
+Swapping in a different backend (e.g. a GPU-enabled Candle build, or
+`tch` / `cudarc`) is a localised change inside `inference.rs`.
 
 Real Mixtral expert weights can already be fed to the engine end-to-end
 via [`scripts/extract_mixtral_experts.py`](./scripts/extract_mixtral_experts.py),
@@ -1036,11 +1044,12 @@ The engine is *inference infrastructure*, not an agent runtime. There is
 nothing here that loops over tool calls, parses ReAct traces, or manages
 memory between turns. However, **any agent framework that delegates
 generation to one of the LLMs above can use this engine as the underlying
-serving layer once a tensor backend is wired in**, LangChain, LangGraph,
-Microsoft AutoGen, CrewAI, llama-index, OpenAI-Agents-SDK, and the
-`smolagents` family are all framework-agnostic about the model server. The
-practical path is: this engine → an OpenAI-compatible HTTP shim →
-the agent framework's standard client.
+serving layer** (the per-expert SwiGLU FFN already runs through
+`candle-core`, and the OpenAI-compatible HTTP server is in place),
+LangChain, LangGraph, Microsoft AutoGen, CrewAI, llama-index,
+OpenAI-Agents-SDK, and the `smolagents` family are all framework-agnostic
+about the model server. The practical path is: this engine's
+OpenAI-compatible endpoint → the agent framework's standard client.
 
 ### Sharding granularity
 
@@ -1063,13 +1072,19 @@ layout without writing a real sharder first: just pick `--num-experts` and
 `--expert-size` to match the geometry above and you'll get realistic
 latency / throughput numbers for that model's I/O profile.
 
-### Picking a tensor backend (when you wire one in)
+### Picking a tensor backend
+
+The per-expert SwiGLU FFN currently runs through **`candle-core`**
+(CPU-only, no `candle-nn`, no GPU backends), bridged in
+`inference::ExpertWeights::to_candle_tensors` /
+`ExpertWeights::forward_candle`. Alternative backends are a
+localised swap inside `inference.rs`:
 
 | Backend | Language | MoE support | Notes |
 |---|---|---|---|
-| **`mistral.rs`** | Rust | First-class (Mixtral, DeepSeek, Phi-MoE, Qwen-MoE) | Closest fit. Replace its weight loader with this engine's `ExpertCache::get` and you're done. |
-| **`candle`** | Rust | Mixtral example in-tree | Tensor lib with no engine; you write the routing loop. Cleanest integration target. |
-| **`burn`** | Rust | Generic; community Mixtral | Good if you want pluggable compute backends (wgpu, cuda, ndarray). |
+| **`candle-core`** *(in tree, default)* | Rust | Used here for the per-expert SwiGLU | CPU-only build; a future PR can flip on a GPU backend (`cuda`, `metal`) without touching call sites. |
+| **`mistral.rs`** | Rust | First-class (Mixtral, DeepSeek, Phi-MoE, Qwen-MoE) | Closest fit if you want a higher-level engine; replace its weight loader with this engine's `ExpertCache::get`. |
+| **`burn`** | Rust | Generic; community Mixtral | Pluggable compute backends (wgpu, cuda, ndarray). |
 | **`llama.cpp` (GGUF MoE)** | C++ | Mixtral, DeepSeek, Qwen-MoE, OLMoE | FFI required. GGUF stores experts contiguously per layer, easy to map to per-expert files. |
 | **`vLLM`** | Python | Excellent | FFI required (the storage layer would expose a `/expert/<id>` server). Hardest, highest payoff for scale. |
 
@@ -1456,10 +1471,13 @@ you can verify the energy-saving paths actually engaged.
   on stable Rust until the tile intrinsics stabilise). The chosen
   backend is logged once at startup. The dense `transformer`
   projections additionally benefit from the existing `simd` /
-  `blas` features. Dropping in BLAS / a CUDA kernel via `tch` /
-  `candle` / `cudarc` for the SwiGLU FFN remains a clean
-  extension — `inference::ExpertWeights::from_bytes` already does
-  zero-copy reinterpretation of the buffer.
+  `blas` features. The per-expert SwiGLU FFN itself already runs
+  through **`candle-core`** (CPU-only build, no `candle-nn`, no
+  GPU backends); enabling a GPU backend (Candle's `cuda` /
+  `metal` features, or swapping for `tch` / `cudarc`) is a
+  localised change inside `inference.rs`, since
+  `ExpertWeights::from_bytes` and `to_candle_tensors` already do
+  the zero-copy bridge from the page-aligned NVMe buffer.
 - **NUMA budget.** `MER_PIN_CORES=N` is honoured at startup to
   `sched_setaffinity(2)` the process to the first `N` CPUs of
   NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere).
