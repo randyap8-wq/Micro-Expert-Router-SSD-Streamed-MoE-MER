@@ -372,10 +372,18 @@ impl Default for EngineOptions {
     }
 }
 
-pub struct Engine {
-    cache: Arc<ExpertCache>,
-    pool: BufferPool,
-    storage: Arc<NvmeStorage>,
+/// Core MoE / I/O wiring: cache, buffer pool, storage, router,
+/// predictor, model shape, and run-time options.
+///
+/// Owns the actual MoE expert-streaming machinery — everything needed
+/// to turn a routing decision into resident weights and back. It is
+/// deliberately free of telemetry and predictive-routing state so that
+/// future feature work (e.g. additional cache tiers, scheduler swaps)
+/// can be added without churning the observability layer alongside.
+pub(crate) struct EngineCore {
+    pub(super) cache: Arc<ExpertCache>,
+    pub(super) pool: BufferPool,
+    pub(super) storage: Arc<NvmeStorage>,
     /// Routing strategy. `Router::Linear` runs the production
     /// `LinearGate` (`softmax(W_gate · x) → top-K`) and is the path
     /// `cmd_serve` wires up when `[real_transformer].enabled = true`
@@ -385,102 +393,201 @@ pub struct Engine {
     /// Both are exercised by the engine through the same call site,
     /// so swapping them does not change cache / I/O / hit-rate
     /// telemetry shape, only which expert ids are selected.
-    router: Router,
-    predictor: Arc<PredictiveLoader>,
-    shape: ModelShape,
-    options: EngineOptions,
-    counters: Arc<Counters>,
-    /// Latency histogram of per-token cycle time, in microseconds.
-    cycle_hist: parking_lot::Mutex<Histogram<u64>>,
-    /// Latency histogram of cache-miss I/O reads, in microseconds.
-    io_hist: parking_lot::Mutex<Histogram<u64>>,
-    /// Latency histogram of per-token compute (FFN forward), in microseconds.
-    compute_hist: parking_lot::Mutex<Histogram<u64>>,
-    /// Aggregate microseconds spent on I/O wait across all tokens (i.e.
-    /// the sum of per-token critical-path miss latencies). Lets us
-    /// report `avg_io_wait_us` and "% of token time on I/O" without
-    /// re-deriving them from the histogram.
-    total_io_wait_us: AtomicU64,
-    /// Aggregate microseconds spent on per-token compute across all tokens.
-    total_compute_us: AtomicU64,
-    /// Aggregate microseconds spent on per-token cycle (compute + I/O wait
-    /// + scheduling overhead) across all tokens.
-    total_cycle_us: AtomicU64,
-    /// Number of tokens processed (i.e. `Engine::generate` calls).
-    tokens_processed: AtomicU64,
-    last_experts: parking_lot::Mutex<Vec<u32>>,
-    /// Set of experts active two tokens ago — fed to the predictor's
-    /// 2nd-order rows so prefetch decisions condition on the
-    /// `(prev_prev, prev)` pair when one is available.
-    last_last_experts: parking_lot::Mutex<Vec<u32>>,
-    /// Per-expert routing-observation counts used by frequency-based
-    /// pinning. Once an expert's count crosses
-    /// `options.pin_after_observations`, the engine asks the cache to
-    /// pin it.
-    route_observations: RwLock<HashMap<u32, u64>>,
+    pub(super) router: Router,
+    pub(super) predictor: Arc<PredictiveLoader>,
+    pub(super) shape: ModelShape,
+    pub(super) options: EngineOptions,
+}
+
+/// Predictive-routing state: aliasing & frequency-based pinning,
+/// locality monitor (the **L** arm of `S ∪ L ∪ M`), and the neural
+/// speculator (the **M** arm). All three live together because they
+/// share the same "observe routing decision → predict / pin" code
+/// path called from `generate` / `moe_step`.
+///
+/// Each arm is independently optional — a fresh `Engine::new(...)`
+/// disables all three, which preserves the legacy benchmark path
+/// bit-for-bit.
+pub(crate) struct EngineSpeculation {
     /// Optional alias map: when present, any routed/predicted expert id
     /// is remapped to its canonical id before the cache is consulted.
     /// Used for **expert deduplication** — pairs of experts that the
     /// offline analyser flagged as numerically near-identical share a
     /// single resident copy. `None` means no aliasing.
-    alias_map: Option<Arc<HashMap<u32, u32>>>,
+    pub(super) alias_map: Option<Arc<HashMap<u32, u32>>>,
     /// Number of times an alias redirect actually changed an expert id
     /// during routing/prefetch (for diagnostics).
-    alias_redirects: AtomicU64,
+    pub(super) alias_redirects: AtomicU64,
+    /// Per-expert routing-observation counts used by frequency-based
+    /// pinning. Once an expert's count crosses
+    /// `options.pin_after_observations`, the engine asks the cache to
+    /// pin it.
+    pub(super) route_observations: RwLock<HashMap<u32, u64>>,
+    pub(super) last_experts: parking_lot::Mutex<Vec<u32>>,
+    /// Set of experts active two tokens ago — fed to the predictor's
+    /// 2nd-order rows so prefetch decisions condition on the
+    /// `(prev_prev, prev)` pair when one is available.
+    pub(super) last_last_experts: parking_lot::Mutex<Vec<u32>>,
     /// Locality monitor — sliding-window heat map over recently-routed
     /// experts. When configured, the engine reconciles its hot set
     /// against the expert cache after every token: ids in the hot set
     /// are pinned (cannot be LRU-evicted) and ids that just dropped
     /// out are unpinned. Forms the **L** arm of the speculative I/O
     /// union `E = S ∪ L ∪ M`.
-    locality: Option<Arc<LocalityMonitor>>,
+    pub(super) locality: Option<Arc<LocalityMonitor>>,
     /// Set of expert ids the locality monitor pinned on the previous
     /// reconciliation. Diff'd against the current hot set so we only
     /// `pin`/`unpin` ids that actually changed status.
-    locality_pinned: parking_lot::Mutex<HashSet<u32>>,
+    pub(super) locality_pinned: parking_lot::Mutex<HashSet<u32>>,
     /// Heat threshold for [`Self::locality`]. Mirrors
     /// [`LocalityMonitor::DEFAULT_THRESHOLD_PCT`] when not overridden.
-    locality_threshold_pct: f32,
+    pub(super) locality_threshold_pct: f32,
+    /// Cumulative locality-hit count (target experts that were already
+    /// in the locality monitor's hot set at routing time).
+    pub(super) locality_hits: AtomicU64,
+    /// Cumulative locality-miss count.
+    pub(super) locality_misses: AtomicU64,
     /// Neural speculator — a tiny 2-layer MLP that predicts the gate's
     /// top-K from the hidden state. Forms the **M** arm of the union
     /// `E = S ∪ L ∪ M` and is trained online against the actual gate
     /// decision. Wrapped in an `Arc` for cheap cloning into spawned
     /// prefetch tasks; internal weights are guarded by an `RwLock`
     /// owned by the speculator itself.
-    speculator: Option<Arc<NeuralSpeculator>>,
+    pub(super) speculator: Option<Arc<NeuralSpeculator>>,
     /// Number of speculator predictions pulled per token (top-K size
     /// for the M arm). Defaults to the router's `top_k`.
-    speculator_topk: usize,
-    /// Optional Prometheus metrics sink. When present, the locality
-    /// hit / miss counters and speculator hit / miss counters are
-    /// updated alongside the per-Engine atomics.
-    metrics: Option<Metrics>,
+    pub(super) speculator_topk: usize,
+    /// Cumulative speculator hit count (predictions that intersected
+    /// the gate's actual top-K).
+    pub(super) spec_hits: AtomicU64,
+    /// Cumulative speculator miss count.
+    pub(super) spec_misses: AtomicU64,
+    /// Cumulative count of tokens for which the speculator's **top-1**
+    /// prediction matched the gate's actual top-1 routed expert.
+    /// Mirrors the `mer_speculator_accuracy_total` Prometheus counter.
+    pub(super) spec_top1_matches: AtomicU64,
+    /// Cumulative count of tokens for which the speculator was
+    /// invoked. Denominator of the top-1 accuracy ratio.
+    pub(super) spec_tokens: AtomicU64,
+}
+
+/// Observability: latency histograms, cumulative timing atomics,
+/// hit/miss/byte counters, the optional Prometheus sink, and the
+/// optional JSONL routing trace writer.
+///
+/// Lives in its own struct so the locality / speculator code paths
+/// can borrow `&EngineMetrics` to record telemetry without grabbing
+/// the whole `Engine`, and so future observability work (extra
+/// histograms, additional exporters) lands in one cohesive place.
+pub(crate) struct EngineMetrics {
+    pub(super) counters: Arc<Counters>,
+    /// Latency histogram of per-token cycle time, in microseconds.
+    pub(super) cycle_hist: parking_lot::Mutex<Histogram<u64>>,
+    /// Latency histogram of cache-miss I/O reads, in microseconds.
+    pub(super) io_hist: parking_lot::Mutex<Histogram<u64>>,
+    /// Latency histogram of per-token compute (FFN forward), in microseconds.
+    pub(super) compute_hist: parking_lot::Mutex<Histogram<u64>>,
+    /// Aggregate microseconds spent on I/O wait across all tokens (i.e.
+    /// the sum of per-token critical-path miss latencies). Lets us
+    /// report `avg_io_wait_us` and "% of token time on I/O" without
+    /// re-deriving them from the histogram.
+    pub(super) total_io_wait_us: AtomicU64,
+    /// Aggregate microseconds spent on per-token compute across all tokens.
+    pub(super) total_compute_us: AtomicU64,
+    /// Aggregate microseconds spent on per-token cycle (compute + I/O wait
+    /// + scheduling overhead) across all tokens.
+    pub(super) total_cycle_us: AtomicU64,
     /// Cumulative microseconds spent on the SSD critical-path stall —
     /// the wall-clock window during which the engine was blocked
     /// waiting for cache-miss reads to land. Distinct from
     /// `total_io_wait_us` only in that it's exported as its own
     /// Prometheus histogram (`mer_ssd_stall_seconds`).
-    total_ssd_stall_us: AtomicU64,
-    /// Cumulative speculator hit count (predictions that intersected
-    /// the gate's actual top-K).
-    spec_hits: AtomicU64,
-    /// Cumulative speculator miss count.
-    spec_misses: AtomicU64,
-    /// Cumulative count of tokens for which the speculator's **top-1**
-    /// prediction matched the gate's actual top-1 routed expert.
-    /// Mirrors the `mer_speculator_accuracy_total` Prometheus counter.
-    spec_top1_matches: AtomicU64,
-    /// Cumulative count of tokens for which the speculator was
-    /// invoked. Denominator of the top-1 accuracy ratio.
-    spec_tokens: AtomicU64,
-    /// Cumulative locality-hit count (target experts that were already
-    /// in the locality monitor's hot set at routing time).
-    locality_hits: AtomicU64,
-    /// Cumulative locality-miss count.
-    locality_misses: AtomicU64,
+    pub(super) total_ssd_stall_us: AtomicU64,
+    /// Number of tokens processed (i.e. `Engine::generate` calls).
+    pub(super) tokens_processed: AtomicU64,
+    /// Optional Prometheus metrics sink. When present, the locality
+    /// hit / miss counters and speculator hit / miss counters are
+    /// updated alongside the per-Engine atomics.
+    pub(super) prom: Option<Metrics>,
     /// Optional JSONL trace sink. When set, every `generate` call
     /// appends one record. See [`TraceWriter`] and gist Phase 6.
-    trace_writer: parking_lot::RwLock<Option<Arc<TraceWriter>>>,
+    pub(super) trace_writer: parking_lot::RwLock<Option<Arc<TraceWriter>>>,
+}
+
+impl EngineCore {
+    fn new(
+        cache: Arc<ExpertCache>,
+        pool: BufferPool,
+        storage: Arc<NvmeStorage>,
+        router: Router,
+        predictor: Arc<PredictiveLoader>,
+        shape: ModelShape,
+        options: EngineOptions,
+    ) -> Self {
+        Self { cache, pool, storage, router, predictor, shape, options }
+    }
+}
+
+impl EngineSpeculation {
+    fn new(speculator_topk_default: usize) -> Self {
+        Self {
+            alias_map: None,
+            alias_redirects: AtomicU64::new(0),
+            route_observations: RwLock::new(HashMap::new()),
+            last_experts: parking_lot::Mutex::new(Vec::new()),
+            last_last_experts: parking_lot::Mutex::new(Vec::new()),
+            locality: None,
+            locality_pinned: parking_lot::Mutex::new(HashSet::new()),
+            locality_threshold_pct: LocalityMonitor::DEFAULT_THRESHOLD_PCT,
+            locality_hits: AtomicU64::new(0),
+            locality_misses: AtomicU64::new(0),
+            speculator: None,
+            speculator_topk: speculator_topk_default,
+            spec_hits: AtomicU64::new(0),
+            spec_misses: AtomicU64::new(0),
+            spec_top1_matches: AtomicU64::new(0),
+            spec_tokens: AtomicU64::new(0),
+        }
+    }
+}
+
+impl EngineMetrics {
+    fn new() -> Self {
+        // 1us..60s, 3 sig figs — wide enough for cache hits (sub-ms)
+        // and slow SSD stalls (multi-second worst case) alike.
+        let mk_hist = || {
+            parking_lot::Mutex::new(
+                Histogram::new_with_bounds(1, 60_000_000, 3)
+                    .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
+            )
+        };
+        Self {
+            counters: Arc::new(Counters::default()),
+            cycle_hist: mk_hist(),
+            io_hist: mk_hist(),
+            compute_hist: mk_hist(),
+            total_io_wait_us: AtomicU64::new(0),
+            total_compute_us: AtomicU64::new(0),
+            total_cycle_us: AtomicU64::new(0),
+            total_ssd_stall_us: AtomicU64::new(0),
+            tokens_processed: AtomicU64::new(0),
+            prom: None,
+            trace_writer: parking_lot::RwLock::new(None),
+        }
+    }
+}
+
+/// Top-level façade: composes [`EngineCore`] (MoE/IO), [`EngineSpeculation`]
+/// (aliasing, locality, neural speculator) and [`EngineMetrics`]
+/// (histograms, counters, Prometheus / trace sinks).
+///
+/// All public methods stay on `Engine` so callers see the same API
+/// surface they always did; `generate` and `moe_step` are the
+/// cross-cutting flows that orchestrate across all three sub-objects.
+pub struct Engine {
+    pub(crate) core: EngineCore,
+    pub(crate) speculation: EngineSpeculation,
+    pub(crate) metrics: EngineMetrics,
 }
 
 impl Engine {
@@ -506,49 +613,9 @@ impl Engine {
     ) -> Self {
         let speculator_topk_default = router.top_k();
         Self {
-            cache,
-            pool,
-            storage,
-            router,
-            predictor,
-            shape,
-            options,
-            counters: Arc::new(Counters::default()),
-            cycle_hist: parking_lot::Mutex::new(
-                Histogram::new_with_bounds(1, 60_000_000, 3)
-                    .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
-            ),
-            io_hist: parking_lot::Mutex::new(
-                Histogram::new_with_bounds(1, 60_000_000, 3)
-                    .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
-            ),
-            compute_hist: parking_lot::Mutex::new(
-                Histogram::new_with_bounds(1, 60_000_000, 3)
-                    .expect("hdr histogram bounds (1us..60s, 3 sig figs) are valid"),
-            ),
-            total_io_wait_us: AtomicU64::new(0),
-            total_compute_us: AtomicU64::new(0),
-            total_cycle_us: AtomicU64::new(0),
-            tokens_processed: AtomicU64::new(0),
-            last_experts: parking_lot::Mutex::new(Vec::new()),
-            last_last_experts: parking_lot::Mutex::new(Vec::new()),
-            route_observations: RwLock::new(HashMap::new()),
-            alias_map: None,
-            alias_redirects: AtomicU64::new(0),
-            locality: None,
-            locality_pinned: parking_lot::Mutex::new(HashSet::new()),
-            locality_threshold_pct: LocalityMonitor::DEFAULT_THRESHOLD_PCT,
-            speculator: None,
-            speculator_topk: speculator_topk_default,
-            metrics: None,
-            total_ssd_stall_us: AtomicU64::new(0),
-            spec_hits: AtomicU64::new(0),
-            spec_misses: AtomicU64::new(0),
-            spec_top1_matches: AtomicU64::new(0),
-            spec_tokens: AtomicU64::new(0),
-            locality_hits: AtomicU64::new(0),
-            locality_misses: AtomicU64::new(0),
-            trace_writer: parking_lot::RwLock::new(None),
+            core: EngineCore::new(cache, pool, storage, router, predictor, shape, options),
+            speculation: EngineSpeculation::new(speculator_topk_default),
+            metrics: EngineMetrics::new(),
         }
     }
 
@@ -556,7 +623,7 @@ impl Engine {
     /// `generate` call appends `{token, layer, experts, cache_hit}` to
     /// the underlying file. Passing `None` disables tracing.
     pub fn set_trace_writer(&self, writer: Option<Arc<TraceWriter>>) {
-        *self.trace_writer.write() = writer;
+        *self.metrics.trace_writer.write() = writer;
     }
 
     /// Install an alias map. Calls to [`Self::generate`] / prefetch will
@@ -565,7 +632,7 @@ impl Engine {
     pub fn with_alias_map(mut self, map: HashMap<u32, u32>) -> Self {
         // Keep only entries that actually move ids. Self-aliases are noise.
         let cleaned: HashMap<u32, u32> = map.into_iter().filter(|(k, v)| k != v).collect();
-        self.alias_map = if cleaned.is_empty() {
+        self.speculation.alias_map = if cleaned.is_empty() {
             None
         } else {
             Some(Arc::new(cleaned))
@@ -579,10 +646,10 @@ impl Engine {
     /// state — newly hot ids are pinned, ids that fell below the heat
     /// threshold are unpinned.
     pub fn with_locality_monitor(mut self, monitor: Arc<LocalityMonitor>, threshold_pct: f32) -> Self {
-        self.locality = Some(monitor);
+        self.speculation.locality = Some(monitor);
         // Clamp into a sane range; values outside `[0,1]` make no
         // semantic sense for a "fraction of the window" threshold.
-        self.locality_threshold_pct = threshold_pct.clamp(0.0, 1.0);
+        self.speculation.locality_threshold_pct = threshold_pct.clamp(0.0, 1.0);
         self
     }
 
@@ -599,8 +666,8 @@ impl Engine {
         // `NeuralSpeculator::queue_train` without blocking the
         // engine's per-token critical path.
         spec.spawn_training_worker();
-        self.speculator = Some(spec);
-        self.speculator_topk = top_k.max(1);
+        self.speculation.speculator = Some(spec);
+        self.speculation.speculator_topk = top_k.max(1);
         self
     }
 
@@ -608,7 +675,7 @@ impl Engine {
     /// telemetry counters (locality / speculator hits & misses, SSD
     /// stall) into the metrics registry alongside its own atomics.
     pub fn with_metrics(mut self, m: Metrics) -> Self {
-        self.metrics = Some(m);
+        self.metrics.prom = Some(m);
         self
     }
 
@@ -616,10 +683,10 @@ impl Engine {
     /// redirect counter on a hit. Pure function on `&self`; safe to
     /// call from any context.
     fn resolve_alias(&self, id: u32) -> u32 {
-        if let Some(m) = &self.alias_map {
+        if let Some(m) = &self.speculation.alias_map {
             if let Some(&canon) = m.get(&id) {
                 if canon != id {
-                    self.alias_redirects.fetch_add(1, Ordering::Relaxed);
+                    self.speculation.alias_redirects.fetch_add(1, Ordering::Relaxed);
                     return canon;
                 }
             }
@@ -628,7 +695,7 @@ impl Engine {
     }
 
     pub fn shape(&self) -> ModelShape {
-        self.shape
+        self.core.shape
     }
 
     /// Process a single token: route, fetch missing experts, run inference,
@@ -642,8 +709,8 @@ impl Engine {
         // forward pass below, so this is at worst the same single
         // `synth_hidden_state` call the legacy path always made.
         let hidden: HiddenState =
-            synth_hidden_state(token_idx, self.shape.d_model, self.shape.hidden_seed);
-        let decision = self.router.route(&hidden, token_idx);
+            synth_hidden_state(token_idx, self.core.shape.d_model, self.core.shape.hidden_seed);
+        let decision = self.core.router.route(&hidden, token_idx);
         let raw_target = decision.experts;
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids. This is what makes deduplicated
@@ -661,15 +728,15 @@ impl Engine {
 
         // Frequency-based pinning: bump observation counts and ask the
         // cache to pin any id that crossed the threshold this token.
-        if self.options.pin_after_observations > 0 {
-            let mut obs = self.route_observations.write();
-            let threshold = self.options.pin_after_observations;
+        if self.core.options.pin_after_observations > 0 {
+            let mut obs = self.speculation.route_observations.write();
+            let threshold = self.core.options.pin_after_observations;
             for &id in &target {
                 let entry = obs.entry(id).or_insert(0);
                 *entry += 1;
                 if *entry == threshold {
                     debug!(expert = id, count = *entry, "pinning hot expert");
-                    self.cache.pin(id);
+                    self.core.cache.pin(id);
                 }
             }
         }
@@ -688,14 +755,14 @@ impl Engine {
         let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
             Vec::new();
         for (i, &id) in target.iter().enumerate() {
-            if let Some(r) = self.cache.get(id) {
-                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            if let Some(r) = self.core.cache.get(id) {
+                self.metrics.counters.hits.fetch_add(1, Ordering::Relaxed);
                 stats.hits += 1;
                 debug!(expert = id, "cache hit");
                 cache_hits_per_expert[i] = true;
                 residents[i] = Some(r);
             } else {
-                self.counters.misses.fetch_add(1, Ordering::Relaxed);
+                self.metrics.counters.misses.fetch_add(1, Ordering::Relaxed);
                 stats.misses += 1;
                 debug!(expert = id, "cache miss, fetching from NVMe");
                 let me = self.clone();
@@ -710,7 +777,7 @@ impl Engine {
         // single-namespace flat router path; the multi-layer path
         // (`moe_step`) emits its own record with the caller-supplied
         // layer id.
-        if let Some(tw) = self.trace_writer.read().as_ref() {
+        if let Some(tw) = self.metrics.trace_writer.read().as_ref() {
             tw.write_record(token_idx, 0, &target, &cache_hits_per_expert);
         }
         let had_misses = !miss_handles.is_empty();
@@ -721,7 +788,7 @@ impl Engine {
             // as it did before this was made concurrent.
             let r = h.await.expect("expert fetch task panicked");
             stats.bytes_read += r.buffer.len() as u64;
-            self.counters
+            self.metrics.counters
                 .bytes_read
                 .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
             residents[i] = Some(r);
@@ -739,8 +806,8 @@ impl Engine {
         // exports it as its own histogram so future overlapped-fetch
         // refactors can decouple the two without breaking dashboards.
         if io_wait_us > 0 {
-            self.total_ssd_stall_us.fetch_add(io_wait_us, Ordering::Relaxed);
-            if let Some(m) = &self.metrics {
+            self.metrics.total_ssd_stall_us.fetch_add(io_wait_us, Ordering::Relaxed);
+            if let Some(m) = &self.metrics.prom {
                 m.record_ssd_stall(io_wait_us as f64 / 1_000_000.0);
             }
         }
@@ -754,7 +821,7 @@ impl Engine {
         //    XOR checksum so the kernel actually delivers the page data
         //    and we can isolate the SSD-streaming cost from FFN compute.
         let compute_start = Instant::now();
-        let compute_us = if self.options.io_only {
+        let compute_us = if self.core.options.io_only {
             let mut digest: u64 = 0;
             let mut total_bytes: u64 = 0;
             for r in &residents {
@@ -802,12 +869,12 @@ impl Engine {
             let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
             let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
             for r in &residents {
-                let res = match self.options.dtype {
-                    WeightDtype::F32 => run_inference(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
-                    WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
-                    WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
-                    WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
-                    WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+                let res = match self.core.options.dtype {
+                    WeightDtype::F32 => run_inference(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
+                    WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
+                    WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
+                    WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
+                    WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
                 };
                 match res {
                     Ok((out, y)) => {
@@ -833,17 +900,17 @@ impl Engine {
             let us = compute_start.elapsed().as_micros() as u64;
             debug!(
                 token = token_idx,
-                d_model = self.shape.d_model,
-                d_ff = self.shape.d_ff,
+                d_model = self.core.shape.d_model,
+                d_ff = self.core.shape.d_ff,
                 ?outputs,
                 combined_norm = combined.iter().map(|v| v * v).sum::<f32>().sqrt(),
                 "FFN forward complete"
             );
             us
         };
-        let _ = self.compute_hist.lock().record(compute_us.max(1));
-        self.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
-        self.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
+        let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
+        self.metrics.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
+        self.metrics.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
 
         // 3) Update predictor with the observed transition.
         //    Use the 2nd-order helper when we have a `prev_prev` set
@@ -851,10 +918,10 @@ impl Engine {
         //    `(prev_prev -> prev -> next)` triples in addition to the
         //    `(prev -> next)` baseline.
         {
-            let mut last = self.last_experts.lock();
-            let mut last_last = self.last_last_experts.lock();
+            let mut last = self.speculation.last_experts.lock();
+            let mut last_last = self.speculation.last_last_experts.lock();
             if !last.is_empty() {
-                self.predictor.observe_step2(&last_last, &last, &target);
+                self.core.predictor.observe_step2(&last_last, &last, &target);
             }
             *last_last = last.clone();
             *last = target.clone();
@@ -868,10 +935,10 @@ impl Engine {
         //    arm) and the locality monitor's hot set (the **L** arm)
         //    into the prefetch set — see [`Engine::union_prefetch`].
         if let Some(&seed) = target.last() {
-            let last_last = self.last_last_experts.lock();
+            let last_last = self.speculation.last_last_experts.lock();
             let s_markov = match last_last.last() {
-                Some(&pp) => self.predictor.predict_next2(pp, seed),
-                None => self.predictor.predict_next(seed),
+                Some(&pp) => self.core.predictor.predict_next2(pp, seed),
+                None => self.core.predictor.predict_next(seed),
             };
             drop(last_last);
             // Speculator: predict + train on the residual-stream
@@ -883,9 +950,9 @@ impl Engine {
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
-        let _ = self.cycle_hist.lock().record(cycle_us.max(1));
-        self.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
-        self.tokens_processed.fetch_add(1, Ordering::Relaxed);
+        let _ = self.metrics.cycle_hist.lock().record(cycle_us.max(1));
+        self.metrics.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
+        self.metrics.tokens_processed.fetch_add(1, Ordering::Relaxed);
 
         stats
     }
@@ -986,13 +1053,13 @@ impl Engine {
         let mut yields = 0usize;
         let mut buf;
         loop {
-            if self.cache.len() >= self.cache.capacity() {
-                if let Some(evicted) = self.cache.evict_lru() {
+            if self.core.cache.len() >= self.core.cache.capacity() {
+                if let Some(evicted) = self.core.cache.evict_lru() {
                     debug!(evicted = evicted.id, "evicted LRU to make room");
                     drop(evicted);
                 }
             }
-            if let Some(b) = self.pool.try_acquire() {
+            if let Some(b) = self.core.pool.try_acquire() {
                 buf = b;
                 break;
             }
@@ -1005,12 +1072,12 @@ impl Engine {
             }
             tokio::task::yield_now().await;
         }
-        match self.storage.read_expert(id, &mut buf).await {
+        match self.core.storage.read_expert(id, &mut buf).await {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
-                let _ = self.io_hist.lock().record(io_us.max(1));
+                let _ = self.metrics.io_hist.lock().record(io_us.max(1));
                 let resident = Arc::new(ExpertResident::new(id, buf));
-                match self.cache.insert(resident.clone()) {
+                match self.core.cache.insert(resident.clone()) {
                     Ok(Some(_evicted)) => debug!(expert = id, "inserted (with eviction)"),
                     Ok(None) => debug!(expert = id, "inserted"),
                     Err(rejected) => {
@@ -1041,14 +1108,14 @@ impl Engine {
         let me = self.clone();
         tokio::spawn(async move {
             // Re-check (could have been loaded by another task in the meantime).
-            if me.cache.contains(id) {
+            if me.core.cache.contains(id) {
                 return;
             }
             // Prefetches are *speculative*. They must never evict resident
             // experts (which could starve a real cache miss) and must never
             // block waiting for a buffer (same reason). The buffer pool is
             // sized with extra slots specifically for in-flight prefetches.
-            let mut buf = match me.pool.try_acquire() {
+            let mut buf = match me.core.pool.try_acquire() {
                 Some(b) => b,
                 None => {
                     debug!(expert = id, "skipping prefetch: pool busy");
@@ -1056,10 +1123,10 @@ impl Engine {
                 }
             };
             let started = Instant::now();
-            match me.storage.read_expert(id, &mut buf).await {
+            match me.core.storage.read_expert(id, &mut buf).await {
                 Ok(_) => {
-                    me.counters.prefetch_completed.fetch_add(1, Ordering::Relaxed);
-                    me.counters
+                    me.metrics.counters.prefetch_completed.fetch_add(1, Ordering::Relaxed);
+                    me.metrics.counters
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     let resident = Arc::new(ExpertResident::new(id, buf));
@@ -1067,7 +1134,7 @@ impl Engine {
                     // the insert (every slot pinned), the resident drops
                     // here and its buffer returns to the pool — exactly
                     // the right behaviour for a speculative load.
-                    if let Err(_rejected) = me.cache.insert(resident) {
+                    if let Err(_rejected) = me.core.cache.insert(resident) {
                         debug!(
                             expert = id,
                             "prefetch dropped: cache full of pinned entries"
@@ -1088,7 +1155,7 @@ impl Engine {
 
     /// Account for the fact that an expert was a hit *because* we prefetched it.
     pub fn note_prefetch_hit(&self) {
-        self.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
+        self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------
@@ -1111,26 +1178,26 @@ impl Engine {
     /// pushed it in or out). Returns the size of the hot set, useful
     /// for tests.
     fn locality_observe_and_reconcile(&self, target: &[u32]) -> usize {
-        let Some(monitor) = self.locality.as_ref() else {
+        let Some(monitor) = self.speculation.locality.as_ref() else {
             return 0;
         };
         // Snapshot pre-observation hit/miss against the *current* hot set.
         let mut hits: u64 = 0;
         let mut misses: u64 = 0;
         for &id in target {
-            if monitor.is_hot(id, self.locality_threshold_pct) {
+            if monitor.is_hot(id, self.speculation.locality_threshold_pct) {
                 hits += 1;
             } else {
                 misses += 1;
             }
         }
         if hits > 0 {
-            self.locality_hits.fetch_add(hits, Ordering::Relaxed);
+            self.speculation.locality_hits.fetch_add(hits, Ordering::Relaxed);
         }
         if misses > 0 {
-            self.locality_misses.fetch_add(misses, Ordering::Relaxed);
+            self.speculation.locality_misses.fetch_add(misses, Ordering::Relaxed);
         }
-        if let Some(m) = &self.metrics {
+        if let Some(m) = &self.metrics.prom {
             m.record_locality(hits, misses);
         }
 
@@ -1139,18 +1206,18 @@ impl Engine {
 
         // Reconcile pin set against the post-observation hot set.
         let new_hot: HashSet<u32> = monitor
-            .hot_set(self.locality_threshold_pct)
+            .hot_set(self.speculation.locality_threshold_pct)
             .into_iter()
             .collect();
-        let mut prev = self.locality_pinned.lock();
+        let mut prev = self.speculation.locality_pinned.lock();
         for &id in new_hot.iter() {
             if !prev.contains(&id) {
-                self.cache.pin(id);
+                self.core.cache.pin(id);
             }
         }
         for &id in prev.iter() {
             if !new_hot.contains(&id) {
-                self.cache.unpin(id);
+                self.core.cache.unpin(id);
             }
         }
         let len = new_hot.len();
@@ -1164,7 +1231,7 @@ impl Engine {
     /// speculator's prediction so the caller can union it into the
     /// prefetch set.
     fn speculator_predict_and_train(&self, x: &[f32], target: &[u32]) -> Vec<u32> {
-        let Some(spec) = self.speculator.as_ref() else {
+        let Some(spec) = self.speculation.speculator.as_ref() else {
             return Vec::new();
         };
         if x.len() != spec.d_model() {
@@ -1174,7 +1241,7 @@ impl Engine {
             // benchmark where d_model can disagree with the real model.
             return Vec::new();
         }
-        let preds = spec.predict_topk(x, self.speculator_topk);
+        let preds = spec.predict_topk(x, self.speculation.speculator_topk);
         let target_set: HashSet<u32> = target.iter().copied().collect();
         let mut hits: u64 = 0;
         for &p in &preds {
@@ -1184,10 +1251,10 @@ impl Engine {
         }
         let misses = preds.len() as u64 - hits;
         if hits > 0 {
-            self.spec_hits.fetch_add(hits, Ordering::Relaxed);
+            self.speculation.spec_hits.fetch_add(hits, Ordering::Relaxed);
         }
         if misses > 0 {
-            self.spec_misses.fetch_add(misses, Ordering::Relaxed);
+            self.speculation.spec_misses.fetch_add(misses, Ordering::Relaxed);
         }
         // Top-1 accuracy: 1 if the speculator's #1 expert matches the
         // gate's #1 expert for this token, 0 otherwise. This is the
@@ -1197,11 +1264,11 @@ impl Engine {
             _ => 0,
         };
         if top1_match > 0 {
-            self.spec_top1_matches.fetch_add(1, Ordering::Relaxed);
+            self.speculation.spec_top1_matches.fetch_add(1, Ordering::Relaxed);
         }
         // One token observed by the speculator (regardless of match).
-        self.spec_tokens.fetch_add(1, Ordering::Relaxed);
-        if let Some(m) = &self.metrics {
+        self.speculation.spec_tokens.fetch_add(1, Ordering::Relaxed);
+        if let Some(m) = &self.metrics.prom {
             m.record_speculator(hits, misses);
             m.record_speculator_top1(top1_match);
         }
@@ -1236,21 +1303,21 @@ impl Engine {
         let mut seen: HashSet<u32> = already_in_flight.clone();
         for &(id, p) in s_markov {
             let canon = self.resolve_alias(id);
-            if seen.insert(canon) && !self.cache.contains(canon) {
+            if seen.insert(canon) && !self.core.cache.contains(canon) {
                 self.spawn_prefetch(canon, p);
             }
         }
-        if let Some(monitor) = self.locality.as_ref() {
-            for id in monitor.hot_set(self.locality_threshold_pct) {
+        if let Some(monitor) = self.speculation.locality.as_ref() {
+            for id in monitor.hot_set(self.speculation.locality_threshold_pct) {
                 let canon = self.resolve_alias(id);
-                if seen.insert(canon) && !self.cache.contains(canon) {
+                if seen.insert(canon) && !self.core.cache.contains(canon) {
                     self.spawn_prefetch(canon, 0.5);
                 }
             }
         }
         for &id in m_speculator {
             let canon = self.resolve_alias(id);
-            if seen.insert(canon) && !self.cache.contains(canon) {
+            if seen.insert(canon) && !self.core.cache.contains(canon) {
                 self.spawn_prefetch(canon, 0.5);
             }
         }
@@ -1261,12 +1328,12 @@ impl Engine {
     /// observations have been recorded yet (the safer default for a
     /// freshly-warmed engine).
     pub fn predictive_telemetry(&self) -> PredictiveTelemetry {
-        let s_hits = self.spec_hits.load(Ordering::Relaxed);
-        let s_misses = self.spec_misses.load(Ordering::Relaxed);
-        let s_top1 = self.spec_top1_matches.load(Ordering::Relaxed);
-        let s_top1_total = self.spec_tokens.load(Ordering::Relaxed);
-        let l_hits = self.locality_hits.load(Ordering::Relaxed);
-        let l_misses = self.locality_misses.load(Ordering::Relaxed);
+        let s_hits = self.speculation.spec_hits.load(Ordering::Relaxed);
+        let s_misses = self.speculation.spec_misses.load(Ordering::Relaxed);
+        let s_top1 = self.speculation.spec_top1_matches.load(Ordering::Relaxed);
+        let s_top1_total = self.speculation.spec_tokens.load(Ordering::Relaxed);
+        let l_hits = self.speculation.locality_hits.load(Ordering::Relaxed);
+        let l_misses = self.speculation.locality_misses.load(Ordering::Relaxed);
         let s_total = s_hits + s_misses;
         let l_total = l_hits + l_misses;
         PredictiveTelemetry {
@@ -1291,7 +1358,7 @@ impl Engine {
             } else {
                 l_hits as f64 / l_total as f64
             },
-            ssd_stall_us: self.total_ssd_stall_us.load(Ordering::Relaxed),
+            ssd_stall_us: self.metrics.total_ssd_stall_us.load(Ordering::Relaxed),
         }
     }
 
@@ -1338,15 +1405,15 @@ impl Engine {
         let m_speculator = self.speculator_predict_and_train(x, &target);
 
         // Frequency-based pinning: same logic as `generate`.
-        if self.options.pin_after_observations > 0 {
-            let mut obs = self.route_observations.write();
-            let threshold = self.options.pin_after_observations;
+        if self.core.options.pin_after_observations > 0 {
+            let mut obs = self.speculation.route_observations.write();
+            let threshold = self.core.options.pin_after_observations;
             for &id in &target {
                 let entry = obs.entry(id).or_insert(0);
                 *entry += 1;
                 if *entry == threshold {
                     debug!(expert = id, count = *entry, "pinning hot expert");
-                    self.cache.pin(id);
+                    self.core.cache.pin(id);
                 }
             }
         }
@@ -1371,10 +1438,10 @@ impl Engine {
         // history update happens after compute below, mirroring
         // `generate`'s order.
         if let Some(&seed) = target.last() {
-            let last_last = self.last_last_experts.lock();
+            let last_last = self.speculation.last_last_experts.lock();
             let s_markov = match last_last.last() {
-                Some(&pp) => self.predictor.predict_next2(pp, seed),
-                None => self.predictor.predict_next(seed),
+                Some(&pp) => self.core.predictor.predict_next2(pp, seed),
+                None => self.core.predictor.predict_next(seed),
             };
             drop(last_last);
             self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
@@ -1389,12 +1456,12 @@ impl Engine {
         )> = Vec::new();
         let mut cache_hits_per_expert: Vec<bool> = Vec::with_capacity(target.len());
         for (i, &id) in target.iter().enumerate() {
-            if let Some(r) = self.cache.get(id) {
-                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            if let Some(r) = self.core.cache.get(id) {
+                self.metrics.counters.hits.fetch_add(1, Ordering::Relaxed);
                 residents[i] = Some(r);
                 cache_hits_per_expert.push(true);
             } else {
-                self.counters.misses.fetch_add(1, Ordering::Relaxed);
+                self.metrics.counters.misses.fetch_add(1, Ordering::Relaxed);
                 let me = self.clone();
                 miss_handles.push((
                     i,
@@ -1408,7 +1475,7 @@ impl Engine {
         // supplied by the caller. This is what makes `--trace-out`
         // useful for the `--gate-weights` and real-transformer paths
         // (which go through `moe_step`, not `generate`).
-        if let Some(tw) = self.trace_writer.read().as_ref() {
+        if let Some(tw) = self.metrics.trace_writer.read().as_ref() {
             tw.write_record(token_idx, layer, &target, &cache_hits_per_expert);
         }
         let had_misses = !miss_handles.is_empty();
@@ -1425,14 +1492,14 @@ impl Engine {
             // re-raise so the supervising scheduler can restart us.
             match h.await.expect("expert fetch task panicked") {
                 Ok(r) => {
-                    self.counters
+                    self.metrics.counters
                         .bytes_read
                         .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
                     residents[i] = Some(r);
                 }
                 Err(e) => {
                     let id = target[i];
-                    self.counters
+                    self.metrics.counters
                         .expert_read_failures
                         .fetch_add(1, Ordering::Relaxed);
                     warn!(token = token_idx, layer, expert = id, error = %e,
@@ -1468,16 +1535,16 @@ impl Engine {
                     // weights[] alignment stays valid (combining with
                     // weight `w_i * 0 = 0` is equivalent to dropping
                     // this expert from the mixture).
-                    per_expert_y.push(vec![0.0f32; self.shape.d_model]);
+                    per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
                     continue;
                 }
             };
-            let res = match self.options.dtype {
-                WeightDtype::F32 => run_inference(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
-                WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
-                WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
-                WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
-                WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, self.shape.d_model, self.shape.d_ff),
+            let res = match self.core.options.dtype {
+                WeightDtype::F32 => run_inference(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
+                WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
+                WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
+                WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
+                WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
             };
             match res {
                 Ok((_out, y)) => per_expert_y.push(y),
@@ -1491,17 +1558,17 @@ impl Engine {
                     // Push a zero vector so the caller's weights[] alignment
                     // stays valid; combining with weight `w_i * 0 = 0` is
                     // the same as if this expert were never picked.
-                    per_expert_y.push(vec![0.0f32; self.shape.d_model]);
+                    per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
                 }
             }
         }
         let compute_us = compute_start.elapsed().as_micros() as u64;
-        let _ = self.compute_hist.lock().record(compute_us.max(1));
-        self.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
-        self.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
+        let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
+        self.metrics.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
+        self.metrics.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
         if io_wait_us > 0 {
-            self.total_ssd_stall_us.fetch_add(io_wait_us, Ordering::Relaxed);
-            if let Some(m) = &self.metrics {
+            self.metrics.total_ssd_stall_us.fetch_add(io_wait_us, Ordering::Relaxed);
+            if let Some(m) = &self.metrics.prom {
                 m.record_ssd_stall(io_wait_us as f64 / 1_000_000.0);
             }
         }
@@ -1511,19 +1578,19 @@ impl Engine {
         // target-miss await — this block only carries forward the
         // 2nd-order ring buffer for the *next* token's prefetch.
         if !target.is_empty() {
-            let mut last = self.last_experts.lock();
-            let mut last_last = self.last_last_experts.lock();
+            let mut last = self.speculation.last_experts.lock();
+            let mut last_last = self.speculation.last_last_experts.lock();
             if !last.is_empty() {
-                self.predictor.observe_step2(&last_last, &last, &target);
+                self.core.predictor.observe_step2(&last_last, &last, &target);
             }
             *last_last = last.clone();
             *last = target.clone();
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
-        let _ = self.cycle_hist.lock().record(cycle_us.max(1));
-        self.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
-        self.tokens_processed.fetch_add(1, Ordering::Relaxed);
+        let _ = self.metrics.cycle_hist.lock().record(cycle_us.max(1));
+        self.metrics.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
+        self.metrics.tokens_processed.fetch_add(1, Ordering::Relaxed);
 
         per_expert_y
     }
@@ -1532,13 +1599,13 @@ impl Engine {
     /// Mirrors the spec example "the router selects Expert ID 3 and 7".
     pub async fn warm_with(self: &Arc<Self>, ids: &[u32]) -> std::io::Result<()> {
         for &id in ids {
-            if id >= self.router.num_experts() {
+            if id >= self.core.router.num_experts() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("expert id {id} >= num_experts"),
                 ));
             }
-            if !self.cache.contains(id) {
+            if !self.core.cache.contains(id) {
                 let _ = self.fetch(id).await;
             }
         }
@@ -1546,13 +1613,13 @@ impl Engine {
     }
 
     pub fn report(&self) -> EngineReport {
-        let cycle = self.cycle_hist.lock();
-        let io = self.io_hist.lock();
-        let compute = self.compute_hist.lock();
-        let tokens = self.tokens_processed.load(Ordering::Relaxed);
-        let total_io_wait_us = self.total_io_wait_us.load(Ordering::Relaxed);
-        let total_compute_us = self.total_compute_us.load(Ordering::Relaxed);
-        let total_cycle_us = self.total_cycle_us.load(Ordering::Relaxed);
+        let cycle = self.metrics.cycle_hist.lock();
+        let io = self.metrics.io_hist.lock();
+        let compute = self.metrics.compute_hist.lock();
+        let tokens = self.metrics.tokens_processed.load(Ordering::Relaxed);
+        let total_io_wait_us = self.metrics.total_io_wait_us.load(Ordering::Relaxed);
+        let total_compute_us = self.metrics.total_compute_us.load(Ordering::Relaxed);
+        let total_cycle_us = self.metrics.total_cycle_us.load(Ordering::Relaxed);
         let avg_io_wait_us = if tokens == 0 { 0.0 } else { total_io_wait_us as f64 / tokens as f64 };
         let avg_compute_us = if tokens == 0 { 0.0 } else { total_compute_us as f64 / tokens as f64 };
         let pct_time_io = if total_cycle_us == 0 {
@@ -1561,10 +1628,10 @@ impl Engine {
             (total_io_wait_us as f64 / total_cycle_us as f64) * 100.0
         };
         EngineReport {
-            hits: self.counters.hits.load(Ordering::Relaxed),
-            misses: self.counters.misses.load(Ordering::Relaxed),
-            prefetch_completed: self.counters.prefetch_completed.load(Ordering::Relaxed),
-            bytes_read: self.counters.bytes_read.load(Ordering::Relaxed),
+            hits: self.metrics.counters.hits.load(Ordering::Relaxed),
+            misses: self.metrics.counters.misses.load(Ordering::Relaxed),
+            prefetch_completed: self.metrics.counters.prefetch_completed.load(Ordering::Relaxed),
+            bytes_read: self.metrics.counters.bytes_read.load(Ordering::Relaxed),
             cycle_p50_us: cycle.value_at_quantile(0.50),
             cycle_p95_us: cycle.value_at_quantile(0.95),
             cycle_p99_us: cycle.value_at_quantile(0.99),
@@ -1576,28 +1643,28 @@ impl Engine {
             compute_p50_us: compute.value_at_quantile(0.50),
             compute_p95_us: compute.value_at_quantile(0.95),
             compute_p99_us: compute.value_at_quantile(0.99),
-            cache_capacity: self.cache.capacity(),
-            pool_capacity: self.pool.capacity(),
-            num_experts: self.router.num_experts(),
-            top_k: self.router.top_k(),
-            d_model: self.shape.d_model,
-            d_ff: self.shape.d_ff,
-            predictor_observations: self.predictor.observations(),
+            cache_capacity: self.core.cache.capacity(),
+            pool_capacity: self.core.pool.capacity(),
+            num_experts: self.core.router.num_experts(),
+            top_k: self.core.router.top_k(),
+            d_model: self.core.shape.d_model,
+            d_ff: self.core.shape.d_ff,
+            predictor_observations: self.core.predictor.observations(),
             tokens_processed: tokens,
             avg_io_wait_us,
             avg_compute_us,
             total_io_wait_us,
             total_cycle_us,
             pct_time_io,
-            io_only: self.options.io_only,
-            pinned_count: self.cache.pinned_count(),
-            alias_redirects: self.alias_redirects.load(Ordering::Relaxed),
-            dtype: self.options.dtype,
-            partial_load_fraction: self.options.partial_load_fraction,
+            io_only: self.core.options.io_only,
+            pinned_count: self.core.cache.pinned_count(),
+            alias_redirects: self.speculation.alias_redirects.load(Ordering::Relaxed),
+            dtype: self.core.options.dtype,
+            partial_load_fraction: self.core.options.partial_load_fraction,
             predictive: self.predictive_telemetry(),
-            locality_enabled: self.locality.is_some(),
-            speculator_enabled: self.speculator.is_some(),
-            expert_read_failures: self.counters.expert_read_failures.load(Ordering::Relaxed),
+            locality_enabled: self.speculation.locality.is_some(),
+            speculator_enabled: self.speculation.speculator.is_some(),
+            expert_read_failures: self.metrics.counters.expert_read_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -1942,8 +2009,8 @@ mod tests {
         let r = engine.report();
         assert_eq!(r.hits, 0);
         assert_eq!(r.misses, 0);
-        assert!(engine.cache.contains(3));
-        assert!(engine.cache.contains(7));
+        assert!(engine.core.cache.contains(3));
+        assert!(engine.core.cache.contains(7));
 
         // Subsequent generate calls now have warmed slots to hit.
         let _ = engine.generate(0).await;
@@ -1971,24 +2038,24 @@ mod tests {
             // of regressions where the cache temporarily holds N+1
             // entries in between an insert and an eviction.
             assert!(
-                engine.cache.resident_ids().len() <= cache_slots,
+                engine.core.cache.resident_ids().len() <= cache_slots,
                 "cache residency {} exceeded capacity {} at token {t}",
-                engine.cache.resident_ids().len(),
+                engine.core.cache.resident_ids().len(),
                 cache_slots
             );
             assert!(
-                engine.cache.len() <= cache_slots,
+                engine.core.cache.len() <= cache_slots,
                 "cache.len() {} exceeded capacity {} at token {t}",
-                engine.cache.len(),
+                engine.core.cache.len(),
                 cache_slots
             );
         }
         let r = engine.report();
         assert_eq!(r.cache_capacity, cache_slots);
         assert!(
-            engine.cache.resident_ids().len() <= cache_slots,
+            engine.core.cache.resident_ids().len() <= cache_slots,
             "post-stream residency {} exceeded capacity {}",
-            engine.cache.resident_ids().len(),
+            engine.core.cache.resident_ids().len(),
             cache_slots
         );
         // Misses dominate when cache_slots is small relative to working set.
@@ -2026,12 +2093,12 @@ mod tests {
         // we mutate via a fresh constructor instead.
         let engine = {
             // SAFETY: tests own the only Arc reference at this point.
-            let cache = engine.cache.clone();
-            let pool = engine.pool.clone();
-            let storage = engine.storage.clone();
-            let router = engine.router.clone();
-            let predictor = engine.predictor.clone();
-            let shape = engine.shape;
+            let cache = engine.core.cache.clone();
+            let pool = engine.core.pool.clone();
+            let storage = engine.core.storage.clone();
+            let router = engine.core.router.clone();
+            let predictor = engine.core.predictor.clone();
+            let shape = engine.core.shape;
             let monitor = Arc::new(LocalityMonitor::new(num_experts, /*window=*/ 16));
             // Threshold of 0.05 ⇒ any id observed at least once in
             // the 16-slot window is "hot" — easy to trip.
@@ -2046,7 +2113,7 @@ mod tests {
         for t in 0..32u64 {
             let _ = engine.generate(t).await;
         }
-        let pinned = engine.cache.pinned_count();
+        let pinned = engine.core.cache.pinned_count();
         assert!(
             pinned > 0,
             "locality monitor should have pinned at least one hot expert; got {pinned}"
@@ -2081,12 +2148,12 @@ mod tests {
             0x5EEEEDED,
         );
         let engine = {
-            let cache = engine.cache.clone();
-            let pool = engine.pool.clone();
-            let storage = engine.storage.clone();
-            let router = engine.router.clone();
-            let predictor = engine.predictor.clone();
-            let shape = engine.shape;
+            let cache = engine.core.cache.clone();
+            let pool = engine.core.pool.clone();
+            let storage = engine.core.storage.clone();
+            let router = engine.core.router.clone();
+            let predictor = engine.core.predictor.clone();
+            let shape = engine.core.shape;
             let spec = Arc::new(NeuralSpeculator::new(d_model, 32, num_experts, 0xABCD));
             Arc::new(
                 Engine::new(cache, pool, storage, router, predictor, shape)
