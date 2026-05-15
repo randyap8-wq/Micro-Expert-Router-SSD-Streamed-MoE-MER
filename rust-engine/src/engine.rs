@@ -206,17 +206,23 @@ impl AlignedKvCache {
         let row_bytes = self.kv_dim * std::mem::size_of::<f32>();
         let start = pos * row_bytes;
         let end = start + row_bytes;
+        debug_assert_eq!(k.len(), self.kv_dim);
+        debug_assert_eq!(v.len(), self.kv_dim);
         // SAFETY: writing bytes — the underlying AlignedBuffer is
         // initialised and we slice within bounds (pos < window_tokens
         // is guaranteed by append's eviction logic).
         let kb = &mut self.keys.as_mut_slice()[start..end];
         let vb = &mut self.values.as_mut_slice()[start..end];
-        for (i, x) in k.iter().enumerate() {
-            kb[i * 4..(i + 1) * 4].copy_from_slice(&x.to_le_bytes());
-        }
-        for (i, x) in v.iter().enumerate() {
-            vb[i * 4..(i + 1) * 4].copy_from_slice(&x.to_le_bytes());
-        }
+        // SAFETY: this crate only supports little-endian targets, so the
+        // in-memory representation of `[f32]` already matches the desired
+        // serialized layout. `[f32]` is contiguous, and the produced byte
+        // slices cover exactly `row_bytes`.
+        let k_bytes =
+            unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, row_bytes) };
+        let v_bytes =
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, row_bytes) };
+        kb.copy_from_slice(k_bytes);
+        vb.copy_from_slice(v_bytes);
     }
 
     fn row_floats<'a>(&'a self, buf: &'a [u8], pos: usize) -> &'a [f32] {
