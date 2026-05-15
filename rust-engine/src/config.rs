@@ -312,7 +312,29 @@ pub struct RealTransformerConfig {
     /// attention (backward compatible). Mixtral uses `4096`.
     #[serde(default)]
     pub window_size: usize,
+
+    /// **Pool back-pressure: "high" threshold** (gist Part 1, fix #4).
+    /// Fraction of [`block_pool::BlockPool`] primary capacity at or
+    /// above which the scheduler classifies the pool as
+    /// [`block_pool::PressureLevel::High`] and runs preemptive
+    /// `evict_idle_blocks`. Defaults to
+    /// [`block_pool::SOFT_CAP_RATIO`] (0.90) when omitted.
+    #[serde(default = "default_pressure_high_threshold")]
+    pub pressure_high_threshold: f32,
+
+    /// **Pool back-pressure: "critical" threshold** (gist Part 1, fix #4).
+    /// Fraction of [`block_pool::BlockPool`] primary capacity at or
+    /// above which the scheduler classifies the pool as
+    /// [`block_pool::PressureLevel::Critical`] and clamps the
+    /// speculation depth to 0. Must be >= `pressure_high_threshold`.
+    /// Defaults to [`block_pool::CRITICAL_PRESSURE_RATIO`] (0.98)
+    /// when omitted.
+    #[serde(default = "default_pressure_critical_threshold")]
+    pub pressure_critical_threshold: f32,
 }
+
+fn default_pressure_high_threshold() -> f32 { crate::block_pool::SOFT_CAP_RATIO }
+fn default_pressure_critical_threshold() -> f32 { crate::block_pool::CRITICAL_PRESSURE_RATIO }
 
 fn default_vocab_size() -> usize { 256 }
 fn default_num_heads() -> usize { 8 }
@@ -491,6 +513,14 @@ impl Config {
                     "real_transformer.max_batch_size must be > 0".into(),
                 ));
             }
+            // Validate the configurable pool back-pressure ladder
+            // (gist Part 1, fix #4). Defaults to the legacy
+            // 90%/98% constants when the operator omits them.
+            crate::block_pool::PressureThresholds::try_new(
+                rt.pressure_high_threshold,
+                rt.pressure_critical_threshold,
+            )
+            .map_err(|e| ConfigError::Invalid(format!("real_transformer.{e}")))?;
         }
         // [predictive] section.
         let p = &self.predictive;

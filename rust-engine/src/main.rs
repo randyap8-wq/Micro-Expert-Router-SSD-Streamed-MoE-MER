@@ -725,6 +725,14 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             idle_eviction_threshold:
                 std::time::Duration::from_millis(rt.idle_eviction_threshold_ms),
             speculation_base_depth: rt.speculation_base_depth,
+            // Pool back-pressure ladder is now config-driven
+            // (gist Part 1, fix #4). Validation in `Config::validate`
+            // already enforces 0 < high <= critical <= 1.
+            pressure_thresholds: crate::block_pool::PressureThresholds::try_new(
+                rt.pressure_high_threshold,
+                rt.pressure_critical_threshold,
+            )
+            .expect("pressure thresholds validated by Config::validate"),
             ..Default::default()
         };
         let scheduler = crate::batch_scheduler::BatchScheduler::spawn(

@@ -180,6 +180,62 @@ pub struct BlockPool {
     /// **in-use** count is `overflow_capacity - overflow_free.len()`,
     /// exposed via [`Self::overflow_in_use`].
     overflow_capacity: Mutex<usize>,
+    /// Per-pool pressure thresholds (gist Part 1, fix #4). Wraps the
+    /// legacy [`SOFT_CAP_RATIO`] / [`CRITICAL_PRESSURE_RATIO`]
+    /// constants so deployments can override them from the
+    /// `[real_transformer]` block in `config.toml` without recompiling.
+    thresholds: PressureThresholds,
+}
+
+/// Per-pool back-pressure thresholds, surfaced from the config file
+/// (gist Part 1, fix #4). The constants [`SOFT_CAP_RATIO`] and
+/// [`CRITICAL_PRESSURE_RATIO`] are the **defaults** — production
+/// deployments override them via the
+/// `[real_transformer].pressure_high_threshold` /
+/// `[real_transformer].pressure_critical_threshold` keys so the
+/// ladder can be tuned per fleet without rebuilding the binary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PressureThresholds {
+    /// Utilisation at or above which the pool is classified
+    /// [`PressureLevel::High`]. Triggers preemptive
+    /// `evict_idle_blocks` in the batch scheduler.
+    pub high: f32,
+    /// Utilisation at or above which the pool is classified
+    /// [`PressureLevel::Critical`]. Causes the scheduler to suspend
+    /// speculation (depth → 0) until pressure drops back below
+    /// `high`.
+    pub critical: f32,
+}
+
+impl Default for PressureThresholds {
+    fn default() -> Self {
+        Self { high: SOFT_CAP_RATIO, critical: CRITICAL_PRESSURE_RATIO }
+    }
+}
+
+impl PressureThresholds {
+    /// Build a custom threshold pair and validate the ordering /
+    /// range. Both values must lie in `(0.0, 1.0]` and `high` must
+    /// be `<= critical`. Returns `Err` with a human-readable
+    /// diagnostic instead of panicking so the config layer can
+    /// surface a clean error message to the operator.
+    pub fn try_new(high: f32, critical: f32) -> Result<Self, String> {
+        if !(high > 0.0 && high <= 1.0) {
+            return Err(format!("pressure_high_threshold must be in (0.0, 1.0]; got {high}"));
+        }
+        if !(critical > 0.0 && critical <= 1.0) {
+            return Err(format!(
+                "pressure_critical_threshold must be in (0.0, 1.0]; got {critical}"
+            ));
+        }
+        if high > critical {
+            return Err(format!(
+                "pressure_high_threshold ({high}) must not exceed \
+                 pressure_critical_threshold ({critical})"
+            ));
+        }
+        Ok(Self { high, critical })
+    }
 }
 
 impl std::fmt::Debug for BlockPool {
@@ -203,6 +259,17 @@ impl BlockPool {
     /// grows them. The overflow slab starts empty and is only
     /// materialised on demand.
     pub fn new(kv_dim: usize, capacity: usize) -> Arc<Self> {
+        Self::with_thresholds(kv_dim, capacity, PressureThresholds::default())
+    }
+
+    /// Build a pool whose back-pressure ladder uses the supplied
+    /// [`PressureThresholds`] instead of the legacy [`SOFT_CAP_RATIO`]
+    /// / [`CRITICAL_PRESSURE_RATIO`] defaults (gist Part 1, fix #4).
+    pub fn with_thresholds(
+        kv_dim: usize,
+        capacity: usize,
+        thresholds: PressureThresholds,
+    ) -> Arc<Self> {
         assert!(kv_dim > 0, "BlockPool kv_dim must be > 0");
         let block_floats = POOL_BLOCK_TOKENS * kv_dim;
         let total = block_floats.checked_mul(capacity).expect("BlockPool capacity overflows usize");
@@ -228,6 +295,7 @@ impl BlockPool {
             overflow_values: Mutex::new(Vec::new()),
             overflow_free: Mutex::new(Vec::new()),
             overflow_capacity: Mutex::new(0),
+            thresholds,
         })
     }
 
@@ -337,24 +405,34 @@ impl BlockPool {
 
     /// Classify the pool's current memory pressure. Drives the
     /// scheduler's back-pressure ladder; see [`PressureLevel`].
+    ///
+    /// The crossover ratios are taken from the per-pool
+    /// [`PressureThresholds`] configured at construction time (gist
+    /// Part 1, fix #4) — operators tune them via the
+    /// `[real_transformer]` block in `config.toml` without recompiling.
     pub fn pressure_level(&self) -> PressureLevel {
         let u = self.utilization();
-        if u >= CRITICAL_PRESSURE_RATIO {
+        if u >= self.thresholds.critical {
             PressureLevel::Critical
-        } else if u >= SOFT_CAP_RATIO {
+        } else if u >= self.thresholds.high {
             PressureLevel::High
         } else {
             PressureLevel::Normal
         }
     }
 
-    /// Whether the pool's primary slab has crossed [`SOFT_CAP_RATIO`].
-    /// The scheduler polls this on every batch and, when true, runs
-    /// `evict_idle_blocks` to reclaim KV blocks from sessions that
-    /// haven't generated a token in `idle_threshold` seconds (default
-    /// 5 s).
+    /// Whether the pool's primary slab has crossed
+    /// `PressureThresholds::high`. The scheduler polls this on every
+    /// batch and, when true, runs `evict_idle_blocks` to reclaim KV
+    /// blocks from sessions that haven't generated a token in
+    /// `idle_threshold` seconds (default 5 s).
     pub fn above_soft_cap(&self) -> bool {
-        self.utilization() >= SOFT_CAP_RATIO
+        self.utilization() >= self.thresholds.high
+    }
+
+    /// Currently configured back-pressure thresholds.
+    pub fn thresholds(&self) -> PressureThresholds {
+        self.thresholds
     }
 
     /// Total physical capacity of the **primary** slab, in blocks
