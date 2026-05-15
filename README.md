@@ -93,6 +93,32 @@ prior); see `PredictiveLoader::predict_unified` in `router.rs` for
 the canonical constants. Prefetches use `try_acquire` only and
 **never evict a resident slot**, speculation can't starve real work.
 
+On top of the unified S ∪ L ∪ M ranking, the predictor also exposes
+**`predict_unified_with_spatial(…)`** which folds two more arms in:
+
+* **Expert-affinity matrix (`router::ExpertAffinity`).** A pre-allocated
+  `N×N` `AtomicU32` co-occurrence heat-map of which experts fire
+  together inside the same MoE layer. Hot-path updates are lock-free
+  saturating atomic increments implemented with a compare-exchange
+  retry loop — no allocation, no `RwLock`. When a seed expert
+  scores ≥ `SPATIAL_CONFIDENCE_THRESHOLD` (0.80) in the unified
+  ranking, its top-K co-fired neighbours from the matrix are added
+  to the prefetch set at a small (+0.10) weight.
+* **Spatial prefetching (`router::spatial_neighbors`).** For the
+  same high-confidence seeds, the immediate UTH-layout neighbours
+  (`id ± 1`, clipped to `[0, num_experts)`) are also enqueued at a
+  small (+0.05) weight. Pulling them from the SSD piggy-backs on the
+  drive's sequential-read locality.
+
+Latency-aware speculation depth is controlled by
+**`router::SpeculationController`** — a lock-free atomic state machine
+that the [batch scheduler](#real-transformer-batch-scheduling) feeds
+with the engine's cumulative `ssd_stall_us` telemetry on every batch.
+The window starts at `[real_transformer] speculation_base_depth`
+tokens-ahead and grows by up to `MAX_LATENCY_BUMP` (= 2) when stall
+is rising; under critical block-pool pressure it is clamped to zero
+so prefetching cannot make a saturated pool worse.
+
 The **router** itself is either the legacy `TopKRouter`
 (deterministic Markov chain over expert ids, clustered locality by
 default, or load a precomputed `N×N` transition matrix via
@@ -199,10 +225,10 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s, optionally split into **primary** + **shadow** halves sharing one `Notify`. Hands out `PooledBuffer` RAII guards; `try_acquire`/`try_acquire_shadow` route to the corresponding free list; dropping a guard returns the buffer to its originating list and wakes waiters. `promote_shadow` does the zero-copy slot-tag swap when a speculative prefetch is confirmed. The literal "pre-allocated RAM buffer" the spec asks for. |
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. |
-| `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. |
+| `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. Exposes `utilization()` and a three-level `PressureLevel { Normal, High, Critical }` (soft-cap at 90 % primary utilisation, critical at 98 %) that the [batch scheduler](#real-transformer-batch-scheduling) reads every batch to drive **preemptive idle-block eviction** and **speculation-depth clamping**. |
 | `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`) routed through the **fault-tolerant `read_at_with_retries` path**: three-tier exponential backoff on transient errors (EIO / EINTR / `WouldBlock` / `TimedOut` / `EAGAIN`; short reads / `UnexpectedEof` fail fast) plus a per-expert **circuit breaker** that trips after `STORAGE_BREAKER_THRESHOLD = 3` consecutive failures and short-circuits to a structured `HardwareFailure::ExpertUnavailable`. A **per-drive** breaker (`STORAGE_DRIVE_BREAKER_THRESHOLD = 3`, sticky `DriveBreakerState`) sums failures across all experts sharded onto the same shard and short-circuits to `HardwareFailure::DriveUnavailable` so the engine stops routing to a known-bad drive without ever issuing the syscall — gist Phase 3. Both breakers transition to **half-open** after `STORAGE_BREAKER_PROBE_INTERVAL = 500 ms`, admitting exactly one probe read per interval via a `compare_exchange` on `tripped_at_ms` so a recovered drive can actually reach the `note_read_success` path and clear the breaker. Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
 | `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point (`read_experts_batch_fixed`). Also exposes `read_experts_batch_fixed_promote`, the **zero-latency speculative → resident** path: one `submit_and_wait(K)` against shadow `PooledBuffer`s, then a `BufferPool::promote_shadow` per CQE so the bytes that just arrived become resident without a re-read. Built behind the `io_uring` cargo feature. |
-| `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API), `LocalityMonitor` (sliding-window heat map, the **L** arm), and `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm). |
+| `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API and the extended `predict_unified_with_spatial(…)` that folds in **expert-affinity** + **UTH-spatial** neighbours when a seed scores ≥ 0.80), `LocalityMonitor` (sliding-window heat map, the **L** arm), `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm), `ExpertAffinity` (lock-free `N×N` `AtomicU32` co-occurrence matrix tracking which experts fire together in the same MoE layer), and `SpeculationController` (latency-aware speculation window — grows under rising `ssd_stall_us`, clamps to 0 under critical pool pressure). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
 | `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q8_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For the GGUF block-quantised dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm` / `run_inference_q8_0_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels — no F32 dequantise of the weights. The legacy `run_inference_q4_0` / `run_inference_q4k` / `run_inference_q8_0` dequant kernels are kept as a graceful fallback when `cols % block_size != 0`. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
 | `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch. `matmul_row_major` auto-escalates: scalar → runtime row-parallel (always compiled) → `matrixmultiply` SGEMV under `--features blas`. |
@@ -211,7 +237,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
 | `tokenizer` | HuggingFace `tokenizers` crate when the `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured; deterministic byte-level fallback otherwise. |
 | `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. |
-| `batch_scheduler` | **Continuous batching.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. Each batched step starts with a **peek/warm pre-pass** that calls `RealModel::peek_experts` for every request, unions the predicted expert ids, and fires one `engine.warm_with(&ids)` so the NVMe sees one read per unique expert across the entire batch (gist Phase 1). |
+| `batch_scheduler` | **Continuous batching + multi-tenant fair-share.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. Each batched step starts with a **peek/warm pre-pass** that calls `RealModel::peek_experts` for every request, unions the predicted expert ids, and fires one `engine.warm_with(&ids)` so the NVMe sees one read per unique expert across the entire batch (gist Phase 1). Registered sessions carry a **`SessionClass`** (`Interactive` weight 4, `Audit` weight 1) consumed by the **Weighted Round-Robin admission policy** so an Audit flood cannot starve Interactive callers, plus a monotonic `last_activity_us` timestamp used by **`evict_idle_blocks`** to reclaim KV blocks from sessions idle ≥ `idle_eviction_threshold` (default 5 s) when the pool crosses its soft-cap. Under `PressureLevel::Critical` the scheduler suspends the shared `SpeculationController` so prefetch depth is clamped to zero. |
 | `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. Also home to [`AlignedKvCache`](#persistent-page-aligned-kv-cache) — a session-scoped, page-aligned, rolling-window K/V buffer attached via `Engine::with_kv_cache`. |
 | `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`, `Q8_0`. Two readers ship side-by-side: `GgufFile::open` (eager — slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming — keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
 | `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q8_0` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files for the 4-bit dtypes, ~4× smaller for `Q8_0`; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
@@ -668,12 +694,43 @@ arrives within `batch_timeout_ms`) into a single batch and runs
 them concurrently against the shared `Engine`. Per-request KV
 caches travel through the channel + a `oneshot` reply, so attention
 state stays strictly per-request while expert streaming and decoder
-compute overlap. The two knobs live under `[real_transformer]`:
+compute overlap. The knobs live under `[real_transformer]`:
 
 ```toml
-max_batch_size  = 8   # max concurrent requests fused per step (1 disables batching)
-batch_timeout_ms = 5  # how long to wait for more requests to join a partial batch
+max_batch_size            = 8     # max concurrent requests fused per step (1 disables batching)
+batch_timeout_ms          = 5     # how long to wait for more requests to join a partial batch
+idle_eviction_threshold_ms = 5000 # idle-cutoff for evict_idle_blocks under pool pressure (default 5 s)
+speculation_base_depth     = 1    # baseline prefetch depth in tokens-ahead (grows to base+2 under SSD stall)
 ```
+
+##### Multi-tenant fair-share (gist Part 1)
+
+Every registered session carries a **`SessionClass`** — `Interactive`
+(weight 4, default) or `Audit` (weight 1) — that the scheduler's
+**Weighted Round-Robin** batch builder consumes when interleaving
+drained `StepRequest`s. The end result is that a fully-mixed pool of
+one Interactive + N Audit sessions still leaves Interactive with
+~4 / (4+N) of every batch slot, so head-of-line latency stays bounded
+regardless of how many Audit streams are running.
+
+The scheduler additionally tracks each session's monotonic
+`last_activity_us` and runs **`evict_idle_blocks(idle_threshold)`**
+whenever the `BlockPool` crosses its soft-cap (90 % primary
+utilisation). Sessions idle for ≥ `idle_eviction_threshold_ms` have
+their attached `BlockManager` dropped, returning every block to the
+free list. Audit-class sessions are evicted first so latency-sensitive
+chat sessions retain their KV memory under pressure.
+
+Under `BlockPool::PressureLevel::Critical` (≥ 98 % primary
+utilisation) the scheduler **suspends the shared
+`SpeculationController`**, clamping `current_speculation_depth()` to
+0. When the pool reverts to `Normal`/`High` the controller resumes,
+and the per-batch `update_from_stall(cumulative_ssd_stall_us)` call
+grows the window up to `speculation_base_depth + MAX_LATENCY_BUMP`
+(= base + 2) when SSD stall is rising. The benchmark in
+[`rust-engine/tests/concurrency_stress.rs`](./rust-engine/tests/concurrency_stress.rs)
+exercises this fair-share + pressure ladder end-to-end with four
+concurrent audit streams and asserts every stream sustains ≥ 8 TPS.
 
 #### Predictive architecture (`[predictive]`)
 
@@ -759,6 +816,8 @@ window_size = 0           # 0 = full causal; Mixtral uses 4096 (sliding-window a
 seed = 0xC0FFEE
 max_batch_size = 8        # continuous batching (see below)
 batch_timeout_ms = 5
+idle_eviction_threshold_ms = 5000   # reclaim idle KV blocks under pool pressure
+speculation_base_depth = 1          # baseline prefetch tokens-ahead
 ```
 
 ##### Paged KV cache (block pool)

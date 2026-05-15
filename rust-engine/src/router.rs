@@ -29,7 +29,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -604,9 +604,107 @@ impl PredictiveLoader {
         out
     }
 
-    /// Sample the next predicted experts from the Markov-chain row's
-    /// distribution (rather than a deterministic argmax). Useful when
-    /// you want exploration in the prefetch policy.
+    /// Extended unified prediction with **spatial prefetching** and
+    /// **expert-affinity** contributions on top of the existing
+    /// Markov / locality / speculator arms.
+    ///
+    /// * `affinity` — optional [`ExpertAffinity`] co-occurrence matrix.
+    ///   For each expert already in the candidate set with
+    ///   `score >= SPATIAL_CONFIDENCE_THRESHOLD`, the top-K affinity
+    ///   neighbours are folded in with a flat weight so experts that
+    ///   habitually fire together in the same layer get prefetched
+    ///   alongside the seed.
+    /// * Spatial prefetching: for the same high-confidence seeds, the
+    ///   immediate UTH neighbours (`id ± 1`, clipped to
+    ///   `[0, num_experts)`) are also enqueued. Pulling them from the
+    ///   SSD piggy-backs on the drive's sequential-read locality, so
+    ///   their cost is close to free.
+    ///
+    /// Returns the same `Vec<(expert_id, score)>` shape as
+    /// [`Self::predict_unified`] with scores still bounded in
+    /// `[0, ~1.2]` (the spatial / affinity weights add a small tail
+    /// that nudges co-fired neighbours into the fanout without
+    /// overwhelming the headline arms). Sorted by descending score.
+    pub fn predict_unified_with_spatial(
+        &self,
+        prev_prev: Option<u32>,
+        prev: u32,
+        monitor: Option<&LocalityMonitor>,
+        threshold_pct: f32,
+        speculator: Option<&NeuralSpeculator>,
+        hidden: &[f32],
+        speculator_k: usize,
+        affinity: Option<&ExpertAffinity>,
+        affinity_k: usize,
+    ) -> Vec<(u32, f32)> {
+        // Weights for the auxiliary spatial / affinity arms. Both are
+        // small relative to the headline Markov / locality /
+        // speculator weights because they're *neighbour* signals: we
+        // want them in the prefetch set when the seed is already
+        // confident, not driving the fanout on their own.
+        const W_AFFINITY: f32 = 0.10;
+        const W_SPATIAL: f32 = 0.05;
+
+        let base = self.predict_unified(
+            prev_prev,
+            prev,
+            monitor,
+            threshold_pct,
+            speculator,
+            hidden,
+            speculator_k,
+        );
+        // Identify high-confidence seeds (scores >= the spatial
+        // threshold). Cloned into a Vec so we can mutate the combined
+        // map without invalidating the iterator.
+        let seeds: Vec<u32> = base
+            .iter()
+            .filter(|(_, s)| *s >= SPATIAL_CONFIDENCE_THRESHOLD)
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut combined: HashMap<u32, f32> = base.into_iter().collect();
+
+        // Spatial neighbour contribution.
+        if !seeds.is_empty() {
+            let n = self.num_experts;
+            for &seed in &seeds {
+                for nbr in spatial_neighbors(seed, n, 2) {
+                    *combined.entry(nbr).or_insert(0.0) += W_SPATIAL;
+                }
+            }
+        }
+
+        // Affinity-matrix contribution. Same seeds, but pulling from
+        // observed co-occurrence rather than UTH adjacency.
+        if let Some(aff) = affinity {
+            if affinity_k > 0 {
+                let n = self.num_experts;
+                for &seed in &seeds {
+                    for nbr in aff.neighbors(seed, affinity_k) {
+                        if nbr < n {
+                            *combined.entry(nbr).or_insert(0.0) += W_AFFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(u32, f32)> = combined
+            .into_iter()
+            .filter(|&(_, p)| p > 0.0)
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if self.fanout > 0 {
+            out.truncate(self.fanout);
+        }
+        out
+    }
+
     #[allow(dead_code)]
     pub fn sample_next(&self, from: u32) -> Vec<u32> {
         if from >= self.num_experts || self.fanout == 0 {
@@ -1451,6 +1549,354 @@ fn speculator_training_loop(
     }
 }
 
+// =====================================================================
+// Advanced predictive prefetching primitives (gist Part 2).
+//
+// * `ExpertAffinity` — co-occurrence heat-map tracking which expert
+//   ids fire together inside the same MoE layer (orthogonal to the
+//   *sequential* Markov chain modelled by `PredictiveLoader`).
+// * `spatial_neighbors` — UTH-layout neighbour lookup used by spatial
+//   prefetching when the predictor is highly confident in a hit.
+// * `SpeculationController` — latency-aware speculation window
+//   controller that bumps the prefetch depth when `ssd_stall_us`
+//   telemetry rises and clamps it under critical memory pressure.
+// =====================================================================
+
+/// Confidence threshold (a score in `[0, 1]`) above which the
+/// predictor should also issue a spatial prefetch for an expert's
+/// immediate UTH neighbours. 0.80 matches the gist's example.
+pub const SPATIAL_CONFIDENCE_THRESHOLD: f32 = 0.80;
+
+/// Default cap on the speculation window after a latency bump. The
+/// controller never grows the window beyond `base_depth +
+/// MAX_LATENCY_BUMP` tokens, even under sustained SSD stall.
+pub const MAX_LATENCY_BUMP: usize = 2;
+
+/// Lock-free co-occurrence matrix tracking which expert ids fire
+/// together inside the same MoE layer. The hot path (`observe_layer`)
+/// only performs atomic updates on pre-allocated `AtomicU32` cells;
+/// saturating increments may use a compare-exchange retry loop, but
+/// the path never grabs a lock and never allocates.
+///
+/// The matrix is **symmetric**: `affinity(i, j) == affinity(j, i)`,
+/// because co-occurrence is undirected (two experts active in the
+/// same layer-step are equally "neighbours" of each other regardless
+/// of which one the gate scored higher). We store the full N×N table
+/// (rather than a triangular half) so `neighbors(id, k)` can walk a
+/// contiguous row, which is cache-friendly and avoids per-call index
+/// arithmetic.
+///
+/// Sizing: at N=64 experts the matrix is 64×64×4 B = 16 KiB; at
+/// N=4096 it is 64 MiB. The pre-allocation cost is identical to a
+/// `Vec<AtomicU32>` of the same size; with `bitvec` we could halve
+/// the per-pair byte count by capping at 65k observations and packing
+/// counters at 16 bits, but real Mixtral traces don't approach that
+/// ceiling within a single conversation and the simpler u32 layout
+/// stays clearly correct under any saturating-add semantics.
+pub struct ExpertAffinity {
+    num_experts: u32,
+    /// Flat N×N matrix of u32 counters, indexed as `[i * n + j]`.
+    /// Allocated once at construction; never resized. Diagonal cells
+    /// (`[i*n + i]`) are kept at zero — self-affinity is meaningless.
+    counts: Box<[AtomicU32]>,
+    /// Cumulative number of `observe_layer` calls. Used by
+    /// [`Self::total_observations`] for diagnostics and to size the
+    /// expected per-pair denominator.
+    observations: AtomicU64,
+}
+
+impl ExpertAffinity {
+    /// Pre-allocate the N×N counter matrix. `num_experts` must be
+    /// non-zero. Construction touches every cell once, which is the
+    /// only allocation this type ever performs.
+    pub fn new(num_experts: u32) -> Self {
+        assert!(num_experts > 0, "ExpertAffinity num_experts must be > 0");
+        let n = num_experts as usize;
+        // `Vec::from_iter` + `into_boxed_slice` so the buffer lives in
+        // a single contiguous allocation that never grows.
+        let counts: Vec<AtomicU32> = (0..n * n).map(|_| AtomicU32::new(0)).collect();
+        Self {
+            num_experts,
+            counts: counts.into_boxed_slice(),
+            observations: AtomicU64::new(0),
+        }
+    }
+
+    /// Number of experts the matrix was sized for.
+    pub fn num_experts(&self) -> u32 {
+        self.num_experts
+    }
+
+    /// Total `observe_layer` calls recorded since construction.
+    pub fn total_observations(&self) -> u64 {
+        self.observations.load(Ordering::Relaxed)
+    }
+
+    /// Record that every pair `(i, j)` in `experts` was activated
+    /// together by the same MoE layer for the same token. Hot-path
+    /// safe: each pair becomes two saturating `fetch_add(1)` calls
+    /// (one per ordering) — no allocations, no locks.
+    pub fn observe_layer(&self, experts: &[u32]) {
+        if experts.len() < 2 {
+            return;
+        }
+        let n = self.num_experts as usize;
+        for (idx, &a) in experts.iter().enumerate() {
+            if (a as usize) >= n {
+                continue;
+            }
+            for &b in &experts[idx + 1..] {
+                if (b as usize) >= n || a == b {
+                    continue;
+                }
+                let ab = (a as usize) * n + b as usize;
+                let ba = (b as usize) * n + a as usize;
+                // Saturating add — pin at u32::MAX so a long-running
+                // session can't wrap the counter back to zero.
+                Self::sat_add(&self.counts[ab]);
+                Self::sat_add(&self.counts[ba]);
+            }
+        }
+        self.observations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn sat_add(cell: &AtomicU32) {
+        // CAS loop saturating at u32::MAX. Almost always succeeds on
+        // first try; the loop only runs under contention.
+        let mut cur = cell.load(Ordering::Relaxed);
+        loop {
+            if cur == u32::MAX {
+                return;
+            }
+            match cell.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Co-occurrence count of `(a, b)`. Returns `0` for out-of-range
+    /// ids or for `a == b` (diagonal is always zero).
+    pub fn affinity(&self, a: u32, b: u32) -> u32 {
+        if a == b {
+            return 0;
+        }
+        let n = self.num_experts as usize;
+        if (a as usize) >= n || (b as usize) >= n {
+            return 0;
+        }
+        self.counts[(a as usize) * n + b as usize].load(Ordering::Relaxed)
+    }
+
+    /// Top-`k` experts most frequently co-fired with `id`, in
+    /// descending affinity order (ties broken by ascending id for
+    /// determinism). Zero-count neighbours are filtered out. Allocates
+    /// a single `Vec<(u32, u32)>` for the sort; the matrix itself is
+    /// untouched.
+    pub fn neighbors(&self, id: u32, k: usize) -> Vec<u32> {
+        let n = self.num_experts as usize;
+        if (id as usize) >= n || k == 0 {
+            return Vec::new();
+        }
+        let row_start = (id as usize) * n;
+        let mut scored: Vec<(u32, u32)> = (0..n)
+            .filter_map(|j| {
+                if j == id as usize {
+                    return None;
+                }
+                let c = self.counts[row_start + j].load(Ordering::Relaxed);
+                if c == 0 {
+                    None
+                } else {
+                    Some((j as u32, c))
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(k);
+        scored.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Reset the matrix to its empty state. Used by tests and by the
+    /// scheduler when a session ends and the prior co-occurrence
+    /// distribution is no longer representative.
+    #[allow(dead_code)]
+    pub fn clear(&self) {
+        for cell in self.counts.iter() {
+            cell.store(0, Ordering::Relaxed);
+        }
+        self.observations.store(0, Ordering::Relaxed);
+    }
+}
+
+/// UTH-layout spatial neighbours of `id` — the experts whose tensor
+/// records sit immediately adjacent to `id` on disk. Returns up to
+/// `k` ids, prioritising `id-1` then `id+1` then expanding outwards.
+/// Clipped to `[0, num_experts)`. Used by spatial prefetching to
+/// piggy-back on the NVMe drive's sequential-read efficiency: pulling
+/// expert N also brings N±1 along for almost free.
+pub fn spatial_neighbors(id: u32, num_experts: u32, k: usize) -> Vec<u32> {
+    if k == 0 || num_experts == 0 || id >= num_experts {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(k);
+    let mut left = (id as i64) - 1;
+    let mut right = (id as i64) + 1;
+    while out.len() < k && (left >= 0 || right < num_experts as i64) {
+        if left >= 0 {
+            out.push(left as u32);
+            left -= 1;
+            if out.len() >= k {
+                break;
+            }
+        }
+        if right < num_experts as i64 {
+            out.push(right as u32);
+            right += 1;
+        }
+    }
+    out
+}
+
+/// Latency-aware speculation window controller.
+///
+/// Reads cumulative `ssd_stall_us` telemetry on each token and adjusts
+/// the speculation depth (how many tokens ahead the predictor
+/// pre-fetches experts for) to hide rising disk wait times. The
+/// controller is **lock-free** — all state is in atomics so the
+/// inference thread can call [`Self::update_from_stall`] and
+/// [`Self::current_depth`] on the hot path without contention.
+///
+/// Policy:
+/// * If `Δssd_stall_us` since the previous call exceeds
+///   [`Self::STALL_RISING_THRESHOLD_US`], grow the window by one
+///   token (clipped to `base_depth + MAX_LATENCY_BUMP`).
+/// * If `Δssd_stall_us` is below half that threshold for two
+///   consecutive updates, shrink the window by one (clipped to
+///   `base_depth`).
+/// * [`Self::suspend`] forces depth to zero (called by the scheduler
+///   under [`crate::block_pool::PressureLevel::Critical`]);
+///   [`Self::resume`] restores the most recent computed depth.
+pub struct SpeculationController {
+    base_depth: usize,
+    /// Currently active window, in tokens. `0` while suspended.
+    current_depth: AtomicUsize,
+    /// Snapshot of `current_depth` taken at the moment of suspension
+    /// so [`Self::resume`] can restore the same value. Sentinel
+    /// `usize::MAX` means "not currently suspended".
+    saved_depth: AtomicUsize,
+    /// Last cumulative `ssd_stall_us` observed via
+    /// [`Self::update_from_stall`].
+    last_stall_us: AtomicU64,
+    /// Consecutive update calls with `Δstall` below the calm
+    /// threshold. Counted so a single quiet sample doesn't
+    /// immediately back off after a sustained stall burst.
+    calm_streak: AtomicU64,
+}
+
+impl SpeculationController {
+    /// Minimum Δstall (microseconds) between two consecutive
+    /// `update_from_stall` calls that counts as "I/O latency is
+    /// rising". 1 ms is roughly one NVMe round-trip on a healthy
+    /// drive — anything noticeably larger is interpreted as the SSD
+    /// queue building up.
+    pub const STALL_RISING_THRESHOLD_US: u64 = 1_000;
+
+    /// Build a controller with the given baseline depth. The active
+    /// window starts at `base_depth` and ranges over `[base_depth,
+    /// base_depth + MAX_LATENCY_BUMP]` during normal operation; under
+    /// suspension it temporarily reads `0`.
+    pub fn new(base_depth: usize) -> Self {
+        Self {
+            base_depth,
+            current_depth: AtomicUsize::new(base_depth),
+            saved_depth: AtomicUsize::new(usize::MAX),
+            last_stall_us: AtomicU64::new(0),
+            calm_streak: AtomicU64::new(0),
+        }
+    }
+
+    /// Baseline depth this controller was built with.
+    pub fn base_depth(&self) -> usize {
+        self.base_depth
+    }
+
+    /// Currently active speculation depth, in tokens. Returns `0`
+    /// while [`Self::suspend`] is in effect.
+    pub fn current_depth(&self) -> usize {
+        self.current_depth.load(Ordering::Relaxed)
+    }
+
+    /// Feed the engine's cumulative `ssd_stall_us` telemetry into the
+    /// controller. Computes the delta since the previous call and
+    /// adjusts the speculation window. Returns the new
+    /// [`Self::current_depth`].
+    ///
+    /// Safe to call on the per-token hot path: a single
+    /// `compare_exchange` plus two atomic loads / stores.
+    pub fn update_from_stall(&self, cumulative_stall_us: u64) -> usize {
+        // Don't fight a manual suspension from the scheduler. Keep
+        // the cumulative-stall baseline fresh behind the scenes so
+        // resume() does not immediately react to stall that accrued
+        // while speculation was intentionally disabled, but
+        // current_depth stays at zero until then.
+        if self.saved_depth.load(Ordering::Relaxed) != usize::MAX {
+            self.last_stall_us.store(cumulative_stall_us, Ordering::Relaxed);
+            return self.current_depth.load(Ordering::Relaxed);
+        }
+        let prev = self.last_stall_us.swap(cumulative_stall_us, Ordering::Relaxed);
+        let delta = cumulative_stall_us.saturating_sub(prev);
+        let mut depth = self.current_depth.load(Ordering::Relaxed);
+        let max_depth = self.base_depth + MAX_LATENCY_BUMP;
+        if delta >= Self::STALL_RISING_THRESHOLD_US {
+            // Stall rising → widen the window.
+            self.calm_streak.store(0, Ordering::Relaxed);
+            if depth < max_depth {
+                depth += 1;
+            }
+        } else if delta * 2 <= Self::STALL_RISING_THRESHOLD_US {
+            let streak = self.calm_streak.fetch_add(1, Ordering::Relaxed) + 1;
+            if streak >= 2 && depth > self.base_depth {
+                depth -= 1;
+                self.calm_streak.store(0, Ordering::Relaxed);
+            }
+        }
+        self.current_depth.store(depth, Ordering::Relaxed);
+        depth
+    }
+
+    /// Force the depth to zero. Called by the scheduler when
+    /// [`crate::block_pool::PressureLevel::Critical`] is reached.
+    /// Idempotent — calling twice is a no-op.
+    pub fn suspend(&self) {
+        let cur = self.current_depth.load(Ordering::Relaxed);
+        // Only stash the pre-suspend value the *first* time so a
+        // double-suspend doesn't overwrite the saved depth with 0.
+        let _ = self.saved_depth.compare_exchange(
+            usize::MAX,
+            cur,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.current_depth.store(0, Ordering::Relaxed);
+    }
+
+    /// Restore the depth that was active before the most recent
+    /// [`Self::suspend`]. No-op when not suspended.
+    pub fn resume(&self) {
+        let saved = self.saved_depth.swap(usize::MAX, Ordering::Relaxed);
+        if saved != usize::MAX {
+            self.current_depth.store(saved, Ordering::Relaxed);
+        }
+    }
+
+    /// `true` while [`Self::suspend`] is in effect.
+    pub fn is_suspended(&self) -> bool {
+        self.saved_depth.load(Ordering::Relaxed) != usize::MAX
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1884,5 +2330,148 @@ mod tests {
         let top = unified.first().expect("non-empty result");
         assert_eq!(top.0, 1);
         assert!(top.1 <= 1.0 + 1e-6, "top score {} exceeded 1.0", top.1);
+    }
+
+    // ------------ ExpertAffinity / spatial / speculation tests ------------
+
+    #[test]
+    fn expert_affinity_records_symmetric_co_occurrence() {
+        let aff = ExpertAffinity::new(8);
+        aff.observe_layer(&[1, 3, 5]);
+        // Every unordered pair (1,3),(1,5),(3,5) should be counted once
+        // in each direction (matrix is symmetric).
+        assert_eq!(aff.affinity(1, 3), 1);
+        assert_eq!(aff.affinity(3, 1), 1);
+        assert_eq!(aff.affinity(1, 5), 1);
+        assert_eq!(aff.affinity(5, 1), 1);
+        assert_eq!(aff.affinity(3, 5), 1);
+        // Diagonal stays zero.
+        assert_eq!(aff.affinity(1, 1), 0);
+        // Out-of-range ids return zero rather than panicking.
+        assert_eq!(aff.affinity(1, 99), 0);
+        // total_observations counts calls, not pairs.
+        assert_eq!(aff.total_observations(), 1);
+
+        // Repeated layer observation accumulates.
+        for _ in 0..4 {
+            aff.observe_layer(&[1, 3]);
+        }
+        assert_eq!(aff.affinity(1, 3), 5);
+        assert_eq!(aff.total_observations(), 5);
+    }
+
+    #[test]
+    fn expert_affinity_neighbors_ranked_by_count() {
+        let aff = ExpertAffinity::new(16);
+        // Co-fire 2 + {5, 7, 9} a lot, 2 + {1} once.
+        for _ in 0..10 { aff.observe_layer(&[2, 5]); }
+        for _ in 0..7  { aff.observe_layer(&[2, 7]); }
+        for _ in 0..3  { aff.observe_layer(&[2, 9]); }
+        aff.observe_layer(&[2, 1]);
+        let nbrs = aff.neighbors(2, 3);
+        assert_eq!(nbrs, vec![5, 7, 9]);
+        // k=0 → empty.
+        assert!(aff.neighbors(2, 0).is_empty());
+        // Out-of-range id → empty.
+        assert!(aff.neighbors(99, 4).is_empty());
+    }
+
+    #[test]
+    fn spatial_neighbors_clips_to_bounds() {
+        assert_eq!(spatial_neighbors(0, 8, 2), vec![1, 2]);
+        assert_eq!(spatial_neighbors(7, 8, 2), vec![6, 5]);
+        // Middle: returns id-1 then id+1.
+        let mid = spatial_neighbors(4, 8, 4);
+        assert_eq!(mid, vec![3, 5, 2, 6]);
+        // k=0 → empty.
+        assert!(spatial_neighbors(4, 8, 0).is_empty());
+        // Out-of-range id → empty.
+        assert!(spatial_neighbors(8, 8, 2).is_empty());
+    }
+
+    #[test]
+    fn speculation_controller_grows_under_rising_stall() {
+        let ctl = SpeculationController::new(2);
+        assert_eq!(ctl.current_depth(), 2);
+        // First call sets the baseline; no delta yet.
+        ctl.update_from_stall(0);
+        assert_eq!(ctl.current_depth(), 2);
+        // Big jump in cumulative stall → +1.
+        ctl.update_from_stall(5_000);
+        assert_eq!(ctl.current_depth(), 3);
+        // Another big jump → +1 (capped at base + MAX_LATENCY_BUMP = 4).
+        ctl.update_from_stall(15_000);
+        assert_eq!(ctl.current_depth(), 4);
+        // Saturates at the cap.
+        ctl.update_from_stall(99_000);
+        assert_eq!(ctl.current_depth(), 4);
+    }
+
+    #[test]
+    fn speculation_controller_backs_off_when_stall_calms() {
+        let ctl = SpeculationController::new(2);
+        ctl.update_from_stall(0);
+        ctl.update_from_stall(10_000); // depth 3
+        assert_eq!(ctl.current_depth(), 3);
+        // Two consecutive calm updates → -1.
+        ctl.update_from_stall(10_000); // delta 0
+        ctl.update_from_stall(10_000); // delta 0 — streak hits 2
+        assert_eq!(ctl.current_depth(), 2);
+        // Never goes below base.
+        ctl.update_from_stall(10_000);
+        ctl.update_from_stall(10_000);
+        assert_eq!(ctl.current_depth(), 2);
+    }
+
+    #[test]
+    fn speculation_controller_suspend_resume_zeroes_depth() {
+        let ctl = SpeculationController::new(3);
+        ctl.update_from_stall(0);
+        ctl.update_from_stall(5_000); // depth 4
+        ctl.suspend();
+        assert_eq!(ctl.current_depth(), 0);
+        assert!(ctl.is_suspended());
+        // Updates while suspended do not change the depth.
+        ctl.update_from_stall(50_000);
+        assert_eq!(ctl.current_depth(), 0);
+        ctl.resume();
+        assert!(!ctl.is_suspended());
+        // The depth at the moment of suspension is restored.
+        assert_eq!(ctl.current_depth(), 4);
+    }
+
+    #[test]
+    fn predict_unified_with_spatial_adds_neighbours() {
+        // Train the Markov chain so prev=0 → next=4 with near-certainty.
+        let p = PredictiveLoader::new(8, 8, 0.0, 1);
+        for _ in 0..200 { p.observe(0, 4); }
+        let monitor = LocalityMonitor::new(8, 16);
+        for _ in 0..16 { monitor.observe_one(4); }
+        let speculator = NeuralSpeculator::new(4, 8, 8, 7);
+        let hidden = vec![0.5f32, -0.2, 0.3, 0.1];
+        for _ in 0..400 { speculator.train_step(&hidden, &[4], 0.1); }
+        // Affinity: 4 strongly co-fires with 6.
+        let aff = ExpertAffinity::new(8);
+        for _ in 0..50 { aff.observe_layer(&[4, 6]); }
+
+        let with_spatial = p.predict_unified_with_spatial(
+            None,
+            0,
+            Some(&monitor),
+            0.10,
+            Some(&speculator),
+            &hidden,
+            1,
+            Some(&aff),
+            2,
+        );
+        // Seed (4) is high-confidence → spatial neighbours 3 and 5 +
+        // affinity neighbour 6 must appear in the candidate set.
+        let ids: Vec<u32> = with_spatial.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&4));
+        assert!(ids.contains(&3) || ids.contains(&5),
+            "expected at least one UTH neighbour of seed 4 in {ids:?}");
+        assert!(ids.contains(&6),
+            "expected affinity neighbour 6 in {ids:?}");
     }
 }

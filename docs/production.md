@@ -95,7 +95,10 @@ TOML file and validates it. The result is logged structurally:
 * **Live-applicable fields** (effective on next request): currently
   `sampling.*` and `server.max_tokens`.
 * **Restart-required fields** (logged with `WARN`): `storage.predict_fanout`,
-  `real_transformer.batch_timeout_ms`, `storage.predict_min_prob`,
+  `real_transformer.batch_timeout_ms`,
+  `real_transformer.idle_eviction_threshold_ms`,
+  `real_transformer.speculation_base_depth`,
+  `storage.predict_min_prob`,
   `storage.partial_load_fraction`. Changing these requires
   `systemctl restart micro-expert-router`.
 

@@ -289,6 +289,25 @@ pub struct RealTransformerConfig {
     #[serde(default = "default_batch_timeout_ms")]
     pub batch_timeout_ms: u64,
 
+    /// Multi-tenant fair-share: cutoff (in milliseconds) after which
+    /// a session's KV blocks become candidates for
+    /// `BatchScheduler::evict_idle_blocks` when the block pool is
+    /// above its 90 % soft-cap. Default: 5 000 ms (5 s), matching
+    /// the gist's multi-tenant hardening requirement. Set to a
+    /// larger value if your workload has natural mid-stream pauses
+    /// (e.g. tool calls) that should not trigger reclamation.
+    #[serde(default = "default_idle_eviction_threshold_ms")]
+    pub idle_eviction_threshold_ms: u64,
+
+    /// Baseline speculation depth (tokens-ahead) the scheduler's
+    /// `SpeculationController` starts from. Under rising
+    /// `ssd_stall_us` telemetry the controller grows the active
+    /// depth by up to `MAX_LATENCY_BUMP` (2) tokens; under
+    /// `BlockPool::PressureLevel::Critical` it clamps depth to 0.
+    /// Default: 1.
+    #[serde(default = "default_speculation_base_depth")]
+    pub speculation_base_depth: usize,
+
     /// Sliding-window attention span. `0` or omitted = full causal
     /// attention (backward compatible). Mixtral uses `4096`.
     #[serde(default)]
@@ -302,6 +321,8 @@ fn default_rms_eps() -> f32 { 1e-6 }
 fn default_seed() -> u64 { 0xC0FFEE }
 fn default_max_batch_size() -> usize { 8 }
 fn default_batch_timeout_ms() -> u64 { 5 }
+fn default_idle_eviction_threshold_ms() -> u64 { 5_000 }
+fn default_speculation_base_depth() -> usize { 1 }
 
 /// Configuration for the predictive architecture (`[predictive]` block).
 ///

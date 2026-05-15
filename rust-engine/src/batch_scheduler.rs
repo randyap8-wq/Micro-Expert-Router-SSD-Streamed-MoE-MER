@@ -51,14 +51,15 @@
 //! `Arc`s, so multiple `moe_step` calls from sibling tasks are safe;
 //! see [`crate::engine`] for details.
 
-use crate::block_pool::{BlockManager, BlockPool};
+use crate::block_pool::{BlockManager, BlockPool, PressureLevel};
 use crate::engine::Engine;
 use crate::model::RealModel;
+use crate::router::SpeculationController;
 use crate::transformer::KvCache;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 // Re-export the block-pool types so HTTP handlers and tests can build
@@ -67,6 +68,79 @@ use tokio::sync::{mpsc, oneshot};
 #[allow(unused_imports)]
 pub use crate::block_pool::{BlockAllocError, BlockId, BlockManager as PooledBlockManager,
     BlockPool as PooledBlockPool, POOL_BLOCK_TOKENS};
+
+/// Service class assigned to each registered session. Drives the
+/// Weighted Round-Robin admission policy in [`BatchScheduler`]: an
+/// `Audit` stream (high-throughput, latency-tolerant) cannot
+/// monopolise the buffer pool / batch slots when `Interactive`
+/// (low-latency) sessions are also active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionClass {
+    /// Default class for chat / API requests — prioritised in the
+    /// WRR scheduler with a 4× weight relative to Audit.
+    Interactive,
+    /// Bulk-throughput class (e.g. corpus audit jobs). Receives a
+    /// smaller per-batch share than Interactive and is the first
+    /// class to have its idle KV blocks reclaimed under pressure.
+    Audit,
+}
+
+impl SessionClass {
+    /// Per-class weight used by the WRR batch builder. Higher = a
+    /// larger share of each batch's slots. Concretely: with the
+    /// default weights, a fully-mixed pool of one Interactive + N
+    /// Audit sessions still leaves Interactive with ~4 / (4+N) of
+    /// every batch slot, so head-of-line latency stays bounded
+    /// regardless of how many Audit streams are running.
+    pub const fn weight(self) -> u32 {
+        match self {
+            SessionClass::Interactive => 4,
+            SessionClass::Audit => 1,
+        }
+    }
+}
+
+impl Default for SessionClass {
+    fn default() -> Self {
+        SessionClass::Interactive
+    }
+}
+
+/// Sidecar metadata stored alongside each registered request. Drives
+/// fair-share admission, idle reclamation, and per-session telemetry.
+/// Wrapped in `Arc` so the scheduler loop and HTTP path can both hold
+/// a cheap handle without cloning the (potentially heavy) optional
+/// `BlockManager`.
+struct SessionMeta {
+    class: SessionClass,
+    /// Monotonic microseconds since scheduler start. Updated on every
+    /// `step_registered` call so [`BatchScheduler::evict_idle_blocks`]
+    /// can identify sessions that have stopped producing tokens.
+    last_activity_us: AtomicU64,
+    /// Optional [`BlockManager`] handle. Populated by
+    /// [`BatchScheduler::bind_block_manager`] when the HTTP request
+    /// owns paged-KV blocks; the scheduler tears it down on idle
+    /// eviction, dropping every block back into the pool's free list.
+    block_manager: parking_lot::Mutex<Option<BlockManager>>,
+}
+
+impl SessionMeta {
+    fn new(class: SessionClass, now_us: u64) -> Self {
+        Self {
+            class,
+            last_activity_us: AtomicU64::new(now_us),
+            block_manager: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn touch(&self, now_us: u64) {
+        self.last_activity_us.store(now_us, Ordering::Relaxed);
+    }
+
+    fn idle_for_us(&self, now_us: u64) -> u64 {
+        now_us.saturating_sub(self.last_activity_us.load(Ordering::Relaxed))
+    }
+}
 
 /// Opaque, monotonically-increasing identifier for a registered
 /// request in the scheduler. Cheap to clone (just a `u64`) so it can
@@ -199,6 +273,16 @@ pub struct BatchConfig {
     /// request touches it.
     pub block_pool_capacity: usize,
     pub block_pool_kv_dim: usize,
+    /// Cutoff after which a session's KV blocks become candidates
+    /// for [`BatchScheduler::evict_idle_blocks`] when the pool is
+    /// above its soft-cap. Default: 5 seconds, matching the gist.
+    pub idle_eviction_threshold: Duration,
+    /// Baseline speculation depth (tokens-ahead) for the predictor's
+    /// prefetch. The scheduler's [`SpeculationController`] grows this
+    /// by up to [`crate::router::MAX_LATENCY_BUMP`] under rising SSD
+    /// stall and clamps it to zero under
+    /// [`PressureLevel::Critical`].
+    pub speculation_base_depth: usize,
 }
 
 impl Default for BatchConfig {
@@ -208,15 +292,39 @@ impl Default for BatchConfig {
             batch_timeout: Duration::from_millis(5),
             block_pool_capacity: 0,
             block_pool_kv_dim: 0,
+            idle_eviction_threshold: Duration::from_secs(5),
+            speculation_base_depth: 1,
         }
     }
 }
 
 /// Lightweight handle to the scheduler. Cheap to clone — under the
-/// hood it just wraps an [`mpsc::Sender`] and a few `Arc`s.
+/// hood it just wraps a pair of [`mpsc::Sender`]s (one per
+/// [`SessionClass`]) and a few `Arc`s.
+///
+/// ## Per-class admission channels
+///
+/// The scheduler maintains a *separate* mpsc channel for each
+/// service class. Submitting a [`StepRequest`] from
+/// [`Self::step_registered`] looks up the registered session's class
+/// and pushes onto the matching channel; the background
+/// [`scheduler_loop`] then drains both channels in weighted
+/// round-robin proportion (`weight_interactive` : `weight_audit`)
+/// when assembling a batch. This gives true fair-share *admission*
+/// — even when the Audit channel's backlog is far longer than
+/// `max_batch_size`, every batch still pulls the Interactive
+/// channel's share first, so an Audit flood cannot starve a
+/// latency-sensitive Interactive caller from being admitted.
 #[derive(Clone)]
 pub struct BatchScheduler {
-    tx: mpsc::Sender<StepRequest>,
+    /// Submission channel for [`SessionClass::Interactive`] sessions.
+    tx_interactive: mpsc::Sender<StepRequest>,
+    /// Submission channel for [`SessionClass::Audit`] sessions. Kept
+    /// physically separate so a backlog on this channel cannot push
+    /// Interactive requests further back in line — admission is
+    /// decided per-class by the WRR drain inside
+    /// [`scheduler_loop`], not by FIFO order on a single fused queue.
+    tx_audit: mpsc::Sender<StepRequest>,
     cfg: BatchConfig,
     /// Optional shared physical pool for paged KV caches. Populated
     /// when [`BatchConfig::block_pool_capacity`] and
@@ -227,6 +335,23 @@ pub struct BatchScheduler {
     /// Central registry of in-flight request KV caches. Shared with
     /// the background scheduler loop via `Arc`.
     registry: Arc<RequestRegistry>,
+    /// Per-session metadata sidecar (class, last-activity timestamp,
+    /// optional [`BlockManager`] for idle reclamation). Keyed by the
+    /// same `u64` as [`RequestRegistry`]. Pre-allocated `DashMap` so
+    /// lookups in the hot path are sharded and lock-free.
+    sessions: Arc<DashMap<u64, Arc<SessionMeta>>>,
+    /// Monotonic clock baseline for `last_activity_us`. Captured at
+    /// scheduler spawn time so the deltas reported by
+    /// [`SessionMeta::idle_for_us`] are unaffected by wall-clock
+    /// adjustments.
+    started_at: Instant,
+    /// Latency-aware speculation window controller. Shared with the
+    /// scheduler loop (which calls `update_from_stall` on every batch
+    /// using the engine's cumulative SSD-stall telemetry) and exposed
+    /// to HTTP / prefetch callers via
+    /// [`Self::current_speculation_depth`] so they know how far ahead
+    /// to prefetch.
+    speculation: Arc<SpeculationController>,
     /// Number of requests that have spilled into the block pool's
     /// overflow slab since startup (cumulative; never decremented).
     /// Snapshot via [`Self::overflow_requests_total`].
@@ -234,6 +359,10 @@ pub struct BatchScheduler {
     /// Latches `true` on the first overflow occurrence so the
     /// warning log is emitted exactly once per scheduler instance.
     overflow_warned: Arc<AtomicBool>,
+    /// Cumulative count of idle-eviction passes that actually
+    /// reclaimed at least one block. Snapshot via
+    /// [`Self::idle_evictions_total`]; useful for stress-test assertions.
+    idle_evictions: Arc<AtomicU64>,
 }
 
 impl BatchScheduler {
@@ -248,23 +377,47 @@ impl BatchScheduler {
         // A reasonable channel depth: each in-flight request can have
         // at most one outstanding StepRequest at a time, so
         // `max_batch_size * 4` gives plenty of headroom without
-        // unbounded growth under back-pressure.
+        // unbounded growth under back-pressure. Each per-class
+        // channel gets its own budget so an Audit backlog cannot
+        // crowd out the Interactive channel.
         let depth = cfg.max_batch_size.saturating_mul(4).max(8);
-        let (tx, rx) = mpsc::channel::<StepRequest>(depth);
+        let (tx_interactive, rx_interactive) = mpsc::channel::<StepRequest>(depth);
+        let (tx_audit, rx_audit) = mpsc::channel::<StepRequest>(depth);
         let registry = Arc::new(RequestRegistry::default());
-        tokio::spawn(scheduler_loop(model, engine, cfg, rx, registry.clone()));
+        let sessions: Arc<DashMap<u64, Arc<SessionMeta>>> = Arc::new(DashMap::new());
+        let started_at = Instant::now();
+        let speculation = Arc::new(SpeculationController::new(cfg.speculation_base_depth));
         let block_pool = if cfg.block_pool_capacity > 0 && cfg.block_pool_kv_dim > 0 {
             Some(BlockPool::new(cfg.block_pool_kv_dim, cfg.block_pool_capacity))
         } else {
             None
         };
+        let idle_evictions = Arc::new(AtomicU64::new(0));
+        tokio::spawn(scheduler_loop(
+            model,
+            engine.clone(),
+            cfg,
+            rx_interactive,
+            rx_audit,
+            registry.clone(),
+            sessions.clone(),
+            block_pool.clone(),
+            started_at,
+            speculation.clone(),
+            idle_evictions.clone(),
+        ));
         Self {
-            tx,
+            tx_interactive,
+            tx_audit,
             cfg,
             block_pool,
             registry,
+            sessions,
+            started_at,
+            speculation,
             overflow_requests: Arc::new(AtomicUsize::new(0)),
             overflow_warned: Arc::new(AtomicBool::new(false)),
+            idle_evictions,
         }
     }
 
@@ -315,8 +468,40 @@ impl BatchScheduler {
     /// pair this with a [`Self::release`] when the request finishes
     /// (or when it is aborted) to reclaim the cache and any
     /// associated paged-pool blocks.
+    ///
+    /// Defaults to [`SessionClass::Interactive`]; use
+    /// [`Self::register_with_class`] for `Audit` sessions.
     pub fn register(&self, kv: Vec<KvCache>) -> RequestId {
-        self.registry.register(kv)
+        self.register_with_class(kv, SessionClass::default())
+    }
+
+    /// Register a request with an explicit service class. The class
+    /// drives the WRR admission policy and the order in which sessions
+    /// become candidates for [`Self::evict_idle_blocks`] under
+    /// pressure.
+    pub fn register_with_class(&self, kv: Vec<KvCache>, class: SessionClass) -> RequestId {
+        let id = self.registry.register(kv);
+        let now_us = self.now_us();
+        self.sessions
+            .insert(id.0, Arc::new(SessionMeta::new(class, now_us)));
+        id
+    }
+
+    /// Attach a [`BlockManager`] handle to a registered request. When
+    /// the scheduler later evicts the session for being idle, it
+    /// takes the manager and drops it, returning every block the
+    /// session owned to the shared pool's free list. No-op if the
+    /// request id is not registered.
+    pub fn bind_block_manager(&self, id: RequestId, manager: BlockManager) {
+        if let Some(meta) = self.sessions.get(&id.0) {
+            *meta.block_manager.lock() = Some(manager);
+        }
+    }
+
+    /// Look up the service class for a registered request, or `None`
+    /// if the id has been released.
+    pub fn session_class(&self, id: RequestId) -> Option<SessionClass> {
+        self.sessions.get(&id.0).map(|m| m.class)
     }
 
     /// Tear down a registered request, returning its (now-mutated)
@@ -327,11 +512,85 @@ impl BatchScheduler {
     /// re-touched the scheduler after a burst.
     pub fn release(&self, id: RequestId) -> Option<Vec<KvCache>> {
         let kv = self.registry.release(id);
+        // Removing the session meta drops the held `BlockManager`
+        // (if any), returning every block it owned to the pool.
+        self.sessions.remove(&id.0);
         // After a release, the BlockManager (if any) owned by the
         // caller will return blocks on Drop, so this is a natural
         // point to surface whether the pool was ever stressed.
         self.maybe_warn_overflow();
         kv
+    }
+
+    /// Memory-pressure classification of the underlying block pool.
+    /// Returns [`PressureLevel::Normal`] when no pool is configured.
+    pub fn pressure_level(&self) -> PressureLevel {
+        self.block_pool
+            .as_ref()
+            .map(|p| p.pressure_level())
+            .unwrap_or(PressureLevel::Normal)
+    }
+
+    /// Currently-active speculation depth, in tokens-ahead. The
+    /// predictor reads this on every batch and clamps its prefetch
+    /// fanout accordingly: `0` under
+    /// [`PressureLevel::Critical`], `base_depth` under normal
+    /// conditions, up to `base_depth + MAX_LATENCY_BUMP` under
+    /// rising SSD stall.
+    pub fn current_speculation_depth(&self) -> usize {
+        self.speculation.current_depth()
+    }
+
+    /// Shared [`SpeculationController`]. Useful for tests and for
+    /// instrumentation code that wants to read more than just the
+    /// current depth (e.g. whether the controller is suspended).
+    pub fn speculation_controller(&self) -> Arc<SpeculationController> {
+        self.speculation.clone()
+    }
+
+    /// Walk the session map and release every block owned by a
+    /// session that hasn't produced a token in `idle_threshold` (or
+    /// the configured default when `None`). Returns the number of
+    /// sessions whose blocks were reclaimed. Idempotent — sessions
+    /// that don't own a `BlockManager` are skipped.
+    ///
+    /// Audit-class sessions are evicted **first** (sorted ahead of
+    /// Interactive) so a flurry of low-priority bulk jobs cannot
+    /// starve a latency-sensitive chat session of KV memory. The
+    /// scheduler loop also calls this method itself whenever
+    /// [`PressureLevel::High`] is reached, but operators can invoke
+    /// it manually for an off-cycle reclamation pass.
+    pub fn evict_idle_blocks(&self, idle_threshold: Option<Duration>) -> usize {
+        let threshold = idle_threshold.unwrap_or(self.cfg.idle_eviction_threshold);
+        let reclaimed = run_idle_eviction(&self.sessions, threshold, self.now_us());
+        if reclaimed > 0 {
+            self.idle_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        reclaimed
+    }
+
+    /// Total number of `evict_idle_blocks` passes that reclaimed at
+    /// least one session. Snapshot via [`Self::idle_evictions_total`].
+    pub fn idle_evictions_total(&self) -> u64 {
+        self.idle_evictions.load(Ordering::Relaxed)
+    }
+
+    /// Number of registered sessions, partitioned by class.
+    /// Useful for diagnostics and for stress-test assertions.
+    pub fn session_counts_by_class(&self) -> (usize, usize) {
+        let mut interactive = 0;
+        let mut audit = 0;
+        for kv in self.sessions.iter() {
+            match kv.value().class {
+                SessionClass::Interactive => interactive += 1,
+                SessionClass::Audit => audit += 1,
+            }
+        }
+        (interactive, audit)
+    }
+
+    fn now_us(&self) -> u64 {
+        self.started_at.elapsed().as_micros() as u64
     }
 
     fn maybe_warn_overflow(&self) {
@@ -365,7 +624,21 @@ impl BatchScheduler {
     ) -> Result<u32, BatchError> {
         let (tx, rx) = oneshot::channel();
         let req = StepRequest { id, token_id, pos, params, resp: tx };
-        self.tx.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
+        // Look up the session's class so the request lands on the
+        // matching per-class admission channel. Unregistered ids
+        // default to Interactive — they will be rejected by the
+        // scheduler loop's registry check anyway, but routing them
+        // to the higher-priority lane keeps the failure path short.
+        let class = self
+            .sessions
+            .get(&id.0)
+            .map(|m| m.class)
+            .unwrap_or(SessionClass::Interactive);
+        let sender = match class {
+            SessionClass::Interactive => &self.tx_interactive,
+            SessionClass::Audit => &self.tx_audit,
+        };
+        sender.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
         let resp = rx.await.map_err(|_| BatchError::SchedulerClosed)??;
         Ok(resp.next_token)
     }
@@ -460,40 +733,184 @@ async fn scheduler_loop(
     model: Arc<RealModel>,
     engine: Arc<Engine>,
     cfg: BatchConfig,
-    mut rx: mpsc::Receiver<StepRequest>,
+    mut rx_interactive: mpsc::Receiver<StepRequest>,
+    mut rx_audit: mpsc::Receiver<StepRequest>,
     registry: Arc<RequestRegistry>,
+    sessions: Arc<DashMap<u64, Arc<SessionMeta>>>,
+    block_pool: Option<Arc<BlockPool>>,
+    started_at: Instant,
+    speculation: Arc<SpeculationController>,
+    idle_evictions: Arc<AtomicU64>,
 ) {
-    loop {
-        // Block until at least one request shows up.
-        let first = match rx.recv().await {
-            Some(r) => r,
-            None => return, // all senders dropped → graceful exit
-        };
-        let mut batch: Vec<StepRequest> = Vec::with_capacity(cfg.max_batch_size);
-        batch.push(first);
+    let now_us = || started_at.elapsed().as_micros() as u64;
+    // Per-class WRR weights, captured once. These are `const fn`s so
+    // pulling them out of the loop is just a readability win.
+    let wi = SessionClass::Interactive.weight() as usize;
+    let wa = SessionClass::Audit.weight() as usize;
 
-        // Greedily drain anything else that's already queued without
-        // waiting (no-await `try_recv`); this fills the batch when
-        // requests arrived during the previous step.
-        while batch.len() < cfg.max_batch_size {
-            match rx.try_recv() {
-                Ok(r) => batch.push(r),
-                Err(_) => break,
+    loop {
+        // ----------------------------------------------------------
+        // Block until at least one request shows up on *either*
+        // per-class channel. `tokio::select!` here is the part that
+        // makes admission class-aware: if only the Audit channel
+        // has traffic, we still wake up; if both have traffic, we
+        // still wake up on whichever fires first, and the WRR drain
+        // below then enforces the 4 : 1 share.
+        // ----------------------------------------------------------
+        let mut batch: Vec<StepRequest> = Vec::with_capacity(cfg.max_batch_size);
+        tokio::select! {
+            biased;
+            // Prefer Interactive on the very first await — under
+            // heavy mixed load this ensures the head-of-batch slot
+            // is reliably claimed by the higher-priority class.
+            r = rx_interactive.recv() => match r {
+                Some(req) => batch.push(req),
+                None => {
+                    // Interactive senders all dropped → fall back to
+                    // Audit-only for the rest of this iteration.
+                    match rx_audit.recv().await {
+                        Some(req) => batch.push(req),
+                        None => return, // both closed
+                    }
+                }
+            },
+            r = rx_audit.recv() => match r {
+                Some(req) => batch.push(req),
+                None => {
+                    match rx_interactive.recv().await {
+                        Some(req) => batch.push(req),
+                        None => return, // both closed
+                    }
+                }
+            },
+        }
+
+        // ----------------------------------------------------------
+        // Class-aware WRR drain: pull `wi` from Interactive, then
+        // `wa` from Audit, repeating, until the batch is full or
+        // both per-class channels are empty. Because the channels
+        // are *physically* separate, an Audit backlog cannot push
+        // an Interactive request further back in line: every cycle
+        // we get up to `wi` Interactive admissions before any Audit
+        // admission, regardless of submission rates.
+        // ----------------------------------------------------------
+        loop {
+            if batch.len() >= cfg.max_batch_size {
+                break;
+            }
+            let mut made_progress = false;
+            for _ in 0..wi {
+                if batch.len() >= cfg.max_batch_size {
+                    break;
+                }
+                match rx_interactive.try_recv() {
+                    Ok(req) => {
+                        batch.push(req);
+                        made_progress = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            for _ in 0..wa {
+                if batch.len() >= cfg.max_batch_size {
+                    break;
+                }
+                match rx_audit.try_recv() {
+                    Ok(req) => {
+                        batch.push(req);
+                        made_progress = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !made_progress {
+                break;
             }
         }
 
-        // If we still haven't filled the batch, give late arrivals up
-        // to `batch_timeout` to join. Bounded by `max_batch_size`.
+        // ----------------------------------------------------------
+        // Give late arrivals up to `batch_timeout` to join. We
+        // race both channels via `select!` so the timeout pass
+        // remains class-aware too. A `biased` select with the
+        // Interactive arm first preserves the fair-share preference
+        // when both channels are ready simultaneously.
+        // ----------------------------------------------------------
         if batch.len() < cfg.max_batch_size && !cfg.batch_timeout.is_zero() {
             let deadline = tokio::time::Instant::now() + cfg.batch_timeout;
             while batch.len() < cfg.max_batch_size {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(r)) => batch.push(r),
-                    Ok(None) => break, // channel closed
-                    Err(_) => break,   // timeout
+                tokio::select! {
+                    biased;
+                    r = tokio::time::timeout_at(deadline, rx_interactive.recv()) => match r {
+                        Ok(Some(req)) => batch.push(req),
+                        Ok(None) => break, // channel closed
+                        Err(_) => break,   // timeout
+                    },
+                    r = tokio::time::timeout_at(deadline, rx_audit.recv()) => match r {
+                        Ok(Some(req)) => batch.push(req),
+                        Ok(None) => break, // channel closed
+                        Err(_) => break,   // timeout
+                    },
                 }
             }
         }
+
+        // ----------------------------------------------------------
+        // Memory-pressure ladder + latency-aware speculation:
+        //   * High   → trigger preemptive idle eviction.
+        //   * Critical → suspend speculation (depth → 0).
+        //   * Normal  → resume speculation if previously suspended;
+        //               feed cumulative SSD-stall telemetry to the
+        //               controller so the depth tracks I/O latency.
+        // ----------------------------------------------------------
+        if let Some(pool) = block_pool.as_ref() {
+            match pool.pressure_level() {
+                PressureLevel::Critical => {
+                    speculation.suspend();
+                    // Best-effort reclamation while under critical pressure.
+                    let reclaimed = run_idle_eviction(
+                        &sessions,
+                        cfg.idle_eviction_threshold,
+                        now_us(),
+                    );
+                    if reclaimed > 0 {
+                        idle_evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                PressureLevel::High => {
+                    if speculation.is_suspended() {
+                        speculation.resume();
+                    }
+                    let reclaimed = run_idle_eviction(
+                        &sessions,
+                        cfg.idle_eviction_threshold,
+                        now_us(),
+                    );
+                    if reclaimed > 0 {
+                        idle_evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                PressureLevel::Normal => {
+                    if speculation.is_suspended() {
+                        speculation.resume();
+                    }
+                }
+            }
+        }
+        // Fold the engine's cumulative SSD-stall telemetry into the
+        // speculation controller. Cheap (one atomic load + one
+        // CAS-free store) so safe to call every batch.
+        let cum_stall = engine.report().predictive.ssd_stall_us;
+        speculation.update_from_stall(cum_stall);
+
+        // ----------------------------------------------------------
+        // Note: the batch built above is already class-interleaved
+        // by construction — the per-class drain pulls `wi` from the
+        // Interactive channel then `wa` from the Audit channel each
+        // cycle, so no additional re-ordering pass is needed here.
+        // The WRR admission policy is enforced *before* requests
+        // enter the batch, which is what makes fair-share robust
+        // against an Audit submission flood.
+        // ----------------------------------------------------------
 
         // ----------------------------------------------------------
         // Pre-pass: peek at every request's routing decision and
@@ -532,8 +949,16 @@ async fn scheduler_loop(
             let model = model.clone();
             let engine = engine.clone();
             let registry = registry.clone();
+            let sessions = sessions.clone();
+            let now = now_us();
             handles.push(tokio::spawn(async move {
                 let StepRequest { id, token_id, pos, params, resp } = req;
+                // Refresh the session's last-activity timestamp so
+                // idle eviction doesn't pull blocks out from under
+                // a request that is still producing tokens.
+                if let Some(meta) = sessions.get(&id.0) {
+                    meta.touch(now);
+                }
                 let entry = match registry.get(id) {
                     Some(e) => e,
                     None => {
@@ -577,6 +1002,47 @@ async fn scheduler_loop(
             }
         }
     }
+}
+
+/// Helper for `scheduler_loop`: walk the session map and drop block
+/// managers for sessions that have been idle for at least `threshold`.
+/// Audit-class sessions go first. Returns the number of sessions
+/// whose blocks were reclaimed.
+fn run_idle_eviction(
+    sessions: &DashMap<u64, Arc<SessionMeta>>,
+    threshold: Duration,
+    now_us: u64,
+) -> usize {
+    let threshold_us = threshold.as_micros() as u64;
+    let mut candidates: Vec<(u64, Arc<SessionMeta>)> = sessions
+        .iter()
+        .filter_map(|kv| {
+            let meta = kv.value().clone();
+            if meta.idle_for_us(now_us) >= threshold_us
+                && meta.block_manager.lock().is_some()
+            {
+                Some((*kv.key(), meta))
+            } else {
+                None
+            }
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        let class_ord = match (a.1.class, b.1.class) {
+            (SessionClass::Audit, SessionClass::Interactive) => std::cmp::Ordering::Less,
+            (SessionClass::Interactive, SessionClass::Audit) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        };
+        class_ord.then_with(|| b.1.idle_for_us(now_us).cmp(&a.1.idle_for_us(now_us)))
+    });
+    let mut reclaimed = 0;
+    for (_id, meta) in candidates {
+        let taken = { meta.block_manager.lock().take() };
+        if taken.is_some() {
+            reclaimed += 1;
+        }
+    }
+    reclaimed
 }
 
 #[cfg(test)]
