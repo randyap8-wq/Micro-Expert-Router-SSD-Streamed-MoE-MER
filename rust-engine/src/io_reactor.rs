@@ -140,29 +140,25 @@ impl IoReactor {
         assert!(queue > 0, "IoReactor queue must be > 0");
         let (tx, mut rx) = mpsc::channel::<ReactorRequest>(queue);
         tokio::spawn(async move {
-            // The actor body is intentionally tiny: dequeue a
-            // request, fan out the actual read on a child task. The
-            // child holds the only mutable references; the actor
-            // itself does no other bookkeeping yet. That keeps the
-            // actor's per-message wall-time well under a
-            // micro-second, so the mpsc queue is essentially never
-            // the bottleneck — the I/O substrate is.
+            // Keep the actual read inside the actor so the bounded
+            // mpsc queue also bounds active I/O concurrency. If we
+            // spawned a child task per dequeued request, a burst
+            // could drain the queue immediately and recreate
+            // unbounded concurrent `read_expert` calls against the
+            // storage layer.
             //
             // Follow-up integrations will fold in-flight
             // deduplication and the breaker-probe scheduler here so
             // the engine's existing `DashMap<u32, Notify>` shard
             // table can retire.
             while let Some(req) = rx.recv().await {
-                let storage = storage.clone();
-                tokio::spawn(async move {
-                    let ReactorRequest { expert_id, mut buf, reply } = req;
-                    let result = storage.read_expert(expert_id, &mut buf).await;
-                    // `send` only fails if the caller dropped the
-                    // oneshot before the reply arrived — that's
-                    // legal (cancellation); swallow it and let the
-                    // buffer drop release its arena slot.
-                    let _ = reply.send(ReactorReply { buf, result });
-                });
+                let ReactorRequest { expert_id, mut buf, reply } = req;
+                let result = storage.read_expert(expert_id, &mut buf).await;
+                // `send` only fails if the caller dropped the
+                // oneshot before the reply arrived — that's
+                // legal (cancellation); swallow it and let the
+                // buffer drop release its arena slot.
+                let _ = reply.send(ReactorReply { buf, result });
             }
             // Channel closed: every handle was dropped. Exit
             // cleanly — no shutdown signal needed.
