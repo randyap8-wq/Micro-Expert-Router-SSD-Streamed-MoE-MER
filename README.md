@@ -134,16 +134,36 @@ For each token, the engine:
 
 The forward pass for the dense decoder pieces is **scalar `f32` Rust by
 default**, no BLAS, no SIMD, no GPU, because the project's thesis is
-about **storage bandwidth**, not compute. Two opt-in cargo features
-escalate the dense-matmul kernel without touching call sites:
+about **storage bandwidth**, not compute. The engine now ships a
+**hardware auto-escalation** layer so a single binary picks the best
+available kernel on the host without recompilation:
 
-* `--features simd` routes the dense projections inside
-  `TransformerLayer` / `LMHead` through a `std::thread::scope`-based
-  **row-parallel** matmul (no extra crate dep).
-* `--features blas` swaps in the **`matrixmultiply` SGEMV
-  microkernel** (the same hand-tuned BLAS-shaped path `ndarray` uses
-  for its `dot` op). Mutually exclusive with `simd`; a static
-  `compile_error!` enforces this in `transformer.rs`.
+* **Runtime row-parallel matmul** — always compiled. `matmul_row_major`
+  and the per-expert `gate_up_swiglu` / `down_proj` paths fan out
+  across cores via `std::thread::scope` whenever the matrix is large
+  enough to amortise thread-spawn overhead. **No cargo feature is
+  required.** The historic `--features simd` flag is retained as a
+  deprecated no-op so existing build scripts keep working.
+* **AVX2 + FMA kernels** — always compiled on `x86_64`. The runtime
+  CPU probe in [`kernels::detect`](rust-engine/src/kernels/mod.rs)
+  selects them transparently on any host that supports them.
+* `--features blas` — opt-in. Routes `matmul_row_major` through the
+  `matrixmultiply` SGEMV microkernel (the hand-tuned BLAS-shaped
+  path `ndarray` uses for its `dot` op). Useful on very large
+  `d_model × d_ff` Mixtral-class workloads where the microkernel's
+  ASM beats the auto-escalation path.
+* `--features avx512` — opt-in. Builds the `kernels/avx512.rs`
+  `#[target_feature]`-gated int8-dequant-and-dot kernels.
+* `--features amx` — opt-in. Builds the AMX skeleton + tile-hint
+  plumbing; the actual matmul body lands behind a future PR (AMX
+  intrinsics are nightly-only as of Rust 1.84).
+
+The runtime probe is logged on a single startup line so ops can
+correlate the selected backend with the deployment fleet:
+
+```
+INFO auto-escalation selected math kernel backend backend=avx2 vendor=GenuineIntel model="Intel(R) Xeon(R) Gold 6438Y+" avx2=true avx512=true amx_int8=true sapphire_rapids=true
+```
 
 The **per-expert SwiGLU FFN itself** runs through Hugging Face
 [`candle-core`](https://github.com/huggingface/candle) (CPU only — no
@@ -153,6 +173,12 @@ The **per-expert SwiGLU FFN itself** runs through Hugging Face
 matmuls and `silu` activation use Candle's built-in kernels. The
 proprietary I/O substrate (`expert_cache`, `buffer_pool`, `io_provider`,
 the O_DIRECT `pread(2)` path) is strictly preserved.
+
+For projects that want to swap candle for a different math library
+(Burn, Tract, a custom CUDA executor) without forking the engine, the
+new [`backend`](rust-engine/src/backend/mod.rs) module defines a
+plugin-system `Backend` trait — see
+[Decoupled math backend](#decoupled-math-backend) below.
 
 ---
 
@@ -167,12 +193,12 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. |
 | `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. |
-| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`). Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
+| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`) routed through the **fault-tolerant `read_at_with_retries` path**: three-tier exponential backoff on transient errors (EIO / EINTR / `WouldBlock` / `TimedOut` / `EAGAIN`; short reads / `UnexpectedEof` fail fast) plus a per-expert **circuit breaker** that trips after `STORAGE_BREAKER_THRESHOLD = 5` consecutive failures and short-circuits to a structured `HardwareFailure::ExpertUnavailable` (recoverable on the first successful read). Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
 | `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point. Built behind the `io_uring` cargo feature. |
 | `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API), `LocalityMonitor` (sliding-window heat map, the **L** arm), and `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
 | `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q8_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For the GGUF block-quantised dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm` / `run_inference_q8_0_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels — no F32 dequantise of the weights. The legacy `run_inference_q4_0` / `run_inference_q4k` / `run_inference_q8_0` dequant kernels are kept as a graceful fallback when `cols % block_size != 0`. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
-| `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch (scalar / `simd` / `blas`). |
+| `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch. `matmul_row_major` auto-escalates: scalar → runtime row-parallel (always compiled) → `matrixmultiply` SGEMV under `--features blas`. |
 | `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. |
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
 | `tokenizer` | HuggingFace `tokenizers` crate when the `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured; deterministic byte-level fallback otherwise. |
@@ -182,7 +208,8 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`, `Q8_0`. Two readers ship side-by-side: `GgufFile::open` (eager — slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming — keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
 | `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q8_0` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files for the 4-bit dtypes, ~4× smaller for `Q8_0`; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
 | `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
-| `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()`), with `scalar.rs` (always on), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The selected backend is logged once at startup. |
+| `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()` + `cpu_features()`), with `scalar.rs` (always on), `avx2.rs` (always compiled on x86_64 — no cargo feature; the `#[target_feature]` entry points are gated on the runtime probe), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The probe also reads `/proc/cpuinfo` to recognise Sapphire-Rapids-class Xeons so AMX can be preferred on the chips it ships on. The selected backend is logged once at startup. |
+| `backend` | Plugin-system math `Backend` trait (`matmul`, `softmax`, `silu_inplace`) with two built-in implementations: `ScalarBackend` (pure Rust reference) and `CandleBackend` (delegates to `candle-core`). The active backend is installed once at startup via `backend::install_default()` and resolved on the hot path through `backend::current()` — a single `OnceLock` load, no `cfg!` dispatch. New executors (Burn, Tract, custom CUDA) implement `Backend` and call `set_backend(Arc<dyn Backend>)` before the first token is generated. |
 | `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`. Validated at startup. |
@@ -236,6 +263,34 @@ blocking thread pool via `block_in_place`. It's `O_DIRECT`-compatible,
 deep-queue-friendly on NVMe, and avoids touching the file offset so
 concurrent reads against the same fd are safe, and it works on every
 Unix without any extra dependencies.
+
+#### Fault-tolerant I/O ("Hardened" MER)
+
+Every `pread(2)` flows through `NvmeStorage::read_at_with_retries`,
+the fault-tolerant path:
+
+* **Three-tier exponential backoff** on transient `io::Error`s
+  (`EIO`, `EINTR`, `WouldBlock`, `TimedOut`, `EAGAIN`). The first
+  retry waits 5 ms, the next 10 ms, capped at 50 ms so a hung drive
+  can't stretch a single token's latency past the HTTP server's
+  per-request timeout. Short reads (`UnexpectedEof`) are
+  deliberately **not** retried — a permanently truncated
+  `expert_<id>.bin` won't grow back during the retry budget, so the
+  error is surfaced on the first observation and counted against
+  the breaker.
+* **Per-expert circuit breaker.** After `STORAGE_BREAKER_THRESHOLD =
+  5` consecutive failures, the breaker trips: subsequent reads
+  against that id short-circuit to a structured
+  `HardwareFailure::ExpertUnavailable` without touching the drive.
+  The first successful read clears the breaker — drives that recover
+  after a brief glitch keep serving traffic without operator
+  intervention.
+* **Structured errors.** Both `HardwareFailure::Transient` (retry
+  budget exhausted) and `HardwareFailure::ExpertUnavailable`
+  (breaker tripped) round-trip out of `io::Error` via
+  `e.into_inner().downcast::<HardwareFailure>()`, so the HTTP server
+  can return a 503 with the expert id and consecutive-failure count
+  instead of panicking.
 
 A real **io_uring backend with registered fixed buffers** ships in
 `src/io_uring_storage.rs` and is built when the cargo feature
@@ -320,16 +375,20 @@ file is bind-mounted read-only into `/etc/mer/config.toml`.
 
 ```bash
 cd rust-engine
-cargo build --release                       # default, portable, scalar
+cargo build --release                       # default; runtime auto-escalation picks scalar / parallel / AVX2 at startup
 cargo build --release --features io_uring   # Linux: enables IoUringStorage
-cargo build --release --features simd       # row-parallel dense matmul (std::thread::scope)
-cargo build --release --features blas       # matrixmultiply SGEMV microkernel (mutually exclusive with `simd`)
+cargo build --release --features blas       # matrixmultiply SGEMV microkernel for the dense matmul
+cargo build --release --features avx512     # build AVX-512 int8-dequant + dot kernels
+cargo build --release --features amx        # build AMX tile-hint plumbing (executor still falls back)
 cargo build --release --features tokenizer  # real HuggingFace tokenizer (pulls in `onig`)
 ```
 
-Features compose freely except `simd` and `blas`, which are mutually
-exclusive (enforced at compile time by a `compile_error!` in
-`transformer.rs`).
+All features compose freely. The legacy `simd` feature is retained as
+a **no-op** for backwards compatibility — the row-parallel matmul is
+now always compiled, so a single binary picks the best available
+kernel (scalar / parallel / AVX2 / AVX-512 / AMX) on the host at
+startup without recompilation. See [Hardware auto-escalation](#hardware-auto-escalation)
+below.
 
 ### Generate synthetic expert files
 
@@ -636,30 +695,62 @@ a warning the first time a request touches the overflow slab so
 operators can size the primary capacity for steady-state workloads
 while staying safe under bursts.
 
-#### Optional row-parallel / BLAS matmul (`simd` / `blas` features)
+#### Hardware auto-escalation
 
 The dense projections inside `TransformerLayer` and `LMHead` are routed
-through `transformer::matmul_row_major`, which is feature-gated:
+through `transformer::matmul_row_major`, which auto-escalates at
+runtime — a single binary picks the best available kernel on the host
+without recompilation:
 
-* **default** (no features): scalar fused-loop matmul, single-threaded.
-* `--features simd`: dispatches to a `std::thread::scope`-based
-  row-parallel implementation (no extra crate dep, output rows are
-  disjoint, so no synchronisation is needed).
-* `--features blas`: routes through `matrixmultiply`'s hand-tuned
-  SGEMV microkernel, the same BLAS-shaped path `ndarray::dot` uses.
-  Mutually exclusive with `simd` (a static `compile_error!` in
-  `transformer.rs` enforces this).
+1. **`--features blas`** (opt-in) — `matrixmultiply` SGEMV microkernel,
+   the same BLAS-shaped path `ndarray::dot` uses.
+2. **Runtime row-parallel** (always compiled, no cargo feature) —
+   `std::thread::scope` fans the output rows across cores when the
+   matrix is large enough to amortise thread-spawn overhead. **Replaces
+   the old `--features simd` build-time flag**; that feature is now a
+   no-op kept for backwards compatibility.
+3. **Scalar fallback** — single-threaded fused loop, the validation
+   oracle for every other backend.
 
-```bash
-cargo build --release --features simd     # row-parallel
-cargo build --release --features blas     # matrixmultiply SGEMV
+Orthogonally, the `kernels` dispatcher selects between AVX-512
+(`--features avx512`) → AVX2+FMA (always compiled on x86_64, no
+feature) → scalar at runtime, gated on the result of a one-shot CPU
+probe in `kernels::cpu_features()`. The probe also reads
+`/proc/cpuinfo` to recognise Sapphire-Rapids-class Xeons so the
+AMX path (`--features amx`) can be preferred on the chips it ships
+on. The selected backend is logged once at startup:
+
+```
+INFO auto-escalation selected math kernel backend backend=avx2 vendor=GenuineIntel ... avx2=true avx512=true amx_int8=true sapphire_rapids=true
 ```
 
-The call sites are unchanged, so a future PR can swap the body for
-a GPU-enabled `candle::Tensor` op or a CUDA kernel without touching
-the layer definitions. (The per-expert SwiGLU FFN already runs
-through `candle-core`; this `matmul_row_major` dispatch governs the
-**dense** decoder projections — attention QKV/O, LM head — only.)
+```bash
+cargo build --release                # default — auto-escalation only
+cargo build --release --features blas      # opt-in BLAS-shaped matmul
+cargo build --release --features avx512    # opt-in AVX-512 dequant + dot
+cargo build --release --features amx       # opt-in AMX tile-hint plumbing
+```
+
+#### Decoupled math backend
+
+The engine's I/O substrate is intentionally independent from the math
+library used to crunch the bytes once they land in RAM. The
+[`backend`](rust-engine/src/backend/mod.rs) module defines a
+plugin-system `Backend` trait (`matmul`, `softmax`, `silu_inplace`)
+with two built-in implementations:
+
+* **`ScalarBackend`** — pure-Rust reference, always available, used
+  as the validation oracle every other backend is tested against.
+* **`CandleBackend`** — wraps the existing `candle-core` CPU path the
+  per-expert SwiGLU forward pass already drives. Installed by
+  `backend::install_default()` at startup, so the production code path
+  is bit-for-bit unchanged.
+
+Future executors (Burn, Tract, a custom CUDA / Vulkan engine) need
+only implement the trait and call `backend::set_backend(Arc<dyn Backend>)`
+before the first token is generated. The hot path resolves the active
+backend through `backend::current()` — a single `OnceLock` load, no
+`cfg!` dispatch.
 
 Tokenization is via the [`tokenizers`] crate when the optional
 `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured,
@@ -1552,19 +1643,23 @@ you can verify the energy-saving paths actually engaged.
 
 - **Per-expert kernel dispatcher.** The engine ships a runtime
   CPU-feature dispatcher (`src/kernels/`) that selects between a
-  scalar reference path (always on), an AVX-512 fused
-  int8-dequant + dot path (`--features avx512`), and an Intel AMX
-  tile skeleton (`--features amx`, currently routes back to scalar
-  on stable Rust until the tile intrinsics stabilise). The chosen
-  backend is logged once at startup. The dense `transformer`
-  projections additionally benefit from the existing `simd` /
-  `blas` features. The per-expert SwiGLU FFN itself already runs
-  through **`candle-core`** (CPU-only build, no `candle-nn`, no
-  GPU backends); enabling a GPU backend (Candle's `cuda` /
-  `metal` features, or swapping for `tch` / `cudarc`) is a
-  localised change inside `inference.rs`, since
-  `ExpertWeights::from_bytes` and `to_candle_tensors` already do
-  the zero-copy bridge from the page-aligned NVMe buffer.
+  scalar reference path (always on), AVX2+FMA (always compiled on
+  x86_64, no cargo feature required — gated on the runtime probe),
+  AVX-512 fused int8-dequant + dot (`--features avx512`), and an
+  Intel AMX tile skeleton (`--features amx`, currently routes back
+  to scalar on stable Rust until the tile intrinsics stabilise).
+  The chosen backend is logged once at startup. The dense
+  `transformer` projections benefit independently from the runtime
+  row-parallel `matmul_row_major` (always compiled) and from
+  `--features blas` (the `matrixmultiply` SGEMV microkernel) when
+  it's the better fit for the workload. The per-expert SwiGLU FFN
+  itself already runs through **`candle-core`** (CPU-only build, no
+  `candle-nn`, no GPU backends); enabling a GPU backend (Candle's
+  `cuda` / `metal` features, or swapping for `tch` / `cudarc`) is a
+  localised change inside `inference.rs` — or, for swappable
+  executors without touching `inference.rs`, an additional `Backend`
+  implementation registered via `backend::set_backend`. See
+  [Decoupled math backend](#decoupled-math-backend).
 - **NUMA budget.** `MER_PIN_CORES=N` is honoured at startup to
   `sched_setaffinity(2)` the process to the first `N` CPUs of
   NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere).

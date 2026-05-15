@@ -110,19 +110,22 @@ tokenizer = ["dep:tokenizers"]
 # Linux-only io_uring backend with registered fixed buffers. Off by default
 # because it requires the `io-uring` crate and only builds on Linux.
 io_uring = ["dep:io-uring"]
-# Row-parallel matmul (uses `std::thread::scope`, no extra crate dep) for
-# the dense projections inside `TransformerLayer` and the LM head. This
-# stands in for a future rayon / candle / cudarc backend —
-# the call sites are already routed through `matmul_row_major`, so a
-# future PR can swap the body for a CUDA kernel without touching callers.
+# Row-parallel matmul. **Deprecated / no-op as of gist Task 1
+# ("Hardware-Agnostic Auto-Escalation"):** the runtime row-parallel
+# dispatch in `matmul_row_major` / `gate_up_swiglu` / `down_proj` is
+# now always compiled, so a single binary auto-escalates on any host
+# with enough cores. The feature is retained as a no-op for backwards
+# compatibility with downstream build scripts that still pass
+# `--features simd`; new builds should omit it.
 simd = []
 
 # BLAS-equivalent dense matmul. When enabled, `matmul_row_major` routes
 # through `matrixmultiply`'s tuned SGEMV microkernel instead of the
-# scalar / `simd` row-parallel loop. Mutually exclusive with `simd`
-# (a static `compile_error!` enforces this in `transformer.rs` so a
-# misconfigured `--features simd,blas` build fails fast rather than
-# silently picking one branch).
+# always-compiled runtime row-parallel loop. Useful on hosts where the
+# `matrixmultiply` microkernel's ASM beats the auto-escalation path —
+# typically large `d_model × d_ff` Mixtral-class workloads on AVX2 /
+# NEON. Off by default; the auto-escalation path is good enough for
+# the common case and adds no extra crate dependency.
 blas = ["dep:matrixmultiply"]
 # Build the AVX-512 dispatcher in `kernels/avx512.rs`. Stable on
 # x86_64; the actual code is `#[target_feature]`-gated and only

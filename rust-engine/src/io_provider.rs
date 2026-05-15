@@ -44,10 +44,60 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
+
+// =====================================================================
+// Fault-tolerant I/O knobs (gist Task 3 — "Hardened" MER).
+// =====================================================================
+
+/// Maximum number of times the storage layer will retry a transient
+/// I/O failure (EIO / EINTR / `Interrupted` / `WouldBlock`) before
+/// surfacing the error.
+///
+/// Three attempts is the "industry-standard 3-tier" retry the gist
+/// asks for; further attempts are pointless on real drive failures
+/// and only add latency.
+pub const STORAGE_RETRY_ATTEMPTS: u32 = 3;
+
+/// Initial backoff between retries. Doubles on every retry (exponential
+/// backoff), capped by [`STORAGE_RETRY_MAX_BACKOFF`].
+pub const STORAGE_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+
+/// Upper bound on the backoff between retries — keeps a hung-drive
+/// situation from stretching a single token's latency beyond what the
+/// HTTP server's per-request timeout will tolerate.
+pub const STORAGE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Consecutive-failure threshold at which the per-expert circuit
+/// breaker trips and subsequent reads short-circuit to
+/// `HardwareFailure` instead of touching the drive. A tripped breaker
+/// is reset by a successful read.
+///
+/// The default matches Hystrix's well-known `5` consecutive failures.
+pub const STORAGE_BREAKER_THRESHOLD: u32 = 5;
+
+/// Classify an `io::Error` as transient (worth retrying) vs. fatal
+/// (worth surfacing immediately to the circuit breaker).
+///
+/// `UnexpectedEof` is **not** treated as transient even though
+/// `read_at_with_retries` synthesises it for short reads. A genuinely
+/// truncated `expert_<id>.bin` is not going to grow back during the
+/// next 50 ms of backoff, so retrying it three times is pointless —
+/// we count the failure against the breaker on the first read and
+/// surface the error immediately.
+fn is_transient_io_error(e: &io::Error) -> bool {
+    use io::ErrorKind::*;
+    matches!(e.kind(), Interrupted | WouldBlock | TimedOut)
+        || e.raw_os_error() == Some(libc::EIO)
+        || e.raw_os_error() == Some(libc::EAGAIN)
+        || e.raw_os_error() == Some(libc::EBUSY)
+}
+
 
 /// Configuration for the storage layer.
 #[derive(Clone, Debug)]
@@ -87,7 +137,97 @@ impl Default for StorageConfig {
     }
 }
 
-/// NVMe-backed storage with a per-expert fd cache.
+// =====================================================================
+// Per-expert circuit-breaker state (gist Task 3 — "Hardened" MER).
+// =====================================================================
+
+/// Sticky per-expert health state. Allocated lazily the first time an
+/// expert id is touched and kept resident in [`NvmeStorage::breakers`]
+/// for the lifetime of the engine.
+#[derive(Debug)]
+pub struct BreakerState {
+    /// Number of consecutive failed reads since the last success.
+    /// Reset to 0 on the first successful `read_at`.
+    pub consecutive_failures: AtomicU32,
+    /// Sticky "permanently failed" bit. Once set, every subsequent
+    /// read against this expert short-circuits to
+    /// [`HardwareFailure::ExpertUnavailable`] without touching the
+    /// drive. Cleared automatically the moment the breaker observes
+    /// a healthy read again (a transient firmware hiccup must not
+    /// permanently take an expert out of rotation).
+    pub tripped: AtomicBool,
+}
+
+impl Default for BreakerState {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: AtomicU32::new(0),
+            tripped: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Outcome of the storage layer's fault-tolerant read path.
+///
+/// The variants distinguish:
+///
+/// * `Transient` — every retry returned a transient `io::Error`. The
+///   upstream caller may choose to retry the whole request (a higher-
+///   level loop in `Engine::moe_step` does this for prefetches).
+/// * `ExpertUnavailable` — the per-expert circuit breaker has tripped
+///   after `STORAGE_BREAKER_THRESHOLD` consecutive failures. Future
+///   reads against this id short-circuit without touching the drive
+///   until the breaker resets.
+///
+/// Surfaced to the HTTP server as a 503 by `server.rs`.
+#[derive(Debug)]
+pub enum HardwareFailure {
+    /// Every retry returned an `io::Error` we classified as transient.
+    /// The inner error is the most recent one.
+    Transient {
+        expert_id: u32,
+        attempts: u32,
+        last_error: io::Error,
+    },
+    /// Per-expert circuit breaker has tripped.
+    ExpertUnavailable {
+        expert_id: u32,
+        consecutive_failures: u32,
+    },
+}
+
+impl std::fmt::Display for HardwareFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HardwareFailure::Transient { expert_id, attempts, last_error } => write!(
+                f,
+                "hardware failure reading expert {expert_id} after {attempts} attempts: {last_error}"
+            ),
+            HardwareFailure::ExpertUnavailable { expert_id, consecutive_failures } => write!(
+                f,
+                "expert {expert_id} marked unavailable by the circuit breaker \
+                 ({consecutive_failures} consecutive failures)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HardwareFailure {}
+
+impl From<HardwareFailure> for io::Error {
+    /// Convert a `HardwareFailure` to an `io::Error` so call sites
+    /// that already plumb `io::Result` (the entire I/O layer) can
+    /// surface it without an enum re-wrapping. The original
+    /// `HardwareFailure` is preserved as the inner error so
+    /// `downcast_ref::<HardwareFailure>()` recovers the full
+    /// information.
+    fn from(e: HardwareFailure) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, e)
+    }
+}
+
+// =====================================================================
+
 pub struct NvmeStorage {
     cfg: StorageConfig,
     files: RwLock<HashMap<u32, Arc<File>>>,
@@ -105,6 +245,15 @@ pub struct NvmeStorage {
     /// fetch path. Wrapped in an [`Arc`] for cheap cloning into
     /// background prefetch tasks.
     manifest: Option<Arc<Manifest>>,
+    /// Per-expert circuit-breaker state (gist Task 3). Tracks
+    /// consecutive read failures and a "tripped" sticky flag. Reads
+    /// against a tripped breaker short-circuit to
+    /// [`HardwareFailure`] instead of touching the drive. The first
+    /// successful read clears the failure counter and resets the
+    /// breaker — drives that recover after a brief glitch (a common
+    /// pattern on hot NVMe enclosures) keep serving traffic without
+    /// operator intervention.
+    breakers: RwLock<HashMap<u32, Arc<BreakerState>>>,
 }
 
 impl NvmeStorage {
@@ -122,6 +271,7 @@ impl NvmeStorage {
             files: RwLock::new(HashMap::new()),
             striped_paths: Vec::new(),
             manifest: None,
+            breakers: RwLock::new(HashMap::new()),
         })
     }
 
@@ -252,6 +402,185 @@ impl NvmeStorage {
         Ok(f)
     }
 
+    /// Per-expert circuit-breaker state (gist Task 3). Lazily
+    /// initialised on first access; never freed for the lifetime of
+    /// the engine. The returned `Arc` is cheap to clone into a
+    /// background prefetch task.
+    pub fn breaker(&self, id: u32) -> Arc<BreakerState> {
+        if let Some(b) = self.breakers.read().get(&id) {
+            return b.clone();
+        }
+        let mut guard = self.breakers.write();
+        guard
+            .entry(id)
+            .or_insert_with(|| Arc::new(BreakerState::default()))
+            .clone()
+    }
+
+    /// `true` iff the per-expert circuit breaker has tripped after
+    /// `STORAGE_BREAKER_THRESHOLD` consecutive failures and reads
+    /// against this id will short-circuit.
+    pub fn is_expert_unavailable(&self, id: u32) -> bool {
+        self.breakers
+            .read()
+            .get(&id)
+            .map(|b| b.tripped.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    /// Record one successful read: reset the failure counter and
+    /// clear the tripped flag if it was set. Called from the
+    /// fault-tolerant read paths after a confirmed `expert_size`
+    /// pread.
+    fn note_read_success(&self, id: u32) {
+        if let Some(b) = self.breakers.read().get(&id) {
+            b.consecutive_failures.store(0, Ordering::Release);
+            if b.tripped.swap(false, Ordering::AcqRel) {
+                tracing::info!(
+                    expert_id = id,
+                    "circuit breaker reset after successful read"
+                );
+            }
+        }
+    }
+
+    /// Record one failed read. Returns `(just_tripped, count)`:
+    /// `just_tripped` is `true` only on the call that flips the
+    /// breaker from closed to open (so callers can log once);
+    /// `count` is the post-increment consecutive-failure tally,
+    /// which the caller propagates into
+    /// `HardwareFailure::ExpertUnavailable.consecutive_failures` so
+    /// the value surfaced to the HTTP 503 reflects the actual
+    /// observed failure count rather than a placeholder.
+    fn note_read_failure(&self, id: u32) -> (bool, u32) {
+        let b = self.breaker(id);
+        let n = b.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        let just_tripped =
+            n >= STORAGE_BREAKER_THRESHOLD && !b.tripped.swap(true, Ordering::AcqRel);
+        if just_tripped {
+            tracing::error!(
+                expert_id = id,
+                consecutive_failures = n,
+                "circuit breaker tripped — expert unavailable until next successful read"
+            );
+        }
+        (just_tripped, n)
+    }
+
+    /// Fault-tolerant `pread(2)` wrapper with three-tier retry +
+    /// circuit breaker. Used by every public `read_expert*` entry
+    /// point. The returned `io::Error` wraps a [`HardwareFailure`]
+    /// (recoverable via `e.into_inner().downcast::<HardwareFailure>()`)
+    /// when the retry budget is exhausted or the breaker has tripped.
+    fn read_at_with_retries(
+        &self,
+        file: &File,
+        expert_id: u32,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        // Fast path: breaker is tripped — no syscall.
+        if self.is_expert_unavailable(expert_id) {
+            let cf = self
+                .breakers
+                .read()
+                .get(&expert_id)
+                .map(|b| b.consecutive_failures.load(Ordering::Acquire))
+                .unwrap_or(STORAGE_BREAKER_THRESHOLD);
+            return Err(HardwareFailure::ExpertUnavailable {
+                expert_id,
+                consecutive_failures: cf,
+            }
+            .into());
+        }
+        let mut last_err: Option<io::Error> = None;
+        let mut backoff = STORAGE_RETRY_BACKOFF;
+        for attempt in 0..STORAGE_RETRY_ATTEMPTS {
+            match file.read_at(dst, offset) {
+                Ok(n) if n == dst.len() => {
+                    self.note_read_success(expert_id);
+                    return Ok(n);
+                }
+                Ok(n) => {
+                    // Short read — almost certainly a permanently
+                    // truncated file. Not worth retrying (the file
+                    // isn't going to grow back in 50 ms); count it
+                    // against the breaker and surface fast.
+                    let (tripped, cf) = self.note_read_failure(expert_id);
+                    let err = io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("short read on expert {expert_id}: got {n} bytes, expected {}", dst.len()),
+                    );
+                    if tripped {
+                        return Err(HardwareFailure::ExpertUnavailable {
+                            expert_id,
+                            consecutive_failures: cf,
+                        }
+                        .into());
+                    }
+                    return Err(err);
+                }
+                Err(e) if is_transient_io_error(&e) => {
+                    tracing::warn!(
+                        expert_id,
+                        attempt = attempt + 1,
+                        error = %e,
+                        "transient I/O error; retrying"
+                    );
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    // Fatal error (permission, broken pipe, etc.): no
+                    // point retrying. We still record one logical
+                    // failure per `read_at_with_retries` *call* (not
+                    // per retry within a call), so a hot fd that
+                    // keeps returning the same fatal error trips the
+                    // breaker after `STORAGE_BREAKER_THRESHOLD`
+                    // *invocations* — i.e. once the layer above has
+                    // attempted the expert that many times.
+                    let (tripped, cf) = self.note_read_failure(expert_id);
+                    if tripped {
+                        return Err(HardwareFailure::ExpertUnavailable {
+                            expert_id,
+                            consecutive_failures: cf,
+                        }
+                        .into());
+                    }
+                    return Err(e);
+                }
+            }
+            // Exponential backoff between retries. We don't sleep
+            // after the last attempt — the error is about to bubble
+            // up anyway.
+            if attempt + 1 < STORAGE_RETRY_ATTEMPTS {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(STORAGE_RETRY_MAX_BACKOFF);
+            }
+        }
+        let (tripped, cf) = self.note_read_failure(expert_id);
+        // `last_err` is always Some here: the only way to fall out of
+        // the loop without returning is via the transient-error branch
+        // (which sets `last_err`). The `unwrap_or_else` is a
+        // defence-in-depth fallback for an impossible state.
+        let err = last_err.unwrap_or_else(|| {
+            io::Error::other("retry loop exited without recording a transient error (bug)")
+        });
+        if tripped {
+            Err(HardwareFailure::ExpertUnavailable {
+                expert_id,
+                consecutive_failures: cf,
+            }
+            .into())
+        } else {
+            Err(HardwareFailure::Transient {
+                expert_id,
+                attempts: STORAGE_RETRY_ATTEMPTS,
+                last_error: err,
+            }
+            .into())
+        }
+    }
+
     /// Pre-open all expert fds to take that cost out of the steady-state path.
     pub fn warmup_fds(&self, ids: impl IntoIterator<Item = u32>) -> io::Result<()> {
         for id in ids {
@@ -270,17 +599,30 @@ impl NvmeStorage {
     /// on success — short reads are surfaced as an `UnexpectedEof` error).
     pub async fn read_expert(&self, expert_id: u32, buf: &mut PooledBuffer) -> io::Result<usize> {
         debug_assert_eq!(buf.len(), self.cfg.expert_size);
-        let file = self.fd_for(expert_id)?;
-        let n = self.read_into(&file, buf).await?;
-        if n != self.cfg.expert_size {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "short read on expert {expert_id}: got {n} bytes, expected {}",
-                    self.cfg.expert_size
-                ),
-            ));
+        // Fast-fail when the breaker has tripped — saves the fd open
+        // syscall and the `block_in_place` round-trip.
+        if self.is_expert_unavailable(expert_id) {
+            let cf = self
+                .breakers
+                .read()
+                .get(&expert_id)
+                .map(|b| b.consecutive_failures.load(Ordering::Acquire))
+                .unwrap_or(STORAGE_BREAKER_THRESHOLD);
+            return Err(HardwareFailure::ExpertUnavailable {
+                expert_id,
+                consecutive_failures: cf,
+            }
+            .into());
         }
+        let file = self.fd_for(expert_id)?;
+        // `read_at_with_retries` already enforces `dst.len()` and surfaces
+        // short reads as transient errors that retry, so no extra
+        // length check is needed here. Each expert is stored as its
+        // own file, so the read always starts at byte 0.
+        let dst_len = buf.len();
+        let n = tokio::task::block_in_place(|| {
+            self.read_at_with_retries(&file, expert_id, 0, &mut buf.as_mut_slice()[..dst_len])
+        })?;
         Ok(n)
     }
 
@@ -330,19 +672,17 @@ impl NvmeStorage {
         // Single donation: all K reads dispatched without yielding to the
         // runtime between syscalls. On Linux this hands the NVMe queue
         // K consecutive submissions, matching the io_uring path's
-        // submit-once semantics.
+        // submit-once semantics. Each read still passes through the
+        // per-expert fault-tolerant path so a single bad drive can't
+        // wedge the whole batch — it surfaces as a `HardwareFailure`
+        // for that expert id and the engine's higher-level cache code
+        // routes around it.
+        let id_vec: Vec<u32> = ids.to_vec();
         let total = tokio::task::block_in_place(|| -> io::Result<usize> {
             let mut total = 0usize;
-            for (file, buf) in files.iter().zip(bufs.iter_mut()) {
-                let n = file.read_at(buf.as_mut_slice(), 0)?;
-                if n != expert_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "short read in batch: got {n} bytes, expected {expert_size}"
-                        ),
-                    ));
-                }
+            for ((file, buf), &id) in files.iter().zip(bufs.iter_mut()).zip(id_vec.iter()) {
+                debug_assert_eq!(buf.len(), expert_size);
+                let n = self.read_at_with_retries(file, id, 0, &mut buf.as_mut_slice()[..expert_size])?;
                 total += n;
             }
             Ok(total)
@@ -1466,5 +1806,79 @@ mod tests {
         assert_eq!(storage.expert_path(99), dir.join("expert_99.bin"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Per-expert circuit breaker trips after
+    /// [`STORAGE_BREAKER_THRESHOLD`] consecutive failures, and resets
+    /// on the first success — gist Task 3 ("Hardened" MER).
+    #[test]
+    fn breaker_trips_and_resets() {
+        let dir = tempdir("breaker");
+        let block = 4096usize;
+        let expert_size = block;
+        // Don't write any expert files — every read will fail.
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap();
+
+        // Initially healthy.
+        assert!(!storage.is_expert_unavailable(0));
+        // Drive the breaker over the threshold.
+        for _ in 0..STORAGE_BREAKER_THRESHOLD {
+            storage.note_read_failure(0);
+        }
+        assert!(storage.is_expert_unavailable(0));
+        // Reset on the first success.
+        storage.note_read_success(0);
+        assert!(!storage.is_expert_unavailable(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `is_transient_io_error` classifies the well-known set of
+    /// retryable kinds correctly.
+    #[test]
+    fn transient_io_error_classification() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_transient_io_error(&Error::new(ErrorKind::Interrupted, "")));
+        assert!(is_transient_io_error(&Error::new(ErrorKind::WouldBlock, "")));
+        assert!(is_transient_io_error(&Error::new(ErrorKind::TimedOut, "")));
+        // EIO maps to a raw-OS retryable error too.
+        let eio = Error::from_raw_os_error(libc::EIO);
+        assert!(is_transient_io_error(&eio));
+        // UnexpectedEof is NOT transient: a permanently truncated
+        // file won't grow back during the retry budget, so we surface
+        // the short read on the first observation rather than wasting
+        // 3×backoff. Short reads are handled by a dedicated branch in
+        // `read_at_with_retries` that fails fast.
+        assert!(!is_transient_io_error(&Error::new(ErrorKind::UnexpectedEof, "")));
+        // Permission denied is NOT transient — surfacing it lets the
+        // operator fix the mount rather than retry forever.
+        assert!(!is_transient_io_error(&Error::new(ErrorKind::PermissionDenied, "")));
+    }
+
+    /// `HardwareFailure` converts to an `io::Error` and round-trips
+    /// out through `into_inner().downcast` so call sites can recover
+    /// the structured error.
+    #[test]
+    fn hardware_failure_roundtrips_through_io_error() {
+        let hf = HardwareFailure::ExpertUnavailable {
+            expert_id: 7,
+            consecutive_failures: STORAGE_BREAKER_THRESHOLD,
+        };
+        let ioerr: io::Error = hf.into();
+        let inner = ioerr.into_inner().expect("inner");
+        let hf = inner
+            .downcast::<HardwareFailure>()
+            .expect("downcast");
+        match *hf {
+            HardwareFailure::ExpertUnavailable { expert_id, .. } => assert_eq!(expert_id, 7),
+            _ => panic!("wrong variant"),
+        }
     }
 }

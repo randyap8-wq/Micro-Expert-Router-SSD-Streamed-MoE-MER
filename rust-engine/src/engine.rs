@@ -347,12 +347,24 @@ pub enum EngineError {
     /// of experts because a single quant scheme is wired into the
     /// per-token math kernel.
     IncompatibleExpertTypes(crate::io_provider::IncompatibleExpertTypes),
+    /// The manifest indexed experts whose unique on-disk dtype does
+    /// not match the engine's configured `WeightDtype`. Surfaced by
+    /// [`Engine::verify_manifest_dtype`].
+    ManifestDtypeMismatch {
+        expected: WeightDtype,
+        found: WeightDtype,
+    },
 }
 
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EngineError::IncompatibleExpertTypes(e) => write!(f, "{e}"),
+            EngineError::ManifestDtypeMismatch { expected, found } => write!(
+                f,
+                "manifest dtype mismatch: engine configured for {expected:?} \
+                 but every indexed expert declares {found:?}"
+            ),
         }
     }
 }
