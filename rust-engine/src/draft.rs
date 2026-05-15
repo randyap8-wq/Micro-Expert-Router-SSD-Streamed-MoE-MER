@@ -344,7 +344,7 @@ impl RealModel {
             // is consulted by `peek_experts`'s attention pre-pass;
             // other layers ignore their KV slots in the peek path.
             if i + 1 < drafts.len() {
-                self.advance_preview_kv(&mut kv_preview[0], draft_tok, pos + i);
+                self.advance_preview_kv(&mut kv_preview[0], cur, pos + i);
             }
             cur = draft_tok;
         }
