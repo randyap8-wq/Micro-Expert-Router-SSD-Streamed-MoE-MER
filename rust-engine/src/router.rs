@@ -1832,11 +1832,13 @@ impl SpeculationController {
     /// Safe to call on the per-token hot path: a single
     /// `compare_exchange` plus two atomic loads / stores.
     pub fn update_from_stall(&self, cumulative_stall_us: u64) -> usize {
-        // Don't fight a manual suspension from the scheduler. The
-        // saved depth is still being tracked behind the scenes so
-        // resume() can restore the right value, but current_depth
-        // stays at zero until then.
+        // Don't fight a manual suspension from the scheduler. Keep
+        // the cumulative-stall baseline fresh behind the scenes so
+        // resume() does not immediately react to stall that accrued
+        // while speculation was intentionally disabled, but
+        // current_depth stays at zero until then.
         if self.saved_depth.load(Ordering::Relaxed) != usize::MAX {
+            self.last_stall_us.store(cumulative_stall_us, Ordering::Relaxed);
             return self.current_depth.load(Ordering::Relaxed);
         }
         let prev = self.last_stall_us.swap(cumulative_stall_us, Ordering::Relaxed);
