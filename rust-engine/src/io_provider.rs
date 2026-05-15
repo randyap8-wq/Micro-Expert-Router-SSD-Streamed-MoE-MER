@@ -78,8 +78,26 @@ pub const STORAGE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(50);
 /// `HardwareFailure` instead of touching the drive. A tripped breaker
 /// is reset by a successful read.
 ///
-/// The default matches Hystrix's well-known `5` consecutive failures.
-pub const STORAGE_BREAKER_THRESHOLD: u32 = 5;
+/// **Gist Phase 3 ("Hardware Failure Recovery").** Per the spec, the
+/// threshold is **3** consecutive read operations returning a
+/// timeout / EIO / checksum-style error — short enough to react to a
+/// failing NVMe shard inside one inference cycle, long enough to
+/// tolerate the kind of single-millisecond firmware hiccup that
+/// otherwise produces a false-positive trip.
+pub const STORAGE_BREAKER_THRESHOLD: u32 = 3;
+
+/// Consecutive-failure threshold at which the **per-drive** circuit
+/// breaker trips. When this many reads against *any* expert routed
+/// to the same drive fail consecutively, subsequent reads against
+/// that drive short-circuit to `HardwareFailure::DriveUnavailable`
+/// and the higher-level scheduler stops routing to it (gist Phase 3
+/// — "stop attempting to route to that specific drive").
+///
+/// In the single-drive layout `NvmeStorage::new` exposes one virtual
+/// drive, so a tripped per-drive breaker is equivalent to a global
+/// engine pause for new SSD reads — the cache + in-flight in-memory
+/// responses can still serve traffic until they drain.
+pub const STORAGE_DRIVE_BREAKER_THRESHOLD: u32 = 3;
 
 /// Classify an `io::Error` as transient (worth retrying) vs. fatal
 /// (worth surfacing immediately to the circuit breaker).
@@ -167,6 +185,37 @@ impl Default for BreakerState {
     }
 }
 
+/// Sticky per-drive health state — the aggregate cousin of
+/// [`BreakerState`] that lets the storage layer stop routing to a
+/// failed shard before *every* expert on that shard has independently
+/// tripped its own breaker. Gist Phase 3 ("Hardware Failure
+/// Recovery"): "if three consecutive read operations against the
+/// same drive return a timeout or checksum error, the controller
+/// must stop attempting to route to that specific drive".
+///
+/// One [`DriveBreakerState`] is kept per shard in [`NvmeStorage`]'s
+/// striped layout, indexed by `id % n_drives`. The single-drive
+/// layout has exactly one entry, in which case the drive breaker is
+/// the engine-wide fail-safe.
+#[derive(Debug)]
+pub struct DriveBreakerState {
+    /// Number of consecutive failed reads across **all** experts
+    /// routed to this drive since the last successful read.
+    pub consecutive_failures: AtomicU32,
+    /// Sticky "drive unavailable" flag. Reads short-circuit until
+    /// the next successful read on this drive clears it.
+    pub tripped: AtomicBool,
+}
+
+impl Default for DriveBreakerState {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: AtomicU32::new(0),
+            tripped: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Outcome of the storage layer's fault-tolerant read path.
 ///
 /// The variants distinguish:
@@ -194,6 +243,16 @@ pub enum HardwareFailure {
         expert_id: u32,
         consecutive_failures: u32,
     },
+    /// Per-drive circuit breaker has tripped — the storage layer
+    /// should stop routing **any** new reads to this shard until a
+    /// successful read clears the breaker. Surfaces the failing
+    /// drive index (`id % n_drives` for striped layouts) so
+    /// dashboards and pagers can correlate the trip with a specific
+    /// device. Gist Phase 3.
+    DriveUnavailable {
+        drive_index: usize,
+        consecutive_failures: u32,
+    },
 }
 
 impl std::fmt::Display for HardwareFailure {
@@ -207,6 +266,11 @@ impl std::fmt::Display for HardwareFailure {
                 f,
                 "expert {expert_id} marked unavailable by the circuit breaker \
                  ({consecutive_failures} consecutive failures)"
+            ),
+            HardwareFailure::DriveUnavailable { drive_index, consecutive_failures } => write!(
+                f,
+                "drive {drive_index} marked unavailable by the circuit breaker \
+                 ({consecutive_failures} consecutive failures across all experts)"
             ),
         }
     }
@@ -254,6 +318,12 @@ pub struct NvmeStorage {
     /// pattern on hot NVMe enclosures) keep serving traffic without
     /// operator intervention.
     breakers: RwLock<HashMap<u32, Arc<BreakerState>>>,
+    /// Per-drive circuit-breaker state (gist Phase 3 — "stop
+    /// attempting to route to that specific drive"). Indexed by
+    /// `id % n_drives` for striped layouts; the single-drive layout
+    /// keeps a one-element vector. Eagerly sized at construction so
+    /// the hot path is a plain index load, no `RwLock` access.
+    drive_breakers: Vec<Arc<DriveBreakerState>>,
 }
 
 impl NvmeStorage {
@@ -272,6 +342,7 @@ impl NvmeStorage {
             striped_paths: Vec::new(),
             manifest: None,
             breakers: RwLock::new(HashMap::new()),
+            drive_breakers: vec![Arc::new(DriveBreakerState::default())],
         })
     }
 
@@ -299,6 +370,9 @@ impl NvmeStorage {
         let mut cfg = cfg;
         cfg.base_path = dirs[0].clone();
         let mut s = Self::new(cfg)?;
+        s.drive_breakers = (0..dirs.len())
+            .map(|_| Arc::new(DriveBreakerState::default()))
+            .collect();
         s.striped_paths = dirs;
         Ok(s)
     }
@@ -442,6 +516,46 @@ impl NvmeStorage {
                 );
             }
         }
+        // A successful read also clears the drive-level breaker:
+        // whatever transient outage was happening is over.
+        let drive_idx = self.drive_index_for(id);
+        let db = &self.drive_breakers[drive_idx];
+        db.consecutive_failures.store(0, Ordering::Release);
+        if db.tripped.swap(false, Ordering::AcqRel) {
+            tracing::info!(
+                drive_index = drive_idx,
+                "drive circuit breaker reset after successful read"
+            );
+        }
+    }
+
+    /// Index of the drive serving `id` under the current layout.
+    /// `0` for the single-drive (`new`) layout.
+    #[inline]
+    fn drive_index_for(&self, id: u32) -> usize {
+        if self.striped_paths.is_empty() {
+            0
+        } else {
+            (id as usize) % self.striped_paths.len()
+        }
+    }
+
+    /// `true` iff the per-drive circuit breaker for the drive that
+    /// would serve `id` has tripped. Gist Phase 3 — exposed publicly
+    /// so the engine's higher-level scheduling layer can stop
+    /// dispatching to a known-bad drive without having to issue an
+    /// I/O.
+    pub fn is_drive_unavailable(&self, id: u32) -> bool {
+        self.drive_breakers[self.drive_index_for(id)]
+            .tripped
+            .load(Ordering::Acquire)
+    }
+
+    /// Borrow the per-drive breaker for a given drive index. Mostly
+    /// useful in tests; callers in production should rely on the
+    /// transparent short-circuit in [`Self::read_at_with_retries`].
+    pub fn drive_breaker(&self, drive_index: usize) -> Option<Arc<DriveBreakerState>> {
+        self.drive_breakers.get(drive_index).cloned()
     }
 
     /// Record one failed read. Returns `(just_tripped, count)`:
@@ -452,7 +566,11 @@ impl NvmeStorage {
     /// `HardwareFailure::ExpertUnavailable.consecutive_failures` so
     /// the value surfaced to the HTTP 503 reflects the actual
     /// observed failure count rather than a placeholder.
-    fn note_read_failure(&self, id: u32) -> (bool, u32) {
+    ///
+    /// Also bumps the **per-drive** breaker so a shard that sees
+    /// failures spread across many experts trips before any one
+    /// expert independently does.
+    fn note_read_failure(&self, id: u32) -> (bool, u32, bool, u32) {
         let b = self.breaker(id);
         let n = b.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
         let just_tripped =
@@ -464,7 +582,19 @@ impl NvmeStorage {
                 "circuit breaker tripped — expert unavailable until next successful read"
             );
         }
-        (just_tripped, n)
+        let drive_idx = self.drive_index_for(id);
+        let db = &self.drive_breakers[drive_idx];
+        let dn = db.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        let drive_just_tripped =
+            dn >= STORAGE_DRIVE_BREAKER_THRESHOLD && !db.tripped.swap(true, Ordering::AcqRel);
+        if drive_just_tripped {
+            tracing::error!(
+                drive_index = drive_idx,
+                consecutive_failures = dn,
+                "drive circuit breaker tripped — no further reads will be routed to this shard"
+            );
+        }
+        (just_tripped, n, drive_just_tripped, dn)
     }
 
     /// Fault-tolerant `pread(2)` wrapper with three-tier retry +
@@ -479,6 +609,22 @@ impl NvmeStorage {
         offset: u64,
         dst: &mut [u8],
     ) -> io::Result<usize> {
+        // Fast path: per-drive breaker is tripped — no syscall, no
+        // expert-level tracking. Drive failures are sticky and
+        // affect every expert sharded onto this drive, so we
+        // short-circuit before even consulting `is_expert_unavailable`.
+        // Gist Phase 3.
+        if self.is_drive_unavailable(expert_id) {
+            let drive_index = self.drive_index_for(expert_id);
+            let cf = self.drive_breakers[drive_index]
+                .consecutive_failures
+                .load(Ordering::Acquire);
+            return Err(HardwareFailure::DriveUnavailable {
+                drive_index,
+                consecutive_failures: cf,
+            }
+            .into());
+        }
         // Fast path: breaker is tripped — no syscall.
         if self.is_expert_unavailable(expert_id) {
             let cf = self
@@ -506,11 +652,18 @@ impl NvmeStorage {
                     // truncated file. Not worth retrying (the file
                     // isn't going to grow back in 50 ms); count it
                     // against the breaker and surface fast.
-                    let (tripped, cf) = self.note_read_failure(expert_id);
+                    let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
                     let err = io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         format!("short read on expert {expert_id}: got {n} bytes, expected {}", dst.len()),
                     );
+                    if drive_tripped {
+                        return Err(HardwareFailure::DriveUnavailable {
+                            drive_index: self.drive_index_for(expert_id),
+                            consecutive_failures: dcf,
+                        }
+                        .into());
+                    }
                     if tripped {
                         return Err(HardwareFailure::ExpertUnavailable {
                             expert_id,
@@ -538,7 +691,14 @@ impl NvmeStorage {
                     // breaker after `STORAGE_BREAKER_THRESHOLD`
                     // *invocations* — i.e. once the layer above has
                     // attempted the expert that many times.
-                    let (tripped, cf) = self.note_read_failure(expert_id);
+                    let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
+                    if drive_tripped {
+                        return Err(HardwareFailure::DriveUnavailable {
+                            drive_index: self.drive_index_for(expert_id),
+                            consecutive_failures: dcf,
+                        }
+                        .into());
+                    }
                     if tripped {
                         return Err(HardwareFailure::ExpertUnavailable {
                             expert_id,
@@ -557,7 +717,7 @@ impl NvmeStorage {
                 backoff = (backoff * 2).min(STORAGE_RETRY_MAX_BACKOFF);
             }
         }
-        let (tripped, cf) = self.note_read_failure(expert_id);
+        let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
         // `last_err` is always Some here: the only way to fall out of
         // the loop without returning is via the transient-error branch
         // (which sets `last_err`). The `unwrap_or_else` is a
@@ -565,7 +725,13 @@ impl NvmeStorage {
         let err = last_err.unwrap_or_else(|| {
             io::Error::other("retry loop exited without recording a transient error (bug)")
         });
-        if tripped {
+        if drive_tripped {
+            Err(HardwareFailure::DriveUnavailable {
+                drive_index: self.drive_index_for(expert_id),
+                consecutive_failures: dcf,
+            }
+            .into())
+        } else if tripped {
             Err(HardwareFailure::ExpertUnavailable {
                 expert_id,
                 consecutive_failures: cf,

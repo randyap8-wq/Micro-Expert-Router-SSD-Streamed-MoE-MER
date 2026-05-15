@@ -433,6 +433,29 @@ impl std::error::Error for BatchError {}
 /// Background loop: collect a batch (size- or timeout-bounded), run
 /// each request's decoder step concurrently on shared `Engine`,
 /// reply to each via its oneshot, repeat.
+///
+/// **SSD Read De-Duplication pre-pass (gist Phase 1).** Before the
+/// concurrent `model.step` tasks are spawned, the loop peeks at the
+/// routing decisions each request is likely to make (via
+/// [`RealModel::peek_experts`]) and folds them into a single
+/// `HashSet<u32>` of unique expert ids. A *single* unified
+/// [`Engine::warm_with`] call then pulls them all into the
+/// [`ExpertCache`] concurrently, with the in-flight singleflight on
+/// `Engine::fetch_with_retry` guaranteeing at most one disk read per
+/// unique id. By the time the math tasks fan out, every common
+/// expert is hot — eliminating the redundant I/O contention the
+/// pre-pass exists to solve.
+///
+/// **Deadlock safety under `BufferPool` pressure.** The pre-pass
+/// fetches funnel through `fetch_with_retry`, which surfaces
+/// [`ExpertReadError::PoolStarved`] rather than spinning if every
+/// pool slot is pinned. `warm_with` discards those errors (it is a
+/// best-effort prefetch), so the scheduler always proceeds to spawn
+/// the per-request `model.step` tasks. Each task then re-tries the
+/// same id through the same singleflight'd path, where buffer-pool
+/// pressure naturally drains as earlier requests complete their
+/// step. No fan-in / fan-out point holds a buffer across the warm
+/// pass, so a saturated pool cannot deadlock the loop.
 async fn scheduler_loop(
     model: Arc<RealModel>,
     engine: Arc<Engine>,
@@ -469,6 +492,34 @@ async fn scheduler_loop(
                     Ok(None) => break, // channel closed
                     Err(_) => break,   // timeout
                 }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // Pre-pass: peek at every request's routing decision and
+        // warm the union of expert ids in a single unified read
+        // (gist Phase 1 — SSD Read De-Duplication).
+        // ----------------------------------------------------------
+        let mut unique: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for req in &batch {
+            if let Some(entry) = registry.get(req.id) {
+                // Use try_lock so a peek never blocks on a step that
+                // is concurrently mutating the same request's KV.
+                // If we can't acquire the lock right now the warm
+                // pass simply skips this request — the singleflight
+                // path still dedups its critical-path reads.
+                if let Ok(kv) = entry.try_lock() {
+                    let peeked = model.peek_experts(req.token_id, req.pos, &kv);
+                    for id in peeked {
+                        unique.insert(id);
+                    }
+                }
+            }
+        }
+        if !unique.is_empty() {
+            let ids: Vec<u32> = unique.into_iter().collect();
+            if let Err(e) = engine.warm_with(&ids).await {
+                tracing::debug!(error = %e, "scheduler pre-pass warm_with failed; falling through to inline fetches");
             }
         }
 
