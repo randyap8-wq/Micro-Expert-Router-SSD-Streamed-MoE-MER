@@ -83,11 +83,18 @@ pub const STORAGE_BREAKER_THRESHOLD: u32 = 5;
 
 /// Classify an `io::Error` as transient (worth retrying) vs. fatal
 /// (worth surfacing immediately to the circuit breaker).
+///
+/// `UnexpectedEof` is **not** treated as transient even though
+/// `read_at_with_retries` synthesises it for short reads. A genuinely
+/// truncated `expert_<id>.bin` is not going to grow back during the
+/// next 50 ms of backoff, so retrying it three times is pointless —
+/// we count the failure against the breaker on the first read and
+/// surface the error immediately.
 fn is_transient_io_error(e: &io::Error) -> bool {
     use io::ErrorKind::*;
     matches!(
         e.kind(),
-        Interrupted | WouldBlock | TimedOut | ResourceBusy | UnexpectedEof
+        Interrupted | WouldBlock | TimedOut | ResourceBusy
     ) || e.raw_os_error() == Some(libc::EIO)
         || e.raw_os_error() == Some(libc::EAGAIN)
 }
@@ -484,13 +491,23 @@ impl NvmeStorage {
                     return Ok(n);
                 }
                 Ok(n) => {
-                    // Short read — count it as transient and retry. A
-                    // genuinely-truncated file will hit the retry cap
-                    // and surface as a `HardwareFailure::Transient`.
-                    last_err = Some(io::Error::new(
+                    // Short read — almost certainly a permanently
+                    // truncated file. Not worth retrying (the file
+                    // isn't going to grow back in 50 ms); count it
+                    // against the breaker and surface fast.
+                    let tripped = self.note_read_failure(expert_id);
+                    let err = io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        format!("short read: got {n} bytes, expected {}", dst.len()),
-                    ));
+                        format!("short read on expert {expert_id}: got {n} bytes, expected {}", dst.len()),
+                    );
+                    if tripped {
+                        return Err(HardwareFailure::ExpertUnavailable {
+                            expert_id,
+                            consecutive_failures: STORAGE_BREAKER_THRESHOLD,
+                        }
+                        .into());
+                    }
+                    return Err(err);
                 }
                 Err(e) if is_transient_io_error(&e) => {
                     tracing::warn!(
@@ -526,7 +543,13 @@ impl NvmeStorage {
             }
         }
         let tripped = self.note_read_failure(expert_id);
-        let err = last_err.unwrap_or_else(|| io::Error::other("unknown I/O failure"));
+        // `last_err` is always Some here: the only way to fall out of
+        // the loop without returning is via the transient-error branch
+        // (which sets `last_err`). The `unwrap_or_else` is a
+        // defence-in-depth fallback for an impossible state.
+        let err = last_err.unwrap_or_else(|| {
+            io::Error::other("retry loop exited without recording a transient error (bug)")
+        });
         if tripped {
             Err(HardwareFailure::ExpertUnavailable {
                 expert_id,
@@ -1803,10 +1826,15 @@ mod tests {
         assert!(is_transient_io_error(&Error::new(ErrorKind::Interrupted, "")));
         assert!(is_transient_io_error(&Error::new(ErrorKind::WouldBlock, "")));
         assert!(is_transient_io_error(&Error::new(ErrorKind::TimedOut, "")));
-        assert!(is_transient_io_error(&Error::new(ErrorKind::UnexpectedEof, "")));
         // EIO maps to a raw-OS retryable error too.
         let eio = Error::from_raw_os_error(libc::EIO);
         assert!(is_transient_io_error(&eio));
+        // UnexpectedEof is NOT transient: a permanently truncated
+        // file won't grow back during the retry budget, so we surface
+        // the short read on the first observation rather than wasting
+        // 3×backoff. Short reads are handled by a dedicated branch in
+        // `read_at_with_retries` that fails fast.
+        assert!(!is_transient_io_error(&Error::new(ErrorKind::UnexpectedEof, "")));
         // Permission denied is NOT transient — surfacing it lets the
         // operator fix the mount rather than retry forever.
         assert!(!is_transient_io_error(&Error::new(ErrorKind::PermissionDenied, "")));

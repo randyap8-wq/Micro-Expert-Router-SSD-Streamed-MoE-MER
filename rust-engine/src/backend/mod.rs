@@ -151,7 +151,9 @@ impl Backend for CandleBackend {
         // Build (rows × cols) and (cols × 1) on the CPU device, multiply,
         // then unwrap back to a Vec<f32>. Falls back to the scalar
         // reference on any candle error so the engine never panics on a
-        // pathological shape.
+        // pathological shape — and emits a warning so operators see
+        // that the candle path is misbehaving rather than silently
+        // running the slower oracle.
         use candle_core::{Device, Tensor};
         let make = || -> Result<Vec<f32>, candle_core::Error> {
             let w_t = Tensor::from_slice(w, (rows, cols), &Device::Cpu)?;
@@ -161,7 +163,15 @@ impl Backend for CandleBackend {
         };
         match make() {
             Ok(v) => v,
-            Err(_) => ScalarBackend.matmul(w, x, rows, cols),
+            Err(e) => {
+                tracing::warn!(
+                    rows,
+                    cols,
+                    error = %e,
+                    "CandleBackend matmul failed; falling back to ScalarBackend"
+                );
+                ScalarBackend.matmul(w, x, rows, cols)
+            }
         }
     }
 

@@ -22,11 +22,14 @@ use std::arch::x86_64::*;
 ///
 /// Caller must guarantee the CPU supports `avx2 + fma`. The
 /// dispatcher in [`super::dot_f32`] checks this exactly once at
-/// startup via [`super::cpu_features`]. The kernel itself reads
-/// through `_mm256_loadu_ps` (no alignment requirement on the
-/// pointer), writes nothing, and uses a separate scalar loop for
-/// the < 8 trailing elements, so no out-of-bounds access is possible
-/// for any `a.len() == b.len()`.
+/// startup via [`super::cpu_features`].
+///
+/// `a` and `b` are borrowed slices whose backing storage remains
+/// valid for the duration of this call (the standard Rust borrow
+/// rules); the kernel reads through `_mm256_loadu_ps` (no alignment
+/// requirement on the pointer), writes nothing, and uses a separate
+/// scalar loop for the < 8 trailing elements, so no out-of-bounds
+/// access is possible for any `a.len() == b.len()`.
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -35,8 +38,9 @@ pub unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0usize;
     while i + 8 <= n {
         // SAFETY: `i + 8 <= n` guarantees the eight floats from offset
-        // `i` are in bounds for both slices; `loadu_ps` has no
-        // alignment requirement.
+        // `i` are in bounds for both slices (which we just bound-
+        // checked against `a.len() == b.len() == n`); `loadu_ps`
+        // imposes no alignment requirement on the pointer.
         let va = _mm256_loadu_ps(a.as_ptr().add(i));
         let vb = _mm256_loadu_ps(b.as_ptr().add(i));
         acc = _mm256_fmadd_ps(va, vb, acc);

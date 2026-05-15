@@ -171,20 +171,37 @@ fn probe_cpu() -> CpuFeatures {
 /// We don't ship a full CPUID family / model table; instead we look
 /// for vendor-distributed model strings that uniquely identify the
 /// generation. Updated as Intel releases new SKUs.
+///
+/// The match is intentionally conservative: we require **both** the
+/// `"xeon"` substring and a SKU-family token that's distinctive to
+/// Sapphire Rapids or newer (e.g. `"platinum 84"`, `"gold 64"`,
+/// `"xeon max"`, `"granite"`, `"emerald"`). Bare two-digit substrings
+/// like `"64"` are too permissive — they match e.g. `"AMD EPYC
+/// 7643"`. AMX is only ever advertised by Intel Xeon, so the `"xeon"`
+/// gate alone already rules out AMD parts; the SKU tokens then narrow
+/// the match to the Sapphire-Rapids generation specifically.
 fn is_sapphire_rapids_or_newer(model: &str) -> bool {
     let s = model.to_ascii_lowercase();
-    // Sapphire Rapids Xeon Scalable 4th gen: model names contain
-    // "Xeon Platinum 84xx", "Gold 64xx", "Silver 44xx", "Bronze 34xx",
-    // or the developer SKU "Xeon Max" / "Xeon w-2400".
-    s.contains("xeon") && (
-        s.contains("84") || s.contains("85") ||
-        s.contains("64") || s.contains("65") ||
-        s.contains("44") || s.contains("45") ||
-        s.contains("34") || s.contains("35") ||
-        s.contains("max") || s.contains("w-2400") || s.contains("w-3400") ||
-        // Granite Rapids (5th gen) and later
-        s.contains("granite") || s.contains("emerald")
-    )
+    if !s.contains("xeon") {
+        return false;
+    }
+    // Sapphire Rapids (4th gen Xeon Scalable) and the Xeon W-2400 /
+    // W-3400 workstation parts. Tokens are taken straight from Intel's
+    // product pages.
+    const SKU_TOKENS: &[&str] = &[
+        "platinum 84", "platinum 85",
+        "gold 64", "gold 65",
+        "silver 44", "silver 45",
+        "bronze 34", "bronze 35",
+        // "max" — only the Xeon Max line carries this token; gated by
+        // the outer `s.contains("xeon")` check above so it can't match
+        // arbitrary non-Xeon model strings.
+        " max ", "w-2400", "w-3400",
+        // Granite Rapids (5th gen Xeon Scalable, AMX-capable) and
+        // Emerald Rapids (refresh of Sapphire Rapids).
+        "granite", "emerald",
+    ];
+    SKU_TOKENS.iter().any(|tok| s.contains(tok))
 }
 
 fn cpuinfo_has_flag(flag: &str) -> bool {
@@ -378,6 +395,10 @@ mod tests {
         assert!(is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Gold 6448Y"));
         assert!(is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Max 9468"));
         assert!(!is_sapphire_rapids_or_newer("AMD EPYC 7763 64-Core Processor"));
+        assert!(!is_sapphire_rapids_or_newer("AMD EPYC 7643 48-Core Processor"));
         assert!(!is_sapphire_rapids_or_newer("Apple M1 Pro"));
+        // Older Xeon generations must NOT match (they predate AMX).
+        assert!(!is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Platinum 8260"));
+        assert!(!is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Gold 6230"));
     }
 }
