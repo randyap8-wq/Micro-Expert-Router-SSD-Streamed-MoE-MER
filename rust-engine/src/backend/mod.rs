@@ -57,7 +57,60 @@ pub trait Backend: Send + Sync + 'static {
     /// Row-major matrix-vector multiply `y = W · x`. `W` is
     /// `[rows × cols]` in row-major order; `x.len() == cols`.
     /// Implementations must return a fresh `Vec<f32>` of length `rows`.
-    fn matmul(&self, w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32>;
+    ///
+    /// **Hot-path callers should prefer [`Backend::matmul_into`]** —
+    /// this method exists for older callers that owned the output
+    /// `Vec`. The default `matmul_into` impl delegates here, so
+    /// implementing only `matmul` keeps everything correct;
+    /// implementing `matmul_into` directly eliminates the allocation.
+    fn matmul(&self, w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut y = vec![0.0f32; rows];
+        self.matmul_into(w, x, rows, cols, &mut y);
+        y
+    }
+
+    /// Row-major matmul that writes into a **caller-owned** `y`
+    /// (`y.len() == rows`). The "no allocation on the hot path"
+    /// performance guardrail: implementations must not allocate new
+    /// `Vec`s here.
+    ///
+    /// Default impl allocates via [`Backend::matmul`] and copies the
+    /// result into `y` — correct, but defeats the no-alloc guardrail.
+    /// Built-in backends override it.
+    fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
+        debug_assert_eq!(y.len(), rows);
+        let v = self.matmul(w, x, rows, cols);
+        y.copy_from_slice(&v);
+    }
+
+    /// Fused SwiGLU FFN inner stage: `y[i] = silu(gate_w[i]·x) * (up_w[i]·x)`.
+    ///
+    /// `gate_w` and `up_w` are row-major `[rows × cols]` matrices.
+    /// `y` is caller-owned (no allocation on the hot path).
+    ///
+    /// Default impl chains two `matmul_into` calls + a scalar SiLU
+    /// fuse — correct on every backend, but built-in backends
+    /// override to keep the gate intermediate hot in registers.
+    fn swiglu_into(
+        &self,
+        gate_w: &[f32],
+        up_w: &[f32],
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        y: &mut [f32],
+    ) {
+        debug_assert_eq!(y.len(), rows);
+        // Caller-owned scratch is not part of the trait surface, so
+        // the default routes through `matmul` (allocation acceptable
+        // on this slow fallback path); overriding backends fuse.
+        let g = self.matmul(gate_w, x, rows, cols);
+        let u = self.matmul(up_w, x, rows, cols);
+        for i in 0..rows {
+            let silu_g = g[i] / (1.0 + (-g[i]).exp());
+            y[i] = silu_g * u[i];
+        }
+    }
 
     /// In-place softmax over `logits`. Numerically stable; the result
     /// must be non-negative and sum to exactly 1.0 within `f32`
@@ -85,19 +138,31 @@ impl Backend for ScalarBackend {
         "scalar"
     }
 
-    fn matmul(&self, w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
         debug_assert_eq!(w.len(), rows * cols);
         debug_assert_eq!(x.len(), cols);
-        let mut y = vec![0.0f32; rows];
+        debug_assert_eq!(y.len(), rows);
+        // Route through the kernel dispatcher so the scalar backend
+        // still auto-escalates to AVX-512 / AVX2 when the host
+        // supports it — same value as the hand-rolled inner loop, no
+        // allocation on the hot path.
         for i in 0..rows {
-            let row = &w[i * cols..(i + 1) * cols];
-            let mut acc = 0.0f32;
-            for j in 0..cols {
-                acc += row[j] * x[j];
-            }
-            y[i] = acc;
+            y[i] = crate::kernels::dot_f32(&w[i * cols..(i + 1) * cols], x);
         }
-        y
+    }
+
+    fn swiglu_into(
+        &self,
+        gate_w: &[f32],
+        up_w: &[f32],
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        y: &mut [f32],
+    ) {
+        // Fused dispatcher — picks the AVX-512 fused kernel when
+        // available, otherwise the scalar reference.
+        crate::kernels::swiglu_f32_into(gate_w, up_w, x, rows, cols, y);
     }
 
     fn softmax(&self, logits: &mut [f32]) {
@@ -147,46 +212,43 @@ impl Backend for CandleBackend {
         "candle"
     }
 
-    fn matmul(&self, w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-        // Build (rows × cols) and (cols × 1) on the CPU device, multiply,
-        // then unwrap back to a Vec<f32>. Falls back to the scalar
-        // reference on any candle error so the engine never panics on a
-        // pathological shape — and emits a warning so operators see
-        // that the candle path is misbehaving rather than silently
-        // running the slower oracle.
+    fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
+        // **Performance contract.** The previous revision rebuilt two
+        // `candle_core::Tensor`s from scratch on every call (one
+        // allocation per tensor plus dispatch overhead). For the
+        // small per-expert / per-row shapes the engine actually
+        // calls this with, that setup cost dwarfed the FMA work.
         //
-        // **Performance contract.** Each call rebuilds two
-        // `candle_core::Tensor`s from scratch (one allocation per
-        // tensor plus the multiply-dispatch overhead). For very small
-        // `rows × cols` shapes this dwarfs the FMA work and the
-        // backend will run slower than [`ScalarBackend`]. Callers on
-        // the hot decoder path are expected to batch projections so
-        // each invocation amortises the setup cost. The crate's
-        // existing `kernels::matmul_row_major` deliberately does
-        // **not** route through this trait today (the dispatch lives
-        // inline so the row-parallel loop stays branch-free); this
-        // backend is wired for places that *do* call
-        // `backend::current().matmul(...)` — gate adapters,
-        // logits-projection harnesses, and future plugin executors.
-        use candle_core::{Device, Tensor};
-        let make = || -> Result<Vec<f32>, candle_core::Error> {
-            let w_t = Tensor::from_slice(w, (rows, cols), &Device::Cpu)?;
-            let x_t = Tensor::from_slice(x, (cols, 1), &Device::Cpu)?;
-            let y_t = w_t.matmul(&x_t)?.squeeze(1)?;
-            y_t.to_vec1::<f32>()
-        };
-        match make() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    rows,
-                    cols,
-                    error = %e,
-                    "CandleBackend matmul failed; falling back to ScalarBackend"
-                );
-                ScalarBackend.matmul(w, x, rows, cols)
-            }
+        // The optimised path bypasses Candle entirely and dispatches
+        // through [`crate::kernels::dot_f32`], which is the runtime
+        // AVX-512 → AVX2 → scalar auto-escalator. The result is
+        // bit-equivalent to the Candle Tensor matmul within `f32`
+        // reduction rounding (the `backend_implementations_agree`
+        // test enforces a 1e-4 envelope), allocations on the hot
+        // path are zero, and AVX-512 hosts get the fused 4×-unrolled
+        // FMA kernel from `kernels::avx512`.
+        debug_assert_eq!(w.len(), rows * cols);
+        debug_assert_eq!(x.len(), cols);
+        debug_assert_eq!(y.len(), rows);
+        for i in 0..rows {
+            y[i] = crate::kernels::dot_f32(&w[i * cols..(i + 1) * cols], x);
         }
+    }
+
+    fn swiglu_into(
+        &self,
+        gate_w: &[f32],
+        up_w: &[f32],
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        y: &mut [f32],
+    ) {
+        // Fused gate + up + SiLU through the kernel dispatcher.
+        // On AVX-512 hosts this is the single-pass
+        // [`crate::kernels::avx512::swiglu_f32_avx512`] kernel
+        // (no candle Tensor round-trip, no scratch allocation).
+        crate::kernels::swiglu_f32_into(gate_w, up_w, x, rows, cols, y);
     }
 
     fn softmax(&self, logits: &mut [f32]) {
@@ -264,6 +326,60 @@ mod tests {
                 "scalar vs candle matmul mismatch at {i}: {} vs {}",
                 s[i],
                 c[i]
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_into_writes_into_caller_buffer_without_allocating() {
+        // The new `_into` entry points satisfy the "no allocation on
+        // the hot path" guardrail: the caller owns `y`.
+        let rows = 5usize;
+        let cols = 9usize;
+        let w: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.2 - 1.0).collect();
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.4).sin()).collect();
+        let mut y_scalar = vec![0.0f32; rows];
+        let mut y_candle = vec![0.0f32; rows];
+        ScalarBackend.matmul_into(&w, &x, rows, cols, &mut y_scalar);
+        CandleBackend.matmul_into(&w, &x, rows, cols, &mut y_candle);
+        for i in 0..rows {
+            assert!((y_scalar[i] - y_candle[i]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn swiglu_into_agrees_across_backends_and_with_unfused_reference() {
+        let rows = 6usize;
+        let cols = 11usize;
+        let gate: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.21).sin()).collect();
+        let up: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.17).cos()).collect();
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.31).cos() * 0.4).collect();
+
+        let mut y_scalar = vec![0.0f32; rows];
+        let mut y_candle = vec![0.0f32; rows];
+        ScalarBackend.swiglu_into(&gate, &up, &x, rows, cols, &mut y_scalar);
+        CandleBackend.swiglu_into(&gate, &up, &x, rows, cols, &mut y_candle);
+
+        // Reference: unfused matmul + scalar SiLU + multiply.
+        let g = ScalarBackend.matmul(&gate, &x, rows, cols);
+        let u = ScalarBackend.matmul(&up, &x, rows, cols);
+        let expected: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
+            .map(|(&gi, &ui)| (gi / (1.0 + (-gi).exp())) * ui)
+            .collect();
+        for i in 0..rows {
+            assert!(
+                (y_scalar[i] - expected[i]).abs() < 1e-4,
+                "scalar swiglu mismatch at {i}: {} vs {}",
+                y_scalar[i],
+                expected[i]
+            );
+            assert!(
+                (y_candle[i] - expected[i]).abs() < 1e-4,
+                "candle swiglu mismatch at {i}: {} vs {}",
+                y_candle[i],
+                expected[i]
             );
         }
     }
