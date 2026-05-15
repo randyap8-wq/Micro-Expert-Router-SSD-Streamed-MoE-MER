@@ -337,13 +337,13 @@ pub struct RealTransformerConfig {
     /// transformer body's matmul / attention / LM-head. `"cpu"`
     /// (default) routes through [`crate::backend::CandleBackend`] /
     /// the auto-escalating SIMD dispatcher in [`crate::kernels`].
-    /// `"gpu"` opts into [`crate::backend::GpuBackend`] — when the
-    /// binary was built with the `gpu` cargo feature **and** a
-    /// compute-capable adapter is reachable, the dense path executes
-    /// on a budget GPU; otherwise the backend transparently falls
-    /// back to CPU. The SSD-streamed expert pipeline stays CPU-side
-    /// either way, matching the gist's "budget GPU augments CPU"
-    /// posture.
+    /// `"gpu"` selects the [`crate::backend::GpuBackend`] integration
+    /// seam. At present this is a compatibility/configuration switch
+    /// for the GPU backend path rather than a guaranteed operational
+    /// GPU offload mode, so execution still falls back to the CPU
+    /// dense path when GPU acceleration is not active. The
+    /// SSD-streamed expert pipeline stays CPU-side either way,
+    /// matching the gist's "budget GPU augments CPU" posture.
     #[serde(default)]
     pub compute_offload: crate::backend::ComputeOffload,
 }
