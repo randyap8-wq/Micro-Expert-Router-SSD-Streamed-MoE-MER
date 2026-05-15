@@ -1574,8 +1574,9 @@ pub const MAX_LATENCY_BUMP: usize = 2;
 
 /// Lock-free co-occurrence matrix tracking which expert ids fire
 /// together inside the same MoE layer. The hot path (`observe_layer`)
-/// only does `fetch_add` on pre-allocated `AtomicU32` cells, so it
-/// never grabs a lock and never allocates.
+/// only performs atomic updates on pre-allocated `AtomicU32` cells;
+/// saturating increments may use a compare-exchange retry loop, but
+/// the path never grabs a lock and never allocates.
 ///
 /// The matrix is **symmetric**: `affinity(i, j) == affinity(j, i)`,
 /// because co-occurrence is undirected (two experts active in the
