@@ -161,6 +161,96 @@ pub unsafe fn dequant_int8_dot_avx512(scale: f32, q: &[i8], x: &[f32]) -> f32 {
     sum * scale
 }
 
+/// **AVX-512 VNNI int8×int8 dot — gist Part 2, fix #8.** Uses
+/// `_mm512_dpbusd_epi32` to compute `sum_{4i+j} a.u8[4i+j] * b.i8[4i+j]`
+/// across 64-byte lanes in a single instruction, accumulating into
+/// i32. The whole inner reduction stays in integer registers; the only
+/// f32 multiply is the final per-tensor scale fold at the end. That
+/// removes the `cvtepi32_ps` round-trip the FP-accumulator path
+/// [`dequant_int8_dot_avx512`] pays on every 16-byte chunk.
+///
+/// **Why the bias trick.** Plain AVX-512 VNNI only ships
+/// `VPDPBUSD` (Bytes Unsigned × Signed → Doubleword), not the
+/// `VPDPBSSD` variant added later in AVX-VNNI / AVX10. We bias the
+/// weight operand `qw` from `i8 ∈ [-128, 127]` into `u8 ∈ [0, 255]`
+/// by adding 128, then correct for the bias on the activation sum:
+///
+///   ```text
+///   qw[i] * qx[i] = (qw[i] + 128 - 128) * qx[i]
+///                 = ((qw[i] + 128) as u8) * qx[i] - 128 * qx[i]
+///   ```
+///
+/// so the full dot reduces to one `dpbusd` reduction plus
+/// `-128 * sum(qx)`. The activation sum is a cheap `sad_epu8` /
+/// horizontal-add across the same bytes, computed once per call.
+///
+/// # Safety
+/// Caller must guarantee the CPU supports `avx512f + avx512bw + avx512vnni`.
+/// The dispatcher in [`super::dot_int8_int8`] checks the runtime probe
+/// before delegating.
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub unsafe fn dot_int8_int8_avx512_vnni(out_scale: f32, qw: &[i8], qx: &[i8]) -> f32 {
+    debug_assert_eq!(qw.len(), qx.len());
+    let n = qw.len();
+    // Two independent VNNI accumulators break the issue-port
+    // dependency chain on Sapphire Rapids (one `vpdpbusd` per cycle
+    // per port × 2 ports). The bias-correction sum is folded in
+    // separately at the end.
+    let mut vnni_acc0 = _mm512_setzero_si512();
+    let mut vnni_acc1 = _mm512_setzero_si512();
+    // Bias offset: 0x80 (128) added to every weight byte to lift
+    // `i8 ∈ [-128, 127]` into `u8 ∈ [0, 255]`. Stored as a vector
+    // constant so the bias add is a single `_mm512_add_epi8`.
+    let bias_v = _mm512_set1_epi8(-128i8); // XOR sign bit equiv to +128 mod 256
+    // Activation sum is computed in i32 by widening i8 → i32 per
+    // lane. `sad_epu8` would only work on u8, and `madd_epi16` needs
+    // a constant 1-vector, so we keep this path explicit.
+    let mut act_sum_acc = _mm512_setzero_si512();
+    let one_i16 = _mm512_set1_epi16(1);
+    let mut i = 0usize;
+    while i + 64 <= n {
+        // Load 64 weights as i8, XOR the sign bit to convert to the
+        // u8 bias-shifted operand expected by `vpdpbusd`.
+        let qw_v = _mm512_loadu_si512(qw.as_ptr().add(i) as *const __m512i);
+        let qw_u8 = _mm512_xor_si512(qw_v, bias_v); // = (qw + 128) as u8
+        let qx_v = _mm512_loadu_si512(qx.as_ptr().add(i) as *const __m512i);
+        // VPDPBUSD: 4-byte groups of (u8 × i8) → i32. Splitting the
+        // 64-byte chunk across two accumulators (low/high halves
+        // interleaved) keeps the issue port busy.
+        vnni_acc0 = _mm512_dpbusd_epi32(vnni_acc0, qw_u8, qx_v);
+        // Activation byte-sum: pmaddubsw with a constant 1-vector
+        // widens i8×u8 → i16, then sum pairs into i32 via madd_epi16.
+        // `pmaddubsw` expects (u8, i8) — we want sum of qx[i].i8, so
+        // multiply by all-ones (u8 = 1) to keep the sign.
+        let ones_u8 = _mm512_set1_epi8(1);
+        let prod_i16 = _mm512_maddubs_epi16(ones_u8, qx_v);
+        act_sum_acc = _mm512_add_epi32(act_sum_acc, _mm512_madd_epi16(prod_i16, one_i16));
+        // Use the second accumulator on alternating iterations so
+        // the issue ports don't stall waiting on a single dependency
+        // chain. (Cosmetic on out-of-order cores; explicit on
+        // in-order issue.)
+        std::mem::swap(&mut vnni_acc0, &mut vnni_acc1);
+        i += 64;
+    }
+    let dot_v = _mm512_add_epi32(vnni_acc0, vnni_acc1);
+    let mut dot_i32 = _mm512_reduce_add_epi32(dot_v) as i64;
+    let mut act_sum = _mm512_reduce_add_epi32(act_sum_acc) as i64;
+    // < 64-byte scalar tail — keeps the kernel total bit-equivalent
+    // to the reference across all lengths.
+    while i < n {
+        // Use the *unbiased* tail formula directly; equivalent to the
+        // SIMD body's `(u + qx) - 128 * qx` rearrangement.
+        dot_i32 += (qw[i] as i32 as i64).wrapping_mul(qx[i] as i32 as i64);
+        i += 1;
+    }
+    // Subtract the bias contribution accumulated by VPDPBUSD.
+    // The SIMD body computed `sum (qw + 128) * qx`, i.e. dot + 128 *
+    // sum(qx_bytes_in_simd_region). Only correct over the SIMD
+    // region; the scalar tail above was added directly, no bias.
+    let dot_full = dot_i32 - 128i64 * act_sum;
+    (dot_full as f32) * out_scale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

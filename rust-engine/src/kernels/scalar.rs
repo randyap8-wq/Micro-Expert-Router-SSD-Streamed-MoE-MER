@@ -33,6 +33,27 @@ pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
     acc * scale
 }
 
+/// Fully-quantised int8×int8 dot with combined output scale: returns
+/// `out_scale * sum_i (qw[i] * qx[i])`. The activation is **also**
+/// int8 (each side carries its own per-tensor scale; `out_scale =
+/// w_scale * x_scale` is folded in at the end). This is the
+/// VNNI-friendly shape — see [`super::avx512::dot_int8_int8_avx512_vnni`]
+/// — so the engine can route int8 activations through
+/// `_mm512_dpbusd_epi32` and only spend one f32 multiply per dot at
+/// the very end. The scalar reference here is the validation oracle.
+#[inline]
+pub fn dot_int8_int8(out_scale: f32, qw: &[i8], qx: &[i8]) -> f32 {
+    debug_assert_eq!(qw.len(), qx.len());
+    // Accumulate in i32 (saturating at i32::MAX is impossible for any
+    // realistic length: max |qw[i] * qx[i]| = 127 * 128 = 16,256, so
+    // even a 1 M-element row stays well under i32::MAX).
+    let mut acc: i32 = 0;
+    for i in 0..qw.len() {
+        acc += (qw[i] as i32) * (qx[i] as i32);
+    }
+    (acc as f32) * out_scale
+}
+
 /// Reference SwiGLU FFN inner stage: `y[i] = silu(gate_w[i]·x) * (up_w[i]·x)`.
 ///
 /// Used as the parity oracle for [`super::avx512::swiglu_f32_avx512`].

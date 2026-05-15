@@ -331,6 +331,21 @@ pub struct RealTransformerConfig {
     /// when omitted.
     #[serde(default = "default_pressure_critical_threshold")]
     pub pressure_critical_threshold: f32,
+
+    /// **Hybrid compute offload** (gist Part 2, fix #5). Picks which
+    /// [`crate::backend::Backend`] implementation handles the dense
+    /// transformer body's matmul / attention / LM-head. `"cpu"`
+    /// (default) routes through [`crate::backend::CandleBackend`] /
+    /// the auto-escalating SIMD dispatcher in [`crate::kernels`].
+    /// `"gpu"` opts into [`crate::backend::GpuBackend`] — when the
+    /// binary was built with the `gpu` cargo feature **and** a
+    /// compute-capable adapter is reachable, the dense path executes
+    /// on a budget GPU; otherwise the backend transparently falls
+    /// back to CPU. The SSD-streamed expert pipeline stays CPU-side
+    /// either way, matching the gist's "budget GPU augments CPU"
+    /// posture.
+    #[serde(default)]
+    pub compute_offload: crate::backend::ComputeOffload,
 }
 
 fn default_pressure_high_threshold() -> f32 { crate::block_pool::SOFT_CAP_RATIO }

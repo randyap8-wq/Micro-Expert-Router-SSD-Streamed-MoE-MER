@@ -139,3 +139,12 @@ avx512 = []
 # through to AVX-512 / scalar. A follow-up PR (or a nightly build)
 # can drop a real tile-based body in without touching call sites.
 amx = []
+# **Budget-GPU offload** (gist Part 2, fix #5). Opt-in build flag that
+# enables the `GpuBackend` integration path in `backend/mod.rs`. The
+# default CPU build (no feature) keeps the binary lean; turning this
+# on prepares the runtime for a follow-up PR that wires in a real
+# `wgpu` compute dispatcher for the dense transformer body. The
+# config-level toggle is `[real_transformer].compute_offload =
+# "gpu"`. Off by default to keep CPU-only builds buildable on
+# toolchains and hosts without a GPU driver.
+gpu = []

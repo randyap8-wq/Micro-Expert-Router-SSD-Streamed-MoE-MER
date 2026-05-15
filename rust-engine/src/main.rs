@@ -19,6 +19,7 @@ mod gguf;
 mod gguf_loader;
 mod inference;
 mod io_provider;
+mod io_reactor;
 #[cfg(all(feature = "io_uring", target_os = "linux"))]
 mod io_uring_storage;
 mod kernels;
@@ -366,8 +367,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Install the default plugin-system math backend (gist Task 2).
     // Logged on the same boot line so ops can see both the low-level
     // CPU-feature dispatch and the high-level Backend in one place.
-    crate::backend::install_default();
-    {
+    //
+    // For the `serve` subcommand we **defer** the default install
+    // until `cmd_serve` has loaded the TOML config — the hybrid
+    // compute offload (`[real_transformer].compute_offload`, gist
+    // Part 2 fix #5) is selected from there, and it must run
+    // *before* `install_default` claims the OnceLock. Other
+    // subcommands keep the immediate install so their math path is
+    // ready as soon as `main` returns into them.
+    if !matches!(cli.cmd, Cmd::Serve { .. }) {
+        crate::backend::install_default();
         let b = crate::backend::current();
         info!(backend = b.name(), "math backend installed");
     }
@@ -518,6 +527,26 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         d_ff = cfg.model.d_ff,
         "loaded server config"
     );
+
+    // Hybrid compute offload (gist Part 2, fix #5). Selects which
+    // `Backend` instance owns the dense transformer body; runs
+    // *before* `install_default` so the OnceLock keeps our pointer.
+    if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu {
+        let gpu = std::sync::Arc::new(crate::backend::GpuBackend::try_new())
+            as std::sync::Arc<dyn crate::backend::Backend>;
+        if let Err(e) = crate::backend::set_backend(gpu) {
+            warn!(error = e, "failed to install GpuBackend; falling back to default");
+        }
+    }
+    crate::backend::install_default();
+    {
+        let b = crate::backend::current();
+        info!(
+            backend = b.name(),
+            compute_offload = ?cfg.real_transformer.compute_offload,
+            "math backend installed"
+        );
+    }
 
     if !cfg.model.data_dir.is_dir() {
         return Err(format!(

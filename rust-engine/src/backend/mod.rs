@@ -264,6 +264,169 @@ impl Backend for CandleBackend {
 }
 
 // =====================================================================
+// Hybrid compute offload (gist Part 2, fix #5) — budget GPU integration
+// point.
+// =====================================================================
+
+/// Operator-facing selector for the math executor (gist Part 2, fix #5).
+///
+/// The runtime traditionally ran every layer's matmul / attention /
+/// LM-head on the CPU through [`CandleBackend`] (auto-escalating to
+/// AVX-512 / AVX2 / scalar via the [`crate::kernels`] dispatcher).
+/// `ComputeOffload::Gpu` plugs in the same `Backend` trait but routes
+/// the compute through a **budget-GPU executor** ([`GpuBackend`]),
+/// keeping the SSD-streamed expert path and the I/O reactor on the
+/// CPU side.
+///
+/// The split is deliberate: cheap consumer / data-centre cards (a
+/// $200-$400 GPU with 8-16 GiB of VRAM) can host the dense
+/// transformer body that's hot every token, while the long-tail MoE
+/// experts continue to stream from NVMe and crunch on the CPU. This
+/// matches the cost-efficiency thesis the gist asks the README to
+/// reflect: "AI cheaper than high-end AI GPUs".
+///
+/// Default = `Cpu`, which preserves the existing single-binary CPU
+/// posture. Operators opt in to GPU offload via the
+/// `[real_transformer].compute_offload` key in `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeOffload {
+    /// Default: CPU executor via [`CandleBackend`]. No GPU runtime
+    /// required.
+    Cpu,
+    /// Budget-GPU executor via [`GpuBackend`]. The backend itself is
+    /// always present (so `compute_offload = "gpu"` parses on every
+    /// build); whether it actually targets a GPU vs falling back to
+    /// CPU depends on the `gpu` cargo feature and on runtime device
+    /// availability.
+    Gpu,
+}
+
+impl Default for ComputeOffload {
+    fn default() -> Self {
+        Self::Cpu
+    }
+}
+
+/// Budget-GPU executor — wraps a wgpu-style compute dispatcher behind
+/// the same [`Backend`] trait every other math executor implements.
+///
+/// **This is the architectural seam, not the GPU driver.** Pulling
+/// the actual `wgpu` runtime into the default dependency graph would
+/// add hundreds of transitive crates and inflate the CPU-only build
+/// time — the gist's "budget GPU" target is an *opt-in* path, not a
+/// mandatory one. The integration model is:
+///
+/// 1. Operator picks `compute_offload = "gpu"` in `config.toml`.
+/// 2. `main.rs` calls [`GpuBackend::try_new`].
+/// 3. If the `gpu` cargo feature is built **and** a compute-capable
+///    GPU adapter is present, the wgpu pipeline takes over the
+///    `matmul_into` / `swiglu_into` / `softmax` entry points; the
+///    SSD-streamed expert path stays CPU-side via the existing
+///    `kernels` dispatcher.
+/// 4. If either pre-condition fails, `GpuBackend` logs the reason
+///    and degrades to a thin pass-through over [`CandleBackend`] so
+///    the binary remains usable on hardware without a discrete GPU.
+///
+/// The trait surface is identical to [`CandleBackend`] — swapping is
+/// a single pointer change in the `BACKEND` `OnceLock` — so callers
+/// (the transformer body in `transformer.rs`, the LM-head in
+/// `model.rs`) need no `cfg(feature = "gpu")` branches.
+pub struct GpuBackend {
+    /// CPU fallback used when the GPU pipeline is unavailable.
+    /// Holding a concrete `CandleBackend` here avoids one level of
+    /// `Arc<dyn Backend>` indirection on the hot path.
+    fallback: CandleBackend,
+    /// `true` when a GPU device was successfully acquired at
+    /// construction. Exposed via [`Self::has_device`] for the
+    /// startup log so ops can see whether offload is actually live.
+    has_device: bool,
+}
+
+impl GpuBackend {
+    /// Try to construct a GPU-backed executor. On builds without the
+    /// `gpu` cargo feature, this always returns a pass-through to
+    /// [`CandleBackend`] and logs a single warning so the operator
+    /// notices their `compute_offload = "gpu"` config has no effect.
+    /// On `gpu`-feature builds the constructor will (in a follow-up
+    /// PR that owns the wgpu runtime) probe for an adapter, request
+    /// a device + queue, and compile the matmul / SwiGLU WGSL
+    /// shaders. The compute shaders live in `backend/wgpu_shaders/`.
+    pub fn try_new() -> Self {
+        #[cfg(not(feature = "gpu"))]
+        {
+            tracing::warn!(
+                "[real_transformer].compute_offload = \"gpu\" requested, but binary was \
+                 built without the `gpu` cargo feature; falling back to CPU executor. \
+                 Rebuild with `cargo build --release --features gpu` to enable budget-GPU \
+                 offload."
+            );
+            return Self { fallback: CandleBackend, has_device: false };
+        }
+        #[cfg(feature = "gpu")]
+        {
+            // gist Part 2, fix #5 — opt-in wgpu device acquisition.
+            // The `gpu` cargo feature pulls in the wgpu runtime; the
+            // device-init / shader-compile logic lives behind that
+            // feature so default builds stay lean. This branch is
+            // the integration point: when the wgpu dependency is
+            // wired in, replace the `has_device = false` line below
+            // with the actual adapter request + pipeline compile.
+            // Until then the `gpu` feature build is identical to the
+            // CPU path (so feature-gated CI still passes), but the
+            // log line below tells the operator the seam is live.
+            tracing::info!(
+                "GpuBackend built with `gpu` feature; runtime device acquisition is a \
+                 follow-up integration step. Operating as a CandleBackend pass-through \
+                 for this binary."
+            );
+            Self { fallback: CandleBackend, has_device: false }
+        }
+    }
+
+    /// Whether a real GPU device is currently servicing requests.
+    /// Exposed for the startup-log diagnostic so ops can see whether
+    /// their `compute_offload = "gpu"` config actually engaged.
+    pub fn has_device(&self) -> bool {
+        self.has_device
+    }
+}
+
+impl Backend for GpuBackend {
+    fn name(&self) -> &'static str {
+        if self.has_device { "gpu" } else { "gpu-fallback" }
+    }
+
+    fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
+        // When a real GPU device is wired in, this is where the wgpu
+        // compute shader gets dispatched. Until then we keep the CPU
+        // fallback so the trait contract still holds and the engine
+        // remains usable.
+        self.fallback.matmul_into(w, x, rows, cols, y);
+    }
+
+    fn swiglu_into(
+        &self,
+        gate_w: &[f32],
+        up_w: &[f32],
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        y: &mut [f32],
+    ) {
+        self.fallback.swiglu_into(gate_w, up_w, x, rows, cols, y);
+    }
+
+    fn softmax(&self, logits: &mut [f32]) {
+        self.fallback.softmax(logits);
+    }
+
+    fn silu_inplace(&self, x: &mut [f32]) {
+        self.fallback.silu_inplace(x);
+    }
+}
+
+// =====================================================================
 // Global registry — set once at startup, read on every hot-path call.
 // =====================================================================
 
