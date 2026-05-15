@@ -1051,11 +1051,10 @@ impl Engine {
         match manifest.verify_uniform_dtype()? {
             None => Ok(None),
             Some(d) if d == expected_dtype => Ok(Some(d)),
-            Some(d) => Err(EngineError::IncompatibleExpertTypes(
-                crate::io_provider::IncompatibleExpertTypes {
-                    found: vec![expected_dtype, d],
-                },
-            )),
+            Some(d) => Err(EngineError::ManifestDtypeMismatch {
+                expected: expected_dtype,
+                found: d,
+            }),
         }
     }
 
