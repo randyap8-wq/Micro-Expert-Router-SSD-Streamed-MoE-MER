@@ -202,18 +202,19 @@ experts, no high-end AI GPU required):
   intrinsics are nightly-only as of Rust 1.84).
 * `--features gpu` — opt-in. Builds the
   [`backend::GpuBackend`](rust-engine/src/backend/mod.rs) integration
-  seam for a budget-GPU compute path. Setting
+  seam for a future budget-GPU compute path. Setting
   `[real_transformer].compute_offload = "gpu"` in `config.toml`
-  installs the GPU backend before the legacy CPU `CandleBackend`
-  claims the `OnceLock`; the dense transformer body (attention +
-  matmul + LM-head) routes through the GPU, while the SSD-streamed
-  MoE experts continue to crunch on the CPU through the same
-  auto-escalating SIMD dispatcher. Targets cheap consumer / data-
-  centre cards with 8–16 GiB of VRAM — the workload that motivates
-  this engine in the first place is "run AI cheaper than high-end
-  AI GPUs". On builds without the feature, or hosts without a
-  compute-capable adapter, the backend transparently falls back to
-  CPU and logs the reason once at startup so ops can correlate.
+  selects that backend before the legacy CPU `CandleBackend`
+  claims the `OnceLock`, so operators can exercise the config /
+  selection path now; however, in this release device
+  initialization and shader/compute kernels have not landed yet, so
+  the backend delegates to the CPU `CandleBackend` rather than
+  running the dense transformer body (attention + matmul + LM-head)
+  on GPU. The SSD-streamed MoE experts likewise continue to crunch
+  on the CPU through the same auto-escalating SIMD dispatcher.
+  Builds without the feature still use the normal CPU path, and the
+  backend logs the selected/fallback reason once at startup so ops
+  can correlate behavior with rollout state.
 
 The runtime probe is logged on a single startup line so ops can
 correlate the selected backend with the deployment fleet:
