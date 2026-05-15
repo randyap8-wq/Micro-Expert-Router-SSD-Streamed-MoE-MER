@@ -299,10 +299,32 @@ impl Default for BatchConfig {
 }
 
 /// Lightweight handle to the scheduler. Cheap to clone — under the
-/// hood it just wraps an [`mpsc::Sender`] and a few `Arc`s.
+/// hood it just wraps a pair of [`mpsc::Sender`]s (one per
+/// [`SessionClass`]) and a few `Arc`s.
+///
+/// ## Per-class admission channels
+///
+/// The scheduler maintains a *separate* mpsc channel for each
+/// service class. Submitting a [`StepRequest`] from
+/// [`Self::step_registered`] looks up the registered session's class
+/// and pushes onto the matching channel; the background
+/// [`scheduler_loop`] then drains both channels in weighted
+/// round-robin proportion (`weight_interactive` : `weight_audit`)
+/// when assembling a batch. This gives true fair-share *admission*
+/// — even when the Audit channel's backlog is far longer than
+/// `max_batch_size`, every batch still pulls the Interactive
+/// channel's share first, so an Audit flood cannot starve a
+/// latency-sensitive Interactive caller from being admitted.
 #[derive(Clone)]
 pub struct BatchScheduler {
-    tx: mpsc::Sender<StepRequest>,
+    /// Submission channel for [`SessionClass::Interactive`] sessions.
+    tx_interactive: mpsc::Sender<StepRequest>,
+    /// Submission channel for [`SessionClass::Audit`] sessions. Kept
+    /// physically separate so a backlog on this channel cannot push
+    /// Interactive requests further back in line — admission is
+    /// decided per-class by the WRR drain inside
+    /// [`scheduler_loop`], not by FIFO order on a single fused queue.
+    tx_audit: mpsc::Sender<StepRequest>,
     cfg: BatchConfig,
     /// Optional shared physical pool for paged KV caches. Populated
     /// when [`BatchConfig::block_pool_capacity`] and
@@ -355,9 +377,12 @@ impl BatchScheduler {
         // A reasonable channel depth: each in-flight request can have
         // at most one outstanding StepRequest at a time, so
         // `max_batch_size * 4` gives plenty of headroom without
-        // unbounded growth under back-pressure.
+        // unbounded growth under back-pressure. Each per-class
+        // channel gets its own budget so an Audit backlog cannot
+        // crowd out the Interactive channel.
         let depth = cfg.max_batch_size.saturating_mul(4).max(8);
-        let (tx, rx) = mpsc::channel::<StepRequest>(depth);
+        let (tx_interactive, rx_interactive) = mpsc::channel::<StepRequest>(depth);
+        let (tx_audit, rx_audit) = mpsc::channel::<StepRequest>(depth);
         let registry = Arc::new(RequestRegistry::default());
         let sessions: Arc<DashMap<u64, Arc<SessionMeta>>> = Arc::new(DashMap::new());
         let started_at = Instant::now();
@@ -372,7 +397,8 @@ impl BatchScheduler {
             model,
             engine.clone(),
             cfg,
-            rx,
+            rx_interactive,
+            rx_audit,
             registry.clone(),
             sessions.clone(),
             block_pool.clone(),
@@ -381,7 +407,8 @@ impl BatchScheduler {
             idle_evictions.clone(),
         ));
         Self {
-            tx,
+            tx_interactive,
+            tx_audit,
             cfg,
             block_pool,
             registry,
@@ -597,7 +624,21 @@ impl BatchScheduler {
     ) -> Result<u32, BatchError> {
         let (tx, rx) = oneshot::channel();
         let req = StepRequest { id, token_id, pos, params, resp: tx };
-        self.tx.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
+        // Look up the session's class so the request lands on the
+        // matching per-class admission channel. Unregistered ids
+        // default to Interactive — they will be rejected by the
+        // scheduler loop's registry check anyway, but routing them
+        // to the higher-priority lane keeps the failure path short.
+        let class = self
+            .sessions
+            .get(&id.0)
+            .map(|m| m.class)
+            .unwrap_or(SessionClass::Interactive);
+        let sender = match class {
+            SessionClass::Interactive => &self.tx_interactive,
+            SessionClass::Audit => &self.tx_audit,
+        };
+        sender.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
         let resp = rx.await.map_err(|_| BatchError::SchedulerClosed)??;
         Ok(resp.next_token)
     }
@@ -692,7 +733,8 @@ async fn scheduler_loop(
     model: Arc<RealModel>,
     engine: Arc<Engine>,
     cfg: BatchConfig,
-    mut rx: mpsc::Receiver<StepRequest>,
+    mut rx_interactive: mpsc::Receiver<StepRequest>,
+    mut rx_audit: mpsc::Receiver<StepRequest>,
     registry: Arc<RequestRegistry>,
     sessions: Arc<DashMap<u64, Arc<SessionMeta>>>,
     block_pool: Option<Arc<BlockPool>>,
@@ -701,34 +743,113 @@ async fn scheduler_loop(
     idle_evictions: Arc<AtomicU64>,
 ) {
     let now_us = || started_at.elapsed().as_micros() as u64;
-    loop {
-        // Block until at least one request shows up.
-        let first = match rx.recv().await {
-            Some(r) => r,
-            None => return, // all senders dropped → graceful exit
-        };
-        let mut batch: Vec<StepRequest> = Vec::with_capacity(cfg.max_batch_size);
-        batch.push(first);
+    // Per-class WRR weights, captured once. These are `const fn`s so
+    // pulling them out of the loop is just a readability win.
+    let wi = SessionClass::Interactive.weight() as usize;
+    let wa = SessionClass::Audit.weight() as usize;
 
-        // Greedily drain anything else that's already queued without
-        // waiting (no-await `try_recv`); this fills the batch when
-        // requests arrived during the previous step.
-        while batch.len() < cfg.max_batch_size {
-            match rx.try_recv() {
-                Ok(r) => batch.push(r),
-                Err(_) => break,
+    loop {
+        // ----------------------------------------------------------
+        // Block until at least one request shows up on *either*
+        // per-class channel. `tokio::select!` here is the part that
+        // makes admission class-aware: if only the Audit channel
+        // has traffic, we still wake up; if both have traffic, we
+        // still wake up on whichever fires first, and the WRR drain
+        // below then enforces the 4 : 1 share.
+        // ----------------------------------------------------------
+        let mut batch: Vec<StepRequest> = Vec::with_capacity(cfg.max_batch_size);
+        tokio::select! {
+            biased;
+            // Prefer Interactive on the very first await — under
+            // heavy mixed load this ensures the head-of-batch slot
+            // is reliably claimed by the higher-priority class.
+            r = rx_interactive.recv() => match r {
+                Some(req) => batch.push(req),
+                None => {
+                    // Interactive senders all dropped → fall back to
+                    // Audit-only for the rest of this iteration.
+                    match rx_audit.recv().await {
+                        Some(req) => batch.push(req),
+                        None => return, // both closed
+                    }
+                }
+            },
+            r = rx_audit.recv() => match r {
+                Some(req) => batch.push(req),
+                None => {
+                    match rx_interactive.recv().await {
+                        Some(req) => batch.push(req),
+                        None => return, // both closed
+                    }
+                }
+            },
+        }
+
+        // ----------------------------------------------------------
+        // Class-aware WRR drain: pull `wi` from Interactive, then
+        // `wa` from Audit, repeating, until the batch is full or
+        // both per-class channels are empty. Because the channels
+        // are *physically* separate, an Audit backlog cannot push
+        // an Interactive request further back in line: every cycle
+        // we get up to `wi` Interactive admissions before any Audit
+        // admission, regardless of submission rates.
+        // ----------------------------------------------------------
+        loop {
+            if batch.len() >= cfg.max_batch_size {
+                break;
+            }
+            let mut made_progress = false;
+            for _ in 0..wi {
+                if batch.len() >= cfg.max_batch_size {
+                    break;
+                }
+                match rx_interactive.try_recv() {
+                    Ok(req) => {
+                        batch.push(req);
+                        made_progress = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            for _ in 0..wa {
+                if batch.len() >= cfg.max_batch_size {
+                    break;
+                }
+                match rx_audit.try_recv() {
+                    Ok(req) => {
+                        batch.push(req);
+                        made_progress = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !made_progress {
+                break;
             }
         }
 
-        // If we still haven't filled the batch, give late arrivals up
-        // to `batch_timeout` to join. Bounded by `max_batch_size`.
+        // ----------------------------------------------------------
+        // Give late arrivals up to `batch_timeout` to join. We
+        // race both channels via `select!` so the timeout pass
+        // remains class-aware too. A `biased` select with the
+        // Interactive arm first preserves the fair-share preference
+        // when both channels are ready simultaneously.
+        // ----------------------------------------------------------
         if batch.len() < cfg.max_batch_size && !cfg.batch_timeout.is_zero() {
             let deadline = tokio::time::Instant::now() + cfg.batch_timeout;
             while batch.len() < cfg.max_batch_size {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(r)) => batch.push(r),
-                    Ok(None) => break, // channel closed
-                    Err(_) => break,   // timeout
+                tokio::select! {
+                    biased;
+                    r = tokio::time::timeout_at(deadline, rx_interactive.recv()) => match r {
+                        Ok(Some(req)) => batch.push(req),
+                        Ok(None) => break, // channel closed
+                        Err(_) => break,   // timeout
+                    },
+                    r = tokio::time::timeout_at(deadline, rx_audit.recv()) => match r {
+                        Ok(Some(req)) => batch.push(req),
+                        Ok(None) => break, // channel closed
+                        Err(_) => break,   // timeout
+                    },
                 }
             }
         }
@@ -782,55 +903,14 @@ async fn scheduler_loop(
         speculation.update_from_stall(cum_stall);
 
         // ----------------------------------------------------------
-        // Weighted Round-Robin admission control: re-order the batch
-        // so that, even when an Audit stream submits faster than
-        // Interactive callers, every batch slot is split according
-        // to the per-class weights. This is the fair-share half of
-        // the multi-tenant hardening called out in the gist —
-        // Interactive sessions are guaranteed a 4 / (4+N_audit)
-        // share of every batch.
+        // Note: the batch built above is already class-interleaved
+        // by construction — the per-class drain pulls `wi` from the
+        // Interactive channel then `wa` from the Audit channel each
+        // cycle, so no additional re-ordering pass is needed here.
+        // The WRR admission policy is enforced *before* requests
+        // enter the batch, which is what makes fair-share robust
+        // against an Audit submission flood.
         // ----------------------------------------------------------
-        let mut interactive: Vec<StepRequest> = Vec::new();
-        let mut audit: Vec<StepRequest> = Vec::new();
-        for req in batch.drain(..) {
-            let class = sessions
-                .get(&req.id.0)
-                .map(|m| m.class)
-                .unwrap_or(SessionClass::Interactive);
-            match class {
-                SessionClass::Interactive => interactive.push(req),
-                SessionClass::Audit => audit.push(req),
-            }
-        }
-        // Interleave with the WRR weights. We emit `weight_i` from
-        // Interactive then `weight_a` from Audit per cycle.
-        let wi = SessionClass::Interactive.weight() as usize;
-        let wa = SessionClass::Audit.weight() as usize;
-        let mut ordered: Vec<StepRequest> =
-            Vec::with_capacity(interactive.len() + audit.len());
-        let mut interactive_iter = interactive.into_iter();
-        let mut audit_iter = audit.into_iter();
-        let mut more = true;
-        while more {
-            more = false;
-            for _ in 0..wi {
-                if let Some(r) = interactive_iter.next() {
-                    ordered.push(r);
-                    more = true;
-                } else {
-                    break;
-                }
-            }
-            for _ in 0..wa {
-                if let Some(r) = audit_iter.next() {
-                    ordered.push(r);
-                    more = true;
-                } else {
-                    break;
-                }
-            }
-        }
-        let batch = ordered;
 
         // ----------------------------------------------------------
         // Pre-pass: peek at every request's routing decision and
