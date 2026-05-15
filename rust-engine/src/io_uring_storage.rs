@@ -282,7 +282,9 @@ impl IoUringStorage {
         assert_eq!(
             ids.len(),
             shadow_bufs.len(),
-            "read_experts_batch_fixed_promote: ids and shadow_bufs must have the same length"
+            "read_experts_batch_fixed_promote: ids.len()={} must equal shadow_bufs.len()={}",
+            ids.len(),
+            shadow_bufs.len(),
         );
         if ids.is_empty() {
             return Ok(Vec::new());

@@ -43,11 +43,17 @@ THRESHOLD="${THRESHOLD:-10}"
 FEATURES="${FEATURES:-avx512}"
 
 # On filesystems that don't support O_DIRECT (tmpfs, overlay, macOS),
-# the engine accepts `--no-direct`. We probe by checking the FS type
-# of $DATA_DIR's parent and adding the flag if necessary.
+# the engine accepts `--no-direct`. Probe portably: GNU `stat -f -c`
+# and BSD/macOS `stat -f` use different flags, so try the GNU form
+# first and fall back to the BSD form. On any failure (no `stat`, an
+# exotic filesystem, …) we leave NO_DIRECT empty and let the engine
+# emit its own warning if needed.
 NO_DIRECT=""
-case "$(stat -f -c '%T' "$(dirname "$DATA_DIR")" 2>/dev/null || echo ext4)" in
-  tmpfs|overlayfs|overlay) NO_DIRECT="--no-direct" ;;
+FS_TYPE="$( (stat -f -c '%T' "$(dirname "$DATA_DIR")" 2>/dev/null) \
+         || (stat -f '%T' "$(dirname "$DATA_DIR")" 2>/dev/null) \
+         || echo unknown)"
+case "$FS_TYPE" in
+  tmpfs|overlayfs|overlay|hfs|apfs) NO_DIRECT="--no-direct" ;;
 esac
 
 mkdir -p "$DATA_DIR"
