@@ -19,9 +19,10 @@ use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::gating::Router;
 use crate::inference::{
     combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4_0,
-    run_inference_q4_0_qmm, run_inference_q4k, run_inference_q4k_qmm, synth_hidden_state,
+    run_inference_q4_0_qmm, run_inference_q4k, run_inference_q4k_qmm,
+    run_inference_q8_0, run_inference_q8_0_qmm, synth_hidden_state,
     uniform_scores, ExpertWeightsError, HiddenState,
-    InferenceOutput, WeightDtype, Q4_0_BLOCK_ELEMS, Q4K_BLOCK_ELEMS,
+    InferenceOutput, WeightDtype, Q4_0_BLOCK_ELEMS, Q4K_BLOCK_ELEMS, Q8_0_BLOCK_ELEMS,
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
@@ -89,6 +90,14 @@ pub struct AlignedKvCache {
     window_tokens: usize,
     /// Hidden dimension per K/V row.
     kv_dim: usize,
+    /// **Dtype hint** describing the K/V row layout in memory. The
+    /// cache itself always stores `f32` rows (which is what the
+    /// candle-core attention path consumes), but the engine records
+    /// this so the upstream attention block can confirm it matches
+    /// the model's hidden-layer dtype and skip an unnecessary cast
+    /// before the K·Vᵀ dot products. Defaults to
+    /// [`WeightDtype::F32`] for backwards compatibility.
+    kv_dtype: WeightDtype,
 }
 
 impl AlignedKvCache {
@@ -98,6 +107,16 @@ impl AlignedKvCache {
     ///
     /// Panics if `window_tokens == 0` or `kv_dim == 0`.
     pub fn new(window_tokens: usize, kv_dim: usize) -> Self {
+        Self::with_dtype(window_tokens, kv_dim, WeightDtype::F32)
+    }
+
+    /// Allocate a fresh cache and tag it with the dtype the rest of
+    /// the model's hidden-layer pipeline expects K/V rows to use.
+    /// The storage layout is identical to [`Self::new`] (always
+    /// `f32` on disk / in DRAM); the `dtype` is recorded so callers
+    /// in the attention block can avoid redundant casts when the
+    /// model is also `F32` and the dtype hint matches.
+    pub fn with_dtype(window_tokens: usize, kv_dim: usize, dtype: WeightDtype) -> Self {
         assert!(window_tokens > 0, "window_tokens must be > 0");
         assert!(kv_dim > 0, "kv_dim must be > 0");
         let row_bytes = kv_dim * std::mem::size_of::<f32>();
@@ -112,6 +131,7 @@ impl AlignedKvCache {
             seq_len: 0,
             window_tokens,
             kv_dim,
+            kv_dtype: dtype,
         }
     }
 
@@ -131,6 +151,15 @@ impl AlignedKvCache {
     #[inline]
     pub fn kv_dim(&self) -> usize {
         self.kv_dim
+    }
+
+    /// Dtype hint describing the model's hidden-layer K/V layout.
+    /// The cache stores rows as `f32`; callers in the attention path
+    /// use this to confirm no cast is required (and panic / log when
+    /// the hint disagrees with the model config).
+    #[inline]
+    pub fn kv_dtype(&self) -> WeightDtype {
+        self.kv_dtype
     }
 
     /// Page-aligned base address of the key buffer (for `O_DIRECT`
@@ -305,6 +334,36 @@ impl std::fmt::Display for ExpertReadError {
 }
 
 impl std::error::Error for ExpertReadError {}
+
+/// Boot-time engine error. Returned by helpers like
+/// [`Engine::verify_manifest_dtype`] that run startup-only invariant
+/// checks the synchronous `Engine::new` constructor doesn't perform.
+#[derive(Debug)]
+pub enum EngineError {
+    /// The cold-start manifest observed at least two experts whose
+    /// Unified Tensor Header declared **different** weight dtypes.
+    /// Surfaces [`crate::io_provider::IncompatibleExpertTypes`] —
+    /// the engine refuses to dispatch against a heterogeneous set
+    /// of experts because a single quant scheme is wired into the
+    /// per-token math kernel.
+    IncompatibleExpertTypes(crate::io_provider::IncompatibleExpertTypes),
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineError::IncompatibleExpertTypes(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+impl From<crate::io_provider::IncompatibleExpertTypes> for EngineError {
+    fn from(e: crate::io_provider::IncompatibleExpertTypes) -> Self {
+        EngineError::IncompatibleExpertTypes(e)
+    }
+}
 
 /// Optional JSONL trace sink — one record per `Engine::generate` call.
 ///
@@ -875,6 +934,19 @@ fn dispatch_expert_forward(
             }
         }
         WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Q8_0 if use_qmm
+            && d_model % Q8_0_BLOCK_ELEMS == 0
+            && d_ff % Q8_0_BLOCK_ELEMS == 0 =>
+        {
+            match run_inference_q8_0_qmm(token_idx, r, x, d_model, d_ff) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    debug!(error = %e, "QMatMul Q8_0 path failed; falling back to dequant");
+                    run_inference_q8_0(token_idx, r, x, d_model, d_ff)
+                }
+            }
+        }
+        WeightDtype::Q8_0 => run_inference_q8_0(token_idx, r, x, d_model, d_ff),
     }
 }
 
@@ -951,6 +1023,39 @@ impl Engine {
             .as_ref()
             .map(|c| c.lock().seq_len())
             .unwrap_or(0)
+    }
+
+    /// Cross-check a cold-start manifest against the engine's
+    /// configured dtype. Returns:
+    ///
+    /// * `Ok(Some(dtype))` if every indexed expert agrees on a
+    ///   single on-disk dtype, **and** that dtype matches the
+    ///   engine's configured `WeightDtype`. The returned dtype is
+    ///   guaranteed to be the one the dispatch table will use.
+    /// * `Ok(None)` if the manifest is empty or holds only legacy
+    ///   bare-payload files (no UTH dtype to verify against).
+    /// * `Err(EngineError::IncompatibleExpertTypes)` if the
+    ///   manifest indexed at least two experts whose dtypes
+    ///   disagree, **or** if the unique dtype in the manifest
+    ///   doesn't match `expected_dtype`. The engine refuses to
+    ///   serve traffic in either case.
+    ///
+    /// This is the runtime hook that backs the gist's "verify the
+    /// manifest invariant on engine startup" requirement; it's a
+    /// constant-time iteration over the already-resident manifest
+    /// (no I/O).
+    pub fn verify_manifest_dtype(
+        manifest: &crate::io_provider::Manifest,
+        expected_dtype: WeightDtype,
+    ) -> Result<Option<WeightDtype>, EngineError> {
+        match manifest.verify_uniform_dtype()? {
+            None => Ok(None),
+            Some(d) if d == expected_dtype => Ok(Some(d)),
+            Some(d) => Err(EngineError::ManifestDtypeMismatch {
+                expected: expected_dtype,
+                found: d,
+            }),
+        }
     }
 
     /// Install a JSONL routing trace sink. Every subsequent

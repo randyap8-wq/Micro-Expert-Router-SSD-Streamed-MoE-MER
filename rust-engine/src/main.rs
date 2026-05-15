@@ -284,15 +284,17 @@ enum Cmd {
         /// for small fixtures.
         #[arg(long, default_value_t = false)]
         legacy_eager: bool,
-        /// **Native 4-bit pass-through.** When set and the source
-        /// GGUF stores its expert tensors as `Q4_0` or `Q4_K`,
-        /// write the raw quantised block stream to disk instead of
-        /// dequantising to F32 first. The output `expert_<id>.bin`
-        /// is then ~7× smaller and the engine's existing
-        /// `run_inference_q4_0` / `run_inference_q4k` paths consume
-        /// it directly. Falls back to F32 dequant when the source
-        /// dtype isn't `Q4_0`/`Q4_K` or the per-expert weight count
-        /// isn't a clean multiple of the block size; the
+        /// **Native quantised pass-through.** When set and the
+        /// source GGUF stores its expert tensors as `Q4_0`, `Q4_K`,
+        /// or `Q8_0`, write the raw quantised block stream to disk
+        /// instead of dequantising to F32 first. The output
+        /// `expert_<id>.bin` is then ~7× smaller (Q4_0 / Q4_K) or
+        /// ~4× smaller (Q8_0) than F32, and the engine's
+        /// `run_inference_q4_0` / `run_inference_q4k` /
+        /// `run_inference_q8_0` paths consume it directly. Falls
+        /// back to F32 dequant when the source dtype isn't one of
+        /// the supported quantisations or the per-expert weight
+        /// count isn't a clean multiple of the block size; the
         /// converter's emitted `metadata.json::dtype` records what
         /// was actually written.
         #[arg(long, default_value_t = false)]

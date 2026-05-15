@@ -294,6 +294,7 @@ pub fn ggml_to_weight_dtype(code: u32) -> Option<WeightDtype> {
         ggml_dtype::F16 => Some(WeightDtype::F16),
         ggml_dtype::Q4_0 => Some(WeightDtype::Q4_0),
         ggml_dtype::Q4_K => Some(WeightDtype::Q4K),
+        ggml_dtype::Q8_0 => Some(WeightDtype::Q8_0),
         _ => None,
     }
 }
@@ -802,10 +803,10 @@ mod tests {
         assert_eq!(ggml_to_weight_dtype(ggml_dtype::F16), Some(WeightDtype::F16));
         assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q4_0), Some(WeightDtype::Q4_0));
         assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q4_K), Some(WeightDtype::Q4K));
+        assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q8_0), Some(WeightDtype::Q8_0));
         // Unsupported: Q6_K, Q5_K, etc. — surface as None so the loader
         // can skip / fall back to seeded init.
         assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q6_K), None);
-        assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q8_0), None);
     }
 
     #[test]
