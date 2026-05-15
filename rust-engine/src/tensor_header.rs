@@ -487,10 +487,17 @@ mod tests {
                 let (_h, payload) = TensorHeader::strip(&buf, block);
                 // The returned payload must be a sub-slice of buf;
                 // its pointer + length must lie within buf.
-                let buf_range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
-                let pay_start = payload.as_ptr() as usize;
-                let pay_end = pay_start + payload.len();
-                assert!(pay_start >= buf_range.start && pay_end <= buf_range.end);
+                //
+                // Skip the pointer-range assertion for empty buffers:
+                // `Vec::as_ptr()` may be a dangling-but-aligned sentinel
+                // for zero-length allocations, so comparing raw pointer
+                // values is not meaningful in that case.
+                if !buf.is_empty() {
+                    let buf_range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
+                    let pay_start = payload.as_ptr() as usize;
+                    let pay_end = pay_start + payload.len();
+                    assert!(pay_start >= buf_range.start && pay_end <= buf_range.end);
+                }
             }
         }
     }
