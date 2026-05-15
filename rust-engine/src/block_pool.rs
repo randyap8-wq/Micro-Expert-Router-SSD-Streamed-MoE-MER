@@ -46,6 +46,38 @@ use parking_lot::Mutex;
 /// block contained on a single MMU page boundary.
 pub const POOL_BLOCK_TOKENS: usize = 16;
 
+/// Soft-cap threshold (fraction of primary capacity) above which the
+/// scheduler should start preemptive idle-block reclamation. The gist
+/// calls out **90%** as the cutoff at which `evict_idle_blocks(...)`
+/// runs to reclaim KV memory from sessions that have stopped producing
+/// tokens.
+pub const SOFT_CAP_RATIO: f32 = 0.90;
+
+/// Critical-pressure threshold (fraction of primary capacity). When
+/// crossed the scheduler clamps the predictive-prefetch speculation
+/// depth to zero so any free RAM is reserved for active resident
+/// tokens. See [`PressureLevel::Critical`].
+pub const CRITICAL_PRESSURE_RATIO: f32 = 0.98;
+
+/// Memory-pressure level reported by [`BlockPool::pressure_level`].
+/// Drives the scheduler's back-pressure policy: under
+/// [`PressureLevel::High`] preemptive idle reclamation kicks in;
+/// under [`PressureLevel::Critical`] speculative prefetching is
+/// suspended entirely (`speculation_depth() == 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PressureLevel {
+    /// Plenty of slack — fewer than [`SOFT_CAP_RATIO`] of primary
+    /// blocks are in use. No reclamation or back-pressure needed.
+    Normal,
+    /// At or above [`SOFT_CAP_RATIO`] but still below
+    /// [`CRITICAL_PRESSURE_RATIO`]. Scheduler runs idle reclamation
+    /// but predictive prefetching continues.
+    High,
+    /// At or above [`CRITICAL_PRESSURE_RATIO`]. Scheduler suspends
+    /// speculative prefetch (depth → 0) until pressure drops.
+    Critical,
+}
+
 /// High bit of [`BlockId`] reserved to distinguish the **primary**
 /// pre-allocated slab (bit clear) from the **overflow** heap-backed
 /// slab (bit set). Sentinel placed at `1 << 31` so the low 31 bits
@@ -283,6 +315,46 @@ impl BlockPool {
     pub fn overflow_in_use(&self) -> usize {
         let cap = *self.overflow_capacity.lock();
         cap.saturating_sub(self.overflow_free.lock().len())
+    }
+
+    /// Fraction of primary capacity currently in use, in `[0.0, 1.0+]`.
+    /// Values `> 1.0` indicate the overflow slab is also active. The
+    /// scheduler reads this to decide when to trigger
+    /// `evict_idle_blocks` and when to clamp speculation depth.
+    /// Snapshot-only; can race.
+    pub fn utilization(&self) -> f32 {
+        if self.capacity == 0 {
+            return 0.0;
+        }
+        let free = self.free.lock().len();
+        let used_primary = self.capacity.saturating_sub(free);
+        let overflow_in_use = {
+            let cap = *self.overflow_capacity.lock();
+            cap.saturating_sub(self.overflow_free.lock().len())
+        };
+        (used_primary + overflow_in_use) as f32 / self.capacity as f32
+    }
+
+    /// Classify the pool's current memory pressure. Drives the
+    /// scheduler's back-pressure ladder; see [`PressureLevel`].
+    pub fn pressure_level(&self) -> PressureLevel {
+        let u = self.utilization();
+        if u >= CRITICAL_PRESSURE_RATIO {
+            PressureLevel::Critical
+        } else if u >= SOFT_CAP_RATIO {
+            PressureLevel::High
+        } else {
+            PressureLevel::Normal
+        }
+    }
+
+    /// Whether the pool's primary slab has crossed [`SOFT_CAP_RATIO`].
+    /// The scheduler polls this on every batch and, when true, runs
+    /// `evict_idle_blocks` to reclaim KV blocks from sessions that
+    /// haven't generated a token in `idle_threshold` seconds (default
+    /// 5 s).
+    pub fn above_soft_cap(&self) -> bool {
+        self.utilization() >= SOFT_CAP_RATIO
     }
 
     /// Total physical capacity of the **primary** slab, in blocks
@@ -723,5 +795,36 @@ mod tests {
         let o3 = pool.allocate().unwrap();
         assert!(o3.is_overflow());
         assert_eq!(o3.index(), 0);
+    }
+
+    #[test]
+    fn pressure_level_walks_through_soft_cap_and_critical() {
+        // 10-block primary slab — 0%/50%/90%/100% utilisation should
+        // bucket Normal / Normal / High / Critical respectively.
+        let pool = BlockPool::new(2, 10);
+        assert_eq!(pool.pressure_level(), PressureLevel::Normal);
+        assert!(!pool.above_soft_cap());
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(pool.allocate().unwrap());
+        }
+        // 50% utilisation → still Normal.
+        assert!((pool.utilization() - 0.5).abs() < 1e-6);
+        assert_eq!(pool.pressure_level(), PressureLevel::Normal);
+        // Drive to 90%.
+        for _ in 0..4 {
+            held.push(pool.allocate().unwrap());
+        }
+        assert!((pool.utilization() - 0.9).abs() < 1e-6);
+        assert!(pool.above_soft_cap());
+        assert_eq!(pool.pressure_level(), PressureLevel::High);
+        // Saturate primary → Critical.
+        held.push(pool.allocate().unwrap());
+        assert!(pool.utilization() >= CRITICAL_PRESSURE_RATIO);
+        assert_eq!(pool.pressure_level(), PressureLevel::Critical);
+        for id in held.drain(..) {
+            pool.release(id);
+        }
+        assert_eq!(pool.pressure_level(), PressureLevel::Normal);
     }
 }
