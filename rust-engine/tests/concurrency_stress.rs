@@ -46,30 +46,69 @@ const RUN_DURATION: Duration = Duration::from_millis(1_500);
 const CHANNEL_CAPACITY: usize = 32;
 
 /// Mirrors the WRR draining logic in `scheduler_loop`: drain up to
-/// `max_batch` ids from the shared queue. The simulated scheduler
-/// only sees Audit traffic in this test, so under WRR each stream
-/// gets an equal share of the slots (the 4 : 1 Interactive : Audit
-/// ratio reduces to a flat fair drain when only Audit is active).
+/// `max_batch` ids from the shared queue using a 4 : 1
+/// Interactive : Audit admission policy. Requests are class-tagged
+/// in-band so this benchmark can exercise the real scheduler shape
+/// without depending on the production `BatchScheduler` type.
+const INTERACTIVE_TAG: u64 = 1 << 63;
+const INTERACTIVE_WEIGHT: usize = 4;
+const AUDIT_WEIGHT: usize = 1;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrafficClass {
+    Interactive,
+    Audit,
+}
+
+fn traffic_class(req: u64) -> TrafficClass {
+    if (req & INTERACTIVE_TAG) != 0 {
+        TrafficClass::Interactive
+    } else {
+        TrafficClass::Audit
+    }
+}
+
 fn drain_wrr(queue: &Mutex<VecDeque<u64>>, max_batch: usize) -> Vec<u64> {
     let mut q = queue.lock().unwrap();
     let mut out = Vec::with_capacity(max_batch);
-    while out.len() < max_batch {
-        match q.pop_front() {
+    let schedule = [
+        TrafficClass::Interactive,
+        TrafficClass::Interactive,
+        TrafficClass::Interactive,
+        TrafficClass::Interactive,
+        TrafficClass::Audit,
+    ];
+    let mut cursor = 0usize;
+
+    while out.len() < max_batch && !q.is_empty() {
+        let preferred = schedule[cursor % (INTERACTIVE_WEIGHT + AUDIT_WEIGHT)];
+        cursor += 1;
+
+        let preferred_idx = q.iter().position(|&req| traffic_class(req) == preferred);
+        let fallback_idx = q.iter().position(|&req| traffic_class(req) != preferred);
+
+        match preferred_idx.or(fallback_idx).and_then(|idx| q.remove(idx)) {
             Some(req) => out.push(req),
             None => break,
         }
     }
+
     out
 }
 
-/// 4 audit streams pushing as fast as they can; the simulated
-/// scheduler drains them in WRR order and increments a per-stream
-/// completion counter. Asserts every stream clears the 8 TPS floor.
+/// 4 audit streams pushing as fast as they can while an Interactive
+/// backlog is also present; the simulated scheduler drains them in
+/// WRR order and increments a per-stream completion counter. This
+/// ensures the test exercises the 4 : 1 Interactive : Audit
+/// admission path instead of a pure Audit-only FIFO path. Asserts
+/// every audit stream still clears the 8 TPS floor.
 #[test]
 fn four_audit_streams_meet_tps_floor() {
-    let queue: Arc<Mutex<VecDeque<u64>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
-        CHANNEL_CAPACITY * NUM_STREAMS,
-    )));
+    let mut initial_queue = VecDeque::with_capacity(CHANNEL_CAPACITY * NUM_STREAMS * 2);
+    for req in 0..(CHANNEL_CAPACITY as u64 * INTERACTIVE_WEIGHT as u64) {
+        initial_queue.push_back(INTERACTIVE_TAG | req);
+    }
+    let queue: Arc<Mutex<VecDeque<u64>>> = Arc::new(Mutex::new(initial_queue));
     let stop = Arc::new(AtomicBool::new(false));
     let completed: Arc<[AtomicU64; NUM_STREAMS]> =
         Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
