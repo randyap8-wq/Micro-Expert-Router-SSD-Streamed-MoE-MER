@@ -162,25 +162,25 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 
 | Module | Responsibility |
 |---|---|
-| `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. |
+| `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. Reused by [`AlignedKvCache`](#persistent-page-aligned-kv-cache) so the session-scoped K/V state can be snapshotted to NVMe with no extra copy. |
 | `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s, optionally split into **primary** + **shadow** halves sharing one `Notify`. Hands out `PooledBuffer` RAII guards; `try_acquire`/`try_acquire_shadow` route to the corresponding free list; dropping a guard returns the buffer to its originating list and wakes waiters. `promote_shadow` does the zero-copy slot-tag swap when a speculative prefetch is confirmed. The literal "pre-allocated RAM buffer" the spec asks for. |
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. |
 | `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. |
-| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`). Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
+| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`). Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
 | `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point. Built behind the `io_uring` cargo feature. |
 | `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API), `LocalityMonitor` (sliding-window heat map, the **L** arm), and `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
-| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q4k` / `_q4_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
+| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For 4-bit dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels — no F32 dequantise of the weights. The legacy `run_inference_q4_0` / `run_inference_q4k` dequant kernels are kept as a graceful fallback when `cols % block_size != 0`. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
 | `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch (scalar / `simd` / `blas`). |
 | `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. |
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
 | `tokenizer` | HuggingFace `tokenizers` crate when the `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured; deterministic byte-level fallback otherwise. |
 | `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. |
 | `batch_scheduler` | **Continuous batching.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. |
-| `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. |
+| `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. Also home to [`AlignedKvCache`](#persistent-page-aligned-kv-cache) — a session-scoped, page-aligned, rolling-window K/V buffer attached via `Engine::with_kv_cache`. |
 | `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`. Two readers ship side-by-side: `GgufFile::open` (eager — slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming — keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
-| `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Driven by the `gguf-convert` subcommand. |
+| `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
 | `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
 | `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()`), with `scalar.rs` (always on), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The selected backend is logged once at startup. |
 | `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
@@ -832,6 +832,15 @@ micro-expert-router gguf-convert
                               + dense weight files
   --num-layers <N>           Override (defaults to llama.block_count)
   --num-experts <N>          Experts per layer (defaults to llama.expert_count)
+  --no-uth                   Skip the 64-byte Unified Tensor Header on each
+                              expert blob (compat with pre-UTH consumers)
+  --legacy-eager             Use the in-memory GGUF reader instead of the
+                              default streaming reader
+  --native-quant             For Q4_0 / Q4_K source tensors, write the raw
+                              quantised block stream to disk instead of
+                              dequantising to F32. Falls back to F32 (with
+                              a logged warning) when the source dtype isn't
+                              4-bit or shapes aren't block-aligned.
 
 micro-expert-router validate-predictor
   --trace <PATH>             JSONL trace from `run --trace-out`
@@ -876,10 +885,22 @@ quant-scale offset) padded to 4 KiB so the weight payload still
 starts at an `O_DIRECT`-friendly boundary; pass `--no-uth` to opt
 out for compatibility with consumers that pre-date the header.
 
+For source GGUFs whose expert tensors are already stored as `Q4_0`
+or `Q4_K_M`, pass `--native-quant` to write the **raw quantised
+block stream** to disk instead of dequantising to F32 first. The
+output `expert_<id>.bin` is then ~7× smaller and the engine's
+`run_inference_q4_0` / `run_inference_q4k` paths consume it
+directly. The flag falls back automatically (with a logged warning)
+when the source dtype isn't `Q4_0`/`Q4_K` or when the per-expert
+weight count `d_ff*d_model` isn't a clean multiple of the block
+size; the converter records what was actually written into
+`metadata.json::dtype`.
+
 ```bash
 ./target/release/micro-expert-router gguf-convert \
     --gguf-path ./mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf \
     --out-dir   ./mixtral-data \
+    --native-quant \
     # add --no-uth and/or --legacy-eager if your tooling needs them
 
 ./target/release/micro-expert-router run --data-dir ./mixtral-data
@@ -1185,28 +1206,90 @@ The engine reads weight bytes straight off the SSD; halving, or
 quartering, the byte width of each weight halves / quarters every
 read. Five on-disk dtypes are first-class:
 
-| `--dtype` | Bytes / weight | Per-blob header | Dequant kernel | Use |
+| `--dtype` | Bytes / weight | Per-blob header | Compute kernel | Use |
 |---|---:|:---:|---|---|
-| `f32` | 4 | none | zero-copy reinterpret | reference / highest fidelity |
-| `f16` | 2 | none | per-fetch `f16 → f32` | ~2× less SSD energy than `f32` |
-| `int8` | 1 | 12 B (`[gate, up, down]: [f32; 3]` per-tensor scales) | symmetric per-tensor dequant | ~4× less SSD energy than `f32` |
-| `q4k` | ~0.5625 | none (block-internal) | `Q4_K_M` 256-block (f16 super-scale + 6-bit sub-scales + 4-bit weights) | GGUF-compatible 4-bit |
-| `q4_0` | ~0.5625 | none (block-internal) | `Q4_0` 32-block (f16 scale, symmetric 4-bit nibbles) | the most widely-used 4-bit format; chosen by the predictive-controller spec |
+| `f32` | 4 | none | zero-copy reinterpret + Candle matmul | reference / highest fidelity |
+| `f16` | 2 | none | per-fetch `f16 → f32` then Candle matmul | ~2× less SSD energy than `f32` |
+| `int8` | 1 | 12 B (`[gate, up, down]: [f32; 3]` per-tensor scales) | symmetric per-tensor dequant + Candle matmul | ~4× less SSD energy than `f32` |
+| `q4k` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q4_K_M` 256-block stream — no F32 dequant of the weights. **Fallback**: 256-block dequant (f16 super-scale + 6-bit sub-scales + 4-bit weights) when `cols % 256 != 0`. | GGUF-compatible 4-bit |
+| `q4_0` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q4_0` 32-block stream — no F32 dequant of the weights. **Fallback**: 32-block dequant (f16 scale, symmetric 4-bit nibbles) when `cols % 32 != 0`. | the most widely-used 4-bit format; chosen by the predictive-controller spec |
 
 Selectable on **`gen-data`** (synthetic data, every dtype has a
 matching generator arm), on **`gguf-convert`** (input format detected
-from the GGUF tensor dtype, output written in the same dtype), and on
-**`run` / `serve`** (must match the on-disk files). The forward pass
-dispatches to `inference::run_inference_*` per dtype, all producing
-the same scalar `f32` SwiGLU output, so a benchmark run is a
-one-flag diff.
+from the GGUF tensor dtype, output written in the same dtype — pass
+`--native-quant` to write the raw `Q4_0` / `Q4_K` block stream
+instead of dequantising to F32), and on **`run` / `serve`** (must
+match the on-disk files). The forward pass dispatches to
+`inference::run_inference_*` per dtype, all producing the same scalar
+`f32` SwiGLU output, so a benchmark run is a one-flag diff.
+
+**4-bit fast path.** For `q4k` and `q4_0` the engine prefers the
+`QMatMul` path (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm`),
+which keeps the weights in their on-disk packed form throughout the
+matmul — only the `d_model`-sized activation is materialised as F32.
+This roughly halves per-token allocator pressure vs the legacy
+dequant-then-Candle path on real Mixtral shapes (`d_model=4096`,
+`d_ff=14336`, both block-aligned). The dequant kernel remains as a
+graceful fallback for shapes that aren't block-aligned and is
+always selected when `EngineOptions::use_qmm_for_q4 = false`.
 
 **How this saves energy.** Every cache miss reads
 `3 · d_model · d_ff` weights off the SSD. Going from `f32` → `f16`
 halves NVMe bandwidth and DRAM writes; `int8` quarters them; `q4k` /
-`q4_0` get an additional ~30% on top. The dequantisation step is
-`d_model · d_ff` cheap scalar ops per expert; on modern SIMD this is
-far less energy than the bytes-moved savings recover.
+`q4_0` get an additional ~30% on top. The QMatMul fast path
+additionally avoids the `O(d_model · d_ff)` dequantise write per
+forward pass, which is the largest L1/L2 win on the hot per-token
+critical path.
+
+### Persistent, page-aligned KV cache
+
+Multi-call chat / completion sessions need to retain attention
+context across `Engine::generate` calls so the prefix isn't
+recomputed on every token. `engine::AlignedKvCache` is a
+session-scoped K/V buffer backed by [`AlignedBuffer`](#repository-layout)
+(4096-byte page-aligned) so the K/V bytes are cheap to spill to an
+`O_DIRECT` snapshot file or share with `io_uring`'s registered
+fixed buffers without any rebuffering.
+
+Key properties:
+
+* **Rolling window.** Once `seq_len` reaches `window_tokens` (default
+  `KV_CACHE_DEFAULT_WINDOW_TOKENS = 4096`), `append` evicts the oldest
+  K/V row and writes the new one at the tail. Memory is bounded at
+  `2 · window_tokens · kv_dim · 4` bytes per session.
+* **Page-aligned base.** `keys_ptr() % 4096 == 0` is an invariant
+  enforced by [`AlignedBuffer`].
+* **Zero-on-reset.** `reset_kv_cache()` calls `zeroize()` so a
+  subsequent allocation that lands in the same heap region cannot
+  observe the previous tenant's state.
+* **Mounted on `Engine`** via the builder method `Engine::with_kv_cache`.
+  Accessors are `Engine::kv_cache()`, `Engine::kv_cache_append(k, v)`,
+  `Engine::kv_cache_seq_len()`, and `Engine::reset_kv_cache()`.
+
+This complements the per-layer paged KV cache in `transformer.rs`
+(used inside one model forward pass) with a session-scoped,
+contiguous version that survives across token cycles.
+
+### Cold-start manifest
+
+`io_provider::Manifest::scan(dirs, ids, block_align,
+num_experts_per_layer)` walks every `expert_<id>.bin` *once* at
+startup, parses the 4 KiB Unified Tensor Header, and stores
+`(expert_id → (path, header, payload_offset, payload_size, dtype))`
+in a `HashMap`. The manifest can then be attached via
+`NvmeStorage::with_manifest(...)` so subsequent fetches:
+
+* skip the per-call directory walk that resolves
+  `id → expert_<id>.bin` across striped data dirs, and
+* surface the on-disk `dtype` to the engine without re-reading the
+  header on every cache miss.
+
+The cold-start cost is one sequential pass over the manifest
+directory — no random reads — which is dwarfed by the engine's
+first speculative prefetch wave. See
+`io_provider::tests::manifest_scan_indexes_uth_and_legacy_files` and
+`nvme_storage_with_manifest_short_circuits_path_resolution` for
+behavioural guarantees.
 
 ### 2. 2nd-order Markov + gate-lookahead prefetching
 

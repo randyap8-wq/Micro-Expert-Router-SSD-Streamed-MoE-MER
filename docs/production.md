@@ -202,8 +202,26 @@ server {
 
 `DELETE /v1/sessions/{id}` overwrites every KV-cache buffer with
 zeros before releasing it, so a subsequent tenant cannot read a
-former tenant's attention state from re-used heap memory. This is
-automatic and requires no configuration.
+former tenant's attention state from re-used heap memory. This
+covers both the per-layer paged KV cache (`transformer.rs`) and the
+session-scoped page-aligned `AlignedKvCache` (`engine.rs`,
+`Engine::reset_kv_cache`). Both call `zeroize()` on the underlying
+`AlignedBuffer`, which is `#[inline(never)]` so the compiler can't
+elide the writes. This is automatic and requires no configuration.
+
+### Quantised inference fast path
+
+For 4-bit dtypes (`q4_0`, `q4k`) the engine routes per-expert
+SwiGLU through candle-core's `QMatMul` directly over the on-disk
+quantised blocks — no F32 dequantise of the weights happens on the
+hot per-token path. This roughly halves allocator pressure and L2
+working-set vs the legacy dequant kernel. The legacy dequant path
+remains as a graceful fallback for shapes that aren't block-aligned
+(e.g. `d_model` not divisible by 32 for `q4_0` or by 256 for `q4k`)
+and is always selected when `EngineOptions::use_qmm_for_q4` is
+disabled. Pair this with `gguf-convert --native-quant` to keep the
+on-disk `expert_<id>.bin` blobs in their native quantised form
+(~7× smaller than the dequantised F32 representation).
 
 ## 7. Admission control
 
