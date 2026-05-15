@@ -27,12 +27,14 @@ use crate::inference::{
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
 use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader};
+use dashmap::DashMap;
 use hdrhistogram::Histogram;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 // =====================================================================
@@ -335,6 +337,37 @@ impl std::fmt::Display for ExpertReadError {
 
 impl std::error::Error for ExpertReadError {}
 
+/// RAII guard that ensures the in-flight singleflight slot for an
+/// expert id is freed (and any waiters notified) when the leader's
+/// fetch attempt finishes — success, failure, or panic. See
+/// [`Engine::fetch_with_retry`] for the algorithm; this guard keeps
+/// the cleanup logic on every exit path so a panicking I/O task
+/// cannot wedge a stale entry in `Engine::in_flight`.
+struct SingleflightLeaderGuard {
+    map: Arc<DashMap<u32, Arc<Notify>>>,
+    id: u32,
+    notify: Arc<Notify>,
+    /// When `false` the guard is a no-op; constructing it on the
+    /// follower path keeps the call site identical between leaders
+    /// and followers without spurious notifications.
+    armed: bool,
+}
+
+impl Drop for SingleflightLeaderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Remove the entry first so any caller landing *after* the
+        // notify_waiters() call below sees a fresh slot to fill.
+        self.map.remove(&self.id);
+        // Wake every follower that parked on this id. They will
+        // re-check the cache and either return a hit (the common
+        // case) or fall through to their own fetch.
+        self.notify.notify_waiters();
+    }
+}
+
 /// Boot-time engine error. Returned by helpers like
 /// [`Engine::verify_manifest_dtype`] that run startup-only invariant
 /// checks the synchronous `Engine::new` constructor doesn't perform.
@@ -614,6 +647,11 @@ struct Counters {
     /// `EngineReport::expert_read_failures` so operators can alert on
     /// it from /metrics + /health.
     expert_read_failures: AtomicU64,
+    /// Number of times a `fetch_with_retry` caller piggy-backed on a
+    /// concurrent leader's in-flight read instead of issuing its own
+    /// (gist Phase 1 — SSD Read De-Duplication). Each increment maps
+    /// directly to one disk read that was *not* performed.
+    singleflight_followers: AtomicU64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -898,6 +936,16 @@ pub struct Engine {
     /// at this layer in the benchmark configuration), but the
     /// real-transformer / server path does — see `server.rs`.
     pub(crate) kv_cache: Option<Arc<Mutex<AlignedKvCache>>>,
+    /// In-flight read singleflight (gist Phase 1 — SSD Read
+    /// De-Duplication). When N concurrent tasks all miss the cache
+    /// on the same expert id, only the first task issues a disk
+    /// read; the rest park on the shared [`Notify`] and re-check the
+    /// cache once the leader's read completes. With this in place,
+    /// `BatchScheduler` pre-pass `engine.warm_with(&unique_ids)`
+    /// truly maps to "one read per unique id across the batch", and
+    /// even without a pre-pass concurrent `moe_step` invocations no
+    /// longer duplicate I/O.
+    pub(crate) in_flight: Arc<DashMap<u32, Arc<Notify>>>,
 }
 
 /// Dispatch a single per-expert SwiGLU forward pass according to
@@ -989,6 +1037,7 @@ impl Engine {
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
             kv_cache: None,
+            in_flight: Arc::new(DashMap::new()),
         }
     }
 
@@ -1238,10 +1287,14 @@ impl Engine {
             // unwrapping the `JoinError` so the panic surfaces exactly
             // as it did before this was made concurrent.
             let r = h.await.expect("expert fetch task panicked");
+            // We still account the per-call `stats.bytes_read` here
+            // for the synthetic-benchmark accumulator (it tracks
+            // logical bytes consumed, not bytes actually pulled
+            // from disk), but the engine-wide `bytes_read` counter
+            // is now bumped inside `fetch_once`, so we don't bump
+            // it again — that would double-count every miss after
+            // SSD-read dedup (gist Phase 1) was introduced.
             stats.bytes_read += r.buffer.len() as u64;
-            self.metrics.counters
-                .bytes_read
-                .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
             residents[i] = Some(r);
         }
         let io_wait_us = if had_misses {
@@ -1437,10 +1490,87 @@ impl Engine {
     /// panicking [`Self::fetch`] when the caller has a way to
     /// degrade — e.g. the multi-expert `moe_step` can drop a single
     /// failed expert from the top-K mixture and continue.
+    ///
+    /// **SSD Read De-Duplication (gist Phase 1).** This method
+    /// participates in a process-wide in-flight singleflight: when N
+    /// concurrent callers all miss the cache on the same id, only
+    /// the first issues a disk read; the rest park on a shared
+    /// [`Notify`] and re-check the cache once the leader is done.
+    /// This guarantees one SSD read per unique expert id across an
+    /// entire continuous-batching wave, with no risk of deadlock if
+    /// the [`BufferPool`] is saturated (the leader may still return
+    /// [`ExpertReadError::PoolStarved`] and the waiters retry
+    /// through their own [`Self::fetch_once`] path).
     pub async fn fetch_with_retry(
         self: &Arc<Self>,
         id: u32,
     ) -> Result<Arc<ExpertResident>, ExpertReadError> {
+        // Fast path: already cached — no singleflight needed. We
+        // deliberately do *not* bump the `hits` counter here: the
+        // upstream `moe_step` path already increments hits/misses
+        // before deciding to call us, so doing it again would
+        // double-count.
+        if let Some(r) = self.core.cache.get(id) {
+            return Ok(r);
+        }
+
+        // Singleflight: try to install a fresh Notify. If we win the
+        // race we are the "leader" and will drive the actual read.
+        // Otherwise we clone the existing Notify and wait for the
+        // leader, then re-check the cache. We use DashMap's
+        // `Entry::Occupied/Vacant` distinction so the leader bit is
+        // unambiguous (Arc strong-count is racy under TSO).
+        let (is_leader, notify) = match self.in_flight.entry(id) {
+            dashmap::mapref::entry::Entry::Occupied(occ) => (false, occ.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                let n = Arc::new(Notify::new());
+                vac.insert(n.clone());
+                (true, n)
+            }
+        };
+
+        if !is_leader {
+            // Pre-register as a waiter *before* re-checking the cache
+            // and the in_flight map, so we cannot miss the leader's
+            // `notify_waiters()` call if it lands between our entry
+            // lookup and our await. This is the standard
+            // `tokio::sync::Notify` race-free pattern.
+            let fut = notify.notified();
+            tokio::pin!(fut);
+            fut.as_mut().enable();
+            if let Some(r) = self.core.cache.get(id) {
+                self.metrics.counters.singleflight_followers
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(r);
+            }
+            // If the leader already removed the in_flight entry
+            // (i.e. completed before we enabled) but the cache
+            // doesn't have the expert, the leader's fetch failed
+            // and we must do our own read.
+            if !self.in_flight.contains_key(&id) {
+                // Fall through to leader path (the cache miss is
+                // legitimate now).
+            } else {
+                fut.await;
+                if let Some(r) = self.core.cache.get(id) {
+                    self.metrics.counters.singleflight_followers
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(r);
+                }
+                // Leader failed; fall through.
+            }
+        }
+
+        // Leader (or fallback follower after a failed leader) path:
+        // drive the retry loop ourselves. Ensure the in_flight slot
+        // is removed and waiters are notified on every exit branch.
+        let _guard = SingleflightLeaderGuard {
+            map: self.in_flight.clone(),
+            id,
+            notify: notify.clone(),
+            armed: is_leader,
+        };
+
         const MAX_ATTEMPTS: usize = 3;
         let mut last_err: Option<String> = None;
         for attempt in 0..MAX_ATTEMPTS {
@@ -1529,6 +1659,18 @@ impl Engine {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.metrics.io_hist.lock().record(io_us.max(1));
+                // Track every byte the engine actually pulls off the
+                // SSD — including `fetch_with_retry`'s leader path,
+                // not just the `moe_step` critical path. This is
+                // what makes the SSD-read-dedup invariant in
+                // `fetch_with_retry_deduplicates_concurrent_reads`
+                // (and any future observability) directly checkable:
+                // a deduplicated batch of N concurrent fetches must
+                // increase `bytes_read` by exactly one expert's
+                // worth, regardless of which call site issued them.
+                self.metrics.counters
+                    .bytes_read
+                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
                 let resident = Arc::new(ExpertResident::new(id, buf));
                 match self.core.cache.insert(resident.clone()) {
                     Ok(Some(_evicted)) => debug!(expert = id, "inserted (with eviction)"),
@@ -1945,9 +2087,14 @@ impl Engine {
             // re-raise so the supervising scheduler can restart us.
             match h.await.expect("expert fetch task panicked") {
                 Ok(r) => {
-                    self.metrics.counters
-                        .bytes_read
-                        .fetch_add(r.buffer.len() as u64, Ordering::Relaxed);
+                    // `bytes_read` is already bumped inside
+                    // `fetch_once` on the actual leader path, so we
+                    // don't double-count here. Followers that
+                    // joined the singleflight (or that found the
+                    // expert already resident by the time their
+                    // task ran) contribute zero bytes, which is
+                    // the correct accounting now that the engine
+                    // dedups SSD reads (gist Phase 1).
                     residents[i] = Some(r);
                 }
                 Err(e) => {
@@ -2052,7 +2199,20 @@ impl Engine {
 
     /// Force-fetch a specific set of experts and load them into the cache.
     /// Mirrors the spec example "the router selects Expert ID 3 and 7".
+    ///
+    /// **SSD Read De-Duplication (gist Phase 1).** The set is
+    /// deduplicated (so accidental repeats in the caller's slice
+    /// never trigger duplicate I/O), then every uncached id is
+    /// fetched **concurrently** on the tokio runtime. Combined with
+    /// the in-flight singleflight inside
+    /// [`Self::fetch_with_retry`], `BatchScheduler` can call this
+    /// once per batch with the union of every request's predicted
+    /// experts and get exactly one disk read per unique id — the
+    /// "single, unified" read the gist asks for.
     pub async fn warm_with(self: &Arc<Self>, ids: &[u32]) -> std::io::Result<()> {
+        // Deduplicate up front: callers may pass overlapping
+        // per-request prediction sets without thinking about it.
+        let mut unique: HashSet<u32> = HashSet::with_capacity(ids.len());
         for &id in ids {
             if id >= self.core.router.num_experts() {
                 return Err(std::io::Error::new(
@@ -2060,8 +2220,44 @@ impl Engine {
                     format!("expert id {id} >= num_experts"),
                 ));
             }
-            if !self.core.cache.contains(id) {
-                let _ = self.fetch(id).await;
+            // Skip ids that are already resident — we still record
+            // them in `unique` so subsequent overlapping calls don't
+            // re-issue, but no fetch task is spawned.
+            if self.core.cache.contains(id) {
+                continue;
+            }
+            unique.insert(id);
+        }
+        if unique.is_empty() {
+            return Ok(());
+        }
+
+        // Spawn one fetch task per unique uncached id. All of them
+        // funnel through `fetch_with_retry` (singleflight'd), so the
+        // SSD sees at most one read per id even when this method is
+        // called concurrently from multiple call sites (e.g. the
+        // BatchScheduler pre-pass and a parallel speculative-decode
+        // verification).
+        let mut handles = Vec::with_capacity(unique.len());
+        for id in unique {
+            let me = self.clone();
+            handles.push(tokio::spawn(async move {
+                (id, me.fetch_with_retry(id).await)
+            }));
+        }
+        for h in handles {
+            match h.await {
+                Ok((id, Err(e))) => {
+                    warn!(expert = id, error = %e, "warm_with: fetch failed");
+                    // We swallow the error here: warm_with is a
+                    // best-effort prefetch, and `moe_step`'s own
+                    // retry / skip path will handle the same id
+                    // again if it really is critical.
+                }
+                Ok((_, Ok(_))) => {}
+                Err(e) => {
+                    warn!(error = %e, "warm_with: fetch task panicked");
+                }
             }
         }
         Ok(())
@@ -2473,6 +2669,58 @@ mod tests {
         // have recorded a sample.
         let r = engine.report();
         assert!(r.cycle_p50_us > 0);
+    }
+
+    /// Gist Phase 1 — SSD Read De-Duplication.
+    ///
+    /// Drive many concurrent `fetch_with_retry` calls against the same
+    /// uncached expert id and assert that the engine performed
+    /// **exactly one** disk read — directly observable as the
+    /// `bytes_read` counter equalling one expert's worth of bytes
+    /// (instead of N × that). Both the in-flight singleflight *and*
+    /// the cache-hit fast path satisfy this property: a follower
+    /// either parks on the leader's Notify or, if the leader has
+    /// already finished, returns from the cache check before
+    /// touching the storage layer. Either way the disk is read
+    /// once. With synthetic local files the leader's read completes
+    /// in microseconds, but the `bytes_read` invariant holds for
+    /// any I/O latency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_with_retry_deduplicates_concurrent_reads() {
+        let dir = TempDir::new("gen-singleflight");
+        let num_experts: u32 = 8;
+        let engine = build_engine(&dir.path, num_experts, 16, 32, 8, 2, 1, 0xF11F);
+        // Sanity: nothing resident yet, no bytes read.
+        assert!(!engine.core.cache.contains(5));
+        assert_eq!(engine.report().bytes_read, 0);
+        let expert_size = engine.core.pool.buffer_size() as u64;
+
+        const N: usize = 32;
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let e = engine.clone();
+            let b = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                e.fetch_with_retry(5).await.expect("fetch")
+            }));
+        }
+        for h in handles {
+            let _ = h.await.unwrap();
+        }
+
+        // The decisive invariant: even with 32 concurrent callers,
+        // the SSD must have served exactly one expert's worth of
+        // bytes. Without the singleflight + cache fast-path
+        // combination, this would be N × expert_size.
+        let r = engine.report();
+        assert_eq!(
+            r.bytes_read, expert_size,
+            "expected exactly one disk read of {expert_size} bytes; got {}",
+            r.bytes_read,
+        );
+        assert!(engine.core.cache.contains(5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

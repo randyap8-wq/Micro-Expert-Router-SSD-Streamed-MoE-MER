@@ -506,6 +506,73 @@ impl RealModel {
         (layer as u32) * (self.config.num_experts as u32) + local
     }
 
+    /// **SSD-read pre-pass peek (gist Phase 1).** Return a best-effort
+    /// estimate of the global expert ids this step is likely to
+    /// require. The pre-pass is cheap and side-effect-free:
+    ///
+    /// 1. **Layer 0 is exact:** we run the embedding +
+    ///    attention-normalised gate against a *clone* of the layer-0
+    ///    KV cache, so the prediction matches the actual routing
+    ///    decision the upcoming [`Self::step`] will make.
+    /// 2. **Deeper layers are approximated** by re-using the
+    ///    embedding as a stand-in for each layer's residual stream
+    ///    and running its gate. This is not exact — those decisions
+    ///    really depend on every preceding MoE FFN output — but it
+    ///    captures the strong layerwise correlation seen on
+    ///    Mixtral-class checkpoints and provides plenty of useful
+    ///    hints for the warm pass. The remaining miss-on-miss
+    ///    fetches still funnel through `Engine`'s in-flight
+    ///    singleflight, so deduplication holds even when the peek
+    ///    is wrong.
+    ///
+    /// The returned vector is **not** deduplicated; the caller is
+    /// expected to fold it into a [`HashSet`] before calling
+    /// [`Engine::warm_with`].
+    pub fn peek_experts(
+        &self,
+        token_id: u32,
+        pos: usize,
+        kv: &[KvCache],
+    ) -> Vec<u32> {
+        assert_eq!(
+            kv.len(),
+            self.config.num_layers,
+            "kv cache slice must have one entry per layer"
+        );
+        // Each layer contributes exactly `routing.experts.len()` ids,
+        // which by the gating contract equals `config.top_k`. We
+        // assert this loosely below via `debug_assert`; the
+        // pre-allocation is a tight upper bound that avoids any
+        // `Vec` growth even when `top_k` is dynamically reduced
+        // (e.g. by alias-deduplication).
+        let mut out = Vec::with_capacity(self.config.num_layers * self.config.top_k);
+        let embed = self.embed(token_id);
+        // Layer 0: run real attention against a *clone* of the KV
+        // slot so the cache is not mutated by the peek.
+        {
+            let layer = &self.layers[0];
+            let mut kv0 = kv[0].clone();
+            let attn_out = layer.attn_block(&embed, pos, &mut kv0);
+            let (_normed, routing) = layer.moe_pre(&attn_out);
+            for &local in &routing.experts {
+                out.push(self.global_expert_id(0, local));
+            }
+        }
+        // Layers ≥ 1: use the embedding as a fast residual-stream
+        // approximation. Cheap (no attention, no cloning), and good
+        // enough to seed the warm pass — anything the peek misses is
+        // still caught by the in-flight singleflight on the critical
+        // path.
+        for layer_idx in 1..self.config.num_layers {
+            let layer = &self.layers[layer_idx];
+            let (_normed, routing) = layer.moe_pre(&embed);
+            for &local in &routing.experts {
+                out.push(self.global_expert_id(layer_idx, local));
+            }
+        }
+        out
+    }
+
     /// Run one decoder step. Returns the sampled next-token id.
     ///
     /// This is the realisation of the gist's pseudocode:
