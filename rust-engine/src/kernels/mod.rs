@@ -98,6 +98,11 @@ pub struct CpuFeatures {
     pub fma: bool,
     pub avx512f: bool,
     pub avx512bw: bool,
+    /// AVX-512 VNNI (Vector Neural Network Instructions): adds
+    /// `VPDPBUSD` for fused (u8 × i8) → i32 reductions. Required by
+    /// the int8×int8 dot kernel
+    /// [`avx512::dot_int8_int8_avx512_vnni`] (gist Part 2, fix #8).
+    pub avx512vnni: bool,
     pub amx_tile: bool,
     pub amx_int8: bool,
     pub amx_bf16: bool,
@@ -117,6 +122,7 @@ impl CpuFeatures {
             fma: false,
             avx512f: false,
             avx512bw: false,
+            avx512vnni: false,
             amx_tile: false,
             amx_int8: false,
             amx_bf16: false,
@@ -141,6 +147,7 @@ fn probe_cpu() -> CpuFeatures {
     f.fma = std::is_x86_feature_detected!("fma");
     f.avx512f = std::is_x86_feature_detected!("avx512f");
     f.avx512bw = std::is_x86_feature_detected!("avx512bw");
+    f.avx512vnni = std::is_x86_feature_detected!("avx512vnni");
     // `is_x86_feature_detected!("amx-tile")` is gated behind the
     // unstable `x86_amx_intrinsics` feature on stable Rust as of
     // 1.84, so we additionally consult /proc/cpuinfo on Linux.
@@ -292,6 +299,7 @@ pub fn log_backend() {
         model = %f.model,
         avx2 = f.avx2,
         avx512 = f.avx512f && f.avx512bw,
+        avx512vnni = f.avx512vnni,
         amx_int8 = f.amx_int8,
         sapphire_rapids = f.sapphire_rapids_or_newer,
         "auto-escalation selected math kernel backend"
@@ -332,6 +340,41 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         }
         _ => scalar::dot_f32(a, b),
     }
+}
+
+/// **Fully-quantised int8×int8 dot** — `out_scale * sum_i (qw[i] *
+/// qx[i])` (gist Part 2, fix #8). When the host CPU supports AVX-512
+/// VNNI (`vpdpbusd`), the inner reduction stays in i32 integer
+/// registers via [`avx512::dot_int8_int8_avx512_vnni`] and only the
+/// final `out_scale` fold spends an f32 multiply. Otherwise the call
+/// falls through to the scalar reference (still i32 accumulation, so
+/// the value is bit-equivalent).
+///
+/// Use this entry point when both the weight stream **and** the
+/// activation row are already int8-quantised — the engine's existing
+/// [`dequant_int8_dot`] entry point keeps the mixed f32-activation
+/// shape used by the default streaming int8 path.
+#[inline]
+pub fn dot_int8_int8(out_scale: f32, qw: &[i8], qx: &[i8]) -> f32 {
+    debug_assert_eq!(qw.len(), qx.len());
+    #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+    {
+        // This kernel is valid whenever the CPU exposes the exact
+        // ISA features it requires, even if the global dispatcher has
+        // selected `KernelBackend::Amx`. Gate directly on the cached
+        // AVX-512 feature bits so AMX-capable hosts do not fall back
+        // to scalar for int8×int8 dots.
+        let f = cpu_features();
+        if f.avx512f && f.avx512bw && f.avx512vnni {
+            // SAFETY: cached CPU feature detection confirmed
+            // `avx512f + avx512bw + avx512vnni`. The kernel reads via
+            // unaligned `loadu_si512`, writes nothing, and handles
+            // the scalar tail explicitly. The bias-trick correction
+            // is documented on the kernel itself.
+            return unsafe { avx512::dot_int8_int8_avx512_vnni(out_scale, qw, qx) };
+        }
+    }
+    scalar::dot_int8_int8(out_scale, qw, qx)
 }
 
 /// `sum_i scale * q[i] * x[i]` — fused symmetric-int8 dequant + dot.
@@ -440,6 +483,23 @@ mod tests {
                 y_ref[i]
             );
         }
+    }
+
+    #[test]
+    fn dot_int8_int8_matches_scalar_reference() {
+        // gist Part 2, fix #8 — VNNI kernel must be bit-equivalent to
+        // the scalar reference (both accumulate in i32, then fold the
+        // f32 scale at the very end, so the only floating-point error
+        // is in that final multiply).
+        let scale = 0.0078125f32; // exact in binary fp
+        let qw: Vec<i8> = (0..193).map(|i| ((i % 251) - 125) as i8).collect();
+        let qx: Vec<i8> = (0..193).map(|i| (((i * 7) % 197) - 98) as i8).collect();
+        let lhs = dot_int8_int8(scale, &qw, &qx);
+        let rhs = scalar::dot_int8_int8(scale, &qw, &qx);
+        assert!(
+            (lhs - rhs).abs() <= 1e-3 + rhs.abs() * 1e-4,
+            "dot_int8_int8 mismatch: dispatch={lhs} scalar={rhs}"
+        );
     }
 
     #[test]

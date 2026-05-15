@@ -283,6 +283,13 @@ pub struct BatchConfig {
     /// stall and clamps it to zero under
     /// [`PressureLevel::Critical`].
     pub speculation_base_depth: usize,
+    /// Pool back-pressure thresholds for the shared
+    /// [`PooledBlockPool`] this scheduler owns (gist Part 1, fix #4).
+    /// Defaults to [`PressureThresholds::default`] (90%/98%) so older
+    /// callers keep their semantics; operators tune via the
+    /// `[real_transformer].pressure_high_threshold` /
+    /// `pressure_critical_threshold` keys.
+    pub pressure_thresholds: crate::block_pool::PressureThresholds,
 }
 
 impl Default for BatchConfig {
@@ -294,6 +301,7 @@ impl Default for BatchConfig {
             block_pool_kv_dim: 0,
             idle_eviction_threshold: Duration::from_secs(5),
             speculation_base_depth: 1,
+            pressure_thresholds: crate::block_pool::PressureThresholds::default(),
         }
     }
 }
@@ -388,7 +396,11 @@ impl BatchScheduler {
         let started_at = Instant::now();
         let speculation = Arc::new(SpeculationController::new(cfg.speculation_base_depth));
         let block_pool = if cfg.block_pool_capacity > 0 && cfg.block_pool_kv_dim > 0 {
-            Some(BlockPool::new(cfg.block_pool_kv_dim, cfg.block_pool_capacity))
+            Some(BlockPool::with_thresholds(
+                cfg.block_pool_kv_dim,
+                cfg.block_pool_capacity,
+                cfg.pressure_thresholds,
+            ))
         } else {
             None
         };

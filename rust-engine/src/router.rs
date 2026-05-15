@@ -1728,6 +1728,178 @@ impl ExpertAffinity {
         }
         self.observations.store(0, Ordering::Relaxed);
     }
+
+    /// **Exponential bit-shift decay (gist Part 2, fix #7).** Right-
+    /// shift every counter by `bits` so older co-occurrences age out
+    /// of the matrix instead of accumulating indefinitely until they
+    /// saturate at `u32::MAX`. Cheap: one atomic load + atomic store
+    /// per cell, no allocation, no lock. Called periodically by the
+    /// background decay worker spawned by
+    /// [`LayeredExpertAffinity::spawn_decay_worker`]; `bits = 1` halves
+    /// every counter, which keeps the heat map responsive to
+    /// distribution shifts without losing all signal in one epoch.
+    pub fn decay(&self, bits: u32) {
+        if bits == 0 {
+            return;
+        }
+        for cell in self.counts.iter() {
+            // Relaxed is correct: the decay is *advisory* — concurrent
+            // `observe_layer` increments may race with the shift, but
+            // we only ever lose at most `bits` of magnitude on a
+            // racing cell, which is precisely the intent.
+            let cur = cell.load(Ordering::Relaxed);
+            cell.store(cur >> bits, Ordering::Relaxed);
+        }
+        // Observation counter is *not* decayed — it's used for
+        // "total samples seen" diagnostics and decaying it would
+        // make the "Per ~100k observations" trigger of the worker
+        // race against itself.
+    }
+}
+
+/// **Per-layer expert-affinity matrix (gist Part 1, fix #2).** Owns
+/// one [`ExpertAffinity`] per MoE layer so co-occurrences observed in
+/// layer $L_0$ never get folded into the "experts that fire together"
+/// signal for layer $L_5$. This matches the way real Mixtral-class
+/// gates behave: each layer learns its own routing pattern, and
+/// fusing them produces ghost neighbours that are not actually
+/// co-fired in any single layer.
+///
+/// Hot-path API ([`Self::observe_layer`]) takes the originating layer
+/// index, so the existing single-namespace flat global-id scheme used
+/// by the cache and the storage layer still passes through unchanged
+/// — only the affinity accounting becomes layer-aware.
+pub struct LayeredExpertAffinity {
+    layers: Box<[ExpertAffinity]>,
+    num_experts: u32,
+}
+
+impl LayeredExpertAffinity {
+    /// Pre-allocate one `N × N` matrix per layer. `num_layers` and
+    /// `num_experts` must both be non-zero. Memory is laid out
+    /// layer-major (one `Box<[AtomicU32]>` per layer), so a hot path
+    /// that only touches a single layer never thrashes adjacent
+    /// layers' cache lines.
+    pub fn new(num_layers: usize, num_experts: u32) -> Self {
+        assert!(num_layers > 0, "LayeredExpertAffinity num_layers must be > 0");
+        assert!(num_experts > 0, "LayeredExpertAffinity num_experts must be > 0");
+        let layers: Vec<ExpertAffinity> =
+            (0..num_layers).map(|_| ExpertAffinity::new(num_experts)).collect();
+        Self {
+            layers: layers.into_boxed_slice(),
+            num_experts,
+        }
+    }
+
+    /// Number of layers the matrix was sized for.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Number of experts each layer's matrix was sized for.
+    pub fn num_experts(&self) -> u32 {
+        self.num_experts
+    }
+
+    /// Record that every pair `(i, j)` in `experts` was activated
+    /// together by the same MoE step inside `layer_idx`. Hot-path
+    /// safe — delegates to the single-layer
+    /// [`ExpertAffinity::observe_layer`] for `layer_idx`. Out-of-range
+    /// layer indices are silently dropped (matches the rest of the
+    /// router's "best-effort instrumentation" stance — telemetry
+    /// must never panic the inference path).
+    pub fn observe_layer(&self, layer_idx: usize, experts: &[u32]) {
+        if let Some(layer) = self.layers.get(layer_idx) {
+            layer.observe_layer(experts);
+        }
+    }
+
+    /// Top-`k` experts most frequently co-fired with `id` **inside
+    /// `layer_idx`**, in descending affinity order.
+    pub fn neighbors(&self, layer_idx: usize, id: u32, k: usize) -> Vec<u32> {
+        self.layers
+            .get(layer_idx)
+            .map(|l| l.neighbors(id, k))
+            .unwrap_or_default()
+    }
+
+    /// Co-occurrence count of `(a, b)` within `layer_idx`. Returns 0
+    /// for out-of-range layer / expert ids or `a == b`.
+    pub fn affinity(&self, layer_idx: usize, a: u32, b: u32) -> u32 {
+        self.layers
+            .get(layer_idx)
+            .map(|l| l.affinity(a, b))
+            .unwrap_or(0)
+    }
+
+    /// Right-shift every counter in **every** layer by `bits` (gist
+    /// Part 2, fix #7). One pass over all `num_layers × N × N` cells;
+    /// still O(1) per cell so the total decay cost is linear in the
+    /// matrix size — fine on the background epoch worker.
+    pub fn decay(&self, bits: u32) {
+        for layer in self.layers.iter() {
+            layer.decay(bits);
+        }
+    }
+
+    /// Cumulative `observe_layer` calls summed across every layer.
+    /// Drives the decay worker's "shift after ~`epoch_threshold`
+    /// observations" trigger.
+    pub fn total_observations(&self) -> u64 {
+        self.layers.iter().map(|l| l.total_observations()).sum()
+    }
+
+    /// Spawn a background worker that calls [`Self::decay`] once
+    /// every `epoch_threshold` cumulative observations across all
+    /// layers. The worker is **opt-in** (the engine starts it only
+    /// when the predictive arm is configured) and parks itself
+    /// efficiently between epochs — the poll interval below is the
+    /// upper bound on how long a saturating counter could remain at
+    /// `u32::MAX` before being shifted down.
+    ///
+    /// `bits = 1` halves every counter per epoch, which gives the
+    /// matrix an effective sliding window of roughly `epoch_threshold
+    /// × log2(u32::MAX)` observations before residual signal decays
+    /// below noise — well beyond the conversation lengths a single
+    /// session realistically generates.
+    ///
+    /// Returns a [`std::sync::Arc<std::sync::atomic::AtomicBool>`]
+    /// the caller can flip to `false` to ask the worker to exit at
+    /// the next poll boundary. Dropping the returned handle has no
+    /// effect — the worker keeps running until the flag is cleared
+    /// (this matches the gist's "lifetime tied to the engine" semantics).
+    #[must_use = "the returned shutdown flag controls the worker's lifetime; \
+                  the worker keeps running while the flag is true"]
+    pub fn spawn_decay_worker(
+        self: std::sync::Arc<Self>,
+        epoch_threshold: u64,
+        bits: u32,
+        poll_interval: std::time::Duration,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let shutdown_clone = shutdown.clone();
+        let aff = self;
+        // Capture the baseline *before* spawning so the worker
+        // observes a deterministic starting point — otherwise a race
+        // between thread startup and concurrent `observe_layer` calls
+        // would let the first epoch's delta drop to zero.
+        let baseline = aff.total_observations();
+        std::thread::Builder::new()
+            .name("affinity-decay".to_string())
+            .spawn(move || {
+                let mut last_seen = baseline;
+                while shutdown_clone.load(Ordering::Relaxed) {
+                    std::thread::sleep(poll_interval);
+                    let now = aff.total_observations();
+                    if now.saturating_sub(last_seen) >= epoch_threshold {
+                        aff.decay(bits);
+                        last_seen = now;
+                    }
+                }
+            })
+            .expect("affinity-decay worker thread failed to spawn");
+        shutdown
+    }
 }
 
 /// UTH-layout spatial neighbours of `id` — the experts whose tensor
@@ -1833,8 +2005,11 @@ impl SpeculationController {
     /// adjusts the speculation window. Returns the new
     /// [`Self::current_depth`].
     ///
-    /// Safe to call on the per-token hot path: a single
-    /// `compare_exchange` plus two atomic loads / stores.
+    /// Safe to call on the per-token hot path: in the common case
+    /// this is a single `AtomicU64::swap` (to atomically pivot the
+    /// `last_stall_us` baseline) plus a small handful of relaxed
+    /// loads/stores on the depth / streak atomics — no
+    /// `compare_exchange` retry loop, no lock, no allocation.
     pub fn update_from_stall(&self, cumulative_stall_us: u64) -> usize {
         // Don't fight a manual suspension from the scheduler. Keep
         // the cumulative-stall baseline fresh behind the scenes so
@@ -2374,6 +2549,80 @@ mod tests {
         assert!(aff.neighbors(2, 0).is_empty());
         // Out-of-range id → empty.
         assert!(aff.neighbors(99, 4).is_empty());
+    }
+
+    #[test]
+    fn layered_affinity_isolates_co_occurrences_per_layer() {
+        // gist Part 1, fix #2: a co-firing of (4, 6) in layer 0
+        // must not appear as a neighbour signal for layer 1.
+        let l = LayeredExpertAffinity::new(/*num_layers=*/ 2, /*num_experts=*/ 8);
+        for _ in 0..5 {
+            l.observe_layer(0, &[4, 6]);
+        }
+        // Layer 0: 4 → 6 (and 6 → 4) is the strongest neighbour.
+        assert_eq!(l.neighbors(0, 4, 1), vec![6]);
+        assert_eq!(l.neighbors(0, 6, 1), vec![4]);
+        assert_eq!(l.affinity(0, 4, 6), 5);
+        // Layer 1: never observed → all zero.
+        assert_eq!(l.affinity(1, 4, 6), 0);
+        assert!(l.neighbors(1, 4, 1).is_empty());
+        // Out-of-range layer index is silently dropped (telemetry
+        // must never panic the inference path).
+        l.observe_layer(99, &[0, 1]);
+        assert_eq!(l.affinity(99, 0, 1), 0);
+        assert!(l.neighbors(99, 0, 1).is_empty());
+    }
+
+    #[test]
+    fn expert_affinity_decay_halves_counts_without_data_loss() {
+        // gist Part 2, fix #7: bit-shift decay ages co-occurrences
+        // out of the matrix without resetting it to zero.
+        let aff = ExpertAffinity::new(8);
+        for _ in 0..16 {
+            aff.observe_layer(&[3, 5]);
+        }
+        let before = aff.affinity(3, 5);
+        assert!(before >= 16);
+        aff.decay(1);
+        let after = aff.affinity(3, 5);
+        // One right-shift ≈ halving (within ±1 due to integer
+        // truncation on the symmetric pair update).
+        assert!(after <= before / 2 + 1, "after={after} vs before={before}");
+        assert!(after > 0, "decay must not wipe the signal");
+        // observation counter is preserved across decay.
+        assert!(aff.total_observations() >= 16);
+    }
+
+    #[test]
+    fn layered_affinity_decay_worker_shifts_counters() {
+        // gist Part 2, fix #7 — wired through the LayeredExpertAffinity
+        // background worker. Spawn the worker first (so it captures
+        // the "zero observations" baseline), then drive enough new
+        // co-firings to cross `epoch_threshold` and confirm the
+        // worker right-shifts.
+        let l = std::sync::Arc::new(LayeredExpertAffinity::new(1, 8));
+        let shutdown = l
+            .clone()
+            .spawn_decay_worker(
+                /*epoch_threshold=*/ 1,
+                /*bits=*/ 1,
+                /*poll_interval=*/ std::time::Duration::from_millis(5),
+            );
+        for _ in 0..32 {
+            l.observe_layer(0, &[2, 4]);
+        }
+        let pre = l.affinity(0, 2, 4);
+        // Wait long enough for the worker to observe one epoch.
+        // Multiple poll intervals (≥10 polls of 5 ms) covers the
+        // OS-scheduler tail under load while still keeping the
+        // test latency bounded.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let post = l.affinity(0, 2, 4);
+        shutdown.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            post < pre,
+            "decay worker should have shifted counters down (pre={pre} post={post})"
+        );
     }
 
     #[test]

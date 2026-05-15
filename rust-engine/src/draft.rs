@@ -84,7 +84,67 @@ pub struct DraftEngine {
     /// `cargo test` reproducible; production builds would replace
     /// this with a learned vector from the main model's first
     /// attention block's output projection.
-    bias: Vec<f32>,
+    ///
+    /// Stored in a 64-byte-aligned heap allocation (boxed slice) so
+    /// the AVX-512 / AVX2 `dot_f32` kernels see clean cache-line
+    /// reads when they pull `bias` into a vector register on every
+    /// `predict_next` call. The embedding rows are aligned implicitly
+    /// (they're contiguous floats inside `embedding`, which the loader
+    /// page-aligns), so the only buffer that needed promotion was the
+    /// bias / hidden-state scratch.
+    bias: AlignedF32,
+}
+
+/// 64-byte-aligned owned `[f32]` slice — sized to keep the AVX-512
+/// kernels' 16-lane FMA loads on a single L1 cache line. Used by
+/// [`DraftEngine`] for the bias and the residual-style hidden scratch
+/// that get FMA-summed into every dot product.
+struct AlignedF32 {
+    ptr: std::ptr::NonNull<f32>,
+    len: usize,
+}
+
+// SAFETY: this is an owned allocation with no interior mutability.
+unsafe impl Send for AlignedF32 {}
+unsafe impl Sync for AlignedF32 {}
+
+impl AlignedF32 {
+    /// Allocate `len` zero-initialised `f32`s on a 64-byte boundary.
+    fn zeros(len: usize) -> Self {
+        assert!(len > 0, "AlignedF32 length must be > 0");
+        // Round the byte size up to a multiple of 64 so the *tail* of
+        // the buffer also sits inside an aligned cache line — keeps
+        // the AVX-512 16-wide tail load from straddling a cache line.
+        let bytes = (len * std::mem::size_of::<f32>() + 63) & !63;
+        let layout = std::alloc::Layout::from_size_align(bytes, 64)
+            .expect("invalid AlignedF32 layout");
+        // SAFETY: layout has non-zero size and a power-of-two align.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) } as *mut f32;
+        let ptr = std::ptr::NonNull::new(raw)
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        Self { ptr, len }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[f32] {
+        // SAFETY: ptr/len describe a fully-initialised owned f32 slab.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        // SAFETY: ptr/len describe a fully-initialised owned f32 slab.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for AlignedF32 {
+    fn drop(&mut self) {
+        let bytes = (self.len * std::mem::size_of::<f32>() + 63) & !63;
+        let layout = std::alloc::Layout::from_size_align(bytes, 64).unwrap();
+        // SAFETY: we own the allocation and the layout matches `zeros`.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout) }
+    }
 }
 
 impl DraftEngine {
@@ -98,10 +158,17 @@ impl DraftEngine {
         let vocab = main.config.vocab_size;
         // Seed the bias with a cheap hash of the embedding rows so
         // it varies with the main model but doesn't pull in an RNG.
-        let mut bias = vec![0.0f32; d];
-        for tok in 0..vocab {
-            for (i, b) in bias.iter_mut().enumerate() {
-                *b += main.embedding[tok * d + i] / (vocab as f32);
+        // 64-byte-aligned scratch — keeps the AVX-512 16-wide loads
+        // in `predict_next` on one cache line per iteration.
+        let mut bias = AlignedF32::zeros(d);
+        {
+            let bias_s = bias.as_mut_slice();
+            let inv_vocab = 1.0f32 / (vocab as f32);
+            for tok in 0..vocab {
+                let row = &main.embedding[tok * d..(tok + 1) * d];
+                for (i, &x) in row.iter().enumerate() {
+                    bias_s[i] += x * inv_vocab;
+                }
             }
         }
         Self {
@@ -125,22 +192,42 @@ impl DraftEngine {
     /// Argmax over `(embed(token) + bias) · embedding.T`. Tied head
     /// means this is a single `O(vocab_size · d_model)` matvec — the
     /// "low-latency dense model" property the gist asks for.
-    fn predict_next(&self, token: u32) -> u32 {
+    ///
+    /// The inner reductions go through [`crate::kernels::dot_f32`],
+    /// which auto-escalates AVX-512 → AVX2 → scalar via the same
+    /// runtime dispatcher [`crate::backend::ScalarBackend::matmul_into`]
+    /// uses. That eliminates the raw nested scalar loop the gist
+    /// flagged for L3-thrashing on `vocab_size × d_model` matmuls.
+    /// The hidden state `h = embed(token) + bias` is built in a
+    /// 64-byte-aligned scratch ([`AlignedF32`]) so the SIMD kernels
+    /// see clean cache-line reads, and we reuse the same allocation
+    /// across the call (no per-call `Vec::with_capacity`).
+    fn predict_next(&self, token: u32, h_scratch: &mut AlignedF32) -> u32 {
         let cur = self.embed_row(token);
-        // h = cur + bias (residual-style update)
-        let mut h = vec![0.0f32; self.d_model];
+        let bias = self.bias.as_slice();
+        let h = h_scratch.as_mut_slice();
+        debug_assert_eq!(h.len(), self.d_model);
+        debug_assert_eq!(bias.len(), self.d_model);
+        debug_assert_eq!(cur.len(), self.d_model);
+        // h = cur + bias (residual-style update). Plain elementwise
+        // add — the optimiser autovectorises this with the same
+        // 16-wide AVX-512 stride the dot product uses below.
         for i in 0..self.d_model {
-            h[i] = cur[i] + self.bias[i];
+            h[i] = cur[i] + bias[i];
         }
-        // logits[v] = h · embedding[v]
+        // logits[v] = h · embedding[v]. Routed through the SIMD
+        // dispatcher; on AVX-512-capable hosts each row is a
+        // 4×-unrolled FMA reduction, on AVX2 it's an 8-wide FMA, and
+        // on scalar it falls back to the reference loop. Argmax is
+        // streamed against `best_score` to avoid materialising the
+        // full logits vector — keeps the working set in L1 and
+        // matches the gist's "no allocation on the hot path" rule.
+        let d = self.d_model;
         let mut best = 0u32;
         let mut best_score = f32::NEG_INFINITY;
         for v in 0..self.vocab_size {
-            let row = &self.embedding[v * self.d_model..(v + 1) * self.d_model];
-            let mut score = 0.0f32;
-            for i in 0..self.d_model {
-                score += h[i] * row[i];
-            }
+            let row = &self.embedding[v * d..(v + 1) * d];
+            let score = crate::kernels::dot_f32(h, row);
             if score > best_score {
                 best_score = score;
                 best = v as u32;
@@ -153,9 +240,13 @@ impl DraftEngine {
 impl DraftLike for DraftEngine {
     fn draft(&self, seed_token: u32, k: usize) -> Vec<u32> {
         let mut tokens = Vec::with_capacity(k);
+        // Single 64-byte-aligned hidden-state scratch reused across
+        // every draft step — no per-iteration allocation, matches the
+        // gist's "allocation-free hot path" rule.
+        let mut h = AlignedF32::zeros(self.d_model.max(1));
         let mut cur = seed_token;
         for _ in 0..k {
-            cur = self.predict_next(cur);
+            cur = self.predict_next(cur, &mut h);
             tokens.push(cur);
         }
         tokens
@@ -223,6 +314,24 @@ impl RealModel {
         // pre-pass for every draft position. Use a *clone* of the
         // KV slice so peeking does not mutate it — the verifier
         // path is what actually advances the real cache.
+        //
+        // **Position-1+ decay fix (gist Part 1, fix #3).** The
+        // previous implementation appended zero K/V vectors for every
+        // lookahead position past the first, which left the routing
+        // pre-pass conditioned on garbage data as the speculation
+        // window $K$ grew. Instead we now compute a lightweight
+        // hidden-state approximation: for the layer the peek actually
+        // re-attends over (layer 0), we project the draft token's
+        // embedding through the layer's `wk`/`wv` matrices, apply
+        // RoPE at the correct absolute position, and append the
+        // result. That anchors `peek_experts` for every $i > 0$ on a
+        // K/V slot derived from the real candidate token rather than
+        // a zero vector, recovering prefetch accuracy for the tail of
+        // the lookahead window. For layers $\geq 1$ the peek does not
+        // re-attend (it re-uses the embedding directly), so their
+        // KV-preview slots stay untouched — feeding them anything
+        // would just waste cycles without changing the routing
+        // decision.
         let mut union: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut kv_preview: Vec<KvCache> = kv.to_vec();
         let mut cur = seed_token;
@@ -231,13 +340,11 @@ impl RealModel {
                 union.insert(id);
             }
             // Advance the preview cache so the next iteration's peek
-            // is conditioned on a plausible position. We can't run
-            // real attention without paying the verifier's cost, so
-            // just append a zero K/V — the position is what the
-            // peek needs most.
-            for slot in kv_preview.iter_mut() {
-                let zeros = vec![0.0f32; slot.kv_dim];
-                slot.append(&zeros, &zeros);
+            // is conditioned on a plausible position. Only layer 0
+            // is consulted by `peek_experts`'s attention pre-pass;
+            // other layers ignore their KV slots in the peek path.
+            if i + 1 < drafts.len() {
+                self.advance_preview_kv(&mut kv_preview[0], cur, pos + i);
             }
             cur = draft_tok;
         }
@@ -273,6 +380,38 @@ impl RealModel {
             accepted.push(next);
         }
         SpeculativeStepResult { accepted, accepted_len, warmed_experts }
+    }
+
+    /// Advance the layer-0 KV preview by one position using the draft
+    /// token's embedding as a hidden-state approximation. Pure
+    /// helper — does **not** touch the real KV cache. Used by
+    /// [`Self::step_speculative`] to fix the position-1+ decay the
+    /// gist flagged: the previous "append zeros" loop polluted the
+    /// peek pre-pass for $i > 0$.
+    fn advance_preview_kv(&self, kv0: &mut KvCache, draft_tok: u32, abs_pos: usize) {
+        use crate::transformer::{apply_rope_inplace, matmul_row_major};
+        let x = self.embed(draft_tok);
+        let attn = &self.layers[0].attn;
+        debug_assert_eq!(kv0.kv_dim, attn.kv_dim());
+        // Project K/V from the draft-token embedding. This is the
+        // same projection the verifier's `attn_block` would do —
+        // *modulo* attention output residuals, which `peek_experts`
+        // does not re-read. Skipping Q/wo + attention sum keeps the
+        // helper "lightweight" (the gist's term): one matmul each
+        // for K and V, no softmax, no scaled-dot, no weighted sum.
+        let mut k = matmul_row_major(&attn.wk, &x, attn.kv_dim(), attn.d_model);
+        let v = matmul_row_major(&attn.wv, &x, attn.kv_dim(), attn.d_model);
+        // RoPE must be applied at the absolute position the verifier
+        // *would* attend at, otherwise the rotational phase of K
+        // drifts and the peek's attention becomes meaningless. The
+        // verifier appends to position `abs_pos + 1` next, so the
+        // K/V we synthesise here represents position `abs_pos + 1`.
+        let rope_pos = abs_pos + 1;
+        for h in 0..attn.num_kv_heads {
+            let s = h * attn.head_dim;
+            apply_rope_inplace(&mut k[s..s + attn.head_dim], rope_pos, attn.rope_base);
+        }
+        kv0.append(&k, &v);
     }
 }
 
