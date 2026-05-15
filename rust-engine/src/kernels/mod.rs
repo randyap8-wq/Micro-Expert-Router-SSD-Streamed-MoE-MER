@@ -359,17 +359,18 @@ pub fn dot_int8_int8(out_scale: f32, qw: &[i8], qx: &[i8]) -> f32 {
     debug_assert_eq!(qw.len(), qx.len());
     #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
     {
-        // VNNI is a strictly newer feature than AVX-512BW; the
-        // dispatcher's `current()` reports `Avx512` for any AVX-512F
-        // + AVX-512BW host, so we separately consult the cached CPU
-        // features for the VNNI bit before entering the VNNI body.
+        // This kernel is valid whenever the CPU exposes the exact
+        // ISA features it requires, even if the global dispatcher has
+        // selected `KernelBackend::Amx`. Gate directly on the cached
+        // AVX-512 feature bits so AMX-capable hosts do not fall back
+        // to scalar for int8×int8 dots.
         let f = cpu_features();
-        if matches!(current(), KernelBackend::Avx512) && f.avx512vnni {
-            // SAFETY: dispatcher confirmed `avx512f + avx512bw +
-            // avx512vnni`. The kernel reads via unaligned `loadu_si512`
-            // and writes nothing; the scalar tail is handled
-            // explicitly. The bias-trick correction is documented on
-            // the kernel itself.
+        if f.avx512f && f.avx512bw && f.avx512vnni {
+            // SAFETY: cached CPU feature detection confirmed
+            // `avx512f + avx512bw + avx512vnni`. The kernel reads via
+            // unaligned `loadu_si512`, writes nothing, and handles
+            // the scalar tail explicitly. The bias-trick correction
+            // is documented on the kernel itself.
             return unsafe { avx512::dot_int8_int8_avx512_vnni(out_scale, qw, qx) };
         }
     }
