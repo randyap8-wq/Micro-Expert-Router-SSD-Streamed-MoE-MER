@@ -21,7 +21,7 @@ use crate::inference::{
     combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4_0,
     run_inference_q4_0_qmm, run_inference_q4k, run_inference_q4k_qmm, synth_hidden_state,
     uniform_scores, ExpertWeightsError, HiddenState,
-    InferenceOutput, WeightDtype,
+    InferenceOutput, WeightDtype, Q4_0_BLOCK_ELEMS, Q4K_BLOCK_ELEMS,
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
@@ -843,7 +843,7 @@ fn dispatch_expert_forward(
         WeightDtype::F32 => run_inference(token_idx, r, x, d_model, d_ff),
         WeightDtype::F16 => run_inference_f16(token_idx, r, x, d_model, d_ff),
         WeightDtype::Int8 => run_inference_int8(token_idx, r, x, d_model, d_ff),
-        WeightDtype::Q4K if use_qmm && d_model % 256 == 0 => {
+        WeightDtype::Q4K if use_qmm && d_model % Q4K_BLOCK_ELEMS == 0 => {
             match run_inference_q4k_qmm(token_idx, r, x, d_model, d_ff) {
                 Ok(v) => Ok(v),
                 Err(e) => {
@@ -853,7 +853,7 @@ fn dispatch_expert_forward(
             }
         }
         WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, d_model, d_ff),
-        WeightDtype::Q4_0 if use_qmm && d_model % 32 == 0 => {
+        WeightDtype::Q4_0 if use_qmm && d_model % Q4_0_BLOCK_ELEMS == 0 => {
             match run_inference_q4_0_qmm(token_idx, r, x, d_model, d_ff) {
                 Ok(v) => Ok(v),
                 Err(e) => {

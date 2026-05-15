@@ -1021,8 +1021,18 @@ impl Manifest {
         self.entries.get(&id).map(|e| e.payload_offset)
     }
 
-    /// Convenience: dtype declared by the file's UTH (or `None` if
-    /// the file is legacy / unindexed).
+    /// Convenience: dtype declared by the file's UTH. Returns `None`
+    /// in **two** distinct cases:
+    ///
+    /// * `id` was not seen at scan time (no `expert_<id>.bin` in any
+    ///   of the manifest's data dirs), or
+    /// * the file *was* indexed but has no UTH (legacy bare-payload
+    ///   layout written before the `--no-uth` flag was introduced).
+    ///
+    /// Callers that need to distinguish these cases should use
+    /// [`Manifest::lookup`] (which returns `None` only in the first
+    /// case; an indexed legacy file still yields `Some(entry)` with
+    /// `entry.dtype == None`).
     #[inline]
     pub fn dtype(&self, id: u32) -> Option<WeightDtype> {
         self.entries.get(&id).and_then(|e| e.dtype)
