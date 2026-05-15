@@ -398,4 +398,100 @@ mod tests {
         bad[..4].copy_from_slice(b"NOPE");
         assert!(TensorHeader::probe(&bad).is_none());
     }
+
+    // -----------------------------------------------------------------
+    // Property-based fuzz tests (gist Task 4 — Formal Verification
+    // Readiness).
+    //
+    // We don't pull in `proptest` / `quickcheck` (extra build-time
+    // dep, slows CI on the engine's already-large compile budget).
+    // Instead a deterministic xorshift PRNG enumerates thousands of
+    // pseudo-random byte buffers and asserts the parser:
+    //   * never panics,
+    //   * never reads past the end of the input (we feed lengths
+    //     spanning 0 .. 4*UTH_BYTES so any out-of-bounds read would
+    //     be caught by the slice machinery),
+    //   * always agrees with the round-trip property when the input
+    //     happens to start with valid UTH bytes.
+    //
+    // Run with `cargo test --release tensor_header::tests::fuzz`.
+    // -----------------------------------------------------------------
+
+    fn xorshift_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn fill_random(buf: &mut [u8], seed: u64) {
+        let mut state = seed.max(1);
+        for chunk in buf.chunks_mut(8) {
+            let v = xorshift_next(&mut state);
+            for (i, b) in chunk.iter_mut().enumerate() {
+                *b = (v >> (8 * i)) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_probe_never_panics_on_random_input() {
+        // 16 K iterations × up to 256 B input ≈ 4 MiB of work, well
+        // under the test budget even in debug mode.
+        for trial in 0..16384u64 {
+            let len = ((trial * 0x9E37_79B9_7F4A_7C15) % (4 * UTH_BYTES as u64 + 1)) as usize;
+            let mut buf = vec![0u8; len];
+            fill_random(&mut buf, trial.wrapping_mul(0x1234_5678) ^ 0xDEAD_BEEF);
+            // Property: probe must return either `None` or a fully-
+            // populated `TensorHeader` whose magic round-trips. It
+            // must NEVER panic, NEVER OOB-read, NEVER UB.
+            match TensorHeader::probe(&buf) {
+                None => {}
+                Some(h) => {
+                    let re = h.to_bytes();
+                    assert_eq!(re.len(), UTH_BYTES);
+                    assert_eq!(&re[0..4], &UTH_MAGIC);
+                    // Re-probe of the canonical encoding must match.
+                    let h2 = TensorHeader::probe(&re).expect("re-probe");
+                    assert_eq!(h, h2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_probe_with_valid_magic_random_tail() {
+        // Force the first 4 bytes to the UTH magic, then randomise
+        // the rest. The parser may accept or reject depending on
+        // dtype validity, but it must never panic.
+        for trial in 0..4096u64 {
+            let mut buf = vec![0u8; UTH_BYTES];
+            buf[..4].copy_from_slice(&UTH_MAGIC);
+            fill_random(&mut buf[4..], trial.wrapping_mul(0xC0FF_EE12_3456_789A));
+            let _ = TensorHeader::probe(&buf);
+        }
+    }
+
+    #[test]
+    fn fuzz_strip_never_panics_on_random_inputs() {
+        // `strip` is the public entry point downstream kernels call;
+        // a panic here would crash the engine on a malformed
+        // expert_<id>.bin.
+        for trial in 0..4096u64 {
+            let len = ((trial * 0x517C_C1B7_2722_0A95) % (3 * UTH_BYTES as u64 + 1)) as usize;
+            let mut buf = vec![0u8; len];
+            fill_random(&mut buf, trial.wrapping_add(0x0123_4567_89AB_CDEF));
+            for block in [16usize, 64, 512, 4096] {
+                let (_h, payload) = TensorHeader::strip(&buf, block);
+                // The returned payload must be a sub-slice of buf;
+                // its pointer + length must lie within buf.
+                let buf_range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
+                let pay_start = payload.as_ptr() as usize;
+                let pay_end = pay_start + payload.len();
+                assert!(pay_start >= buf_range.start && pay_end <= buf_range.end);
+            }
+        }
+    }
 }

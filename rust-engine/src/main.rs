@@ -6,6 +6,7 @@
 //! See README.md at the repository root for architecture and design notes.
 
 mod aligned_buffer;
+mod backend;
 mod batch_scheduler;
 mod block_pool;
 mod buffer_pool;
@@ -360,6 +361,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the journal that tells them "you're running the scalar path"
     // before they go looking for missing AVX-512 perf.
     crate::kernels::log_backend();
+
+    // Install the default plugin-system math backend (gist Task 2).
+    // Logged on the same boot line so ops can see both the low-level
+    // CPU-feature dispatch and the high-level Backend in one place.
+    crate::backend::install_default();
+    {
+        let b = crate::backend::current();
+        info!(backend = b.name(), "math backend installed");
+    }
 
     match cli.cmd {
         Cmd::GenData {

@@ -846,4 +846,63 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }
+
+    // -----------------------------------------------------------------
+    // Property-based fuzz tests (gist Task 4 — Formal Verification
+    // Readiness).
+    //
+    // The GGUF parser is exposed to arbitrary byte streams in
+    // production (`gguf-convert` consumes whatever the user points at).
+    // These tests verify the eager parser never panics, OOB-reads, or
+    // hangs on a malformed file, irrespective of how the bytes were
+    // produced.
+    // -----------------------------------------------------------------
+
+    fn xorshift_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn fill_random(buf: &mut [u8], seed: u64) {
+        let mut state = seed.max(1);
+        for chunk in buf.chunks_mut(8) {
+            let v = xorshift_next(&mut state);
+            for (i, b) in chunk.iter_mut().enumerate() {
+                *b = (v >> (8 * i)) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_parse_never_panics_on_random_bytes() {
+        // 4096 random inputs × up to 4 KiB; the parser must always
+        // return Err cleanly, never panic / unwrap / OOB-read.
+        for trial in 0..4096u64 {
+            let len = ((trial * 0xA3C5_9B27) % 4096) as usize;
+            let mut buf = vec![0u8; len];
+            fill_random(&mut buf, trial.wrapping_mul(0xDEAD_BEEF));
+            // The eager parser is the public consumer of arbitrary
+            // byte streams; the streaming reader needs a file path,
+            // which the fuzzer can't conjure into existence here.
+            let _ = GgufFile::parse(buf);
+        }
+    }
+
+    #[test]
+    fn fuzz_parse_with_valid_magic_random_tail() {
+        // Stamp the first 4 bytes with the GGUF magic and randomise
+        // the rest. The parser must still reject every invalid
+        // metadata block without panicking.
+        for trial in 0..2048u64 {
+            let len = 8 + ((trial * 0x9E37_79B9) % 1024) as usize;
+            let mut buf = vec![0u8; len];
+            buf[..4].copy_from_slice(GGUF_MAGIC);
+            fill_random(&mut buf[4..], trial.wrapping_add(0xC0FF_EE12));
+            let _ = GgufFile::parse(buf);
+        }
+    }
 }

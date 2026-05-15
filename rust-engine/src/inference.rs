@@ -1113,7 +1113,7 @@ fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_mode
         return;
     }
 
-    #[cfg(feature = "simd")]
+    #[cfg(not(feature = "blas"))]
     {
         let d_ff = gated.len();
         if d_ff * d_model >= 8 * 1024 {
@@ -1193,7 +1193,7 @@ fn down_proj(down: &[f32], gated: &[f32], y: &mut [f32], d_ff: usize) {
         return;
     }
 
-    #[cfg(feature = "simd")]
+    #[cfg(not(feature = "blas"))]
     {
         let d_model = y.len();
         if d_model * d_ff >= 8 * 1024 {

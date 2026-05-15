@@ -403,22 +403,24 @@ pub fn run_expert_forward(
 /// Row-major matrix-vector multiply: `y = W · x` where `W` is
 /// `[rows, cols]` row-major. Returns a fresh `Vec<f32>` of length `rows`.
 ///
-/// The `simd` cargo feature replaces the scalar loop with a row-parallel
-/// implementation using `std::thread::scope` (no extra crate dependency),
-/// which stands in for the rayon / candle / cudarc backend the gist
-/// mentions in Phase 6. The scalar path remains the default — it has zero
-/// extra deps and is the same shape every other matmul in this engine
-/// uses, so behaviour is bit-for-bit unchanged unless you opt in.
+/// **Auto-escalation (gist Task 1).** Three layers of dispatch, in
+/// order:
+///
+/// 1. `--features blas` → BLAS-shaped `matrixmultiply` SGEMV
+///    microkernel (the `ndarray`-style tuned path).
+/// 2. Otherwise, **runtime row-parallel** when the matrix is large
+///    enough to amortise thread-spawn overhead (`rows*cols ≥ 8 KiB`).
+///    This path is now always compiled — the `--features simd` flag is
+///    no longer required and is retained only for backwards
+///    compatibility (it is a no-op).
+/// 3. Scalar fallback otherwise.
 pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
-    // Compile-time guard: `simd` and `blas` are mutually exclusive
-    // backend choices for this matmul. Building with both on at once
-    // is almost certainly a configuration mistake.
-    #[cfg(all(feature = "simd", feature = "blas"))]
-    compile_error!(
-        "cargo features `simd` and `blas` are mutually exclusive — pick one matmul backend"
-    );
+    // Note: the historic `simd`/`blas` mutual-exclusion `compile_error!`
+    // is no longer needed — `simd` is now a deprecated no-op feature
+    // (the runtime row-parallel path is always compiled). The `blas`
+    // branch still wins when present.
     #[cfg(feature = "blas")]
     {
         // BLAS-equivalent SGEMV via `matrixmultiply::sgemm`: treat the
@@ -428,11 +430,14 @@ pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f
         // the scalar loop on AVX2 / NEON for the dense projections in
         // `TransformerLayer`.
         let mut y = vec![0.0f32; rows];
-        // Safety: matrixmultiply::sgemm is defined as taking pointers
+        // SAFETY: matrixmultiply::sgemm is defined as taking pointers
         // to row-major (m × k) and (k × n) matrices and writing into a
-        // row-major (m × n) output; we satisfy all aliasing and bounds
-        // requirements. `rsa` / `csa` etc. are the row/col strides for
-        // the three matrices; `1` everywhere selects row-major.
+        // row-major (m × n) output. We satisfy all aliasing and bounds
+        // requirements: `w` is a borrowed slice of exactly `rows*cols`
+        // floats, `x` is `cols` floats, and `y` is a fresh `rows`-
+        // length buffer that doesn't alias either input. `rsa` / `csa`
+        // etc. are the row/col strides for the three matrices; `1`
+        // everywhere selects row-major.
         unsafe {
             matrixmultiply::sgemm(
                 rows,
@@ -453,12 +458,11 @@ pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f
         }
         return y;
     }
-    #[cfg(feature = "simd")]
+    // Runtime row-parallel path. Always compiled (no `#[cfg(feature =
+    // "simd")]` gate) so a single binary auto-escalates on any host
+    // with enough cores.
+    #[cfg(not(feature = "blas"))]
     {
-        // Heuristic: only parallelise when the matrix is large enough
-        // that thread-spawn overhead doesn't dominate. The break-even
-        // point is around ~32 KiB of work; below that the scalar path
-        // is faster.
         if rows * cols >= 8 * 1024 {
             return matmul_row_major_parallel(w, x, rows, cols);
         }
@@ -477,11 +481,10 @@ pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f
 
 /// Row-parallel matmul using `std::thread::scope`. Each worker computes a
 /// contiguous block of output rows; no synchronisation is required because
-/// the output rows are disjoint. Used when the `simd` feature is on. A
-/// future PR can swap the body for a `candle::Tensor` op or a CUDA kernel
-/// without changing this function's signature — the call sites are
-/// already routed through `matmul_row_major`.
-#[cfg(feature = "simd")]
+/// the output rows are disjoint. Always compiled — gist Task 1's
+/// "auto-escalation" requirement means we can't hide this behind a
+/// cargo feature any more.
+#[cfg(not(feature = "blas"))]
 fn matmul_row_major_parallel(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let nthreads = std::thread::available_parallelism()
         .map(|n| n.get())

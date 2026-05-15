@@ -1,15 +1,20 @@
-//! Hardware-specific math dispatcher — gist Phase 2.
+//! Hardware-specific math dispatcher — gist Task 1 (Hardware-Agnostic
+//! "Auto-Escalation").
 //!
-//! At startup the engine probes the host CPU once and picks a kernel
-//! backend, which is then exposed via [`current()`]:
+//! At startup the engine probes the host CPU **once** and picks a
+//! kernel backend, which is then exposed via [`current()`]:
 //!
 //! * [`KernelBackend::Scalar`] — pure Rust, always available, the
 //!   fallback every other backend is benchmarked against.
+//! * [`KernelBackend::Avx2`] — 256-bit FMA dot product. Compiled in
+//!   unconditionally on `x86_64` (no cargo feature required); the
+//!   `#[target_feature(enable = "avx2,fma")]` body is only entered
+//!   when the runtime detector confirms the CPU supports it.
 //! * [`KernelBackend::Avx512`] — AVX-512F + AVX-512BW intrinsics that
 //!   fuse int8 dequant with the dot product so weights never spill to
 //!   a separate `Vec<f32>`. Compiled in only when the `avx512` cargo
-//!   feature is enabled (off by default to keep portable builds
-//!   buildable on any x86_64 toolchain without nightly).
+//!   feature is enabled (off by default so portable builds keep
+//!   working on toolchains pinned to a non-AVX-512 baseline).
 //! * [`KernelBackend::Amx`] — Intel AMX tile-based BF16 matmul stub.
 //!   AMX intrinsics are nightly-only as of Rust 1.84, so this module
 //!   only carries a documented skeleton and the runtime detector;
@@ -19,16 +24,30 @@
 //!   build) can drop a real AMX kernel into [`amx`] without touching
 //!   any call sites.
 //!
-//! The dispatcher only covers kernels where SIMD makes a meaningful
-//! difference for the engine's hot path — namely the int8 dequant-dot
-//! used by the streaming SwiGLU experts and a couple of helper
-//! reductions. The dense `gate_up_swiglu` / `down_proj` matmuls in
-//! [`crate::inference`] already route through `simd` / `blas` cargo
-//! features; this module **does not** duplicate that path, it
-//! supplements it for the quantised-weight code paths the scalar
-//! float matmul can't accelerate by itself.
+//! ### Why a feature-less auto-escalation path matters
+//!
+//! Before this module existed, opting into a SIMD matmul meant
+//! recompiling with `--features simd` (or `--features blas`) and
+//! shipping a different binary per CPU class. That conflicts with the
+//! gist's **"Hardware-Agnostic Auto-Escalation"** requirement: a
+//! single binary deployed across heterogeneous fleets must pick the
+//! best local kernel by itself. The AVX2 path is therefore always
+//! compiled (no cargo feature), and the runtime detector chooses
+//! between AVX-512 (if the optional feature was built) → AVX2 → scalar
+//! transparently. The selection is logged once at startup so ops can
+//! see which path is live.
+//!
+//! ### Zero-overhead dispatch
+//!
+//! [`current()`] caches the detection result in a `OnceLock`, so the
+//! hot path pays a single atomic load — never a `cfg!` evaluation,
+//! never a re-probe of `is_x86_feature_detected!`. This matches the
+//! gist's explicit "Zero-Overhead Dispatch" constraint.
 
 pub mod scalar;
+
+#[cfg(target_arch = "x86_64")]
+pub mod avx2;
 
 #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
 pub mod avx512;
@@ -42,6 +61,9 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelBackend {
     Scalar,
+    /// 256-bit FMA dot product. Always compiled on x86_64; entered
+    /// only when the CPU supports `avx2 + fma`.
+    Avx2,
     Avx512,
     /// AMX tile-based BF16. See module docs.
     Amx,
@@ -51,33 +73,179 @@ impl KernelBackend {
     pub fn as_str(self) -> &'static str {
         match self {
             KernelBackend::Scalar => "scalar",
+            KernelBackend::Avx2 => "avx2",
             KernelBackend::Avx512 => "avx512",
             KernelBackend::Amx => "amx",
         }
     }
 }
 
+/// Detailed snapshot of the host CPU's capabilities, used both by the
+/// kernel selector and by the startup log to give ops a single line
+/// they can correlate with deployment fleets.
+///
+/// Filled in once at startup by [`probe_cpu`] and cached in a
+/// `OnceLock`; the hot path never re-runs the probe. This matches the
+/// gist's explicit "Zero-Overhead Dispatch" constraint.
+#[derive(Debug, Clone)]
+pub struct CpuFeatures {
+    /// Vendor string from `/proc/cpuinfo` (`"GenuineIntel"`, …) or
+    /// `"unknown"` on non-Linux / parse failure.
+    pub vendor: String,
+    /// CPU model string (`model name` in `/proc/cpuinfo`).
+    pub model: String,
+    pub avx2: bool,
+    pub fma: bool,
+    pub avx512f: bool,
+    pub avx512bw: bool,
+    pub amx_tile: bool,
+    pub amx_int8: bool,
+    pub amx_bf16: bool,
+    /// True if the CPU model string contains a substring that strongly
+    /// suggests this is a Sapphire Rapids (or newer Granite Rapids)
+    /// Xeon — the chips on which the AMX 2-tile matmul path is the
+    /// default-preferred kernel.
+    pub sapphire_rapids_or_newer: bool,
+}
+
+impl CpuFeatures {
+    fn unknown() -> Self {
+        Self {
+            vendor: "unknown".into(),
+            model: "unknown".into(),
+            avx2: false,
+            fma: false,
+            avx512f: false,
+            avx512bw: false,
+            amx_tile: false,
+            amx_int8: false,
+            amx_bf16: false,
+            sapphire_rapids_or_newer: false,
+        }
+    }
+}
+
+static FEATURES: OnceLock<CpuFeatures> = OnceLock::new();
 static BACKEND: OnceLock<KernelBackend> = OnceLock::new();
 
-/// Runtime CPU-feature probe.
-///
-/// Order of preference: AMX (when both the cargo feature and the CPU
-/// support it), then AVX-512F+BW (cargo feature + CPU), then scalar.
-/// `std::is_x86_feature_detected!` is stable on x86 since Rust 1.27,
-/// so this needs no extra crate dependency.
+/// Cached host CPU probe. The first call performs the actual
+/// detection; subsequent calls are a single atomic load.
+pub fn cpu_features() -> &'static CpuFeatures {
+    FEATURES.get_or_init(probe_cpu)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn probe_cpu() -> CpuFeatures {
+    let mut f = CpuFeatures::unknown();
+    f.avx2 = std::is_x86_feature_detected!("avx2");
+    f.fma = std::is_x86_feature_detected!("fma");
+    f.avx512f = std::is_x86_feature_detected!("avx512f");
+    f.avx512bw = std::is_x86_feature_detected!("avx512bw");
+    // `is_x86_feature_detected!("amx-tile")` is gated behind the
+    // unstable `x86_amx_intrinsics` feature on stable Rust as of
+    // 1.84, so we additionally consult /proc/cpuinfo on Linux.
+    f.amx_tile = cpuinfo_has_flag("amx_tile");
+    f.amx_int8 = cpuinfo_has_flag("amx_int8");
+    f.amx_bf16 = cpuinfo_has_flag("amx_bf16");
+    if let Some((vendor, model)) = cpuinfo_vendor_model() {
+        f.sapphire_rapids_or_newer = is_sapphire_rapids_or_newer(&model);
+        f.vendor = vendor;
+        f.model = model;
+    }
+    f
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn probe_cpu() -> CpuFeatures {
+    // AArch64 / other architectures: the engine still runs, just on
+    // the scalar reference. NEON autovectorisation by the Rust
+    // optimiser remains active in the scalar path.
+    let (vendor, model) = cpuinfo_vendor_model().unwrap_or_else(|| ("unknown".into(), "unknown".into()));
+    let mut f = CpuFeatures::unknown();
+    f.vendor = vendor;
+    f.model = model;
+    f
+}
+
+/// Heuristic match for Sapphire Rapids–class Xeons (AMX-capable).
+/// We don't ship a full CPUID family / model table; instead we look
+/// for vendor-distributed model strings that uniquely identify the
+/// generation. Updated as Intel releases new SKUs.
+fn is_sapphire_rapids_or_newer(model: &str) -> bool {
+    let s = model.to_ascii_lowercase();
+    // Sapphire Rapids Xeon Scalable 4th gen: model names contain
+    // "Xeon Platinum 84xx", "Gold 64xx", "Silver 44xx", "Bronze 34xx",
+    // or the developer SKU "Xeon Max" / "Xeon w-2400".
+    s.contains("xeon") && (
+        s.contains("84") || s.contains("85") ||
+        s.contains("64") || s.contains("65") ||
+        s.contains("44") || s.contains("45") ||
+        s.contains("34") || s.contains("35") ||
+        s.contains("max") || s.contains("w-2400") || s.contains("w-3400") ||
+        // Granite Rapids (5th gen) and later
+        s.contains("granite") || s.contains("emerald")
+    )
+}
+
+fn cpuinfo_has_flag(flag: &str) -> bool {
+    let Some(s) = read_proc_cpuinfo() else { return false };
+    s.lines()
+        .filter(|l| l.starts_with("flags") || l.starts_with("Features"))
+        .any(|l| l.split_whitespace().any(|tok| tok == flag))
+}
+
+fn cpuinfo_vendor_model() -> Option<(String, String)> {
+    let s = read_proc_cpuinfo()?;
+    let mut vendor = None;
+    let mut model = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("vendor_id") {
+            vendor = v.split(':').nth(1).map(|x| x.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("model name") {
+            model = v.split(':').nth(1).map(|x| x.trim().to_string());
+        }
+        if vendor.is_some() && model.is_some() {
+            break;
+        }
+    }
+    Some((vendor.unwrap_or_else(|| "unknown".into()),
+          model.unwrap_or_else(|| "unknown".into())))
+}
+
+fn read_proc_cpuinfo() -> Option<String> {
+    use std::io::Read;
+    let mut s = String::new();
+    let mut f = std::fs::File::open("/proc/cpuinfo").ok()?;
+    f.read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
+/// Runtime CPU-feature probe. Order of preference:
+/// AMX (when both the cargo feature and the CPU support it, and the
+/// CPU is Sapphire-Rapids-class or newer) → AVX-512F+BW (cargo
+/// feature + CPU) → AVX2+FMA (always compiled on x86_64) → scalar.
 pub fn detect() -> KernelBackend {
+    let f = cpu_features();
     #[cfg(all(feature = "amx", target_arch = "x86_64"))]
     {
-        if amx::cpu_supports_amx() {
+        if f.amx_tile && f.amx_int8 && f.sapphire_rapids_or_newer {
             return KernelBackend::Amx;
         }
     }
     #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
     {
-        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
+        if f.avx512f && f.avx512bw {
             return KernelBackend::Avx512;
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if f.avx2 && f.fma {
+            return KernelBackend::Avx2;
+        }
+    }
+    // Touch f so non-x86 builds still see it as used.
+    let _ = f;
     KernelBackend::Scalar
 }
 
@@ -86,29 +254,56 @@ pub fn current() -> KernelBackend {
     *BACKEND.get_or_init(detect)
 }
 
-/// Log a one-line description of the selected backend. Safe to call
-/// multiple times; only the first call probes.
+/// Log a one-line description of the selected backend and the salient
+/// CPU features that drove the decision. Safe to call multiple times;
+/// only the first call probes.
 pub fn log_backend() {
     let b = current();
-    tracing::info!(backend = b.as_str(), "selected math kernel backend");
+    let f = cpu_features();
+    tracing::info!(
+        backend = b.as_str(),
+        vendor = %f.vendor,
+        model = %f.model,
+        avx2 = f.avx2,
+        avx512 = f.avx512f && f.avx512bw,
+        amx_int8 = f.amx_int8,
+        sapphire_rapids = f.sapphire_rapids_or_newer,
+        "auto-escalation selected math kernel backend"
+    );
 }
 
 // -----------------------------------------------------------------------
 // Public dispatch entry points.
 //
-// Each kernel returns the same value as its scalar reference. AVX-512 /
-// AMX paths are unsafe wrappers around `#[target_feature]` intrinsics
-// and are only entered when `current()` confirms the CPU supports them.
+// Each kernel returns the same value as its scalar reference. AVX-2 /
+// AVX-512 / AMX paths are unsafe wrappers around `#[target_feature]`
+// intrinsics and are only entered when `current()` confirms the CPU
+// supports them.
 // -----------------------------------------------------------------------
 
 /// Dot product over `f32` slices. The dense transformer matmul path
-/// uses BLAS / `simd` directly; this helper exists for the quantised
+/// uses BLAS / SIMD directly; this helper exists for the quantised
 /// expert kernels that need a one-off `f32` dot.
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     match current() {
         #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
-        KernelBackend::Avx512 => unsafe { avx512::dot_f32_avx512(a, b) },
+        KernelBackend::Avx512 => {
+            // SAFETY: the dispatcher confirmed the CPU supports
+            // `avx512f` via the runtime probe in `cpu_features()`;
+            // the AVX-512 kernel uses only safe slice indexing and a
+            // 16-wide FMA accumulator, with the scalar tail handled
+            // explicitly.
+            unsafe { avx512::dot_f32_avx512(a, b) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        KernelBackend::Avx2 => {
+            // SAFETY: the dispatcher confirmed the CPU supports
+            // `avx2 + fma`. The kernel reads via `loadu_ps` (no
+            // alignment requirement on the pointer), writes nothing,
+            // and uses an explicit scalar tail.
+            unsafe { avx2::dot_f32_avx2(a, b) }
+        }
         _ => scalar::dot_f32(a, b),
     }
 }
@@ -121,7 +316,15 @@ pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
     debug_assert_eq!(q.len(), x.len());
     match current() {
         #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
-        KernelBackend::Avx512 => unsafe { avx512::dequant_int8_dot_avx512(scale, q, x) },
+        KernelBackend::Avx512 => {
+            // SAFETY: the dispatcher confirmed the CPU supports
+            // `avx512f + avx512bw` (the latter is required for
+            // `_mm512_cvtepi8_epi32`). The kernel reads via
+            // `loadu_si128` / `loadu_ps` (no alignment requirement),
+            // writes nothing, and handles the scalar tail
+            // explicitly.
+            unsafe { avx512::dequant_int8_dot_avx512(scale, q, x) }
+        }
         _ => scalar::dequant_int8_dot(scale, q, x),
     }
 }
@@ -159,6 +362,22 @@ mod tests {
     #[test]
     fn backend_log_string_is_known() {
         let s = current().as_str();
-        assert!(matches!(s, "scalar" | "avx512" | "amx"));
+        assert!(matches!(s, "scalar" | "avx2" | "avx512" | "amx"));
+    }
+
+    #[test]
+    fn cpu_features_probe_is_stable() {
+        let a = cpu_features();
+        let b = cpu_features();
+        assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
+    fn sapphire_rapids_heuristic_recognises_obvious_models() {
+        assert!(is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Platinum 8480+"));
+        assert!(is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Gold 6448Y"));
+        assert!(is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Max 9468"));
+        assert!(!is_sapphire_rapids_or_newer("AMD EPYC 7763 64-Core Processor"));
+        assert!(!is_sapphire_rapids_or_newer("Apple M1 Pro"));
     }
 }
