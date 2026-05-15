@@ -92,11 +92,10 @@ pub const STORAGE_BREAKER_THRESHOLD: u32 = 5;
 /// surface the error immediately.
 fn is_transient_io_error(e: &io::Error) -> bool {
     use io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        Interrupted | WouldBlock | TimedOut | ResourceBusy
-    ) || e.raw_os_error() == Some(libc::EIO)
+    matches!(e.kind(), Interrupted | WouldBlock | TimedOut)
+        || e.raw_os_error() == Some(libc::EIO)
         || e.raw_os_error() == Some(libc::EAGAIN)
+        || e.raw_os_error() == Some(libc::EBUSY)
 }
 
 
