@@ -99,7 +99,8 @@ On top of the unified S ∪ L ∪ M ranking, the predictor also exposes
 * **Expert-affinity matrix (`router::ExpertAffinity`).** A pre-allocated
   `N×N` `AtomicU32` co-occurrence heat-map of which experts fire
   together inside the same MoE layer. Hot-path updates are lock-free
-  `fetch_add`s — no allocation, no `RwLock`. When a seed expert
+  saturating atomic increments implemented with a compare-exchange
+  retry loop — no allocation, no `RwLock`. When a seed expert
   scores ≥ `SPATIAL_CONFIDENCE_THRESHOLD` (0.80) in the unified
   ranking, its top-K co-fired neighbours from the matrix are added
   to the prefetch set at a small (+0.10) weight.
