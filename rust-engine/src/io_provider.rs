@@ -2006,6 +2006,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Gist Phase 3 — per-drive circuit breaker.
+    ///
+    /// Failures *spread across multiple experts on the same drive*
+    /// must trip the drive-level breaker even though no single
+    /// expert has hit its own threshold. Once tripped, any read
+    /// against that drive short-circuits to
+    /// `HardwareFailure::DriveUnavailable` without ever touching
+    /// the device — that's the "stop attempting to route to that
+    /// specific drive" behaviour from the gist.
+    #[test]
+    fn drive_breaker_trips_after_three_consecutive_failures() {
+        let dir = tempdir("drive-breaker");
+        let block = 4096usize;
+        let expert_size = block;
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap();
+
+        // Three failures spread across distinct expert ids: the
+        // per-expert breakers each only see one failure (well below
+        // their `STORAGE_BREAKER_THRESHOLD`), but the drive-level
+        // counter sums them and trips at 3.
+        assert!(!storage.is_drive_unavailable(0));
+        assert!(!storage.is_drive_unavailable(1));
+        assert!(!storage.is_drive_unavailable(2));
+        storage.note_read_failure(0);
+        storage.note_read_failure(1);
+        storage.note_read_failure(2);
+        // All three experts now route through the same (single)
+        // drive, so any of them reports it unavailable.
+        assert!(storage.is_drive_unavailable(0));
+        assert!(storage.is_drive_unavailable(7));
+        // Per-expert breakers are *not* tripped — only one failure each.
+        assert!(!storage.is_expert_unavailable(0));
+        assert!(!storage.is_expert_unavailable(1));
+        assert!(!storage.is_expert_unavailable(2));
+
+        // A successful read on **any** expert on this drive clears
+        // the drive-level breaker.
+        storage.note_read_success(0);
+        assert!(!storage.is_drive_unavailable(0));
+        assert!(!storage.is_drive_unavailable(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In a striped layout each drive maintains an independent
+    /// breaker. A failed shard must not take its siblings out of
+    /// rotation.
+    #[test]
+    fn drive_breaker_is_independent_per_shard() {
+        let block = 4096usize;
+        let expert_size = block;
+        let dir_a = tempdir("drive-striped-a");
+        let dir_b = tempdir("drive-striped-b");
+        let storage = NvmeStorage::striped(
+            StorageConfig {
+                base_path: dir_a.clone(),
+                expert_size,
+                block_align: block,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            },
+            vec![dir_a.clone(), dir_b.clone()],
+        )
+        .unwrap();
+
+        // Drive 0 serves even ids, drive 1 serves odd ids. Three
+        // failures on even ids trip drive 0 only.
+        storage.note_read_failure(0);
+        storage.note_read_failure(2);
+        storage.note_read_failure(4);
+        assert!(storage.is_drive_unavailable(0));
+        assert!(storage.is_drive_unavailable(8));
+        // Odd ids (drive 1) are still healthy.
+        assert!(!storage.is_drive_unavailable(1));
+        assert!(!storage.is_drive_unavailable(3));
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
     /// `is_transient_io_error` classifies the well-known set of
     /// retryable kinds correctly.
     #[test]

@@ -193,17 +193,18 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. |
 | `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. |
-| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`) routed through the **fault-tolerant `read_at_with_retries` path**: three-tier exponential backoff on transient errors (EIO / EINTR / `WouldBlock` / `TimedOut` / `EAGAIN`; short reads / `UnexpectedEof` fail fast) plus a per-expert **circuit breaker** that trips after `STORAGE_BREAKER_THRESHOLD = 5` consecutive failures and short-circuits to a structured `HardwareFailure::ExpertUnavailable` (recoverable on the first successful read). Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
+| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`) routed through the **fault-tolerant `read_at_with_retries` path**: three-tier exponential backoff on transient errors (EIO / EINTR / `WouldBlock` / `TimedOut` / `EAGAIN`; short reads / `UnexpectedEof` fail fast) plus a per-expert **circuit breaker** that trips after `STORAGE_BREAKER_THRESHOLD = 3` consecutive failures and short-circuits to a structured `HardwareFailure::ExpertUnavailable` (recoverable on the first successful read). A **per-drive** breaker (`STORAGE_DRIVE_BREAKER_THRESHOLD = 3`, sticky `DriveBreakerState`) sums failures across all experts sharded onto the same shard and short-circuits to `HardwareFailure::DriveUnavailable` so the engine stops routing to a known-bad drive without ever issuing the syscall — gist Phase 3. Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
 | `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point. Built behind the `io_uring` cargo feature. |
 | `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API), `LocalityMonitor` (sliding-window heat map, the **L** arm), and `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
 | `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q8_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For the GGUF block-quantised dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm` / `run_inference_q8_0_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels — no F32 dequantise of the weights. The legacy `run_inference_q4_0` / `run_inference_q4k` / `run_inference_q8_0` dequant kernels are kept as a graceful fallback when `cols % block_size != 0`. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
 | `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch. `matmul_row_major` auto-escalates: scalar → runtime row-parallel (always compiled) → `matrixmultiply` SGEMV under `--features blas`. |
-| `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. |
+| `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. Also exposes `peek_experts` (cheap, side-effect-free routing pre-pass) and `step_speculative` (verify K draft tokens with a unified expert prefetch — gist Phase 2). |
+| `draft` | Speculative-decoding "draft" model (gist Phase 2). `DraftLike` trait + `DraftEngine` (a small, deterministic, RAM-resident dense head tied to the main model's embedding). Generates K candidate tokens with no SSD I/O so `RealModel::step_speculative` can verify them in a single batched-prefetch wave. |
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
 | `tokenizer` | HuggingFace `tokenizers` crate when the `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured; deterministic byte-level fallback otherwise. |
 | `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. |
-| `batch_scheduler` | **Continuous batching.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. |
+| `batch_scheduler` | **Continuous batching.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. Each batched step starts with a **peek/warm pre-pass** that calls `RealModel::peek_experts` for every request, unions the predicted expert ids, and fires one `engine.warm_with(&ids)` so the NVMe sees one read per unique expert across the entire batch (gist Phase 1). |
 | `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. Also home to [`AlignedKvCache`](#persistent-page-aligned-kv-cache) — a session-scoped, page-aligned, rolling-window K/V buffer attached via `Engine::with_kv_cache`. |
 | `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`, `Q8_0`. Two readers ship side-by-side: `GgufFile::open` (eager — slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming — keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
 | `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q8_0` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files for the 4-bit dtypes, ~4× smaller for `Q8_0`; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
@@ -279,18 +280,71 @@ the fault-tolerant path:
   error is surfaced on the first observation and counted against
   the breaker.
 * **Per-expert circuit breaker.** After `STORAGE_BREAKER_THRESHOLD =
-  5` consecutive failures, the breaker trips: subsequent reads
+  3` consecutive failures, the breaker trips: subsequent reads
   against that id short-circuit to a structured
   `HardwareFailure::ExpertUnavailable` without touching the drive.
   The first successful read clears the breaker — drives that recover
   after a brief glitch keep serving traffic without operator
   intervention.
-* **Structured errors.** Both `HardwareFailure::Transient` (retry
-  budget exhausted) and `HardwareFailure::ExpertUnavailable`
-  (breaker tripped) round-trip out of `io::Error` via
+* **Per-drive circuit breaker (gist Phase 3).** After
+  `STORAGE_DRIVE_BREAKER_THRESHOLD = 3` consecutive failures
+  *summed across every expert sharded onto the same drive*, the
+  drive-level breaker trips and every subsequent read against that
+  shard returns `HardwareFailure::DriveUnavailable` without touching
+  the device — the engine stops routing to a known-bad drive without
+  having to wait for each expert to independently exhaust its own
+  threshold. In a striped layout each shard has its own breaker so
+  a single failed drive does not take its siblings out of rotation;
+  the first successful read on that drive clears the breaker.
+* **Structured errors.** `HardwareFailure::Transient` (retry
+  budget exhausted), `HardwareFailure::ExpertUnavailable`
+  (per-expert breaker tripped), and `HardwareFailure::DriveUnavailable`
+  (per-drive breaker tripped) all round-trip out of `io::Error` via
   `e.into_inner().downcast::<HardwareFailure>()`, so the HTTP server
-  can return a 503 with the expert id and consecutive-failure count
-  instead of panicking.
+  can return a 503 with the expert id (or drive index) and
+  consecutive-failure count instead of panicking.
+
+#### SSD Read De-Duplication (continuous batching)
+
+`Engine::fetch_with_retry` is the production entry point for every
+expert miss, and it participates in a **process-wide in-flight
+singleflight** (`DashMap<u32, Arc<Notify>>`). When `N` concurrent
+callers all miss the cache on the same expert id, exactly one (the
+"leader") races into `Engine::fetch_once` and issues the `pread`;
+the other `N-1` park on the leader's `Notify`, then re-check the
+cache once it fires. The decisive invariant is observable in
+`Engine::report().bytes_read`: a batch of 32 concurrent fetches
+for the same id increments it by **one** expert's worth of bytes,
+not 32 — see
+`engine::tests::fetch_with_retry_deduplicates_concurrent_reads`.
+
+The same property holds across multiple distinct ids: the
+[`BatchScheduler`](#real-transformer-batch-scheduling) runs a
+**pre-pass before each batched step** that calls
+`RealModel::peek_experts` for every active request, unions the
+predicted global expert ids into a single `HashSet`, and fires one
+`engine.warm_with(&ids)`. `warm_with` itself deduplicates the input
+slice and fans out parallel fetches through the singleflight, so the
+NVMe sees exactly one read per unique expert id per batch — gist
+Phase 1.
+
+#### Speculative verification (draft model)
+
+`src/draft.rs` defines the `DraftLike` trait and a minimal
+`DraftEngine` — a small, deterministic, RAM-resident dense head
+tied to the main model's embedding. `RealModel::step_speculative`
+takes a seed token and a draft length `K`, asks the draft for `K`
+candidate tokens (no SSD I/O), peeks the routing decision for each
+candidate position via `RealModel::peek_experts`, unions the
+predicted expert ids, and fires **one** `engine.warm_with(&ids)`
+covering every position. It then verifies each draft token by
+running the main MoE step with greedy sampling and accepts the
+longest matching prefix. The returned `SpeculativeStepResult`
+exposes `accepted`, `accepted_len`, and `warmed_experts` so callers
+can quantify the speculative speed-up. Verifier-equivalence with
+sequential `RealModel::step` is exercised by
+`draft::tests::speculative_step_matches_sequential_step` — gist
+Phase 2.
 
 A real **io_uring backend with registered fixed buffers** ships in
 `src/io_uring_storage.rs` and is built when the cargo feature
