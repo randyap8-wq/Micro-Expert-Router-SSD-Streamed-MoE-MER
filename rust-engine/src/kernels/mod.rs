@@ -355,6 +355,42 @@ pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
     }
 }
 
+/// Fused SwiGLU FFN inner stage: `y[i] = silu(gate_w[i]·x) * (up_w[i]·x)`.
+///
+/// Writes into the caller-provided `y` (length `rows`) — **no
+/// allocation on the hot path**, matching the gist's "performance
+/// guardrail" rule. `gate_w` and `up_w` are row-major
+/// `[rows × cols]` matrices, `x` is `cols`-long.
+///
+/// Auto-escalates: AVX-512 (when the cargo feature is compiled **and**
+/// the CPU advertises `avx512f`) → scalar reference. The AVX-512 path
+/// is the fused [`avx512::swiglu_f32_avx512`] kernel; the scalar
+/// fallback is [`scalar::swiglu_f32`].
+#[inline]
+pub fn swiglu_f32_into(
+    gate_w: &[f32],
+    up_w: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    y: &mut [f32],
+) {
+    debug_assert_eq!(gate_w.len(), rows * cols);
+    debug_assert_eq!(up_w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    match current() {
+        #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+        KernelBackend::Avx512 => {
+            // SAFETY: dispatcher confirmed `avx512f`. The kernel only
+            // reads via `loadu_ps` (no alignment requirement) and
+            // writes through the caller's `&mut [f32]`.
+            unsafe { avx512::swiglu_f32_avx512(gate_w, up_w, x, rows, cols, y) }
+        }
+        _ => scalar::swiglu_f32(gate_w, up_w, x, rows, cols, y),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +419,27 @@ mod tests {
         let lhs = dequant_int8_dot(scale, &q, &x);
         let rhs = scalar::dequant_int8_dot(scale, &q, &x);
         assert!((lhs - rhs).abs() <= 1e-3, "dequant_int8_dot mismatch");
+    }
+
+    #[test]
+    fn swiglu_f32_into_matches_scalar_reference() {
+        let rows = 11usize;
+        let cols = 73usize;
+        let gate: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.07).sin()).collect();
+        let up: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.11).cos()).collect();
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.13).sin() * 0.5).collect();
+        let mut y_dispatch = vec![0.0f32; rows];
+        swiglu_f32_into(&gate, &up, &x, rows, cols, &mut y_dispatch);
+        let mut y_ref = vec![0.0f32; rows];
+        scalar::swiglu_f32(&gate, &up, &x, rows, cols, &mut y_ref);
+        for i in 0..rows {
+            assert!(
+                (y_dispatch[i] - y_ref[i]).abs() <= 1e-3 + y_ref[i].abs() * 1e-4,
+                "swiglu_f32_into mismatch at {i}: {} vs {}",
+                y_dispatch[i],
+                y_ref[i]
+            );
+        }
     }
 
     #[test]

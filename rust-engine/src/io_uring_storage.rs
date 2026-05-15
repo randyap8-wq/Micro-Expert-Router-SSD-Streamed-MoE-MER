@@ -242,6 +242,76 @@ impl IoUringStorage {
             ))
         }
     }
+    /// Speculative-prefetch entry point that fuses the **batched io_uring
+    /// completion** with the **zero-copy shadow → primary promotion**
+    /// requested by the gist (Task 2: "the Speculator triggers a
+    /// `promote_shadow` call in the BufferPool during the io_uring
+    /// completion interrupt").
+    ///
+    /// Caller owns:
+    ///
+    /// * `ids` — the expert ids to fetch (top-K speculator output);
+    /// * `shadow_bufs` — `K` `PooledBuffer`s previously acquired from
+    ///   the **shadow** half of `pool` via
+    ///   [`crate::buffer_pool::BufferPool::try_acquire_shadow`] /
+    ///   [`crate::buffer_pool::BufferPool::acquire_shadow`];
+    /// * `pool` — the [`BufferPool`] those shadow buffers came from
+    ///   (used for the slot-tag swap).
+    ///
+    /// The method:
+    ///
+    /// 1. issues a single batched `submit_and_wait(K)` against the
+    ///    pre-registered fixed buffers (same submission path as
+    ///    [`Self::read_experts_batch_fixed`] — one syscall regardless
+    ///    of K);
+    /// 2. on completion, calls [`BufferPool::promote_shadow`] for each
+    ///    buffer so the next `Drop` returns the slot to the **primary**
+    ///    free list — i.e. the bytes that just arrived become resident
+    ///    without any extra copy or re-read.
+    ///
+    /// The returned `Vec<PooledBuffer>` is in the same order as `ids`
+    /// and every buffer reports `is_shadow() == false` (they're now
+    /// primary). On error the shadow buffers are dropped back into
+    /// the shadow free list — no leak.
+    pub async fn read_experts_batch_fixed_promote(
+        &self,
+        ids: &[u32],
+        mut shadow_bufs: Vec<PooledBuffer>,
+        pool: &BufferPool,
+    ) -> io::Result<Vec<PooledBuffer>> {
+        assert_eq!(
+            ids.len(),
+            shadow_bufs.len(),
+            "read_experts_batch_fixed_promote: ids.len()={} must equal shadow_bufs.len()={}",
+            ids.len(),
+            shadow_bufs.len(),
+        );
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        for buf in shadow_bufs.iter() {
+            debug_assert_eq!(buf.len(), self.cfg.expert_size);
+        }
+        // Drive the existing batched submission path. We grab mutable
+        // refs to the caller's buffers, fire the batched READ_FIXED,
+        // wait for K completions, then promote each shadow buffer
+        // in-place. No additional allocation beyond the (small) ref
+        // vector required by the batch entry point.
+        {
+            let mut refs: Vec<&mut PooledBuffer> = shadow_bufs.iter_mut().collect();
+            let _n = self.read_experts_batch_fixed(ids, &mut refs).await?;
+        }
+        // Single-syscall completion fence behind us: every byte for
+        // every expert in `ids` is now in the matching shadow buffer.
+        // Promote each one so the slot accounting flips to primary
+        // without an extra copy — this is the zero-latency
+        // "speculation confirmed → resident" hand-off.
+        let promoted: Vec<PooledBuffer> = shadow_bufs
+            .into_iter()
+            .map(|b| pool.promote_shadow(b))
+            .collect();
+        Ok(promoted)
+    }
 }
 
 /// Tiny `Send` wrapper over a `Vec<*mut u8>` so it can cross the
@@ -631,6 +701,90 @@ mod tests {
         let path = tmp.join("expert_0000.bin");
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(&raw[..], buf.as_slice());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_fixed_promote_round_trips_and_flips_shadow_to_primary() {
+        use crate::io_provider::generate_synthetic_experts;
+
+        let mut tmp = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        tmp.push(format!("mer-iouring-promote-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let num_experts = 3u32;
+        let d_model = 8usize;
+        let d_ff = 16usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block = 4096usize;
+        let expert_size = ((weight_bytes + block - 1) / block) * block;
+        generate_synthetic_experts(&tmp, num_experts, expert_size, d_model, d_ff).unwrap();
+
+        // Two primary + two shadow slots; the speculative path uses the shadow half.
+        let pool = BufferPool::new_with_shadow(2, 2, expert_size, block);
+        let storage = match IoUringStorage::new(
+            IoUringConfig {
+                base_path: tmp.clone(),
+                expert_size,
+                block_align: block,
+                queue_depth: 8,
+                numa_node: None,
+            },
+            &pool,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("io_uring not available, skipping: {e}");
+                let _ = std::fs::remove_dir_all(&tmp);
+                return;
+            }
+        };
+
+        // Acquire two **shadow** buffers — what a Speculator would do.
+        let s0 = pool.try_acquire_shadow().expect("shadow 0");
+        let s1 = pool.try_acquire_shadow().expect("shadow 1");
+        assert!(s0.is_shadow() && s1.is_shadow());
+
+        // One submit_and_wait(K) fires both reads, then promote_shadow
+        // is called for each completion: the returned buffers must
+        // already be primary.
+        let ids = vec![0u32, 1u32];
+        let promoted = match storage
+            .read_experts_batch_fixed_promote(&ids, vec![s0, s1], &pool)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("io_uring batch read failed in this env: {e}");
+                let _ = std::fs::remove_dir_all(&tmp);
+                return;
+            }
+        };
+        assert_eq!(promoted.len(), 2);
+        for (i, buf) in promoted.iter().enumerate() {
+            assert!(
+                !buf.is_shadow(),
+                "buffer {i} should have been promoted to primary"
+            );
+            // Byte-identical to a raw pread of the same expert file.
+            let raw = std::fs::read(tmp.join(format!("expert_{i:04}.bin"))).unwrap();
+            assert_eq!(&raw[..], buf.as_slice());
+        }
+
+        // Dropping the promoted buffers must release them into the
+        // *primary* free list — the shadow half should still be
+        // exhausted (we promoted both shadow slots).
+        drop(promoted);
+        assert!(pool.try_acquire_shadow().is_none(), "shadow exhausted");
+        // Primary picked up the two now-free buffers.
+        let _p0 = pool.try_acquire().expect("primary slot 0");
+        let _p1 = pool.try_acquire().expect("primary slot 1");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

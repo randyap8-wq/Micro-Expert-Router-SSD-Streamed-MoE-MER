@@ -33,6 +33,32 @@ pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
     acc * scale
 }
 
+/// Reference SwiGLU FFN inner stage: `y[i] = silu(gate_w[i]·x) * (up_w[i]·x)`.
+///
+/// Used as the parity oracle for [`super::avx512::swiglu_f32_avx512`].
+/// Writes into the caller-provided `y` (no allocation).
+#[inline]
+pub fn swiglu_f32(
+    gate_w: &[f32],
+    up_w: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    y: &mut [f32],
+) {
+    debug_assert_eq!(gate_w.len(), rows * cols);
+    debug_assert_eq!(up_w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    for row in 0..rows {
+        let off = row * cols;
+        let g = dot_f32(&gate_w[off..off + cols], x);
+        let u = dot_f32(&up_w[off..off + cols], x);
+        let silu_g = g / (1.0 + (-g).exp());
+        y[row] = silu_g * u;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
