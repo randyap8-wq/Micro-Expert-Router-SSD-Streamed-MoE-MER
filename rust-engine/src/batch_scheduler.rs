@@ -535,41 +535,7 @@ impl BatchScheduler {
     /// it manually for an off-cycle reclamation pass.
     pub fn evict_idle_blocks(&self, idle_threshold: Option<Duration>) -> usize {
         let threshold = idle_threshold.unwrap_or(self.cfg.idle_eviction_threshold);
-        let threshold_us = threshold.as_micros() as u64;
-        let now_us = self.now_us();
-        let mut candidates: Vec<(u64, Arc<SessionMeta>)> = self
-            .sessions
-            .iter()
-            .filter_map(|kv| {
-                let meta = kv.value().clone();
-                if meta.idle_for_us(now_us) >= threshold_us
-                    && meta.block_manager.lock().is_some()
-                {
-                    Some((*kv.key(), meta))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // Audit first, then Interactive. Within a class, oldest idle
-        // first so a steady drip of reclaims hits the worst offender.
-        candidates.sort_by(|a, b| {
-            let class_ord = match (a.1.class, b.1.class) {
-                (SessionClass::Audit, SessionClass::Interactive) => std::cmp::Ordering::Less,
-                (SessionClass::Interactive, SessionClass::Audit) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            };
-            class_ord.then_with(|| b.1.idle_for_us(now_us).cmp(&a.1.idle_for_us(now_us)))
-        });
-        let mut reclaimed = 0;
-        for (_id, meta) in candidates {
-            let taken = { meta.block_manager.lock().take() };
-            if taken.is_some() {
-                reclaimed += 1;
-                // `taken` drops here → BlockManager::drop releases
-                // every block back into the pool.
-            }
-        }
+        let reclaimed = run_idle_eviction(&self.sessions, threshold, self.now_us());
         if reclaimed > 0 {
             self.idle_evictions.fetch_add(1, Ordering::Relaxed);
         }
@@ -842,13 +808,13 @@ async fn scheduler_loop(
         let wa = SessionClass::Audit.weight() as usize;
         let mut ordered: Vec<StepRequest> =
             Vec::with_capacity(interactive.len() + audit.len());
-        let mut i = interactive.into_iter();
-        let mut a = audit.into_iter();
+        let mut interactive_iter = interactive.into_iter();
+        let mut audit_iter = audit.into_iter();
         let mut more = true;
         while more {
             more = false;
             for _ in 0..wi {
-                if let Some(r) = i.next() {
+                if let Some(r) = interactive_iter.next() {
                     ordered.push(r);
                     more = true;
                 } else {
@@ -856,7 +822,7 @@ async fn scheduler_loop(
                 }
             }
             for _ in 0..wa {
-                if let Some(r) = a.next() {
+                if let Some(r) = audit_iter.next() {
                     ordered.push(r);
                     more = true;
                 } else {

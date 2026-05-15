@@ -722,6 +722,9 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let batch_cfg = crate::batch_scheduler::BatchConfig {
             max_batch_size: rt.max_batch_size,
             batch_timeout: std::time::Duration::from_millis(rt.batch_timeout_ms),
+            idle_eviction_threshold:
+                std::time::Duration::from_millis(rt.idle_eviction_threshold_ms),
+            speculation_base_depth: rt.speculation_base_depth,
             ..Default::default()
         };
         let scheduler = crate::batch_scheduler::BatchScheduler::spawn(
@@ -737,6 +740,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             vocab_size = rt.vocab_size,
             max_batch_size = rt.max_batch_size,
             batch_timeout_ms = rt.batch_timeout_ms,
+            idle_eviction_threshold_ms = rt.idle_eviction_threshold_ms,
+            speculation_base_depth = rt.speculation_base_depth,
             "real transformer pipeline enabled (with continuous batching)"
         );
         (Some(model_arc), Some(Arc::new(scheduler)))
@@ -894,6 +899,16 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                         "real_transformer.batch_timeout_ms",
                         prev.real_transformer.batch_timeout_ms.to_string(),
                         new.real_transformer.batch_timeout_ms.to_string(),
+                    ),
+                    (
+                        "real_transformer.idle_eviction_threshold_ms",
+                        prev.real_transformer.idle_eviction_threshold_ms.to_string(),
+                        new.real_transformer.idle_eviction_threshold_ms.to_string(),
+                    ),
+                    (
+                        "real_transformer.speculation_base_depth",
+                        prev.real_transformer.speculation_base_depth.to_string(),
+                        new.real_transformer.speculation_base_depth.to_string(),
                     ),
                     (
                         "storage.predict_min_prob",
