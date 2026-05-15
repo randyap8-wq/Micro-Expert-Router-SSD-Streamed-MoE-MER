@@ -125,15 +125,18 @@ pub enum WeightDtype {
     /// occupies 34 bytes: an `f16` block scale `d` followed by 32
     /// signed-`i8` symmetrically-quantised weights. The dequantised
     /// value is `d * (q as i8 as f32)`. Effective bytes-per-weight
-    /// = 34 / 32 ≈ 1.0625 — the same density as a per-tensor `Int8`
-    /// blob (1 byte/weight + a tiny per-block scale overhead) but
-    /// with **block-local** scales so quantisation error stays bounded
-    /// inside each 32-weight neighbourhood. This is the GGUF
-    /// quantisation that ships alongside Q4_0 in every production
-    /// llama.cpp release; we accept it as a native, no-fallback
-    /// runtime dtype. See [`Q8_0_BLOCK_BYTES`] / [`Q8_0_BLOCK_ELEMS`]
-    /// for the layout constants and [`dequantize_q8_0_block`] for
-    /// the inverse kernel.
+    /// = 34 / 32 ≈ 1.0625 — slightly larger than this codebase's
+    /// per-tensor `Int8` format, which stores 1 byte/weight plus a
+    /// single 12-byte per-expert header of three `f32` scales. Q8_0
+    /// instead adds an `f16` scale to each 32-weight block, trading a
+    /// small density increase for **block-local** scales so
+    /// quantisation error stays bounded inside each 32-weight
+    /// neighbourhood. This is the GGUF quantisation that ships
+    /// alongside Q4_0 in every production llama.cpp release; we
+    /// accept it as a native, no-fallback runtime dtype. See
+    /// [`Q8_0_BLOCK_BYTES`] / [`Q8_0_BLOCK_ELEMS`] for the layout
+    /// constants and [`dequantize_q8_0_block`] for the inverse
+    /// kernel.
     #[serde(alias = "Q8_0", alias = "q80", alias = "q8_0_gguf")]
     Q8_0,
 }
