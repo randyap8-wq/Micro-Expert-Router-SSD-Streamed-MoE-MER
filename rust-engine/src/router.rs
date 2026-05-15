@@ -679,9 +679,12 @@ impl PredictiveLoader {
         // observed co-occurrence rather than UTH adjacency.
         if let Some(aff) = affinity {
             if affinity_k > 0 {
+                let n = self.num_experts;
                 for &seed in &seeds {
                     for nbr in aff.neighbors(seed, affinity_k) {
-                        *combined.entry(nbr).or_insert(0.0) += W_AFFINITY;
+                        if nbr < n {
+                            *combined.entry(nbr).or_insert(0.0) += W_AFFINITY;
+                        }
                     }
                 }
             }
