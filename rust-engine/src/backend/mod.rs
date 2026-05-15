@@ -205,6 +205,13 @@ pub fn set_backend(b: Arc<dyn Backend>) -> Result<(), &'static str> {
 
 /// Install the default backend (`CandleBackend`) if none has been set
 /// yet. Called from `main` at startup; safe to call multiple times.
+///
+/// Precedence is first-writer-wins:
+/// - if [`set_backend`] was called earlier, this is a no-op and the
+///   caller-provided backend remains active;
+/// - if this function runs first, later calls to [`set_backend`] will
+///   return `Err` because the process-wide backend has already been
+///   installed.
 pub fn install_default() {
     let _ = BACKEND.set(Arc::new(CandleBackend) as Arc<dyn Backend>);
 }
