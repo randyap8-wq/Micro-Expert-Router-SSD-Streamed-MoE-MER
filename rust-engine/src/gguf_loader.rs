@@ -29,6 +29,7 @@ use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo};
 use crate::inference::{
     dequantize_f16_to_f32, expert_weight_bytes_for, WeightDtype,
     Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS,
+    Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
 };
 use crate::tensor_header::TensorHeader;
 use serde::Serialize;
@@ -559,6 +560,11 @@ fn bytes_to_f32(data: &[u8], dtype: u32, elems: usize, name: &str) -> io::Result
             crate::inference::dequantize_q4k_to_f32(data, elems, &mut out);
             Ok(out)
         }
+        ggml_dtype::Q8_0 => {
+            let mut out = Vec::with_capacity(elems);
+            crate::inference::dequantize_q8_0_to_f32(data, elems, &mut out);
+            Ok(out)
+        }
         other => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("tensor {name}: unsupported dtype code {other}"),
@@ -897,6 +903,7 @@ fn detect_native_quant_dtype(
         let layer_dtype = match g.ggml_dtype {
             ggml_dtype::Q4_0 if per_expert % Q4_0_BLOCK_ELEMS == 0 => WeightDtype::Q4_0,
             ggml_dtype::Q4_K if per_expert % Q4K_BLOCK_ELEMS == 0 => WeightDtype::Q4K,
+            ggml_dtype::Q8_0 if per_expert % Q8_0_BLOCK_ELEMS == 0 => WeightDtype::Q8_0,
             _ => return None,
         };
         match chosen {
@@ -933,10 +940,11 @@ fn load_layer_expert_native_quant(
     let (block_elems, block_bytes) = match dtype {
         WeightDtype::Q4_0 => (Q4_0_BLOCK_ELEMS, Q4_0_BLOCK_BYTES),
         WeightDtype::Q4K => (Q4K_BLOCK_ELEMS, Q4K_BLOCK_BYTES),
+        WeightDtype::Q8_0 => (Q8_0_BLOCK_ELEMS, Q8_0_BLOCK_BYTES),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "load_layer_expert_native_quant: dtype must be Q4_0 or Q4_K",
+                "load_layer_expert_native_quant: dtype must be Q4_0, Q4_K, or Q8_0",
             ));
         }
     };

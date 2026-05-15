@@ -64,7 +64,7 @@ token → |   Router   | → | Expert IDs   | → | LRU Cache | → | SwiGLU FFN
                                                    ↓
                                           bytes reinterpreted as
                                           f32 / f16 / int8 / Q4_K_M /
-                                          Q4_0 weights → matmul
+                                          Q4_0 / Q8_0 weights → matmul
 ```
 
 After every token the engine updates **three predictors in parallel**:
@@ -114,7 +114,7 @@ For each token, the engine:
    `pread(2)` per miss, or one fused `io_uring_enter` for the whole
    batch with `--io-uring`);
 3. **reinterprets the buffer as weight matrices** in the configured
-   dtype (`F32`, `F16`, `Int8`, `Q4_K_M`, or `Q4_0`, see
+   dtype (`F32`, `F16`, `Int8`, `Q4_K_M`, `Q4_0`, or `Q8_0`, see
    [Quantization](#1-on-disk-quantization---dtype)). For the
    floating-point dtypes this is a zero-copy reinterpretation; for
    the integer / block-quantised dtypes a small per-fetch
@@ -171,7 +171,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point. Built behind the `io_uring` cargo feature. |
 | `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API), `LocalityMonitor` (sliding-window heat map, the **L** arm), and `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
-| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For 4-bit dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels — no F32 dequantise of the weights. The legacy `run_inference_q4_0` / `run_inference_q4k` dequant kernels are kept as a graceful fallback when `cols % block_size != 0`. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
+| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q8_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For the GGUF block-quantised dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm` / `run_inference_q8_0_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels — no F32 dequantise of the weights. The legacy `run_inference_q4_0` / `run_inference_q4k` / `run_inference_q8_0` dequant kernels are kept as a graceful fallback when `cols % block_size != 0`. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
 | `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch (scalar / `simd` / `blas`). |
 | `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. |
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
@@ -179,8 +179,8 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. |
 | `batch_scheduler` | **Continuous batching.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. |
 | `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. Also home to [`AlignedKvCache`](#persistent-page-aligned-kv-cache) — a session-scoped, page-aligned, rolling-window K/V buffer attached via `Engine::with_kv_cache`. |
-| `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`. Two readers ship side-by-side: `GgufFile::open` (eager — slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming — keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
-| `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
+| `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`, `Q8_0`. Two readers ship side-by-side: `GgufFile::open` (eager — slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming — keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
+| `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q8_0` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files for the 4-bit dtypes, ~4× smaller for `Q8_0`; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
 | `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
 | `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()`), with `scalar.rs` (always on), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The selected backend is logged once at startup. |
 | `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
@@ -762,7 +762,7 @@ micro-expert-router gen-data
   --d-model <N>              FFN hidden dim (default 512)
   --d-ff <N>                 FFN intermediate dim (default 2048)
   --block-align <BYTES>      O_DIRECT alignment (default 4096)
-  --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 (default f32)
+  --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 | q8_0 (default f32)
 
 micro-expert-router run
   --data-dir <PATH>          Directory with expert_<id>.bin files
@@ -777,7 +777,7 @@ micro-expert-router run
   --cache-slots <N>          Resident experts (default 4; warns if > 16)
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
-  --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 (default f32).
+  --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 | q8_0 (default f32).
                               Must match gen-data / the offline extractor.
   --predict-fanout <N>       Prefetch candidates per token (default 2)
   --predict-min-prob <P>     Skip prefetch below this probability (default 0.05)
@@ -836,11 +836,12 @@ micro-expert-router gguf-convert
                               expert blob (compat with pre-UTH consumers)
   --legacy-eager             Use the in-memory GGUF reader instead of the
                               default streaming reader
-  --native-quant             For Q4_0 / Q4_K source tensors, write the raw
-                              quantised block stream to disk instead of
-                              dequantising to F32. Falls back to F32 (with
-                              a logged warning) when the source dtype isn't
-                              4-bit or shapes aren't block-aligned.
+  --native-quant             For Q4_0 / Q4_K / Q8_0 source tensors,
+                              write the raw quantised block stream to
+                              disk instead of dequantising to F32.
+                              Falls back to F32 (with a logged warning)
+                              when the source dtype isn't quantised or
+                              shapes aren't block-aligned.
 
 micro-expert-router validate-predictor
   --trace <PATH>             JSONL trace from `run --trace-out`
@@ -870,11 +871,11 @@ cargo run --release --manifest-path rust-engine/Cargo.toml -- \
 
 **2. From a GGUF checkpoint (`gguf-convert`).** No Python required,
 the engine's built-in GGUF reader handles llama.cpp / Ollama-style
-files directly. Supports `F32`, `F16`, `Q4_0`, `Q4_K_M` natively;
-`Q6_K` tensors are recognised but fall back to seeded init (the
-engine doesn't dequantise Q6_K). The output directory has the same
-shape as the Mixtral extractor's: `expert_<layer>_<id>.bin` blobs +
-`metadata.json` + per-tensor dense weight files.
+files directly. Supports `F32`, `F16`, `Q4_0`, `Q4_K_M`, and `Q8_0`
+natively; `Q6_K` tensors are recognised but fall back to seeded init
+(the engine doesn't dequantise Q6_K). The output directory has the
+same shape as the Mixtral extractor's: `expert_<layer>_<id>.bin`
+blobs + `metadata.json` + per-tensor dense weight files.
 
 `gguf-convert` defaults to a **streaming reader** that parses only
 the GGUF header and seeks each tensor body on demand — a strict win
@@ -885,16 +886,17 @@ quant-scale offset) padded to 4 KiB so the weight payload still
 starts at an `O_DIRECT`-friendly boundary; pass `--no-uth` to opt
 out for compatibility with consumers that pre-date the header.
 
-For source GGUFs whose expert tensors are already stored as `Q4_0`
-or `Q4_K_M`, pass `--native-quant` to write the **raw quantised
-block stream** to disk instead of dequantising to F32 first. The
-output `expert_<id>.bin` is then ~7× smaller and the engine's
-`run_inference_q4_0` / `run_inference_q4k` paths consume it
-directly. The flag falls back automatically (with a logged warning)
-when the source dtype isn't `Q4_0`/`Q4_K` or when the per-expert
-weight count `d_ff*d_model` isn't a clean multiple of the block
-size; the converter records what was actually written into
-`metadata.json::dtype`.
+For source GGUFs whose expert tensors are already stored as `Q4_0`,
+`Q4_K_M`, or `Q8_0`, pass `--native-quant` to write the **raw
+quantised block stream** to disk instead of dequantising to F32
+first. The output `expert_<id>.bin` is then ~7× smaller for the
+4-bit dtypes (~4× smaller for `Q8_0`) and the engine's
+`run_inference_q4_0` / `run_inference_q4k` / `run_inference_q8_0`
+paths consume it directly. The flag falls back automatically (with
+a logged warning) when the source dtype isn't one of these or when
+the per-expert weight count `d_ff*d_model` isn't a clean multiple of
+the block size; the converter records what was actually written
+into `metadata.json::dtype`.
 
 ```bash
 ./target/release/micro-expert-router gguf-convert \
@@ -925,7 +927,7 @@ The `metadata.json` written by `extract_mixtral_experts.py` or
 need no further flags. Each Mixtral 8x7B expert is ~88 MiB at `f16`
 (zero-padded to a 4 KiB multiple), ~700 MiB on disk for one layer,
 fully streamable from any modern NVMe; at `q4_0` / `q4k` the same
-expert is ~25 MiB.
+expert is ~25 MiB, at `q8_0` ~47 MiB.
 
 ### Routing model, Markov chain, transition matrix, or LinearGate
 
@@ -1204,7 +1206,7 @@ explains which of these the change moves and why.
 
 The engine reads weight bytes straight off the SSD; halving, or
 quartering, the byte width of each weight halves / quarters every
-read. Five on-disk dtypes are first-class:
+read. Six on-disk dtypes are first-class:
 
 | `--dtype` | Bytes / weight | Per-blob header | Compute kernel | Use |
 |---|---:|:---:|---|---|
@@ -1213,30 +1215,32 @@ read. Five on-disk dtypes are first-class:
 | `int8` | 1 | 12 B (`[gate, up, down]: [f32; 3]` per-tensor scales) | symmetric per-tensor dequant + Candle matmul | ~4× less SSD energy than `f32` |
 | `q4k` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q4_K_M` 256-block stream — no F32 dequant of the weights. **Fallback**: 256-block dequant (f16 super-scale + 6-bit sub-scales + 4-bit weights) when `cols % 256 != 0`. | GGUF-compatible 4-bit |
 | `q4_0` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q4_0` 32-block stream — no F32 dequant of the weights. **Fallback**: 32-block dequant (f16 scale, symmetric 4-bit nibbles) when `cols % 32 != 0`. | the most widely-used 4-bit format; chosen by the predictive-controller spec |
+| `q8_0` | ~1.0625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q8_0` 32-block stream (one `f16` scale + 32 signed `i8` weights per block). **Fallback**: 32-block dequant when `cols % 32 != 0`. | GGUF-compatible 8-bit; same density as `int8` but with **per-block** scales, so dynamic range stays bounded inside each 32-weight neighbourhood |
 
 Selectable on **`gen-data`** (synthetic data, every dtype has a
 matching generator arm), on **`gguf-convert`** (input format detected
 from the GGUF tensor dtype, output written in the same dtype — pass
-`--native-quant` to write the raw `Q4_0` / `Q4_K` block stream
-instead of dequantising to F32), and on **`run` / `serve`** (must
-match the on-disk files). The forward pass dispatches to
+`--native-quant` to write the raw `Q4_0` / `Q4_K` / `Q8_0` block
+stream instead of dequantising to F32), and on **`run` / `serve`**
+(must match the on-disk files). The forward pass dispatches to
 `inference::run_inference_*` per dtype, all producing the same scalar
 `f32` SwiGLU output, so a benchmark run is a one-flag diff.
 
-**4-bit fast path.** For `q4k` and `q4_0` the engine prefers the
-`QMatMul` path (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm`),
-which keeps the weights in their on-disk packed form throughout the
-matmul — only the `d_model`-sized activation is materialised as F32.
-This roughly halves per-token allocator pressure vs the legacy
-dequant-then-Candle path on real Mixtral shapes (`d_model=4096`,
-`d_ff=14336`, both block-aligned). The dequant kernel remains as a
-graceful fallback for shapes that aren't block-aligned and is
-always selected when `EngineOptions::use_qmm_for_q4 = false`.
+**Quantised fast path.** For `q4k`, `q4_0`, and `q8_0` the engine
+prefers the `QMatMul` path (`run_inference_q4_0_qmm` /
+`run_inference_q4k_qmm` / `run_inference_q8_0_qmm`), which keeps the
+weights in their on-disk packed form throughout the matmul — only
+the `d_model`-sized activation is materialised as F32. This roughly
+halves per-token allocator pressure vs the legacy dequant-then-Candle
+path on real Mixtral shapes (`d_model=4096`, `d_ff=14336`, all three
+formats block-aligned). The dequant kernel remains as a graceful
+fallback for shapes that aren't block-aligned and is always selected
+when `EngineOptions::use_qmm_for_q4 = false`.
 
 **How this saves energy.** Every cache miss reads
 `3 · d_model · d_ff` weights off the SSD. Going from `f32` → `f16`
-halves NVMe bandwidth and DRAM writes; `int8` quarters them; `q4k` /
-`q4_0` get an additional ~30% on top. The QMatMul fast path
+halves NVMe bandwidth and DRAM writes; `int8` / `q8_0` quarter them;
+`q4k` / `q4_0` get an additional ~30% on top. The QMatMul fast path
 additionally avoids the `O(d_model · d_ff)` dequantise write per
 forward pass, which is the largest L1/L2 win on the hot per-token
 critical path.

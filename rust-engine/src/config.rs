@@ -627,13 +627,13 @@ mod tests {
     }
 
     /// `config.toml` documents weight dtypes using lowercase strings
-    /// (`"f32"`, `"f16"`, `"int8"`, `"q4k"`, `"q4_0"`), and the serde
-    /// layer also accepts additional aliases (for example `"fp32"`,
-    /// `"fp16"`, `"half"`, `"i8"`, `"q8"`, `"q4_k_m"`, `"q4km"`,
-    /// `"q40"`, `"q4"`). Deserializing a `ModelConfig` must accept
-    /// each supported spelling, plus the legacy variant names,
-    /// otherwise users following the in-tree documentation will hit
-    /// confusing parse errors.
+    /// (`"f32"`, `"f16"`, `"int8"`, `"q4k"`, `"q4_0"`, `"q8_0"`), and
+    /// the serde layer also accepts additional aliases (for example
+    /// `"fp32"`, `"fp16"`, `"half"`, `"i8"`, `"q8"`, `"q4_k_m"`,
+    /// `"q4km"`, `"q40"`, `"q4"`, `"q80"`). Deserializing a
+    /// `ModelConfig` must accept each supported spelling, plus the
+    /// legacy variant names, otherwise users following the in-tree
+    /// documentation will hit confusing parse errors.
     #[test]
     fn model_dtype_accepts_documented_spellings() {
         let cases: &[(&str, WeightDtype)] = &[
@@ -658,6 +658,9 @@ mod tests {
             ("q40", WeightDtype::Q4_0),
             ("q4", WeightDtype::Q4_0),
             ("Q4_0", WeightDtype::Q4_0),
+            ("q8_0", WeightDtype::Q8_0),
+            ("q80", WeightDtype::Q8_0),
+            ("Q8_0", WeightDtype::Q8_0),
         ];
         for (spelling, expected) in cases {
             let toml_src = format!(

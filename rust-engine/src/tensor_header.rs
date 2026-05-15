@@ -72,6 +72,7 @@ pub enum UthDtypeId {
     Int8 = 2,
     Q4K = 3,
     Q4_0 = 4,
+    Q8_0 = 5,
 }
 
 impl UthDtypeId {
@@ -82,6 +83,7 @@ impl UthDtypeId {
             WeightDtype::Int8 => UthDtypeId::Int8,
             WeightDtype::Q4K => UthDtypeId::Q4K,
             WeightDtype::Q4_0 => UthDtypeId::Q4_0,
+            WeightDtype::Q8_0 => UthDtypeId::Q8_0,
         }
     }
 
@@ -92,6 +94,7 @@ impl UthDtypeId {
             UthDtypeId::Int8 => WeightDtype::Int8,
             UthDtypeId::Q4K => WeightDtype::Q4K,
             UthDtypeId::Q4_0 => WeightDtype::Q4_0,
+            UthDtypeId::Q8_0 => WeightDtype::Q8_0,
         }
     }
 
@@ -102,6 +105,7 @@ impl UthDtypeId {
             2 => Some(UthDtypeId::Int8),
             3 => Some(UthDtypeId::Q4K),
             4 => Some(UthDtypeId::Q4_0),
+            5 => Some(UthDtypeId::Q8_0),
             _ => None,
         }
     }
@@ -151,7 +155,7 @@ impl TensorHeader {
             WeightDtype::Int8 => (0u32, 3u32),
             // No global scale region — `quant_scale_offset` is unused
             // when `quant_scale_count == 0`.
-            WeightDtype::F32 | WeightDtype::F16 | WeightDtype::Q4K | WeightDtype::Q4_0 => (0, 0),
+            WeightDtype::F32 | WeightDtype::F16 | WeightDtype::Q4K | WeightDtype::Q4_0 | WeightDtype::Q8_0 => (0, 0),
         };
         Self {
             version: UTH_VERSION,
@@ -315,6 +319,7 @@ mod tests {
             WeightDtype::Int8,
             WeightDtype::Q4K,
             WeightDtype::Q4_0,
+            WeightDtype::Q8_0,
         ] {
             let h = TensorHeader::for_swiglu_expert(dtype, 512, 2048);
             let bytes = h.to_bytes();
@@ -341,6 +346,7 @@ mod tests {
             WeightDtype::F16,
             WeightDtype::Q4K,
             WeightDtype::Q4_0,
+            WeightDtype::Q8_0,
         ] {
             let h = TensorHeader::for_swiglu_expert(dtype, 512, 2048);
             assert_eq!(

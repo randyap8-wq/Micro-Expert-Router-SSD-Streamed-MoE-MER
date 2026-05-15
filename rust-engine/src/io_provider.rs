@@ -631,21 +631,25 @@ pub fn generate_synthetic_experts_with_dtype(
                 f.write_all(&block_bytes)?;
                 floats_remaining = floats_remaining.saturating_sub(n);
             }
-        } else if matches!(dtype, WeightDtype::Q4_0) {
-            // Q4_0 writes per-block (18 bytes for 32 weights), per-tensor.
-            // Each of gate / up / down is rounded up to a 32-weight
-            // boundary independently to match
-            // [`expert_weight_bytes_for(_, _, Q4_0)`] and
-            // [`OwnedExpertWeights::from_bytes_q4_0`].
-            use crate::inference::{quantize_q4_0_block, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS};
-            let mut block_floats = vec![0.0f32; Q4_0_BLOCK_ELEMS];
-            let mut block_bytes = vec![0u8; Q4_0_BLOCK_BYTES];
-            // Three tensors of `d_model * d_ff` weights each.
+        } else if matches!(dtype, WeightDtype::Q4_0 | WeightDtype::Q8_0) {
+            // Q4_0 / Q8_0 write per-block, per-tensor (gate / up / down
+            // independently rounded up to a block boundary).
+            use crate::inference::{
+                quantize_q4_0_block, quantize_q8_0_block, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS,
+                Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
+            };
+            let (block_elems, block_bytes) = match dtype {
+                WeightDtype::Q4_0 => (Q4_0_BLOCK_ELEMS, Q4_0_BLOCK_BYTES),
+                WeightDtype::Q8_0 => (Q8_0_BLOCK_ELEMS, Q8_0_BLOCK_BYTES),
+                _ => unreachable!(),
+            };
+            let mut block_floats = vec![0.0f32; block_elems];
+            let mut block_bytes_buf = vec![0u8; block_bytes];
             let one = d_model.saturating_mul(d_ff);
             for _tensor in 0..3 {
                 let mut t_remaining = one;
                 while t_remaining > 0 {
-                    let n = t_remaining.min(Q4_0_BLOCK_ELEMS);
+                    let n = t_remaining.min(block_elems);
                     for slot in block_floats.iter_mut().take(n) {
                         state ^= state << 13;
                         state ^= state >> 7;
@@ -657,8 +661,18 @@ pub fn generate_synthetic_experts_with_dtype(
                     for slot in block_floats.iter_mut().skip(n) {
                         *slot = 0.0;
                     }
-                    quantize_q4_0_block(&block_floats[..Q4_0_BLOCK_ELEMS], &mut block_bytes);
-                    f.write_all(&block_bytes)?;
+                    match dtype {
+                        WeightDtype::Q4_0 => quantize_q4_0_block(
+                            &block_floats[..block_elems],
+                            &mut block_bytes_buf,
+                        ),
+                        WeightDtype::Q8_0 => quantize_q8_0_block(
+                            &block_floats[..block_elems],
+                            &mut block_bytes_buf,
+                        ),
+                        _ => unreachable!(),
+                    }
+                    f.write_all(&block_bytes_buf)?;
                     t_remaining = t_remaining.saturating_sub(n);
                 }
             }
@@ -696,6 +710,7 @@ pub fn generate_synthetic_experts_with_dtype(
                         }
                         WeightDtype::Q4K => unreachable!("Q4K handled above"),
                         WeightDtype::Q4_0 => unreachable!("Q4_0 handled above"),
+                        WeightDtype::Q8_0 => unreachable!("Q8_0 handled above"),
                     }
                 }
                 f.write_all(&buf)?;
@@ -955,7 +970,7 @@ impl Manifest {
                         }
                     }
                     Err(err) => {
-                        log::warn!(
+                        tracing::warn!(
                             "failed to read header probe from {}: {}",
                             path.display(),
                             err
@@ -964,7 +979,11 @@ impl Manifest {
                     }
                 },
                 Err(err) => {
-                    log::warn!("failed to open {} for header probe: {}", path.display(), err);
+                    tracing::warn!(
+                        "failed to open {} for header probe: {}",
+                        path.display(),
+                        err
+                    );
                     None
                 }
             };
@@ -1049,7 +1068,71 @@ impl Manifest {
     pub fn dtype(&self, id: u32) -> Option<WeightDtype> {
         self.entries.get(&id).and_then(|e| e.dtype)
     }
+
+    /// Verify that every expert recorded in the manifest carries the
+    /// **same** on-disk dtype.
+    ///
+    /// Returns:
+    ///
+    /// * `Ok(Some(dtype))` — every manifest entry that advertised a
+    ///   UTH dtype agreed on `dtype`; entries with `dtype = None`
+    ///   (legacy bare-payload files) are ignored.
+    /// * `Ok(None)` — the manifest is empty, or every entry is a
+    ///   legacy bare-payload file with no UTH (so no dtype could be
+    ///   read). The engine falls back to the config's declared dtype.
+    /// * `Err(IncompatibleExpertTypes { found })` — at least two
+    ///   entries declared *different* dtypes. The engine refuses to
+    ///   boot rather than silently driving heterogeneous experts
+    ///   through a single dispatch arm.
+    ///
+    /// This is the runtime cross-check that backs the
+    /// `[EngineError::IncompatibleExpertTypes]` startup error: a
+    /// compute kernel built for one quant scheme produces silently
+    /// wrong activations against another, so we surface the
+    /// inconsistency before the first `pread`.
+    pub fn verify_uniform_dtype(&self) -> Result<Option<WeightDtype>, IncompatibleExpertTypes> {
+        let mut chosen: Option<WeightDtype> = None;
+        let mut all_seen: Vec<WeightDtype> = Vec::new();
+        for entry in self.entries.values() {
+            let Some(d) = entry.dtype else { continue };
+            if !all_seen.contains(&d) {
+                all_seen.push(d);
+            }
+            match chosen {
+                None => chosen = Some(d),
+                Some(c) if c == d => {}
+                Some(_) => {
+                    return Err(IncompatibleExpertTypes { found: all_seen });
+                }
+            }
+        }
+        Ok(chosen)
+    }
 }
+
+/// Returned by [`Manifest::verify_uniform_dtype`] when the manifest
+/// indexed at least two experts whose on-disk Unified Tensor Header
+/// declares **different** weight dtypes. Surfaced upstream by the
+/// engine as `EngineError::IncompatibleExpertTypes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompatibleExpertTypes {
+    /// The set of distinct dtypes the manifest observed, in the
+    /// order they were first encountered. Always has at least two
+    /// entries (otherwise the verifier would have returned `Ok`).
+    pub found: Vec<WeightDtype>,
+}
+
+impl std::fmt::Display for IncompatibleExpertTypes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "manifest indexed experts with incompatible weight dtypes: {:?}",
+            self.found
+        )
+    }
+}
+
+impl std::error::Error for IncompatibleExpertTypes {}
 
 // =====================================================================
 
@@ -1057,6 +1140,87 @@ impl Manifest {
 mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
+
+    #[test]
+    fn manifest_verify_uniform_dtype_agrees() {
+        let mut m = Manifest::default();
+        m.block_align = 4096;
+        m.entries.insert(
+            0,
+            ManifestEntry {
+                path: PathBuf::from("/dev/null"),
+                file_size: 0,
+                payload_offset: 0,
+                payload_size: 0,
+                dtype: Some(WeightDtype::Q8_0),
+                header: None,
+            },
+        );
+        m.entries.insert(
+            1,
+            ManifestEntry {
+                path: PathBuf::from("/dev/null"),
+                file_size: 0,
+                payload_offset: 0,
+                payload_size: 0,
+                dtype: Some(WeightDtype::Q8_0),
+                header: None,
+            },
+        );
+        assert_eq!(m.verify_uniform_dtype(), Ok(Some(WeightDtype::Q8_0)));
+    }
+
+    #[test]
+    fn manifest_verify_uniform_dtype_rejects_mismatch() {
+        let mut m = Manifest::default();
+        m.block_align = 4096;
+        m.entries.insert(
+            0,
+            ManifestEntry {
+                path: PathBuf::from("/dev/null"),
+                file_size: 0,
+                payload_offset: 0,
+                payload_size: 0,
+                dtype: Some(WeightDtype::Q4_0),
+                header: None,
+            },
+        );
+        m.entries.insert(
+            1,
+            ManifestEntry {
+                path: PathBuf::from("/dev/null"),
+                file_size: 0,
+                payload_offset: 0,
+                payload_size: 0,
+                dtype: Some(WeightDtype::Q8_0),
+                header: None,
+            },
+        );
+        let err = m.verify_uniform_dtype().unwrap_err();
+        // Both dtypes are surfaced — the engine logs them on refusal.
+        assert!(err.found.contains(&WeightDtype::Q4_0));
+        assert!(err.found.contains(&WeightDtype::Q8_0));
+    }
+
+    #[test]
+    fn manifest_verify_uniform_dtype_ignores_legacy_entries() {
+        let mut m = Manifest::default();
+        m.block_align = 4096;
+        m.entries.insert(
+            0,
+            ManifestEntry {
+                path: PathBuf::from("/dev/null"),
+                file_size: 0,
+                payload_offset: 0,
+                payload_size: 0,
+                dtype: None,
+                header: None,
+            },
+        );
+        // Pure-legacy manifest → no dtype to verify against, so the
+        // engine falls back to the config-declared dtype.
+        assert_eq!(m.verify_uniform_dtype(), Ok(None));
+    }
 
     /// Internal helper: a unique tempdir under `std::env::temp_dir()`.
     fn tempdir(tag: &str) -> std::path::PathBuf {
