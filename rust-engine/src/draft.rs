@@ -235,8 +235,7 @@ impl RealModel {
             // real attention without paying the verifier's cost, so
             // just append a zero K/V — the position is what the
             // peek needs most.
-            for (layer_idx, slot) in kv_preview.iter_mut().enumerate() {
-                let _ = layer_idx;
+            for slot in kv_preview.iter_mut() {
                 let zeros = vec![0.0f32; slot.kv_dim];
                 slot.append(&zeros, &zeros);
             }

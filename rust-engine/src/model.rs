@@ -539,6 +539,12 @@ impl RealModel {
             self.config.num_layers,
             "kv cache slice must have one entry per layer"
         );
+        // Each layer contributes exactly `routing.experts.len()` ids,
+        // which by the gating contract equals `config.top_k`. We
+        // assert this loosely below via `debug_assert`; the
+        // pre-allocation is a tight upper bound that avoids any
+        // `Vec` growth even when `top_k` is dynamically reduced
+        // (e.g. by alias-deduplication).
         let mut out = Vec::with_capacity(self.config.num_layers * self.config.top_k);
         let embed = self.embed(token_id);
         // Layer 0: run real attention against a *clone* of the KV
