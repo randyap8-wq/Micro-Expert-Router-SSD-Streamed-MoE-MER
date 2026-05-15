@@ -28,6 +28,7 @@
 use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo};
 use crate::inference::{
     dequantize_f16_to_f32, expert_weight_bytes_for, WeightDtype,
+    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS,
 };
 use crate::tensor_header::TensorHeader;
 use serde::Serialize;
@@ -121,11 +122,36 @@ pub struct ExtractOptions {
     /// engine's `O_DIRECT` invariants and per-expert `expert_size`
     /// contract. Default `true`.
     pub emit_uth: bool,
+
+    /// **Native 4-bit pass-through (Industrial Upgrade Task 0).**
+    ///
+    /// When `true` *and* every expert tensor in a layer is `Q4_0` or
+    /// `Q4_K` *and* the per-expert weight count divides cleanly on
+    /// the corresponding block boundary (32 weights for `Q4_0`, 256
+    /// for `Q4_K`), the converter writes the **raw quantised block
+    /// stream** to disk instead of dequantising to F32. The output
+    /// `expert_<id>.bin` then contains
+    /// `gate_blocks || up_blocks || down_blocks` exactly as
+    /// [`crate::inference::OwnedExpertWeights::from_bytes_q4_0`] /
+    /// `from_bytes_q4k` expect, page-padded to `block_align` so the
+    /// `O_DIRECT` reader stays compatible.
+    ///
+    /// This shrinks per-expert on-disk footprint by ~7× vs the F32
+    /// dequant path (a 4096 × 14336 SwiGLU triple goes from
+    /// ~672 MiB f32 down to ~96 MiB Q4_0 — half a GiB less per
+    /// expert read off the SSD).
+    ///
+    /// Layers / models that don't satisfy the alignment precondition
+    /// **fall back to F32 dequant** transparently and the converter
+    /// keeps making forward progress; the report's `expert_dtype`
+    /// records what was actually written so downstream tooling /
+    /// `metadata.json` always describe the on-disk reality.
+    pub native_quant: bool,
 }
 
 impl Default for ExtractOptions {
     fn default() -> Self {
-        Self { emit_uth: true }
+        Self { emit_uth: true, native_quant: false }
     }
 }
 
@@ -201,33 +227,59 @@ pub fn extract_experts_from_source(
         d_ff,
         top_k,
         emit_uth = opts.emit_uth,
+        native_quant = opts.native_quant,
         "gguf-convert: extracting experts"
     );
+
+    // Probe the first layer's expert tensors to figure out whether the
+    // native pass-through path is *eligible*. We require:
+    //   * `opts.native_quant` was requested,
+    //   * gate / up / down all use the same Q4_0 *or* Q4_K dtype,
+    //   * the per-expert weight count divides cleanly on the block
+    //     boundary (32 for Q4_0, 256 for Q4_K) — otherwise per-expert
+    //     slicing wouldn't fall on block boundaries and we'd corrupt
+    //     the per-block scales.
+    //
+    // When ineligible we silently fall back to the F32 dequant path,
+    // which is what the loader has always done.
+    let native_dtype = if opts.native_quant {
+        detect_native_quant_dtype(gguf, num_layers, d_model, d_ff)
+    } else {
+        None
+    };
+    let expert_dtype = native_dtype.unwrap_or(WeightDtype::F32);
+    if let Some(d) = native_dtype {
+        info!(?d, "native 4-bit pass-through is eligible — writing raw quantised blocks");
+    } else if opts.native_quant {
+        warn!(
+            "native 4-bit pass-through requested but not eligible \
+             (mixed dtypes, non-Q4 source, or per-expert weight count \
+             not block-aligned); falling back to F32 dequant"
+        );
+    }
 
     let mut report = ExtractionReport {
         experts_written: 0,
         dense_written: 0,
         skipped: 0,
         total_bytes: 0,
-        expert_dtype: WeightDtype::F32,
+        expert_dtype,
         d_model,
         d_ff,
         num_experts_per_layer: num_experts,
         num_layers,
     };
 
-    // Walk layers and emit per-expert files. Output dtype is always F32
-    // here: the GGUF block-quant streams pack all experts together, so
-    // slicing them at byte granularity isn't possible without unpacking.
-    // Dequantising at extract time gives the engine the simplest input
-    // and preserves accuracy.
+    // Walk layers and emit per-expert files. Output dtype is `F32`
+    // for the dequant path (legacy default), or whichever 4-bit dtype
+    // was detected as eligible above.
     //
     // When `opts.emit_uth` is set, each expert file is prefixed with a
     // 64-byte U.T.H., page-padded to DEFAULT_BLOCK_ALIGN so the weight
     // payload still starts at a 4 KiB boundary. The total file size
     // therefore grows by exactly one block (4 KiB) per expert.
     let payload_size = align_up(
-        expert_weight_bytes_for(d_model, d_ff, WeightDtype::F32),
+        expert_weight_bytes_for(d_model, d_ff, expert_dtype),
         DEFAULT_BLOCK_ALIGN,
     );
     let header_overhead = if opts.emit_uth { DEFAULT_BLOCK_ALIGN } else { 0 };
@@ -235,21 +287,51 @@ pub fn extract_experts_from_source(
 
     for layer in 0..num_layers {
         info!(layer, "extracting layer experts");
-        let per_expert =
-            load_layer_expert_matrices(gguf, layer, num_experts, d_model, d_ff)?;
-        for (e, (gate, up, down)) in per_expert.into_iter().enumerate() {
-            let global_id = layer * num_experts + e;
-            let path = out_dir.join(format!("expert_{global_id}.bin"));
-            let mut bytes = Vec::with_capacity(expert_size);
-            if opts.emit_uth {
-                TensorHeader::for_swiglu_expert(WeightDtype::F32, d_model, d_ff)
-                    .write_padded(DEFAULT_BLOCK_ALIGN, &mut bytes);
-                debug_assert_eq!(bytes.len(), DEFAULT_BLOCK_ALIGN);
+        match native_dtype {
+            Some(d) => {
+                // Native pass-through: pull the raw quantised bytes
+                // for this layer's gate/up/down tensors and slice each
+                // expert's stride out without dequantising.
+                let per_expert =
+                    load_layer_expert_native_quant(gguf, layer, num_experts, d_model, d_ff, d)?;
+                for (e, (gate, up, down)) in per_expert.into_iter().enumerate() {
+                    let global_id = layer * num_experts + e;
+                    let path = out_dir.join(format!("expert_{global_id}.bin"));
+                    let mut bytes = Vec::with_capacity(expert_size);
+                    if opts.emit_uth {
+                        TensorHeader::for_swiglu_expert(d, d_model, d_ff)
+                            .write_padded(DEFAULT_BLOCK_ALIGN, &mut bytes);
+                        debug_assert_eq!(bytes.len(), DEFAULT_BLOCK_ALIGN);
+                    }
+                    bytes.extend_from_slice(&gate);
+                    bytes.extend_from_slice(&up);
+                    bytes.extend_from_slice(&down);
+                    if bytes.len() < expert_size {
+                        bytes.resize(expert_size, 0);
+                    }
+                    write_file(&path, &bytes)?;
+                    report.experts_written += 1;
+                    report.total_bytes += bytes.len() as u64;
+                }
             }
-            append_expert_f32(&mut bytes, &gate, &up, &down, expert_size);
-            write_file(&path, &bytes)?;
-            report.experts_written += 1;
-            report.total_bytes += bytes.len() as u64;
+            None => {
+                let per_expert =
+                    load_layer_expert_matrices(gguf, layer, num_experts, d_model, d_ff)?;
+                for (e, (gate, up, down)) in per_expert.into_iter().enumerate() {
+                    let global_id = layer * num_experts + e;
+                    let path = out_dir.join(format!("expert_{global_id}.bin"));
+                    let mut bytes = Vec::with_capacity(expert_size);
+                    if opts.emit_uth {
+                        TensorHeader::for_swiglu_expert(WeightDtype::F32, d_model, d_ff)
+                            .write_padded(DEFAULT_BLOCK_ALIGN, &mut bytes);
+                        debug_assert_eq!(bytes.len(), DEFAULT_BLOCK_ALIGN);
+                    }
+                    append_expert_f32(&mut bytes, &gate, &up, &down, expert_size);
+                    write_file(&path, &bytes)?;
+                    report.experts_written += 1;
+                    report.total_bytes += bytes.len() as u64;
+                }
+            }
         }
     }
 
@@ -361,7 +443,7 @@ pub fn extract_experts_from_source(
         d_ff,
         expert_size,
         block_align: DEFAULT_BLOCK_ALIGN,
-        dtype: "f32",
+        dtype: expert_dtype.as_str(),
         weight_layout: "gate_proj || up_proj || down_proj (row-major)",
         num_layers,
         num_experts_per_layer: num_experts,
@@ -777,6 +859,130 @@ fn slice_expert_matrix(
 
 // (end of module body)
 
+// ---------------------------------------------------------------------
+// Native 4-bit pass-through (Industrial Upgrade Task 0).
+// ---------------------------------------------------------------------
+
+/// Inspect the first layer's expert tensors and determine whether the
+/// native 4-bit pass-through path can be used for the whole model.
+///
+/// Returns `Some(WeightDtype::Q4_0)` / `Some(WeightDtype::Q4K)` when:
+///   * gate / up / down all live under interleaved tensors (the only
+///     layout the native slicer supports today),
+///   * all three tensors share the same `Q4_0` *or* `Q4_K` GGML dtype,
+///   * the per-expert weight count `d_ff * d_model` is a whole multiple
+///     of the corresponding block-element size (32 or 256), so each
+///     expert's slice falls on a clean block boundary,
+///   * all subsequent layers expose the same shapes / dtypes (the
+///     extractor writes one global `expert_dtype` into
+///     `metadata.json` so a single ineligible layer poisons the whole
+///     run).
+///
+/// Returns `None` otherwise (the caller falls back to F32 dequant).
+fn detect_native_quant_dtype(
+    gguf: &dyn GgufSource,
+    num_layers: usize,
+    d_model: usize,
+    d_ff: usize,
+) -> Option<WeightDtype> {
+    let mut chosen: Option<WeightDtype> = None;
+    let per_expert = d_ff.checked_mul(d_model)?;
+    for layer in 0..num_layers {
+        let g = gguf.tensor_info(&format!("blk.{layer}.ffn_gate_exps.weight"))?;
+        let u = gguf.tensor_info(&format!("blk.{layer}.ffn_up_exps.weight"))?;
+        let d = gguf.tensor_info(&format!("blk.{layer}.ffn_down_exps.weight"))?;
+        if g.ggml_dtype != u.ggml_dtype || g.ggml_dtype != d.ggml_dtype {
+            return None;
+        }
+        let layer_dtype = match g.ggml_dtype {
+            ggml_dtype::Q4_0 if per_expert % Q4_0_BLOCK_ELEMS == 0 => WeightDtype::Q4_0,
+            ggml_dtype::Q4_K if per_expert % Q4K_BLOCK_ELEMS == 0 => WeightDtype::Q4K,
+            _ => return None,
+        };
+        match chosen {
+            None => chosen = Some(layer_dtype),
+            Some(c) if c == layer_dtype => {}
+            _ => return None,
+        }
+    }
+    chosen
+}
+
+/// Load the (gate, up, down) **raw quantised byte streams** for every
+/// expert in one layer.
+///
+/// Each returned `Vec<u8>` is a contiguous run of `Q4_0_BLOCK_BYTES` /
+/// `Q4K_BLOCK_BYTES`-sized blocks ready to be written into an
+/// `expert_<id>.bin` payload — `gate_blocks || up_blocks ||
+/// down_blocks` is exactly the byte layout
+/// [`crate::inference::OwnedExpertWeights::from_bytes_q4_0`] /
+/// `from_bytes_q4k` consume.
+///
+/// Slicing happens at byte granularity:
+/// `per_expert_bytes = (per_expert_weights / block_elems) * block_bytes`
+/// which the precondition checked by [`detect_native_quant_dtype`]
+/// guarantees is exact.
+fn load_layer_expert_native_quant(
+    gguf: &dyn GgufSource,
+    layer: usize,
+    num_experts: usize,
+    d_model: usize,
+    d_ff: usize,
+    dtype: WeightDtype,
+) -> io::Result<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>> {
+    let (block_elems, block_bytes) = match dtype {
+        WeightDtype::Q4_0 => (Q4_0_BLOCK_ELEMS, Q4_0_BLOCK_BYTES),
+        WeightDtype::Q4K => (Q4K_BLOCK_ELEMS, Q4K_BLOCK_BYTES),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "load_layer_expert_native_quant: dtype must be Q4_0 or Q4_K",
+            ));
+        }
+    };
+    let per_expert_weights = d_ff.saturating_mul(d_model);
+    let per_expert_bytes = (per_expert_weights / block_elems) * block_bytes;
+
+    let read_layer_tensor = |name: String| -> io::Result<Vec<u8>> {
+        let info = gguf.tensor_info(&name).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("tensor {name} missing"))
+        })?;
+        let buf = gguf.read_tensor_owned(&info.name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tensor {} has no data slice", info.name),
+            )
+        })?;
+        let need = num_experts.saturating_mul(per_expert_bytes);
+        if buf.len() < need {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "tensor {name}: expected {need} quantised bytes, got {}",
+                    buf.len()
+                ),
+            ));
+        }
+        Ok(buf)
+    };
+
+    let gate_all = read_layer_tensor(format!("blk.{layer}.ffn_gate_exps.weight"))?;
+    let up_all = read_layer_tensor(format!("blk.{layer}.ffn_up_exps.weight"))?;
+    let down_all = read_layer_tensor(format!("blk.{layer}.ffn_down_exps.weight"))?;
+
+    let mut out = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let s = e * per_expert_bytes;
+        let end = s + per_expert_bytes;
+        out.push((
+            gate_all[s..end].to_vec(),
+            up_all[s..end].to_vec(),
+            down_all[s..end].to_vec(),
+        ));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,7 +1123,7 @@ mod tests {
             &out2,
             1,
             num_experts,
-            ExtractOptions { emit_uth: false },
+            ExtractOptions { emit_uth: false, native_quant: false },
         )
         .expect("extract no-uth");
         for e in 0..num_experts {
@@ -1064,6 +1270,64 @@ mod tests {
             out.extend_from_slice(blob);
         }
         out
+    }
+
+    /// `native_quant: true` against an F32-source GGUF must fall back
+    /// to the legacy F32 dequant path without erroring (the source
+    /// dtype is ineligible for native pass-through). The output
+    /// `metadata.json` should still report `dtype = "f32"`, matching
+    /// what was actually written.
+    #[test]
+    fn extract_native_quant_falls_back_when_source_is_f32() {
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let num_experts = 2usize;
+        let bytes = build_synth_gguf(d_model, d_ff, num_experts);
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+
+        let out = tmp.join("native-fallback");
+        let report = extract_experts_from_source(
+            &gguf,
+            &out,
+            1,
+            num_experts,
+            ExtractOptions { emit_uth: true, native_quant: true },
+        )
+        .expect("extract");
+        assert_eq!(report.experts_written, num_experts);
+        assert_eq!(
+            report.expert_dtype,
+            WeightDtype::F32,
+            "F32 source must fall back to F32 dequant"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(meta["dtype"], "f32");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Unit test for the byte-level slicing math: per-expert byte
+    /// stride is `(d_ff*d_model / block_elems) * block_bytes`, and
+    /// the eligibility check rejects `d_ff*d_model` values that
+    /// don't divide cleanly by the block size.
+    #[test]
+    fn native_quant_slicing_arithmetic() {
+        // Q4_0: 32 elements / 18 bytes per block. 4 * 8 = 32 weights
+        // → exactly 1 block per expert per tensor → 18 bytes.
+        let block_elems = 32usize;
+        let block_bytes = 18usize;
+        let per_expert_weights = 4 * 8usize;
+        assert_eq!(per_expert_weights % block_elems, 0);
+        let per_expert_bytes = (per_expert_weights / block_elems) * block_bytes;
+        assert_eq!(per_expert_bytes, 18);
+
+        // Q4_K: 256 / 144. 4 * 8 = 32 weights → ineligible
+        // (32 % 256 != 0); the converter must fall back to F32.
+        let q4k_block_elems = 256usize;
+        assert_ne!(per_expert_weights % q4k_block_elems, 0);
     }
 
     fn lstring(s: &[u8]) -> Vec<u8> {

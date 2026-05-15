@@ -13,6 +13,7 @@
 //! 5. Speculatively kick off prefetches for the most likely next experts.
 //! 6. Record per-token latency and emit structured tracing events.
 
+use crate::aligned_buffer::AlignedBuffer;
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::gating::Router;
@@ -26,12 +27,228 @@ use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
 use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader};
 use hdrhistogram::Histogram;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
+
+// =====================================================================
+// Persistent, page-aligned KV cache (Industrial Upgrade Task 2).
+// =====================================================================
+
+/// Default block alignment for [`AlignedKvCache`] backing storage. The
+/// engine's NVMe path uses the same 4 KiB constant; sharing it here
+/// keeps the KV bytes cheap to splice into a future `O_DIRECT`
+/// snapshot path without re-allocating into a new aligned region.
+pub const KV_CACHE_BLOCK_ALIGN: usize = 4096;
+
+/// Default rolling-window capacity (in tokens) for [`AlignedKvCache`].
+/// Once `seq_len` reaches this value an `append` evicts the oldest
+/// token and shifts the tail down — the standard sliding-window
+/// transformer attention pattern. Zero means "unbounded": the cache
+/// will keep growing until the host runs out of memory.
+pub const KV_CACHE_DEFAULT_WINDOW_TOKENS: usize = 4096;
+
+/// **Persistent, page-aligned KV cache** complementing the per-layer
+/// paged KV cache in `transformer.rs`. The transformer module's
+/// `KvCache` is a `Vec`-backed paged cache used inside one model
+/// forward pass; this is a *session-scoped*, contiguous, page-aligned
+/// cache that survives across [`Engine::generate`] calls so a single
+/// chat / completion request can decode many tokens without
+/// recomputing the prefix on every call.
+///
+/// **Why page-aligned?** Backing the cache with [`AlignedBuffer`]
+/// means a future "warm-restart" path can `pwrite(2)` the cache
+/// straight to an `O_DIRECT` snapshot file without bouncing through
+/// the kernel page cache. It also makes the K/V bytes cheap to share
+/// with `io_uring`'s registered fixed buffers if the engine ever
+/// pushes attention compute to a device queue.
+///
+/// **Rolling window.** When the cache fills its `window_tokens`
+/// budget, `append` shifts the tail down by one slot and writes the
+/// new K/V at the end. This bounds memory at
+/// `2 * window_tokens * kv_dim * 4` bytes (per-instance) and
+/// implements the same sliding-window attention pattern Mistral / the
+/// real transformer use.
+///
+/// **Memory safety.** The underlying `AlignedBuffer` is owned and
+/// `Drop`'s deallocate the page-aligned region. `zeroize()` overwrites
+/// the bytes via a trivial `fill(0)` before `reset` — sufficient for
+/// the engine's session-deletion path because the buffer is
+/// immediately re-allocated on the next session.
+pub struct AlignedKvCache {
+    keys: AlignedBuffer,
+    values: AlignedBuffer,
+    /// Number of tokens currently resident.
+    seq_len: usize,
+    /// Token capacity of the rolling window. `0` means unbounded
+    /// (the cache will refuse `append` once it's full instead of
+    /// shifting).
+    window_tokens: usize,
+    /// Hidden dimension per K/V row.
+    kv_dim: usize,
+}
+
+impl AlignedKvCache {
+    /// Allocate a fresh cache that holds up to `window_tokens` K/V
+    /// rows of `kv_dim` floats each, page-aligned to
+    /// [`KV_CACHE_BLOCK_ALIGN`].
+    ///
+    /// Panics if `window_tokens == 0` or `kv_dim == 0`.
+    pub fn new(window_tokens: usize, kv_dim: usize) -> Self {
+        assert!(window_tokens > 0, "window_tokens must be > 0");
+        assert!(kv_dim > 0, "kv_dim must be > 0");
+        let row_bytes = kv_dim * std::mem::size_of::<f32>();
+        let raw = window_tokens * row_bytes;
+        // Round up to the page alignment so AlignedBuffer's invariant
+        // (size % align == 0) holds. The trailing pad bytes are
+        // unused and never read; `seq_len` bounds every iteration.
+        let padded = raw.div_ceil(KV_CACHE_BLOCK_ALIGN) * KV_CACHE_BLOCK_ALIGN;
+        Self {
+            keys: AlignedBuffer::new(padded, KV_CACHE_BLOCK_ALIGN),
+            values: AlignedBuffer::new(padded, KV_CACHE_BLOCK_ALIGN),
+            seq_len: 0,
+            window_tokens,
+            kv_dim,
+        }
+    }
+
+    /// Number of tokens currently resident.
+    #[inline]
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    /// Window capacity in tokens.
+    #[inline]
+    pub fn window_tokens(&self) -> usize {
+        self.window_tokens
+    }
+
+    /// Hidden dimension per row.
+    #[inline]
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
+    /// Page-aligned base address of the key buffer (for `O_DIRECT`
+    /// snapshot use). Always a multiple of [`KV_CACHE_BLOCK_ALIGN`].
+    pub fn keys_ptr(&self) -> *const u8 {
+        self.keys.as_slice().as_ptr()
+    }
+
+    /// Page-aligned base address of the value buffer.
+    pub fn values_ptr(&self) -> *const u8 {
+        self.values.as_slice().as_ptr()
+    }
+
+    /// Append one (k, v) row. If the cache is at capacity, the
+    /// oldest token is evicted (rolling window) and the new row
+    /// replaces it at the tail.
+    ///
+    /// Returns `true` when an eviction actually happened, `false`
+    /// when the new row simply extended the resident window.
+    ///
+    /// Panics if either slice's length differs from `kv_dim`.
+    pub fn append(&mut self, k: &[f32], v: &[f32]) -> bool {
+        assert_eq!(k.len(), self.kv_dim, "AlignedKvCache::append: kv_dim mismatch");
+        assert_eq!(v.len(), self.kv_dim, "AlignedKvCache::append: kv_dim mismatch");
+        let evicted = if self.seq_len == self.window_tokens {
+            self.shift_one_left();
+            true
+        } else {
+            false
+        };
+        let pos = self.seq_len;
+        self.write_row(pos, k, v);
+        self.seq_len += 1;
+        evicted
+    }
+
+    /// Read the i-th cached key (`i < seq_len`). Returns a slice of
+    /// length `kv_dim` borrowed from the page-aligned backing store.
+    pub fn key(&self, i: usize) -> &[f32] {
+        assert!(i < self.seq_len, "AlignedKvCache::key: index out of bounds");
+        let row = self.row_floats(self.keys.as_slice(), i);
+        row
+    }
+
+    /// Read the i-th cached value.
+    pub fn value(&self, i: usize) -> &[f32] {
+        assert!(i < self.seq_len, "AlignedKvCache::value: index out of bounds");
+        self.row_floats(self.values.as_slice(), i)
+    }
+
+    /// Drop every resident token. The backing allocation is kept so
+    /// the next `append` doesn't pay for a fresh page-aligned alloc.
+    pub fn reset(&mut self) {
+        self.seq_len = 0;
+    }
+
+    /// Overwrite every resident K/V byte with zero before [`Self::reset`]
+    /// — the engine calls this before tearing down a session so the
+    /// next allocation that lands in the same heap region cannot
+    /// observe the previous tenant's attention state.
+    pub fn zeroize(&mut self) {
+        self.keys.as_mut_slice().fill(0);
+        self.values.as_mut_slice().fill(0);
+        self.reset();
+    }
+
+    /// Resident bytes (keys + values), useful for telemetry.
+    pub fn resident_bytes(&self) -> usize {
+        self.seq_len * self.kv_dim * std::mem::size_of::<f32>() * 2
+    }
+
+    fn write_row(&mut self, pos: usize, k: &[f32], v: &[f32]) {
+        let row_bytes = self.kv_dim * std::mem::size_of::<f32>();
+        let start = pos * row_bytes;
+        let end = start + row_bytes;
+        // SAFETY: writing bytes — the underlying AlignedBuffer is
+        // initialised and we slice within bounds (pos < window_tokens
+        // is guaranteed by append's eviction logic).
+        let kb = &mut self.keys.as_mut_slice()[start..end];
+        let vb = &mut self.values.as_mut_slice()[start..end];
+        for (i, x) in k.iter().enumerate() {
+            kb[i * 4..(i + 1) * 4].copy_from_slice(&x.to_le_bytes());
+        }
+        for (i, x) in v.iter().enumerate() {
+            vb[i * 4..(i + 1) * 4].copy_from_slice(&x.to_le_bytes());
+        }
+    }
+
+    fn row_floats<'a>(&'a self, buf: &'a [u8], pos: usize) -> &'a [f32] {
+        let row_bytes = self.kv_dim * std::mem::size_of::<f32>();
+        let start = pos * row_bytes;
+        let bytes = &buf[start..start + row_bytes];
+        // SAFETY: AlignedBuffer is allocated with `KV_CACHE_BLOCK_ALIGN`
+        // (4096-byte) alignment, so every per-row offset is a multiple
+        // of `4 = align_of::<f32>()`. The byte length is exactly
+        // `kv_dim * 4`, and `f32` has no validity invariants beyond
+        // alignment.
+        unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.kv_dim)
+        }
+    }
+
+    /// Shift the K/V rows one slot toward index 0. Called by `append`
+    /// when the rolling window is full. `O(seq_len * kv_dim)` byte
+    /// moves; cheap relative to one attention sweep.
+    fn shift_one_left(&mut self) {
+        let row_bytes = self.kv_dim * std::mem::size_of::<f32>();
+        let live_bytes = (self.seq_len - 1) * row_bytes;
+        if live_bytes == 0 {
+            return;
+        }
+        let kb = self.keys.as_mut_slice();
+        let vb = self.values.as_mut_slice();
+        kb.copy_within(row_bytes..row_bytes + live_bytes, 0);
+        vb.copy_within(row_bytes..row_bytes + live_bytes, 0);
+        self.seq_len -= 1;
+    }
+}
 
 /// Internal: outcome of a single fetch attempt.
 enum FetchOnceError {
@@ -588,6 +805,12 @@ pub struct Engine {
     pub(crate) core: EngineCore,
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
+    /// Optional persistent, page-aligned KV cache attached at
+    /// construction time via [`Engine::with_kv_cache`]. The synthetic
+    /// `generate` path doesn't append to it (no real attention runs
+    /// at this layer in the benchmark configuration), but the
+    /// real-transformer / server path does — see `server.rs`.
+    pub(crate) kv_cache: Option<Arc<Mutex<AlignedKvCache>>>,
 }
 
 impl Engine {
@@ -616,7 +839,53 @@ impl Engine {
             core: EngineCore::new(cache, pool, storage, router, predictor, shape, options),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
+            kv_cache: None,
         }
+    }
+
+    /// Attach a persistent, page-aligned KV cache (one per session
+    /// when called from a session-aware server path). The cache is
+    /// owned by the engine and its window / kv_dim are immutable.
+    /// Returns `self` for builder-style chaining.
+    pub fn with_kv_cache(mut self, cache: AlignedKvCache) -> Self {
+        self.kv_cache = Some(Arc::new(Mutex::new(cache)));
+        self
+    }
+
+    /// Borrow the engine's KV cache, if any. Callers acquire the
+    /// inner `parking_lot::Mutex` to read or append.
+    pub fn kv_cache(&self) -> Option<Arc<Mutex<AlignedKvCache>>> {
+        self.kv_cache.clone()
+    }
+
+    /// Append `(k, v)` to the persistent KV cache. No-op (returns
+    /// `Ok(false)`) when no cache is attached. The boolean return
+    /// value mirrors [`AlignedKvCache::append`]: `true` ⇔ the
+    /// rolling window evicted its oldest token to make room.
+    pub fn kv_cache_append(&self, k: &[f32], v: &[f32]) -> bool {
+        match &self.kv_cache {
+            Some(c) => c.lock().append(k, v),
+            None => false,
+        }
+    }
+
+    /// Reset the persistent KV cache (drop every resident token but
+    /// keep the page-aligned allocation). No-op when no cache is
+    /// attached. Called by the session-delete path before the engine
+    /// state is swapped for a new tenant.
+    pub fn reset_kv_cache(&self) {
+        if let Some(c) = &self.kv_cache {
+            c.lock().zeroize();
+        }
+    }
+
+    /// Number of tokens currently resident in the persistent KV
+    /// cache, or `0` when no cache is attached.
+    pub fn kv_cache_seq_len(&self) -> usize {
+        self.kv_cache
+            .as_ref()
+            .map(|c| c.lock().seq_len())
+            .unwrap_or(0)
     }
 
     /// Install a JSONL routing trace sink. Every subsequent
@@ -2249,5 +2518,50 @@ mod tests {
         let report = engine.report();
         assert_eq!(report.hits + report.misses, total_fetches);
         assert_eq!(report.expert_read_failures, 0);
+    }
+
+    /// `AlignedKvCache::append` extends the resident window until
+    /// capacity, after which it slides the tail down by one and
+    /// overwrites the freed slot with the new row. The first
+    /// `seq_len` indices always read back the most recent K/V rows.
+    #[test]
+    fn aligned_kv_cache_rolls_window_and_keeps_recent_rows() {
+        let kv_dim = 8usize;
+        let window = 4usize;
+        let mut cache = AlignedKvCache::new(window, kv_dim);
+        // The buffer must be page-aligned (4 KiB) — that's the whole
+        // point of using AlignedBuffer here.
+        assert_eq!(cache.keys_ptr() as usize % KV_CACHE_BLOCK_ALIGN, 0);
+        assert_eq!(cache.values_ptr() as usize % KV_CACHE_BLOCK_ALIGN, 0);
+
+        for i in 0..window {
+            let k: Vec<f32> = (0..kv_dim).map(|j| (i * 10 + j) as f32).collect();
+            let v: Vec<f32> = (0..kv_dim).map(|j| (i * 10 + j) as f32 + 0.5).collect();
+            assert_eq!(cache.append(&k, &v), false, "no eviction before full");
+        }
+        assert_eq!(cache.seq_len(), window);
+        // Read back: token 0 has values starting at 0, token 3 at 30.
+        assert_eq!(cache.key(0)[0], 0.0);
+        assert_eq!(cache.key(3)[0], 30.0);
+
+        // Filling one more row evicts the oldest. After the shift,
+        // index 0 is what used to be index 1 (values 10..), index 3
+        // is the *new* row (values 40..).
+        let k: Vec<f32> = (0..kv_dim).map(|j| (4 * 10 + j) as f32).collect();
+        let v: Vec<f32> = (0..kv_dim).map(|j| (4 * 10 + j) as f32 + 0.5).collect();
+        assert_eq!(cache.append(&k, &v), true, "eviction expected at capacity");
+        assert_eq!(cache.seq_len(), window);
+        assert_eq!(cache.key(0)[0], 10.0, "oldest token shifted out");
+        assert_eq!(cache.key(window - 1)[0], 40.0, "new token at tail");
+        assert_eq!(cache.value(window - 1)[0], 40.5);
+
+        // Resident bytes accounting matches: 4 tokens * 8 floats * 2 (k+v) * 4 bytes.
+        assert_eq!(cache.resident_bytes(), 4 * 8 * 2 * 4);
+
+        // Reset clears seq_len but keeps the page-aligned allocation.
+        let ptr_before = cache.keys_ptr();
+        cache.zeroize();
+        assert_eq!(cache.seq_len(), 0);
+        assert_eq!(cache.keys_ptr(), ptr_before, "allocation must be reused");
     }
 }

@@ -284,6 +284,19 @@ enum Cmd {
         /// for small fixtures.
         #[arg(long, default_value_t = false)]
         legacy_eager: bool,
+        /// **Native 4-bit pass-through.** When set and the source
+        /// GGUF stores its expert tensors as `Q4_0` or `Q4_K`,
+        /// write the raw quantised block stream to disk instead of
+        /// dequantising to F32 first. The output `expert_<id>.bin`
+        /// is then ~7× smaller and the engine's existing
+        /// `run_inference_q4_0` / `run_inference_q4k` paths consume
+        /// it directly. Falls back to F32 dequant when the source
+        /// dtype isn't `Q4_0`/`Q4_K` or the per-expert weight count
+        /// isn't a clean multiple of the block size; the
+        /// converter's emitted `metadata.json::dtype` records what
+        /// was actually written.
+        #[arg(long, default_value_t = false)]
+        native_quant: bool,
     },
 
     /// Replay a routing trace through the predictive prefetcher and
@@ -443,7 +456,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_experts,
             no_uth,
             legacy_eager,
-        } => cmd_gguf_convert(&gguf_path, &out_dir, num_layers, num_experts, !no_uth, legacy_eager),
+            native_quant,
+        } => cmd_gguf_convert(
+            &gguf_path,
+            &out_dir,
+            num_layers,
+            num_experts,
+            !no_uth,
+            legacy_eager,
+            native_quant,
+        ),
         Cmd::ValidatePredictor { trace, cache_slots } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1794,14 +1816,16 @@ fn cmd_gguf_convert(
     num_experts: usize,
     emit_uth: bool,
     legacy_eager: bool,
+    native_quant: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         path = %gguf_path.display(),
         emit_uth,
         legacy_eager,
+        native_quant,
         "opening GGUF file"
     );
-    let opts = crate::gguf_loader::ExtractOptions { emit_uth };
+    let opts = crate::gguf_loader::ExtractOptions { emit_uth, native_quant };
     let report = if legacy_eager {
         // Eager path: slurps the file into memory before slicing.
         // Retained for compatibility and small fixtures.

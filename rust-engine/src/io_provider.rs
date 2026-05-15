@@ -37,6 +37,7 @@
 
 use crate::buffer_pool::PooledBuffer;
 use crate::inference::WeightDtype;
+use crate::tensor_header::{TensorHeader, UTH_BYTES};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -96,6 +97,14 @@ pub struct NvmeStorage {
     /// empty, only `cfg.base_path` is consulted — the legacy single-
     /// drive layout. Gist Phase 4 (multi-drive striping).
     striped_paths: Vec<PathBuf>,
+    /// Optional cold-start manifest. When attached via
+    /// [`NvmeStorage::with_manifest`], `expert_path(id)` consults it
+    /// first and avoids re-walking the multi-namespace fallback +
+    /// the per-call `metadata()` syscall.  Built once at engine boot
+    /// (see [`Manifest::scan`]) and shared across the steady-state
+    /// fetch path. Wrapped in an [`Arc`] for cheap cloning into
+    /// background prefetch tasks.
+    manifest: Option<Arc<Manifest>>,
 }
 
 impl NvmeStorage {
@@ -112,6 +121,7 @@ impl NvmeStorage {
             cfg,
             files: RwLock::new(HashMap::new()),
             striped_paths: Vec::new(),
+            manifest: None,
         })
     }
 
@@ -143,6 +153,27 @@ impl NvmeStorage {
         Ok(s)
     }
 
+    /// Attach a pre-built [`Manifest`] (typically produced by
+    /// [`Manifest::scan`] at engine boot) to this storage. The
+    /// manifest's `payload_offset` / `dtype` lookups are then
+    /// available to the rest of the engine via [`Self::manifest`],
+    /// and [`Self::expert_path`] short-circuits the multi-namespace
+    /// resolution + `metadata()` syscall on every call.
+    ///
+    /// Builder-style: returns `self` for chaining at construction time
+    /// (`NvmeStorage::new(cfg)?.with_manifest(m)`).
+    pub fn with_manifest(mut self, manifest: Arc<Manifest>) -> Self {
+        self.manifest = Some(manifest);
+        self
+    }
+
+    /// The cold-start manifest attached via [`Self::with_manifest`],
+    /// if any. `None` means the storage was constructed without
+    /// indexing — the legacy per-fetch resolution path is used.
+    pub fn manifest(&self) -> Option<&Arc<Manifest>> {
+        self.manifest.as_ref()
+    }
+
     /// Number of drives this storage is striped across. `1` for the
     /// legacy single-drive layout.
     pub fn num_drives(&self) -> usize {
@@ -168,6 +199,13 @@ impl NvmeStorage {
     /// `<dir>` is `cfg.base_path` for the single-drive layout, or
     /// `striped_paths[id % n_drives]` for striped multi-drive layouts.
     pub fn expert_path(&self, id: u32) -> PathBuf {
+        // Zero-latency seek when a manifest is present: the path was
+        // already resolved at scan time.
+        if let Some(m) = &self.manifest {
+            if let Some(entry) = m.lookup(id) {
+                return entry.path.clone();
+            }
+        }
         let dir = if self.striped_paths.is_empty() {
             self.cfg.base_path.clone()
         } else {
@@ -781,6 +819,218 @@ fn q4k_pack_scales_local(pairs: &[(u8, u8); 8]) -> [u8; 12] {
     s
 }
 
+// =====================================================================
+// Cold-start expert manifest (Task 3 of the Industrial Upgrade).
+// =====================================================================
+
+/// One row of [`Manifest`]: everything we learned about a single
+/// `expert_<id>.bin` file at startup that the steady-state path would
+/// otherwise have to re-derive on every fetch.
+///
+/// In particular `payload_offset` is the byte offset where the *weight
+/// payload* starts inside the file — `0` for legacy bare-payload
+/// blobs, [`crate::tensor_header::UTH_BYTES`] padded to `block_align`
+/// (typically 4096) when the file carries a Unified Tensor Header.
+/// With this number cached, a fetch handler can skip the per-call
+/// `TensorHeader::probe` over the head of every resident buffer and
+/// jump directly at the payload bytes — the "Zero-Latency Seek"
+/// guarantee the spec asks for.
+#[derive(Debug, Clone)]
+pub struct ManifestEntry {
+    /// Filesystem path resolved by `NvmeStorage::expert_path` at scan
+    /// time. Cached so subsequent file-open calls don't re-walk the
+    /// striped-drive lookup or hit the multi-layer fallback again.
+    pub path: PathBuf,
+    /// `metadata().len()` of the file. Always a multiple of
+    /// `block_align`; reads of size `expert_size` bounded against this
+    /// value catch a truncated / partially-written conversion.
+    pub file_size: u64,
+    /// Byte offset where the weight payload begins. Equal to the
+    /// page-padded UTH size when a header is present, `0` otherwise.
+    pub payload_offset: usize,
+    /// Number of payload bytes (= `file_size - payload_offset`,
+    /// rounded *down* to the alignment block — defensive against a
+    /// short tail page).
+    pub payload_size: usize,
+    /// Weight dtype declared by the header. `None` for legacy
+    /// (bare-payload) files where the dtype must be supplied
+    /// out-of-band by the engine config / `metadata.json`.
+    pub dtype: Option<WeightDtype>,
+    /// Parsed UTH, when present. Callers that need the AMX tile hints
+    /// or quant-scale-offset metadata go through this field.
+    pub header: Option<TensorHeader>,
+}
+
+/// Cold-start index over every `expert_<id>.bin` in a data directory.
+///
+/// Built once at engine boot by [`Manifest::scan`] and then kept
+/// resident (`Arc<Manifest>`) so that the inference loop's
+/// `read_expert(id)` call resolves to a `(path, payload_offset,
+/// payload_size, dtype)` tuple in `O(1)` time without touching the
+/// filesystem header again. This is the "cold-start manifest"
+/// requirement of the Industrial Upgrade spec — it eliminates the
+/// per-fetch UTH probe and gives `ExpertLoader` a zero-latency seek
+/// into the weight bytes.
+///
+/// Memory cost is tiny: one [`ManifestEntry`] per expert file,
+/// dominated by the `PathBuf` (a few hundred bytes for a Mixtral-scale
+/// 8 × 32 expert model is on the order of 64 KiB).
+#[derive(Debug, Clone, Default)]
+pub struct Manifest {
+    entries: HashMap<u32, ManifestEntry>,
+    block_align: usize,
+}
+
+impl Manifest {
+    /// Walk `dirs` and probe the head of every `expert_<id>.bin` for
+    /// `id` in `ids`, returning a populated [`Manifest`].
+    ///
+    /// For each id we:
+    /// * resolve the path via the same single-namespace / multi-layer
+    ///   logic [`NvmeStorage::expert_path`] uses (callers that want
+    ///   striped multi-drive layouts pass the full `striped_paths`
+    ///   list and `num_experts_per_layer`),
+    /// * `pread` the first `block_align` bytes (cheap — at most one
+    ///   page per file),
+    /// * call [`TensorHeader::probe`] over those bytes.
+    ///
+    /// Missing files are tolerated: they're recorded as a `None`
+    /// entry-set member and the engine's existing "fall back to
+    /// synthetic init" code path handles the gap.  Files that exist
+    /// but fail the probe are recorded with `header = None` and
+    /// `dtype = None` (legacy bare-payload layout).
+    pub fn scan(
+        dirs: &[PathBuf],
+        ids: impl IntoIterator<Item = u32>,
+        block_align: usize,
+        num_experts_per_layer: Option<u32>,
+    ) -> io::Result<Self> {
+        assert!(
+            block_align.is_power_of_two() && block_align > 0,
+            "Manifest::scan: block_align must be a power of two"
+        );
+        let dirs: Vec<PathBuf> = if dirs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Manifest::scan requires at least one directory",
+            ));
+        } else {
+            dirs.to_vec()
+        };
+        let n_drives = dirs.len();
+
+        let mut entries = HashMap::new();
+        let mut head = vec![0u8; block_align];
+        for id in ids {
+            let dir = &dirs[(id as usize) % n_drives];
+            let primary = dir.join(format!("expert_{id}.bin"));
+            let path = if std::fs::metadata(&primary).is_ok() {
+                primary
+            } else if let Some(n) = num_experts_per_layer {
+                if n > 0 {
+                    dir.join(format!("expert_{}_{}.bin", id / n, id % n))
+                } else {
+                    primary
+                }
+            } else {
+                primary
+            };
+
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let file_size = meta.len();
+            // Probe the first block of the file for a UTH. We use
+            // `read_at` (positional) so the cached fd table — which
+            // doesn't exist yet at scan time — is not perturbed; this
+            // is the only sync filesystem hit the Manifest performs.
+            let probed = match File::open(&path) {
+                Ok(f) => {
+                    let n = f.read_at(&mut head, 0).unwrap_or(0);
+                    if n >= UTH_BYTES {
+                        TensorHeader::probe(&head[..n.min(block_align)])
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
+
+            let (payload_offset, dtype) = match probed.as_ref() {
+                Some(h) => (block_align, Some(h.dtype.to_weight())),
+                None => (0usize, None),
+            };
+            let payload_size = (file_size as usize)
+                .saturating_sub(payload_offset)
+                & !(block_align - 1);
+
+            entries.insert(
+                id,
+                ManifestEntry {
+                    path,
+                    file_size,
+                    payload_offset,
+                    payload_size,
+                    dtype,
+                    header: probed,
+                },
+            );
+        }
+
+        Ok(Self { entries, block_align })
+    }
+
+    /// Look up a manifest entry by expert id. `None` if the file
+    /// wasn't present at scan time.
+    #[inline]
+    pub fn lookup(&self, id: u32) -> Option<&ManifestEntry> {
+        self.entries.get(&id)
+    }
+
+    /// Number of indexed experts.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the manifest indexed any experts.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Block alignment the manifest was scanned with. Every
+    /// `payload_offset` is a multiple of this value.
+    #[inline]
+    pub fn block_align(&self) -> usize {
+        self.block_align
+    }
+
+    /// Iterate over `(id, entry)` pairs in arbitrary order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &ManifestEntry)> + '_ {
+        self.entries.iter().map(|(k, v)| (*k, v))
+    }
+
+    /// Convenience: zero-latency lookup of the byte offset where the
+    /// weight payload starts inside `expert_<id>.bin`. Returns `0`
+    /// when the file has no header and `None` when the file wasn't
+    /// indexed.
+    #[inline]
+    pub fn payload_offset(&self, id: u32) -> Option<usize> {
+        self.entries.get(&id).map(|e| e.payload_offset)
+    }
+
+    /// Convenience: dtype declared by the file's UTH (or `None` if
+    /// the file is legacy / unindexed).
+    #[inline]
+    pub fn dtype(&self, id: u32) -> Option<WeightDtype> {
+        self.entries.get(&id).and_then(|e| e.dtype)
+    }
+}
+
+// =====================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +1193,91 @@ mod tests {
         assert_eq!(bytes, expert_size);
         // Layer=1, local=1 → fill byte = (1*3 + 1) + 0x40 = 0x44.
         assert_eq!(buf.as_slice()[0], 0x44);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Manifest::scan` indexes every file under the directory, parses
+    /// the UTH where present, and exposes the payload offset / dtype
+    /// in `O(1)`. Files without a UTH are still indexed (legacy
+    /// bare-payload layout) but report `header = None` and
+    /// `payload_offset = 0`.
+    #[test]
+    fn manifest_scan_indexes_uth_and_legacy_files() {
+        let dir = tempdir("manifest");
+        let block = 4096usize;
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let payload = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let payload_pad = payload.div_ceil(block) * block;
+
+        // expert_0.bin: legacy bare payload, no UTH.
+        std::fs::write(dir.join("expert_0.bin"), vec![0xAAu8; payload_pad]).unwrap();
+        // expert_1.bin: F32 SwiGLU header + page-padded payload.
+        let mut blob1 = Vec::with_capacity(block + payload_pad);
+        TensorHeader::for_swiglu_expert(WeightDtype::F32, d_model, d_ff)
+            .write_padded(block, &mut blob1);
+        blob1.resize(block + payload_pad, 0xBB);
+        std::fs::write(dir.join("expert_1.bin"), &blob1).unwrap();
+
+        let m = Manifest::scan(
+            &[dir.clone()],
+            [0u32, 1u32, 7u32], // 7 doesn't exist → silently skipped
+            block,
+            None,
+        )
+        .expect("scan");
+        assert_eq!(m.len(), 2, "missing files are tolerated");
+        assert!(m.lookup(7).is_none());
+
+        let e0 = m.lookup(0).expect("expert_0 indexed");
+        assert_eq!(e0.payload_offset, 0, "no header → offset 0");
+        assert!(e0.header.is_none());
+        assert!(e0.dtype.is_none());
+        assert_eq!(e0.file_size as usize, payload_pad);
+
+        let e1 = m.lookup(1).expect("expert_1 indexed");
+        assert_eq!(e1.payload_offset, block, "UTH page-padded to block");
+        assert_eq!(e1.dtype, Some(WeightDtype::F32));
+        let h = e1.header.as_ref().expect("UTH parsed");
+        assert_eq!(h.shape[0] as usize, d_ff);
+        assert_eq!(m.payload_offset(1), Some(block));
+        assert_eq!(m.dtype(1), Some(WeightDtype::F32));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When a `Manifest` is attached, `expert_path` short-circuits
+    /// the multi-namespace fallback and returns the path the
+    /// manifest already cached.
+    #[test]
+    fn nvme_storage_with_manifest_short_circuits_path_resolution() {
+        let dir = tempdir("storage-manifest");
+        let block = 4096usize;
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let payload = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let expert_size = payload.div_ceil(block) * block;
+        std::fs::write(dir.join("expert_0.bin"), vec![0u8; expert_size]).unwrap();
+        std::fs::write(dir.join("expert_1.bin"), vec![0u8; expert_size]).unwrap();
+
+        let manifest = Arc::new(
+            Manifest::scan(&[dir.clone()], [0u32, 1u32], block, None).unwrap(),
+        );
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap()
+        .with_manifest(manifest.clone());
+
+        assert!(storage.manifest().is_some());
+        assert_eq!(storage.expert_path(0), dir.join("expert_0.bin"));
+        // Unindexed id → falls through to the legacy resolution.
+        assert_eq!(storage.expert_path(99), dir.join("expert_99.bin"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
