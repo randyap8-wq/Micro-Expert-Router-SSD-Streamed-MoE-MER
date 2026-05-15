@@ -946,15 +946,27 @@ impl Manifest {
             // doesn't exist yet at scan time — is not perturbed; this
             // is the only sync filesystem hit the Manifest performs.
             let probed = match File::open(&path) {
-                Ok(f) => {
-                    let n = f.read_at(&mut head, 0).unwrap_or(0);
-                    if n >= UTH_BYTES {
-                        TensorHeader::probe(&head[..n.min(block_align)])
-                    } else {
+                Ok(f) => match f.read_at(&mut head, 0) {
+                    Ok(n) => {
+                        if n >= UTH_BYTES {
+                            TensorHeader::probe(&head[..n.min(block_align)])
+                        } else {
+                            None
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "failed to read header probe from {}: {}",
+                            path.display(),
+                            err
+                        );
                         None
                     }
+                },
+                Err(err) => {
+                    log::warn!("failed to open {} for header probe: {}", path.display(), err);
+                    None
                 }
-                Err(_) => None,
             };
 
             let (payload_offset, dtype) = match probed.as_ref() {
