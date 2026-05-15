@@ -646,6 +646,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             dtype: cfg.model.dtype,
             partial_load_fraction: cfg.storage.partial_load_fraction,
             pin_after_observations: cfg.storage.pin_after_observations,
+            use_qmm_for_q4: true,
         },
     );
     // Attach the speculative-architecture components requested via
@@ -1310,6 +1311,7 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                 dtype: args.dtype,
                 partial_load_fraction: args.partial_load_fraction,
                 pin_after_observations: args.pin_after_observations,
+                use_qmm_for_q4: true,
             },
         );
         // Optional alias map (Change 6: expert deduplication).

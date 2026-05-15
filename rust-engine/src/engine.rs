@@ -19,8 +19,8 @@ use crate::expert_cache::{ExpertCache, ExpertResident};
 use crate::gating::Router;
 use crate::inference::{
     combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4_0,
-    run_inference_q4k, synth_hidden_state,
-    uniform_scores, HiddenState,
+    run_inference_q4_0_qmm, run_inference_q4k, run_inference_q4k_qmm, synth_hidden_state,
+    uniform_scores, ExpertWeightsError, HiddenState,
     InferenceOutput, WeightDtype,
 };
 use crate::io_provider::NvmeStorage;
@@ -576,6 +576,15 @@ pub struct EngineOptions {
     /// targets, pin it permanently in the LRU cache. `0` disables
     /// frequency-based pinning entirely.
     pub pin_after_observations: u64,
+    /// **QMatMul fast path for 4-bit dtypes (Industrial Upgrade Task 1).**
+    /// When `true` (default) and `dtype` is `Q4_0` or `Q4K`, the
+    /// engine dispatches per-expert SwiGLU through candle-core's
+    /// `QMatMul` directly over the on-disk quantised blocks — no F32
+    /// dequant of the weights happens. Falls back to the legacy
+    /// dequant path automatically when `QMatMul` returns an error
+    /// (e.g. block-alignment mismatch on a corrupt blob), so this is
+    /// a strict-superset behaviour switch.
+    pub use_qmm_for_q4: bool,
 }
 
 impl Default for EngineOptions {
@@ -585,6 +594,7 @@ impl Default for EngineOptions {
             dtype: WeightDtype::F32,
             partial_load_fraction: 1.0,
             pin_after_observations: 0,
+            use_qmm_for_q4: true,
         }
     }
 }
@@ -811,6 +821,49 @@ pub struct Engine {
     /// at this layer in the benchmark configuration), but the
     /// real-transformer / server path does — see `server.rs`.
     pub(crate) kv_cache: Option<Arc<Mutex<AlignedKvCache>>>,
+}
+
+/// Dispatch a single per-expert SwiGLU forward pass according to
+/// `dtype`. For `Q4_0` / `Q4K` and `use_qmm = true` the
+/// `QMatMul`-based path is tried first and the dequant path is used
+/// as a fallback when QMM returns an error (this can happen on a
+/// corrupt block stream where dequant has more lenient bounds
+/// checks). For every other dtype the legacy entry point is called
+/// directly.
+fn dispatch_expert_forward(
+    dtype: WeightDtype,
+    use_qmm: bool,
+    token_idx: u64,
+    r: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    match dtype {
+        WeightDtype::F32 => run_inference(token_idx, r, x, d_model, d_ff),
+        WeightDtype::F16 => run_inference_f16(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Int8 => run_inference_int8(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Q4K if use_qmm && d_model % 256 == 0 => {
+            match run_inference_q4k_qmm(token_idx, r, x, d_model, d_ff) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    debug!(error = %e, "QMatMul Q4_K path failed; falling back to dequant");
+                    run_inference_q4k(token_idx, r, x, d_model, d_ff)
+                }
+            }
+        }
+        WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Q4_0 if use_qmm && d_model % 32 == 0 => {
+            match run_inference_q4_0_qmm(token_idx, r, x, d_model, d_ff) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    debug!(error = %e, "QMatMul Q4_0 path failed; falling back to dequant");
+                    run_inference_q4_0(token_idx, r, x, d_model, d_ff)
+                }
+            }
+        }
+        WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, d_model, d_ff),
+    }
 }
 
 impl Engine {
@@ -1138,13 +1191,15 @@ impl Engine {
             let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
             let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
             for r in &residents {
-                let res = match self.core.options.dtype {
-                    WeightDtype::F32 => run_inference(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                    WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                    WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                    WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                    WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                };
+                let res = dispatch_expert_forward(
+                    self.core.options.dtype,
+                    self.core.options.use_qmm_for_q4,
+                    token_idx,
+                    r,
+                    x,
+                    self.core.shape.d_model,
+                    self.core.shape.d_ff,
+                );
                 match res {
                     Ok((out, y)) => {
                         outputs.push(out);
@@ -1808,13 +1863,15 @@ impl Engine {
                     continue;
                 }
             };
-            let res = match self.core.options.dtype {
-                WeightDtype::F32 => run_inference(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                WeightDtype::F16 => run_inference_f16(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                WeightDtype::Int8 => run_inference_int8(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-                WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, self.core.shape.d_model, self.core.shape.d_ff),
-            };
+            let res = dispatch_expert_forward(
+                self.core.options.dtype,
+                self.core.options.use_qmm_for_q4,
+                token_idx,
+                r,
+                x,
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+            );
             match res {
                 Ok((_out, y)) => per_expert_y.push(y),
                 Err(e) => {
