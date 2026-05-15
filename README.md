@@ -193,7 +193,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. |
 | `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. |
-| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`) routed through the **fault-tolerant `read_at_with_retries` path**: three-tier exponential backoff on transient errors (EIO / EINTR / `WouldBlock` / `TimedOut` / `EAGAIN`; short reads / `UnexpectedEof` fail fast) plus a per-expert **circuit breaker** that trips after `STORAGE_BREAKER_THRESHOLD = 3` consecutive failures and short-circuits to a structured `HardwareFailure::ExpertUnavailable` (recoverable on the first successful read). A **per-drive** breaker (`STORAGE_DRIVE_BREAKER_THRESHOLD = 3`, sticky `DriveBreakerState`) sums failures across all experts sharded onto the same shard and short-circuits to `HardwareFailure::DriveUnavailable` so the engine stops routing to a known-bad drive without ever issuing the syscall — gist Phase 3. Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
+| `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`) routed through the **fault-tolerant `read_at_with_retries` path**: three-tier exponential backoff on transient errors (EIO / EINTR / `WouldBlock` / `TimedOut` / `EAGAIN`; short reads / `UnexpectedEof` fail fast) plus a per-expert **circuit breaker** that trips after `STORAGE_BREAKER_THRESHOLD = 3` consecutive failures and short-circuits to a structured `HardwareFailure::ExpertUnavailable`. A **per-drive** breaker (`STORAGE_DRIVE_BREAKER_THRESHOLD = 3`, sticky `DriveBreakerState`) sums failures across all experts sharded onto the same shard and short-circuits to `HardwareFailure::DriveUnavailable` so the engine stops routing to a known-bad drive without ever issuing the syscall — gist Phase 3. Both breakers transition to **half-open** after `STORAGE_BREAKER_PROBE_INTERVAL = 500 ms`, admitting exactly one probe read per interval via a `compare_exchange` on `tripped_at_ms` so a recovered drive can actually reach the `note_read_success` path and clear the breaker. Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
 | `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point. Built behind the `io_uring` cargo feature. |
 | `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API), `LocalityMonitor` (sliding-window heat map, the **L** arm), and `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
@@ -283,9 +283,8 @@ the fault-tolerant path:
   3` consecutive failures, the breaker trips: subsequent reads
   against that id short-circuit to a structured
   `HardwareFailure::ExpertUnavailable` without touching the drive.
-  The first successful read clears the breaker — drives that recover
-  after a brief glitch keep serving traffic without operator
-  intervention.
+  A recovered expert is brought back into service via the
+  **half-open probe gate** described below.
 * **Per-drive circuit breaker (gist Phase 3).** After
   `STORAGE_DRIVE_BREAKER_THRESHOLD = 3` consecutive failures
   *summed across every expert sharded onto the same drive*, the
@@ -294,8 +293,21 @@ the fault-tolerant path:
   the device — the engine stops routing to a known-bad drive without
   having to wait for each expert to independently exhaust its own
   threshold. In a striped layout each shard has its own breaker so
-  a single failed drive does not take its siblings out of rotation;
-  the first successful read on that drive clears the breaker.
+  a single failed drive does not take its siblings out of rotation.
+* **Half-open probe gate (`STORAGE_BREAKER_PROBE_INTERVAL = 500 ms`).**
+  A purely closed breaker is unrecoverable — the short-circuit means
+  the read path that would call `note_read_success` is never
+  reached. Instead, every
+  `STORAGE_BREAKER_PROBE_INTERVAL` after the trip, the breaker
+  transitions to **half-open** and admits *exactly one* probe read
+  (a `compare_exchange` on `tripped_at_ms` rate-limits concurrent
+  callers to a single in-flight probe). If the probe succeeds the
+  breaker clears (consecutive-failure counter reset, `tripped` bit
+  cleared); if it fails the timestamp is restamped to "now" and the
+  next probe is held off for another full interval. Drives that
+  recover after a brief glitch therefore return to service within
+  one inference cycle, without operator intervention; genuinely
+  failed drives don't generate continuous I/O pressure.
 * **Structured errors.** `HardwareFailure::Transient` (retry
   budget exhausted), `HardwareFailure::ExpertUnavailable`
   (per-expert breaker tripped), and `HardwareFailure::DriveUnavailable`

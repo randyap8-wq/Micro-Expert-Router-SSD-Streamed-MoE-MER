@@ -44,9 +44,9 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
@@ -98,6 +98,55 @@ pub const STORAGE_BREAKER_THRESHOLD: u32 = 3;
 /// engine pause for new SSD reads — the cache + in-flight in-memory
 /// responses can still serve traffic until they drain.
 pub const STORAGE_DRIVE_BREAKER_THRESHOLD: u32 = 3;
+
+/// How long after a circuit breaker trips before a single probe read
+/// is allowed through to test recovery. The breaker stays "open" to
+/// every other read during this window, then transitions to
+/// "half-open" — exactly one in-flight probe is admitted, and:
+///
+/// * if the probe **succeeds**, [`NvmeStorage::note_read_success`]
+///   clears the `tripped` bit and the breaker returns to "closed"
+///   (full traffic);
+/// * if the probe **fails**, [`NvmeStorage::note_read_failure`]
+///   re-stamps `tripped_at_ms` to "now" so the next probe is held
+///   off for another `STORAGE_BREAKER_PROBE_INTERVAL`.
+///
+/// Without this half-open path a tripped breaker would short-circuit
+/// every subsequent read forever, making `note_read_success`
+/// unreachable through the public `read_*` entry points and rendering
+/// the documented "first successful read clears the breaker"
+/// semantics unimplementable. The probe gate is a process-wide
+/// rate-limit on hopeful retries: the engine is allowed to *try*
+/// once every `STORAGE_BREAKER_PROBE_INTERVAL`, no more, no less.
+///
+/// 500 ms is chosen as a compromise between two goals: fast enough
+/// that a recovered drive returns to service within a single
+/// inference cycle, slow enough that a genuinely failed drive does
+/// not generate continuous I/O pressure.
+pub const STORAGE_BREAKER_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Process-wide monotonic clock used as the reference point for
+/// [`BreakerState::tripped_at_ms`] / [`DriveBreakerState::tripped_at_ms`].
+/// Storing elapsed milliseconds in an `AtomicU64` keeps the breaker
+/// state lock-free; the `Instant` itself can't be packed into one.
+fn breaker_clock_origin() -> Instant {
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
+/// Milliseconds elapsed since [`breaker_clock_origin`].
+#[inline]
+fn breaker_now_ms() -> u64 {
+    // Clamp to at least 1 so the value never collides with the
+    // "no trip on record" sentinel `0` used by
+    // [`BreakerState::tripped_at_ms`] / [`DriveBreakerState::tripped_at_ms`].
+    // Without this clamp a trip recorded in the very first
+    // millisecond of the process (common in tests) would be
+    // indistinguishable from a never-tripped breaker, and
+    // `try_admit_probe` would admit traffic immediately.
+    (breaker_clock_origin().elapsed().as_millis() as u64).max(1)
+}
 
 /// Classify an `io::Error` as transient (worth retrying) vs. fatal
 /// (worth surfacing immediately to the circuit breaker).
@@ -170,10 +219,19 @@ pub struct BreakerState {
     /// Sticky "permanently failed" bit. Once set, every subsequent
     /// read against this expert short-circuits to
     /// [`HardwareFailure::ExpertUnavailable`] without touching the
-    /// drive. Cleared automatically the moment the breaker observes
-    /// a healthy read again (a transient firmware hiccup must not
-    /// permanently take an expert out of rotation).
+    /// drive *until the half-open probe gate admits one read* (see
+    /// [`STORAGE_BREAKER_PROBE_INTERVAL`]). Cleared automatically
+    /// the moment the breaker observes a healthy read again (a
+    /// transient firmware hiccup must not permanently take an expert
+    /// out of rotation).
     pub tripped: AtomicBool,
+    /// Reference timestamp in milliseconds since
+    /// [`breaker_clock_origin`], updated each time the breaker (a)
+    /// first trips or (b) admits a probe read. `0` while the breaker
+    /// is closed. Used by [`NvmeStorage::try_admit_probe`] to
+    /// rate-limit probe attempts to one per
+    /// [`STORAGE_BREAKER_PROBE_INTERVAL`].
+    pub tripped_at_ms: AtomicU64,
 }
 
 impl Default for BreakerState {
@@ -181,6 +239,7 @@ impl Default for BreakerState {
         Self {
             consecutive_failures: AtomicU32::new(0),
             tripped: AtomicBool::new(false),
+            tripped_at_ms: AtomicU64::new(0),
         }
     }
 }
@@ -203,8 +262,14 @@ pub struct DriveBreakerState {
     /// routed to this drive since the last successful read.
     pub consecutive_failures: AtomicU32,
     /// Sticky "drive unavailable" flag. Reads short-circuit until
-    /// the next successful read on this drive clears it.
+    /// the next successful read on this drive clears it. The
+    /// half-open probe gate (see [`STORAGE_BREAKER_PROBE_INTERVAL`])
+    /// admits one probe per interval so a recovered drive can
+    /// actually reach the read path that calls `note_read_success`.
     pub tripped: AtomicBool,
+    /// Reference timestamp (ms since [`breaker_clock_origin`]) for
+    /// the probe gate. See [`BreakerState::tripped_at_ms`].
+    pub tripped_at_ms: AtomicU64,
 }
 
 impl Default for DriveBreakerState {
@@ -212,6 +277,7 @@ impl Default for DriveBreakerState {
         Self {
             consecutive_failures: AtomicU32::new(0),
             tripped: AtomicBool::new(false),
+            tripped_at_ms: AtomicU64::new(0),
         }
     }
 }
@@ -510,9 +576,10 @@ impl NvmeStorage {
         if let Some(b) = self.breakers.read().get(&id) {
             b.consecutive_failures.store(0, Ordering::Release);
             if b.tripped.swap(false, Ordering::AcqRel) {
+                b.tripped_at_ms.store(0, Ordering::Release);
                 tracing::info!(
                     expert_id = id,
-                    "circuit breaker reset after successful read"
+                    "circuit breaker reset after successful probe read"
                 );
             }
         }
@@ -522,9 +589,10 @@ impl NvmeStorage {
         let db = &self.drive_breakers[drive_idx];
         db.consecutive_failures.store(0, Ordering::Release);
         if db.tripped.swap(false, Ordering::AcqRel) {
+            db.tripped_at_ms.store(0, Ordering::Release);
             tracing::info!(
                 drive_index = drive_idx,
-                "drive circuit breaker reset after successful read"
+                "drive circuit breaker reset after successful probe read"
             );
         }
     }
@@ -576,11 +644,24 @@ impl NvmeStorage {
         let just_tripped =
             n >= STORAGE_BREAKER_THRESHOLD && !b.tripped.swap(true, Ordering::AcqRel);
         if just_tripped {
+            // Stamp the trip time so the half-open probe gate
+            // (`try_admit_probe`) knows when to start admitting
+            // recovery probes.
+            b.tripped_at_ms
+                .store(breaker_now_ms(), Ordering::Release);
             tracing::error!(
                 expert_id = id,
                 consecutive_failures = n,
-                "circuit breaker tripped — expert unavailable until next successful read"
+                "circuit breaker tripped — expert unavailable until probe succeeds"
             );
+        } else if b.tripped.load(Ordering::Acquire) {
+            // A probe that itself failed: restamp so the next probe
+            // is held off for another full
+            // `STORAGE_BREAKER_PROBE_INTERVAL`. Without this restamp
+            // the gate would let every read through once the
+            // initial interval elapsed.
+            b.tripped_at_ms
+                .store(breaker_now_ms(), Ordering::Release);
         }
         let drive_idx = self.drive_index_for(id);
         let db = &self.drive_breakers[drive_idx];
@@ -588,13 +669,53 @@ impl NvmeStorage {
         let drive_just_tripped =
             dn >= STORAGE_DRIVE_BREAKER_THRESHOLD && !db.tripped.swap(true, Ordering::AcqRel);
         if drive_just_tripped {
+            db.tripped_at_ms
+                .store(breaker_now_ms(), Ordering::Release);
             tracing::error!(
                 drive_index = drive_idx,
                 consecutive_failures = dn,
                 "drive circuit breaker tripped — no further reads will be routed to this shard"
             );
+        } else if db.tripped.load(Ordering::Acquire) {
+            // Failed half-open probe: restamp.
+            db.tripped_at_ms
+                .store(breaker_now_ms(), Ordering::Release);
         }
         (just_tripped, n, drive_just_tripped, dn)
+    }
+
+    /// Half-open probe gate. Returns `true` iff the caller is allowed
+    /// to attempt one read against a tripped breaker — i.e. at least
+    /// [`STORAGE_BREAKER_PROBE_INTERVAL`] has elapsed since the last
+    /// probe (or the initial trip) **and** the current task wins the
+    /// `compare_exchange` race against any concurrent probe.
+    ///
+    /// Exactly one probe is admitted per interval per breaker; losers
+    /// of the CAS see the short-circuit return as usual. This is the
+    /// "half-open" state from the classic circuit-breaker pattern:
+    /// the breaker has not yet decided whether the underlying drive
+    /// is healthy, so it lets one read through to find out.
+    #[inline]
+    fn try_admit_probe(tripped_at_ms: &AtomicU64) -> bool {
+        let now = breaker_now_ms();
+        let last = tripped_at_ms.load(Ordering::Acquire);
+        // `last == 0` is the sentinel for "no trip on record" — used
+        // both before the breaker has ever fired and when a test
+        // (or a manual operator reset) wants to force-admit the
+        // next probe. Treat it as "infinitely long ago".
+        // `breaker_now_ms` always returns >= 1, so a real stamp can
+        // never collide with the sentinel.
+        if last != 0
+            && now.saturating_sub(last) < STORAGE_BREAKER_PROBE_INTERVAL.as_millis() as u64
+        {
+            return false;
+        }
+        // CAS so concurrent callers race for the single probe slot.
+        // The winner advances `tripped_at_ms` to `now`; losers fall
+        // back to the short-circuit.
+        tripped_at_ms
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Fault-tolerant `pread(2)` wrapper with three-tier retry +
@@ -609,35 +730,46 @@ impl NvmeStorage {
         offset: u64,
         dst: &mut [u8],
     ) -> io::Result<usize> {
-        // Fast path: per-drive breaker is tripped — no syscall, no
-        // expert-level tracking. Drive failures are sticky and
-        // affect every expert sharded onto this drive, so we
-        // short-circuit before even consulting `is_expert_unavailable`.
-        // Gist Phase 3.
+        // Fast path: per-drive breaker is tripped. Drive failures
+        // are sticky and affect every expert sharded onto this
+        // drive, so we short-circuit before even consulting
+        // `is_expert_unavailable` — *unless* the half-open probe
+        // gate admits exactly one recovery read. Without that gate
+        // the breaker could never reach the read path that calls
+        // `note_read_success`, leaving a recovered drive offline
+        // forever. Gist Phase 3.
+        let drive_index = self.drive_index_for(expert_id);
         if self.is_drive_unavailable(expert_id) {
-            let drive_index = self.drive_index_for(expert_id);
-            let cf = self.drive_breakers[drive_index]
-                .consecutive_failures
-                .load(Ordering::Acquire);
-            return Err(HardwareFailure::DriveUnavailable {
+            let db = &self.drive_breakers[drive_index];
+            if !Self::try_admit_probe(&db.tripped_at_ms) {
+                let cf = db.consecutive_failures.load(Ordering::Acquire);
+                return Err(HardwareFailure::DriveUnavailable {
+                    drive_index,
+                    consecutive_failures: cf,
+                }
+                .into());
+            }
+            tracing::info!(
                 drive_index,
-                consecutive_failures: cf,
-            }
-            .into());
+                "drive circuit breaker half-open — admitting one probe read"
+            );
         }
-        // Fast path: breaker is tripped — no syscall.
+        // Fast path: per-expert breaker is tripped. Same half-open
+        // probe gate applies so a recovered expert can clear it.
         if self.is_expert_unavailable(expert_id) {
-            let cf = self
-                .breakers
-                .read()
-                .get(&expert_id)
-                .map(|b| b.consecutive_failures.load(Ordering::Acquire))
-                .unwrap_or(STORAGE_BREAKER_THRESHOLD);
-            return Err(HardwareFailure::ExpertUnavailable {
-                expert_id,
-                consecutive_failures: cf,
+            let b = self.breaker(expert_id);
+            if !Self::try_admit_probe(&b.tripped_at_ms) {
+                let cf = b.consecutive_failures.load(Ordering::Acquire);
+                return Err(HardwareFailure::ExpertUnavailable {
+                    expert_id,
+                    consecutive_failures: cf,
+                }
+                .into());
             }
-            .into());
+            tracing::info!(
+                expert_id,
+                "expert circuit breaker half-open — admitting one probe read"
+            );
         }
         let mut last_err: Option<io::Error> = None;
         let mut backoff = STORAGE_RETRY_BACKOFF;
@@ -765,21 +897,12 @@ impl NvmeStorage {
     /// on success — short reads are surfaced as an `UnexpectedEof` error).
     pub async fn read_expert(&self, expert_id: u32, buf: &mut PooledBuffer) -> io::Result<usize> {
         debug_assert_eq!(buf.len(), self.cfg.expert_size);
-        // Fast-fail when the breaker has tripped — saves the fd open
-        // syscall and the `block_in_place` round-trip.
-        if self.is_expert_unavailable(expert_id) {
-            let cf = self
-                .breakers
-                .read()
-                .get(&expert_id)
-                .map(|b| b.consecutive_failures.load(Ordering::Acquire))
-                .unwrap_or(STORAGE_BREAKER_THRESHOLD);
-            return Err(HardwareFailure::ExpertUnavailable {
-                expert_id,
-                consecutive_failures: cf,
-            }
-            .into());
-        }
+        // Note: the breaker fast-fail used to live here for symmetry
+        // with `read_at_with_retries`, but that bypassed the
+        // half-open probe gate (a tripped breaker could never reach
+        // the read path that calls `note_read_success`). The
+        // short-circuit + probe-gate logic now lives only in
+        // `read_at_with_retries`, which we always go through below.
         let file = self.fd_for(expert_id)?;
         // `read_at_with_retries` already enforces `dst.len()` and surfaces
         // short reads as transient errors that retry, so no extra
@@ -2091,6 +2214,108 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// Gist Phase 3 — half-open recovery.
+    ///
+    /// Without a probe gate, a tripped breaker would short-circuit
+    /// every read forever, so `note_read_success` is unreachable and
+    /// the documented "first successful read clears the breaker"
+    /// semantics is unimplementable. This test exercises the
+    /// half-open path end-to-end:
+    ///
+    /// 1. Trip both breakers via `note_read_failure`.
+    /// 2. Confirm an immediate `read_expert` returns
+    ///    `DriveUnavailable` (probe gate is closed for the first
+    ///    `STORAGE_BREAKER_PROBE_INTERVAL`).
+    /// 3. Backdate the trip timestamps to simulate elapsed probe
+    ///    interval (so the test doesn't sleep for 500 ms).
+    /// 4. Confirm the next `read_expert` succeeds and clears both
+    ///    breakers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn breaker_half_open_probe_recovers_after_interval() {
+        let dir = tempdir("breaker-probe");
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let block = 4096usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let expert_size = ((weight_bytes + block - 1) / block) * block;
+        // One real expert file so the underlying `pread` succeeds.
+        generate_synthetic_experts(&dir, 1, expert_size, d_model, d_ff).unwrap();
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap();
+
+        // Trip both breakers. We synthesise 3 logical failures so the
+        // per-expert breaker also trips (per-drive trips at 3 as well).
+        for _ in 0..STORAGE_BREAKER_THRESHOLD {
+            storage.note_read_failure(0);
+        }
+        assert!(storage.is_expert_unavailable(0));
+        assert!(storage.is_drive_unavailable(0));
+
+        // Step 2: immediate read short-circuits — probe gate is closed.
+        let pool = BufferPool::new(2, expert_size, block);
+        let mut buf = pool.acquire().await;
+        let err = storage.read_expert(0, &mut buf).await.unwrap_err();
+        let inner = err
+            .into_inner()
+            .and_then(|e| e.downcast::<HardwareFailure>().ok())
+            .expect("expected a structured HardwareFailure");
+        assert!(
+            matches!(*inner, HardwareFailure::DriveUnavailable { .. }),
+            "expected DriveUnavailable while probe gate is closed, got {:?}",
+            inner
+        );
+        // Breakers remain tripped.
+        assert!(storage.is_drive_unavailable(0));
+        assert!(storage.is_expert_unavailable(0));
+
+        // Step 3: backdate both `tripped_at_ms` so the probe gate
+        // admits the next attempt. `0` is "long ago" by definition
+        // (it precedes any `breaker_now_ms()` value).
+        storage.breaker(0).tripped_at_ms.store(0, Ordering::Release);
+        storage.drive_breakers[0]
+            .tripped_at_ms
+            .store(0, Ordering::Release);
+
+        // Step 4: probe is admitted, real read succeeds, both
+        // breakers clear.
+        let mut buf2 = pool.acquire().await;
+        let n = storage
+            .read_expert(0, &mut buf2)
+            .await
+            .expect("half-open probe should succeed against a healthy file");
+        assert_eq!(n, expert_size);
+        assert!(!storage.is_drive_unavailable(0));
+        assert!(!storage.is_expert_unavailable(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `try_admit_probe` rate-limits recovery probes to one per
+    /// `STORAGE_BREAKER_PROBE_INTERVAL`. Concurrent attempts race on
+    /// a CAS and only one wins; the rest fall through to the
+    /// short-circuit return so we don't dogpile a struggling drive.
+    #[test]
+    fn try_admit_probe_admits_at_most_one_per_interval() {
+        let stamp = AtomicU64::new(0); // last probe was "long ago"
+        // First call wins the CAS and advances `stamp` to now.
+        assert!(NvmeStorage::try_admit_probe(&stamp));
+        let first = stamp.load(Ordering::Acquire);
+        assert!(first >= 1, "stamp should advance past zero");
+        // Immediate follow-up is rejected — we're well inside
+        // `STORAGE_BREAKER_PROBE_INTERVAL`.
+        assert!(!NvmeStorage::try_admit_probe(&stamp));
+        assert!(!NvmeStorage::try_admit_probe(&stamp));
+        // Backdate the stamp past the interval — next probe admitted.
+        stamp.store(0, Ordering::Release);
+        assert!(NvmeStorage::try_admit_probe(&stamp));
     }
 
     /// `is_transient_io_error` classifies the well-known set of
