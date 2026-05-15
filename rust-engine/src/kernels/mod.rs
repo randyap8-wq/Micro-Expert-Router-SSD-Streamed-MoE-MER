@@ -167,10 +167,11 @@ fn probe_cpu() -> CpuFeatures {
     f
 }
 
-/// Heuristic match for Sapphire Rapids–class Xeons (AMX-capable).
-/// We don't ship a full CPUID family / model table; instead we look
-/// for vendor-distributed model strings that uniquely identify the
-/// generation. Updated as Intel releases new SKUs.
+/// Heuristic match for Sapphire-Rapids-class (or newer) Xeons that
+/// are **expected to advertise AMX**. We don't ship a full CPUID
+/// family / model table; instead we look for vendor-distributed
+/// model strings that uniquely identify the generation. Updated as
+/// Intel releases new SKUs.
 ///
 /// The match is intentionally conservative: we require **both** the
 /// `"xeon"` substring and a SKU-family token that's distinctive to
@@ -180,6 +181,15 @@ fn probe_cpu() -> CpuFeatures {
 /// 7643"`. AMX is only ever advertised by Intel Xeon, so the `"xeon"`
 /// gate alone already rules out AMD parts; the SKU tokens then narrow
 /// the match to the Sapphire-Rapids generation specifically.
+///
+/// **Bronze SKUs are deliberately excluded.** The only Sapphire-Rapids
+/// Bronze part at the time of writing (Bronze 3408U) does not
+/// implement AMX, so matching `"bronze 34"` / `"bronze 35"` here
+/// would yield a misleading `sapphire_rapids` log line on a chip
+/// that will never escalate to the AMX kernel. The downstream
+/// `detect()` separately requires `amx_tile && amx_int8` from
+/// `/proc/cpuinfo`, so omitting Bronze tokens has no effect on
+/// kernel selection — only on log accuracy.
 fn is_sapphire_rapids_or_newer(model: &str) -> bool {
     let s = model.to_ascii_lowercase();
     if !s.contains("xeon") {
@@ -192,7 +202,6 @@ fn is_sapphire_rapids_or_newer(model: &str) -> bool {
         "platinum 84", "platinum 85",
         "gold 64", "gold 65",
         "silver 44", "silver 45",
-        "bronze 34", "bronze 35",
         // "max" — only the Xeon Max line carries this token; gated by
         // the outer `s.contains("xeon")` check above so it can't match
         // arbitrary non-Xeon model strings.

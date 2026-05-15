@@ -882,7 +882,7 @@ mod tests {
         // 4096 random inputs × up to 4 KiB; the parser must always
         // return Err cleanly, never panic / unwrap / OOB-read.
         for trial in 0..4096u64 {
-            let len = ((trial * 0xA3C5_9B27) % 4096) as usize;
+            let len = (trial.wrapping_mul(0xA3C5_9B27) % 4096) as usize;
             let mut buf = vec![0u8; len];
             fill_random(&mut buf, trial.wrapping_mul(0xDEAD_BEEF));
             // The eager parser is the public consumer of arbitrary
@@ -898,7 +898,7 @@ mod tests {
         // the rest. The parser must still reject every invalid
         // metadata block without panicking.
         for trial in 0..2048u64 {
-            let len = 8 + ((trial * 0x9E37_79B9) % 1024) as usize;
+            let len = 8 + (trial.wrapping_mul(0x9E37_79B9) % 1024) as usize;
             let mut buf = vec![0u8; len];
             buf[..4].copy_from_slice(GGUF_MAGIC);
             fill_random(&mut buf[4..], trial.wrapping_add(0xC0FF_EE12));

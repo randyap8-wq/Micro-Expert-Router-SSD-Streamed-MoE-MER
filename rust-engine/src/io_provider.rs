@@ -444,21 +444,27 @@ impl NvmeStorage {
         }
     }
 
-    /// Record one failed read. Returns `true` if the breaker has
-    /// **just** tripped on this call (so the caller can log + surface
-    /// a `HardwareFailure::ExpertUnavailable` upstream).
-    fn note_read_failure(&self, id: u32) -> bool {
+    /// Record one failed read. Returns `(just_tripped, count)`:
+    /// `just_tripped` is `true` only on the call that flips the
+    /// breaker from closed to open (so callers can log once);
+    /// `count` is the post-increment consecutive-failure tally,
+    /// which the caller propagates into
+    /// `HardwareFailure::ExpertUnavailable.consecutive_failures` so
+    /// the value surfaced to the HTTP 503 reflects the actual
+    /// observed failure count rather than a placeholder.
+    fn note_read_failure(&self, id: u32) -> (bool, u32) {
         let b = self.breaker(id);
         let n = b.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        if n >= STORAGE_BREAKER_THRESHOLD && !b.tripped.swap(true, Ordering::AcqRel) {
+        let just_tripped =
+            n >= STORAGE_BREAKER_THRESHOLD && !b.tripped.swap(true, Ordering::AcqRel);
+        if just_tripped {
             tracing::error!(
                 expert_id = id,
                 consecutive_failures = n,
                 "circuit breaker tripped — expert unavailable until next successful read"
             );
-            return true;
         }
-        false
+        (just_tripped, n)
     }
 
     /// Fault-tolerant `pread(2)` wrapper with three-tier retry +
@@ -466,7 +472,13 @@ impl NvmeStorage {
     /// point. The returned `io::Error` wraps a [`HardwareFailure`]
     /// (recoverable via `e.into_inner().downcast::<HardwareFailure>()`)
     /// when the retry budget is exhausted or the breaker has tripped.
-    fn read_at_with_retries(&self, file: &File, expert_id: u32, dst: &mut [u8]) -> io::Result<usize> {
+    fn read_at_with_retries(
+        &self,
+        file: &File,
+        expert_id: u32,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
         // Fast path: breaker is tripped — no syscall.
         if self.is_expert_unavailable(expert_id) {
             let cf = self
@@ -484,7 +496,7 @@ impl NvmeStorage {
         let mut last_err: Option<io::Error> = None;
         let mut backoff = STORAGE_RETRY_BACKOFF;
         for attempt in 0..STORAGE_RETRY_ATTEMPTS {
-            match file.read_at(dst, 0) {
+            match file.read_at(dst, offset) {
                 Ok(n) if n == dst.len() => {
                     self.note_read_success(expert_id);
                     return Ok(n);
@@ -494,7 +506,7 @@ impl NvmeStorage {
                     // truncated file. Not worth retrying (the file
                     // isn't going to grow back in 50 ms); count it
                     // against the breaker and surface fast.
-                    let tripped = self.note_read_failure(expert_id);
+                    let (tripped, cf) = self.note_read_failure(expert_id);
                     let err = io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         format!("short read on expert {expert_id}: got {n} bytes, expected {}", dst.len()),
@@ -502,7 +514,7 @@ impl NvmeStorage {
                     if tripped {
                         return Err(HardwareFailure::ExpertUnavailable {
                             expert_id,
-                            consecutive_failures: STORAGE_BREAKER_THRESHOLD,
+                            consecutive_failures: cf,
                         }
                         .into());
                     }
@@ -519,14 +531,18 @@ impl NvmeStorage {
                 }
                 Err(e) => {
                     // Fatal error (permission, broken pipe, etc.): no
-                    // point retrying. Still count it against the
-                    // breaker so a hot fd that keeps returning the
-                    // same fatal error eventually trips.
-                    let tripped = self.note_read_failure(expert_id);
+                    // point retrying. We still record one logical
+                    // failure per `read_at_with_retries` *call* (not
+                    // per retry within a call), so a hot fd that
+                    // keeps returning the same fatal error trips the
+                    // breaker after `STORAGE_BREAKER_THRESHOLD`
+                    // *invocations* — i.e. once the layer above has
+                    // attempted the expert that many times.
+                    let (tripped, cf) = self.note_read_failure(expert_id);
                     if tripped {
                         return Err(HardwareFailure::ExpertUnavailable {
                             expert_id,
-                            consecutive_failures: STORAGE_BREAKER_THRESHOLD,
+                            consecutive_failures: cf,
                         }
                         .into());
                     }
@@ -541,7 +557,7 @@ impl NvmeStorage {
                 backoff = (backoff * 2).min(STORAGE_RETRY_MAX_BACKOFF);
             }
         }
-        let tripped = self.note_read_failure(expert_id);
+        let (tripped, cf) = self.note_read_failure(expert_id);
         // `last_err` is always Some here: the only way to fall out of
         // the loop without returning is via the transient-error branch
         // (which sets `last_err`). The `unwrap_or_else` is a
@@ -552,7 +568,7 @@ impl NvmeStorage {
         if tripped {
             Err(HardwareFailure::ExpertUnavailable {
                 expert_id,
-                consecutive_failures: STORAGE_BREAKER_THRESHOLD,
+                consecutive_failures: cf,
             }
             .into())
         } else {
@@ -586,19 +602,26 @@ impl NvmeStorage {
         // Fast-fail when the breaker has tripped — saves the fd open
         // syscall and the `block_in_place` round-trip.
         if self.is_expert_unavailable(expert_id) {
+            let cf = self
+                .breakers
+                .read()
+                .get(&expert_id)
+                .map(|b| b.consecutive_failures.load(Ordering::Acquire))
+                .unwrap_or(STORAGE_BREAKER_THRESHOLD);
             return Err(HardwareFailure::ExpertUnavailable {
                 expert_id,
-                consecutive_failures: STORAGE_BREAKER_THRESHOLD,
+                consecutive_failures: cf,
             }
             .into());
         }
         let file = self.fd_for(expert_id)?;
         // `read_at_with_retries` already enforces `dst.len()` and surfaces
         // short reads as transient errors that retry, so no extra
-        // length check is needed here.
+        // length check is needed here. Each expert is stored as its
+        // own file, so the read always starts at byte 0.
         let dst_len = buf.len();
         let n = tokio::task::block_in_place(|| {
-            self.read_at_with_retries(&file, expert_id, &mut buf.as_mut_slice()[..dst_len])
+            self.read_at_with_retries(&file, expert_id, 0, &mut buf.as_mut_slice()[..dst_len])
         })?;
         Ok(n)
     }
@@ -659,7 +682,7 @@ impl NvmeStorage {
             let mut total = 0usize;
             for ((file, buf), &id) in files.iter().zip(bufs.iter_mut()).zip(id_vec.iter()) {
                 debug_assert_eq!(buf.len(), expert_size);
-                let n = self.read_at_with_retries(file, id, &mut buf.as_mut_slice()[..expert_size])?;
+                let n = self.read_at_with_retries(file, id, 0, &mut buf.as_mut_slice()[..expert_size])?;
                 total += n;
             }
             Ok(total)

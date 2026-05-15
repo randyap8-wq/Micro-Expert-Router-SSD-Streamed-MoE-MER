@@ -154,6 +154,20 @@ impl Backend for CandleBackend {
         // pathological shape — and emits a warning so operators see
         // that the candle path is misbehaving rather than silently
         // running the slower oracle.
+        //
+        // **Performance contract.** Each call rebuilds two
+        // `candle_core::Tensor`s from scratch (one allocation per
+        // tensor plus the multiply-dispatch overhead). For very small
+        // `rows × cols` shapes this dwarfs the FMA work and the
+        // backend will run slower than [`ScalarBackend`]. Callers on
+        // the hot decoder path are expected to batch projections so
+        // each invocation amortises the setup cost. The crate's
+        // existing `kernels::matmul_row_major` deliberately does
+        // **not** route through this trait today (the dispatch lives
+        // inline so the row-parallel loop stays branch-free); this
+        // backend is wired for places that *do* call
+        // `backend::current().matmul(...)` — gate adapters,
+        // logits-projection harnesses, and future plugin executors.
         use candle_core::{Device, Tensor};
         let make = || -> Result<Vec<f32>, candle_core::Error> {
             let w_t = Tensor::from_slice(w, (rows, cols), &Device::Cpu)?;
