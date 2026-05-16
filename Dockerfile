@@ -40,9 +40,10 @@ RUN cd rust-engine \
 FROM debian:bookworm-slim AS runtime
 
 # `ca-certificates` for any future HTTPS-fetched models;
+# `curl` is used by the compose healthcheck (see `docker-compose.yml`).
 # `libgcc-s1` is already present in slim but listed for completeness.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. The data dir is mounted in by the operator at runtime.

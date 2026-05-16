@@ -201,12 +201,18 @@ impl Admission {
     /// the slot on `Drop`.
     pub fn try_admit(&self) -> Option<AdmissionGuard> {
         if self.inner.max_concurrent > 0 {
-            // Atomically reserve a slot via CAS so that two concurrent
-            // callers can never both observe `cur == max - 1` and both
-            // pass. The previous `fetch_add` + post-hoc compare leaked
-            // briefly over the limit under contention (and, in the
-            // worst case, two callers could each see `prev < max` and
-            // both proceed).
+            // Reserve a slot via CAS. The previous `fetch_add` +
+            // post-hoc `fetch_sub` was correct in terms of *which*
+            // callers were admitted (every caller gets a unique
+            // `prev`, so the limit was never actually exceeded), but
+            // it caused a *transient over-increment* of `in_flight`
+            // between the `fetch_add` and the compensating `fetch_sub`.
+            // Observers reading the counter during that window
+            // (`Debug` impl, the `mer_in_flight_requests` Prometheus
+            // gauge, `Self::in_flight()`) could see a value greater
+            // than `max_concurrent`, which is surprising for an
+            // admission controller that advertises a hard cap.
+            // The CAS loop avoids the spurious bump entirely.
             let mut cur = self.inner.in_flight.load(Ordering::Acquire);
             loop {
                 if cur >= self.inner.max_concurrent {
