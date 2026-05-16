@@ -387,6 +387,14 @@ pub fn dot_int8_int8(out_scale: f32, qw: &[i8], qx: &[i8]) -> f32 {
 /// chain for a one-time per-call activation-quantization pre-pass.
 /// On hosts without VNNI we fall back to the bit-accurate scalar
 /// reference.
+///
+/// The VNNI kernel writes its quantized-activation prepass into a
+/// caller-owned `Vec<u8>`; this entry point hides that behind a
+/// `thread_local!` buffer so simple call sites do not allocate on
+/// every dot. Matmul-shaped call sites with their own row loop
+/// should reach into [`avx512::dequant_int8_dot_avx512`] directly
+/// and pass a single scratch buffer across every row of the
+/// matrix-vector product.
 #[inline]
 pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
     debug_assert_eq!(q.len(), x.len());
@@ -399,11 +407,26 @@ pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
         // overall backend was picked as `Avx512`.
         let f = cpu_features();
         if f.avx512f && f.avx512bw && f.avx512vnni {
-            // SAFETY: cached CPU feature detection confirmed
-            // `avx512f + avx512bw + avx512vnni`. The kernel reads via
-            // unaligned `loadu_si512`, writes nothing, and handles
-            // the scalar tail explicitly.
-            return unsafe { avx512::dequant_int8_dot_avx512(scale, q, x) };
+            // Per-thread reusable scratch buffer for the activation
+            // pre-pass. Allocating once per thread (instead of once
+            // per call) makes this entry point safe to use from a
+            // row loop without paying for `Vec` growth on every row;
+            // workers that own the row loop should still consider
+            // calling [`avx512::dequant_int8_dot_avx512`] directly
+            // so the buffer lifetime is explicit at the call site.
+            thread_local! {
+                static QX_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+            }
+            return QX_SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                // SAFETY: cached CPU feature detection confirmed
+                // `avx512f + avx512bw + avx512vnni`. The kernel reads
+                // via unaligned `loadu_si512`, writes only into the
+                // caller-owned scratch buffer, and handles the scalar
+                // tail explicitly.
+                unsafe { avx512::dequant_int8_dot_avx512(scale, q, x, &mut scratch) }
+            });
         }
     }
     scalar::dequant_int8_dot(scale, q, x)

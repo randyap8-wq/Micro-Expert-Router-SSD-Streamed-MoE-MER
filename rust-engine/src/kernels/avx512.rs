@@ -139,7 +139,7 @@ pub unsafe fn swiglu_f32_avx512(
 /// f32 conversion has been **eliminated**:
 ///
 /// 1. The activation slice `x` is quantized **once** at the head of
-///    the call into a small stack-bound `u8` scratch buffer
+///    the call into a `u8` scratch buffer provided by the caller
 ///    (per-vector symmetric scale chosen from `max|x|`).
 /// 2. The inner loop accumulates `i8 weight × u8 activation` directly
 ///    in i32 via `_mm512_dpbusd_epi32` (the VNNI `vpdpbusd`
@@ -161,6 +161,25 @@ pub unsafe fn swiglu_f32_avx512(
 /// `cvtepi32_ps + fmadd_ps` chain it replaces, and the f32 unpack
 /// path that used to dominate the inner loop is gone.
 ///
+/// # Scratch buffer ownership
+/// `qx_scratch` is a **caller-owned** quantized-activation buffer.
+/// It is `clear()`'d and resized to `x.len()` on entry, so callers
+/// can keep one `Vec<u8>` per matmul (or per worker) and amortize
+/// the allocation across every row dot in the matrix-vector product:
+///
+/// ```text
+/// let mut scratch = Vec::<u8>::with_capacity(cols);
+/// for row in 0..rows {
+///     y[row] = dequant_int8_dot_avx512(scale, &qw[row*cols..][..cols], x, &mut scratch);
+/// }
+/// // `scratch` is reused across every row — zero allocations in the loop.
+/// ```
+///
+/// The dispatcher in [`super::dequant_int8_dot`] hides this via a
+/// `thread_local!` scratch buffer so simple call sites do not have
+/// to thread the buffer through; matmul-shaped call sites should
+/// reach into this variant directly.
+///
 /// # Safety
 /// Caller must guarantee the CPU supports
 /// `avx512f + avx512bw + avx512vnni`. The dispatcher in
@@ -168,10 +187,16 @@ pub unsafe fn swiglu_f32_avx512(
 /// delegating; the call falls back to the scalar reference on hosts
 /// without VNNI.
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-pub unsafe fn dequant_int8_dot_avx512(scale: f32, q: &[i8], x: &[f32]) -> f32 {
+pub unsafe fn dequant_int8_dot_avx512(
+    scale: f32,
+    q: &[i8],
+    x: &[f32],
+    qx_scratch: &mut Vec<u8>,
+) -> f32 {
     debug_assert_eq!(q.len(), x.len());
     let n = q.len();
     if n == 0 {
+        qx_scratch.clear();
         return 0.0;
     }
 
@@ -198,11 +223,15 @@ pub unsafe fn dequant_int8_dot_avx512(scale: f32, q: &[i8], x: &[f32]) -> f32 {
     }
     let x_scale = if x_max > 0.0 { x_max / 127.0 } else { 1.0 };
     let inv_x_scale = if x_max > 0.0 { 127.0 / x_max } else { 0.0 };
-    // Stack-allocated quantized activation buffer (i8 with sign-bit
-    // pre-flipped to land in u8 lanes for `vpdpbusd`). Allocating
-    // here keeps the call self-contained; for hot paths the caller
-    // can pre-quantize x and route through `dot_int8_int8` directly.
-    let mut qx_u8: Vec<u8> = Vec::with_capacity(n);
+    // Caller-owned quantized-activation buffer (i8 with sign-bit
+    // pre-flipped to land in u8 lanes for `vpdpbusd`). We `clear()`
+    // and refill rather than reallocate, so a matmul that reuses the
+    // same scratch across every row pays exactly one `Vec` growth on
+    // first call. `Vec::reserve` ensures the spare capacity is
+    // available before the push loop, so the body never reallocates
+    // mid-loop.
+    qx_scratch.clear();
+    qx_scratch.reserve(n);
     for &xi in x.iter() {
         let mut qi = (xi * inv_x_scale).round() as i32;
         if qi > 127 {
@@ -216,8 +245,9 @@ pub unsafe fn dequant_int8_dot_avx512(scale: f32, q: &[i8], x: &[f32]) -> f32 {
         // two's-complement byte is exactly the +128 reinterpretation
         // the VNNI bias trick depends on (matching the pattern used
         // in [`dot_int8_int8_avx512_vnni`]).
-        qx_u8.push((qi as i8) as u8 ^ 0x80);
+        qx_scratch.push((qi as i8) as u8 ^ 0x80);
     }
+    let qx_u8: &[u8] = qx_scratch.as_slice();
 
     // ---- Integer accumulation loop (pure i32 space) ----
     let mut vnni_acc0 = _mm512_setzero_si512();
@@ -429,7 +459,10 @@ mod tests {
         let scale = 0.0078125f32;
         let q: Vec<i8> = (0..200).map(|i| ((i % 251) - 125) as i8).collect();
         let x: Vec<f32> = (0..200).map(|i| ((i as f32) * 0.13).sin()).collect();
-        let lhs = unsafe { dequant_int8_dot_avx512(scale, &q, &x) };
+        let lhs = unsafe {
+            let mut scratch: Vec<u8> = Vec::new();
+            dequant_int8_dot_avx512(scale, &q, &x, &mut scratch)
+        };
         let rhs = crate::kernels::scalar::dequant_int8_dot(scale, &q, &x);
         // The VNNI rewrite (gist Part 3) quantizes the activation
         // vector to i8 in a per-call pre-pass before the integer
