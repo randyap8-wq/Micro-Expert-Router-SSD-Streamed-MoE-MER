@@ -210,7 +210,12 @@ pub unsafe fn dequant_int8_dot_avx512(scale: f32, q: &[i8], x: &[f32]) -> f32 {
         } else if qi < -127 {
             qi = -127;
         }
-        // i8 -> u8 via +128 (bias for vpdpbusd's u8 operand).
+        // i8 -> u8 with a +128 bias for `vpdpbusd`'s u8 operand.
+        // `(qi as i8) as u8 ^ 0x80` is the byte-wise XOR form of
+        // `(qi + 128) as u8`: it flips the sign bit, which on a
+        // two's-complement byte is exactly the +128 reinterpretation
+        // the VNNI bias trick depends on (matching the pattern used
+        // in [`dot_int8_int8_avx512_vnni`]).
         qx_u8.push((qi as i8) as u8 ^ 0x80);
     }
 
