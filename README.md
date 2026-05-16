@@ -10,13 +10,18 @@ SwiGLU FFN forward pass** directly over the bytes that just arrived from the
 drive.
 
 The premise is straightforward: a **modern PCIe-4 / 5 NVMe SSD sustains
-6-14 GB/s** of sequential read; a Mixtral-class expert is ~88 MB; pulling
-the top-K active experts per token therefore costs a few milliseconds of
-I/O even when the *full* parameter set is 10-100× DRAM. So you can run
-much larger models on much more modest hardware by treating the SSD as
-the main weight store and DRAM as a small cache of *active* experts.
-This engine is the substrate that makes that tradeoff observable and
-measurable.
+6-14 GB/s** of sequential read; a single Mixtral-8x7B expert is
+~336 MiB at bf16 / f16 and **~95 MiB at q4_K_M or q4_0** (the format
+llama.cpp ships by default); pulling the top-K active experts per token
+therefore costs a small fraction of a second of I/O per MoE layer, and
+**tens of milliseconds at 4-bit**, even when the *full* parameter set
+is 10-100× DRAM. Quantisation is what makes the trade-off practical
+on real models: 4-bit weights cut SSD bytes per token by ~3.5× vs bf16
+and let a single PCIe-4 NVMe sustain interactive token rates on
+Mixtral-class checkpoints. So you can run much larger models on much
+more modest hardware by treating the SSD as the main weight store and
+DRAM as a small cache of *active* experts. This engine is the
+substrate that makes that trade-off observable and measurable.
 
 The engine lives under [`rust-engine/`](./rust-engine).
 
@@ -1200,10 +1205,49 @@ loader.
 The `metadata.json` written by `extract_mixtral_experts.py` or
 `gguf-convert` lets `run` auto-fill `--num-experts`, `--d-model`,
 `--d-ff`, `--top-k`, and `--expert-size` so the subsequent commands
-need no further flags. Each Mixtral 8x7B expert is ~88 MiB at `f16`
-(zero-padded to a 4 KiB multiple), ~700 MiB on disk for one layer,
-fully streamable from any modern NVMe; at `q4_0` / `q4k` the same
-expert is ~25 MiB, at `q8_0` ~47 MiB.
+need no further flags.
+
+**Per-expert sizes for Mixtral-8x7B** (`d_model = 4096`, `d_ff = 14336`,
+~176 M weights per expert across the three SwiGLU matrices, plus a small
+zero-padding tail so the on-disk blob is a multiple of the 4 KiB
+`O_DIRECT` block):
+
+| dtype | bytes / weight | per expert (8x7B) | one layer (8 experts) | all 256 experts (32 layers) |
+|---|---:|---:|---:|---:|
+| `f32` | 4 | ~672 MiB | ~5.3 GiB | ~170 GB |
+| `bf16` / `f16` | 2 | **~336 MiB** | ~2.6 GiB | ~85 GB |
+| `int8` / `q8_0` | 1 / ~1.0625 | ~168–178 MiB | ~1.3–1.4 GiB | ~43–46 GB |
+| `q4_0` / `q4_K_M` | ~0.5625 | **~95 MiB** | ~750 MiB | ~24 GB |
+
+**Mixtral-8x22B** is ~1.7× larger per expert
+(`d_model = 6144`, `d_ff = 16384`, ~302 M weights/expert):
+~576 MiB at bf16, ~302 MiB at q8_0, ~162 MiB at q4_K_M; one of its
+8-expert layers occupies ~4.6 GiB at bf16 or ~1.3 GiB at q4_K_M, and
+the full 56 layers come to ~258 GB at bf16 or ~73 GB at q4_K_M.
+
+**What this translates to at runtime.** With top-2 routing the per-token
+SSD bandwidth requirement is `2 · per_expert_bytes` for every MoE layer
+that misses on both experts (in the worst case; the predictive S ∪ L ∪ M
+prefetcher and the LRU cache typically push this well below 2×). On
+PCIe-4 (~6 GB/s) and PCIe-5 (~12 GB/s) NVMe that works out to roughly:
+
+| dtype | per-layer top-2 bytes (8x7B) | PCIe-4 wait | PCIe-5 wait | viable interactively? |
+|---|---:|---:|---:|---|
+| `bf16` / `f16` | ~672 MiB | ~110 ms | ~55 ms | only with high cache hit rate + small `cache_slots` ratio; this is the regime where the predictive arms earn their keep |
+| `q8_0` | ~340 MiB | ~55 ms | ~27 ms | comfortable on PCIe-5, tight on PCIe-4 |
+| `q4_K_M` / `q4_0` | ~190 MiB | ~30 ms | ~15 ms | comfortable on any modern NVMe, including a single PCIe-4 drive |
+
+Numbers are sequential-read wall-clock assuming every fetch is a cache
+miss; in practice the predictor + LRU + frequency-pin path turns most
+fetches into hits and the engine reports the **realised** per-token I/O
+wait as `i/o latency` and `I/O share` in the run summary. The headline
+is that **`q4_K_M` (or `q4_0`) is the practical default for running
+real Mixtral checkpoints from SSD**: it fits the full 8x7B in ~24 GB of
+NVMe, keeps per-layer I/O under a PCIe-4 frame budget, and is exactly
+the dtype `gguf-convert --native-quant` writes to disk. Mixtral-8x22B
+needs PCIe-5 or multi-drive striping (see `--data-dir DIR1,DIR2,...`)
+to stay interactive even at q4_K_M; bf16 / f16 are best treated as
+fidelity references rather than production knobs.
 
 ### Routing model, Markov chain, transition matrix, or LinearGate
 
@@ -1315,18 +1359,65 @@ a sharding script that splits their `safetensors` into one
 `expert_<id>.bin` per expert (or per-layer-per-expert, see "Sharding
 granularity" below):
 
-| Model | Total params | Active / token | Experts | Top-K | Per-expert FFN (bf16) | Notes |
-|---|---|---|---|---|---|---|
-| **Mixtral 8x7B** | ~47 B | ~12.9 B | 8 × 32 layers | 2 | ~88 MB | Canonical fit. ~22 GB of expert weight, easily streamed from a single PCIe-4 NVMe. |
-| **Mixtral 8x22B** | ~141 B | ~39 B | 8 × 56 layers | 2 | ~240 MB | Comfortable on PCIe-5 NVMe. Cache 8-16 experts; prefetcher learns the routing well. |
-| **Phi-3.5-MoE-instruct** | ~42 B | ~6.6 B | 16 × 32 layers | 2 | ~80 MB | Smaller experts, more of them, exercises the predictor harder. |
-| **Qwen1.5-MoE-A2.7B / Qwen2-MoE** | ~14 B | ~2.7 B | 60 × 24 layers | 4 | ~10 MB | Fine-grained experts; ideal for demonstrating prefetch hit-rate. |
-| **DeepSeek-MoE 16B** | ~16.4 B | ~2.8 B | 64 routed + 2 shared × 28 layers | 6 | ~5-8 MB | "Shared experts" should be pinned (use `--first-token` to warm them, set `--cache-slots` ≥ shared count). |
-| **DeepSeek-V2-Lite / V2** | 16 B / 236 B | 2.4 B / 21 B | 64-160 × many layers | 6 | small | Same shape, larger scale. V2-full needs PCIe-5 + ≥ 32 cache slots to keep p99 sane. |
-| **DeepSeek-V3 / V3-0324** | 671 B | 37 B | 256 routed + 1 shared × 61 layers | 8 | small but many | Stress test of the design, ~15 K expert tensors. Sharding at per-layer-per-expert is mandatory. |
-| **OLMoE-1B-7B** | 7 B | 1.3 B | 64 × 16 layers | 8 | ~6 MB | Open-everything; good for benchmarking and reproducibility. |
-| **Snowflake Arctic** | 480 B | 17 B | 128 × 35 layers | 2 | medium | Top-2 makes prefetcher very effective. |
-| **Grok-1** | 314 B | ~78 B | 8 × 64 layers | 2 | ~600 MB | Per-expert footprint approaches GB; keep `--cache-slots` modest and let the LRU breathe. |
+| Model | Total params | Active / token | Experts | Top-K | Per-expert FFN (bf16) | Per-expert at q4_K_M | Notes |
+|---|---|---|---|---|---|---|---|
+| **Mixtral 8x7B** | ~47 B | ~12.9 B | 8 × 32 layers | 2 | ~336 MiB | ~95 MiB | Canonical fit. ~85 GB of expert weight at bf16, ~24 GB at q4_K_M; the 4-bit case streams comfortably from a single PCIe-4 NVMe. |
+| **Mixtral 8x22B** | ~141 B | ~39 B | 8 × 56 layers | 2 | ~576 MiB | ~162 MiB | bf16 wants PCIe-5 (or multi-drive striping via `--data-dir DIR1,DIR2,...`); q4_K_M is comfortable on a single PCIe-4. Cache 8–16 experts; prefetcher learns the routing well. |
+| **Phi-3.5-MoE-instruct** | ~42 B | ~6.6 B | 16 × 32 layers | 2 | ~150 MiB | ~42 MiB | Smaller experts, more of them, exercises the predictor harder. |
+| **Qwen1.5-MoE-A2.7B / Qwen2-MoE** | ~14 B | ~2.7 B | 60 × 24 layers | 4 | ~16 MiB | ~5 MiB | Fine-grained experts; ideal for demonstrating prefetch hit-rate. |
+| **DeepSeek-MoE 16B** | ~16.4 B | ~2.8 B | 64 routed + 2 shared × 28 layers | 6 | ~16 MiB | ~5 MiB | "Shared experts" should be pinned (use `--first-token` to warm them, set `--cache-slots` ≥ shared count). |
+| **DeepSeek-V2-Lite / V2** | 16 B / 236 B | 2.4 B / 21 B | 64–160 × many layers | 6 | small (≤ ~20 MiB) | small (≤ ~6 MiB) | Same shape, larger scale. V2-full needs PCIe-5 + ≥ 32 cache slots to keep p99 sane. |
+| **DeepSeek-V3 / V3-0324** | 671 B | 37 B | 256 routed + 1 shared × 61 layers | 8 | small but many (~15 K tensors) | ditto | Stress test of the design. Sharding at per-layer-per-expert is mandatory. |
+| **OLMoE-1B-7B** | 7 B | 1.3 B | 64 × 16 layers | 8 | ~12 MiB | ~3.5 MiB | Open-everything; good for benchmarking and reproducibility. |
+| **Snowflake Arctic** | 480 B | 17 B | 128 × 35 layers | 2 | medium (dense + sparse mix) | medium | Hybrid dense + MoE; top-2 on the sparse side makes the prefetcher very effective. |
+| **Grok-1** | 314 B | ~78 B | 8 × 64 layers | 2 | ~1.1 GiB | ~315 MiB | Per-expert footprint approaches a gigabyte even at 4-bit; keep `--cache-slots` modest and let the LRU breathe, or stripe across drives. |
+
+Numbers above are weight-only (the three SwiGLU matrices
+`3 · d_model · d_ff` per expert), rounded for legibility, and assume
+the GGUF block-quant overhead the engine actually reads from disk
+(see [Quantization](#1-on-disk-quantization---dtype) for the byte-
+per-weight constants). On-disk blobs add 4 KiB of zero-pad to land
+on an `O_DIRECT` block boundary, and INT8 adds a 12-byte per-expert
+scale header.
+
+**How that translates to running them.** For a top-K MoE layer with
+every expert missing the cache, the per-layer SSD bandwidth at token
+*t* is approximately `K · per_expert_bytes`. Multiplying by the layer
+count and dividing by the drive's sequential read rate gives the
+per-token worst-case SSD wait; the predictor + LRU + frequency-pin
+path cuts this dramatically once the routing converges (the
+`/metrics` `mer_*_hits_total` counters and the run summary's
+`I/O share` quantify how much). For the top-2 models above on a
+single PCIe-4 (~6 GB/s) NVMe:
+
+* **Mixtral-8x7B at q4_K_M**: ~190 MiB / layer worst-case ⇒ ~30 ms
+  layer wait; whole-token worst-case across 32 layers is ~1 s if
+  every layer misses both experts, which essentially never happens
+  once `L` + `M` are engaged.
+* **Mixtral-8x7B at bf16**: ~672 MiB / layer worst-case ⇒ ~110 ms
+  layer wait. PCIe-5 (~12 GB/s) cuts that to ~55 ms. Practical
+  only with a high cache hit rate; this is the regime where the
+  predictive arms (`S ∪ L ∪ M`) and frequency-pinning earn their
+  keep.
+* **Mixtral-8x22B at q4_K_M**: ~325 MiB / layer worst-case ⇒
+  ~55 ms on PCIe-4, ~27 ms on PCIe-5. Comfortable with a warm cache.
+* **Qwen-/OLMoE-/DeepSeek-MoE-class (small experts, high top-K)**:
+  the per-layer fetch is dominated by the *number* of activated
+  experts, not their size — top-4 / top-6 / top-8 over ~5–16 MiB
+  experts is ~20–100 MiB / layer worst-case, ⇒ a handful of
+  milliseconds per layer on any modern NVMe. These are the
+  configurations where the prefetcher's hit-rate is the dominant
+  knob.
+
+The practical rule is: **`q4_K_M` (or `q4_0`) is the default for
+running real Mixtral / Llama-MoE checkpoints from SSD**; bf16 / f16
+are fidelity references for small models or development; `int8` /
+`q8_0` are a middle ground when accuracy is sensitive but 4-bit is
+too lossy. Use `gguf-convert --native-quant` to write the on-disk
+4-bit block stream directly (no F32 detour), pair it with
+`--features io_uring` on Linux, and pick `--cache-slots` so the
+resident set is a few times your top-K but well below the full
+expert count — that's the configuration the engine is shaped for.
 
 What this means in practice:
 
