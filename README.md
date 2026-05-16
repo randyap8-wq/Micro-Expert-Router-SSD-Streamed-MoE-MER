@@ -191,23 +191,29 @@ experts, no high-end AI GPU required):
 * `--features avx512` — opt-in. Builds the `kernels/avx512.rs`
   `#[target_feature]`-gated kernels: a 4×-unrolled `dot_f32_avx512`
   (four independent FMA accumulators break the issue-port latency
-  chain), the fused int8-dequant-and-dot kernel, the fused
-  per-row `swiglu_f32_avx512` SwiGLU kernel
+  chain), the fused per-row `swiglu_f32_avx512` SwiGLU kernel
   (`y[i] = silu(gate_w[i]·x) * (up_w[i]·x)`, no allocation —
-  caller owns `y`), and a **native AVX-512 VNNI int8×int8 dot**
-  (`dot_int8_int8_avx512_vnni`) built on `_mm512_dpbusd_epi32`: the
-  inner reduction stays in i32 integer registers and only the
-  final per-tensor scale costs one f32 multiply, saving the
-  `cvtepi32_ps` round-trip the FP-accumulator path pays per chunk.
-  All entry points are gated on the runtime AVX-512F (and, for
-  VNNI, AVX-512VNNI) probe so a single binary still runs on hosts
-  without AVX-512.
+  caller owns `y`), a **native AVX-512 VNNI int8×int8 dot**
+  (`dot_int8_int8_avx512_vnni`) built on `_mm512_dpbusd_epi32`, and
+  the **VNNI-rewritten symmetric-int8 dequant + dot kernel**
+  (`dequant_int8_dot_avx512`, gist Part 3): activations are
+  quantized to u8 once per call, the inner FMA loop runs entirely
+  in i32 via `vpdpbusd`, and the per-tensor floating-point scale
+  is folded in exactly once — *immediately before the SiLU pass* —
+  eliminating the per-chunk `cvtepi32_ps + fmadd_ps` round-trip the
+  previous f32-accumulator path paid. All entry points are gated on
+  the runtime AVX-512F / AVX-512VNNI probe so a single binary still
+  runs on hosts without AVX-512.
 * `--features amx` — opt-in. Builds the AMX skeleton + tile-hint
   plumbing; the actual matmul body lands behind a future PR (AMX
   intrinsics are nightly-only as of Rust 1.84).
 * `--features gpu` — opt-in. Builds the
   [`backend::GpuBackend`](rust-engine/src/backend/mod.rs) integration
-  seam for a future budget-GPU compute path. Setting
+  seam for a future budget-GPU compute path, alongside the
+  [`transformer::DenseBackbone`](rust-engine/src/transformer.rs)
+  trait that abstracts `attn_block`, `RmsNorm`, and `LMHead` so a
+  device-side backbone can take over the dense body while the
+  SSD-streaming MoE path stays CPU-side (gist Part 2). Setting
   `[real_transformer].compute_offload = "gpu"` in `config.toml`
   selects that backend before the legacy CPU `CandleBackend`
   claims the `OnceLock`, so operators can exercise the config /
@@ -218,8 +224,10 @@ experts, no high-end AI GPU required):
   on GPU. The SSD-streamed MoE experts likewise continue to crunch
   on the CPU through the same auto-escalating SIMD dispatcher.
   Builds without the feature still use the normal CPU path, and the
-  backend logs the selected/fallback reason once at startup so ops
-  can correlate behavior with rollout state.
+  backend logs the **actual device runtime** (`cpu-fallback`,
+  `cuda-0`, `wgpu-vulkan` …) at startup — gist Part 2 retired the
+  previous stale `gpu-fallback` label so the log faithfully reports
+  whether a real GPU is live.
 
 The runtime probe is logged on a single startup line so ops can
 correlate the selected backend with the deployment fleet:
@@ -279,7 +287,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
 | `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()` + `cpu_features()`), with `scalar.rs` (always on, also home of the `swiglu_f32` reference oracle plus the `dot_int8_int8` scalar reference for VNNI), `avx2.rs` (always compiled on x86_64 — no cargo feature; the `#[target_feature]` entry points are gated on the runtime probe), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot, the 4×-unrolled `dot_f32_avx512`, the fused per-row `swiglu_f32_avx512` kernel, **and** the AVX-512 VNNI int8×int8 dot `dot_int8_int8_avx512_vnni` built on `_mm512_dpbusd_epi32` — gist Part 2 fix #8 — with the i8→u8 bias-trick correction so the inner reduction stays in i32 integer registers), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The dispatcher also exposes `swiglu_f32_into(gate_w, up_w, x, rows, cols, y)` which routes to the AVX-512 fused kernel on capable hosts and the scalar reference elsewhere — caller owns `y`, no allocation on the hot path. The probe reads `/proc/cpuinfo` to recognise Sapphire-Rapids-class Xeons so AMX can be preferred on the chips it ships on. The selected backend is logged once at startup. |
 | `backend` | Plugin-system math `Backend` trait (`matmul`, `matmul_into`, `swiglu_into`, `softmax`, `silu_inplace`) with three built-in implementations: `ScalarBackend` (pure Rust reference), `CandleBackend` (default CPU executor, dispatches through `kernels::dot_f32` / `kernels::swiglu_f32_into` — no `candle_core::Tensor` rebuild on the hot path, **zero allocation** in either call), and `GpuBackend` (gist Part 2 fix #5 — opt-in budget-GPU executor selected by `[real_transformer].compute_offload = "gpu"`; the integration seam compiles on every build, the wgpu compute pipeline lights up behind the `gpu` cargo feature). Both CPU backends override `matmul_into` to dispatch through `kernels::dot_f32` (auto-escalates AVX-512 → AVX2 → scalar). The active backend is installed once at startup via `backend::install_default()` (or, when `compute_offload = "gpu"`, `set_backend(GpuBackend::try_new())` runs first) and resolved on the hot path through `backend::current()` — a single `OnceLock` load, no `cfg!` dispatch. New executors (Burn, Tract, custom CUDA) implement `Backend` and call `set_backend(Arc<dyn Backend>)` before the first token is generated. |
-| `io_reactor` | **Actor-pattern I/O reactor** (gist Part 2 fix #6). Wraps an `NvmeStorage` behind a single-owner tokio task that dequeues read requests from a bounded `mpsc` channel and replies over per-request `oneshot`s. `IoReactorHandle` is cheaply cloneable (the sender side is reference-counted by tokio); workers issue `read_expert(id, buf)` without ever touching a shared `DashMap` shard / `RwLock` write guard. Backpressure is automatic — when the I/O substrate saturates, callers park on `mpsc::send` instead of overflowing a per-thread queue. Exposed as a standalone helper alongside the legacy `engine` path so the in-flight `DashMap<u32, Notify>` deduplicator can retire one subsystem at a time. |
+| `io_reactor` | **Actor-pattern I/O reactor** (gist Part 5 doc fix). Wraps an `NvmeStorage` behind a single-owner tokio task that runs a **bounded serial loop**: it dequeues read requests from a bounded `mpsc` channel one at a time, `await`s the read inline, replies over the per-request `oneshot`, and only then pulls the next request — the bounded queue therefore also bounds active I/O concurrency. `IoReactorHandle` is cheaply cloneable (the sender side is reference-counted by tokio); workers issue `read_expert(id, buf)` without ever touching a shared `DashMap` shard / `RwLock` write guard. Backpressure is automatic — when the I/O substrate saturates, callers park on `mpsc::send` instead of overflowing a per-thread queue. Exposed as a standalone helper alongside the legacy `engine` path so the in-flight `DashMap<u32, Notify>` deduplicator can retire one subsystem at a time. |
 | `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`. Validated at startup. |
@@ -437,6 +445,13 @@ kernel never has to walk the user mapping or pin pages on the hot
 path. A batched submission entry point
 (`IoUringStorage::read_experts_batch_fixed`) pushes `K` SQEs and calls
 `submit_and_wait(K)` once when a token misses on multiple experts.
+The batched submission path is **chunked by the ring's configured
+`queue_depth`** (gist Part 1): when the speculator's deduplicated
+lookahead window exceeds the ring depth the call splits the
+submission into windowed `submit()` chunks and only blocks on the
+final `submit_and_wait` once every SQE has been pushed — eliminating
+the previous "io_uring submission queue full" failure mode while
+keeping the macro-batch a single completion-wait boundary.
 A second batched entry point —
 `IoUringStorage::read_experts_batch_fixed_promote` — fuses that
 single-syscall submission with the **zero-latency shadow → primary

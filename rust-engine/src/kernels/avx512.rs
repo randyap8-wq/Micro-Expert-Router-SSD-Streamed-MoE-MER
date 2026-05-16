@@ -130,35 +130,173 @@ pub unsafe fn swiglu_f32_avx512(
     }
 }
 
-/// Fused symmetric-int8 dequant + dot. Each iteration loads 16 i8
-/// weights, sign-extends to i32, converts to f32, multiplies by 16
-/// f32 activations, and FMAs into an f32 accumulator. The
-/// per-tensor scale is folded in *once* on the final reduction.
+/// Fused symmetric-int8 dequant + dot — **rewritten for AVX-512 VNNI
+/// (gist Part 3)**.
+///
+/// The previous revision sign-extended each i8 weight chunk to i32,
+/// converted i32 → f32 inside the inner loop (`_mm512_cvtepi32_ps`),
+/// and FMAd against `_mm512_loadu_ps(x[i..])`. That mid-flight i32 →
+/// f32 conversion has been **eliminated**:
+///
+/// 1. The activation slice `x` is quantized **once** at the head of
+///    the call into a `u8` scratch buffer provided by the caller
+///    (per-vector symmetric scale chosen from `max|x|`).
+/// 2. The inner loop accumulates `i8 weight × u8 activation` directly
+///    in i32 via `_mm512_dpbusd_epi32` (the VNNI `vpdpbusd`
+///    instruction: 4-byte groups → i32 FMA in a single µop). The
+///    weight operand is biased into the u8 range expected by
+///    `vpdpbusd` via the same XOR-with-sign-bit trick the int8/int8
+///    VNNI kernel ([`dot_int8_int8_avx512_vnni`]) uses; the bias
+///    contribution is corrected after the reduction.
+/// 3. The per-tensor floating-point scale is folded in **exactly
+///    once**, after the i32 reduction, immediately before the SiLU
+///    activation pass the caller runs on the row scalar — matching
+///    the "Deferred Scaling" requirement in gist Part 3.
+///
+/// The kernel therefore stays entirely in integer registers between
+/// the activation quantization pre-pass and the final scalar
+/// multiply, which is the whole point of running int8 FFN math on
+/// AVX-512 VNNI parts (Ice Lake / Sapphire Rapids / Zen 4): each
+/// `vpdpbusd` retires in ~1 cycle vs ~4 cycles for the
+/// `cvtepi32_ps + fmadd_ps` chain it replaces, and the f32 unpack
+/// path that used to dominate the inner loop is gone.
+///
+/// # Scratch buffer ownership
+/// `qx_scratch` is a **caller-owned** quantized-activation buffer.
+/// It is `clear()`'d and resized to `x.len()` on entry, so callers
+/// can keep one `Vec<u8>` per matmul (or per worker) and amortize
+/// the allocation across every row dot in the matrix-vector product:
+///
+/// ```text
+/// let mut scratch = Vec::<u8>::with_capacity(cols);
+/// for row in 0..rows {
+///     y[row] = dequant_int8_dot_avx512(scale, &qw[row*cols..][..cols], x, &mut scratch);
+/// }
+/// // `scratch` is reused across every row — zero allocations in the loop.
+/// ```
+///
+/// The dispatcher in [`super::dequant_int8_dot`] hides this via a
+/// `thread_local!` scratch buffer so simple call sites do not have
+/// to thread the buffer through; matmul-shaped call sites should
+/// reach into this variant directly.
 ///
 /// # Safety
-/// Caller must guarantee the CPU supports `avx512f` + `avx512bw`
-/// (we use `_mm512_cvtepi8_epi32` which is part of AVX-512BW).
-#[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn dequant_int8_dot_avx512(scale: f32, q: &[i8], x: &[f32]) -> f32 {
+/// Caller must guarantee the CPU supports
+/// `avx512f + avx512bw + avx512vnni`. The dispatcher in
+/// [`super::dequant_int8_dot`] checks the runtime probe before
+/// delegating; the call falls back to the scalar reference on hosts
+/// without VNNI.
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub unsafe fn dequant_int8_dot_avx512(
+    scale: f32,
+    q: &[i8],
+    x: &[f32],
+    qx_scratch: &mut Vec<u8>,
+) -> f32 {
     debug_assert_eq!(q.len(), x.len());
     let n = q.len();
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= n {
-        // Load 16 packed i8 → sign-extend to 16x i32 → convert to f32.
-        let q_i8 = _mm_loadu_si128(q.as_ptr().add(i) as *const __m128i);
-        let q_i32 = _mm512_cvtepi8_epi32(q_i8);
-        let q_f32 = _mm512_cvtepi32_ps(q_i32);
-        let x_f32 = _mm512_loadu_ps(x.as_ptr().add(i));
-        acc = _mm512_fmadd_ps(q_f32, x_f32, acc);
-        i += 16;
+    if n == 0 {
+        qx_scratch.clear();
+        return 0.0;
     }
-    let mut sum = _mm512_reduce_add_ps(acc);
+
+    // ---- Activation quantization pre-pass (runs once per call) ----
+    //
+    // Symmetric per-vector quantization: scale activations into
+    // [-127, 127] using a single max-abs scan, then bias into the
+    // u8 range expected by `vpdpbusd` (the i8/u8 VNNI form) using
+    // the XOR-with-sign-bit trick. The bias contribution is
+    // accumulated separately and removed from the final i32 sum.
+    //
+    // `_mm512_dpbusd_epi32` semantics:
+    //   vpdpbusd(acc, a, b) = acc + Σ_{j∈[0,4)} a.u8[j] * b.i8[j]
+    //
+    // We arrange operands as `vpdpbusd(acc, qx_u8, qw_i8)` so that
+    // weights stay signed (no extra bias correction on the weight
+    // side); the activation operand is what gets biased.
+    let mut x_max = 0.0f32;
+    for &xi in x.iter() {
+        let a = xi.abs();
+        if a > x_max {
+            x_max = a;
+        }
+    }
+    let x_scale = if x_max > 0.0 { x_max / 127.0 } else { 1.0 };
+    let inv_x_scale = if x_max > 0.0 { 127.0 / x_max } else { 0.0 };
+    // Caller-owned quantized-activation buffer (i8 with sign-bit
+    // pre-flipped to land in u8 lanes for `vpdpbusd`). We `clear()`
+    // and refill rather than reallocate, so a matmul that reuses the
+    // same scratch across every row pays exactly one `Vec` growth on
+    // first call. `Vec::reserve` ensures the spare capacity is
+    // available before the push loop, so the body never reallocates
+    // mid-loop.
+    qx_scratch.clear();
+    qx_scratch.reserve(n);
+    for &xi in x.iter() {
+        let mut qi = (xi * inv_x_scale).round() as i32;
+        if qi > 127 {
+            qi = 127;
+        } else if qi < -127 {
+            qi = -127;
+        }
+        // i8 -> u8 with a +128 bias for `vpdpbusd`'s u8 operand.
+        // `(qi as i8) as u8 ^ 0x80` is the byte-wise XOR form of
+        // `(qi + 128) as u8`: it flips the sign bit, which on a
+        // two's-complement byte is exactly the +128 reinterpretation
+        // the VNNI bias trick depends on (matching the pattern used
+        // in [`dot_int8_int8_avx512_vnni`]).
+        qx_scratch.push((qi as i8) as u8 ^ 0x80);
+    }
+    let qx_u8: &[u8] = qx_scratch.as_slice();
+
+    // ---- Integer accumulation loop (pure i32 space) ----
+    let mut vnni_acc0 = _mm512_setzero_si512();
+    let mut vnni_acc1 = _mm512_setzero_si512();
+    // Activation byte-sum: we biased qx by +128 (XOR sign bit), so
+    // vpdpbusd computed Σ (qx_u8) * qw. Real product Σ (qx_i8 + 128) * qw
+    // = dot + 128 * Σ qw_per_lane. We subtract 128 * sum(qw over the SIMD
+    // region) at the end. `vpsadbw` gives us Σ |qw| against zero which
+    // is not what we want; instead we widen qw bytes through
+    // `pmaddubsw(ones, qw)` to get signed i16, then `madd_epi16(1)` →
+    // i32 lane-sum.
+    let mut weight_sum_acc = _mm512_setzero_si512();
+    let ones_u8 = _mm512_set1_epi8(1);
+    let one_i16 = _mm512_set1_epi16(1);
+
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let qw_v = _mm512_loadu_si512(q.as_ptr().add(i) as *const __m512i);
+        let qx_v = _mm512_loadu_si512(qx_u8.as_ptr().add(i) as *const __m512i);
+        // vpdpbusd(acc, u8, i8): u8 = qx_u8 (biased activation),
+        // i8 = qw (the original signed weight). i32 FMA, single µop.
+        vnni_acc0 = _mm512_dpbusd_epi32(vnni_acc0, qx_v, qw_v);
+        // Sum of weight bytes (signed) over this 64-byte chunk,
+        // for the bias correction. pmaddubsw(u8=1, i8=qw) → i16,
+        // then madd_epi16(1) → i32.
+        let prod_i16 = _mm512_maddubs_epi16(ones_u8, qw_v);
+        weight_sum_acc =
+            _mm512_add_epi32(weight_sum_acc, _mm512_madd_epi16(prod_i16, one_i16));
+        // Alternate accumulators so the two VNNI ports stay busy on
+        // Sapphire Rapids / Zen 4 (cosmetic on OoO cores).
+        std::mem::swap(&mut vnni_acc0, &mut vnni_acc1);
+        i += 64;
+    }
+    let dot_v = _mm512_add_epi32(vnni_acc0, vnni_acc1);
+    let mut dot_i32 = _mm512_reduce_add_epi32(dot_v) as i64;
+    let weight_sum_simd = _mm512_reduce_add_epi32(weight_sum_acc) as i64;
+    // Remove the +128 activation bias accumulated by vpdpbusd over
+    // the SIMD region. The scalar tail below uses the *unbiased* qx
+    // value directly so it doesn't pay the correction.
+    dot_i32 -= 128i64 * weight_sum_simd;
+    // < 64-byte scalar tail — undoes the bias since qx_u8 stored
+    // (qi + 128), and we want qi * qw.
     while i < n {
-        sum += (q[i] as f32) * x[i];
+        let qx_real = ((qx_u8[i] ^ 0x80) as i8) as i32;
+        dot_i32 += (q[i] as i32 as i64).wrapping_mul(qx_real as i64);
         i += 1;
     }
-    sum * scale
+    // ---- Deferred scaling — exactly once, before the SiLU pass ----
+    (dot_i32 as f32) * scale * x_scale
 }
 
 /// **AVX-512 VNNI int8×int8 dot — gist Part 2, fix #8.** Uses
@@ -313,15 +451,33 @@ mod tests {
     #[test]
     fn dequant_int8_avx512_matches_scalar_when_supported() {
         if !(std::is_x86_feature_detected!("avx512f")
-            && std::is_x86_feature_detected!("avx512bw"))
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vnni"))
         {
             return;
         }
         let scale = 0.0078125f32;
         let q: Vec<i8> = (0..200).map(|i| ((i % 251) - 125) as i8).collect();
         let x: Vec<f32> = (0..200).map(|i| ((i as f32) * 0.13).sin()).collect();
-        let lhs = unsafe { dequant_int8_dot_avx512(scale, &q, &x) };
+        let lhs = unsafe {
+            let mut scratch: Vec<u8> = Vec::new();
+            dequant_int8_dot_avx512(scale, &q, &x, &mut scratch)
+        };
         let rhs = crate::kernels::scalar::dequant_int8_dot(scale, &q, &x);
-        assert!((lhs - rhs).abs() <= 1e-3);
+        // The VNNI rewrite (gist Part 3) quantizes the activation
+        // vector to i8 in a per-call pre-pass before the integer
+        // accumulation loop — see the kernel comment. That
+        // introduces a per-element quantization error of at most
+        // `x_max/254`, which propagates through the dot as
+        // `scale * x_max * Σ|q[i]| / 254`. We allow the kernel
+        // output to drift by that bound (with a small absolute
+        // floor for the worst-case rounding tail).
+        let q_abs_sum: f32 = q.iter().map(|&qi| qi.abs() as f32).sum();
+        let x_max = x.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
+        let q_err_bound = scale * x_max * q_abs_sum / 254.0 + 1e-3;
+        assert!(
+            (lhs - rhs).abs() <= q_err_bound,
+            "VNNI rewrite drift exceeds quantization bound: lhs={lhs} rhs={rhs} bound={q_err_bound}"
+        );
     }
 }

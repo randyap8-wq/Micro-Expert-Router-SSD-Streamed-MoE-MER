@@ -1863,19 +1863,22 @@ impl LayeredExpertAffinity {
     /// below noise — well beyond the conversation lengths a single
     /// session realistically generates.
     ///
-    /// Returns a [`std::sync::Arc<std::sync::atomic::AtomicBool>`]
-    /// the caller can flip to `false` to ask the worker to exit at
-    /// the next poll boundary. Dropping the returned handle has no
-    /// effect — the worker keeps running until the flag is cleared
-    /// (this matches the gist's "lifetime tied to the engine" semantics).
-    #[must_use = "the returned shutdown flag controls the worker's lifetime; \
-                  the worker keeps running while the flag is true"]
+    /// Returns a [`DecayWorkerHandle`] (gist Part 5, fix #11) — an
+    /// owned supervisor that the engine retains for the lifetime of
+    /// the affinity tracker. Dropping the handle (e.g. on engine
+    /// shutdown) signals the worker to exit at its next poll
+    /// boundary; [`DecayWorkerHandle::shutdown`] / [`DecayWorkerHandle::abort`]
+    /// are exposed for callers that want to retire the worker
+    /// explicitly before drop. The handle owns the shutdown flag so
+    /// the worker's lifetime is tied to it by construction — no
+    /// `#[must_use]` lint is required, because dropping the handle
+    /// *does* something meaningful (clean shutdown).
     pub fn spawn_decay_worker(
         self: std::sync::Arc<Self>,
         epoch_threshold: u64,
         bits: u32,
         poll_interval: std::time::Duration,
-    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    ) -> DecayWorkerHandle {
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let shutdown_clone = shutdown.clone();
         let aff = self;
@@ -1884,7 +1887,7 @@ impl LayeredExpertAffinity {
         // between thread startup and concurrent `observe_layer` calls
         // would let the first epoch's delta drop to zero.
         let baseline = aff.total_observations();
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("affinity-decay".to_string())
             .spawn(move || {
                 let mut last_seen = baseline;
@@ -1898,7 +1901,73 @@ impl LayeredExpertAffinity {
                 }
             })
             .expect("affinity-decay worker thread failed to spawn");
-        shutdown
+        DecayWorkerHandle {
+            shutdown,
+            join: Some(join),
+        }
+    }
+}
+
+/// Owned supervisor returned by [`LayeredExpertAffinity::spawn_decay_worker`]
+/// (gist Part 5, fix #11).
+///
+/// The handle wraps the shutdown flag *and* the background thread's
+/// `JoinHandle`. Dropping the handle:
+///
+/// 1. clears the flag so the worker exits at the next poll boundary;
+/// 2. joins the worker so the engine has a deterministic teardown
+///    order (no orphaned threads running after the affinity tracker
+///    has been dropped).
+///
+/// Because dropping is a meaningful operation, the type does **not**
+/// carry a `#[must_use]` attribute — letting the value bind to `_` or
+/// fall out of scope at the end of an engine's lifetime is exactly
+/// the intended shutdown path. Callers that want to retire the worker
+/// earlier can call [`Self::shutdown`] (cooperative) or
+/// [`Self::abort`] (synonym, kept for ergonomic symmetry with
+/// `tokio::JoinHandle::abort`).
+pub struct DecayWorkerHandle {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `None` after the handle has been joined explicitly via
+    /// [`Self::shutdown`] / [`Self::abort`]; the `Drop` impl then has
+    /// nothing to do.
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DecayWorkerHandle {
+    /// Direct accessor for the shutdown flag — exposed for the
+    /// integration test that needs to flip the flag while the
+    /// `Drop` impl is still in scope (i.e. it cannot move `self`).
+    /// In production the engine never calls this directly; it just
+    /// drops the handle on shutdown.
+    pub fn shutdown_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.shutdown.clone()
+    }
+
+    /// Cooperative shutdown: clear the flag and join the worker.
+    /// Subsequent calls / `Drop` are no-ops.
+    pub fn shutdown(mut self) {
+        self.shutdown.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+
+    /// Alias for [`Self::shutdown`] — provided so callers used to
+    /// `tokio::task::JoinHandle::abort` can use the same name.
+    pub fn abort(self) {
+        self.shutdown();
+    }
+}
+
+impl Drop for DecayWorkerHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            // Best-effort join — a panicked worker shouldn't crash
+            // the engine on shutdown.
+            let _ = j.join();
+        }
     }
 }
 
@@ -2601,7 +2670,7 @@ mod tests {
         // co-firings to cross `epoch_threshold` and confirm the
         // worker right-shifts.
         let l = std::sync::Arc::new(LayeredExpertAffinity::new(1, 8));
-        let shutdown = l
+        let handle = l
             .clone()
             .spawn_decay_worker(
                 /*epoch_threshold=*/ 1,
@@ -2618,7 +2687,7 @@ mod tests {
         // test latency bounded.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let post = l.affinity(0, 2, 4);
-        shutdown.store(false, std::sync::atomic::Ordering::Relaxed);
+        handle.shutdown();
         assert!(
             post < pre,
             "decay worker should have shifted counters down (pre={pre} post={post})"

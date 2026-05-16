@@ -661,6 +661,93 @@ pub fn softmax_inplace(v: &mut [f32]) {
     }
 }
 
+// =====================================================================
+// Dense backbone abstraction (gist Part 2, fix #6).
+// =====================================================================
+
+/// Trait abstraction over the dense ("backbone") compute pieces of a
+/// transformer decoder — `attn_block`, `RmsNorm`, and `LMHead`.
+///
+/// **Why**: the dense backbone is O(N²) attention math plus a couple
+/// of dense matmuls. Today every byte of it runs on the CPU through
+/// the scalar `transformer.rs` implementation (auto-escalated to
+/// AVX-512 by the [`crate::kernels`] dispatcher inside the
+/// [`crate::backend::Backend`] math facade). The gist's Part 2 calls
+/// for a *clean seam* so an opt-in heterogeneous executor (a
+/// `cudarc` / `wgpu` GpuBackend) can take over the dense body while
+/// the SSD-streaming MoE path stays CPU-side. Pinned-host residuals
+/// cross the host/device boundary exactly once per attention block,
+/// not on every row of math.
+///
+/// **Where it plugs in**: [`crate::backend::Backend`] already owns
+/// the per-row matmul / SwiGLU / softmax primitives (the GpuBackend
+/// implementation overrides those). `DenseBackbone` is the layer
+/// *above* that: it composes those primitives into the named blocks
+/// the gist enumerates (`attn_block`, `RmsNorm`, `LMHead`) so a GPU
+/// executor can fuse them into a single device-side kernel launch
+/// instead of paying per-primitive host/device boundary cost.
+///
+/// The default implementation [`CpuBackbone`] just delegates to the
+/// inherent methods on [`TransformerLayer`], [`RmsNorm`], and
+/// [`LMHead`] — i.e. the existing CPU path. A future GPU backbone
+/// implementation lives in `backend/mod.rs` next to [`crate::backend::GpuBackend`].
+pub trait DenseBackbone: Send + Sync {
+    /// Short human-readable name (e.g. `"cpu"`, `"cuda-0"`,
+    /// `"wgpu-vulkan"`). Used by the startup log so operators can see
+    /// which backbone is live alongside the math [`crate::backend::Backend`]
+    /// identifier.
+    fn name(&self) -> &'static str;
+
+    /// `hidden → rmsnorm → attention → residual`. Equivalent to
+    /// `layer.attn_block(hidden, pos, kv)` on the CPU path. A GPU
+    /// implementation can launch a single fused kernel here.
+    fn attn_block(
+        &self,
+        layer: &TransformerLayer,
+        hidden: &[f32],
+        pos: usize,
+        kv: &mut KvCache,
+    ) -> Vec<f32>;
+
+    /// RMSNorm. Equivalent to `norm.forward(x)`. The default impl
+    /// delegates to the inherent method; a device-side
+    /// implementation overrides this to keep the residual on-device.
+    fn rmsnorm(&self, norm: &RmsNorm, x: &[f32]) -> Vec<f32> {
+        norm.forward(x)
+    }
+
+    /// Project the final hidden state to logits via the LM head.
+    /// Equivalent to `head.forward(hidden)`. A GPU implementation
+    /// runs the final `[vocab × d_model]` matmul on-device and only
+    /// transfers the `vocab`-long logits vector back to the host.
+    fn lm_head(&self, head: &LMHead, hidden: &[f32]) -> Vec<f32> {
+        head.forward(hidden)
+    }
+}
+
+/// Default CPU backbone: every method delegates to the existing
+/// inherent implementation. Adding this is a no-op for the CPU
+/// runtime — it's the trait wrapper around the existing methods so
+/// callers can be ported to `DenseBackbone` without losing behaviour.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CpuBackbone;
+
+impl DenseBackbone for CpuBackbone {
+    fn name(&self) -> &'static str {
+        "cpu"
+    }
+
+    fn attn_block(
+        &self,
+        layer: &TransformerLayer,
+        hidden: &[f32],
+        pos: usize,
+        kv: &mut KvCache,
+    ) -> Vec<f32> {
+        layer.attn_block(hidden, pos, kv)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,6 +29,7 @@ mod model;
 mod multi_layer_cache;
 mod numa;
 mod router;
+mod rpc;
 mod sampling;
 mod server;
 mod session;
@@ -528,14 +529,28 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         "loaded server config"
     );
 
-    // Hybrid compute offload (gist Part 2, fix #5). Selects which
+    // Hybrid compute offload (gist Part 2, fix #6). Selects which
     // `Backend` instance owns the dense transformer body; runs
     // *before* `install_default` so the OnceLock keeps our pointer.
+    // The startup log below reports the actual device runtime
+    // (`cpu-fallback` / `cuda-0` / `wgpu-vulkan`) as `GpuBackend::name`
+    // surfaces it — no more stale hardcoded `"gpu-fallback"` strings.
     if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu {
-        let gpu = std::sync::Arc::new(crate::backend::GpuBackend::try_new())
-            as std::sync::Arc<dyn crate::backend::Backend>;
+        let gpu_concrete = crate::backend::GpuBackend::try_new();
+        let has_device = gpu_concrete.has_device();
+        let device_name = gpu_concrete.device_name();
+        let gpu = std::sync::Arc::new(gpu_concrete) as std::sync::Arc<dyn crate::backend::Backend>;
         if let Err(e) = crate::backend::set_backend(gpu) {
-            warn!(error = e, "failed to install GpuBackend; falling back to default");
+            warn!(
+                error = e,
+                "failed to install GpuBackend; falling back to default"
+            );
+        } else {
+            info!(
+                device = device_name,
+                has_device,
+                "GpuBackend installed for dense backbone"
+            );
         }
     }
     crate::backend::install_default();

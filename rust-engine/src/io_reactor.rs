@@ -123,9 +123,13 @@ impl IoReactorHandle {
 }
 
 /// The single-owner actor task. Wraps an [`NvmeStorage`] and serialises
-/// every read through one task — but the reads themselves are
-/// dispatched concurrently via `tokio::spawn`, so the actor is a
-/// **dispatcher**, not a serialising bottleneck.
+/// every read through one task — this is a **high-efficiency bounded
+/// serial actor loop**, not a concurrent dispatcher: requests are
+/// dequeued one at a time and the read is `await`-ed inline before the
+/// next request is pulled. The bounded mpsc queue therefore also
+/// bounds active I/O concurrency (no `tokio::spawn` per request, no
+/// fan-out), which is exactly the back-pressure shape the engine
+/// wants when the storage layer is the rate-limiting stage.
 pub struct IoReactor;
 
 impl IoReactor {
