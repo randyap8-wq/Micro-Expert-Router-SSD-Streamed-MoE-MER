@@ -14,7 +14,7 @@
 
 [server]
 # Address to listen on. `0.0.0.0:8080` to expose to the network.
-bind = "127.0.0.1:8080"
+bind = "0.0.0.0:8080"
 # Hard cap on the `max_tokens` any single request can ask for. Requests
 # asking for more are silently clamped to this value.
 max_tokens = 256

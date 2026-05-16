@@ -15,18 +15,15 @@
 # Bring up:
 #   docker compose up --build
 #
-# Important: the shipped `config.toml` binds `127.0.0.1:8080`, which
-# inside the container is *not* reachable from the published host
-# port (Docker's port forwarding only sees the container's external
-# interface). Before running compose, override `bind` in the
-# host-mounted config:
+# The shipped `config.toml` binds `0.0.0.0:8080` so the container's
+# published port is reachable from the host. If you change this in
+# the host-mounted config to a loopback address (e.g. `127.0.0.1:8080`),
+# Docker's port forwarding will return "connection refused" because the
+# app won't be listening on the container's external interface.
 #
-#   [server]
-#   bind = "0.0.0.0:8080"
-#
-# The same `bind` value is used by the container-internal healthcheck
-# below (`curl http://127.0.0.1:8080/health`), which works regardless
-# because that probe runs *inside* the container's network namespace.
+# The container-internal healthcheck below (`curl http://127.0.0.1:8080/health`)
+# works regardless of whether `bind` is `0.0.0.0` or `127.0.0.1`, because
+# that probe runs *inside* the container's network namespace.
 #
 # Smoke test (after `docker compose up`):
 #   curl -sS http://localhost:8080/health

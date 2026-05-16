@@ -143,8 +143,14 @@ fn four_audit_streams_meet_tps_floor() {
         thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let batch = drain_wrr(&queue, 8);
-                for stream in batch {
-                    completed[stream as usize].fetch_add(1, Ordering::Relaxed);
+                for req in batch {
+                    // Only credit Audit streams (which are cleanly numbered
+                    // 0..NUM_STREAMS). Interactive backlog requests are
+                    // OR'd with `INTERACTIVE_TAG` (1 << 63) and would
+                    // otherwise panic when used to index `completed`.
+                    if traffic_class(req) == TrafficClass::Audit {
+                        completed[req as usize].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 // The real scheduler does ~10 µs of work per token at
                 // this batch size; sleep here so the simulation
