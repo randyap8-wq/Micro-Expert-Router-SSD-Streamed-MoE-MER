@@ -26,6 +26,37 @@ max_tokens = 256
 # haven't been touched in this many seconds. Use the
 # `DELETE /v1/sessions/{id}` endpoint to purge a session explicitly.
 session_ttl_secs = 0
+# Maximum number of HTTP requests allowed to be executing concurrently.
+# Excess requests are rejected with `503 Service Unavailable` so the
+# engine never silently degrades into unbounded queueing. `0` (default)
+# disables the limit.
+max_concurrent_requests = 0
+# Minimum number of free blocks the paged-KV pool must hold for a new
+# request to be admitted. Requires `[real_transformer]` to also be
+# configured with a block pool. `0` (default) disables.
+admission_min_free_blocks = 0
+
+# Optional API-key gate + simple in-process rate limiting. The whole
+# section is optional; when omitted (or when `api_keys` is empty) the
+# server runs with no auth, matching the legacy behaviour. See
+# `docs/production.md` for the recommended production shape (terminate
+# TLS at a reverse proxy, plumb in distinct keys per tenant).
+# [security]
+# Bearer / `X-API-Key` values that may access the API. Requests
+# missing or carrying a value not in this set are rejected `401`.
+# api_keys = ["secret-key-1", "secret-key-2"]
+# In-process token-bucket rate limit, requests per second per key.
+# `0` (default) disables. Bursts of up to `rate_limit_burst` are
+# allowed before the bucket empties.
+# rate_limit_rps = 0
+# Burst size for the token bucket. `0` defaults to `rate_limit_rps`.
+# rate_limit_burst = 0
+# Paths to PEM-encoded TLS cert/key. This release does *not* link
+# rustls into the binary; setting these logs a `WARN` and the server
+# continues to bind plain HTTP. Setting only one of the two is a hard
+# validation error.
+# tls_cert = "/etc/mer/tls/cert.pem"
+# tls_key = "/etc/mer/tls/key.pem"
 
 [sampling]
 # Server-wide defaults for the next-token sampler. Each request can

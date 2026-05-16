@@ -432,6 +432,20 @@ pub struct TraceWriter {
     /// definite "everything queued so far has been written" point
     /// (used in shutdown paths and tests).
     flush_signal: Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar, std::sync::atomic::AtomicU64)>,
+    /// Producer-side high-water mark: the largest sequence number
+    /// successfully enqueued onto the channel. Updated *after* a
+    /// successful `try_send` so `flush()` never waits on a record the
+    /// channel rejected (queue full / disconnected). When `try_send`
+    /// fails the record is silently dropped and the HWM is left
+    /// unchanged — that matches the documented "best-effort" trace
+    /// contract.
+    producer_hwm: std::sync::atomic::AtomicU64,
+    /// Monotonic sequence counter for outgoing records. Per-instance
+    /// (was previously a `static` inside `write_record`, which shared
+    /// the counter across every `TraceWriter` ever created in the
+    /// process and prevented `flush` from synchronising correctly
+    /// when multiple writers existed in tests).
+    seq: std::sync::atomic::AtomicU64,
     /// Set to `true` the first time a write fails so subsequent failures
     /// stay silent. Without this guard a sticky I/O error (full disk,
     /// unwritable path) would emit a `warn!` on *every* record and
@@ -479,35 +493,76 @@ impl TraceWriter {
             .name("mer-trace-writer".to_string())
             .spawn(move || {
                 use std::io::Write;
+                use std::sync::mpsc::TryRecvError;
                 let mut latched_failure = false;
-                while let Ok(rec) = rx.recv() {
-                    let mut s = String::with_capacity(64 + rec.experts.len() * 8);
-                    s.push_str(&format!(
-                        "{{\"token\":{},\"layer\":{},\"experts\":[",
-                        rec.token, rec.layer
-                    ));
-                    for (i, e) in rec.experts.iter().enumerate() {
-                        if i > 0 { s.push(','); }
-                        s.push_str(&e.to_string());
-                    }
-                    s.push_str("],\"cache_hit\":[");
-                    for (i, h) in rec.cache_hit.iter().enumerate() {
-                        if i > 0 { s.push(','); }
-                        s.push_str(if *h { "true" } else { "false" });
-                    }
-                    s.push_str("]}\n");
+                // Outer loop: block until at least one record arrives.
+                'outer: while let Ok(first) = rx.recv() {
+                    let mut latest_seq = first.seq;
+                    let mut rec = first;
+                    // Inner loop: drain anything already queued before
+                    // touching the BufWriter::flush. This lets sustained
+                    // writes batch in the BufWriter (which is the whole
+                    // point of buffering); we only flush when the
+                    // channel momentarily empties, so quiet periods see
+                    // bytes hit the kernel quickly enough for `flush()`
+                    // callers to make progress.
+                    let drained_cleanly = loop {
+                        let mut s = String::with_capacity(64 + rec.experts.len() * 8);
+                        s.push_str(&format!(
+                            "{{\"token\":{},\"layer\":{},\"experts\":[",
+                            rec.token, rec.layer
+                        ));
+                        for (i, e) in rec.experts.iter().enumerate() {
+                            if i > 0 { s.push(','); }
+                            s.push_str(&e.to_string());
+                        }
+                        s.push_str("],\"cache_hit\":[");
+                        for (i, h) in rec.cache_hit.iter().enumerate() {
+                            if i > 0 { s.push(','); }
+                            s.push_str(if *h { "true" } else { "false" });
+                        }
+                        s.push_str("]}\n");
+                        if !latched_failure {
+                            if let Err(e) = writer.write_all(s.as_bytes()) {
+                                warn!(error = %e, "trace writer failed; subsequent records may be lost (further failures suppressed)");
+                                latched_failure = true;
+                            }
+                        }
+                        latest_seq = rec.seq;
+                        match rx.try_recv() {
+                            Ok(next) => { rec = next; }
+                            Err(TryRecvError::Empty) => break true,
+                            Err(TryRecvError::Disconnected) => break false,
+                        }
+                    };
+                    // Flush the BufWriter so any `TraceWriter::flush()`
+                    // caller waiting on `latest_seq` sees the bytes hit
+                    // the file descriptor (not just BufWriter's
+                    // in-memory buffer). Without this flush, advancing
+                    // the worker HWM before flushing would let
+                    // `flush()` return while the JSONL bytes were still
+                    // stuck inside the BufWriter — exactly the bug the
+                    // reviewer flagged.
                     if !latched_failure {
-                        if let Err(e) = writer.write_all(s.as_bytes()) {
-                            warn!(error = %e, "trace writer failed; subsequent records may be lost (further failures suppressed)");
+                        if let Err(e) = writer.flush() {
+                            warn!(error = %e, "trace writer flush failed; subsequent records may be lost (further failures suppressed)");
                             latched_failure = true;
                         }
                     }
-                    // Update the high-water mark so flush() can spin until it
-                    // crosses the producer's max enqueued seq.
-                    flush_signal_w.2.store(rec.seq, std::sync::atomic::Ordering::Release);
-                    let mut g = flush_signal_w.0.lock();
-                    *g = rec.seq;
-                    flush_signal_w.1.notify_all();
+                    // Only *now* publish the high-water mark so flushers
+                    // unblock with the bytes already durable in the file
+                    // descriptor.
+                    flush_signal_w.2.store(latest_seq, std::sync::atomic::Ordering::Release);
+                    {
+                        let mut g = flush_signal_w.0.lock();
+                        *g = latest_seq;
+                        flush_signal_w.1.notify_all();
+                    }
+                    if !drained_cleanly {
+                        // Sender side dropped after the drain — exit
+                        // the outer loop and run the shutdown flush.
+                        break 'outer;
+                    }
                 }
                 // Channel closed: final flush so partial records hit the disk.
                 let _ = writer.flush();
@@ -516,15 +571,16 @@ impl TraceWriter {
         Ok(Self {
             tx: parking_lot::Mutex::new(Some(tx)),
             flush_signal,
+            producer_hwm: std::sync::atomic::AtomicU64::new(0),
+            seq: std::sync::atomic::AtomicU64::new(0),
             write_failed_once: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub fn write_record(&self, token: u64, layer: u32, experts: &[u32], cache_hit: &[bool]) {
-        // Assign a monotonic sequence so flush() has something to
-        // wait on.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Assign a monotonic per-writer sequence so flush() has
+        // something to wait on.
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let rec = TraceRecord {
             token,
             layer,
@@ -536,36 +592,67 @@ impl TraceWriter {
         let Some(tx) = guard.as_ref() else { return };
         // `try_send` is non-blocking; on overflow the newest record is
         // dropped (back-pressure to bound memory).
-        if let Err(e) = tx.try_send(rec) {
-            if !self
-                .write_failed_once
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
-                warn!(reason = %e, "trace writer queue full; dropping records (further drops suppressed)");
+        match tx.try_send(rec) {
+            Ok(()) => {
+                // Only publish the producer HWM *after* the channel has
+                // accepted the record. If we advanced it before
+                // `try_send` and the send then failed (queue full or
+                // disconnected), every subsequent `flush()` would stall
+                // until the 500 ms timeout waiting for a seq the
+                // worker can never observe. Release pairs with
+                // flush()'s Acquire load.
+                //
+                // The store uses a CAS-style max so out-of-order
+                // success notifications (rare under contention) can't
+                // walk the HWM backwards.
+                let mut current = self
+                    .producer_hwm
+                    .load(std::sync::atomic::Ordering::Acquire);
+                while seq > current {
+                    match self.producer_hwm.compare_exchange_weak(
+                        current,
+                        seq,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => current = observed,
+                    }
+                }
+            }
+            Err(e) => {
+                if !self
+                    .write_failed_once
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    warn!(reason = %e, "trace writer queue full; dropping records (further drops suppressed)");
+                }
             }
         }
     }
 
     pub fn flush(&self) {
         // Block until the worker has caught up to the highest seq the
-        // producer side has ever assigned. Bounded wait so a stuck
-        // worker can't deadlock the caller.
-        let target = std::sync::atomic::AtomicU64::new(0);
-        // Read the current producer high-water mark *atomically*: we
-        // can simply ask the channel since a `flush` after a series
-        // of `write_record` calls will see the most recent SEQ.
-        let snapshot = {
-            let _ = &target;
-            // Re-fetch from the static. (We rely on the relaxed load
-            // being a recent value; the worker is monotonically
-            // catching up so any value ≤ the true current is safe.)
-            // SAFETY: the static was only ever written via fetch_add.
-            // Use Acquire to pair with the worker's Release store on
-            // the same atomic.
-            self.flush_signal.2.load(std::sync::atomic::Ordering::Acquire)
-        };
+        // producer side ever successfully enqueued *and* the worker's
+        // BufWriter has been flushed so those bytes are visible to
+        // file readers. Bounded wait so a stuck worker can't deadlock
+        // the caller.
+        //
+        // Two-part invariant the worker now upholds: after every
+        // queue-drained iteration it (1) calls `BufWriter::flush()`
+        // and *then* (2) publishes `latest_seq` on `flush_signal.2`
+        // and `flush_signal.0`. So observing `*guard >= snapshot`
+        // implies the bytes for every seq ≤ snapshot have hit the
+        // file descriptor.
+        //
+        // Snapshot the *producer* HWM (not the worker's HWM); the
+        // worker's HWM lags the producer and would let `flush` return
+        // before the worker has actually drained the latest records.
+        let snapshot = self
+            .producer_hwm
+            .load(std::sync::atomic::Ordering::Acquire);
         if snapshot == 0 {
-            return; // nothing ever queued
+            return; // nothing ever queued (or every send dropped)
         }
         let mut guard = self.flush_signal.0.lock();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);

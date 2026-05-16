@@ -63,9 +63,19 @@ impl MultiLayerExpertCache {
     }
 
     /// Borrow the [`ExpertCache`] for one layer (so existing engine code
-    /// that takes an `Arc<ExpertCache>` keeps working).
+    /// that takes an `Arc<ExpertCache>` keeps working). Panics if
+    /// `layer` is out of range — call sites that may receive an
+    /// untrusted layer index should pre-validate against
+    /// [`Self::num_layers`].
     pub fn cache_for_layer(&self, layer: u32) -> Arc<ExpertCache> {
-        self.caches[layer as usize].clone()
+        let idx = layer as usize;
+        assert!(
+            idx < self.caches.len(),
+            "MultiLayerExpertCache::cache_for_layer: layer {} out of range (num_layers = {})",
+            layer,
+            self.caches.len()
+        );
+        self.caches[idx].clone()
     }
 
     pub fn get(&self, key: ExpertKey) -> Option<Arc<ExpertResident>> {
