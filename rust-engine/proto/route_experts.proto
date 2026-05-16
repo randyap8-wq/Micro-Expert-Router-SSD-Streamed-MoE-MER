@@ -1,0 +1,74 @@
+// gist Part 4 — sharded RouteExperts gRPC contract.
+//
+// This proto definition mirrors the hand-rolled wire format in
+// `rust-engine/src/rpc.rs` so a follow-up integration can swap in
+// `tonic` + `prost`-generated types without changing the on-wire
+// layout. The proto is intentionally minimal: every field is `bytes`
+// or a small scalar so the zero-copy hot path (a `Bytes` buffer
+// directly off the network) doesn't need to recursively decode
+// repeated message types.
+//
+// See `docs/distributed.md` for the full partitioning scheme.
+
+syntax = "proto3";
+
+package micro_expert_router.v1;
+
+// One sharded MoE step. The request-receiving node computes the full
+// top-K (cheap: one `d_model × num_experts` SGEMV) and issues one
+// `RouteExperts` call per shard with the subset of top-K ids that
+// live on that shard.
+service ExpertShard {
+  rpc RouteExperts(RouteExpertsRequest) returns (RouteExpertsResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message RouteExpertsRequest {
+  // Correlation id; echoed back on the response so the combiner
+  // can route returns to the original token decode.
+  uint64 request_id = 1;
+
+  // Decoder layer index. Each layer's expert population is sharded
+  // independently, but the gating output is per-token so all of a
+  // token's per-layer shard RPCs share `request_id`.
+  uint32 layer_idx = 2;
+
+  // Width of `hidden_state` (in f16 elements). Carried explicitly so
+  // the receiver can validate frame length without an out-of-band
+  // schema lookup.
+  uint32 d_model = 3;
+
+  // Top-K expert ids on this shard. Order is preserved by the
+  // combiner so it can join against the original gating weights.
+  repeated uint32 expert_ids = 4 [packed = true];
+
+  // Hidden state packed as f16 (little-endian raw bits, length =
+  // d_model * 2 bytes). f16 halves wire size vs f32; the engine
+  // already loses no precision against the f32 path because the
+  // gate/up projections are followed by SwiGLU + downcast.
+  bytes hidden_state_f16 = 5;
+}
+
+message RouteExpertsResponse {
+  uint64 request_id = 1;
+  uint32 d_model = 2;
+
+  // Echoed back so the combiner can join FFN outputs to gating
+  // weights without an out-of-band index.
+  repeated uint32 expert_ids = 3 [packed = true];
+
+  // Row-major f16 FFN outputs, length = k * d_model * 2 bytes.
+  // Row `i` corresponds to `expert_ids[i]`.
+  bytes ffn_out_f16 = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  // Free pinned-host buffer pool slots on this shard.
+  uint32 free_blocks = 1;
+  // Cumulative expert read failures since process start.
+  uint64 expert_read_failures = 2;
+  // Implementation revision string (e.g. `"v0.5.2-shard"`).
+  string version = 3;
+}

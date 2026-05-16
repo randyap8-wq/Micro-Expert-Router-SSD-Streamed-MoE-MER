@@ -341,17 +341,38 @@ pub struct GpuBackend {
     /// construction. Exposed via [`Self::has_device`] for the
     /// startup log so ops can see whether offload is actually live.
     has_device: bool,
+    /// Identifier for the underlying device runtime. Reported by
+    /// [`Backend::name`] so operators can see the *actual* device in
+    /// the startup log instead of the previous stale hardcoded
+    /// `"gpu-fallback"` string (gist Part 2, fix #6).
+    ///
+    /// Convention:
+    /// * `"cpu-fallback"` — no GPU runtime is live (default for
+    ///   binaries without the `gpu` cargo feature, or when device
+    ///   probing fails at startup).
+    /// * `"cuda-0"`, `"cuda-1"`, … — a CUDA device acquired via
+    ///   `cudarc`. The trailing index is the visible device id.
+    /// * `"wgpu-vulkan"`, `"wgpu-metal"`, `"wgpu-dx12"` — a `wgpu`
+    ///   adapter backed by the named graphics API.
+    ///
+    /// Kept as `&'static str` because the `Backend::name` contract
+    /// returns one; the GPU init path picks the right literal from a
+    /// curated set when it acquires the device.
+    device_name: &'static str,
 }
 
 impl GpuBackend {
     /// Try to construct a GPU-backed executor. On builds without the
     /// `gpu` cargo feature, this always returns a pass-through to
-    /// [`CandleBackend`] and logs a single warning so the operator
+    /// [`CandleBackend`] (`has_device == false`, `device_name ==
+    /// "cpu-fallback"`) and logs a single warning so the operator
     /// notices their `compute_offload = "gpu"` config has no effect.
     /// On `gpu`-feature builds the constructor will (in a follow-up
-    /// PR that owns the wgpu runtime) probe for an adapter, request
-    /// a device + queue, and compile the matmul / SwiGLU WGSL
-    /// shaders. The compute shaders live in `backend/wgpu_shaders/`.
+    /// PR that owns the wgpu / cudarc runtime) probe for an adapter,
+    /// request a device + queue, compile the matmul / SwiGLU WGSL
+    /// shaders, and set `device_name` to the actual runtime
+    /// identifier (e.g. `"cuda-0"` or `"wgpu-vulkan"`). The compute
+    /// shaders live in `backend/wgpu_shaders/`.
     pub fn try_new() -> Self {
         #[cfg(not(feature = "gpu"))]
         {
@@ -361,26 +382,37 @@ impl GpuBackend {
                  Rebuild with `cargo build --release --features gpu` to enable budget-GPU \
                  offload."
             );
-            return Self { fallback: CandleBackend, has_device: false };
+            return Self {
+                fallback: CandleBackend,
+                has_device: false,
+                device_name: "cpu-fallback",
+            };
         }
         #[cfg(feature = "gpu")]
         {
-            // gist Part 2, fix #5 — opt-in wgpu device acquisition.
-            // The `gpu` cargo feature pulls in the wgpu runtime; the
-            // device-init / shader-compile logic lives behind that
-            // feature so default builds stay lean. This branch is
-            // the integration point: when the wgpu dependency is
-            // wired in, replace the `has_device = false` line below
-            // with the actual adapter request + pipeline compile.
-            // Until then the `gpu` feature build is identical to the
-            // CPU path (so feature-gated CI still passes), but the
-            // log line below tells the operator the seam is live.
+            // gist Part 2, fix #6 — opt-in wgpu / cudarc device
+            // acquisition. The `gpu` cargo feature pulls in the
+            // device-init crates; the device-init / shader-compile
+            // logic lives behind that feature so default builds stay
+            // lean. This branch is the integration point: when the
+            // wgpu / cudarc dependency is wired in, replace the
+            // `device_name = "cpu-fallback"` line below with the
+            // probe's runtime label (e.g. `"cuda-0"` /
+            // `"wgpu-vulkan"`). Until then the `gpu`-feature build
+            // is identical to the CPU path (so feature-gated CI
+            // still passes), and the device label transparently
+            // reports `"cpu-fallback"` so the startup log does not
+            // claim a GPU is active when it isn't.
             tracing::info!(
                 "GpuBackend built with `gpu` feature; runtime device acquisition is a \
                  follow-up integration step. Operating as a CandleBackend pass-through \
                  for this binary."
             );
-            Self { fallback: CandleBackend, has_device: false }
+            Self {
+                fallback: CandleBackend,
+                has_device: false,
+                device_name: "cpu-fallback",
+            }
         }
     }
 
@@ -390,11 +422,25 @@ impl GpuBackend {
     pub fn has_device(&self) -> bool {
         self.has_device
     }
+
+    /// Identifier of the underlying device runtime (e.g. `"cuda-0"`,
+    /// `"wgpu-vulkan"`, or `"cpu-fallback"` when no GPU is live).
+    /// Same string [`Backend::name`] returns — exposed inherently so
+    /// `main.rs` can read the runtime tag without re-routing through
+    /// the `Backend` trait object.
+    pub fn device_name(&self) -> &'static str {
+        self.device_name
+    }
 }
 
 impl Backend for GpuBackend {
     fn name(&self) -> &'static str {
-        if self.has_device { "gpu" } else { "gpu-fallback" }
+        // gist Part 2, fix #6: report the *actual* device runtime
+        // instead of the stale hardcoded `"gpu-fallback"` string the
+        // previous revision returned. `has_device` is the truth
+        // source for "did the GPU pipeline come up?"; `device_name`
+        // carries the human-readable runtime label.
+        self.device_name
     }
 
     fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {

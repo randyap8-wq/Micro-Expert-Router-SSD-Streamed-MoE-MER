@@ -346,6 +346,17 @@ mod linux_impl {
         /// Per-expert open-file cache, mirroring `NvmeStorage`'s.
         fds: RwLock<HashMap<u32, std::sync::Arc<File>>>,
         cfg_base: std::path::PathBuf,
+        /// Cached SQE capacity (`cfg.queue_depth`). Used by the batched
+        /// submission path (gist Part 1) to **chunk** macro-batches that
+        /// exceed the ring's configured depth: we push at most
+        /// `queue_depth` SQEs, call `submit()` to hand them to the
+        /// kernel, advance the cursor, and only issue the final
+        /// blocking `submit_and_wait` after every SQE for the whole
+        /// macro-batch has been queued. This avoids the
+        /// "io_uring submission queue full" error that would otherwise
+        /// fire when the lookahead-deduplicated `warm_with` window
+        /// exceeds the ring depth.
+        queue_depth: usize,
     }
 
     impl Ring {
@@ -399,6 +410,7 @@ mod linux_impl {
                 buf_index,
                 fds: RwLock::new(HashMap::new()),
                 cfg_base: cfg.base_path.clone(),
+                queue_depth: cfg.queue_depth as usize,
             })
         }
 
@@ -478,22 +490,70 @@ mod linux_impl {
                 keep_alive.push(f);
             }
 
+            // gist Part 1 — windowed chunking by ring `queue_depth`.
+            //
+            // The previous revision pushed every SQE before calling
+            // `submit_and_wait`. If `ids.len() > queue_depth` (which
+            // happens when the speculator's deduplicated lookahead
+            // window outgrows the configured ring depth) the second
+            // `push` returned `io::Error("io_uring submission queue
+            // full")` and the batch failed wholesale.
+            //
+            // We now walk `prepared` in chunks of `queue_depth`:
+            //
+            //   * populate up to `queue_depth` SQEs;
+            //   * call `submit()` to flush them down to the kernel
+            //     (non-blocking — the kernel starts servicing the
+            //     reads while we keep queueing the rest);
+            //   * advance the cursor and repeat;
+            //   * after the entire macro-batch has been pushed,
+            //     issue **one** `submit_and_wait(N)` to block until
+            //     every completion has landed, then reap the K CQEs.
+            //
+            // This keeps the batched-submit cost at a single
+            // syscall-equivalent boundary while making the call
+            // tolerant of macro-batches that exceed `queue_depth`.
+            let cap = self.queue_depth.max(1);
+            let total = ids.len();
             let mut ring = self.ring.lock().unwrap();
-            for (i, (fd, ptr, buf_idx)) in prepared.iter().copied().enumerate() {
-                let sqe = opcode::ReadFixed::new(types::Fd(fd), ptr, len as u32, buf_idx)
-                    .offset(0)
-                    .build()
-                    .user_data(ids[i] as u64);
-                // SAFETY: see read_expert_fixed_blocking above.
-                unsafe {
-                    ring.submission().push(&sqe).map_err(|_| {
-                        io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
-                    })?;
+            let mut pushed = 0usize;
+            while pushed < total {
+                let chunk_end = (pushed + cap).min(total);
+                for i in pushed..chunk_end {
+                    let (fd, ptr, buf_idx) = prepared[i];
+                    let sqe = opcode::ReadFixed::new(types::Fd(fd), ptr, len as u32, buf_idx)
+                        .offset(0)
+                        .build()
+                        .user_data(ids[i] as u64);
+                    // SAFETY: see read_expert_fixed_blocking above.
+                    unsafe {
+                        ring.submission().push(&sqe).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::Other,
+                                "io_uring submission queue full after chunking; \
+                                 this indicates the ring is smaller than 1 SQE \
+                                 (queue_depth must be >= 1)",
+                            )
+                        })?;
+                    }
                 }
+                if chunk_end < total {
+                    // Hand this window down to the kernel so it can
+                    // start servicing the reads while we keep
+                    // populating the next chunk. Do not block on
+                    // completions yet — the wait happens once after
+                    // every SQE has been pushed.
+                    ring.submit()?;
+                }
+                pushed = chunk_end;
             }
-            ring.submit_and_wait(ids.len())?;
-            let mut total = 0usize;
-            for _ in 0..ids.len() {
+            // Final wait gathers every completion that the chunked
+            // submissions left pending. `submit_and_wait(total)`
+            // submits any remaining SQEs from the last chunk and
+            // blocks until all `total` reads complete.
+            ring.submit_and_wait(total)?;
+            let mut totalbytes = 0usize;
+            for _ in 0..total {
                 let cqe = ring.completion().next().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::Other, "io_uring: missing completion event")
                 })?;
@@ -501,11 +561,11 @@ mod linux_impl {
                 if result < 0 {
                     return Err(io::Error::from_raw_os_error(-result));
                 }
-                total += result as usize;
+                totalbytes += result as usize;
             }
             // `keep_alive` goes out of scope here; the fds remain
             // cached in `self.fds` and will be reused on the next call.
-            Ok(total)
+            Ok(totalbytes)
         }
     }
 

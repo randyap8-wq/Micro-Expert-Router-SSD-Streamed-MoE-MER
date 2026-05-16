@@ -51,6 +51,36 @@ single-process `combine_moe_outputs` does today. Top-K is small
 
 ## Status
 
+The transport-agnostic scaffolding for the sharded `RouteExperts`
+RPC is **in tree** as of this PR:
+
+* The shard-routing function ([`crate::rpc::shard_for_expert`]) and
+  the top-K bucketing helper
+  ([`crate::rpc::group_top_k_by_shard`]) — the only routing
+  decisions the request-receiving node makes when the partitioning
+  is enabled.
+* The packed wire-format frames
+  ([`crate::rpc::RouteExpertsRequest`] /
+  [`crate::rpc::RouteExpertsResponse`]) with explicit
+  `encode` / `decode` — bit-identical to the layout an eventual
+  `tonic`-generated decoder will produce against the matching
+  `proto/route_experts.proto` schema. Carrying both `hidden_state`
+  and `ffn_out` as packed `bytes` keeps the on-wire path zero-copy.
+* `proto/route_experts.proto` — the gRPC contract a follow-up
+  `tonic` integration consumes. Service surface is two RPCs:
+  `RouteExperts` and `Health`, matching the sketch above.
+
+What is **not** in tree yet (and is left to a follow-up so the
+default build stays lean):
+
+* The `tonic` server / client wiring. Bringing it in adds ~150
+  transitive crates; the current scaffold ships the packed
+  byte-stream encoder so a unix-socket prototype can validate the
+  combiner end-to-end before that dependency lands.
+* The runtime shard table — a static `expert_id → worker_address`
+  map driven from `[distributed]` config. The existing single-
+  process path is the trivial special case (`num_workers == 1`).
+
 This document captures the design so a follow-up change can implement
 it without re-deriving it; the partitioning surface area is recorded
-here on purpose, ahead of the implementation.
+here and exercised by the unit tests in `src/rpc.rs`.
