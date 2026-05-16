@@ -70,10 +70,13 @@ pub trait DraftLike: Send + Sync {
 /// equivalent to `temperature = 0` sampling and matches the verifier
 /// when run with `SamplingParams::greedy()`.
 pub struct DraftEngine {
-    /// Shared reference to the main model's embedding table. Tied
-    /// embedding keeps the draft head's parameter count at zero
-    /// (excluding the bias vector) so the engine never accidentally
-    /// drifts into "the draft is bigger than the verifier" territory.
+    /// Shared `Arc<Vec<f32>>` snapshot of the main model's embedding
+    /// table. The current loader stores the embedding as a plain
+    /// `Vec<f32>` on `RealModel`, so `from_main` clones it into the
+    /// `Arc` once at construction. Tied embedding (in the ML sense:
+    /// the draft's logit projection reuses the same weight matrix as
+    /// the verifier's input embedding) is preserved regardless of
+    /// whether the bytes are physically shared.
     embedding: Arc<Vec<f32>>,
     /// Vocabulary size and hidden dim — copied from the main model
     /// at construction so the draft can run without holding a
@@ -156,6 +159,17 @@ impl DraftEngine {
     pub fn from_main(main: &RealModel) -> Self {
         let d = main.config.d_model;
         let vocab = main.config.vocab_size;
+        // A zero-vocab model can't produce drafts and would also make
+        // `inv_vocab = 1.0 / 0.0 = inf`, silently corrupting every
+        // bias entry to inf/NaN and every subsequent draft to garbage.
+        assert!(
+            vocab > 0,
+            "DraftEngine::from_main requires vocab_size > 0 (got {vocab})"
+        );
+        assert!(
+            d > 0,
+            "DraftEngine::from_main requires d_model > 0 (got {d})"
+        );
         // Seed the bias with a cheap hash of the embedding rows so
         // it varies with the main model but doesn't pull in an RNG.
         // 64-byte-aligned scratch — keeps the AVX-512 16-wide loads

@@ -271,6 +271,7 @@ impl BlockPool {
         thresholds: PressureThresholds,
     ) -> Arc<Self> {
         assert!(kv_dim > 0, "BlockPool kv_dim must be > 0");
+        assert!(capacity > 0, "BlockPool capacity must be > 0");
         let block_floats = POOL_BLOCK_TOKENS * kv_dim;
         let total = block_floats.checked_mul(capacity).expect("BlockPool capacity overflows usize");
         let keys = vec![0.0f32; total];

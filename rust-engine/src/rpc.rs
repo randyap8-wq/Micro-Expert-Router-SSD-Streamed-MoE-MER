@@ -24,11 +24,11 @@
 //!   without a re-encode.
 //!
 //! When a follow-up PR wires in `tonic`, the `.proto` schema
-//! mirroring the structs below lives at `proto/route_experts.proto`.
-//! The Rust types in this file are intentionally *not* derived from
-//! `prost`; they hand-roll a tiny length-prefixed format so the
-//! engine can validate end-to-end on a unix socket before the
-//! `tonic` dependency is committed to.
+//! mirroring the structs below will live at `proto/route_experts.proto`
+//! (not yet committed). The Rust types in this file are intentionally
+//! *not* derived from `prost`; they hand-roll a tiny length-prefixed
+//! format so the engine can validate end-to-end on a unix socket
+//! before the `tonic` dependency is committed to.
 
 use std::convert::TryInto;
 use std::io;

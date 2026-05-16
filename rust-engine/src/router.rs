@@ -386,9 +386,30 @@ impl PredictiveLoader {
     /// Record a whole batch of activations from a single token's expert set.
     /// Each previous-token expert transitions to each current-token expert.
     pub fn observe_step(&self, prev_set: &[u32], next_set: &[u32]) {
-        for &p in prev_set {
-            for &n in next_set {
-                self.observe(p, n);
+        // Take the write lock once for the whole batch (top-K² updates
+        // per call) rather than re-acquiring it inside every iteration.
+        // With top-K=8 the inner loop fires 64 updates per token, and
+        // the previous per-update lock acquisition dominated the
+        // routing tail under continuous batching.
+        if prev_set.is_empty() || next_set.is_empty() {
+            return;
+        }
+        let n = self.num_experts;
+        let mut rows = self.rows.write();
+        for &from in prev_set {
+            if from >= n {
+                continue;
+            }
+            let row = &mut rows[from as usize];
+            for &to in next_set {
+                if to >= n {
+                    continue;
+                }
+                let entry = row.counts.entry(to).or_insert(0);
+                if *entry < u32::MAX {
+                    *entry += 1;
+                    row.total_observed = row.total_observed.saturating_add(1);
+                }
             }
         }
     }

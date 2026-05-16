@@ -16,7 +16,7 @@
 #   docker compose up --build
 #
 # Smoke test:
-#   curl -sS http://localhost:8080/healthz
+#   curl -sS http://localhost:8080/health
 #   curl -sS -X POST http://localhost:8080/v1/completions \
 #     -H 'content-type: application/json' \
 #     -d '{"prompt":"Hello","max_tokens":4,"stream":true}'
@@ -51,7 +51,9 @@ services:
     # devices:
     #   - "/dev/nvme0n1:/dev/nvme0n1"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/micro-expert-router", "--help"]
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS http://127.0.0.1:8080/health || exit 1"
       interval: 30s
       timeout: 5s
       retries: 3

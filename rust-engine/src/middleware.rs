@@ -201,10 +201,26 @@ impl Admission {
     /// the slot on `Drop`.
     pub fn try_admit(&self) -> Option<AdmissionGuard> {
         if self.inner.max_concurrent > 0 {
-            let prev = self.inner.in_flight.fetch_add(1, Ordering::AcqRel);
-            if prev >= self.inner.max_concurrent {
-                self.inner.in_flight.fetch_sub(1, Ordering::AcqRel);
-                return None;
+            // Atomically reserve a slot via CAS so that two concurrent
+            // callers can never both observe `cur == max - 1` and both
+            // pass. The previous `fetch_add` + post-hoc compare leaked
+            // briefly over the limit under contention (and, in the
+            // worst case, two callers could each see `prev < max` and
+            // both proceed).
+            let mut cur = self.inner.in_flight.load(Ordering::Acquire);
+            loop {
+                if cur >= self.inner.max_concurrent {
+                    return None;
+                }
+                match self.inner.in_flight.compare_exchange_weak(
+                    cur,
+                    cur + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => cur = observed,
+                }
             }
         }
         if self.inner.min_free_blocks > 0 {

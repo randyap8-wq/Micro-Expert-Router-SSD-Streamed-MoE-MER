@@ -432,6 +432,18 @@ pub struct TraceWriter {
     /// definite "everything queued so far has been written" point
     /// (used in shutdown paths and tests).
     flush_signal: Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar, std::sync::atomic::AtomicU64)>,
+    /// Producer-side high-water mark: the largest sequence number
+    /// `write_record` has ever assigned. `flush` waits for the worker
+    /// to catch up to this value (not the worker's own HWM, which
+    /// would be `0` until at least one record has been processed,
+    /// causing `flush` to return prematurely).
+    producer_hwm: std::sync::atomic::AtomicU64,
+    /// Monotonic sequence counter for outgoing records. Per-instance
+    /// (was previously a `static` inside `write_record`, which shared
+    /// the counter across every `TraceWriter` ever created in the
+    /// process and prevented `flush` from synchronising correctly
+    /// when multiple writers existed in tests).
+    seq: std::sync::atomic::AtomicU64,
     /// Set to `true` the first time a write fails so subsequent failures
     /// stay silent. Without this guard a sticky I/O error (full disk,
     /// unwritable path) would emit a `warn!` on *every* record and
@@ -516,15 +528,21 @@ impl TraceWriter {
         Ok(Self {
             tx: parking_lot::Mutex::new(Some(tx)),
             flush_signal,
+            producer_hwm: std::sync::atomic::AtomicU64::new(0),
+            seq: std::sync::atomic::AtomicU64::new(0),
             write_failed_once: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub fn write_record(&self, token: u64, layer: u32, experts: &[u32], cache_hit: &[bool]) {
-        // Assign a monotonic sequence so flush() has something to
-        // wait on.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Assign a monotonic per-writer sequence so flush() has
+        // something to wait on.
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Record the producer high-water mark *before* enqueuing so
+        // flush() can never read a value the producer has not yet
+        // committed to. Release pairs with flush()'s Acquire load.
+        self.producer_hwm
+            .store(seq, std::sync::atomic::Ordering::Release);
         let rec = TraceRecord {
             token,
             layer,
@@ -550,20 +568,13 @@ impl TraceWriter {
         // Block until the worker has caught up to the highest seq the
         // producer side has ever assigned. Bounded wait so a stuck
         // worker can't deadlock the caller.
-        let target = std::sync::atomic::AtomicU64::new(0);
-        // Read the current producer high-water mark *atomically*: we
-        // can simply ask the channel since a `flush` after a series
-        // of `write_record` calls will see the most recent SEQ.
-        let snapshot = {
-            let _ = &target;
-            // Re-fetch from the static. (We rely on the relaxed load
-            // being a recent value; the worker is monotonically
-            // catching up so any value ≤ the true current is safe.)
-            // SAFETY: the static was only ever written via fetch_add.
-            // Use Acquire to pair with the worker's Release store on
-            // the same atomic.
-            self.flush_signal.2.load(std::sync::atomic::Ordering::Acquire)
-        };
+        //
+        // Snapshot the *producer* HWM (not the worker's HWM); the
+        // worker's HWM lags the producer and would let `flush` return
+        // before the worker has actually drained the latest records.
+        let snapshot = self
+            .producer_hwm
+            .load(std::sync::atomic::Ordering::Acquire);
         if snapshot == 0 {
             return; // nothing ever queued
         }
