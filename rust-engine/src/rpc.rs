@@ -130,6 +130,20 @@ impl RouteExpertsRequest {
     pub fn encode(&self) -> Vec<u8> {
         let k = self.expert_ids.len();
         let d = self.hidden_state_f16.len();
+        // Frame self-consistency (release, not just debug): the
+        // header `d_model` must match the actual hidden-state slice
+        // length, otherwise a decoder reading exactly `d_model`
+        // elements would silently drop the trailing bytes (or
+        // overrun the buffer) and produce a frame that round-trips
+        // to a different value. The two-fields invariant is the
+        // encoder's responsibility — fail loudly here rather than
+        // ship an inconsistent frame on the wire.
+        assert_eq!(
+            d, self.d_model as usize,
+            "RouteExpertsRequest::encode: hidden_state_f16.len() ({d}) != d_model ({}) — \
+             refusing to emit an inconsistent frame",
+            self.d_model
+        );
         let mut out = Vec::with_capacity(20 + 4 * k + 2 * d);
         out.extend_from_slice(&self.request_id.to_le_bytes());
         out.extend_from_slice(&self.layer_idx.to_le_bytes());
@@ -220,6 +234,19 @@ impl RouteExpertsResponse {
     pub fn encode(&self) -> Vec<u8> {
         let k = self.expert_ids.len();
         let d = self.d_model as usize;
+        // Frame self-consistency (release, not just debug): the
+        // flat `ffn_out_f16` slice must be exactly `k * d_model`
+        // entries — row `i` is the FFN output for `expert_ids[i]`.
+        // A mismatch here would emit an internally inconsistent
+        // frame the decoder cannot recover, so we fail loudly on
+        // the encoder side.
+        assert_eq!(
+            self.ffn_out_f16.len(),
+            k * d,
+            "RouteExpertsResponse::encode: ffn_out_f16.len() ({}) != expert_ids.len() ({k}) \
+             * d_model ({d}) — refusing to emit an inconsistent frame",
+            self.ffn_out_f16.len()
+        );
         let mut out = Vec::with_capacity(16 + 4 * k + 2 * d * k);
         out.extend_from_slice(&self.request_id.to_le_bytes());
         out.extend_from_slice(&self.d_model.to_le_bytes());
@@ -227,7 +254,6 @@ impl RouteExpertsResponse {
         for &id in &self.expert_ids {
             out.extend_from_slice(&id.to_le_bytes());
         }
-        debug_assert_eq!(self.ffn_out_f16.len(), k * d);
         for &h in &self.ffn_out_f16 {
             out.extend_from_slice(&h.to_le_bytes());
         }
@@ -444,5 +470,34 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 3];
         let err = RouteExpertsRequest::decode(truncated).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    #[should_panic(expected = "RouteExpertsRequest::encode: hidden_state_f16.len()")]
+    fn encode_panics_on_d_model_mismatch_request() {
+        // Internal-consistency guard (release, not just debug):
+        // a divergent `d_model` vs `hidden_state_f16.len()` must
+        // refuse to emit a frame instead of silently producing one
+        // that would not round-trip.
+        let req = RouteExpertsRequest {
+            request_id: 1,
+            layer_idx: 0,
+            d_model: 8,
+            expert_ids: vec![0],
+            hidden_state_f16: vec![0; 4], // mismatch: 4 != 8
+        };
+        let _ = req.encode();
+    }
+
+    #[test]
+    #[should_panic(expected = "RouteExpertsResponse::encode: ffn_out_f16.len()")]
+    fn encode_panics_on_ffn_out_size_mismatch_response() {
+        let resp = RouteExpertsResponse {
+            request_id: 1,
+            d_model: 4,
+            expert_ids: vec![0, 1], // k=2, expects 8 elements
+            ffn_out_f16: vec![0; 5], // mismatch: 5 != 2*4
+        };
+        let _ = resp.encode();
     }
 }
