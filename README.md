@@ -1938,58 +1938,34 @@ you can verify the energy-saving paths actually engaged.
 
 ## Limitations / next steps
 
-- **Per-expert kernel dispatcher.** The engine ships a runtime
-  CPU-feature dispatcher (`src/kernels/`) that selects between a
-  scalar reference path (always on), AVX2+FMA (always compiled on
-  x86_64, no cargo feature required — gated on the runtime probe),
-  AVX-512 fused int8-dequant + dot (`--features avx512`), and an
-  Intel AMX tile skeleton (`--features amx`, currently routes back
-  to scalar on stable Rust until the tile intrinsics stabilise).
-  The chosen backend is logged once at startup. The dense
-  `transformer` projections benefit independently from the runtime
-  row-parallel `matmul_row_major` (always compiled) and from
-  `--features blas` (the `matrixmultiply` SGEMV microkernel) when
-  it's the better fit for the workload. The per-expert SwiGLU FFN
-  itself already runs through **`candle-core`** (CPU-only build, no
-  `candle-nn`, no GPU backends); enabling a GPU backend (Candle's
-  `cuda` / `metal` features, or swapping for `tch` / `cudarc`) is a
-  localised change inside `inference.rs` — or, for swappable
-  executors without touching `inference.rs`, an additional `Backend`
-  implementation registered via `backend::set_backend`. See
-  [Decoupled math backend](#decoupled-math-backend).
-- **NUMA budget.** `MER_PIN_CORES=N` is honoured at startup to
-  `sched_setaffinity(2)` the process to the first `N` CPUs of
-  NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere).
-  See `src/numa.rs`. Real per-ring per-node pinning would still
-  need one io_uring ring per node and per-node buffer pools, a
-  deeper refactor.
-- **Streaming GGUF reader.** `gguf-convert` defaults to a streaming
-  reader (`crate::gguf::GgufStreamReader`) that parses only the
-  header + tensor-info table into memory and reads each tensor
-  body on demand with `seek + read_exact`. Pass `--legacy-eager`
-  to fall back to the in-memory `GgufFile::open` reader for
-  small fixtures or compatibility testing. The streaming path is
-  a strict win for ≥ 100 GB checkpoints.
-- **Unified Tensor Header (U.T.H.).** Every `expert_<id>.bin`
-  produced by `gguf-convert` is prefixed by default with a
-  64-byte U.T.H. (`UTH1` magic + dtype + shape + quant-scale
-  offset + AMX tile hint + flags), page-padded to 4 KiB so the
-  weight payload still starts at a `O_DIRECT`-friendly boundary.
-  Older consumers that need the legacy bare-payload layout can
-  pass `--no-uth`. The runtime
-  (`ExpertResident::data()` / `expert_cache.rs`) transparently
-  strips the header when present, so the rest of the engine sees
-  exactly the same bytes as before.
-- **Primary / Shadow buffer pool.** `BufferPool::new_with_shadow`
-  carves the pool into a primary half (resident LRU) and an
-  optional shadow half reserved for speculative prefetches.
-  Speculation calls `try_acquire_shadow` so it can never starve
-  primary work; on confirmation, `promote_shadow` does a
-  zero-copy slot-tag swap so the same backing memory becomes a
-  resident without re-reading the SSD. When the `io_uring` cargo
-  feature is on, `IoUringStorage::read_experts_batch_fixed_promote`
-  fires one batched `submit_and_wait(K)` over those shadow buffers
-  and applies the promotion on completion — a single syscall covers
-  every prefetched expert and the resulting buffers are already
-  primary by the time the caller sees them.
+The streaming GGUF reader, the Unified Tensor Header (U.T.H.) format,
+and the primary/shadow `BufferPool` (with the batched
+`IoUringStorage::read_experts_batch_fixed_promote` fast path) are all
+shipped and on by default — see the *Energy Efficiency Features*
+section above for the user-facing details. The genuinely open items
+are:
+
+- **GPU / alternative math backend.** The per-expert SwiGLU FFN runs
+  through **`candle-core`** (CPU-only build, no `candle-nn`, no GPU
+  backends). Enabling a GPU backend (Candle's `cuda` / `metal`
+  features, or swapping for `tch` / `cudarc`) is a localised change
+  inside `inference.rs` — or, for swappable executors without
+  touching `inference.rs`, an additional `Backend` implementation
+  registered via `backend::set_backend`. See
+  [Decoupled math backend](#decoupled-math-backend). Validating this
+  requires GPU hardware, so it is left to contributors with the
+  appropriate target.
+- **AMX tile intrinsics.** `--features amx` compiles in the Intel
+  AMX tile skeleton in `src/kernels/`, but currently routes back to
+  the scalar path on stable Rust until the tile intrinsics
+  stabilise. The runtime dispatcher already selects between the
+  scalar reference path, AVX2+FMA (always compiled on x86_64), and
+  AVX-512 (`--features avx512`); AMX will slot into the same
+  dispatcher once the intrinsics land.
+- **Per-NUMA-node io_uring rings.** `MER_PIN_CORES=N` is honoured at
+  startup to `sched_setaffinity(2)` the process to the first `N`
+  CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn
+  elsewhere — see `src/numa.rs`). Real per-ring per-node pinning
+  would still need one io_uring ring per node and per-node buffer
+  pools, a deeper refactor of `IoUringStorage` and `BufferPool`.
 
