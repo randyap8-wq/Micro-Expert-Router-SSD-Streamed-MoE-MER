@@ -97,7 +97,13 @@ impl LinearGate {
         let mut weights: Vec<f32> = idx.iter().map(|&i| logits[i as usize]).collect();
         if self.normalise_topk {
             let sum: f32 = weights.iter().sum();
-            if sum > 0.0 {
+            // Guard against `0.0`, negatives (impossible post-softmax but
+            // cheap to defend), and non-finite values (`NaN`/`±inf`) that
+            // can arise from a broken gate weight load. In any of those
+            // degenerate cases we leave the unnormalised top-k weights
+            // alone rather than producing `NaN`s the downstream mixture
+            // would silently propagate.
+            if sum.is_finite() && sum > 0.0 {
                 for w in &mut weights {
                     *w /= sum;
                 }

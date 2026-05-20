@@ -37,6 +37,11 @@
 //! anything implementing [`DraftLike`] plugs into
 //! `step_speculative`.
 
+// Speculative-decoding scaffold (gist Phase 2). The wiring into
+// `Engine::generate` lands in a follow-up; until then keep the public
+// surface compilable without per-item `dead_code` noise.
+#![allow(dead_code)]
+
 use crate::engine::Engine;
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;

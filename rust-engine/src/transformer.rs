@@ -1139,7 +1139,7 @@ mod tests {
             vec![-2.5f32; 7].into_boxed_slice(),
             vec![f32::INFINITY; 1].into_boxed_slice(),
             Vec::<f32>::new().into_boxed_slice(),
-            vec![3.14f32; 33].into_boxed_slice(),
+            vec![std::f32::consts::PI; 33].into_boxed_slice(),
         ];
         // Sanity: at least one non-zero element exists before zeroising.
         assert!(blocks.iter().any(|b| b.iter().any(|&v| v != 0.0)));

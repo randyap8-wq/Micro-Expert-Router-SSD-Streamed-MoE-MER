@@ -48,7 +48,7 @@ use crate::buffer_pool::BufferPool;
 use crate::engine::{Engine, EngineOptions, ModelShape};
 use crate::expert_cache::ExpertCache;
 use crate::inference::expert_weight_bytes;
-use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
+use crate::io_provider::{NvmeStorage, StorageConfig};
 use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter};
 
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
@@ -1847,9 +1847,10 @@ pub fn detect_data_dir_numa_node(data_dir: &std::path::Path) -> Option<i32> {
         // for the legacy layout but Linux uses a more flexible
         // encoding. libc::major()/minor() handle both.
         let dev = md.dev();
-        // SAFETY: makedev / major / minor are pure macros; we use libc.
-        let major = unsafe { libc::major(dev) } as u32;
-        let minor = unsafe { libc::minor(dev) } as u32;
+        // `libc::major` / `libc::minor` are safe `const fn`s in libc ≥ 0.2.156;
+        // no `unsafe` block is required.
+        let major = libc::major(dev) as u32;
+        let minor = libc::minor(dev) as u32;
         let sys_path = format!("/sys/dev/block/{}:{}/device/numa_node", major, minor);
         let body = std::fs::read_to_string(&sys_path).ok()?;
         let node: i32 = body.trim().parse().ok()?;
