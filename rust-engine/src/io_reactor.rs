@@ -43,6 +43,11 @@
 //! end-to-end semantics (single fetch under contention, fair
 //! ordering, errors propagated cleanly).
 
+// Actor-pattern I/O reactor (gist Part 2, fix #6). Replaces the current
+// `DashMap` in-flight set, but isn't wired into the hot path yet; the
+// items below are the public surface the swap-over will use.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};

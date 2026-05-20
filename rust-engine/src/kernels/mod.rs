@@ -44,6 +44,11 @@
 //! never a re-probe of `is_x86_feature_detected!`. This matches the
 //! gist's explicit "Zero-Overhead Dispatch" constraint.
 
+// CPU-feature kernel scaffold (gist Task 1). The AVX-512 / AMX paths are
+// compiled but not yet selected by the hot path on every target; keep
+// the per-arch helpers compiled without `dead_code` noise.
+#![allow(dead_code)]
+
 pub mod scalar;
 
 #[cfg(target_arch = "x86_64")]

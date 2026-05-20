@@ -1106,8 +1106,8 @@ fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_mode
                     0.0, u_vec.as_mut_ptr(), 1, 1,
                 );
             }
-            for i in 0..d_ff {
-                gated[i] = silu(gated[i]) * u_vec[i];
+            for (g, &u) in gated.iter_mut().zip(u_vec.iter()) {
+                *g = silu(*g) * u;
             }
         });
         return;

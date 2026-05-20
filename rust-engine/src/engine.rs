@@ -497,7 +497,10 @@ impl TraceWriter {
                 let mut latched_failure = false;
                 // Outer loop: block until at least one record arrives.
                 'outer: while let Ok(first) = rx.recv() {
-                    let mut latest_seq = first.seq;
+                    // `latest_seq` is assigned inside the inner loop before
+                    // it's read after the loop, so no initial value is
+                    // needed here.
+                    let mut latest_seq;
                     let mut rec = first;
                     // Inner loop: drain anything already queued before
                     // touching the BufWriter::flush. This lets sustained
@@ -723,7 +726,7 @@ pub struct PredictiveTelemetry {
 }
 
 #[derive(Default)]
-struct Counters {
+pub(crate) struct Counters {
     hits: AtomicU64,
     misses: AtomicU64,
     prefetch_completed: AtomicU64,

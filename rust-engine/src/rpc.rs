@@ -30,6 +30,11 @@
 //! format so the engine can validate end-to-end on a unix socket
 //! before the `tonic` dependency is committed to.
 
+// Sharded `RouteExperts` RPC scaffold (gist Part 4). Not yet wired into
+// the single-process server; keep the transport types compilable
+// without per-item `dead_code` noise.
+#![allow(dead_code)]
+
 use std::convert::TryInto;
 use std::io;
 

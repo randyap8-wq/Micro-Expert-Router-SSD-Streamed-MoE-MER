@@ -34,6 +34,12 @@
 //! `main.rs`). The hot path therefore pays one atomic load, never a
 //! `cfg!` macro evaluation, a feature-gated branch, or a runtime probe.
 
+// Forward-looking backend plugin scaffold (gist Task 2). Items here are
+// referenced by future code paths and are intentionally retained as a
+// stable surface; silence noisy per-item `dead_code` warnings at the
+// module level until those paths come online.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::sync::OnceLock;
 
