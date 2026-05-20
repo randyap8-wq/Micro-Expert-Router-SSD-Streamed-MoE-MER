@@ -35,7 +35,6 @@
 // without per-item `dead_code` noise.
 #![allow(dead_code)]
 
-use std::convert::TryInto;
 use std::io;
 
 /// Deterministic shard assignment for an expert id (gist Part 4 /
