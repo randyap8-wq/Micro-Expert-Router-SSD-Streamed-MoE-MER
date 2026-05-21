@@ -616,6 +616,140 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+// ---------------------------------------------------------------------------
+// Live-reloadable runtime configuration.
+//
+// `RuntimeConfig` carries the subset of `Config` whose values may legitimately
+// change at runtime without rebuilding the engine, scheduler, storage, or
+// model. It is the surface read by Tokio worker threads on the **hot
+// token-evaluation path** — the sampling defaults applied to every request
+// and the per-request `max_tokens` cap.
+//
+// Hot-path access goes through `arc_swap::ArcSwap<RuntimeConfig>`:
+//
+//   * `LiveConfig::snapshot()` is a single relaxed atomic load returning an
+//     `Arc<RuntimeConfig>`. There is **no mutex** anywhere on the inference
+//     path; multiple worker threads reading concurrently never contend.
+//   * SIGHUP-triggered reloads `parse → validate → store`. If any step
+//     fails, the in-memory runtime stays bit-identical (`tracing::warn!` is
+//     emitted instead). Successful reloads are an atomic pointer swap —
+//     in-flight readers keep observing the previous `Arc<RuntimeConfig>`
+//     until they drop their snapshot, so no visibility tear can occur.
+//
+// `RuntimeConfig` is therefore intentionally narrow: only fields that can
+// be applied without rebuilding stateful subsystems (model weights, block
+// pool capacity, ring depth, …) live here. Restart-required knobs stay on
+// `Config` and trigger a `WARN`-level diff log on SIGHUP.
+// ---------------------------------------------------------------------------
+
+/// Subset of [`Config`] safe to swap atomically while the engine is serving
+/// traffic. See module-level comment above.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    /// Server-wide default sampling parameters. Per-request overrides
+    /// from the JSON body still win; this is the baseline.
+    pub sampling: crate::sampling::SamplingParams,
+    /// Per-request cap on generated tokens. The HTTP layer clamps
+    /// each request's `max_tokens` to this value before driving the
+    /// engine.
+    pub max_tokens_cap: usize,
+    /// Telemetry flag: emit per-request structured logs (`info`-level
+    /// access log line including model name, prompt + completion
+    /// token counts, latency, and request id). When `false` only
+    /// `warn!` / `error!` lines are emitted from the request path.
+    ///
+    /// Reserved for future use by the request handlers; carried in
+    /// `RuntimeConfig` today so SIGHUP can flip it live without a
+    /// `Config` rewrite once the access-log path is wired.
+    #[allow(dead_code)]
+    pub access_log_enabled: bool,
+}
+
+impl RuntimeConfig {
+    /// Build a `RuntimeConfig` from the full TOML [`Config`].
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            sampling: cfg.sampling.to_params(),
+            max_tokens_cap: cfg.server.max_tokens,
+            // Default `true` matches the pre-refactor behaviour where
+            // the request handlers unconditionally emitted an info log.
+            access_log_enabled: true,
+        }
+    }
+}
+
+/// Thread-safe handle to the live, atomically swappable [`RuntimeConfig`].
+///
+/// Cloning a [`LiveConfig`] is `O(1)` — both clones share the same
+/// `ArcSwap` and therefore observe the same atomic swaps. The hot path
+/// only ever calls [`Self::snapshot`], which is a single relaxed atomic
+/// load.
+#[derive(Clone)]
+pub struct LiveConfig {
+    inner: std::sync::Arc<arc_swap::ArcSwap<RuntimeConfig>>,
+}
+
+impl LiveConfig {
+    /// Build a new `LiveConfig` seeded from the given full [`Config`].
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            inner: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                RuntimeConfig::from_config(cfg),
+            )),
+        }
+    }
+
+    /// Zero-overhead hot-path read. Returns a cheap RCU-style guard
+    /// that dereferences to the current [`RuntimeConfig`]. Holding the
+    /// guard for the duration of one token-evaluation step is fine —
+    /// concurrent SIGHUP reloads do not block on it.
+    #[inline]
+    pub fn snapshot(&self) -> arc_swap::Guard<std::sync::Arc<RuntimeConfig>> {
+        self.inner.load()
+    }
+
+    /// Snapshot helper that clones the inner `Arc` so callers can hold
+    /// the value across an `await` point without keeping the underlying
+    /// RCU guard live. Still O(1) — just an atomic refcount bump.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn load_full(&self) -> std::sync::Arc<RuntimeConfig> {
+        self.inner.load_full()
+    }
+
+    /// Validate `new` and, on success, atomically replace the live
+    /// runtime configuration. On any validation failure (schema, range,
+    /// invariant) the in-memory runtime is left **pristine** and a
+    /// structured `tracing::warn!` is emitted so operators can correlate
+    /// the rejected SIGHUP with their config-management pipeline.
+    ///
+    /// Returns the new runtime config on success so the caller may
+    /// inspect / diff against the previous snapshot.
+    pub fn try_reload(&self, new: &Config) -> Result<std::sync::Arc<RuntimeConfig>, ConfigError> {
+        // Re-validate; never trust a freshly-parsed Config to satisfy
+        // the cross-section invariants without an explicit check.
+        if let Err(e) = new.validate() {
+            tracing::warn!(
+                error = %e,
+                "live config reload rejected: validation failed; existing runtime \
+                 configuration left un-mutated",
+            );
+            return Err(e);
+        }
+        let next = std::sync::Arc::new(RuntimeConfig::from_config(new));
+        self.inner.store(next.clone());
+        Ok(next)
+    }
+}
+
+impl std::fmt::Debug for LiveConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveConfig")
+            .field("snapshot", &*self.snapshot())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

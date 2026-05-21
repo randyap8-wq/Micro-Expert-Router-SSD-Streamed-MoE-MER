@@ -41,6 +41,13 @@ prometheus = { version = "0.13", default-features = false }
 # which is exactly what we want around a short critical section.
 parking_lot = "0.12"
 
+# Lock-free, RCU-style atomic Arc swap. Used for the live-reloadable
+# runtime configuration so Tokio worker threads can read sampling
+# parameters / max-tokens caps on the hot token-evaluation path with
+# zero lock contention — `ArcSwap::load()` is a single relaxed atomic
+# load. See `crate::config::RuntimeConfig`.
+arc-swap = "1.7"
+
 # CLI and structured logging.
 clap = { version = "4.4", features = ["derive", "env"] }
 tracing = "0.1"

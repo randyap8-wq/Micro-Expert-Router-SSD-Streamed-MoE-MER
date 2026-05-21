@@ -309,6 +309,12 @@ pub fn log_backend() {
         sapphire_rapids = f.sapphire_rapids_or_newer,
         "auto-escalation selected math kernel backend"
     );
+    // When the `amx` feature is compiled in, surface the one-time
+    // fallback notice unconditionally — the dispatcher may have
+    // selected AMX in `b`, but the executor body is still the scalar
+    // reference until stable tile intrinsics land.
+    #[cfg(feature = "amx")]
+    amx::init_warn_once();
 }
 
 // -----------------------------------------------------------------------
