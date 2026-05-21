@@ -453,7 +453,7 @@ reads are `IORING_OP_READ_FIXED` SQEs that reference a buffer
 on the hot path.
 
 The ring itself is owned **exclusively** by a dedicated
-`io_uring-reactor` OS thread; the public async surface
+`mer-io-reactor` OS thread; the public async surface
 (`IoUringStorage::read_expert_fixed` / `read_experts_batch_fixed` /
 `read_experts_batch_fixed_promote`) never holds a `Mutex<IoUring>`
 and never calls `block_in_place`. Requests are handed to the reactor
@@ -1782,7 +1782,7 @@ turns an opaque kernel `EINVAL` into a structured `InvalidInput`
 error). `read_expert_fixed` then submits an `IORING_OP_READ_FIXED`
 SQE that references the buffer *index* and waits for the completion.
 
-The ring is owned **exclusively** by a dedicated `io_uring-reactor`
+The ring is owned **exclusively** by a dedicated `mer-io-reactor`
 OS thread — there is **no `Mutex<IoUring>`** on the request path.
 Requests flow into the reactor over a **bounded
 `tokio::sync::mpsc`** channel (sized to `queue_depth`), giving the

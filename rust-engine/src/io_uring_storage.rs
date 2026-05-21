@@ -466,7 +466,7 @@ mod linux_impl {
             // reactor is in flight on at least one macro-batch.
             let (tx, rx) = tokio::sync::mpsc::channel::<ReactorRequest>(queue_depth);
             let reactor = std::thread::Builder::new()
-                .name("io_uring-reactor".into())
+                .name("mer-io-reactor".into())
                 .spawn(move || reactor_loop(ring, rx, queue_depth))
                 .map_err(|e| {
                     io::Error::new(
