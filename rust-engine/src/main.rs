@@ -867,31 +867,43 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         admission,
     };
 
+    // Live, atomically-swappable runtime configuration. The hot
+    // token-evaluation path reads sampling defaults and the
+    // `max_tokens` cap through `runtime.snapshot()` (a single relaxed
+    // atomic load — see `LiveConfig` in `crate::config`). SIGHUP
+    // refreshes this in place.
+    let runtime = crate::config::LiveConfig::from_config(&cfg);
+
     let state = AppState {
         engine,
         tokenizer,
         metrics: Metrics::new(),
-        max_tokens_cap: cfg.server.max_tokens,
         real_model,
         batch_scheduler,
-        default_sampling: cfg.sampling.to_params(),
+        runtime: runtime.clone(),
         sessions,
         middleware: middleware_state,
     };
-    // SIGHUP-triggered config reload (diff-only). Re-reads the file,
-    // validates it, and logs which fields differ from the
-    // configuration baseline used by the reload task. This path does
-    // *not* mutate the live `AppState` that requests use — the
-    // engine, scheduler, sampling defaults, and middleware are
-    // constructed once at startup and are not currently
-    // atomic-mutable. The task advances its local baseline after a
-    // successful parse so later SIGHUPs compare against the most
-    // recently accepted file, but operators must restart the process
-    // for any reloaded value to actually take effect.
+    // SIGHUP-triggered config reload.
+    //
+    // For fields covered by [`crate::config::RuntimeConfig`] (sampling
+    // defaults, max-tokens cap, telemetry flags) we apply the reload
+    // live via `runtime.try_reload(&new)` — an atomic `ArcSwap` store.
+    // In-flight requests holding a `runtime.snapshot()` keep observing
+    // their previous `Arc<RuntimeConfig>` until they drop it; concurrent
+    // SIGHUPs never block on each other and never block readers.
+    //
+    // For restart-required fields (storage prefetch settings, batch
+    // scheduler timing, etc.) we still emit a structured diff at WARN
+    // level so operators know a restart is needed to fully apply the
+    // file. If parsing or validation fails the in-memory runtime is
+    // left **pristine** and a single `tracing::warn!` line documents
+    // the rejection.
     #[cfg(unix)]
     {
         let path = config_path.clone();
         let baseline = cfg.clone();
+        let runtime = runtime;
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let mut sig = match signal(SignalKind::hangup()) {
@@ -907,40 +919,37 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                 let new = match Config::from_file(&path) {
                     Ok(c) => c,
                     Err(e) => {
-                        warn!(error = %e, "config reload rejected; keeping previous config");
+                        warn!(
+                            error = %e,
+                            "config reload rejected; existing runtime configuration left un-mutated",
+                        );
                         continue;
                     }
                 };
-                // Diff-only: log what would change. The reload task
-                // does not hold a handle to the live AppState, so
-                // none of these knobs are applied in place — both
-                // "safe-to-reload" and "restart-required" buckets
-                // require a process restart in this release. The
-                // bucketing is preserved so we can mark fields safe
-                // for live update once AppState is wrapped in an
-                // ArcSwap/lock in a follow-up.
-                let safe_keys: &[(&str, String, String)] = &[
-                    (
-                        "sampling.temperature",
-                        prev.sampling.temperature.to_string(),
-                        new.sampling.temperature.to_string(),
+                // Apply the safe-to-reload subset live. `try_reload`
+                // re-validates internally; on rejection it logs a
+                // structured `tracing::warn!` and leaves the live
+                // `ArcSwap<RuntimeConfig>` un-mutated. The atomic store
+                // is contention-free with request-path readers
+                // (`runtime.snapshot()` is a single relaxed atomic load).
+                match runtime.try_reload(&new) {
+                    Ok(rc) => info!(
+                        sampling_temperature = rc.sampling.temperature,
+                        sampling_top_p = rc.sampling.top_p,
+                        sampling_top_k = rc.sampling.top_k,
+                        max_tokens_cap = rc.max_tokens_cap,
+                        "live runtime configuration swapped atomically",
                     ),
-                    (
-                        "sampling.top_p",
-                        prev.sampling.top_p.to_string(),
-                        new.sampling.top_p.to_string(),
-                    ),
-                    (
-                        "sampling.top_k",
-                        prev.sampling.top_k.to_string(),
-                        new.sampling.top_k.to_string(),
-                    ),
-                    (
-                        "server.max_tokens",
-                        prev.server.max_tokens.to_string(),
-                        new.server.max_tokens.to_string(),
-                    ),
-                ];
+                    Err(_) => {
+                        // try_reload already emitted a structured warn;
+                        // skip applying restart-key diffs against an
+                        // invalid file.
+                        continue;
+                    }
+                }
+                // Restart-required diff: surface changes that the live
+                // swap does **not** cover so operators know which fields
+                // still demand a process restart.
                 let restart_keys: &[(&str, String, String)] = &[
                     (
                         "storage.predict_fanout",
@@ -973,12 +982,6 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                         new.storage.partial_load_fraction.to_string(),
                     ),
                 ];
-                for (k, before, after) in safe_keys {
-                    if before != after {
-                        warn!(key = k, before = %before, after = %after,
-                            "config changed; restart required to apply (diff-only reload)");
-                    }
-                }
                 for (k, before, after) in restart_keys {
                     if before != after {
                         warn!(key = k, before = %before, after = %after,

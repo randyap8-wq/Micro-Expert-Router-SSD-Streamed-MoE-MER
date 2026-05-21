@@ -26,6 +26,7 @@
 //! HTTP shape doesn't change.
 
 use crate::batch_scheduler::BatchScheduler;
+use crate::config::LiveConfig;
 use crate::engine::Engine;
 use crate::metrics::Metrics;
 use crate::middleware::{
@@ -57,7 +58,6 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub tokenizer: Arc<Tokenizer>,
     pub metrics: Metrics,
-    pub max_tokens_cap: usize,
     /// Optional real transformer. When set, [`generate`] runs the
     /// embedding → stacked layers → LM head pipeline (with experts
     /// streamed from SSD by the engine on every layer's MoE step) and
@@ -74,9 +74,14 @@ pub struct AppState {
     /// single batch so multiple HTTP clients share each round of
     /// SSD-streamed expert FFN compute.
     pub batch_scheduler: Option<Arc<BatchScheduler>>,
-    /// Server-wide sampling defaults. Each request can override these
-    /// via `temperature` / `top_p` / `top_k` / `seed` JSON fields.
-    pub default_sampling: SamplingParams,
+    /// Live, atomically-swappable runtime configuration. Reads on the
+    /// hot path (sampling defaults, `max_tokens` cap) go through a
+    /// single relaxed atomic load — no mutex, no contention across
+    /// Tokio worker threads. SIGHUP refreshes this in place via
+    /// [`LiveConfig::try_reload`]; in-flight requests keep observing
+    /// their snapshot until they drop it. See
+    /// [`crate::config::RuntimeConfig`].
+    pub runtime: LiveConfig,
     /// Optional session store for KV-cache persistence between
     /// requests. `None` when `server.session_ttl_secs == 0`.
     pub sessions: Option<SessionStore>,
@@ -418,10 +423,11 @@ impl std::fmt::Display for GenerateError {
 }
 
 /// Resolve per-request sampling parameters from the request fields,
-/// falling back to the server-wide defaults from
-/// [`AppState::default_sampling`]. OpenAI's API treats `temperature: 0`
-/// as "deterministic" — we mirror that by passing it through verbatim
-/// (the sampler in [`crate::sampling`] degrades to greedy `argmax`).
+/// falling back to the server-wide defaults pulled from the
+/// atomically-swappable [`crate::config::RuntimeConfig`]. OpenAI's API
+/// treats `temperature: 0` as "deterministic" — we mirror that by
+/// passing it through verbatim (the sampler in [`crate::sampling`]
+/// degrades to greedy `argmax`).
 fn resolve_params(
     state: &AppState,
     temperature: Option<f32>,
@@ -429,7 +435,10 @@ fn resolve_params(
     top_k: Option<usize>,
     seed: Option<u64>,
 ) -> SamplingParams {
-    let mut p = state.default_sampling;
+    // One relaxed atomic load — no lock, no contention with concurrent
+    // SIGHUP reloads. The guard drops at the end of this function and
+    // never crosses an `await` point.
+    let mut p = state.runtime.snapshot().sampling;
     if let Some(t) = temperature {
         p.temperature = t;
     }
@@ -456,7 +465,9 @@ async fn generate(
     if prompt.is_empty() {
         return Err(GenerateError::InvalidRequest("prompt must be non-empty".into()));
     }
-    let max_tokens = requested_max.min(state.max_tokens_cap).max(1);
+    let max_tokens = requested_max
+        .min(state.runtime.snapshot().max_tokens_cap)
+        .max(1);
 
     // 1) Tokenize the prompt. The token ids drive the engine's deterministic
     //    routing seed so completions are reproducible for a given prompt.
@@ -835,7 +846,9 @@ async fn stream_tokens(
     if prompt.is_empty() {
         return Err(GenerateError::InvalidRequest("prompt must be non-empty".into()));
     }
-    let max_tokens = requested_max.min(state.max_tokens_cap).max(1);
+    let max_tokens = requested_max
+        .min(state.runtime.snapshot().max_tokens_cap)
+        .max(1);
     let prompt_ids = state
         .tokenizer
         .encode(&prompt)
@@ -1231,6 +1244,46 @@ mod tests {
     use tempdir::TempDir;
     use tower::ServiceExt;
 
+    /// Minimal valid [`crate::config::Config`] for the server tests. The
+    /// per-test `make_state` overrides `server.max_tokens` to vary the
+    /// runtime cap exercised by [`generate`].
+    fn test_minimal_cfg() -> crate::config::Config {
+        use std::path::PathBuf;
+        crate::config::Config {
+            server: crate::config::ServerConfig {
+                bind: "127.0.0.1:0".into(),
+                max_tokens: 32,
+                session_ttl_secs: 0,
+                max_concurrent_requests: 0,
+                admission_min_free_blocks: 0,
+            },
+            model: crate::config::ModelConfig {
+                data_dir: PathBuf::from("./data"),
+                num_experts: 8,
+                top_k: 2,
+                d_model: 8,
+                d_ff: 16,
+                expert_size: 4096,
+                num_layers: 1,
+                dtype: crate::inference::WeightDtype::F32,
+            },
+            storage: crate::config::StorageConfigToml {
+                cache_slots: 4,
+                block_align: 4096,
+                no_direct: true,
+                predict_fanout: 2,
+                predict_min_prob: 0.05,
+                partial_load_fraction: 1.0,
+                pin_after_observations: 0,
+            },
+            tokenizer: crate::config::TokenizerConfig::default(),
+            real_transformer: crate::config::RealTransformerConfig::default(),
+            sampling: crate::config::SamplingConfig::default(),
+            predictive: crate::config::PredictiveConfig::default(),
+            security: crate::config::SecurityConfig::default(),
+        }
+    }
+
     // We need a tempdir helper but don't want to add `tempfile` for one
     // test; reuse `std::env::temp_dir()` with a unique subpath.
     mod tempdir {
@@ -1289,10 +1342,13 @@ mod tests {
             engine,
             tokenizer: Arc::new(Tokenizer::bytes()),
             metrics: Metrics::new(),
-            max_tokens_cap: 32,
             real_model: None,
             batch_scheduler: None,
-            default_sampling: SamplingParams::greedy(),
+            runtime: crate::config::LiveConfig::from_config(&{
+                let mut c = test_minimal_cfg();
+                c.server.max_tokens = 32;
+                c
+            }),
             sessions: None,
             middleware: MiddlewareState {
                 api_keys: crate::middleware::ApiKeyGate::default(),
@@ -1630,10 +1686,13 @@ mod tests {
             engine,
             tokenizer: Arc::new(Tokenizer::bytes()),
             metrics: Metrics::new(),
-            max_tokens_cap: 16,
             real_model: Some(model),
             batch_scheduler: Some(scheduler),
-            default_sampling: SamplingParams::greedy(),
+            runtime: crate::config::LiveConfig::from_config(&{
+                let mut c = test_minimal_cfg();
+                c.server.max_tokens = 16;
+                c
+            }),
             sessions: Some(crate::session::SessionStore::new(std::time::Duration::from_secs(60))),
             middleware: MiddlewareState {
                 api_keys: crate::middleware::ApiKeyGate::default(),
