@@ -799,9 +799,9 @@ pub struct EngineOptions {
     /// time. Each call to `spawn_prefetch` must acquire a semaphore
     /// permit before issuing the I/O — when the bound is reached the
     /// prefetch is dropped (it's speculative, missing one is fine)
-    /// and `prefetch_dropped_concurrency` is incremented. `0` would
-    /// disable prefetch entirely, so the minimum effective value is
-    /// `1`; the default `64` matches typical io_uring queue depths.
+    /// and `prefetch_dropped_concurrency` is incremented. Values less
+    /// than `1` are clamped to `1`; the default `64` matches typical
+    /// io_uring queue depths.
     pub max_concurrent_prefetches: usize,
 }
 

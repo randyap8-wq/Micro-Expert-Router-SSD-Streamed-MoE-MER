@@ -608,7 +608,6 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let extra = total % num_layers;
         let caps: Vec<usize> = (0..num_layers)
             .map(|i| base + if i < extra { 1 } else { 0 })
-            .map(|c| c.max(1))
             .collect();
         if num_layers == 1 {
             Arc::new(MultiLayerExpertCache::single_layer(total))

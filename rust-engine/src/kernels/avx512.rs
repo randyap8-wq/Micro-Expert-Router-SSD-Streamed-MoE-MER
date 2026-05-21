@@ -475,6 +475,12 @@ mod tests {
         let q_abs_sum: f32 = q.iter().map(|&qi| qi.abs() as f32).sum();
         let x_max = x.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
         let q_err_bound = scale * x_max * q_abs_sum / 254.0 + 1e-3;
+        assert!(
+            (lhs - rhs).abs() <= q_err_bound,
+            "lhs={lhs} rhs={rhs} q_err_bound={q_err_bound}"
+        );
+    }
+
     #[test]
     fn vnni_bias_correction_is_exact_for_int8_int8() {
         // Dedicated VNNI bias-correction test (gist Part 2 minor note):

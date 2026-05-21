@@ -361,8 +361,8 @@ pub struct RealTransformerConfig {
     /// "overflow" KV blocks the [`block_pool::BlockPool`] may
     /// allocate beyond its primary slab before
     /// [`block_pool::BlockPool::allocate`] starts returning `None`
-    /// (admission back-pressure). `None` (omitted) preserves the
-    /// historical unbounded growth behaviour.
+    /// (admission back-pressure). `None` (omitted) and `Some(0)`
+    /// preserve the historical unbounded growth behaviour.
     #[serde(default)]
     pub max_overflow_capacity: Option<usize>,
 }
@@ -495,6 +495,12 @@ impl Config {
                 self.model.expert_size, self.storage.block_align
             )));
         }
+        if self.model.num_layers > 1 && self.storage.cache_slots < self.model.num_layers {
+            return Err(ConfigError::Invalid(format!(
+                "storage.cache_slots ({}) must be >= model.num_layers ({}) for multi-layer caching",
+                self.storage.cache_slots, self.model.num_layers
+            )));
+        }
         if self.server.max_tokens == 0 {
             return Err(ConfigError::Invalid("server.max_tokens must be > 0".into()));
         }
@@ -559,15 +565,6 @@ impl Config {
                 rt.pressure_critical_threshold,
             )
             .map_err(|e| ConfigError::Invalid(format!("real_transformer.{e}")))?;
-            if let Some(max) = rt.max_overflow_capacity {
-                if max == 0 {
-                    return Err(ConfigError::Invalid(
-                        "real_transformer.max_overflow_capacity must be > 0 when set; \
-                         omit the key to keep the historical unbounded behaviour"
-                            .into(),
-                    ));
-                }
-            }
             if rt.max_concurrent_prefetches == 0 {
                 return Err(ConfigError::Invalid(
                     "real_transformer.max_concurrent_prefetches must be > 0".into(),
@@ -851,6 +848,31 @@ mod tests {
         let mut c = minimal_cfg();
         c.storage.block_align = 4097;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_cache_slots_below_layer_count_for_multi_layer() {
+        let mut c = minimal_cfg();
+        c.model.num_layers = 3;
+        c.storage.cache_slots = 2;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn allows_zero_overflow_cap_as_unbounded() {
+        let mut c = minimal_cfg();
+        c.real_transformer = RealTransformerConfig {
+            enabled: true,
+            vocab_size: 256,
+            num_heads: 8,
+            max_batch_size: 8,
+            pressure_high_threshold: crate::block_pool::SOFT_CAP_RATIO,
+            pressure_critical_threshold: crate::block_pool::CRITICAL_PRESSURE_RATIO,
+            max_concurrent_prefetches: crate::engine::DEFAULT_MAX_CONCURRENT_PREFETCHES,
+            max_overflow_capacity: Some(0),
+            ..RealTransformerConfig::default()
+        };
+        c.validate().expect("0 overflow cap should map to unbounded");
     }
 
     #[test]

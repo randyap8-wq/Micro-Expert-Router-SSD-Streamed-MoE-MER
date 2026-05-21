@@ -249,8 +249,10 @@ impl PressureThresholds {
     }
 
     /// Builder-style setter for the overflow cap (gist Part 1, fix #5).
+    /// `Some(0)` is normalized to `None` (unbounded) so the config
+    /// surface can use `0 = unbounded` ergonomically.
     pub fn with_max_overflow_capacity(mut self, max: Option<usize>) -> Self {
-        self.max_overflow_capacity = max;
+        self.max_overflow_capacity = max.filter(|&n| n > 0);
         self
     }
 }
@@ -320,15 +322,16 @@ impl BlockPool {
     /// Pop one block id from the free list. Allocation is always
     /// O(1): first the primary slab's free list, then the overflow
     /// slab's free list, and finally a fresh overflow extension. This
-    /// method never returns `None` (allocation is infallible from the
-    /// pool's perspective); callers that want to refuse / queue
-    /// requests *before* hitting the heap-backed overflow should
-    /// consult [`Self::free_blocks`] first.
+    /// method returns `None` only when a configured
+    /// [`PressureThresholds::max_overflow_capacity`] has been reached;
+    /// callers that want to refuse / queue requests *before* hitting
+    /// the heap-backed overflow should consult [`Self::free_blocks`]
+    /// first.
     ///
     /// The historical signature returns `Option<BlockId>` for source
-    /// compatibility, but `None` is now unreachable in the absence of
-    /// `OOM` from the global allocator (in which case the `Vec` grow
-    /// inside will itself panic before we ever return).
+    /// compatibility. With no configured overflow cap, allocation is
+    /// infallible from the pool's perspective (OOM still panics via
+    /// `Vec` growth).
     pub fn allocate(&self) -> Option<BlockId> {
         // Fast path: O(1) primary slab pop.
         if let Some(idx) = self.free.lock().pop() {
