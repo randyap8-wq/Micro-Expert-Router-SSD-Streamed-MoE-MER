@@ -439,6 +439,7 @@ mod tests {
     use super::*;
     use crate::engine::{EngineOptions, ModelShape};
     use crate::expert_cache::ExpertCache;
+    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::buffer_pool::BufferPool;
     use crate::io_provider::{NvmeStorage, StorageConfig};
     use crate::router::{PredictiveLoader, TopKRouter};
@@ -485,7 +486,7 @@ mod tests {
         )
         .unwrap();
         let storage = Arc::new(NvmeStorage::new(cfg).unwrap());
-        let cache = Arc::new(ExpertCache::new(num_experts as usize));
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(num_experts as usize));
         let pool = BufferPool::new(num_experts as usize, expert_size, 4096);
         let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, 2, 0)));
         let predictor = Arc::new(PredictiveLoader::new(num_experts, 4, 0.0, 0));

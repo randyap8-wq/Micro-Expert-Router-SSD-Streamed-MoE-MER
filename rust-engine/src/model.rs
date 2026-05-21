@@ -707,6 +707,7 @@ mod tests {
     use crate::buffer_pool::BufferPool;
     use crate::engine::{Engine, EngineOptions, ModelShape};
     use crate::expert_cache::ExpertCache;
+    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
     use crate::router::{PredictiveLoader, TopKRouter};
     use std::path::PathBuf;
@@ -797,7 +798,7 @@ mod tests {
         );
         storage.warmup_fds(0..total).expect("warmup");
         let pool = BufferPool::new(total as usize + 2, expert_size, block);
-        let cache = Arc::new(ExpertCache::new((total as usize).max(2)));
+        let cache = Arc::new(MultiLayerExpertCache::single_layer((total as usize).max(2)));
         // The engine's TopKRouter is unused by `moe_step` (the gate
         // produces ids directly), but the engine constructor still
         // requires one.

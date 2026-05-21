@@ -346,7 +346,28 @@ pub struct RealTransformerConfig {
     /// matching the gist's "budget GPU augments CPU" posture.
     #[serde(default)]
     pub compute_offload: crate::backend::ComputeOffload,
+
+    /// **Bounded speculative prefetches** (gist Part 1, fix #3).
+    /// Maximum number of in-flight `Engine::spawn_prefetch` I/Os
+    /// allowed at any one time. Each spawn acquires an owned permit
+    /// from an internal semaphore; when the ceiling is saturated the
+    /// prefetch is dropped and the
+    /// `prefetch_dropped_concurrency` counter is incremented.
+    /// Defaults to `64` (≈ a typical io_uring queue depth).
+    #[serde(default = "default_max_concurrent_prefetches")]
+    pub max_concurrent_prefetches: usize,
+
+    /// **Overflow-slab cap** (gist Part 1, fix #5). Maximum number of
+    /// "overflow" KV blocks the [`block_pool::BlockPool`] may
+    /// allocate beyond its primary slab before
+    /// [`block_pool::BlockPool::allocate`] starts returning `None`
+    /// (admission back-pressure). `None` (omitted) preserves the
+    /// historical unbounded growth behaviour.
+    #[serde(default)]
+    pub max_overflow_capacity: Option<usize>,
 }
+
+fn default_max_concurrent_prefetches() -> usize { 64 }
 
 fn default_pressure_high_threshold() -> f32 { crate::block_pool::SOFT_CAP_RATIO }
 fn default_pressure_critical_threshold() -> f32 { crate::block_pool::CRITICAL_PRESSURE_RATIO }
@@ -536,6 +557,20 @@ impl Config {
                 rt.pressure_critical_threshold,
             )
             .map_err(|e| ConfigError::Invalid(format!("real_transformer.{e}")))?;
+            if let Some(max) = rt.max_overflow_capacity {
+                if max == 0 {
+                    return Err(ConfigError::Invalid(
+                        "real_transformer.max_overflow_capacity must be > 0 when set; \
+                         omit the key to keep the historical unbounded behaviour"
+                            .into(),
+                    ));
+                }
+            }
+            if rt.max_concurrent_prefetches == 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.max_concurrent_prefetches must be > 0".into(),
+                ));
+            }
         }
         // [predictive] section.
         let p = &self.predictive;

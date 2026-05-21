@@ -205,11 +205,22 @@ pub struct PressureThresholds {
     /// speculation (depth → 0) until pressure drops back below
     /// `high`.
     pub critical: f32,
+    /// Optional cap on the number of overflow blocks allocated
+    /// beyond the primary slab (gist Part 1, fix #5). `None`
+    /// preserves the historical "grow forever" behaviour; `Some(n)`
+    /// makes [`BlockPool::allocate`] return `None` once `n` overflow
+    /// blocks are in flight, giving the scheduler an admission
+    /// back-pressure signal instead of silently exploding heap.
+    pub max_overflow_capacity: Option<usize>,
 }
 
 impl Default for PressureThresholds {
     fn default() -> Self {
-        Self { high: SOFT_CAP_RATIO, critical: CRITICAL_PRESSURE_RATIO }
+        Self {
+            high: SOFT_CAP_RATIO,
+            critical: CRITICAL_PRESSURE_RATIO,
+            max_overflow_capacity: None,
+        }
     }
 }
 
@@ -234,7 +245,13 @@ impl PressureThresholds {
                  pressure_critical_threshold ({critical})"
             ));
         }
-        Ok(Self { high, critical })
+        Ok(Self { high, critical, max_overflow_capacity: None })
+    }
+
+    /// Builder-style setter for the overflow cap (gist Part 1, fix #5).
+    pub fn with_max_overflow_capacity(mut self, max: Option<usize>) -> Self {
+        self.max_overflow_capacity = max;
+        self
     }
 }
 
@@ -329,6 +346,16 @@ impl BlockPool {
         let mut keys = self.overflow_keys.lock();
         let mut values = self.overflow_values.lock();
         let mut cap = self.overflow_capacity.lock();
+        // Admission back-pressure (gist Part 1, fix #5): if a hard
+        // cap on the overflow slab is configured and we've already
+        // grown to it, refuse the allocation. The scheduler treats
+        // `None` as "pool exhausted" and either queues or rejects
+        // the request rather than oomming the host.
+        if let Some(max) = self.thresholds.max_overflow_capacity {
+            if *cap >= max {
+                return None;
+            }
+        }
         let new_idx = *cap as u32;
         assert!(
             (new_idx & OVERFLOW_BIT) == 0,

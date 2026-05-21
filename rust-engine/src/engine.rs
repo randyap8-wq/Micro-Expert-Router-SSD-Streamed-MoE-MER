@@ -16,6 +16,7 @@
 use crate::aligned_buffer::AlignedBuffer;
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident};
+use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::gating::Router;
 use crate::inference::{
     combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4_0,
@@ -742,6 +743,10 @@ pub(crate) struct Counters {
     /// (gist Phase 1 — SSD Read De-Duplication). Each increment maps
     /// directly to one disk read that was *not* performed.
     singleflight_followers: AtomicU64,
+    /// Speculative prefetches dropped because the concurrent-prefetch
+    /// semaphore was exhausted (gist Phase 3 — bounded prefetch).
+    /// Surfaced via `EngineReport::prefetch_dropped_concurrency`.
+    prefetch_dropped_concurrency: AtomicU64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -790,6 +795,14 @@ pub struct EngineOptions {
     /// (e.g. block-alignment mismatch on a corrupt blob), so this is
     /// a strict-superset behaviour switch.
     pub use_qmm_for_q4: bool,
+    /// Upper bound on speculative prefetches in flight at any one
+    /// time. Each call to `spawn_prefetch` must acquire a semaphore
+    /// permit before issuing the I/O — when the bound is reached the
+    /// prefetch is dropped (it's speculative, missing one is fine)
+    /// and `prefetch_dropped_concurrency` is incremented. `0` would
+    /// disable prefetch entirely, so the minimum effective value is
+    /// `1`; the default `64` matches typical io_uring queue depths.
+    pub max_concurrent_prefetches: usize,
 }
 
 impl Default for EngineOptions {
@@ -800,6 +813,7 @@ impl Default for EngineOptions {
             partial_load_fraction: 1.0,
             pin_after_observations: 0,
             use_qmm_for_q4: true,
+            max_concurrent_prefetches: 64,
         }
     }
 }
@@ -813,7 +827,14 @@ impl Default for EngineOptions {
 /// future feature work (e.g. additional cache tiers, scheduler swaps)
 /// can be added without churning the observability layer alongside.
 pub(crate) struct EngineCore {
-    pub(super) cache: Arc<ExpertCache>,
+    /// The engine's expert cache. Wrapped in [`MultiLayerExpertCache`]
+    /// so the per-layer LRU dispatch is on the hot path: single-layer
+    /// models use [`MultiLayerExpertCache::single_layer`] (observably
+    /// identical to the previous flat `ExpertCache`), while multi-layer
+    /// `serve` paths construct it with `with_uniform_capacity` /
+    /// `with_capacities` so layer N's prefetched experts can never
+    /// evict layer M's residents.
+    pub(super) cache: Arc<MultiLayerExpertCache>,
     pub(super) pool: BufferPool,
     pub(super) storage: Arc<NvmeStorage>,
     /// Routing strategy. `Router::Linear` runs the production
@@ -948,7 +969,7 @@ pub(crate) struct EngineMetrics {
 
 impl EngineCore {
     fn new(
-        cache: Arc<ExpertCache>,
+        cache: Arc<MultiLayerExpertCache>,
         pool: BufferPool,
         storage: Arc<NvmeStorage>,
         router: Router,
@@ -1036,6 +1057,13 @@ pub struct Engine {
     /// even without a pre-pass concurrent `moe_step` invocations no
     /// longer duplicate I/O.
     pub(crate) in_flight: Arc<DashMap<u32, Arc<Notify>>>,
+    /// Bound on concurrent speculative prefetches. Sized from
+    /// `EngineOptions::max_concurrent_prefetches`. Each
+    /// `spawn_prefetch` call must obtain an owned permit *before*
+    /// spawning the async task; failure to acquire drops the
+    /// prefetch and increments
+    /// `EngineMetrics::counters::prefetch_dropped_concurrency`.
+    pub(crate) prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Dispatch a single per-expert SwiGLU forward pass according to
@@ -1102,7 +1130,7 @@ fn dispatch_expert_forward(
 
 impl Engine {
     pub fn new(
-        cache: Arc<ExpertCache>,
+        cache: Arc<MultiLayerExpertCache>,
         pool: BufferPool,
         storage: Arc<NvmeStorage>,
         router: Router,
@@ -1113,7 +1141,7 @@ impl Engine {
     }
 
     pub fn with_options(
-        cache: Arc<ExpertCache>,
+        cache: Arc<MultiLayerExpertCache>,
         pool: BufferPool,
         storage: Arc<NvmeStorage>,
         router: Router,
@@ -1122,12 +1150,14 @@ impl Engine {
         options: EngineOptions,
     ) -> Self {
         let speculator_topk_default = router.top_k();
+        let prefetch_permits = options.max_concurrent_prefetches.max(1);
         Self {
             core: EngineCore::new(cache, pool, storage, router, predictor, shape, options),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
             kv_cache: None,
             in_flight: Arc::new(DashMap::new()),
+            prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
         }
     }
 
@@ -1798,8 +1828,30 @@ impl Engine {
     }
 
     fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
+        // Speculative prefetches are *bounded*: each spawn must hold
+        // an owned permit from `prefetch_semaphore` for the duration
+        // of the I/O. When the configured ceiling
+        // (`EngineOptions::max_concurrent_prefetches`) is saturated
+        // we drop the request rather than queue it — speculative
+        // loads are valuable only if they complete before the real
+        // miss, and queuing them defeats that. The drop is observable
+        // via the `prefetch_dropped_concurrency` counter.
+        let permit = match self.prefetch_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                self.metrics
+                    .counters
+                    .prefetch_dropped_concurrency
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(expert = id, "skipping prefetch: concurrency ceiling reached");
+                return;
+            }
+        };
         let me = self.clone();
         tokio::spawn(async move {
+            // Permit released on task completion (drop). Holding it
+            // across the I/O is what enforces the bound.
+            let _permit = permit;
             // Re-check (could have been loaded by another task in the meantime).
             if me.core.cache.contains(id) {
                 return;
@@ -2414,6 +2466,11 @@ impl Engine {
             locality_enabled: self.speculation.locality.is_some(),
             speculator_enabled: self.speculation.speculator.is_some(),
             expert_read_failures: self.metrics.counters.expert_read_failures.load(Ordering::Relaxed),
+            prefetch_dropped_concurrency: self
+                .metrics
+                .counters
+                .prefetch_dropped_concurrency
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -2567,6 +2624,9 @@ pub struct EngineReport {
     /// indicate corrupt weight files or persistent SSD I/O errors;
     /// alert on a non-zero rate from the Prometheus exporter.
     pub expert_read_failures: u64,
+    /// Speculative prefetches dropped because
+    /// `EngineOptions::max_concurrent_prefetches` was already saturated.
+    pub prefetch_dropped_concurrency: u64,
 }
 
 #[cfg(test)]
@@ -2653,7 +2713,7 @@ mod tests {
 
         let pool_slots = cache_slots + predict_fanout.max(1);
         let pool = BufferPool::new(pool_slots, expert_size, block_align);
-        let cache = Arc::new(ExpertCache::new(cache_slots));
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(cache_slots));
         let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, top_k, seed)));
         let predictor = Arc::new(PredictiveLoader::new(num_experts, predict_fanout, 0.05, seed));
 
