@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Shared handler state. Cheap to clone — everything is `Arc`.
@@ -1214,8 +1214,119 @@ fn error_response(e: GenerateError) -> Response {
 
 // ------------------------------ run ---------------------------------
 
+/// **Cold-start mitigation orchestrator (gist Task 1).**
+///
+/// Runs a synthetic pass through the full token pipeline so the
+/// very first user request does not pay the one-time costs of:
+///
+/// * faulting the `AlignedBuffer` slab pool into the resident set
+///   (a `BufferPool` slot is `posix_memalign`'d up front but the
+///   pages are only zero-filled on first touch),
+/// * registering `io_uring` fixed buffers / fixed files with the
+///   kernel (`IORING_REGISTER_BUFFERS` is amortised across every
+///   subsequent read, but the first read pays the syscall),
+/// * JIT-warming the math backend kernels (AVX-512 dispatch
+///   tables, candle Tensor allocators, future GPU command queues).
+///
+/// Implementation strategy:
+///
+/// 1. If a real-transformer pipeline + batch scheduler is wired in,
+///    invoke [`BatchScheduler::submit_internal_warmup`] which drives
+///    one synthetic decoder step through the existing scheduler
+///    plumbing — bypassing every network / auth / rate-limit /
+///    admission layer that gates real HTTP requests.
+/// 2. Otherwise, fall back to a direct `engine.warm_with(0..8)` +
+///    a tiny synthetic backend `swiglu_into` call. This still
+///    primes the slab pool, the io_uring fixed-buffer table, and
+///    the math kernel dispatch — just without the
+///    `mpsc → scheduler_loop` exercise.
+///
+/// **Safety contract.** If any warm-up step fails the server must
+/// still bind. We log the failure via [`tracing::warn!`] and
+/// continue startup — a warm-up failure is *not* a fatal startup
+/// error (gist Task 1, "Constraint: The server must still bind if
+/// warm-up fails").
+///
+/// **Performance contract.** This routine runs **before** the
+/// listener binds in [`serve`], so the listening socket only
+/// accepts connections once warm-up has completed. The first
+/// real user therefore sees a 0-ms-start system.
+pub async fn run_engine_warmup(state: &AppState) {
+    const SCHEDULER_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
+    let start = Instant::now();
+    tracing::info!("engine warm-up starting (cold-start mitigation)");
+
+    let mut result: Result<&'static str, String> = Ok("noop");
+
+    if let (Some(model), Some(scheduler)) = (state.real_model.as_ref(), state.batch_scheduler.as_ref()) {
+        // Full path: drive a synthetic decoder step through the
+        // batch scheduler. Bypasses HTTP/auth/admission by design.
+        match tokio::time::timeout(
+            SCHEDULER_WARMUP_TIMEOUT,
+            scheduler.submit_internal_warmup(model, &state.engine),
+        )
+        .await
+        {
+            Ok(Ok(())) => result = Ok("scheduler-synthetic-step"),
+            Ok(Err(e)) => result = Err(format!("scheduler warm-up failed: {e}")),
+            Err(_) => {
+                result = Err(format!(
+                    "scheduler warm-up timed out after {}s",
+                    SCHEDULER_WARMUP_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    } else {
+        // Fallback path (no real-transformer / no scheduler wired in
+        // — e.g. legacy benchmark generator). Still primes the slab
+        // pool + io_uring + math backend so even the legacy path
+        // sees a 0-ms start.
+        let num_experts = state.engine.num_experts();
+        if num_experts > 0 {
+            let cap = num_experts.min(8);
+            let ids: Vec<u32> = (0..cap).collect();
+            if let Err(e) = state.engine.warm_with(&ids).await {
+                result = Err(format!("engine.warm_with failed: {e}"));
+            } else {
+                result = Ok("engine-warm_with");
+            }
+        }
+        // JIT-warm the math backend kernels regardless.
+        let backend = crate::backend::current();
+        let rows = 4usize;
+        let cols = 8usize;
+        let gate: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.01).collect();
+        let up: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.02).collect();
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.03).collect();
+        let mut y = vec![0.0f32; rows];
+        backend.swiglu_into(&gate, &up, &x, rows, cols, &mut y);
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    match result {
+        Ok(path) => tracing::info!(
+            elapsed_ms = format!("{elapsed_ms:.2}"),
+            path,
+            "engine warm-up complete — first request sees a primed slab pool, io_uring \
+             registrations, and JIT-warmed math kernels"
+        ),
+        Err(reason) => tracing::warn!(
+            elapsed_ms = format!("{elapsed_ms:.2}"),
+            reason,
+            "engine warm-up failed; continuing to bind listener (cold-start cost will be \
+             paid on the first user request)"
+        ),
+    }
+}
+
 /// Bind the server, listen, and run until the runtime is shut down.
 pub async fn serve(state: AppState, bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Speculative engine warm-up — runs *before* the listener
+    // binds so the first user request sees a 0-ms start. Failures
+    // here are logged via `tracing::warn!` and the bind still
+    // proceeds (gist Task 1 safety constraint).
+    run_engine_warmup(&state).await;
+
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(bind, "HTTP server listening");

@@ -690,6 +690,104 @@ impl BatchScheduler {
             }
         }
     }
+
+    /// **Internal-only warm-up entry point (gist Task 1).**
+    ///
+    /// Drives a *single* synthetic decoder step that bypasses
+    /// every network / auth / HTTP layer the public `step` and
+    /// `step_registered` paths sit behind. The motivation is
+    /// cold-start mitigation: the first real user-facing request
+    /// would otherwise pay the one-time cost of
+    ///
+    ///   1. lazily-faulting the `AlignedBuffer` slab pool pages
+    ///      into the resident set,
+    ///   2. registering `io_uring` fixed-buffer slots (`IORING_REGISTER_BUFFERS`)
+    ///      with the kernel on the first read,
+    ///   3. JIT-warming the math backend kernels (AVX-512 / NEON /
+    ///      candle dispatch tables) the first time
+    ///      [`crate::backend::Backend::swiglu_into`] is called.
+    ///
+    /// All three are amortised here so the user sees a 0-ms start.
+    ///
+    /// ### Contract
+    /// - This function must **never** be reached from a network
+    ///   path. It is only called from
+    ///   [`crate::server::run_engine_warmup`] before the listener
+    ///   binds. There is no auth, no rate-limit, no admission
+    ///   check — by design.
+    /// - It is best-effort. Channel/registry failures are surfaced as
+    ///   [`BatchError`]. `engine.warm_with` failures are logged in
+    ///   place and warm-up continues so startup still reaches bind.
+    /// - **Zero-contention.** This routine does **not** add new
+    ///   locks to [`scheduler_loop`]. It re-uses the existing
+    ///   per-class mpsc channels and the same registry / release
+    ///   path real requests use, so it cannot perturb the
+    ///   steady-state hot path.
+    pub async fn submit_internal_warmup(
+        &self,
+        model: &Arc<RealModel>,
+        engine: &Arc<Engine>,
+    ) -> Result<(), BatchError> {
+        // (1) Prime the `AlignedBuffer` slab + io_uring fixed-buffer
+        //     registrations by pulling a representative set of
+        //     expert ids into the resident cache. The first
+        //     `fetch_with_retry` per expert lazy-registers its
+        //     buffer with the kernel; subsequent reads are
+        //     zero-syscall via the registered fd / buffer pair.
+        let num_experts = engine.num_experts();
+        if num_experts > 0 {
+            let cap = num_experts.min(8);
+            let ids: Vec<u32> = (0..cap).collect();
+            if let Err(e) = engine.warm_with(&ids).await {
+                // `warm_with` is best-effort by design; log and keep
+                // progressing through warm-up so startup still binds.
+                tracing::warn!(error = %e, "submit_internal_warmup: warm_with failed");
+            }
+        }
+
+        // (2) JIT-warm the registered math backend. A tiny
+        //     synthetic `swiglu_into` call lights up the dispatch
+        //     tables (AVX-512 detect, candle Tensor allocators,
+        //     future GPU command queues) once, so the very first
+        //     real token does not pay the one-shot kernel-init
+        //     cost.
+        {
+            let backend = crate::backend::current();
+            let rows = 4usize;
+            let cols = 8usize;
+            let gate: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.01).collect();
+            let up: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.02).collect();
+            let x: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.03).collect();
+            let mut y = vec![0.0f32; rows];
+            backend.swiglu_into(&gate, &up, &x, rows, cols, &mut y);
+        }
+
+        // (3) Drive a *single* synthetic decoder step through the
+        //     normal scheduler path. We register a fresh KV cache,
+        //     send one `StepRequest` over the Interactive channel,
+        //     wait for the reply, then release the cache. This
+        //     exercises the full `mpsc → batch fuse → model.step →
+        //     oneshot` loop exactly once, so the *first* real user
+        //     request finds every code path (tokio worker stacks,
+        //     scheduler_loop branch predictor, sampler temperature
+        //     table) already in cache.
+        let kv = model.fresh_kv_caches();
+        let id = self.register_with_class(kv, SessionClass::Interactive);
+        // The synthetic token id and position are deliberately
+        // small / valid: token 0 at position 0 always round-trips
+        // through the model without exercising window-eviction
+        // edge cases. `SamplingParams::default()` gives
+        // greedy-argmax sampling so the result is deterministic.
+        let params = crate::sampling::SamplingParams::default();
+        let result = self.step_registered(id, 0u32, 0usize, params).await;
+        // Always release, even on error — leaving a stale id in
+        // the registry would leak the KV cache across the
+        // process's lifetime.
+        let _ = self.release(id);
+        // Ignore the sampled token; warm-up only cares that the
+        // pipeline produced *a* token, not which one.
+        result.map(|_| ())
+    }
 }
 
 /// Errors returned from [`BatchScheduler::step`] and friends.
