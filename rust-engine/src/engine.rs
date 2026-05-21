@@ -3112,6 +3112,77 @@ mod tests {
         assert_eq!(report.expert_read_failures, 0);
     }
 
+    /// Stress test for gist Part 1, fix #3: when many
+    /// `spawn_prefetch` calls race past the semaphore ceiling, the
+    /// excess prefetches must be **dropped** (not queued, not
+    /// crashed) and the `prefetch_dropped_concurrency` counter must
+    /// reflect that. We construct an engine with a deliberately tiny
+    /// semaphore (cap=1), fire a burst of prefetches, and assert
+    /// both the counter and that no panics escape the spawned tasks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawn_prefetch_is_bounded_by_semaphore_under_load() {
+        let dir = TempDir::new("prefetch-stress");
+        let num_experts: u32 = 32;
+        let d_model = 16;
+        let d_ff = 32;
+        let cache_slots = 4;
+        let predict_fanout = 4;
+        let seed = 0xDEADBEEFu64;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        crate::io_provider::generate_synthetic_experts(
+            &dir.path, num_experts, expert_size, d_model, d_ff,
+        )
+        .expect("generate experts");
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .unwrap(),
+        );
+        storage.warmup_fds(0..num_experts).expect("warmup");
+        let pool_slots = cache_slots + predict_fanout + 16;
+        let pool = BufferPool::new(pool_slots, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(cache_slots));
+        let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(num_experts, predict_fanout, 0.05, seed));
+        let mut opts = EngineOptions::default();
+        opts.max_concurrent_prefetches = 1; // adversarial ceiling
+        let engine = Arc::new(Engine::with_options(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape { d_model, d_ff, hidden_seed: seed },
+            opts,
+        ));
+        // Fire a burst of prefetches well past the ceiling. With a
+        // semaphore cap of 1 the vast majority must be refused.
+        let burst = 256u32;
+        for id in 0..burst {
+            engine.spawn_prefetch(id % num_experts, 0.5);
+        }
+        // Give in-flight prefetches a moment to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let dropped = engine
+            .metrics
+            .counters
+            .prefetch_dropped_concurrency
+            .load(Ordering::Relaxed);
+        assert!(
+            dropped > 0,
+            "expected some prefetches to be dropped under a 1-permit semaphore; got 0"
+        );
+        // Sanity: the report surface mirrors the counter.
+        assert_eq!(engine.report().prefetch_dropped_concurrency, dropped);
+    }
+
     /// `AlignedKvCache::append` extends the resident window until
     /// capacity, after which it slides the tail down by one and
     /// overwrites the freed slot with the new row. The first

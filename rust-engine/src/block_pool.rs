@@ -904,6 +904,28 @@ mod tests {
     }
 
     #[test]
+    fn overflow_cap_enforces_admission_back_pressure() {
+        // Primary slab of 1 + overflow cap of 2 → fourth allocate must
+        // return None instead of growing the heap unboundedly.
+        let thresholds = PressureThresholds::default()
+            .with_max_overflow_capacity(Some(2));
+        let pool = BlockPool::with_thresholds(2, 1, thresholds);
+        let p = pool.allocate().expect("primary block");
+        let o1 = pool.allocate().expect("overflow #1");
+        let o2 = pool.allocate().expect("overflow #2");
+        assert!(o1.is_overflow() && o2.is_overflow());
+        // Cap reached: next request must be refused.
+        assert!(pool.allocate().is_none(), "overflow cap should refuse");
+        // Releasing an overflow block frees the slot for re-admission.
+        pool.release(o1);
+        let o3 = pool.allocate().expect("retry after release succeeds");
+        assert!(o3.is_overflow());
+        pool.release(o2);
+        pool.release(o3);
+        pool.release(p);
+    }
+
+    #[test]
     fn pressure_level_walks_through_soft_cap_and_critical() {
         // 10-block primary slab — 0%/50%/90%/100% utilisation should
         // bucket Normal / Normal / High / Critical respectively.

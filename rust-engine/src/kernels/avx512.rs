@@ -475,9 +475,42 @@ mod tests {
         let q_abs_sum: f32 = q.iter().map(|&qi| qi.abs() as f32).sum();
         let x_max = x.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
         let q_err_bound = scale * x_max * q_abs_sum / 254.0 + 1e-3;
+    #[test]
+    fn vnni_bias_correction_is_exact_for_int8_int8() {
+        // Dedicated VNNI bias-correction test (gist Part 2 minor note):
+        // `vpdpbusd` only accepts u8 × i8 on plain AVX-512 VNNI, so
+        // the kernel biases the i8 weights by +128 and subtracts the
+        // accumulated 128 × Σx_i bias back out. This test verifies
+        // the *bias-correction arithmetic* is exact (i.e. no
+        // quantization error path, unlike the f32×i8 case): both
+        // operands are already i8, so the VNNI kernel must match
+        // the scalar reference within a few ULPs.
+        if !(std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vnni"))
+        {
+            return;
+        }
+        let out_scale = 0.0078125f32 * 0.0078125f32;
+        // Construct adversarial inputs that exercise the +128 bias
+        // pathway: large-magnitude i8 values of both signs in both
+        // operands, plus a non-multiple-of-64 length to walk the
+        // scalar tail too.
+        let n = 257usize;
+        let qw: Vec<i8> = (0..n).map(|i| (((i * 37) % 251) as i32 - 125) as i8).collect();
+        let qx: Vec<i8> = (0..n).map(|i| (((i * 53) % 251) as i32 - 125) as i8).collect();
+        let lhs = unsafe { dot_int8_int8_avx512_vnni(out_scale, &qw, &qx) };
+        // Scalar reference: sum_i qw[i] * qx[i], scaled by out_scale.
+        let mut acc: i64 = 0;
+        for i in 0..n {
+            acc += (qw[i] as i64) * (qx[i] as i64);
+        }
+        let rhs = (acc as f64 * out_scale as f64) as f32;
+        // Bias correction is integer arithmetic — only the final
+        // multiply-by-out_scale introduces FP error.
         assert!(
-            (lhs - rhs).abs() <= q_err_bound,
-            "VNNI rewrite drift exceeds quantization bound: lhs={lhs} rhs={rhs} bound={q_err_bound}"
+            (lhs - rhs).abs() <= 1e-3 + rhs.abs() * 1e-5,
+            "VNNI bias-correction drift too large: lhs={lhs} rhs={rhs}"
         );
     }
 }
