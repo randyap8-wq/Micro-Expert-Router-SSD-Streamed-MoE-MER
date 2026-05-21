@@ -206,7 +206,13 @@ experts, no high-end AI GPU required):
   runs on hosts without AVX-512.
 * `--features amx` — opt-in. Builds the AMX skeleton + tile-hint
   plumbing; the actual matmul body lands behind a future PR (AMX
-  intrinsics are nightly-only as of Rust 1.84).
+  intrinsics are nightly-only as of Rust 1.84). When the feature is
+  compiled in, the engine emits a single structured
+  `tracing::warn!` line at startup (latched by a `OnceLock` so it
+  fires at most once per process — verbosity-safe even in
+  high-throughput deployments) informing operators that every AMX
+  dispatch currently falls back to the scalar reference kernel
+  until `rust-lang/rust#126622` stabilises the tile intrinsics.
 * `--features gpu` — opt-in. Builds the
   [`backend::GpuBackend`](rust-engine/src/backend/mod.rs) integration
   seam for a future budget-GPU compute path, alongside the
@@ -439,26 +445,40 @@ A real **io_uring backend with registered fixed buffers** ships in
 `src/io_uring_storage.rs` and is built when the cargo feature
 `io_uring` is enabled (Linux only). On startup it
 `io_uring_register(IORING_REGISTER_BUFFERS)`s every `BufferPool` slot
-with the kernel exactly once, so subsequent reads are
-`IORING_OP_READ_FIXED` SQEs that reference a buffer *index*, the
-kernel never has to walk the user mapping or pin pages on the hot
-path. A batched submission entry point
-(`IoUringStorage::read_experts_batch_fixed`) pushes `K` SQEs and calls
-`submit_and_wait(K)` once when a token misses on multiple experts.
-The batched submission path is **chunked by the ring's configured
-`queue_depth`** (gist Part 1): when the speculator's deduplicated
-lookahead window exceeds the ring depth the call splits the
-submission into windowed `submit()` chunks and only blocks on the
-final `submit_and_wait` once every SQE has been pushed — eliminating
-the previous "io_uring submission queue full" failure mode while
-keeping the macro-batch a single completion-wait boundary.
-A second batched entry point —
-`IoUringStorage::read_experts_batch_fixed_promote` — fuses that
-single-syscall submission with the **zero-latency shadow → primary
-promotion** for speculative prefetches: the speculator hands in `K`
-shadow `PooledBuffer`s (acquired via `BufferPool::try_acquire_shadow`),
-the ring fires one `submit_and_wait(K)`, and every CQE is mirrored by
-a `BufferPool::promote_shadow` slot-tag swap so the bytes that just
+with the kernel exactly once (after validating that every fixed
+buffer is page-aligned — 4096 B base address *and* 4096 B-multiple
+length — so the kernel never returns an opaque `EINVAL`). Subsequent
+reads are `IORING_OP_READ_FIXED` SQEs that reference a buffer
+*index*, the kernel never has to walk the user mapping or pin pages
+on the hot path.
+
+The ring itself is owned **exclusively** by a dedicated
+`io_uring-reactor` OS thread; the public async surface
+(`IoUringStorage::read_expert_fixed` / `read_experts_batch_fixed` /
+`read_experts_batch_fixed_promote`) never holds a `Mutex<IoUring>`
+and never calls `block_in_place`. Requests are handed to the reactor
+through a **bounded** `tokio::sync::mpsc` channel sized to the ring's
+`queue_depth`, providing natural async backpressure when the reactor
+is saturated — `.send().await` simply yields, no `block_in_place` /
+blocking-thread starvation. Each request carries a `tokio::sync::oneshot::Sender`
+that the reactor fires with `io::Result<usize>` once all CQEs for the
+batch have landed.
+
+The reactor pushes `K` SQEs in chunks of `queue_depth` (Part 1
+windowing), calls `submit()` to flush each chunk to the kernel, and
+issues one final `submit_and_wait(K)` once every SQE for the
+macro-batch is queued. If the ring's internal submission queue
+reports "full" before the chunk boundary (e.g. when the kernel
+downsized the requested depth) the reactor performs a non-blocking
+`submit()` to drain whatever is already queued and retries — never
+panicking, never blocking the request side. A second batched entry
+point — `IoUringStorage::read_experts_batch_fixed_promote` — fuses
+that single-syscall submission with the **zero-latency shadow →
+primary promotion** for speculative prefetches: the speculator hands
+in `K` shadow `PooledBuffer`s (acquired via
+`BufferPool::try_acquire_shadow`), the ring fires one
+`submit_and_wait(K)`, and every CQE is mirrored by a
+`BufferPool::promote_shadow` slot-tag swap so the bytes that just
 arrived become resident without an extra copy or a re-read. Pass
 `--io-uring` on the CLI (or build with `--features io_uring`) to opt
 in. When the kernel doesn't support the registration (older
@@ -686,6 +706,40 @@ and applies only to the real-transformer path
 (`[real_transformer].enabled = true`); the legacy synthetic generator
 ignores these fields apart from `seed`, which still drives its
 deterministic id stream.
+
+##### Live config reload (`SIGHUP`)
+
+A subset of `config.toml` is **hot-swappable** at runtime: send
+`SIGHUP` to the running server and the engine re-reads the file,
+re-validates it, and **atomically** publishes the new values to a
+shared `ArcSwap<RuntimeConfig>` ([`config::LiveConfig`](./rust-engine/src/config.rs)).
+The hot path (`generate`, `stream_tokens`, `resolve_params`) reads
+this via a single relaxed atomic load — no mutex, no lock contention
+with concurrent SIGHUPs, and in-flight requests holding a previous
+snapshot finish under their original parameters before the swap
+takes effect for them.
+
+Fields covered by the live swap:
+
+| field                  | effect                                                              |
+| ---------------------- | ------------------------------------------------------------------- |
+| `[sampling].temperature` | New baseline temperature for every request that does not override it. |
+| `[sampling].top_p`     | New nucleus cutoff baseline.                                        |
+| `[sampling].top_k`     | New top-K truncation baseline.                                      |
+| `[sampling].seed`      | New default sampling seed.                                          |
+| `[server].max_tokens`  | New hard cap on per-request `max_tokens`.                           |
+
+Fields outside that subset (storage / batch scheduler / predictive /
+real-transformer wiring) still require a process restart because
+they are baked into the engine's construction-time state; a SIGHUP
+that changes those keys still produces a structured `tracing::warn!`
+diff so operators know a restart is needed.
+
+If the reloaded file fails parse-time or `validate()` checks the
+runtime configuration is left **completely un-mutated** and the
+rejection reason is emitted as a single `tracing::warn!` line. The
+previous in-memory snapshot remains live; there is no torn-update
+window.
 
 #### Session API
 
@@ -1721,11 +1775,24 @@ compute term and prepares the API surface for the bandwidth term.
 `io_uring_storage.rs` is a real Linux backend, gated behind the
 `io_uring` cargo feature. `IoUringStorage::new` calls
 `io_uring_register(IORING_REGISTER_BUFFERS)` over every
-`BufferPool::raw_iovecs` slot at startup; `read_expert_fixed` then
-submits an `IORING_OP_READ_FIXED` SQE that references the buffer
-*index* and waits for the completion. A batched submission entry point
-(`read_experts_batch_fixed`) pushes K SQEs and `submit_and_wait(K)`
-once when a token misses on multiple experts.
+`BufferPool::raw_iovecs` slot at startup, **after validating that
+every fixed buffer is 4096-byte aligned in base address and length**
+(io_uring requires page-aligned registered buffers; the validation
+turns an opaque kernel `EINVAL` into a structured `InvalidInput`
+error). `read_expert_fixed` then submits an `IORING_OP_READ_FIXED`
+SQE that references the buffer *index* and waits for the completion.
+
+The ring is owned **exclusively** by a dedicated `io_uring-reactor`
+OS thread — there is **no `Mutex<IoUring>`** on the request path.
+Requests flow into the reactor over a **bounded
+`tokio::sync::mpsc`** channel (sized to `queue_depth`), giving the
+public async surface natural backpressure without ever calling
+`block_in_place` or stealing tokio worker threads. Each request
+carries a `tokio::sync::oneshot::Sender` that the reactor fires
+once every CQE for the macro-batch has landed. A batched submission
+entry point (`read_experts_batch_fixed`) pushes K SQEs in chunks of
+`queue_depth` and issues a single `submit_and_wait(K)` once when a
+token misses on multiple experts.
 `read_experts_batch_fixed_promote` extends that pattern for
 **speculative prefetches**: it accepts shadow `PooledBuffer`s, fires
 the same single `submit_and_wait(K)`, then calls

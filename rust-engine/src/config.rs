@@ -657,6 +657,11 @@ pub struct RuntimeConfig {
     /// access log line including model name, prompt + completion
     /// token counts, latency, and request id). When `false` only
     /// `warn!` / `error!` lines are emitted from the request path.
+    ///
+    /// Reserved for future use by the request handlers; carried in
+    /// `RuntimeConfig` today so SIGHUP can flip it live without a
+    /// `Config` rewrite once the access-log path is wired.
+    #[allow(dead_code)]
     pub access_log_enabled: bool,
 }
 
@@ -707,6 +712,7 @@ impl LiveConfig {
     /// the value across an `await` point without keeping the underlying
     /// RCU guard live. Still O(1) — just an atomic refcount bump.
     #[inline]
+    #[allow(dead_code)]
     pub fn load_full(&self) -> std::sync::Arc<RuntimeConfig> {
         self.inner.load_full()
     }

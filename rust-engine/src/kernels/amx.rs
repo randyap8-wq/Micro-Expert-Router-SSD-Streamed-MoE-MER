@@ -83,3 +83,35 @@ impl Default for AmxTileHint {
         Self { m: 16, n: 16, k: 64 }
     }
 }
+
+/// One-shot warning latch: ensures the fallback notice is emitted at
+/// most once per process lifetime regardless of how many call sites
+/// hit [`init_warn_once`] (engine startup, dispatcher selection,
+/// expert-cache prewarm, …).
+static AMX_FALLBACK_NOTIFIED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Emit a single, structured `tracing::warn!` line on the first call
+/// per process informing operators that the AMX execution path is a
+/// compiled-in skeleton — every matrix-vector multiplication routed
+/// to it falls back to the scalar reference kernel until the stable
+/// tile intrinsics land (rust-lang/rust#126622).
+///
+/// Subsequent calls are no-ops (cost: one relaxed atomic load on the
+/// `OnceLock`). Safe to invoke from any thread and any context,
+/// including hot paths.
+pub fn init_warn_once() {
+    AMX_FALLBACK_NOTIFIED.get_or_init(|| {
+        let detected = cpu_supports_amx();
+        tracing::warn!(
+            target: "kernels::amx",
+            amx_runtime_detected = detected,
+            "AMX kernel module is compiled (cargo feature `amx`) but the tile-based \
+             executor is a structural skeleton; every dispatch through this path \
+             currently routes to the scalar reference kernel. Stable Rust does not \
+             yet expose the AMX tile intrinsics (rust-lang/rust#126622); enable AVX-512 \
+             or recompile against a nightly toolchain that ships a real tile body to \
+             get hardware-accelerated matmul. This warning is emitted at most once \
+             per process.",
+        );
+    });
+}

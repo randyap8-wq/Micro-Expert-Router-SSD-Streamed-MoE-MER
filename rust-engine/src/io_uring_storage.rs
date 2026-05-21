@@ -158,12 +158,9 @@ impl IoUringStorage {
         debug_assert_eq!(buf.len(), self.cfg.expert_size);
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
-            let ring = self.inner.clone();
             let ptr = buf.as_mut_slice().as_mut_ptr();
             let len = self.cfg.expert_size;
-            let n = tokio::task::block_in_place(move || {
-                ring.read_expert_fixed_blocking(expert_id, ptr, len)
-            })?;
+            let n = self.inner.read_expert_fixed_async(expert_id, ptr, len).await?;
             if n != self.cfg.expert_size {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -208,22 +205,23 @@ impl IoUringStorage {
 
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
-            let ring = self.inner.clone();
             let len = self.cfg.expert_size;
             // Snapshot raw pointers + ids without holding any borrow
-            // across the `block_in_place` boundary.
+            // across the `.await` boundary. The mutable borrows on
+            // `bufs` keep the backing AlignedBuffers alive for the
+            // duration of the request — the reactor never accesses
+            // them after the oneshot fires, and we never access them
+            // while in flight.
             let ids_owned: Vec<u32> = ids.to_vec();
-            let ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_slice().as_mut_ptr()).collect();
-            // SAFETY: the &mut PooledBuffer borrows here keep the
-            // backing AlignedBuffers alive for the duration of the
-            // syscall. We move the raw pointers into the closure but
-            // do not let them outlive this `await` (the mutable
-            // borrows are released only after `block_in_place`
-            // returns).
+            let ptrs: Vec<*mut u8> = bufs
+                .iter_mut()
+                .map(|b| b.as_mut_slice().as_mut_ptr())
+                .collect();
             let ptrs_send = SendPtrs(ptrs);
-            let n = tokio::task::block_in_place(move || {
-                ring.read_experts_batch_fixed_blocking(&ids_owned, &ptrs_send.0, len)
-            })?;
+            let n = self
+                .inner
+                .read_experts_batch_fixed_async(&ids_owned, &ptrs_send.0, len)
+                .await?;
             let expected = self.cfg.expert_size * ids.len();
             if n != expected {
                 return Err(io::Error::new(
@@ -335,28 +333,52 @@ mod linux_impl {
     use std::fs::File;
     use std::io;
     use std::os::unix::io::{AsRawFd, RawFd};
-    use std::sync::Mutex;
+
+    /// One pending submission: a fully-prepared batch of `(fd, ptr,
+    /// buf_idx, expert_id)` tuples plus a oneshot the reactor uses to
+    /// report total bytes (or the first OS error).
+    pub(super) struct ReactorRequest {
+        pub prepared: Vec<(RawFd, *mut u8, u16, u32)>,
+        pub len: usize,
+        pub reply: tokio::sync::oneshot::Sender<io::Result<usize>>,
+        /// Kept alive on the requester side until the oneshot fires;
+        /// the reactor never touches it. We hold a `Box<dyn Any +
+        /// Send>` so the requester can stash whatever borrow it
+        /// needs (here: the `Arc<File>` fd-cache entries).
+        pub _keep_alive: Box<dyn std::any::Any + Send>,
+    }
+
+    // SAFETY: the raw pointers in `prepared` refer to bytes inside
+    // `PooledBuffer`s that the requester keeps mutably borrowed until
+    // the oneshot in `reply` fires. The reactor never holds them past
+    // that point, and the requester never accesses them while the
+    // request is in flight, so there is no data race.
+    unsafe impl Send for ReactorRequest {}
+
+    /// Bounded async-backpressure channel between the public
+    /// `IoUringStorage` async surface and the dedicated reactor thread
+    /// that exclusively owns the `IoUring`.
+    pub(super) type ReactorTx = tokio::sync::mpsc::Sender<ReactorRequest>;
+    type ReactorRx = tokio::sync::mpsc::Receiver<ReactorRequest>;
 
     pub(super) struct Ring {
-        ring: Mutex<IoUring>,
-        /// Map registered buffer pointer -> kernel buffer index. `acquire`
-        /// hands out the same pointer every time a given slot is reused,
-        /// so this lookup is stable across the lifetime of the pool.
+        /// Bounded mpsc channel: the public async surface holds the
+        /// `Sender` and uses `send().await` to apply natural async
+        /// backpressure when the reactor is saturated. The reactor
+        /// thread owns the `Receiver`.
+        tx: ReactorTx,
+        /// Map registered buffer pointer -> kernel buffer index.
         buf_index: HashMap<usize, u16>,
         /// Per-expert open-file cache, mirroring `NvmeStorage`'s.
         fds: RwLock<HashMap<u32, std::sync::Arc<File>>>,
         cfg_base: std::path::PathBuf,
-        /// Cached SQE capacity (`cfg.queue_depth`). Used by the batched
-        /// submission path (gist Part 1) to **chunk** macro-batches that
-        /// exceed the ring's configured depth: we push at most
-        /// `queue_depth` SQEs, call `submit()` to hand them to the
-        /// kernel, advance the cursor, and only issue the final
-        /// blocking `submit_and_wait` after every SQE for the whole
-        /// macro-batch has been queued. This avoids the
-        /// "io_uring submission queue full" error that would otherwise
-        /// fire when the lookahead-deduplicated `warm_with` window
-        /// exceeds the ring depth.
+        /// Cached SQE capacity (`cfg.queue_depth`). Used by the
+        /// reactor's batched submission path to chunk macro-batches
+        /// that exceed the ring's configured depth.
         queue_depth: usize,
+        /// Join handle for the reactor thread, joined on Drop so a
+        /// torn-down storage doesn't leave a dangling kernel ring.
+        reactor: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Ring {
@@ -364,11 +386,44 @@ mod linux_impl {
             cfg: &super::IoUringConfig,
             iovecs: Vec<(*mut u8, usize)>,
         ) -> io::Result<Self> {
+            // gist Part 3 — buffer alignment validation. The kernel
+            // requires every fixed buffer registered via
+            // `IORING_REGISTER_BUFFERS` to be page-aligned (4096 bytes
+            // on x86_64 / aarch64). `AlignedBuffer::new` already
+            // enforces this for the primary `BufferPool` allocation
+            // path, but we revalidate here so that:
+            //
+            //   * any future caller that constructs `iovecs` outside of
+            //     `BufferPool` (custom integrations, tests) gets a
+            //     clear `InvalidInput` instead of an opaque kernel
+            //     `EINVAL` from `register_buffers`;
+            //   * the invariant is captured at the io_uring boundary,
+            //     not just at the allocator boundary.
+            const REQUIRED_ALIGN: usize = 4096;
+            for (i, (p, l)) in iovecs.iter().enumerate() {
+                let addr = *p as usize;
+                if addr % REQUIRED_ALIGN != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "io_uring fixed buffer #{i} base pointer {addr:#x} is not aligned to {REQUIRED_ALIGN} bytes; \
+                             io_uring requires page-aligned registered buffers",
+                        ),
+                    ));
+                }
+                if *l == 0 || *l % REQUIRED_ALIGN != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "io_uring fixed buffer #{i} length {l} is not a positive multiple of {REQUIRED_ALIGN}; \
+                             io_uring requires page-sized registered buffers",
+                        ),
+                    ));
+                }
+            }
             // Best-effort NUMA pinning before ring creation so the
-            // kernel allocates the ring's metadata on a node close
-            // to the buffers and (typically) the NVMe device.
-            // Failures are logged and ignored — pinning is a perf
-            // hint, never a correctness requirement.
+            // kernel allocates the ring's metadata on a node close to
+            // the buffers. Failures are logged and ignored.
             if let Some(node) = cfg.numa_node {
                 if let Err(e) = pin_thread_to_numa_node(node) {
                     tracing::warn!(
@@ -387,30 +442,43 @@ mod linux_impl {
                     );
                 }
             }
-            let ring = IoUring::new(cfg.queue_depth)?;
+            let mut ring = IoUring::new(cfg.queue_depth)?;
             let raw_iovecs: Vec<libc::iovec> = iovecs
                 .iter()
                 .map(|(p, l)| libc::iovec { iov_base: *p as *mut _, iov_len: *l })
                 .collect();
             // SAFETY: `raw_iovecs` borrows pointers owned by the
             // caller's `BufferPool`. The pool guarantees these stay
-            // valid for the lifetime of the engine; the io_uring crate
-            // requires the registered set to outlive every in-flight
-            // submission, which is also satisfied by that lifetime.
+            // valid for the lifetime of the engine.
             unsafe {
                 ring.submitter().register_buffers(&raw_iovecs)?;
             }
-            let buf_index = iovecs
+            let buf_index: HashMap<usize, u16> = iovecs
                 .iter()
                 .enumerate()
                 .map(|(i, (p, _))| (*p as usize, i as u16))
                 .collect();
+            let queue_depth = (cfg.queue_depth as usize).max(1);
+            // Bounded mpsc — depth `queue_depth` so the channel
+            // naturally back-pressures the request side once the
+            // reactor is in flight on at least one macro-batch.
+            let (tx, rx) = tokio::sync::mpsc::channel::<ReactorRequest>(queue_depth);
+            let reactor = std::thread::Builder::new()
+                .name("io_uring-reactor".into())
+                .spawn(move || reactor_loop(ring, rx, queue_depth))
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("io_uring: failed to spawn reactor thread: {e}"),
+                    )
+                })?;
             Ok(Self {
-                ring: Mutex::new(ring),
+                tx,
                 buf_index,
                 fds: RwLock::new(HashMap::new()),
                 cfg_base: cfg.base_path.clone(),
-                queue_depth: cfg.queue_depth as usize,
+                queue_depth,
+                reactor: Some(reactor),
             })
         }
 
@@ -434,139 +502,179 @@ mod linux_impl {
             })
         }
 
-        pub(super) fn read_expert_fixed_blocking(
+        /// Async single-expert read: encoded as a 1-element batch
+        /// through the reactor channel. No `block_in_place`, no
+        /// shared mutex on the hot path.
+        pub(super) async fn read_expert_fixed_async(
             &self,
             expert_id: u32,
             buf_ptr: *mut u8,
             len: usize,
         ) -> io::Result<usize> {
-            let buf_idx = self.buf_idx_for(buf_ptr)?;
-            let f = self.fd_for(expert_id)?;
-            let fd: RawFd = f.as_raw_fd();
-            let sqe = opcode::ReadFixed::new(types::Fd(fd), buf_ptr, len as u32, buf_idx)
-                .offset(0)
-                .build()
-                .user_data(expert_id as u64);
-            let mut ring = self.ring.lock().unwrap();
-            // SAFETY: SQE references `buf_ptr` and `fd` which are both
-            // kept alive (the buffer through the caller's mutable
-            // borrow on `PooledBuffer`, the fd through `f` which is
-            // also stored in `self.fds`).
-            unsafe {
-                ring.submission().push(&sqe).map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
-                })?;
-            }
-            ring.submit_and_wait(1)?;
-            let cqe = ring
-                .completion()
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring: no completion event"))?;
-            let result = cqe.result();
-            if result < 0 {
-                return Err(io::Error::from_raw_os_error(-result));
-            }
-            Ok(result as usize)
+            self.submit_batch(&[expert_id], &[buf_ptr], len).await
         }
 
-        pub(super) fn read_experts_batch_fixed_blocking(
+        /// Async batched read: prepares the descriptor tuples, sends
+        /// one `ReactorRequest`, awaits the oneshot. The bounded mpsc
+        /// channel applies async backpressure when the reactor is busy.
+        pub(super) async fn read_experts_batch_fixed_async(
             &self,
             ids: &[u32],
             ptrs: &[*mut u8],
             len: usize,
         ) -> io::Result<usize> {
-            // Resolve indices + fds without the ring lock so any
-            // expensive setup happens before we touch the queue.
-            let mut prepared: Vec<(RawFd, *mut u8, u16)> = Vec::with_capacity(ids.len());
-            // Hold strong references to the fd Arcs so they outlive
-            // the ring submission (they're also cached in self.fds,
-            // but be explicit).
+            self.submit_batch(ids, ptrs, len).await
+        }
+
+        async fn submit_batch(
+            &self,
+            ids: &[u32],
+            ptrs: &[*mut u8],
+            len: usize,
+        ) -> io::Result<usize> {
+            // Resolve fds + buf indices on the request side (lock-free
+            // for the reactor — it never has to touch the fd cache or
+            // the buf-index map).
+            let mut prepared: Vec<(RawFd, *mut u8, u16, u32)> = Vec::with_capacity(ids.len());
             let mut keep_alive: Vec<std::sync::Arc<File>> = Vec::with_capacity(ids.len());
             for (i, &expert_id) in ids.iter().enumerate() {
                 let buf_idx = self.buf_idx_for(ptrs[i])?;
                 let f = self.fd_for(expert_id)?;
                 let fd = f.as_raw_fd();
-                prepared.push((fd, ptrs[i], buf_idx));
+                prepared.push((fd, ptrs[i], buf_idx, expert_id));
                 keep_alive.push(f);
             }
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let req = ReactorRequest {
+                prepared,
+                len,
+                reply: reply_tx,
+                _keep_alive: Box::new(keep_alive),
+            };
+            self.tx.send(req).await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "io_uring reactor channel closed — backend has been torn down",
+                )
+            })?;
+            // Note: the reactor *always* sends a reply (Ok or Err) for
+            // every accepted request, so a RecvError here genuinely
+            // indicates a reactor panic.
+            reply_rx.await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "io_uring reactor dropped reply channel — reactor thread panicked",
+                )
+            })?
+        }
+    }
 
-            // gist Part 1 — windowed chunking by ring `queue_depth`.
-            //
-            // The previous revision pushed every SQE before calling
-            // `submit_and_wait`. If `ids.len() > queue_depth` (which
-            // happens when the speculator's deduplicated lookahead
-            // window outgrows the configured ring depth) the second
-            // `push` returned `io::Error("io_uring submission queue
-            // full")` and the batch failed wholesale.
-            //
-            // We now walk `prepared` in chunks of `queue_depth`:
-            //
-            //   * populate up to `queue_depth` SQEs;
-            //   * call `submit()` to flush them down to the kernel
-            //     (non-blocking — the kernel starts servicing the
-            //     reads while we keep queueing the rest);
-            //   * advance the cursor and repeat;
-            //   * after the entire macro-batch has been pushed,
-            //     issue **one** `submit_and_wait(N)` to block until
-            //     every completion has landed, then reap the K CQEs.
-            //
-            // This keeps the batched-submit cost at a single
-            // syscall-equivalent boundary while making the call
-            // tolerant of macro-batches that exceed `queue_depth`.
-            let cap = self.queue_depth.max(1);
-            let total = ids.len();
-            let mut ring = self.ring.lock().unwrap();
-            let mut pushed = 0usize;
-            while pushed < total {
-                let chunk_end = (pushed + cap).min(total);
-                for i in pushed..chunk_end {
-                    let (fd, ptr, buf_idx) = prepared[i];
-                    let sqe = opcode::ReadFixed::new(types::Fd(fd), ptr, len as u32, buf_idx)
-                        .offset(0)
-                        .build()
-                        .user_data(ids[i] as u64);
-                    // SAFETY: see read_expert_fixed_blocking above.
-                    unsafe {
-                        ring.submission().push(&sqe).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::Other,
-                                "io_uring submission queue full after chunking; \
-                                 this indicates the ring is smaller than 1 SQE \
-                                 (queue_depth must be >= 1)",
-                            )
-                        })?;
+    impl Drop for Ring {
+        fn drop(&mut self) {
+            // Closing `tx` causes the reactor's `recv().await` to
+            // return `None` and the loop to exit cleanly. We `take`
+            // out of `self.reactor` because `JoinHandle::join`
+            // consumes by value.
+            // Replace `tx` with a fresh closed channel by dropping the
+            // sender first.
+            // `tx` is not Option<T> so we drop the Ring's `tx` field
+            // implicitly when Self drops — but to guarantee the
+            // reactor sees the close *before* we try to join, we move
+            // it out via a synthetic temporary.
+            let _ = std::mem::replace(
+                &mut self.tx,
+                tokio::sync::mpsc::channel::<ReactorRequest>(1).0,
+            );
+            if let Some(h) = self.reactor.take() {
+                // Best-effort join; if the reactor panicked we don't
+                // want the drop path to also panic.
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Reactor body. Exclusively owns the `IoUring`. Pulls one
+    /// `ReactorRequest` at a time (mpsc semantics), pushes its SQEs
+    /// in chunks of `queue_depth`, issues a single
+    /// `submit_and_wait(N)`, drains the N CQEs, replies via the
+    /// request's oneshot. Loops until the channel closes.
+    fn reactor_loop(mut ring: IoUring, mut rx: ReactorRx, queue_depth: usize) {
+        let cap = queue_depth.max(1);
+        // Use the current-thread runtime's `blocking_recv`-equivalent:
+        // we are on a dedicated std::thread, so we can call
+        // `Receiver::blocking_recv` directly.
+        while let Some(req) = rx.blocking_recv() {
+            let ReactorRequest { prepared, len, reply, _keep_alive } = req;
+            let result = process_one(&mut ring, &prepared, len, cap);
+            // Send the reply; if the requester dropped its receiver
+            // (cancelled future) just drop the result.
+            let _ = reply.send(result);
+            drop(_keep_alive);
+        }
+    }
+
+    fn process_one(
+        ring: &mut IoUring,
+        prepared: &[(RawFd, *mut u8, u16, u32)],
+        len: usize,
+        cap: usize,
+    ) -> io::Result<usize> {
+        let total = prepared.len();
+        if total == 0 {
+            return Ok(0);
+        }
+        let mut pushed = 0usize;
+        while pushed < total {
+            let chunk_end = (pushed + cap).min(total);
+            for i in pushed..chunk_end {
+                let (fd, ptr, buf_idx, expert_id) = prepared[i];
+                let sqe = opcode::ReadFixed::new(types::Fd(fd), ptr, len as u32, buf_idx)
+                    .offset(0)
+                    .build()
+                    .user_data(expert_id as u64);
+                // SAFETY: SQE references `ptr` and `fd` which are kept
+                // alive by the requester's `_keep_alive` box and its
+                // mutable borrow on the `PooledBuffer`. We do not
+                // panic on submission-queue-full: instead we
+                // `submit()` to flush whatever is already queued
+                // (creating room) and retry. This makes the reactor
+                // robust against a `queue_depth` smaller than `cap`
+                // (e.g. a kernel that downsizes the requested depth).
+                loop {
+                    let push_result = unsafe { ring.submission().push(&sqe) };
+                    if push_result.is_ok() {
+                        break;
                     }
-                }
-                if chunk_end < total {
-                    // Hand this window down to the kernel so it can
-                    // start servicing the reads while we keep
-                    // populating the next chunk. Do not block on
-                    // completions yet — the wait happens once after
-                    // every SQE has been pushed.
+                    // SQ full — non-blocking flush, then retry. This
+                    // is the only place where we may briefly spin,
+                    // and only when the ring's internal SQ ring is
+                    // smaller than `cap`. submit() is non-blocking
+                    // and never deadlocks against us because we hold
+                    // exclusive access to `ring`.
                     ring.submit()?;
                 }
-                pushed = chunk_end;
             }
-            // Final wait gathers every completion that the chunked
-            // submissions left pending. `submit_and_wait(total)`
-            // submits any remaining SQEs from the last chunk and
-            // blocks until all `total` reads complete.
-            ring.submit_and_wait(total)?;
-            let mut totalbytes = 0usize;
-            for _ in 0..total {
-                let cqe = ring.completion().next().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::Other, "io_uring: missing completion event")
-                })?;
-                let result = cqe.result();
-                if result < 0 {
-                    return Err(io::Error::from_raw_os_error(-result));
-                }
-                totalbytes += result as usize;
+            if chunk_end < total {
+                // Hand this window down to the kernel so it can start
+                // servicing reads while we keep queueing. Non-blocking.
+                ring.submit()?;
             }
-            // `keep_alive` goes out of scope here; the fds remain
-            // cached in `self.fds` and will be reused on the next call.
-            Ok(totalbytes)
+            pushed = chunk_end;
         }
+        // Single wait barrier for the whole macro-batch.
+        ring.submit_and_wait(total)?;
+        let mut totalbytes = 0usize;
+        for _ in 0..total {
+            let cqe = ring.completion().next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "io_uring: missing completion event")
+            })?;
+            let result = cqe.result();
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result));
+            }
+            totalbytes += result as usize;
+        }
+        Ok(totalbytes)
     }
 
     /// Best-effort: pin the calling thread to the CPUs reported by
