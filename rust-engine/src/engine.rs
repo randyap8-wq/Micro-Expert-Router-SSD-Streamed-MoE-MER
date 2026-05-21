@@ -805,6 +805,12 @@ pub struct EngineOptions {
     pub max_concurrent_prefetches: usize,
 }
 
+/// Default semaphore ceiling for `Engine::spawn_prefetch`. Matches a
+/// typical io_uring submission-queue depth and is the source of truth
+/// for both `EngineOptions::default()` and the TOML default of
+/// `[real_transformer].max_concurrent_prefetches`.
+pub const DEFAULT_MAX_CONCURRENT_PREFETCHES: usize = 64;
+
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
@@ -813,7 +819,7 @@ impl Default for EngineOptions {
             partial_load_fraction: 1.0,
             pin_after_observations: 0,
             use_qmm_for_q4: true,
-            max_concurrent_prefetches: 64,
+            max_concurrent_prefetches: DEFAULT_MAX_CONCURRENT_PREFETCHES,
         }
     }
 }

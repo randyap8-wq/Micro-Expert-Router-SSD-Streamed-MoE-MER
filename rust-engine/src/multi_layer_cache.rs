@@ -292,14 +292,20 @@ mod tests {
 
 impl MultiLayerExpertCache {
     /// `(layer, local)` membership check — kept for tests/diagnostics
+    /// `(layer, local)` → encoded global expert id, in the canonical
+    /// stride-based encoding the engine emits everywhere.
+    #[inline]
+    fn global_id(&self, key: ExpertKey) -> u32 {
+        key.layer
+            .saturating_mul(self.experts_per_layer)
+            .saturating_add(key.expert)
+    }
+
     /// that already use the explicit `ExpertKey` form.
     pub fn contains_at(&self, key: ExpertKey) -> bool {
         self.caches
             .get(key.layer as usize)
-            .map(|c| {
-                let global = key.layer.saturating_mul(self.experts_per_layer).saturating_add(key.expert);
-                c.contains(global)
-            })
+            .map(|c| c.contains(self.global_id(key)))
             .unwrap_or(false)
     }
 
@@ -307,7 +313,6 @@ impl MultiLayerExpertCache {
     /// rest of the engine emits.
     pub fn get_at(&self, key: ExpertKey) -> Option<Arc<ExpertResident>> {
         let cache = self.caches.get(key.layer as usize)?;
-        let global = key.layer.saturating_mul(self.experts_per_layer).saturating_add(key.expert);
-        cache.get(global)
+        cache.get(self.global_id(key))
     }
 }

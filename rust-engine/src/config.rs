@@ -367,7 +367,9 @@ pub struct RealTransformerConfig {
     pub max_overflow_capacity: Option<usize>,
 }
 
-fn default_max_concurrent_prefetches() -> usize { 64 }
+fn default_max_concurrent_prefetches() -> usize {
+    crate::engine::DEFAULT_MAX_CONCURRENT_PREFETCHES
+}
 
 fn default_pressure_high_threshold() -> f32 { crate::block_pool::SOFT_CAP_RATIO }
 fn default_pressure_critical_threshold() -> f32 { crate::block_pool::CRITICAL_PRESSURE_RATIO }
