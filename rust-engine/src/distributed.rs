@@ -55,6 +55,9 @@
 //! Kubernetes-aware variant — without touching the predictor's
 //! Markov / locality / speculator arithmetic.
 
+// Scaffolding for future multi-node support. Most items are exposed
+// only via the public trait surface today; wiring this into the
+// scheduler hot path lands in a follow-up PR.
 #![allow(dead_code)]
 
 use std::future::Future;

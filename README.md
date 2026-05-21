@@ -298,7 +298,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`. Validated at startup. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
-| `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`) wrapped in `InferenceError::ShardFetch`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports (gRPC, RDMA, …) plug in by implementing the trait. |
+| `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`) wrapped in `InferenceError::RemoteShardFetchFailed`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports (gRPC, RDMA, …) plug in by implementing the trait. |
 | `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-predictor`, and `serve` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2,...` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
 
 ### Key design decisions
@@ -1035,7 +1035,7 @@ remote router is installed. Remote fetches return a boxed
 `ShardFetchFuture` so the trait stays object-safe without pulling in
 `async-trait`. Failures surface as structured `ShardRouterError`s
 (`Timeout`, `Unreachable`, `NotFound`, `Transport`) wrapped in
-`InferenceError::ShardFetch`, which the scheduler can match on to
+`InferenceError::RemoteShardFetchFailed`, which the scheduler can match on to
 decide whether to retry, fall back to a local replica or fail the
 request. The scaffolding is intentionally minimal — wire transports
 (gRPC, RDMA, …) plug in as new `ShardRouter` impls without touching
