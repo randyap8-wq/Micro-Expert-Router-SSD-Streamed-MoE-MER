@@ -1288,6 +1288,14 @@ impl Engine {
         self.core.shape
     }
 
+    /// Total number of distinct experts the engine's router can
+    /// address. Exposed so warm-up / diagnostic paths can size
+    /// their work to the global expert namespace without reaching
+    /// into the router enum.
+    pub fn num_experts(&self) -> u32 {
+        self.core.router.num_experts()
+    }
+
     /// Process a single token: route, fetch missing experts, run inference,
     /// update predictor, and kick off prefetches. Returns one [`CycleStats`].
     pub async fn generate(self: &Arc<Self>, token_idx: u64) -> CycleStats {

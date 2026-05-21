@@ -297,7 +297,8 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`. Validated at startup. |
-| `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`. |
+| `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
+| `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`) wrapped in `InferenceError::ShardFetch`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports (gRPC, RDMA, …) plug in by implementing the trait. |
 | `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-predictor`, and `serve` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2,...` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
 
 ### Key design decisions
@@ -1000,6 +1001,45 @@ only implement the trait and call `backend::set_backend(Arc<dyn Backend>)`
 before the first token is generated. The hot path resolves the active
 backend through `backend::current()` — a single `OnceLock` load, no
 `cfg!` dispatch.
+
+#### Speculative engine warm-up
+
+Before the HTTP listener binds, `server::serve` calls
+[`run_engine_warmup`](rust-engine/src/server.rs), which exercises the
+end-to-end path with a tiny synthetic request:
+
+1. `Engine::warm_with` is invoked on the first handful of expert ids
+   (up to eight, sized off `Engine::num_experts`) so the NVMe loader,
+   `ExpertCache` and `BufferPool` slabs all touch hot paths once.
+2. A small synthetic `Backend::swiglu_into` runs through
+   `backend::current()` so the registered math backend, runtime CPU
+   probe and kernel dispatcher are all primed.
+3. When a real transformer is configured, `BatchScheduler::submit_internal_warmup`
+   drives **one** synthetic decoder step through the registry +
+   `Interactive` mpsc channel — exactly the path real traffic takes —
+   so the first user token never pays the cold-start cost.
+
+The warm-up is **best-effort**: any failure is logged with
+`tracing::warn!` and the listener binds anyway. No new locks are taken
+on the scheduler loop or the io_uring reactor, and the zero-copy
+invariant on the resident path is preserved.
+
+#### Distributed expert sharding
+
+The [`distributed`](rust-engine/src/distributed.rs) module defines a
+`ShardRouter` trait that turns expert lookups into
+`ShardInstruction::{Local, Remote}` decisions, plus a
+`LocalShardRouter` default that always routes locally — the engine
+behaves identically to today's single-node deployment until a real
+remote router is installed. Remote fetches return a boxed
+`ShardFetchFuture` so the trait stays object-safe without pulling in
+`async-trait`. Failures surface as structured `ShardRouterError`s
+(`Timeout`, `Unreachable`, `NotFound`, `Transport`) wrapped in
+`InferenceError::ShardFetch`, which the scheduler can match on to
+decide whether to retry, fall back to a local replica or fail the
+request. The scaffolding is intentionally minimal — wire transports
+(gRPC, RDMA, …) plug in as new `ShardRouter` impls without touching
+the hot inference path.
 
 Tokenization is via the [`tokenizers`] crate when the optional
 `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured,

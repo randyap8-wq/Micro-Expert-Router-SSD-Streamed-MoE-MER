@@ -11,6 +11,7 @@ mod batch_scheduler;
 mod block_pool;
 mod buffer_pool;
 mod config;
+mod distributed;
 mod draft;
 mod engine;
 mod expert_cache;
