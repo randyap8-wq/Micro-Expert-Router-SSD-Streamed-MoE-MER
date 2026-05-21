@@ -365,8 +365,10 @@ mod linux_impl {
         /// Bounded mpsc channel: the public async surface holds the
         /// `Sender` and uses `send().await` to apply natural async
         /// backpressure when the reactor is saturated. The reactor
-        /// thread owns the `Receiver`.
-        tx: ReactorTx,
+        /// thread owns the `Receiver`. Wrapped in `Option` so `Drop`
+        /// can `take()` it — dropping the sender is what signals the
+        /// reactor loop to exit.
+        tx: Option<ReactorTx>,
         /// Map registered buffer pointer -> kernel buffer index.
         buf_index: HashMap<usize, u16>,
         /// Per-expert open-file cache, mirroring `NvmeStorage`'s.
@@ -473,7 +475,7 @@ mod linux_impl {
                     )
                 })?;
             Ok(Self {
-                tx,
+                tx: Some(tx),
                 buf_index,
                 fds: RwLock::new(HashMap::new()),
                 cfg_base: cfg.base_path.clone(),
@@ -551,7 +553,13 @@ mod linux_impl {
                 reply: reply_tx,
                 _keep_alive: Box::new(keep_alive),
             };
-            self.tx.send(req).await.map_err(|_| {
+            let tx = self.tx.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "io_uring reactor channel closed — backend has been torn down",
+                )
+            })?;
+            tx.send(req).await.map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::Other,
                     "io_uring reactor channel closed — backend has been torn down",
@@ -573,18 +581,11 @@ mod linux_impl {
         fn drop(&mut self) {
             // Closing `tx` causes the reactor's `recv().await` to
             // return `None` and the loop to exit cleanly. We `take`
-            // out of `self.reactor` because `JoinHandle::join`
-            // consumes by value.
-            // Replace `tx` with a fresh closed channel by dropping the
-            // sender first.
-            // `tx` is not Option<T> so we drop the Ring's `tx` field
-            // implicitly when Self drops — but to guarantee the
-            // reactor sees the close *before* we try to join, we move
-            // it out via a synthetic temporary.
-            let _ = std::mem::replace(
-                &mut self.tx,
-                tokio::sync::mpsc::channel::<ReactorRequest>(1).0,
-            );
+            // it out of the `Option` so the sender is dropped *before*
+            // we attempt to join the reactor thread — otherwise the
+            // join would deadlock waiting for a channel close that
+            // never came.
+            drop(self.tx.take());
             if let Some(h) = self.reactor.take() {
                 // Best-effort join; if the reactor panicked we don't
                 // want the drop path to also panic.

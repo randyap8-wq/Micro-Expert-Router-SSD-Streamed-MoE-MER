@@ -208,7 +208,7 @@ experts, no high-end AI GPU required):
   plumbing; the actual matmul body lands behind a future PR (AMX
   intrinsics are nightly-only as of Rust 1.84). When the feature is
   compiled in, the engine emits a single structured
-  `tracing::warn!` line at startup (latched by a `OnceLock` so it
+  `tracing::warn!` line at startup (latched by an `OnceLock` so it
   fires at most once per process — verbosity-safe even in
   high-throughput deployments) informing operators that every AMX
   dispatch currently falls back to the scalar reference kernel
