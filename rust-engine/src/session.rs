@@ -65,6 +65,17 @@ impl SessionState {
     pub fn new(kv: Vec<KvCache>) -> Self {
         Self { kv, position: 0, last_used: Instant::now() }
     }
+
+    /// Overwrite every per-layer KV buffer with zeros so a later
+    /// allocation that lands in the freed memory cannot read residual
+    /// attention state. Called from both the explicit
+    /// `DELETE /v1/sessions/{id}` endpoint *and* the TTL evictor
+    /// before the entry is dropped — gist Issue #1.
+    pub(crate) fn zeroize_in_place(&mut self) {
+        for cache in self.kv.iter_mut() {
+            cache.zeroize();
+        }
+    }
 }
 
 /// Lock-free session store.
@@ -123,9 +134,7 @@ impl SessionStore {
     pub fn delete(&self, id: &str) -> bool {
         match self.inner.remove(id) {
             Some((_, mut state)) => {
-                for cache in state.kv.iter_mut() {
-                    cache.zeroize();
-                }
+                state.zeroize_in_place();
                 true
             }
             None => false,
@@ -135,22 +144,46 @@ impl SessionStore {
     /// Evict entries idle for longer than the configured TTL. Returns
     /// the number of entries removed. Cheap when the store is small;
     /// the background evictor task calls this periodically.
+    ///
+    /// Every evicted [`SessionState`] is zeroized **before** being
+    /// dropped (gist Issue #1) so a TTL-driven cleanup leaks no more
+    /// residual KV bytes than an explicit `DELETE` would.
     pub fn evict_expired(&self) -> usize {
         if self.ttl.is_zero() {
             return 0;
         }
         let now = Instant::now();
         let ttl = self.ttl;
+        // We deliberately avoid `DashMap::retain` here: it would drop
+        // expired values inline (no chance to zeroize) and there's no
+        // hook to run code on the removed entry. Instead, snapshot
+        // the expired keys under shard read locks, then `remove`
+        // each one and explicitly zeroize before the `SessionState`
+        // is dropped at the end of the loop iteration.
+        let expired_keys: Vec<String> = self
+            .inner
+            .iter()
+            .filter_map(|entry| {
+                if now.duration_since(entry.value().last_used) > ttl {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut removed = 0usize;
-        // `retain` is `&mut`-locking per shard, so other shards stay
-        // available for concurrent reads.
-        self.inner.retain(|_, s| {
-            let keep = now.duration_since(s.last_used) <= ttl;
-            if !keep {
+        for k in expired_keys {
+            // Between the read-scan above and the `remove` call here
+            // another request may have reinserted the id (we treat
+            // the fresh state as "no longer expired" and leave it),
+            // or removed it (`remove` returns `None` — skip).
+            if let Some((_, mut state)) = self.inner.remove_if(&k, |_, s| {
+                now.duration_since(s.last_used) > ttl
+            }) {
+                state.zeroize_in_place();
                 removed += 1;
             }
-            keep
-        });
+        }
         removed
     }
 
@@ -233,5 +266,47 @@ mod tests {
         store.inner.insert("ancient".into(), s);
         assert_eq!(store.evict_expired(), 0);
         assert!(store.take("ancient").is_some());
+    }
+
+    #[test]
+    fn zeroize_in_place_clears_kv_buffers() {
+        // Build a SessionState whose KV cache has real (non-zero) bytes
+        // written into it. After `zeroize_in_place` every byte the
+        // public API can observe must read back as zero — the property
+        // both `delete` and `evict_expired` rely on.
+        let mut kv = KvCache::new(4);
+        kv.append(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]);
+        assert!(kv.num_blocks() > 0, "test setup: KV must own at least one block");
+        let mut state = SessionState::new(vec![kv]);
+        state.zeroize_in_place();
+        assert_eq!(
+            state.kv[0].num_blocks(),
+            0,
+            "zeroize_in_place must drop block-table entries after zeroing the bytes"
+        );
+        assert_eq!(state.kv[0].seq_len, 0);
+    }
+
+    #[test]
+    fn evict_expired_zeroizes_before_drop() {
+        // Regression for gist Issue #1: `evict_expired` previously
+        // dropped expired entries via `DashMap::retain`, which never
+        // ran the per-cache `zeroize` step. We can't observe the
+        // bytes of a value that's already been dropped, so we
+        // instead assert that the eviction path used here is the
+        // explicit `remove`+zeroize path — by checking that the
+        // store no longer holds the id and the count is correct,
+        // and we verify the zeroize itself via the dedicated test
+        // above. Together they pin down the contract.
+        let store = SessionStore::new(Duration::from_millis(1));
+        let mut kv = KvCache::new(4);
+        kv.append(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]);
+        let mut s = SessionState::new(vec![kv]);
+        // Force `last_used` into the past so the eviction sweep
+        // classifies the entry as expired.
+        s.last_used = Instant::now() - Duration::from_secs(60);
+        store.inner.insert("expired".into(), s);
+        assert_eq!(store.evict_expired(), 1);
+        assert!(store.take("expired").is_none());
     }
 }

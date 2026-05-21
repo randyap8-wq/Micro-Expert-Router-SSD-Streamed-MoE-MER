@@ -346,6 +346,30 @@ pub struct RealTransformerConfig {
     /// matching the gist's "budget GPU augments CPU" posture.
     #[serde(default)]
     pub compute_offload: crate::backend::ComputeOffload,
+
+    /// **Bounded speculative prefetches** (gist Part 1, fix #3).
+    /// Maximum number of in-flight `Engine::spawn_prefetch` I/Os
+    /// allowed at any one time. Each spawn acquires an owned permit
+    /// from an internal semaphore; when the ceiling is saturated the
+    /// prefetch is dropped and the
+    /// `prefetch_dropped_concurrency` counter is incremented.
+    /// Defaults to `64` (≈ a typical io_uring queue depth).
+    #[serde(default = "default_max_concurrent_prefetches")]
+    pub max_concurrent_prefetches: usize,
+
+    /// **Overflow-slab cap** (gist Part 1, fix #5). Maximum number of
+    /// "overflow" KV blocks the [`block_pool::BlockPool`] may
+    /// allocate beyond its primary slab before
+    /// [`block_pool::BlockPool::allocate`] starts returning `None`
+    /// (admission back-pressure). `None` (omitted) preserves the
+    /// historical unbounded growth behaviour; `Some(0)` is normalized
+    /// to `None`, so it is treated as unbounded too.
+    #[serde(default)]
+    pub max_overflow_capacity: Option<usize>,
+}
+
+fn default_max_concurrent_prefetches() -> usize {
+    crate::engine::DEFAULT_MAX_CONCURRENT_PREFETCHES
 }
 
 fn default_pressure_high_threshold() -> f32 { crate::block_pool::SOFT_CAP_RATIO }
@@ -472,6 +496,12 @@ impl Config {
                 self.model.expert_size, self.storage.block_align
             )));
         }
+        if self.model.num_layers > 1 && self.storage.cache_slots < self.model.num_layers {
+            return Err(ConfigError::Invalid(format!(
+                "storage.cache_slots ({}) must be >= model.num_layers ({}) for multi-layer caching",
+                self.storage.cache_slots, self.model.num_layers
+            )));
+        }
         if self.server.max_tokens == 0 {
             return Err(ConfigError::Invalid("server.max_tokens must be > 0".into()));
         }
@@ -536,6 +566,11 @@ impl Config {
                 rt.pressure_critical_threshold,
             )
             .map_err(|e| ConfigError::Invalid(format!("real_transformer.{e}")))?;
+            if rt.max_concurrent_prefetches == 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.max_concurrent_prefetches must be > 0".into(),
+                ));
+            }
         }
         // [predictive] section.
         let p = &self.predictive;
@@ -814,6 +849,31 @@ mod tests {
         let mut c = minimal_cfg();
         c.storage.block_align = 4097;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_cache_slots_below_layer_count_for_multi_layer() {
+        let mut c = minimal_cfg();
+        c.model.num_layers = 3;
+        c.storage.cache_slots = 2;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn allows_zero_overflow_cap_as_unbounded() {
+        let mut c = minimal_cfg();
+        c.real_transformer = RealTransformerConfig {
+            enabled: true,
+            vocab_size: 256,
+            num_heads: 8,
+            max_batch_size: 8,
+            pressure_high_threshold: crate::block_pool::SOFT_CAP_RATIO,
+            pressure_critical_threshold: crate::block_pool::CRITICAL_PRESSURE_RATIO,
+            max_concurrent_prefetches: crate::engine::DEFAULT_MAX_CONCURRENT_PREFETCHES,
+            max_overflow_capacity: Some(0),
+            ..RealTransformerConfig::default()
+        };
+        c.validate().expect("0 overflow cap should map to unbounded");
     }
 
     #[test]

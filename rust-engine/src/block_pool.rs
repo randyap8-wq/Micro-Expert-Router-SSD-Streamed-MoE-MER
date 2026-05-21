@@ -205,11 +205,22 @@ pub struct PressureThresholds {
     /// speculation (depth → 0) until pressure drops back below
     /// `high`.
     pub critical: f32,
+    /// Optional cap on the number of overflow blocks allocated
+    /// beyond the primary slab (gist Part 1, fix #5). `None`
+    /// preserves the historical "grow forever" behaviour; `Some(n)`
+    /// makes [`BlockPool::allocate`] return `None` once `n` overflow
+    /// blocks are in flight, giving the scheduler an admission
+    /// back-pressure signal instead of silently exploding heap.
+    pub max_overflow_capacity: Option<usize>,
 }
 
 impl Default for PressureThresholds {
     fn default() -> Self {
-        Self { high: SOFT_CAP_RATIO, critical: CRITICAL_PRESSURE_RATIO }
+        Self {
+            high: SOFT_CAP_RATIO,
+            critical: CRITICAL_PRESSURE_RATIO,
+            max_overflow_capacity: None,
+        }
     }
 }
 
@@ -234,7 +245,15 @@ impl PressureThresholds {
                  pressure_critical_threshold ({critical})"
             ));
         }
-        Ok(Self { high, critical })
+        Ok(Self { high, critical, max_overflow_capacity: None })
+    }
+
+    /// Builder-style setter for the overflow cap (gist Part 1, fix #5).
+    /// `Some(0)` is normalized to `None` (unbounded) so the config
+    /// surface can use `0 = unbounded` ergonomically.
+    pub fn with_max_overflow_capacity(mut self, max: Option<usize>) -> Self {
+        self.max_overflow_capacity = max.filter(|&n| n > 0);
+        self
     }
 }
 
@@ -303,15 +322,16 @@ impl BlockPool {
     /// Pop one block id from the free list. Allocation is always
     /// O(1): first the primary slab's free list, then the overflow
     /// slab's free list, and finally a fresh overflow extension. This
-    /// method never returns `None` (allocation is infallible from the
-    /// pool's perspective); callers that want to refuse / queue
-    /// requests *before* hitting the heap-backed overflow should
-    /// consult [`Self::free_blocks`] first.
+    /// method returns `None` only when a configured
+    /// [`PressureThresholds::max_overflow_capacity`] has been reached;
+    /// callers that want to refuse / queue requests *before* hitting
+    /// the heap-backed overflow should consult [`Self::free_blocks`]
+    /// first.
     ///
     /// The historical signature returns `Option<BlockId>` for source
-    /// compatibility, but `None` is now unreachable in the absence of
-    /// `OOM` from the global allocator (in which case the `Vec` grow
-    /// inside will itself panic before we ever return).
+    /// compatibility. With no configured overflow cap, allocation is
+    /// infallible from the pool's perspective (OOM still panics via
+    /// `Vec` growth).
     pub fn allocate(&self) -> Option<BlockId> {
         // Fast path: O(1) primary slab pop.
         if let Some(idx) = self.free.lock().pop() {
@@ -329,6 +349,16 @@ impl BlockPool {
         let mut keys = self.overflow_keys.lock();
         let mut values = self.overflow_values.lock();
         let mut cap = self.overflow_capacity.lock();
+        // Admission back-pressure (gist Part 1, fix #5): if a hard
+        // cap on the overflow slab is configured and we've already
+        // grown to it, refuse the allocation. The scheduler treats
+        // `None` as "pool exhausted" and either queues or rejects
+        // the request rather than oomming the host.
+        if let Some(max) = self.thresholds.max_overflow_capacity {
+            if *cap >= max {
+                return None;
+            }
+        }
         let new_idx = *cap as u32;
         assert!(
             (new_idx & OVERFLOW_BIT) == 0,
@@ -874,6 +904,28 @@ mod tests {
         let o3 = pool.allocate().unwrap();
         assert!(o3.is_overflow());
         assert_eq!(o3.index(), 0);
+    }
+
+    #[test]
+    fn overflow_cap_enforces_admission_back_pressure() {
+        // Primary slab of 1 + overflow cap of 2 → fourth allocate must
+        // return None instead of growing the heap unboundedly.
+        let thresholds = PressureThresholds::default()
+            .with_max_overflow_capacity(Some(2));
+        let pool = BlockPool::with_thresholds(2, 1, thresholds);
+        let p = pool.allocate().expect("primary block");
+        let o1 = pool.allocate().expect("overflow #1");
+        let o2 = pool.allocate().expect("overflow #2");
+        assert!(o1.is_overflow() && o2.is_overflow());
+        // Cap reached: next request must be refused.
+        assert!(pool.allocate().is_none(), "overflow cap should refuse");
+        // Releasing an overflow block frees the slot for re-admission.
+        pool.release(o1);
+        let o3 = pool.allocate().expect("retry after release succeeds");
+        assert!(o3.is_overflow());
+        pool.release(o2);
+        pool.release(o3);
+        pool.release(p);
     }
 
     #[test]

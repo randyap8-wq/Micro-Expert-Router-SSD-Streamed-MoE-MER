@@ -1161,6 +1161,7 @@ mod tests {
     use crate::buffer_pool::BufferPool;
     use crate::engine::{Engine, EngineOptions, ModelShape};
     use crate::expert_cache::ExpertCache;
+    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
     use crate::model::{RealModel, RealModelConfig};
     use crate::router::{PredictiveLoader, TopKRouter};
@@ -1204,7 +1205,7 @@ mod tests {
         // Cache big enough to keep every expert hot after the first
         // request, so we measure compute parallelism rather than I/O
         // serialisation.
-        let cache = Arc::new(ExpertCache::new((total as usize).max(2)));
+        let cache = Arc::new(MultiLayerExpertCache::single_layer((total as usize).max(2)));
         let pool = BufferPool::new(total as usize + 4, expert_size, block);
         let router = crate::gating::Router::Markov(Arc::new(TopKRouter::new(total, cfg.top_k, 1)));
         let predictor = Arc::new(PredictiveLoader::new(total, 0, 0.05, 1));

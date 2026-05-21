@@ -1347,6 +1347,7 @@ mod tests {
     use crate::buffer_pool::BufferPool;
     use crate::engine::{Engine, EngineOptions, ModelShape};
     use crate::expert_cache::ExpertCache;
+    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
     use crate::router::{PredictiveLoader, TopKRouter};
     use axum::body::{to_bytes, Body};
@@ -1440,7 +1441,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let cache = Arc::new(ExpertCache::new(2));
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(2));
         let pool = BufferPool::new(3, expert_size, block);
         let router = crate::gating::Router::Markov(Arc::new(TopKRouter::clustered(num_experts, 2, 2, 0.9, 1)));
         let predictor = Arc::new(PredictiveLoader::new(num_experts, 1, 0.05, 1));
@@ -1770,7 +1771,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let cache = Arc::new(ExpertCache::new((total as usize).max(2)));
+        let cache = Arc::new(MultiLayerExpertCache::single_layer((total as usize).max(2)));
         let pool = BufferPool::new(total as usize + 2, expert_size, block);
         let router = crate::gating::Router::Markov(Arc::new(TopKRouter::new(total, cfg.top_k, 1)));
         let predictor = Arc::new(PredictiveLoader::new(total, 0, 0.05, 1));

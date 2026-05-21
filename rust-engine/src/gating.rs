@@ -204,4 +204,33 @@ mod tests {
             assert!((w - 0.5).abs() < 1e-6);
         }
     }
+
+    #[test]
+    fn router_linear_variant_dispatches_to_real_gate() {
+        // Pin (gist Part 1, finding #4): `Router::Linear` is the
+        // production wiring path when `[real_transformer].enabled =
+        // true`. This test asserts the enum variant actually
+        // dispatches `route()` to `LinearGate::route` (a `softmax(W·x)
+        // → top-K`) rather than to the legacy Markov chain. Without
+        // it a refactor that swaps the variant arms would compile
+        // silently.
+        let num_experts = 4;
+        let d_model = 3;
+        let mut w = Vec::with_capacity(num_experts * d_model);
+        for i in 0..num_experts {
+            for _ in 0..d_model {
+                w.push((i + 1) as f32);
+            }
+        }
+        let gate = LinearGate::new(w, num_experts, d_model, 2);
+        let router = Router::Linear(Arc::new(gate));
+        assert_eq!(router.num_experts(), num_experts as u32);
+        assert_eq!(router.top_k(), 2);
+        let dec = router.route(&[1.0, 1.0, 1.0], /* token_idx ignored */ 42);
+        assert_eq!(dec.experts.len(), 2);
+        assert_eq!(dec.experts[0], 3);
+        assert_eq!(dec.experts[1], 2);
+        let sum: f32 = dec.weights.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+    }
 }

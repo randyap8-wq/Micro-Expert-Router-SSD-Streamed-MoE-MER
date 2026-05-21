@@ -48,6 +48,7 @@ use tracing_subscriber::EnvFilter;
 use crate::buffer_pool::BufferPool;
 use crate::engine::{Engine, EngineOptions, ModelShape};
 use crate::expert_cache::ExpertCache;
+use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::inference::expert_weight_bytes;
 use crate::io_provider::{NvmeStorage, StorageConfig};
 use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter};
@@ -594,7 +595,26 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     let prefetch_headroom = cfg.storage.predict_fanout.max(1);
     let pool_slots = cfg.storage.cache_slots + prefetch_headroom;
     let pool = BufferPool::new(pool_slots, cfg.model.expert_size, cfg.storage.block_align);
-    let cache = Arc::new(ExpertCache::new(cfg.storage.cache_slots));
+    let cache = {
+        let num_layers = cfg.model.num_layers.max(1);
+        let per_layer = cfg.model.num_experts.max(1) as u32;
+        // Split the configured residency budget across layers so the
+        // *aggregate* capacity matches the operator's `cache_slots`
+        // setting. Layers each get a fair share with the remainder
+        // distributed to the lower-indexed layers (which tend to be
+        // hotter in MoE workloads).
+        let total = cfg.storage.cache_slots.max(1);
+        let base = total / num_layers;
+        let extra = total % num_layers;
+        let caps: Vec<usize> = (0..num_layers)
+            .map(|i| base + if i < extra { 1 } else { 0 })
+            .collect();
+        if num_layers == 1 {
+            Arc::new(MultiLayerExpertCache::single_layer(total))
+        } else {
+            Arc::new(MultiLayerExpertCache::with_capacities(caps, per_layer))
+        }
+    };
 
     // Multi-layer addressing: the engine's expert cache uses a single
     // global namespace `(layer * num_experts_per_layer) + local`, so
@@ -705,6 +725,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             partial_load_fraction: cfg.storage.partial_load_fraction,
             pin_after_observations: cfg.storage.pin_after_observations,
             use_qmm_for_q4: true,
+            max_concurrent_prefetches: cfg.real_transformer.max_concurrent_prefetches,
         },
     );
     // Attach the speculative-architecture components requested via
@@ -777,7 +798,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                 rt.pressure_high_threshold,
                 rt.pressure_critical_threshold,
             )
-            .expect("pressure thresholds validated by Config::validate"),
+            .expect("pressure thresholds validated by Config::validate")
+            .with_max_overflow_capacity(rt.max_overflow_capacity),
             ..Default::default()
         };
         let scheduler = crate::batch_scheduler::BatchScheduler::spawn(
@@ -1344,7 +1366,7 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         "buffer pool sized with prefetch headroom"
     );
     let pool = BufferPool::new(pool_slots, args.expert_size, args.block_align);
-    let cache = Arc::new(ExpertCache::new(args.cache_slots));
+    let cache = Arc::new(MultiLayerExpertCache::single_layer(args.cache_slots));
 
     // Build the Markov router. If the user supplied a precomputed matrix
     // (e.g. derived from a real Mixtral routing trace), prefer that;
@@ -1396,6 +1418,7 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                 partial_load_fraction: args.partial_load_fraction,
                 pin_after_observations: args.pin_after_observations,
                 use_qmm_for_q4: true,
+                max_concurrent_prefetches: 64,
             },
         );
         // Optional alias map (Change 6: expert deduplication).

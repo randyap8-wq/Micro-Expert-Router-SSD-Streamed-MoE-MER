@@ -7,17 +7,18 @@
 //! 5's prefetched experts evict layer 0's, defeating the cache.
 //!
 //! [`MultiLayerExpertCache`] owns one [`crate::expert_cache::ExpertCache`]
-//! per layer. The router, predictor, and engine all key on
-//! `(layer, expert_id)`. The on-disk file naming convention is
-//! `expert_<layer>_<id>.bin` for multi-layer models (single-layer models
-//! continue to use `expert_<id>.bin`, written by the existing extractor).
+//! per layer plus the `experts_per_layer` stride used to derive
+//! `(layer, local_id)` from the *global* expert id encoded in
+//! [`ExpertResident::id`]. The rest of the engine still threads a single
+//! id-space through router, predictor and cache APIs — the wrapper just
+//! dispatches each call to the per-layer LRU that owns it. For single-
+//! layer models (the in-tree `serve` path) use [`Self::single_layer`],
+//! which gives the same observable behaviour as the original flat
+//! `ExpertCache`.
 //!
-//! The wrapper is consumed by the multi-layer transformer wiring landing
-//! in a follow-up PR; the in-tree single-layer `serve` path uses one
-//! `ExpertCache` directly. `dead_code` is allowed so the surface is
-//! greppable without a forced call site.
-#![allow(dead_code)]
-
+//! The on-disk file naming convention is `expert_<layer>_<id>.bin` for
+//! multi-layer models (single-layer models continue to use
+//! `expert_<id>.bin`, written by the existing extractor).
 
 use crate::expert_cache::{ExpertCache, ExpertResident};
 use std::sync::Arc;
@@ -38,28 +39,79 @@ impl ExpertKey {
 /// One [`ExpertCache`] per layer. Capacities can be set per-layer (e.g.
 /// to give "hot" early layers more residency budget) or uniformly via
 /// [`MultiLayerExpertCache::with_uniform_capacity`].
+///
+/// `experts_per_layer` is the stride used to decode a global expert id
+/// into `(layer, local_id)` — `layer = id / experts_per_layer`,
+/// `local_id = id % experts_per_layer`. The engine builds resident
+/// experts with global ids (see `model.rs`'s layer-qualified id space),
+/// so this stride must match the model's layout. Single-layer models
+/// can use [`Self::single_layer`], which sets the stride to `u32::MAX`
+/// so every id maps to layer 0.
 pub struct MultiLayerExpertCache {
     caches: Vec<Arc<ExpertCache>>,
+    experts_per_layer: u32,
 }
 
 impl MultiLayerExpertCache {
     /// Build a cache with `num_layers` per-layer caches, each of
-    /// capacity `cap_per_layer`.
-    pub fn with_uniform_capacity(num_layers: usize, cap_per_layer: usize) -> Self {
+    /// capacity `cap_per_layer`. `experts_per_layer` is the stride
+    /// used to decode global expert ids into `(layer, local)`.
+    pub fn with_uniform_capacity(
+        num_layers: usize,
+        cap_per_layer: usize,
+        experts_per_layer: u32,
+    ) -> Self {
         assert!(num_layers > 0, "num_layers must be > 0");
-        let caches = (0..num_layers).map(|_| Arc::new(ExpertCache::new(cap_per_layer))).collect();
-        Self { caches }
+        assert!(experts_per_layer > 0, "experts_per_layer must be > 0");
+        let caches = (0..num_layers)
+            .map(|_| Arc::new(ExpertCache::new(cap_per_layer)))
+            .collect();
+        Self {
+            caches,
+            experts_per_layer,
+        }
     }
 
     /// Build a cache from explicit per-layer capacities.
-    pub fn with_capacities(per_layer_caps: Vec<usize>) -> Self {
+    pub fn with_capacities(per_layer_caps: Vec<usize>, experts_per_layer: u32) -> Self {
         assert!(!per_layer_caps.is_empty(), "must have at least one layer");
-        let caches = per_layer_caps.into_iter().map(|c| Arc::new(ExpertCache::new(c))).collect();
-        Self { caches }
+        assert!(experts_per_layer > 0, "experts_per_layer must be > 0");
+        let caches = per_layer_caps
+            .into_iter()
+            .map(|c| Arc::new(ExpertCache::new(c)))
+            .collect();
+        Self {
+            caches,
+            experts_per_layer,
+        }
+    }
+
+    /// Single-layer convenience: one underlying `ExpertCache` of
+    /// `capacity`, with the stride set to `u32::MAX` so every global
+    /// id maps to layer 0. Used by the in-tree `serve` path and tests
+    /// that haven't been ported to a real multi-layer model yet.
+    pub fn single_layer(capacity: usize) -> Self {
+        Self {
+            caches: vec![Arc::new(ExpertCache::new(capacity))],
+            experts_per_layer: u32::MAX,
+        }
     }
 
     pub fn num_layers(&self) -> usize {
         self.caches.len()
+    }
+
+    pub fn experts_per_layer(&self) -> u32 {
+        self.experts_per_layer
+    }
+
+    /// Decode a global expert id into the index of its per-layer
+    /// cache. Clamps to the last layer when `id` is out of range so
+    /// downstream callers never panic on a malformed router output —
+    /// they get a miss instead, which is the correct degradation.
+    fn layer_idx(&self, id: u32) -> usize {
+        let layer = (id / self.experts_per_layer) as usize;
+        layer.min(self.caches.len().saturating_sub(1))
     }
 
     /// Borrow the [`ExpertCache`] for one layer (so existing engine code
@@ -78,20 +130,90 @@ impl MultiLayerExpertCache {
         self.caches[idx].clone()
     }
 
-    pub fn get(&self, key: ExpertKey) -> Option<Arc<ExpertResident>> {
-        self.caches.get(key.layer as usize)?.get(key.expert)
+    // --- ExpertCache-mirroring API on global expert ids ------------------
+    //
+    // The engine hot path operates on global ids; these methods route each
+    // call to the per-layer LRU that owns it. Aggregate getters
+    // (`len`/`capacity`/`pinned_count`/`resident_ids`) sum across layers
+    // so existing diagnostics keep reporting whole-engine totals.
+
+    pub fn get(&self, id: u32) -> Option<Arc<ExpertResident>> {
+        self.caches[self.layer_idx(id)].get(id)
     }
 
-    pub fn contains(&self, key: ExpertKey) -> bool {
-        self.caches
-            .get(key.layer as usize)
-            .map(|c| c.contains(key.expert))
-            .unwrap_or(false)
+    pub fn contains(&self, id: u32) -> bool {
+        self.caches[self.layer_idx(id)].contains(id)
+    }
+
+    pub fn insert(
+        &self,
+        resident: Arc<ExpertResident>,
+    ) -> Result<Option<Arc<ExpertResident>>, Arc<ExpertResident>> {
+        let idx = self.layer_idx(resident.id);
+        self.caches[idx].insert(resident)
+    }
+
+    pub fn pin(&self, id: u32) {
+        self.caches[self.layer_idx(id)].pin(id);
+    }
+
+    pub fn unpin(&self, id: u32) {
+        self.caches[self.layer_idx(id)].unpin(id);
+    }
+
+    /// Pop a least-recently-used non-pinned entry. With multiple
+    /// layers, evicts from the layer whose per-layer LRU has the most
+    /// residents (so we relieve the most-pressured layer first); ties
+    /// go to the lowest layer index. Returns `None` only when every
+    /// resident across every layer is pinned.
+    pub fn evict_lru(&self) -> Option<Arc<ExpertResident>> {
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, cache) in self.caches.iter().enumerate() {
+            let len = cache.len();
+            if len == 0 {
+                continue;
+            }
+            match best {
+                Some((_, best_len)) if len <= best_len => {}
+                _ => best = Some((idx, len)),
+            }
+        }
+        let (start, _) = best?;
+        // Try the heaviest layer first, then fall back to others in
+        // case every entry there is pinned.
+        let n = self.caches.len();
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            if let Some(r) = self.caches[idx].evict_lru() {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    pub fn len(&self) -> usize {
+        self.caches.iter().map(|c| c.len()).sum()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.caches.iter().map(|c| c.capacity()).sum()
+    }
+
+    pub fn pinned_count(&self) -> usize {
+        self.caches.iter().map(|c| c.pinned_count()).sum()
+    }
+
+    pub fn resident_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::with_capacity(self.len());
+        for c in &self.caches {
+            ids.extend(c.resident_ids());
+        }
+        ids
     }
 
     /// Total number of cached experts across all layers.
     pub fn total_resident(&self) -> usize {
-        self.caches.iter().map(|c| c.len()).sum()
+        self.len()
     }
 }
 
@@ -103,25 +225,94 @@ mod tests {
     #[test]
     fn per_layer_caches_are_independent() {
         let pool = BufferPool::new(4, 4096, 4096);
-        let mlc = MultiLayerExpertCache::with_uniform_capacity(2, 2);
+        // experts_per_layer = 8 -> id 0 = (layer 0, local 0); id 8 = (layer 1, local 0)
+        let mlc = MultiLayerExpertCache::with_uniform_capacity(2, 2, 8);
 
-        // Insert expert 0 into layer 0.
+        // Insert expert 0 into layer 0 via the global-id API.
         let resident = Arc::new(ExpertResident::new(
             0,
             pool.try_acquire().unwrap(),
         ));
-        mlc.cache_for_layer(0).insert(resident);
+        let _ = mlc.insert(resident);
 
-        assert!(mlc.contains(ExpertKey::new(0, 0)));
-        assert!(!mlc.contains(ExpertKey::new(1, 0)));
+        assert!(mlc.contains(0));
+        assert!(!mlc.contains(8));
         assert_eq!(mlc.total_resident(), 1);
+        assert!(mlc.contains_at(ExpertKey::new(0, 0)));
+        assert!(!mlc.contains_at(ExpertKey::new(1, 0)));
     }
 
     #[test]
     fn cache_for_layer_returns_clones_of_same_arc() {
-        let mlc = MultiLayerExpertCache::with_uniform_capacity(3, 1);
+        let mlc = MultiLayerExpertCache::with_uniform_capacity(3, 1, 4);
         let a = mlc.cache_for_layer(0);
         let b = mlc.cache_for_layer(0);
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn single_layer_acts_like_flat_cache() {
+        let pool = BufferPool::new(4, 4096, 4096);
+        let mlc = MultiLayerExpertCache::single_layer(2);
+        for id in [3u32, 7u32, 42u32] {
+            let r = Arc::new(ExpertResident::new(id, pool.try_acquire().unwrap()));
+            let _ = mlc.insert(r);
+        }
+        // Capacity is 2 so the oldest insertion (3) should have been
+        // evicted on the third insert.
+        assert_eq!(mlc.len(), 2);
+        assert!(mlc.contains(7));
+        assert!(mlc.contains(42));
+        assert!(!mlc.contains(3));
+        let mut ids = mlc.resident_ids();
+        ids.sort();
+        assert_eq!(ids, vec![7, 42]);
+    }
+
+    #[test]
+    fn evict_lru_targets_most_loaded_layer() {
+        let pool = BufferPool::new(8, 4096, 4096);
+        let mlc = MultiLayerExpertCache::with_uniform_capacity(2, 4, 8);
+        // Layer 0 gets 3 residents, layer 1 gets 1.
+        for id in [0u32, 1, 2] {
+            let r = Arc::new(ExpertResident::new(id, pool.try_acquire().unwrap()));
+            let _ = mlc.insert(r);
+        }
+        let r = Arc::new(ExpertResident::new(8, pool.try_acquire().unwrap()));
+        let _ = mlc.insert(r);
+        assert_eq!(mlc.len(), 4);
+
+        let evicted = mlc.evict_lru().expect("an eviction");
+        // Evicts from layer 0 (heaviest) — LRU there is id 0.
+        assert_eq!(evicted.id, 0);
+        assert!(!mlc.contains(0));
+        assert!(mlc.contains(8), "layer 1's expert untouched");
+    }
+}
+
+impl MultiLayerExpertCache {
+    /// `(layer, local)` → encoded global expert id, in the canonical
+    /// stride-based encoding the engine emits everywhere.
+    #[inline]
+    fn global_id(&self, key: ExpertKey) -> u32 {
+        key.layer
+            .saturating_mul(self.experts_per_layer)
+            .saturating_add(key.expert)
+    }
+
+    /// `(layer, local)` membership check — kept for tests/diagnostics
+    /// that already use the explicit `ExpertKey` form.
+    pub fn contains_at(&self, key: ExpertKey) -> bool {
+        self.caches
+            .get(key.layer as usize)
+            .map(|c| c.contains(self.global_id(key)))
+            .unwrap_or(false)
+    }
+
+    /// `(layer, local)` lookup using the same global-id encoding the
+    /// rest of the engine emits.
+    pub fn get_at(&self, key: ExpertKey) -> Option<Arc<ExpertResident>> {
+        let cache = self.caches.get(key.layer as usize)?;
+        cache.get(self.global_id(key))
     }
 }
