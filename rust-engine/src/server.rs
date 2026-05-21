@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Shared handler state. Cheap to clone — everything is `Arc`.
@@ -1243,15 +1243,16 @@ fn error_response(e: GenerateError) -> Response {
 ///
 /// **Safety contract.** If any warm-up step fails the server must
 /// still bind. We log the failure via [`tracing::warn!`] and
-/// return `Ok(())` to the caller — a warm-up failure is *not* a
-/// fatal startup error (gist Task 1, "Constraint: The server
-/// must still bind if warm-up fails").
+/// continue startup — a warm-up failure is *not* a fatal startup
+/// error (gist Task 1, "Constraint: The server must still bind if
+/// warm-up fails").
 ///
 /// **Performance contract.** This routine runs **before** the
 /// listener binds in [`serve`], so the listening socket only
 /// accepts connections once warm-up has completed. The first
 /// real user therefore sees a 0-ms-start system.
 pub async fn run_engine_warmup(state: &AppState) {
+    const SCHEDULER_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
     let start = Instant::now();
     tracing::info!("engine warm-up starting (cold-start mitigation)");
 
@@ -1260,9 +1261,20 @@ pub async fn run_engine_warmup(state: &AppState) {
     if let (Some(model), Some(scheduler)) = (state.real_model.as_ref(), state.batch_scheduler.as_ref()) {
         // Full path: drive a synthetic decoder step through the
         // batch scheduler. Bypasses HTTP/auth/admission by design.
-        match scheduler.submit_internal_warmup(model, &state.engine).await {
-            Ok(()) => result = Ok("scheduler-synthetic-step"),
-            Err(e) => result = Err(format!("scheduler warm-up failed: {e}")),
+        match tokio::time::timeout(
+            SCHEDULER_WARMUP_TIMEOUT,
+            scheduler.submit_internal_warmup(model, &state.engine),
+        )
+        .await
+        {
+            Ok(Ok(())) => result = Ok("scheduler-synthetic-step"),
+            Ok(Err(e)) => result = Err(format!("scheduler warm-up failed: {e}")),
+            Err(_) => {
+                result = Err(format!(
+                    "scheduler warm-up timed out after {}s",
+                    SCHEDULER_WARMUP_TIMEOUT.as_secs()
+                ))
+            }
         }
     } else {
         // Fallback path (no real-transformer / no scheduler wired in

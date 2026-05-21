@@ -715,10 +715,9 @@ impl BatchScheduler {
     ///   [`crate::server::run_engine_warmup`] before the listener
     ///   binds. There is no auth, no rate-limit, no admission
     ///   check — by design.
-    /// - It is best-effort. Any failure is surfaced as
-    ///   [`BatchError`] / `std::io::Error` to the caller, which
-    ///   logs a `tracing::warn!` and continues serving — the
-    ///   server must still bind even if warm-up fails.
+    /// - It is best-effort. Channel/registry failures are surfaced as
+    ///   [`BatchError`]. `engine.warm_with` failures are logged in
+    ///   place and warm-up continues so startup still reaches bind.
     /// - **Zero-contention.** This routine does **not** add new
     ///   locks to [`scheduler_loop`]. It re-uses the existing
     ///   per-class mpsc channels and the same registry / release
@@ -740,10 +739,8 @@ impl BatchScheduler {
             let cap = num_experts.min(8);
             let ids: Vec<u32> = (0..cap).collect();
             if let Err(e) = engine.warm_with(&ids).await {
-                // Surface the I/O error to the caller. The
-                // top-level `run_engine_warmup` will downgrade it
-                // to a `tracing::warn!` so the listener still
-                // binds (gist Task 1 safety constraint).
+                // `warm_with` is best-effort by design; log and keep
+                // progressing through warm-up so startup still binds.
                 tracing::warn!(error = %e, "submit_internal_warmup: warm_with failed");
             }
         }

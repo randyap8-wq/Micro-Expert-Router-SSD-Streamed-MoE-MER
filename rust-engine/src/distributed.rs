@@ -26,12 +26,10 @@
 //!     └──────────────────┘                       └─────────────────────────────┘
 //! ```
 //!
-//! The `BatchScheduler` consults the [`ShardRouter`] *before* it
-//! issues the `Engine::warm_with` pre-pass that pulls the unique
-//! expert ids into the local cache: ids tagged `Local` go through
-//! the existing NVMe path; ids tagged `Remote` produce a structured
-//! [`InferenceError::RemoteShardFetchFailed`] when the remote fetch
-//! cannot be satisfied (rather than panicking inside the hot loop).
+//! Planned wiring (follow-up PR): the `BatchScheduler` will consult
+//! [`ShardRouter`] before issuing `Engine::warm_with`, so ids tagged
+//! `Local` stay on the existing NVMe path while `Remote` ids can
+//! surface structured remote-fetch failures instead of panicking.
 //!
 //! ## Zero-copy invariant
 //!
@@ -93,9 +91,11 @@ impl std::fmt::Display for NodeAddr {
 /// What the [`ShardRouter`] tells the batch scheduler to do for a
 /// given expert id.
 ///
-/// Construction is cheap: every variant is a small, owned, `Copy`-ish
-/// payload — no buffers, no `Vec`s, no `Arc`s of weight bytes. This
-/// preserves the **zero-copy invariant** the engine commits to.
+/// Construction is lightweight and owns metadata only (expert id,
+/// node address, timeout) — never expert weight buffers. `Remote`
+/// stores a `NodeAddr(String)` and error types may carry textual
+/// reasons, but no variant carries weight bytes. This preserves the
+/// **zero-copy invariant** the engine commits to.
 #[derive(Debug, Clone)]
 pub enum ShardInstruction {
     /// Expert is locally resident or fetchable from local NVMe.
