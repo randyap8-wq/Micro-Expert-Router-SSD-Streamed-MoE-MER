@@ -291,7 +291,6 @@ mod tests {
 }
 
 impl MultiLayerExpertCache {
-    /// `(layer, local)` membership check — kept for tests/diagnostics
     /// `(layer, local)` → encoded global expert id, in the canonical
     /// stride-based encoding the engine emits everywhere.
     #[inline]
@@ -301,6 +300,7 @@ impl MultiLayerExpertCache {
             .saturating_add(key.expert)
     }
 
+    /// `(layer, local)` membership check — kept for tests/diagnostics
     /// that already use the explicit `ExpertKey` form.
     pub fn contains_at(&self, key: ExpertKey) -> bool {
         self.caches

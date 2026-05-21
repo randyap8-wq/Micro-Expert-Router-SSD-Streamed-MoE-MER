@@ -361,8 +361,9 @@ pub struct RealTransformerConfig {
     /// "overflow" KV blocks the [`block_pool::BlockPool`] may
     /// allocate beyond its primary slab before
     /// [`block_pool::BlockPool::allocate`] starts returning `None`
-    /// (admission back-pressure). `None` (omitted) and `Some(0)`
-    /// preserve the historical unbounded growth behaviour.
+    /// (admission back-pressure). `None` (omitted) preserves the
+    /// historical unbounded growth behaviour; `Some(0)` is normalized
+    /// to `None`, so it is treated as unbounded too.
     #[serde(default)]
     pub max_overflow_capacity: Option<usize>,
 }
