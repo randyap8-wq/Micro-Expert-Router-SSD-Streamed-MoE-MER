@@ -1811,26 +1811,12 @@ pub fn run_inference_gpu(
     #[cfg(feature = "cuda")]
     {
         use candle_core::{Device, Tensor};
-        match Device::new_cuda(0) {
-            Ok(dev) => {
-                let weights = ExpertWeights::from_bytes(resident.data(), d_model, d_ff)?;
-                let map_err =
-                    |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
-                let (gate_t, up_t, down_t) =
-                    weights.to_candle_tensors(&dev).map_err(map_err)?;
-                let x_t = Tensor::from_slice(x, (d_model, 1), &dev).map_err(map_err)?;
-                let g = gate_t.matmul(&x_t).map_err(map_err)?;
-                let u = up_t.matmul(&x_t).map_err(map_err)?;
-                let gated = Tensor::silu(&g)
-                    .map_err(map_err)?
-                    .mul(&u)
-                    .map_err(map_err)?;
-                let y_t = down_t.matmul(&gated).map_err(map_err)?;
-                let y_t = y_t.squeeze(1).map_err(map_err)?;
-                let y: HiddenState = y_t.to_vec1::<f32>().map_err(map_err)?;
-                let out = summarise_output(token_idx, resident.id, &y);
-                return Ok((out, y));
-            }
+        static CUDA_DEVICE: std::sync::OnceLock<Result<Device, String>> =
+            std::sync::OnceLock::new();
+        let dev = match CUDA_DEVICE
+            .get_or_init(|| Device::new_cuda(0).map_err(|e| e.to_string()))
+        {
+            Ok(dev) => dev,
             Err(e) => {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
@@ -1840,8 +1826,21 @@ pub fn run_inference_gpu(
                          inference path. Subsequent failures will be silent."
                     );
                 });
+                return run_inference(token_idx, resident, x, d_model, d_ff);
             }
-        }
+        };
+        let weights = ExpertWeights::from_bytes(resident.data(), d_model, d_ff)?;
+        let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
+        let (gate_t, up_t, down_t) = weights.to_candle_tensors(dev).map_err(map_err)?;
+        let x_t = Tensor::from_slice(x, (d_model, 1), dev).map_err(map_err)?;
+        let g = gate_t.matmul(&x_t).map_err(map_err)?;
+        let u = up_t.matmul(&x_t).map_err(map_err)?;
+        let gated = Tensor::silu(&g).map_err(map_err)?.mul(&u).map_err(map_err)?;
+        let y_t = down_t.matmul(&gated).map_err(map_err)?;
+        let y_t = y_t.squeeze(1).map_err(map_err)?;
+        let y: HiddenState = y_t.to_vec1::<f32>().map_err(map_err)?;
+        let out = summarise_output(token_idx, resident.id, &y);
+        return Ok((out, y));
     }
     #[cfg(not(feature = "cuda"))]
     {
