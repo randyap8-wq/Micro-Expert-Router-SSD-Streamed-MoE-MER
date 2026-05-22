@@ -82,6 +82,18 @@ impl SessionState {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     inner: Arc<DashMap<String, SessionState>>,
+    /// Ids that are currently checked out via [`Self::take`] and not
+    /// yet returned via [`Self::put`]. Lets [`Self::delete`] observe
+    /// — and revoke — an in-flight session that is invisible to a
+    /// `DashMap::remove` against `inner` because the entry has been
+    /// handed to a request handler. (F1.5 in the audit.)
+    in_flight: Arc<DashMap<String, ()>>,
+    /// Ids that were ordered deleted while still in flight. The next
+    /// [`Self::put`] for one of these ids zeroizes the returned state
+    /// and refuses to reinsert it, preserving the
+    /// `DELETE /v1/sessions/{id}` invariant that no resumption of the
+    /// session is possible after the delete is observed.
+    tombstones: Arc<DashMap<String, ()>>,
     ttl: Duration,
 }
 
@@ -91,6 +103,8 @@ impl SessionStore {
     pub fn new(ttl: Duration) -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
+            tombstones: Arc::new(DashMap::new()),
             ttl,
         }
     }
@@ -109,10 +123,24 @@ impl SessionStore {
     /// session resumes on the next request. Returns `None` when no
     /// session with that id exists.
     pub fn take(&self, id: &str) -> Option<SessionState> {
-        self.inner.remove(id).map(|(_, mut s)| {
+        // Reject takes for ids that have an outstanding tombstone:
+        // a concurrent `delete` already decided this session is
+        // gone, and serving its state to a new request would
+        // resurrect attention bytes the operator asked to be
+        // discarded.
+        if self.tombstones.contains_key(id) {
+            return None;
+        }
+        let removed = self.inner.remove(id).map(|(_, mut s)| {
             s.last_used = Instant::now();
             s
-        })
+        });
+        if removed.is_some() {
+            // Record the in-flight checkout so `delete` can find
+            // the session even though it is no longer in `inner`.
+            self.in_flight.insert(id.to_string(), ());
+        }
+        removed
     }
 
     /// Reinsert a session — typically after a request has consumed
@@ -121,6 +149,17 @@ impl SessionStore {
     /// for the same session ran in parallel; last writer wins,
     /// matching vLLM / ollama semantics).
     pub fn put(&self, id: String, mut state: SessionState) {
+        // Always clear the in-flight marker — whether or not we
+        // ultimately reinsert, this checkout is done.
+        self.in_flight.remove(&id);
+        if self.tombstones.remove(&id).is_some() {
+            // A `delete` arrived while this id was in flight. Honour
+            // the delete: scrub the KV bytes and drop the state
+            // instead of reinserting. This is the resurrection-
+            // prevention half of F1.5.
+            state.zeroize_in_place();
+            return;
+        }
         state.last_used = Instant::now();
         self.inner.insert(id, state);
     }
@@ -132,13 +171,25 @@ impl SessionStore {
     /// later allocation that lands in the same memory. This is the
     /// "memory zeroing" production-readiness ask.
     pub fn delete(&self, id: &str) -> bool {
-        match self.inner.remove(id) {
-            Some((_, mut state)) => {
-                state.zeroize_in_place();
-                true
-            }
-            None => false,
+        // First case: the session is resident. Remove + zeroize as
+        // usual. A concurrent `take` either lost the race on
+        // `inner.remove` (and will return `None`) or won and is in
+        // the in-flight branch below — never both.
+        if let Some((_, mut state)) = self.inner.remove(id) {
+            state.zeroize_in_place();
+            // Clear any tombstone defensively — the session is gone.
+            self.tombstones.remove(id);
+            return true;
         }
+        // Second case: the session is currently checked out via
+        // `take`. We cannot zeroize the bytes (the request handler
+        // owns them) but we *can* arm a tombstone so the matching
+        // `put` zeroizes-and-discards instead of reinserting.
+        if self.in_flight.contains_key(id) {
+            self.tombstones.insert(id.to_string(), ());
+            return true;
+        }
+        false
     }
 
     /// Evict entries idle for longer than the configured TTL. Returns
@@ -308,5 +359,60 @@ mod tests {
         store.inner.insert("expired".into(), s);
         assert_eq!(store.evict_expired(), 1);
         assert!(store.take("expired").is_none());
+    }
+
+    /// F1.5 regression: a `delete` that arrives while the session is
+    /// checked out via `take` must (a) report success and (b) prevent
+    /// the subsequent `put` from resurrecting the session.
+    #[test]
+    fn delete_during_in_flight_take_blocks_resurrection() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let mut s = SessionState::new(fake_kv());
+        s.position = 7;
+        store.put("alice".into(), s);
+
+        // Request handler checks the session out.
+        let in_flight = store.take("alice").expect("session must exist");
+        assert_eq!(in_flight.position, 7);
+        assert_eq!(store.len(), 0, "take is destructive on `inner`");
+
+        // Concurrent DELETE /v1/sessions/alice arrives. There is no
+        // resident entry to remove, but the session is in flight —
+        // the delete must still report success and arm a tombstone.
+        assert!(
+            store.delete("alice"),
+            "delete must see in-flight sessions"
+        );
+
+        // Request handler finishes and tries to put the session
+        // back. The tombstone must prevent the reinsert.
+        store.put("alice".into(), in_flight);
+        assert_eq!(store.len(), 0, "delete must win the race");
+        assert!(store.take("alice").is_none());
+
+        // A fresh put after the resolution is allowed.
+        store.put("alice".into(), SessionState::new(fake_kv()));
+        assert!(store.take("alice").is_some());
+    }
+
+    /// F1.5 regression: a `take` that arrives after `delete` has armed
+    /// a tombstone (e.g. because the session was just deleted and a
+    /// straggling reuse attempt comes in) must return `None`, not
+    /// resurrect a freshly-inserted entry by id collision.
+    #[test]
+    fn take_respects_outstanding_tombstone() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        store.put("bob".into(), SessionState::new(fake_kv()));
+        // Simulate "in flight then deleted" by hand: check out, then
+        // delete — the tombstone is now armed.
+        let s = store.take("bob").expect("must exist");
+        assert!(store.delete("bob"));
+        // Even if a racing caller manages to slip a `put` in (e.g.
+        // because two takes ran in parallel and one already ran
+        // `put`), the tombstone-aware `take` refuses to surface a
+        // tombstoned id. Here we simulate that by inserting back
+        // and asserting the next `take` returns None.
+        store.put("bob".into(), s); // honoured tombstone → no insert
+        assert!(store.take("bob").is_none());
     }
 }

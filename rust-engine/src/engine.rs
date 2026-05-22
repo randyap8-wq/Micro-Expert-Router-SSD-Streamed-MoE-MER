@@ -1748,101 +1748,119 @@ impl Engine {
             return Ok(r);
         }
 
-        // Singleflight: try to install a fresh Notify. If we win the
-        // race we are the "leader" and will drive the actual read.
-        // Otherwise we clone the existing Notify and wait for the
-        // leader, then re-check the cache. We use DashMap's
-        // `Entry::Occupied/Vacant` distinction so the leader bit is
-        // unambiguous (Arc strong-count is racy under TSO).
-        let (is_leader, notify) = match self.in_flight.entry(id) {
-            dashmap::mapref::entry::Entry::Occupied(occ) => (false, occ.get().clone()),
-            dashmap::mapref::entry::Entry::Vacant(vac) => {
-                let n = Arc::new(Notify::new());
-                vac.insert(n.clone());
-                (true, n)
-            }
-        };
+        // Loop so that a follower whose leader failed re-contends
+        // for the singleflight slot rather than barrelling into its
+        // own disk read (which would be the thundering-herd case
+        // F1.4 documents). Bound the contention loop so a stream of
+        // failing leaders can still surface an error.
+        const MAX_LEADER_ELECTIONS: usize = 4;
+        for _election in 0..MAX_LEADER_ELECTIONS {
+            // Singleflight: try to install a fresh Notify. If we win
+            // the race we are the "leader" and will drive the actual
+            // read. Otherwise we clone the existing Notify and wait
+            // for the leader, then re-check the cache. We use
+            // DashMap's `Entry::Occupied/Vacant` distinction so the
+            // leader bit is unambiguous (Arc strong-count is racy
+            // under TSO).
+            let (is_leader, notify) = match self.in_flight.entry(id) {
+                dashmap::mapref::entry::Entry::Occupied(occ) => (false, occ.get().clone()),
+                dashmap::mapref::entry::Entry::Vacant(vac) => {
+                    let n = Arc::new(Notify::new());
+                    vac.insert(n.clone());
+                    (true, n)
+                }
+            };
 
-        if !is_leader {
-            // Pre-register as a waiter *before* re-checking the cache
-            // and the in_flight map, so we cannot miss the leader's
-            // `notify_waiters()` call if it lands between our entry
-            // lookup and our await. This is the standard
-            // `tokio::sync::Notify` race-free pattern.
-            let fut = notify.notified();
-            tokio::pin!(fut);
-            fut.as_mut().enable();
-            if let Some(r) = self.core.cache.get(id) {
-                self.metrics.counters.singleflight_followers
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(r);
-            }
-            // If the leader already removed the in_flight entry
-            // (i.e. completed before we enabled) but the cache
-            // doesn't have the expert, the leader's fetch failed
-            // and we must do our own read.
-            if !self.in_flight.contains_key(&id) {
-                // Fall through to leader path (the cache miss is
-                // legitimate now).
-            } else {
-                fut.await;
+            if !is_leader {
+                // Pre-register as a waiter *before* re-checking the
+                // cache and the in_flight map, so we cannot miss the
+                // leader's `notify_waiters()` call if it lands
+                // between our entry lookup and our await. This is
+                // the standard `tokio::sync::Notify` race-free
+                // pattern.
+                let fut = notify.notified();
+                tokio::pin!(fut);
+                fut.as_mut().enable();
                 if let Some(r) = self.core.cache.get(id) {
                     self.metrics.counters.singleflight_followers
                         .fetch_add(1, Ordering::Relaxed);
                     return Ok(r);
                 }
-                // Leader failed; fall through.
-            }
-        }
-
-        // Leader (or fallback follower after a failed leader) path:
-        // drive the retry loop ourselves. Ensure the in_flight slot
-        // is removed and waiters are notified on every exit branch.
-        let _guard = SingleflightLeaderGuard {
-            map: self.in_flight.clone(),
-            id,
-            notify: notify.clone(),
-            armed: is_leader,
-        };
-
-        const MAX_ATTEMPTS: usize = 3;
-        let mut last_err: Option<String> = None;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self.fetch_once(id).await {
-                Ok(r) => {
-                    if attempt > 0 {
-                        info!(expert = id, attempt, "expert fetch recovered after retry");
+                if self.in_flight.contains_key(&id) {
+                    fut.await;
+                    if let Some(r) = self.core.cache.get(id) {
+                        self.metrics.counters.singleflight_followers
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(r);
                     }
-                    return Ok(r);
+                    // Leader failed. Loop back and contend for the
+                    // singleflight slot again. Exactly one of the
+                    // woken followers will win the next CAS and
+                    // become the new leader; the rest will park on
+                    // its Notify. This prevents the thundering
+                    // herd (F1.4 in the audit).
                 }
-                Err(FetchOnceError::PoolStarved) => {
-                    return Err(ExpertReadError::PoolStarved { id });
-                }
-                Err(FetchOnceError::Io(msg)) => {
-                    last_err = Some(msg.clone());
-                    if attempt + 1 < MAX_ATTEMPTS {
-                        // Exponential backoff: 10ms, 40ms, 160ms. Cap
-                        // at 500ms to keep request latency bounded —
-                        // the real-transformer path can skip failed
-                        // experts so a long retry storm is worse than
-                        // a quick degraded response.
-                        let backoff_ms = (10u64 << (attempt * 2)).min(500);
-                        warn!(
-                            expert = id,
-                            attempt,
-                            backoff_ms,
-                            error = %msg,
-                            "expert fetch failed; will retry"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                continue;
+            }
+
+            // Leader path: drive the retry loop ourselves. Ensure
+            // the in_flight slot is removed and waiters are notified
+            // on every exit branch.
+            let _guard = SingleflightLeaderGuard {
+                map: self.in_flight.clone(),
+                id,
+                notify: notify.clone(),
+                armed: true,
+            };
+
+            const MAX_ATTEMPTS: usize = 3;
+            let mut last_err: Option<String> = None;
+            for attempt in 0..MAX_ATTEMPTS {
+                match self.fetch_once(id).await {
+                    Ok(r) => {
+                        if attempt > 0 {
+                            info!(expert = id, attempt, "expert fetch recovered after retry");
+                        }
+                        return Ok(r);
+                    }
+                    Err(FetchOnceError::PoolStarved) => {
+                        return Err(ExpertReadError::PoolStarved { id });
+                    }
+                    Err(FetchOnceError::Io(msg)) => {
+                        last_err = Some(msg.clone());
+                        if attempt + 1 < MAX_ATTEMPTS {
+                            // Exponential backoff: 10ms, 40ms, 160ms.
+                            // Cap at 500ms to keep request latency
+                            // bounded — the real-transformer path can
+                            // skip failed experts so a long retry
+                            // storm is worse than a quick degraded
+                            // response.
+                            let backoff_ms = (10u64 << (attempt * 2)).min(500);
+                            warn!(
+                                expert = id,
+                                attempt,
+                                backoff_ms,
+                                error = %msg,
+                                "expert fetch failed; will retry"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        }
                     }
                 }
             }
+            return Err(ExpertReadError::Io {
+                id,
+                attempts: MAX_ATTEMPTS,
+                source: last_err.unwrap_or_else(|| "unknown".into()),
+            });
         }
+        // Exhausted the leader-election budget without a successful
+        // fetch and without ourselves becoming leader. Treat this
+        // as an I/O failure so callers can surface a 503.
         Err(ExpertReadError::Io {
             id,
-            attempts: MAX_ATTEMPTS,
-            source: last_err.unwrap_or_else(|| "unknown".into()),
+            attempts: MAX_LEADER_ELECTIONS,
+            source: "exhausted singleflight leader-election budget".into(),
         })
     }
 
