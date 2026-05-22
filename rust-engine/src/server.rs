@@ -1412,6 +1412,7 @@ mod tests {
             sampling: crate::config::SamplingConfig::default(),
             predictive: crate::config::PredictiveConfig::default(),
             security: crate::config::SecurityConfig::default(),
+            gpu_cache: crate::config::GpuCacheConfig::default(),
         }
     }
 

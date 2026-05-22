@@ -916,6 +916,7 @@ mod tests {
             sampling: SamplingConfig::default(),
             predictive: PredictiveConfig::default(),
             security: SecurityConfig::default(),
+            gpu_cache: GpuCacheConfig::default(),
         }
     }
 
