@@ -265,7 +265,20 @@ impl AlignedKvCache {
         // (4096-byte) alignment, so every per-row offset is a multiple
         // of `4 = align_of::<f32>()`. The byte length is exactly
         // `kv_dim * 4`, and `f32` has no validity invariants beyond
-        // alignment.
+        // alignment. The two `debug_assert!`s below check those
+        // invariants in debug builds (gist feedback #1.7) so a future
+        // refactor that violates them fails loudly rather than
+        // returning a misaligned / mis-sized slice.
+        debug_assert_eq!(
+            bytes.len(),
+            self.kv_dim * std::mem::size_of::<f32>(),
+            "row_floats: byte slice length must be exactly kv_dim * 4"
+        );
+        debug_assert_eq!(
+            (bytes.as_ptr() as usize) % std::mem::align_of::<f32>(),
+            0,
+            "row_floats: byte slice pointer must be 4-byte aligned for f32"
+        );
         unsafe {
             std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.kv_dim)
         }
@@ -732,6 +745,24 @@ pub(crate) struct Counters {
     misses: AtomicU64,
     prefetch_completed: AtomicU64,
     prefetch_used: AtomicU64,
+    /// Cumulative bytes pulled from the storage layer. **Single
+    /// source of truth: incremented exactly once per disk read, by
+    /// the leader inside [`Engine::fetch_once`] (and by the
+    /// background prefetch task, which is also a leader path).**
+    /// Critical-path callers (`generate`, `moe_step`) never bump
+    /// this counter — followers parked on the in-flight singleflight
+    /// notify don't issue I/O, so adding to `bytes_read` from
+    /// `generate` post-SSD-dedup (gist Phase 1) would double-count
+    /// every miss. The per-call `FetchStats::bytes_read` is a
+    /// separate, *logical* accumulator: it tracks how many bytes a
+    /// given token consumed, including bytes that were served from
+    /// the cache without touching disk (so it sums to the working
+    /// set, not the I/O traffic). The invariant
+    /// `EngineReport::bytes_read >= sum(FetchStats::bytes_read)` may
+    /// fail because the per-call stat counts cache hits while the
+    /// counter does not, but `EngineReport::bytes_read >=
+    /// sum(critical-path miss bytes)` always holds — see the test
+    /// `assert_singleflight_dedupes_concurrent_misses`.
     bytes_read: AtomicU64,
     /// Cumulative experts dropped from a `moe_step` mixture because
     /// their fetch failed after all retry attempts. Surfaced via
@@ -803,6 +834,17 @@ pub struct EngineOptions {
     /// than `1` are clamped to `1`; the default `64` matches typical
     /// io_uring queue depths.
     pub max_concurrent_prefetches: usize,
+    /// Upper bound on yield iterations [`Engine::fetch_once`] spins
+    /// through while waiting for a free [`PooledBuffer`] when the
+    /// expert cache is full of pinned residents. Once the limit is
+    /// reached the call returns [`FetchOnceError::PoolStarved`]
+    /// instead of yielding indefinitely. Defaults to
+    /// [`DEFAULT_MAX_FETCH_YIELDS`] (`128`) — low enough to surface a
+    /// pool-misconfiguration as a fast error in latency-sensitive
+    /// scenarios, but high enough to absorb a transient burst of
+    /// concurrent prefetches under steady-state load (gist feedback
+    /// #1.3). Values less than `1` are clamped to `1` at use.
+    pub max_fetch_yields: usize,
 }
 
 /// Default semaphore ceiling for `Engine::spawn_prefetch`. Matches a
@@ -810,6 +852,16 @@ pub struct EngineOptions {
 /// for both `EngineOptions::default()` and the TOML default of
 /// `[real_transformer].max_concurrent_prefetches`.
 pub const DEFAULT_MAX_CONCURRENT_PREFETCHES: usize = 64;
+
+/// Default cap on yield iterations [`Engine::fetch_once`] waits
+/// before declaring the buffer pool starved and returning
+/// [`FetchOnceError::PoolStarved`]. Lowered from `1024` in gist
+/// feedback #1.3 — `1024` yields under heavy load corresponds to
+/// many milliseconds of soft-stall before the engine surfaces the
+/// underlying pool-sizing bug to the caller, which is too forgiving
+/// for latency-sensitive scenarios. `128` still absorbs a normal
+/// burst of concurrent prefetches without spurious failures.
+pub const DEFAULT_MAX_FETCH_YIELDS: usize = 128;
 
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -820,6 +872,7 @@ impl Default for EngineOptions {
             pin_after_observations: 0,
             use_qmm_for_q4: true,
             max_concurrent_prefetches: DEFAULT_MAX_CONCURRENT_PREFETCHES,
+            max_fetch_yields: DEFAULT_MAX_FETCH_YIELDS,
         }
     }
 }
@@ -870,6 +923,34 @@ pub(crate) struct EngineCore {
     /// fire-and-forget.
     pub(super) gpu_promotion_tx:
         Option<tokio::sync::mpsc::UnboundedSender<(u32, Arc<ExpertResident>)>>,
+    /// Optional persistent, page-aligned KV cache attached at
+    /// construction time via [`Engine::with_kv_cache`]. Lives on
+    /// `EngineCore` (gist feedback #2.4 — complete the I/O-runtime
+    /// split) alongside the other I/O-runtime fields the synthetic
+    /// `generate` path doesn't append to (no real attention runs at
+    /// this layer in the benchmark configuration), but the
+    /// real-transformer / server path does — see `server.rs`.
+    pub(super) kv_cache: Option<Arc<Mutex<AlignedKvCache>>>,
+    /// In-flight read singleflight (gist Phase 1 — SSD Read
+    /// De-Duplication). Lives on `EngineCore` (gist feedback #2.4)
+    /// because it is part of the I/O-runtime infrastructure that
+    /// the cache + pool + storage triple already lives on. When N
+    /// concurrent tasks all miss the cache on the same expert id,
+    /// only the first task issues a disk read; the rest park on the
+    /// shared [`Notify`] and re-check the cache once the leader's
+    /// read completes. With this in place, `BatchScheduler` pre-pass
+    /// `engine.warm_with(&unique_ids)` truly maps to "one read per
+    /// unique id across the batch", and even without a pre-pass
+    /// concurrent `moe_step` invocations no longer duplicate I/O.
+    pub(super) in_flight: Arc<DashMap<u32, Arc<Notify>>>,
+    /// Bound on concurrent speculative prefetches. Sized from
+    /// [`EngineOptions::max_concurrent_prefetches`]. Lives on
+    /// `EngineCore` (gist feedback #2.4) alongside the other
+    /// I/O-runtime infrastructure. Each `spawn_prefetch` call must
+    /// obtain an owned permit *before* spawning the async task;
+    /// failure to acquire drops the prefetch and increments
+    /// `EngineMetrics::counters::prefetch_dropped_concurrency`.
+    pub(super) prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Predictive-routing state: aliasing & frequency-based pinning,
@@ -997,7 +1078,21 @@ impl EngineCore {
         shape: ModelShape,
         options: EngineOptions,
     ) -> Self {
-        Self { cache, pool, storage, router, predictor, shape, options, gpu_cache: None, gpu_promotion_tx: None }
+        let prefetch_permits = options.max_concurrent_prefetches.max(1);
+        Self {
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            shape,
+            options,
+            gpu_cache: None,
+            gpu_promotion_tx: None,
+            kv_cache: None,
+            in_flight: Arc::new(DashMap::new()),
+            prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
+        }
     }
 }
 
@@ -1061,29 +1156,6 @@ pub struct Engine {
     pub(crate) core: EngineCore,
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
-    /// Optional persistent, page-aligned KV cache attached at
-    /// construction time via [`Engine::with_kv_cache`]. The synthetic
-    /// `generate` path doesn't append to it (no real attention runs
-    /// at this layer in the benchmark configuration), but the
-    /// real-transformer / server path does — see `server.rs`.
-    pub(crate) kv_cache: Option<Arc<Mutex<AlignedKvCache>>>,
-    /// In-flight read singleflight (gist Phase 1 — SSD Read
-    /// De-Duplication). When N concurrent tasks all miss the cache
-    /// on the same expert id, only the first task issues a disk
-    /// read; the rest park on the shared [`Notify`] and re-check the
-    /// cache once the leader's read completes. With this in place,
-    /// `BatchScheduler` pre-pass `engine.warm_with(&unique_ids)`
-    /// truly maps to "one read per unique id across the batch", and
-    /// even without a pre-pass concurrent `moe_step` invocations no
-    /// longer duplicate I/O.
-    pub(crate) in_flight: Arc<DashMap<u32, Arc<Notify>>>,
-    /// Bound on concurrent speculative prefetches. Sized from
-    /// `EngineOptions::max_concurrent_prefetches`. Each
-    /// `spawn_prefetch` call must obtain an owned permit *before*
-    /// spawning the async task; failure to acquire drops the
-    /// prefetch and increments
-    /// `EngineMetrics::counters::prefetch_dropped_concurrency`.
-    pub(crate) prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Dispatch a single per-expert SwiGLU forward pass according to
@@ -1170,14 +1242,10 @@ impl Engine {
         options: EngineOptions,
     ) -> Self {
         let speculator_topk_default = router.top_k();
-        let prefetch_permits = options.max_concurrent_prefetches.max(1);
         Self {
             core: EngineCore::new(cache, pool, storage, router, predictor, shape, options),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
-            kv_cache: None,
-            in_flight: Arc::new(DashMap::new()),
-            prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
         }
     }
 
@@ -1186,7 +1254,7 @@ impl Engine {
     /// owned by the engine and its window / kv_dim are immutable.
     /// Returns `self` for builder-style chaining.
     pub fn with_kv_cache(mut self, cache: AlignedKvCache) -> Self {
-        self.kv_cache = Some(Arc::new(Mutex::new(cache)));
+        self.core.kv_cache = Some(Arc::new(Mutex::new(cache)));
         self
     }
 
@@ -1241,7 +1309,7 @@ impl Engine {
     /// Borrow the engine's KV cache, if any. Callers acquire the
     /// inner `parking_lot::Mutex` to read or append.
     pub fn kv_cache(&self) -> Option<Arc<Mutex<AlignedKvCache>>> {
-        self.kv_cache.clone()
+        self.core.kv_cache.clone()
     }
 
     /// Append `(k, v)` to the persistent KV cache. No-op (returns
@@ -1249,7 +1317,7 @@ impl Engine {
     /// value mirrors [`AlignedKvCache::append`]: `true` ⇔ the
     /// rolling window evicted its oldest token to make room.
     pub fn kv_cache_append(&self, k: &[f32], v: &[f32]) -> bool {
-        match &self.kv_cache {
+        match &self.core.kv_cache {
             Some(c) => c.lock().append(k, v),
             None => false,
         }
@@ -1260,7 +1328,7 @@ impl Engine {
     /// attached. Called by the session-delete path before the engine
     /// state is swapped for a new tenant.
     pub fn reset_kv_cache(&self) {
-        if let Some(c) = &self.kv_cache {
+        if let Some(c) = &self.core.kv_cache {
             c.lock().zeroize();
         }
     }
@@ -1268,7 +1336,7 @@ impl Engine {
     /// Number of tokens currently resident in the persistent KV
     /// cache, or `0` when no cache is attached.
     pub fn kv_cache_seq_len(&self) -> usize {
-        self.kv_cache
+        self.core.kv_cache
             .as_ref()
             .map(|c| c.lock().seq_len())
             .unwrap_or(0)
@@ -1762,7 +1830,7 @@ impl Engine {
             // DashMap's `Entry::Occupied/Vacant` distinction so the
             // leader bit is unambiguous (Arc strong-count is racy
             // under TSO).
-            let (is_leader, notify) = match self.in_flight.entry(id) {
+            let (is_leader, notify) = match self.core.in_flight.entry(id) {
                 dashmap::mapref::entry::Entry::Occupied(occ) => (false, occ.get().clone()),
                 dashmap::mapref::entry::Entry::Vacant(vac) => {
                     let n = Arc::new(Notify::new());
@@ -1786,7 +1854,7 @@ impl Engine {
                         .fetch_add(1, Ordering::Relaxed);
                     return Ok(r);
                 }
-                if self.in_flight.contains_key(&id) {
+                if self.core.in_flight.contains_key(&id) {
                     fut.await;
                     if let Some(r) = self.core.cache.get(id) {
                         self.metrics.counters.singleflight_followers
@@ -1807,7 +1875,7 @@ impl Engine {
             // the in_flight slot is removed and waiters are notified
             // on every exit branch.
             let _guard = SingleflightLeaderGuard {
-                map: self.in_flight.clone(),
+                map: self.core.in_flight.clone(),
                 id,
                 notify: notify.clone(),
                 armed: true,
@@ -1879,12 +1947,17 @@ impl Engine {
         // grabbed the freed slot before we did, we evict another LRU and
         // retry.
         //
-        // Bounded by `MAX_FETCH_YIELDS`: if the cache is full of pinned
-        // entries *and* the buffer pool has no free slot, no amount of
-        // yielding will help — we're hard-blocked on a configuration
-        // bug (more pinned experts than the pool can keep resident).
-        // Return `PoolStarved` rather than spin forever.
-        const MAX_FETCH_YIELDS: usize = 1024;
+        // Bounded by `EngineOptions::max_fetch_yields` (default
+        // [`DEFAULT_MAX_FETCH_YIELDS`] = 128, gist feedback #1.3 —
+        // lowered from `1024` so latency-sensitive callers surface
+        // a pool-sizing misconfiguration in milliseconds rather than
+        // tens of milliseconds): if the cache is full of pinned
+        // entries *and* the buffer pool has no free slot, no amount
+        // of yielding will help — we're hard-blocked on a
+        // configuration bug (more pinned experts than the pool can
+        // keep resident). Return `PoolStarved` rather than spin
+        // forever.
+        let max_yields = self.core.options.max_fetch_yields.max(1);
         let mut yields = 0usize;
         let mut buf;
         loop {
@@ -1902,7 +1975,7 @@ impl Engine {
             // other task (prefetch or another fetch) is holding buffers.
             // Yield to the runtime briefly to let them make progress.
             yields += 1;
-            if yields > MAX_FETCH_YIELDS {
+            if yields > max_yields {
                 return Err(FetchOnceError::PoolStarved);
             }
             tokio::task::yield_now().await;
@@ -1960,7 +2033,7 @@ impl Engine {
         // loads are valuable only if they complete before the real
         // miss, and queuing them defeats that. The drop is observable
         // via the `prefetch_dropped_concurrency` counter.
-        let permit = match self.prefetch_semaphore.clone().try_acquire_owned() {
+        let permit = match self.core.prefetch_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
                 self.metrics
@@ -2345,7 +2418,19 @@ impl Engine {
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
                 ) {
-                    if gpu.should_promote(new_hits) {
+                    // Edge-triggered: only enqueue a promotion on the
+                    // single hit that *crosses* `promote_after_hits`,
+                    // not on every subsequent hit. Mirrors the same
+                    // crossing check in `Engine::generate` — without
+                    // it, every hot-path hit after the threshold
+                    // floods the unbounded mpsc with redundant
+                    // promotions (each one paying a `to_vec()` copy +
+                    // mutex-guarded insert on the background worker).
+                    // See gist feedback #2 (`moe_step` level- vs.
+                    // edge-trigger).
+                    let crossed_promote_threshold = gpu.should_promote(new_hits)
+                        && !gpu.should_promote(new_hits.saturating_sub(1));
+                    if crossed_promote_threshold && !gpu.get(id).is_hit() {
                         let _ = tx.send((id, r.clone()));
                     }
                 }
@@ -3113,12 +3198,12 @@ mod tests {
         // path first. We then simulate a failing leader by removing
         // the entry and notifying waiters without filling the cache.
         let notify = Arc::new(Notify::new());
-        engine.in_flight.insert(5, notify.clone());
+        engine.core.in_flight.insert(5, notify.clone());
 
         let e = engine.clone();
         let follower = tokio::spawn(async move { e.fetch_with_retry(5).await });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        engine.in_flight.remove(&5);
+        engine.core.in_flight.remove(&5);
         notify.notify_waiters();
 
         let _ = follower
@@ -3127,7 +3212,7 @@ mod tests {
             .expect("follower should re-contend and fetch after failed leader");
         assert!(engine.core.cache.contains(5));
         assert_eq!(engine.report().bytes_read, expert_size);
-        assert!(!engine.in_flight.contains_key(&5));
+        assert!(!engine.core.in_flight.contains_key(&5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

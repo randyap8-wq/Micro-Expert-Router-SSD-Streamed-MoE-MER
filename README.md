@@ -287,7 +287,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `tokenizer` | HuggingFace `tokenizers` crate when the `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured; deterministic byte-level fallback otherwise. |
 | `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. TTL-driven `evict_expired` now zeroizes each expired session's KV buffers **before** the `Arc<SessionState>` is dropped (gist Part 1 fix #1) so residual user context cannot survive in freed heap pages; `delete` does the same on explicit removal. |
 | `batch_scheduler` | **Continuous batching + multi-tenant fair-share.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. Each batched step starts with a **peek/warm pre-pass** that calls `RealModel::peek_experts` for every request, unions the predicted expert ids, and fires one `engine.warm_with(&ids)` so the NVMe sees one read per unique expert across the entire batch (gist Phase 1). Registered sessions carry a **`SessionClass`** (`Interactive` weight 4, `Audit` weight 1) consumed by the **Weighted Round-Robin admission policy** so an Audit flood cannot starve Interactive callers, plus a monotonic `last_activity_us` timestamp used by **`evict_idle_blocks`** to reclaim KV blocks from sessions idle ≥ `idle_eviction_threshold` (default 5 s) when the pool crosses its soft-cap. Under `PressureLevel::Critical` the scheduler suspends the shared `SpeculationController` so prefetch depth is clamped to zero. |
-| `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. Also home to [`AlignedKvCache`](#persistent-page-aligned-kv-cache) — a session-scoped, page-aligned, rolling-window K/V buffer attached via `Engine::with_kv_cache`. `spawn_prefetch` is **bounded** by a `tokio::sync::Semaphore` sized from `EngineOptions::max_concurrent_prefetches` (default 64, configurable via `[real_transformer].max_concurrent_prefetches`, gist Part 1 fix #3): an owned permit is acquired *before* `tokio::spawn`, so the bound is enforced before any task work happens; refusals bump `Counters::prefetch_dropped_concurrency` (also surfaced on `EngineReport`). |
+| `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. Also home to [`AlignedKvCache`](#persistent-page-aligned-kv-cache) — a session-scoped, page-aligned, rolling-window K/V buffer attached via `Engine::with_kv_cache`. `spawn_prefetch` is **bounded** by a `tokio::sync::Semaphore` sized from `EngineOptions::max_concurrent_prefetches` (default 64, configurable via `[real_transformer].max_concurrent_prefetches`, gist Part 1 fix #3): an owned permit is acquired *before* `tokio::spawn`, so the bound is enforced before any task work happens; refusals bump `Counters::prefetch_dropped_concurrency` (also surfaced on `EngineReport`). `Engine::fetch_once` likewise bounds its `tokio::task::yield_now()` spin loop at `EngineOptions::max_fetch_yields` (default 128, configurable via `[real_transformer].max_fetch_yields`, gist feedback #1.3): when the cache is full of pinned residents and no `PooledBuffer` frees within the budget, `fetch_once` returns `FetchOnceError::PoolStarved` instead of yielding indefinitely. |
 | `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`, `Q8_0`. Two readers ship side-by-side: `GgufFile::open` (eager — slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming — keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
 | `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q8_0` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files for the 4-bit dtypes, ~4× smaller for `Q8_0`; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
 | `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
@@ -834,6 +834,7 @@ batch_timeout_ms          = 5     # how long to wait for more requests to join a
 idle_eviction_threshold_ms = 5000 # idle-cutoff for evict_idle_blocks under pool pressure (default 5 s)
 speculation_base_depth     = 1    # baseline prefetch depth in tokens-ahead (grows to base+2 under SSD stall)
 max_concurrent_prefetches  = 64   # gist Part 1 fix #3 — semaphore ceiling for engine.spawn_prefetch (refusals bump `prefetch_dropped_concurrency`)
+max_fetch_yields           = 128  # gist feedback #1.3 — bound on `tokio::yield_now` spins in `Engine::fetch_once` before returning `FetchOnceError::PoolStarved`
 max_overflow_capacity      = 0    # gist Part 1 fix #5 — admission cap on BlockPool overflow growth (0 = unbounded; positive = max overflow slabs)
 ```
 
@@ -953,6 +954,7 @@ batch_timeout_ms = 5
 idle_eviction_threshold_ms = 5000   # reclaim idle KV blocks under pool pressure
 speculation_base_depth = 1          # baseline prefetch tokens-ahead
 max_concurrent_prefetches = 64      # gist Part 1 fix #3 — Engine spawn_prefetch semaphore ceiling
+max_fetch_yields = 128              # gist feedback #1.3 — Engine::fetch_once yield budget before `FetchOnceError::PoolStarved`
 max_overflow_capacity = 0           # gist Part 1 fix #5 — BlockPool overflow admission cap (0 = unbounded)
 ```
 
@@ -1231,8 +1233,11 @@ micro-expert-router run
                               by Engine::moe_step.
   --io-uring                 Probe the IoUringStorage backend (Linux,
                               --features io_uring); also pins the process
-                              to NUMA-local cores (override count via
-                              MER_PIN_CORES env var).
+                              to NUMA-local cores (min(8, available
+                              parallelism)). To override the pin count,
+                              set the MER_PIN_CORES env var — it is
+                              honoured globally at startup before any
+                              subcommand-specific pinning runs.
   --token-pause-us <N>       Sleep between tokens to throttle the stream
   --seed <U64>               PRNG seed for reproducibility
   --trace-out <PATH>         Append a JSONL routing trace (one record per

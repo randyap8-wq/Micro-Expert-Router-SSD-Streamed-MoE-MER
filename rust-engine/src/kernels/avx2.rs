@@ -34,6 +34,16 @@ use std::arch::x86_64::*;
 pub unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let n = a.len();
+    // Defensive bound-check (gist feedback #1.1): the SIMD `while i +
+    // 8 <= n` loop is already safe for any `n` (including `n == 0`
+    // and `n == 1`, where it iterates zero times and the scalar tail
+    // handles every element), but pinning the invariants here makes
+    // a future refactor that misuses pointer arithmetic fail loudly.
+    debug_assert!(
+        n == 0 || (a.as_ptr() as usize % core::mem::align_of::<f32>() == 0
+            && b.as_ptr() as usize % core::mem::align_of::<f32>() == 0),
+        "dot_f32_avx2: non-empty slices must be `f32`-aligned"
+    );
     let mut acc = _mm256_setzero_ps();
     let mut i = 0usize;
     while i + 8 <= n {

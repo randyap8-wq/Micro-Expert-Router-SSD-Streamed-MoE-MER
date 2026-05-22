@@ -542,18 +542,12 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     use crate::server::{serve, AppState};
     use crate::tokenizer::Tokenizer;
 
-    // Best-effort NUMA-local pinning. Off by default; opt in by
-    // setting `MER_PIN_CORES=N` in the environment. Useful for
-    // reducing cross-socket DRAM hops on multi-NUMA hosts under
-    // sustained load. Has no effect on non-Linux builds.
-    if let Some(n) = std::env::var("MER_PIN_CORES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        if let Err(e) = pin_to_local_cores(n) {
-            warn!(error = %e, "MER_PIN_CORES set but pinning failed; continuing without affinity");
-        }
-    }
+    // NUMA-local pinning via `MER_PIN_CORES` is consumed centrally
+    // at process start in `main()` (see `numa::apply_mer_pin_cores_env`)
+    // and the env var is then cleared. We deliberately do **not**
+    // re-read it here — every subcommand goes through that single
+    // startup contract, so a per-subcommand re-read would be dead
+    // code (gist feedback #2.3).
 
     let cfg = Config::from_file(&config_path)?;
     info!(
@@ -762,6 +756,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             pin_after_observations: cfg.storage.pin_after_observations,
             use_qmm_for_q4: true,
             max_concurrent_prefetches: cfg.real_transformer.max_concurrent_prefetches,
+            max_fetch_yields: cfg.real_transformer.max_fetch_yields,
         },
     );
     // Attach the speculative-architecture components requested via
@@ -1308,16 +1303,19 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.io_uring {
         // Best-effort affinity: keep the engine on the NUMA node that
         // owns CPU 0 to avoid cross-socket DRAM hops on every io_uring
-        // completion. Honored only on Linux. Configurable via the
-        // `MER_PIN_CORES` env var (number of cores to pin to); defaults
-        // to `min(8, available_parallelism)` when unset, which is a
-        // reasonable starting point for a single-socket workstation.
-        let n = std::env::var("MER_PIN_CORES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8)
-            });
+        // completion. Honored only on Linux.
+        //
+        // Note: `MER_PIN_CORES` is consumed centrally at process start
+        // (see `numa::apply_mer_pin_cores_env` in `main`) and then
+        // cleared, so re-reading it here would be dead code (gist
+        // feedback #2.3). Instead the io_uring path always pins to
+        // `min(8, available_parallelism)` cores when enabled — a
+        // reasonable starting point for a single-socket workstation
+        // and required for stable completion-queue latency.
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
         if let Err(e) = pin_to_local_cores(n) {
             warn!(error = %e, "could not set CPU affinity (continuing without pinning)");
         }
@@ -1483,6 +1481,7 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                 pin_after_observations: args.pin_after_observations,
                 use_qmm_for_q4: true,
                 max_concurrent_prefetches: 64,
+                max_fetch_yields: crate::engine::DEFAULT_MAX_FETCH_YIELDS,
             },
         );
         // Optional alias map (Change 6: expert deduplication).
@@ -2076,20 +2075,51 @@ async fn cmd_validate_predictor(
         top1_hits: u64,
         top2_hits: u64,
     }
+
+    // Flat list of (token, layer, experts) records in the order
+    // they were observed in the JSONL file. We rely on a stable
+    // sort over the global `token` field to reconstruct the engine's
+    // per-token, per-layer interleaving — even if a multi-layer
+    // trace's records were appended in any order. Pre gist
+    // feedback #2.2 we instead grouped by layer first and then
+    // flattened, which produced "all of layer 0, then all of
+    // layer 1, …" — meaningless on real multi-layer (e.g. Mixtral's
+    // 32 layers) traces because the per-layer caches saw an entirely
+    // synthetic recent-history.
+    let mut records: Vec<(u64, u32, Vec<u32>)> = Vec::new();
     let mut by_layer: std::collections::BTreeMap<u32, LayerStats> = Default::default();
-    let mut tokens_per_layer: std::collections::BTreeMap<u32, Vec<Vec<u32>>> = Default::default();
-    for line in text.lines() {
+    for (file_idx, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        // Fall back to the file-line index when a record lacks
+        // an explicit `token` so legacy traces still order
+        // monotonically by appearance.
+        let token = json_get_u64(line, "token").unwrap_or(file_idx as u64);
         let layer = json_get_u64(line, "layer").unwrap_or(0) as u32;
         let experts = json_get_u32_array(line, "experts");
         if experts.is_empty() {
             continue;
         }
         by_layer.entry(layer).or_default().tokens += 1;
-        tokens_per_layer.entry(layer).or_default().push(experts);
+        records.push((token, layer, experts));
+    }
+    // Stable sort by (token, layer) reconstructs the original
+    // interleaved order the engine produced — for token T the
+    // entries for layer 0, 1, 2, … appear in order, then the same
+    // for token T+1, etc. — which is what the LRU saw in production.
+    records.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+    // Group sorted records into per-layer buckets *after* sorting
+    // so the Markov accuracy pass downstream still sees one
+    // monotone-in-token sequence per layer.
+    let mut tokens_per_layer: std::collections::BTreeMap<u32, Vec<Vec<u32>>> = Default::default();
+    for (_token, layer, experts) in &records {
+        tokens_per_layer
+            .entry(*layer)
+            .or_default()
+            .push(experts.clone());
     }
 
     // Per-cache-size simulation: maintain a single LRU shared across
@@ -2103,29 +2133,36 @@ async fn cmd_validate_predictor(
     } else {
         cache_slots.to_vec()
     };
-    // Flatten the per-layer sequences in token order so the LRU sees
-    // the *same* token stream the engine produced. `tokens_per_layer`
-    // is keyed by layer but the original record order is preserved
-    // within each layer's bucket; concatenating in layer order
-    // reproduces the per-token-per-layer interleaving for a given run.
-    let flat_seq: Vec<&Vec<u32>> = tokens_per_layer
-        .values()
-        .flat_map(|v| v.iter())
-        .collect();
     println!("validate-predictor: trace={}", trace_path.display());
     for k in &ks {
         let mut hits = 0u64;
         let mut total = 0u64;
+        // Maintain order in a VecDeque and membership in a HashSet
+        // so the per-token hit check is O(1) instead of O(N). The
+        // VecDeque carries the LRU ordering (front = oldest); the
+        // HashSet mirrors the same id set for fast `contains`. This
+        // is the same hit-rate as before, just without the O(N·M)
+        // walk over `lru.iter().any(...)` that the prior version
+        // performed (gist feedback #2.5 — keeps `validate-predictor`
+        // workable on long real-engine traces).
         let mut lru: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
-        for experts in &flat_seq {
+        let mut lru_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for (_token, _layer, experts) in &records {
             for &e in experts.iter() {
-                if lru.iter().any(|&x| x == e) {
+                if lru_set.contains(&e) {
                     hits += 1;
-                    lru.retain(|&x| x != e);
+                    // Move-to-back: O(N) here but only on a hit
+                    // (cheap relative to the surrounding miss-path).
+                    if let Some(pos) = lru.iter().position(|x| *x == e) {
+                        lru.remove(pos);
+                    }
                 } else if lru.len() == *k {
-                    lru.pop_front();
+                    if let Some(evicted) = lru.pop_front() {
+                        lru_set.remove(&evicted);
+                    }
                 }
                 lru.push_back(e);
+                lru_set.insert(e);
                 total += 1;
             }
         }

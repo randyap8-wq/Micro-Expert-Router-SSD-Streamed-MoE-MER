@@ -357,6 +357,18 @@ pub struct RealTransformerConfig {
     #[serde(default = "default_max_concurrent_prefetches")]
     pub max_concurrent_prefetches: usize,
 
+    /// **Bounded `fetch_once` yield budget** (gist feedback #1.3).
+    /// Maximum number of `tokio::task::yield_now()` iterations
+    /// [`Engine::fetch_once`] spins through while waiting for a free
+    /// `PooledBuffer` when the expert cache is full of pinned
+    /// residents. Once the limit is reached the call returns
+    /// `FetchOnceError::PoolStarved` instead of yielding indefinitely.
+    /// Defaults to `128` — low enough to surface pool-sizing
+    /// misconfigurations as a fast error, high enough to absorb a
+    /// normal burst of concurrent prefetches under steady-state load.
+    #[serde(default = "default_max_fetch_yields")]
+    pub max_fetch_yields: usize,
+
     /// **Overflow-slab cap** (gist Part 1, fix #5). Maximum number of
     /// "overflow" KV blocks the [`block_pool::BlockPool`] may
     /// allocate beyond its primary slab before
@@ -370,6 +382,10 @@ pub struct RealTransformerConfig {
 
 fn default_max_concurrent_prefetches() -> usize {
     crate::engine::DEFAULT_MAX_CONCURRENT_PREFETCHES
+}
+
+fn default_max_fetch_yields() -> usize {
+    crate::engine::DEFAULT_MAX_FETCH_YIELDS
 }
 
 fn default_pressure_high_threshold() -> f32 { crate::block_pool::SOFT_CAP_RATIO }
@@ -675,6 +691,11 @@ impl Config {
                     "real_transformer.max_concurrent_prefetches must be > 0".into(),
                 ));
             }
+            if rt.max_fetch_yields == 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.max_fetch_yields must be > 0".into(),
+                ));
+            }
         }
         // [predictive] section.
         let p = &self.predictive;
@@ -975,6 +996,7 @@ mod tests {
             pressure_high_threshold: crate::block_pool::SOFT_CAP_RATIO,
             pressure_critical_threshold: crate::block_pool::CRITICAL_PRESSURE_RATIO,
             max_concurrent_prefetches: crate::engine::DEFAULT_MAX_CONCURRENT_PREFETCHES,
+            max_fetch_yields: crate::engine::DEFAULT_MAX_FETCH_YIELDS,
             max_overflow_capacity: Some(0),
             ..RealTransformerConfig::default()
         };
