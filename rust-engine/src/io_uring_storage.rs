@@ -79,16 +79,13 @@ impl Default for IoUringConfig {
     }
 }
 
-/// `io_uring` storage backend.
+/// `io_uring` storage backend (gist Part 2).
 ///
 /// **Construction** registers every buffer in `pool` as a fixed
 /// io_uring buffer (one `io_uring_register` syscall, amortised across
 /// the lifetime of the engine). Subsequent reads are
 /// `IORING_OP_READ_FIXED` SQEs that reference a buffer index — no
-/// per-read iovec setup.
-/// io_uring storage backend (gist Part 2). Stages a registered fixed
-/// buffer pool at construction time and submits `READ_FIXED` SQEs from
-/// the engine's async path, avoiding the per-syscall cost of the
+/// per-read iovec setup, avoiding the per-syscall cost of the
 /// `read_at`/pread fallback in [`crate::io_provider::NvmeStorage`].
 ///
 /// On non-Linux targets (or when the `io_uring` cargo feature is off)
@@ -328,7 +325,7 @@ impl IoUringStorage {
         // the legacy `&mut PooledBuffer` API, which leaves the bufs
         // on the caller's stack — a cancellation there frees the
         // slot while the kernel is mid-write.
-        let mut shadow_bufs = {
+        let shadow_bufs = {
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             {
                 let len = self.cfg.expert_size;
@@ -352,7 +349,7 @@ impl IoUringStorage {
         // without an extra copy — this is the zero-latency
         // "speculation confirmed → resident" hand-off.
         let promoted: Vec<PooledBuffer> = shadow_bufs
-            .drain(..)
+            .into_iter()
             .map(|b| pool.promote_shadow(b))
             .collect();
         Ok(promoted)
