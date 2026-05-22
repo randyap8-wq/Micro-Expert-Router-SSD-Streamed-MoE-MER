@@ -10,14 +10,20 @@
 //! view. It never mutates engine state.
 //!
 //! Visual language is borrowed from the "Amalgafy" reference image
-//! attached to the original gist:
+//! attached to the original gist — high-density, monochromatic
+//! tech-noir, crisp single-pixel borders, high-contrast status bars:
 //!
-//! * Header strip with status pill, uptime, and per-second throughput;
-//! * 3-tier hit-grid (VRAM / RAM / SSD) rendered with progress
-//!   gauges so the relative tier mix is legible at a glance;
+//! * Header strip with status pill, uptime, and per-second throughput
+//!   (with restart-recovery: TPS resets to zero on a backwards jump
+//!   of `tokens_generated`);
+//! * 3-tier hit-grid (VRAM / RAM / SSD) rendered as three side-by-side
+//!   sparklines plotting the **delta** of each tier's hit counter
+//!   per refresh tick — i.e. pulse/load, not a cumulative staircase;
 //! * VRAM and RAM utilisation bars (anchor + LRU regions for the
 //!   VRAM tier; logical occupancy for the RAM tier);
-//! * I/O reactor pulse — a sparkline of recent bytes-per-poll.
+//! * I/O reactor pulse — a sparkline of the per-tick miss delta
+//!   (i.e. SSD reads required this tick), surfacing backpressure
+//!   and stall on the inference critical path.
 //!
 //! The HTTP fetch path is dependency-free: we hand-roll a minimal
 //! HTTP/1.1 GET over `tokio::net::TcpStream` so the dashboard does
@@ -79,10 +85,31 @@ struct AppState {
     last: HealthSnapshot,
     last_tokens: u64,
     tokens_per_sec: u64,
-    bytes_history: VecDeque<u64>,
+    /// Per-tier hit *delta* history (cap 60). Each push is
+    /// `current_counter - prev_counter` so the sparkline shows the
+    /// pulse/load per refresh tick rather than the cumulative
+    /// staircase the previous revision rendered. Phase 1 telemetry
+    /// bug fix.
+    vram_hits_history: VecDeque<u64>,
+    ram_hits_history: VecDeque<u64>,
+    ssd_hits_history: VecDeque<u64>,
+    /// Snapshots of the cumulative counters captured on the previous
+    /// poll, used to compute the delta. Initialised lazily — on the
+    /// first poll we record the *current* values without pushing a
+    /// data point so the first frame doesn't render a spurious spike
+    /// equal to the cumulative-since-startup total.
+    prev_vram_hits: Option<u64>,
+    prev_ram_hits: Option<u64>,
+    prev_ssd_hits: Option<u64>,
     start: std::time::Instant,
     error: Option<String>,
 }
+
+/// Maximum number of points kept in each rolling sparkline buffer.
+/// Caps memory growth (gist "Telemetry" constraint: "Ensure the
+/// sparkline history is capped (e.g., 60 points) to prevent
+/// memory growth").
+const HISTORY_CAP: usize = 60;
 
 impl AppState {
     fn new(url_base: String) -> Self {
@@ -91,17 +118,72 @@ impl AppState {
             last: HealthSnapshot::default(),
             last_tokens: 0,
             tokens_per_sec: 0,
-            bytes_history: VecDeque::with_capacity(60),
+            vram_hits_history: VecDeque::with_capacity(HISTORY_CAP),
+            ram_hits_history: VecDeque::with_capacity(HISTORY_CAP),
+            ssd_hits_history: VecDeque::with_capacity(HISTORY_CAP),
+            prev_vram_hits: None,
+            prev_ram_hits: None,
+            prev_ssd_hits: None,
             start: std::time::Instant::now(),
             error: None,
         }
     }
 
+    /// Record one polled sample into the rolling histories. Stores the
+    /// **delta** (current − prev) for each tier so the sparkline
+    /// represents per-tick load, not a cumulative staircase
+    /// (Phase 1 bug fix). On a counter regression — which happens on
+    /// server restart, since the engine resets its counters to zero —
+    /// the delta is treated as zero and the previous snapshot is
+    /// rebased to the new value so subsequent ticks resume reading
+    /// real load instead of a single huge negative spike.
     fn record_history(&mut self) {
-        let bytes_proxy = self.last.cache_hits + self.last.cache_misses;
-        self.bytes_history.push_back(bytes_proxy);
-        if self.bytes_history.len() > 60 {
-            self.bytes_history.pop_front();
+        push_delta(
+            &mut self.vram_hits_history,
+            &mut self.prev_vram_hits,
+            self.last.gpu_cache_hits,
+        );
+        push_delta(
+            &mut self.ram_hits_history,
+            &mut self.prev_ram_hits,
+            self.last.cache_hits,
+        );
+        // SSD tier resolves on a RAM miss, so we plot the RAM-miss
+        // delta as the SSD-hit pulse. The reactor stall pane in
+        // `draw_pulse` reads from this same history at render time,
+        // so we don't keep a second buffer of identical values.
+        let ssd_hits = self.last.cache_misses;
+        push_delta(
+            &mut self.ssd_hits_history,
+            &mut self.prev_ssd_hits,
+            ssd_hits,
+        );
+    }
+}
+
+/// Push `current - prev` onto `buf`, rebase `prev` to `current`, and
+/// cap `buf` at [`HISTORY_CAP`] entries. On the very first call
+/// (`prev` is `None`) the delta is **not** pushed; we only seed
+/// `prev` so the next tick's delta is a true per-interval pulse
+/// rather than the cumulative since startup.
+fn push_delta(buf: &mut VecDeque<u64>, prev: &mut Option<u64>, current: u64) {
+    match *prev {
+        None => {
+            *prev = Some(current);
+        }
+        Some(p) => {
+            // Counter regression (e.g. server restart): rebase prev
+            // and emit a zero this tick so the sparkline doesn't
+            // pretend the negative jump was real load.
+            let delta = current.saturating_sub(p);
+            // On a regression `current < p` ⇒ delta == 0 via
+            // saturating_sub; rebase prev to current so the next
+            // delta is computed against the new baseline.
+            buf.push_back(delta);
+            if buf.len() > HISTORY_CAP {
+                buf.pop_front();
+            }
+            *prev = Some(current);
         }
     }
 }
@@ -155,11 +237,23 @@ async fn event_loop(
             match fetch_health(&app.url_base).await {
                 Ok(snap) => {
                     let dt = interval.as_secs_f64().max(0.001);
-                    if snap.tokens_generated >= app.last_tokens {
+                    // TPS guard with restart recovery (gist Phase 1
+                    // bug fix). When `tokens_generated` jumps
+                    // **backwards** the server has been restarted —
+                    // the engine resets its counter to zero on boot.
+                    // Treat that as a fresh epoch: zero the rate and
+                    // rebase `last_tokens` to the new snapshot so the
+                    // next tick computes a real delta instead of a
+                    // negative one (which would wrap around as a
+                    // u64 underflow).
+                    if snap.tokens_generated < app.last_tokens {
+                        app.tokens_per_sec = 0;
+                        app.last_tokens = snap.tokens_generated;
+                    } else {
                         app.tokens_per_sec =
                             ((snap.tokens_generated - app.last_tokens) as f64 / dt) as u64;
+                        app.last_tokens = snap.tokens_generated;
                     }
-                    app.last_tokens = snap.tokens_generated;
                     app.last = snap;
                     app.record_history();
                     app.error = None;
@@ -242,48 +336,85 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
 }
 
 fn draw_tiers(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
+    // Cumulative counters (header labels) — but the body of the
+    // panel renders **delta** sparklines below (gist Phase 1).
     let vram_hits = app.last.gpu_cache_hits;
     let ram_hits = app.last.cache_hits;
-    let misses = app.last.cache_misses;
-    let total = (vram_hits + ram_hits + misses).max(1);
-    let vram_pct = (vram_hits as f64 / total as f64 * 100.0) as u16;
-    let ram_pct = (ram_hits as f64 / total as f64 * 100.0) as u16;
-    let ssd_pct = (misses as f64 / total as f64 * 100.0).round() as u16;
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
-        ])
-        .margin(1)
-        .split(area);
+    let ssd_hits = app.last.cache_misses;
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
-            " TIERED HIT GRID ",
+            " 3-TIER HIT GRID · Δ per tick ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     f.render_widget(block, area);
 
-    let vram = Gauge::default()
-        .label(format!("VRAM  {vram_hits:>10}  {vram_pct:>3}%"))
-        .gauge_style(Style::default().fg(ACCENT).bg(Color::Black))
-        .percent(vram_pct.min(100));
-    let ram = Gauge::default()
-        .label(format!("RAM   {ram_hits:>10}  {ram_pct:>3}%"))
-        .gauge_style(Style::default().fg(Color::LightCyan).bg(Color::Black))
-        .percent(ram_pct.min(100));
-    let ssd = Gauge::default()
-        .label(format!("SSD   {misses:>10}  {ssd_pct:>3}%"))
-        .gauge_style(Style::default().fg(Color::LightYellow).bg(Color::Black))
-        .percent(ssd_pct.min(100));
-    f.render_widget(vram, rows[0]);
-    f.render_widget(ram, rows[1]);
-    f.render_widget(ssd, rows[2]);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .margin(1)
+        .split(area);
+
+    draw_tier_sparkline(
+        f,
+        columns[0],
+        "VRAM",
+        vram_hits,
+        &app.vram_hits_history,
+        ACCENT,
+    );
+    draw_tier_sparkline(
+        f,
+        columns[1],
+        "RAM ",
+        ram_hits,
+        &app.ram_hits_history,
+        Color::LightCyan,
+    );
+    draw_tier_sparkline(
+        f,
+        columns[2],
+        "SSD ",
+        ssd_hits,
+        &app.ssd_hits_history,
+        Color::LightYellow,
+    );
+}
+
+/// Render one tier column: a label line ("VRAM 12345 Δ7") above a
+/// sparkline drawn from the supplied delta history. Each panel owns
+/// its own border so the three tiers visually segment cleanly even
+/// in narrow terminals.
+fn draw_tier_sparkline(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    label: &str,
+    cumulative: u64,
+    history: &VecDeque<u64>,
+    fg: Color,
+) {
+    let last_delta = history.back().copied().unwrap_or(0);
+    let title = format!(" {label} · total {cumulative} · Δ {last_delta} ");
+    let data: Vec<u64> = history.iter().copied().collect();
+    let sp = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(DIM))
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .data(&data)
+        .style(Style::default().fg(fg));
+    f.render_widget(sp, area);
 }
 
 fn draw_vram(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
@@ -319,7 +450,7 @@ fn draw_vram(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     let vram_label = format!(
         "VRAM  {} / {} MiB   anchor={}  lru={}  promotions={}",
         app.last.vram_used_bytes / (1024 * 1024),
-        (app.last.vram_capacity_bytes / (1024 * 1024)).max(0),
+        app.last.vram_capacity_bytes / (1024 * 1024),
         app.last.gpu_anchor_count,
         app.last.gpu_lru_count,
         app.last.gpu_promotions_total
@@ -351,18 +482,25 @@ fn draw_vram(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
 }
 
 fn draw_pulse(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
+    // Reactor pulse — per-tick SSD-miss delta sourced from
+    // `ssd_hits_history` (a RAM miss == an SSD read). A flat-zero
+    // line means every routed expert was served out of RAM/VRAM
+    // (no I/O stall); tall bars are direct evidence of backpressure
+    // on the inference critical path.
+    let last_delta = app.ssd_hits_history.back().copied().unwrap_or(0);
+    let title = format!(" I/O REACTOR · stall pulse · last Δ {last_delta} ");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
-            " I/O REACTOR PULSE — lookups per tick ",
+            title,
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
-    let data: Vec<u64> = app.bytes_history.iter().copied().collect();
+    let data: Vec<u64> = app.ssd_hits_history.iter().copied().collect();
     let sp = Sparkline::default()
         .block(block)
         .data(&data)
-        .style(Style::default().fg(ACCENT));
+        .style(Style::default().fg(Color::LightYellow));
     f.render_widget(sp, area);
 }
 

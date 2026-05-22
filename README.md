@@ -298,7 +298,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[security]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`, `[gpu_cache]`. Validated at startup. |
 | `expert_cache` (3-tier extension) | Alongside the legacy RAM-resident `ExpertCache`, this module now also defines `GpuExpertCache`, the optional **VRAM tier** of a 3-tier SSD → RAM → VRAM hierarchy. It is an **Anchor Core + LRU Edge** structure: experts whose RAM-side hit count (`ExpertResident::hits`) crosses `[gpu_cache] promote_after_hits` are pinned into the Anchor Core (HashMap, capped at `vram_anchor_ratio * vram_capacity_mb`); all other promotions land in the LRU Edge (capped at the remainder). Engine wiring is hot-path additive — `Engine::generate` / `Engine::moe_step` probe the VRAM tier first, bump RAM hits on a miss, and enqueue a promotion on a background tokio task installed by `Engine::install_gpu_cache`. On CPU-only builds the VRAM bytes are emulated host-side; with `--features cuda`, `inference::run_inference_gpu` dispatches the SwiGLU matmul through `candle-core`'s CUDA backend (falls back to the existing CPU kernel if the device is unavailable). |
-| `tui` (with `--features tui`) | Native terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`mer-cli monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS), a 3-tier cache hit grid (SSD / RAM / VRAM), a VRAM utilisation gauge, and an I/O reactor sparkline. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
+| `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`mer-cli monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a 3-tier hit grid with one **delta-calculated** sparkline per tier (VRAM / RAM / SSD — pulse per refresh tick, not a cumulative staircase), a VRAM/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`, plus the operator endpoints `GET /v1/admin/health/experts` and `POST /v1/admin/evict`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
 | `middleware` | Production-readiness HTTP middleware layered onto the `server` router via `axum::middleware::from_fn_with_state`: per-request UUID tracing span, optional **API-key gate** (`[security].api_keys`; `401` when configured and missing/unknown), optional **per-key token-bucket rate limit** (`rate_limit_rps` / `rate_limit_burst`; `429` on overflow), and **admission control** (`[server].max_concurrent_requests`, `[server].admission_min_free_blocks` against the paged-KV pool; `503` when saturated). Defaults are fully permissive so legacy benchmark / development flows are byte-identical. |
 | `rpc` | Sharded `RouteExperts` RPC scaffold (gist Part 4): the deterministic `shard_for_expert` routing function plus the packed `RouteExpertsRequest` / `RouteExpertsResponse` wire frames documented in `docs/distributed.md`. Transport-agnostic on purpose — `tonic` / `prost` are intentionally not pulled into the dependency graph so the CPU-only build stays slim; a concrete transport plugs in by serialising these frames over whatever the deployment already runs. |
@@ -2120,12 +2120,23 @@ A native terminal dashboard ships with the engine under `--features tui`
 mer-cli monitor --url http://127.0.0.1:8080 --refresh-ms 250
 ```
 
-It polls `/v1/admin/health/experts` on the refresh interval and renders:
+It polls `/v1/admin/health/experts` on the refresh interval and renders
+the Amalgafy-style monochromatic tech-noir layout:
 
-* a header with status / uptime / TPS,
-* a 3-tier cache hit grid (SSD / RAM / VRAM),
-* a VRAM utilisation gauge driven by the new metrics, and
-* an I/O reactor sparkline.
+* a header with status / uptime / TPS — the TPS counter resets to
+  zero when `tokens_generated` jumps backwards (server restart) so
+  the rate stays meaningful across engine restarts;
+* a 3-tier hit grid with one sparkline per tier (VRAM / RAM / SSD).
+  Each sparkline plots the **delta** of the tier's cumulative
+  counter per refresh tick, so the trace shows real load pulse, not
+  a cumulative staircase;
+* a VRAM utilisation gauge (anchor + LRU regions) and a RAM
+  occupancy gauge driven by the `/metrics` companion gauges; and
+* an I/O reactor stall pulse — a sparkline of the per-tick SSD-miss
+  delta, surfacing backpressure on the inference critical path.
+
+All sparkline histories are capped at 60 points to bound memory
+growth.
 
 Built with `ratatui` + `crossterm`. Disable with
 `cargo build --release --no-default-features` if you want a TUI-free
