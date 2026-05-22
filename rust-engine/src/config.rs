@@ -482,10 +482,20 @@ pub struct GpuCacheConfig {
     #[serde(default = "default_vram_anchor_ratio")]
     pub vram_anchor_ratio: f32,
 
-    /// On-device dtype for the resident expert bytes. Mirrors
-    /// [`WeightDtype::as_str`]: `"f32"`, `"f16"`, `"int8"`, `"q4k"`,
-    /// `"q4_0"`, `"q8_0"`. Defaults to `"f16"` — typically half the
-    /// VRAM footprint of `f32` with no perceptible quality loss.
+    /// Advisory on-device dtype label for the resident expert bytes.
+    /// Accepts the same spellings as [`WeightDtype::as_str`]: `"f32"`,
+    /// `"f16"`, `"int8"`, `"q4k"`, `"q4_0"`, `"q8_0"`; defaults to
+    /// `"f16"`.
+    ///
+    /// **Currently advisory only.** The promotion path copies the
+    /// on-disk expert bytes into VRAM as-is — it does not yet convert
+    /// or repack between dtypes, and VRAM accounting is driven by the
+    /// raw byte length of each [`ExpertResident`] rather than by this
+    /// field. The value is validated at startup (so typos fail fast)
+    /// and logged for observability, and is reserved for a future
+    /// promotion-time conversion/sizing path. Operators should size
+    /// `vram_capacity_mb` against the on-disk footprint, not against
+    /// the dtype label here.
     #[serde(default = "default_gpu_dtype")]
     pub dtype: String,
 }
