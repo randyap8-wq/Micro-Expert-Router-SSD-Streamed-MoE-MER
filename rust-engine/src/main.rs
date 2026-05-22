@@ -794,7 +794,13 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // SSD → RAM → VRAM). When `[gpu_cache].enabled = false` (default)
     // the engine retains its historical 2-tier posture.
     if cfg.gpu_cache.enabled {
-        let dtype_for_sizing =
+        // `gpu_cache.dtype` is currently advisory — it is validated by
+        // `AppConfig::validate` (so typos fail fast) and surfaced here
+        // for observability, but the promotion path copies on-disk
+        // bytes into VRAM without conversion or repacking. Parse it
+        // here purely so the startup log records the operator's
+        // declared intent.
+        let dtype_for_logging =
             crate::inference::WeightDtype::from_str_opt(&cfg.gpu_cache.dtype)
                 .unwrap_or(crate::inference::WeightDtype::F16);
         let capacity_bytes = (cfg.gpu_cache.vram_capacity_mb as usize) * 1024 * 1024;
@@ -807,8 +813,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             vram_capacity_mb = cfg.gpu_cache.vram_capacity_mb,
             anchor_ratio = cfg.gpu_cache.vram_anchor_ratio,
             promote_after_hits = cfg.gpu_cache.promote_after_hits,
-            dtype = %dtype_for_sizing.as_str(),
-            "VRAM (GPU) expert cache enabled — 3-tier SSD→RAM→VRAM hierarchy active"
+            dtype_advisory = %dtype_for_logging.as_str(),
+            "VRAM (GPU) expert cache enabled — 3-tier SSD→RAM→VRAM hierarchy active (dtype is advisory; bytes copied as-is)"
         );
         engine_builder.install_gpu_cache(gpu);
     }

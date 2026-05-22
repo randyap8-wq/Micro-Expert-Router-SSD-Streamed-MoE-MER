@@ -1450,6 +1450,11 @@ impl Engine {
         let mut cache_hits_per_expert: Vec<bool> = vec![false; target.len()];
         let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
             Vec::new();
+        // VRAM (GPU) tier — aggregate hits/misses across this routing
+        // decision and record once, rather than incrementing Prometheus
+        // counters per activation on the hot path.
+        let mut gpu_hits_acc: u64 = 0;
+        let mut gpu_misses_acc: u64 = 0;
         for (i, &id) in target.iter().enumerate() {
             // VRAM (GPU) tier — Phase 2 three-tier hierarchy. The cache
             // shadows RAM; on hit we still resolve the authoritative
@@ -1458,11 +1463,9 @@ impl Engine {
             if let Some(gpu) = self.core.gpu_cache.as_ref() {
                 let lookup = gpu.get(id);
                 if lookup.is_hit() {
-                    if let Some(p) = self.metrics.prom.as_ref() {
-                        p.record_gpu_cache(1, 0);
-                    }
-                } else if let Some(p) = self.metrics.prom.as_ref() {
-                    p.record_gpu_cache(0, 1);
+                    gpu_hits_acc += 1;
+                } else {
+                    gpu_misses_acc += 1;
                 }
             }
             if let Some(r) = self.core.cache.get(id) {
@@ -1495,6 +1498,12 @@ impl Engine {
                     i,
                     tokio::spawn(async move { me.fetch(id).await }),
                 ));
+            }
+        }
+        // Aggregate VRAM-tier outcome for this routing decision.
+        if let Some(p) = self.metrics.prom.as_ref() {
+            if gpu_hits_acc > 0 || gpu_misses_acc > 0 {
+                p.record_gpu_cache(gpu_hits_acc, gpu_misses_acc);
             }
         }
         // Emit a trace record after we know which experts were chosen
@@ -2297,15 +2306,18 @@ impl Engine {
             tokio::task::JoinHandle<Result<Arc<ExpertResident>, ExpertReadError>>,
         )> = Vec::new();
         let mut cache_hits_per_expert: Vec<bool> = Vec::with_capacity(target.len());
+        // VRAM (GPU) tier — aggregate hits/misses across this routing
+        // decision and record once, rather than incrementing Prometheus
+        // counters per activation on the hot path.
+        let mut gpu_hits_acc: u64 = 0;
+        let mut gpu_misses_acc: u64 = 0;
         for (i, &id) in target.iter().enumerate() {
             if let Some(gpu) = self.core.gpu_cache.as_ref() {
                 let lookup = gpu.get(id);
-                if let Some(p) = self.metrics.prom.as_ref() {
-                    if lookup.is_hit() {
-                        p.record_gpu_cache(1, 0);
-                    } else {
-                        p.record_gpu_cache(0, 1);
-                    }
+                if lookup.is_hit() {
+                    gpu_hits_acc += 1;
+                } else {
+                    gpu_misses_acc += 1;
                 }
             }
             if let Some(r) = self.core.cache.get(id) {
@@ -2329,6 +2341,12 @@ impl Engine {
                     tokio::spawn(async move { me.fetch_with_retry(id).await }),
                 ));
                 cache_hits_per_expert.push(false);
+            }
+        }
+        // Aggregate VRAM-tier outcome for this routing decision.
+        if let Some(p) = self.metrics.prom.as_ref() {
+            if gpu_hits_acc > 0 || gpu_misses_acc > 0 {
+                p.record_gpu_cache(gpu_hits_acc, gpu_misses_acc);
             }
         }
         // Emit one routing-trace record per `moe_step` call — same
