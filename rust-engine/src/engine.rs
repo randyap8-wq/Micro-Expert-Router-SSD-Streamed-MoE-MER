@@ -1465,14 +1465,16 @@ impl Engine {
                 cache_hits_per_expert[i] = true;
                 // RAM hit: bump the per-expert hit counter and, if we
                 // have a VRAM tier configured, enqueue a fire-and-forget
-                // promotion when this expert crosses the promote_after
-                // threshold.
+                // promotion only on the threshold crossing, and only if
+                // the expert is not already resident in the GPU cache.
                 let new_hits = r.record_hit();
                 if let (Some(gpu), Some(tx)) = (
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
                 ) {
-                    if gpu.should_promote(new_hits) {
+                    let crossed_promote_threshold = gpu.should_promote(new_hits)
+                        && !gpu.should_promote(new_hits.saturating_sub(1));
+                    if crossed_promote_threshold && !gpu.get(id).is_hit() {
                         let _ = tx.send((id, r.clone()));
                     }
                 }
