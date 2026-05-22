@@ -37,6 +37,7 @@
 use crate::transformer::KvCache;
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// One active session's persisted state.
@@ -87,15 +88,18 @@ pub struct SessionStore {
     /// — and revoke — an in-flight session that is invisible to a
     /// `DashMap::remove` against `inner` because the entry has been
     /// handed to a request handler. (F1.5 in the audit.)
-    in_flight: Arc<DashMap<String, ()>>,
+    in_flight: Arc<DashMap<String, u64>>,
     /// Ids that were ordered deleted while still in flight. The next
     /// [`Self::put`] for one of these ids zeroizes the returned state
     /// and refuses to reinsert it, preserving the
     /// `DELETE /v1/sessions/{id}` invariant that no resumption of the
     /// session is possible after the delete is observed.
     tombstones: Arc<DashMap<String, ()>>,
+    next_checkout: Arc<AtomicU64>,
     ttl: Duration,
 }
+
+pub type SessionCheckoutToken = u64;
 
 impl SessionStore {
     /// `ttl == 0` disables time-based eviction (sessions live until
@@ -105,6 +109,7 @@ impl SessionStore {
             inner: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
             tombstones: Arc::new(DashMap::new()),
+            next_checkout: Arc::new(AtomicU64::new(1)),
             ttl,
         }
     }
@@ -119,10 +124,10 @@ impl SessionStore {
     }
 
     /// Atomically remove and return the session state for `id`. The
-    /// caller is expected to call [`Self::put`] when finished so the
-    /// session resumes on the next request. Returns `None` when no
-    /// session with that id exists.
-    pub fn take(&self, id: &str) -> Option<SessionState> {
+    /// caller is expected to call [`Self::put`] with the returned
+    /// checkout token when finished so the session resumes on the next
+    /// request. Returns `None` when no session with that id exists.
+    pub fn take(&self, id: &str) -> Option<(SessionState, SessionCheckoutToken)> {
         // Reject takes for ids that have an outstanding tombstone:
         // a concurrent `delete` already decided this session is
         // gone, and serving its state to a new request would
@@ -131,28 +136,65 @@ impl SessionStore {
         if self.tombstones.contains_key(id) {
             return None;
         }
+        let token = self.next_checkout.fetch_add(1, Ordering::Relaxed);
+        let key = id.to_string();
+        match self.in_flight.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(token);
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return None;
+            }
+        }
         let removed = self.inner.remove(id).map(|(_, mut s)| {
             s.last_used = Instant::now();
             s
         });
-        if removed.is_some() {
-            // Record the in-flight checkout so `delete` can find
-            // the session even though it is no longer in `inner`.
-            self.in_flight.insert(id.to_string(), ());
+        match removed {
+            Some(mut state) => {
+                if self.tombstones.contains_key(id) {
+                    state.zeroize_in_place();
+                    if self.in_flight.get(id).map(|v| *v == token).unwrap_or(false) {
+                        self.in_flight.remove(id);
+                    }
+                    return None;
+                }
+                Some((state, token))
+            }
+            None => {
+                if self.in_flight.get(id).map(|v| *v == token).unwrap_or(false) {
+                    self.in_flight.remove(id);
+                }
+                None
+            }
         }
-        removed
     }
 
     /// Reinsert a session — typically after a request has consumed
-    /// `take` and produced new tokens. Overwrites any prior state for
-    /// the same id (which can happen if a second concurrent request
-    /// for the same session ran in parallel; last writer wins,
-    /// matching vLLM / ollama semantics).
-    pub fn put(&self, id: String, mut state: SessionState) {
-        // Always clear the in-flight marker — whether or not we
-        // ultimately reinsert, this checkout is done.
-        self.in_flight.remove(&id);
-        if self.tombstones.remove(&id).is_some() {
+    /// `take` and produced new tokens. `checkout` must be the token
+    /// returned by `take` for this in-flight session; use `None` when
+    /// storing a fresh session that was not checked out from the store.
+    pub fn put(
+        &self,
+        id: String,
+        mut state: SessionState,
+        checkout: Option<SessionCheckoutToken>,
+    ) {
+        // Returning an in-flight checkout must prove ownership of the
+        // current marker. Callers that did not successfully `take`
+        // pass `None` and must not clear another request's marker.
+        if let Some(token) = checkout {
+            let owns_marker = self.in_flight.get(&id).map(|v| *v == token).unwrap_or(false);
+            if !owns_marker {
+                state.zeroize_in_place();
+                return;
+            }
+            self.in_flight.remove(&id);
+        }
+        if self.tombstones.contains_key(&id) {
+            if checkout.is_some() {
+                self.tombstones.remove(&id);
+            }
             // A `delete` arrived while this id was in flight. Honour
             // the delete: scrub the KV bytes and drop the state
             // instead of reinserting. This is the resurrection-
@@ -277,9 +319,9 @@ mod tests {
         let store = SessionStore::new(Duration::from_secs(60));
         let mut s = SessionState::new(fake_kv());
         s.position = 4;
-        store.put("alice".to_string(), s);
+        store.put("alice".to_string(), s, None);
         assert_eq!(store.len(), 1);
-        let back = store.take("alice").expect("session must exist");
+        let (back, _token) = store.take("alice").expect("session must exist");
         assert_eq!(back.position, 4);
         // Take is destructive.
         assert!(store.take("alice").is_none());
@@ -289,7 +331,7 @@ mod tests {
     #[test]
     fn delete_returns_existence_flag() {
         let store = SessionStore::new(Duration::from_secs(60));
-        store.put("a".into(), SessionState::new(fake_kv()));
+        store.put("a".into(), SessionState::new(fake_kv()), None);
         assert!(store.delete("a"));
         assert!(!store.delete("a"));
         assert!(!store.delete("never-existed"));
@@ -302,7 +344,7 @@ mod tests {
         // Force `last_used` into the past so the eviction sweep removes it.
         s.last_used = Instant::now() - Duration::from_secs(60);
         store.inner.insert("stale".into(), s);
-        store.put("fresh".into(), SessionState::new(fake_kv()));
+        store.put("fresh".into(), SessionState::new(fake_kv()), None);
         let removed = store.evict_expired();
         assert_eq!(removed, 1);
         assert!(store.take("fresh").is_some());
@@ -369,10 +411,10 @@ mod tests {
         let store = SessionStore::new(Duration::from_secs(60));
         let mut s = SessionState::new(fake_kv());
         s.position = 7;
-        store.put("alice".into(), s);
+        store.put("alice".into(), s, None);
 
         // Request handler checks the session out.
-        let in_flight = store.take("alice").expect("session must exist");
+        let (in_flight, checkout) = store.take("alice").expect("session must exist");
         assert_eq!(in_flight.position, 7);
         assert_eq!(store.len(), 0, "take is destructive on `inner`");
 
@@ -386,12 +428,12 @@ mod tests {
 
         // Request handler finishes and tries to put the session
         // back. The tombstone must prevent the reinsert.
-        store.put("alice".into(), in_flight);
+        store.put("alice".into(), in_flight, Some(checkout));
         assert_eq!(store.len(), 0, "delete must win the race");
         assert!(store.take("alice").is_none());
 
         // A fresh put after the resolution is allowed.
-        store.put("alice".into(), SessionState::new(fake_kv()));
+        store.put("alice".into(), SessionState::new(fake_kv()), None);
         assert!(store.take("alice").is_some());
     }
 
@@ -402,17 +444,17 @@ mod tests {
     #[test]
     fn take_respects_outstanding_tombstone() {
         let store = SessionStore::new(Duration::from_secs(60));
-        store.put("bob".into(), SessionState::new(fake_kv()));
+        store.put("bob".into(), SessionState::new(fake_kv()), None);
         // Simulate "in flight then deleted" by hand: check out, then
         // delete — the tombstone is now armed.
-        let s = store.take("bob").expect("must exist");
+        let (s, checkout) = store.take("bob").expect("must exist");
         assert!(store.delete("bob"));
         // Even if a racing caller manages to slip a `put` in (e.g.
         // because two takes ran in parallel and one already ran
         // `put`), the tombstone-aware `take` refuses to surface a
         // tombstoned id. Here we simulate that by inserting back
         // and asserting the next `take` returns None.
-        store.put("bob".into(), s); // honoured tombstone → no insert
+        store.put("bob".into(), s, Some(checkout)); // honoured tombstone → no insert
         assert!(store.take("bob").is_none());
     }
 }

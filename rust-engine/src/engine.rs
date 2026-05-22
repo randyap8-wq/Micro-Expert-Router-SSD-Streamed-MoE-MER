@@ -3098,6 +3098,38 @@ mod tests {
         assert!(engine.core.cache.contains(5));
     }
 
+    /// Regression for F1.4: a caller that starts as a follower must
+    /// re-contend and succeed after being notified by a failed leader
+    /// that did not populate the cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_with_retry_follower_recontends_after_leader_failure() {
+        let dir = TempDir::new("gen-singleflight-recontend");
+        let num_experts: u32 = 8;
+        let engine = build_engine(&dir.path, num_experts, 16, 32, 8, 2, 1, 0xF11E);
+        let expert_size = engine.core.pool.buffer_size() as u64;
+        assert!(!engine.core.cache.contains(5));
+
+        // Seed an in-flight entry so this call must enter the follower
+        // path first. We then simulate a failing leader by removing
+        // the entry and notifying waiters without filling the cache.
+        let notify = Arc::new(Notify::new());
+        engine.in_flight.insert(5, notify.clone());
+
+        let e = engine.clone();
+        let follower = tokio::spawn(async move { e.fetch_with_retry(5).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        engine.in_flight.remove(&5);
+        notify.notify_waiters();
+
+        let _ = follower
+            .await
+            .expect("join")
+            .expect("follower should re-contend and fetch after failed leader");
+        assert!(engine.core.cache.contains(5));
+        assert_eq!(engine.report().bytes_read, expert_size);
+        assert!(!engine.in_flight.contains_key(&5));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_cap_bounds_residency_under_load() {
         // The engine must never let more than `cache_slots` experts be

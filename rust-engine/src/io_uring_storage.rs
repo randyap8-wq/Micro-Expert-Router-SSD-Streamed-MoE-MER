@@ -114,7 +114,7 @@ pub struct IoUringStorage {
     /// fixed buffers the kernel has registered raw pointers into.
     /// Holding this `BufferPool` (which is internally an `Arc`)
     /// guarantees the backing storage outlives the kernel ring.
-    /// Mostly opaque; surfaced via [`Self::buffer_pool`] for tests.
+    /// Mostly opaque; retained for fixed-buffer lifetime safety.
     #[allow(dead_code)]
     pool: BufferPool,
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
@@ -757,6 +757,7 @@ mod linux_impl {
         if total == 0 {
             return Ok(0);
         }
+        let mut submitted_ops = 0usize;
         let mut pushed = 0usize;
         while pushed < total {
             let chunk_end = (pushed + cap).min(total);
@@ -789,6 +790,15 @@ mod linux_impl {
                     }
                     push_attempts += 1;
                     if push_attempts > MAX_PUSH_RETRIES {
+                        if submitted_ops > 0 {
+                            if let Err(e) = drain_submitted_completions(ring, submitted_ops) {
+                                tracing::warn!(
+                                    error = %e,
+                                    submitted_ops,
+                                    "io_uring: failed to fully drain previously submitted CQEs before SQ retry abort"
+                                );
+                            }
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
                             format!(
@@ -800,13 +810,13 @@ mod linux_impl {
                     // forwards any kernel-side error (EAGAIN, ENOMEM,
                     // …) out of the reactor; only `PushError::Full`
                     // from `push` is treated as "transient, retry".
-                    ring.submit()?;
+                    submitted_ops += ring.submit()?;
                 }
             }
             if chunk_end < total {
                 // Hand this window down to the kernel so it can start
                 // servicing reads while we keep queueing. Non-blocking.
-                ring.submit()?;
+                submitted_ops += ring.submit()?;
             }
             pushed = chunk_end;
         }
@@ -878,6 +888,19 @@ mod linux_impl {
         } else {
             Ok(totalbytes)
         }
+    }
+
+    fn drain_submitted_completions(ring: &mut IoUring, submitted: usize) -> io::Result<()> {
+        let mut drained = 0usize;
+        while drained < submitted {
+            match ring.completion().next() {
+                Some(_) => drained += 1,
+                None => {
+                    ring.submit_and_wait(1)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Best-effort: pin the calling thread to the CPUs reported by

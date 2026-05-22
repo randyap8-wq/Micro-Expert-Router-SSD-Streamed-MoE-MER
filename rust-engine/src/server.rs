@@ -34,7 +34,7 @@ use crate::middleware::{
 };
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;
-use crate::session::{SessionState, SessionStore};
+use crate::session::{SessionCheckoutToken, SessionState, SessionStore};
 use crate::tokenizer::Tokenizer;
 use axum::{
     extract::{Path as AxumPath, State},
@@ -501,7 +501,7 @@ async fn generate(
         // Resolve session: take any existing KV state, then put it
         // back at the end. When no session is configured the request
         // is fully stateless (legacy behaviour).
-        let (mut kv, mut start_pos) = load_session_kv(state, model, session_id.as_deref());
+        let (mut kv, mut start_pos, checkout) = load_session_kv(state, model, session_id.as_deref());
         let pre_hits = state.engine.report().hits;
         let pre_misses = state.engine.report().misses;
 
@@ -525,7 +525,7 @@ async fn generate(
             last = next;
             start_pos += 1;
         }
-        save_session_kv(state, session_id.as_deref(), kv, start_pos);
+        save_session_kv(state, session_id.as_deref(), kv, start_pos, checkout);
         let post = state.engine.report();
         hits_total = post.hits.saturating_sub(pre_hits);
         misses_total = post.misses.saturating_sub(pre_misses);
@@ -631,18 +631,22 @@ fn load_session_kv(
     state: &AppState,
     model: &Arc<RealModel>,
     session_id: Option<&str>,
-) -> (Vec<crate::transformer::KvCache>, usize) {
+) -> (
+    Vec<crate::transformer::KvCache>,
+    usize,
+    Option<SessionCheckoutToken>,
+) {
     if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
-        if let Some(prev) = store.take(id) {
+        if let Some((prev, checkout)) = store.take(id) {
             // Validate shape: layer count must match the live model.
             // Mismatches happen if the server is restarted with a
             // different config; treat as a fresh session.
             if prev.kv.len() == model.config.num_layers {
-                return (prev.kv, prev.position);
+                return (prev.kv, prev.position, Some(checkout));
             }
         }
     }
-    (model.fresh_kv_caches(), 0)
+    (model.fresh_kv_caches(), 0, None)
 }
 
 /// Persist KV state back to the store at request completion. No-op
@@ -652,6 +656,7 @@ fn save_session_kv(
     session_id: Option<&str>,
     kv: Vec<crate::transformer::KvCache>,
     position: usize,
+    checkout: Option<SessionCheckoutToken>,
 ) {
     if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
         store.put(
@@ -661,6 +666,7 @@ fn save_session_kv(
                 position,
                 last_used: Instant::now(),
             },
+            checkout,
         );
     }
 }
@@ -880,6 +886,7 @@ async fn stream_tokens(
             kv: Vec<crate::transformer::KvCache>,
             last_token: u32,
             position: usize,
+            checkout: Option<SessionCheckoutToken>,
         },
         Legacy {
             base: u64,
@@ -889,7 +896,7 @@ async fn stream_tokens(
     let mode = if let Some(model) = state.real_model.as_ref() {
         // Resume from session state if configured — otherwise start
         // fresh, matching the non-streaming `generate` path.
-        let (mut kv, mut pos) = load_session_kv(&state, model, session_id.as_deref());
+        let (mut kv, mut pos, checkout) = load_session_kv(&state, model, session_id.as_deref());
         for &tid in prompt_ids.iter() {
             let _ = step_through_scheduler(&state, model, tid, pos, &mut kv, &params).await;
             pos += 1;
@@ -898,6 +905,7 @@ async fn stream_tokens(
             kv,
             last_token: *prompt_ids.last().unwrap_or(&0u32),
             position: pos,
+            checkout,
         }
     } else {
         GenMode::Legacy {
@@ -946,9 +954,15 @@ async fn stream_tokens(
             // Final chunk carries `finish_reason: length` and no new text.
             // Persist KV-cache state back to the session store so a
             // follow-up request can pick up where we stopped.
-            if let GenMode::Real { kv, last_token: _, position } = &mut st.mode {
+            if let GenMode::Real { kv, last_token: _, position, checkout } = &mut st.mode {
                 let kv_take = std::mem::take(kv);
-                save_session_kv(&st.state, st.session_id.as_deref(), kv_take, *position);
+                save_session_kv(
+                    &st.state,
+                    st.session_id.as_deref(),
+                    kv_take,
+                    *position,
+                    checkout.take(),
+                );
             }
             st.finished_emitted = true;
             return Some((
@@ -959,7 +973,7 @@ async fn stream_tokens(
         let pre_hits = st.state.engine.report().hits;
         let pre_misses = st.state.engine.report().misses;
         let next: u32 = match &mut st.mode {
-            GenMode::Real { kv, last_token, position } => {
+            GenMode::Real { kv, last_token, position, checkout: _ } => {
                 let model = st
                     .state
                     .real_model
