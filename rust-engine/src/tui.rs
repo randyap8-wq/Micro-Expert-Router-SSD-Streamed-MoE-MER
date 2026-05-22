@@ -148,15 +148,16 @@ impl AppState {
             &mut self.prev_ram_hits,
             self.last.cache_hits,
         );
-        // SSD tier resolves on a RAM miss, so we plot the RAM-miss
-        // delta as the SSD-hit pulse. The reactor stall pane in
+        // SSD tier activity is driven by a RAM miss, so this history
+        // stores the RAM-miss / SSD-read delta from `cache_misses`,
+        // not a literal SSD-hit counter. The reactor stall pane in
         // `draw_pulse` reads from this same history at render time,
         // so we don't keep a second buffer of identical values.
-        let ssd_hits = self.last.cache_misses;
+        let ssd_misses = self.last.cache_misses;
         push_delta(
             &mut self.ssd_hits_history,
             &mut self.prev_ssd_hits,
-            ssd_hits,
+            ssd_misses,
         );
     }
 }
