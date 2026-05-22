@@ -754,6 +754,28 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         ));
         engine_builder = engine_builder.with_speculator(spec, top_k);
     }
+    // Phase 2: optional VRAM (GPU) expert cache (3-tier hierarchy
+    // SSD → RAM → VRAM). When `[gpu_cache].enabled = false` (default)
+    // the engine retains its historical 2-tier posture.
+    if cfg.gpu_cache.enabled {
+        let dtype_for_sizing =
+            crate::inference::WeightDtype::from_str_opt(&cfg.gpu_cache.dtype)
+                .unwrap_or(crate::inference::WeightDtype::F16);
+        let capacity_bytes = (cfg.gpu_cache.vram_capacity_mb as usize) * 1024 * 1024;
+        let gpu = std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(
+            capacity_bytes,
+            cfg.gpu_cache.vram_anchor_ratio,
+            cfg.gpu_cache.promote_after_hits,
+        ));
+        info!(
+            vram_capacity_mb = cfg.gpu_cache.vram_capacity_mb,
+            anchor_ratio = cfg.gpu_cache.vram_anchor_ratio,
+            promote_after_hits = cfg.gpu_cache.promote_after_hits,
+            dtype = %dtype_for_sizing.as_str(),
+            "VRAM (GPU) expert cache enabled — 3-tier SSD→RAM→VRAM hierarchy active"
+        );
+        engine_builder.install_gpu_cache(gpu);
+    }
     let engine = Arc::new(engine_builder);
 
     let tokenizer = match cfg.tokenizer.path.as_ref() {

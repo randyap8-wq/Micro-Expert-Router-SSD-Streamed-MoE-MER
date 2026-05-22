@@ -437,6 +437,75 @@ impl Default for PredictiveConfig {
     }
 }
 
+/// `[gpu_cache]` — Phase 1/2 of the 3-Tier Heterogeneous Memory
+/// Orchestrator (SSD → RAM → VRAM).
+///
+/// Off by default. When `enabled = true` and the binary has the `cuda`
+/// cargo feature compiled in *and* a CUDA-capable device is present at
+/// startup, the engine layers a [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
+/// on top of the existing RAM `ExpertCache`. The VRAM cache is split
+/// into an **Anchor Core** (high-frequency experts permanently pinned
+/// once they cross `promote_after_hits`) and an **LRU Edge** (O(1) LRU
+/// queue handling temporal topic shifts). The `vram_anchor_ratio`
+/// controls the split between the two regions.
+///
+/// If CUDA is requested but unavailable at runtime the engine emits a
+/// `tracing::warn!`, leaves the field disabled, and continues serving
+/// from the RAM + NVMe tiers — never panics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuCacheConfig {
+    /// Master switch. `false` (default) leaves the existing 2-tier
+    /// (SSD → RAM) substrate untouched.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// VRAM budget, in mebibytes (1 MiB = 1024 × 1024 bytes), available
+    /// to the expert cache. Defaults to 0 — i.e. the cache is created
+    /// with zero capacity and every lookup misses straight through to
+    /// the RAM tier. Operators sizing the cache should leave headroom
+    /// for the dense transformer body and the KV cache; a typical
+    /// 16 GiB consumer card might allocate 4096–8192 here.
+    #[serde(default)]
+    pub vram_capacity_mb: usize,
+
+    /// Hit count an expert must accumulate (in [`ExpertResident::hits`])
+    /// before it is permanently pinned into the Anchor Core. Defaults
+    /// to 16. `0` disables promotion (every expert routes through the
+    /// LRU Edge only).
+    #[serde(default = "default_promote_after_hits")]
+    pub promote_after_hits: u64,
+
+    /// Fraction of `vram_capacity_mb` reserved for the Anchor Core
+    /// (the rest is the LRU Edge). Range `0.0..=1.0`. Defaults to
+    /// `0.5` — half the VRAM is pinned to the hottest experts, half
+    /// floats with topical shifts.
+    #[serde(default = "default_vram_anchor_ratio")]
+    pub vram_anchor_ratio: f32,
+
+    /// On-device dtype for the resident expert bytes. Mirrors
+    /// [`WeightDtype::as_str`]: `"f32"`, `"f16"`, `"int8"`, `"q4k"`,
+    /// `"q4_0"`, `"q8_0"`. Defaults to `"f16"` — typically half the
+    /// VRAM footprint of `f32` with no perceptible quality loss.
+    #[serde(default = "default_gpu_dtype")]
+    pub dtype: String,
+}
+
+fn default_promote_after_hits() -> u64 { 16 }
+fn default_vram_anchor_ratio() -> f32 { 0.5 }
+fn default_gpu_dtype() -> String { "f16".to_string() }
+
+impl Default for GpuCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vram_capacity_mb: 0,
+            promote_after_hits: default_promote_after_hits(),
+            vram_anchor_ratio: default_vram_anchor_ratio(),
+            dtype: default_gpu_dtype(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -455,6 +524,12 @@ pub struct Config {
     /// HTTP) to preserve the legacy behaviour bit-for-bit.
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Optional `[gpu_cache]` section — Phase 1/2 of the 3-tier
+    /// heterogeneous memory orchestrator (SSD → RAM → VRAM). Off by
+    /// default; the binary behaves identically to the 2-tier engine
+    /// when this section is absent.
+    #[serde(default)]
+    pub gpu_cache: GpuCacheConfig,
 }
 
 impl Config {
@@ -510,6 +585,25 @@ impl Config {
                 "storage.partial_load_fraction ({}) must be in [0.1, 1.0]",
                 self.storage.partial_load_fraction
             )));
+        }
+        // [gpu_cache] validation — only meaningful when enabled.
+        if self.gpu_cache.enabled {
+            if !(0.0..=1.0).contains(&self.gpu_cache.vram_anchor_ratio) {
+                return Err(ConfigError::Invalid(format!(
+                    "gpu_cache.vram_anchor_ratio ({}) must be in [0.0, 1.0]",
+                    self.gpu_cache.vram_anchor_ratio
+                )));
+            }
+            // Parse the dtype string against the WeightDtype contract so
+            // we fail fast on a typo rather than at first VRAM
+            // promotion.
+            if WeightDtype::from_str_opt(&self.gpu_cache.dtype).is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "gpu_cache.dtype: unknown weight dtype {:?} (expected one of \
+                     f32, f16, int8, q4k, q4_0, q8_0)",
+                    self.gpu_cache.dtype
+                )));
+            }
         }
         if self.real_transformer.enabled {
             let rt = &self.real_transformer;
