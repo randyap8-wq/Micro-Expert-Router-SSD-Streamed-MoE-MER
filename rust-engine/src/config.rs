@@ -440,18 +440,18 @@ impl Default for PredictiveConfig {
 /// `[gpu_cache]` — Phase 1/2 of the 3-Tier Heterogeneous Memory
 /// Orchestrator (SSD → RAM → VRAM).
 ///
-/// Off by default. When `enabled = true` and the binary has the `cuda`
-/// cargo feature compiled in *and* a CUDA-capable device is present at
-/// startup, the engine layers a [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
-/// on top of the existing RAM `ExpertCache`. The VRAM cache is split
-/// into an **Anchor Core** (high-frequency experts permanently pinned
-/// once they cross `promote_after_hits`) and an **LRU Edge** (O(1) LRU
+/// Off by default. When `enabled = true`, the server is configured to
+/// layer a [`GpuExpertCache`](crate::expert_cache::GpuExpertCache) on
+/// top of the existing RAM `ExpertCache`. The VRAM cache is split into
+/// an **Anchor Core** (high-frequency experts permanently pinned once
+/// they cross `promote_after_hits`) and an **LRU Edge** (O(1) LRU
 /// queue handling temporal topic shifts). The `vram_anchor_ratio`
 /// controls the split between the two regions.
 ///
-/// If CUDA is requested but unavailable at runtime the engine emits a
-/// `tracing::warn!`, leaves the field disabled, and continues serving
-/// from the RAM + NVMe tiers — never panics.
+/// Note: this field is only a configuration switch. Support for GPU
+/// caching depends on how the binary was built and what runtime
+/// environment it is started in; this config definition does not
+/// itself perform CUDA feature detection or automatic fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuCacheConfig {
     /// Master switch. `false` (default) leaves the existing 2-tier
