@@ -426,14 +426,101 @@ async fn fetch_health(url_base: &str) -> Result<HealthSnapshot, Box<dyn std::err
         .position(|w| w == needle)
         .ok_or("malformed HTTP response (no header terminator)")?
         + needle.len();
+    let head = &buf[..body_start - needle.len()];
     let body = &buf[body_start..];
-    // Strip transfer-encoding: chunked artefacts if present (the server
-    // serialises a small JSON body and uses Content-Length, so this is
-    // a defensive trim of trailing CRLFs only).
-    let json = std::str::from_utf8(body)?.trim_matches(|c: char| c == '\r' || c == '\n');
-    // If the server sent a chunked body, strip a trailing "0" chunk-size
-    // line after the last newline-trim above so the JSON parses cleanly.
-    let json = json.trim_end_matches('\u{0}');
-    let snap: HealthSnapshot = serde_json::from_str(json.trim())?;
+
+    // Validate status line — only 2xx responses carry a meaningful JSON
+    // body for this endpoint; anything else is surfaced as an error so
+    // the dashboard does not attempt to parse an HTML error page.
+    let head_str = std::str::from_utf8(head)
+        .map_err(|_| "malformed HTTP response (non-utf8 header)")?;
+    let mut header_lines = head_str.split("\r\n");
+    let status_line = header_lines
+        .next()
+        .ok_or("malformed HTTP response (missing status line)")?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    let _http_version = status_parts.next().unwrap_or("");
+    let status_code: u16 = status_parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or("malformed HTTP response (missing status code)")?;
+    if !(200..300).contains(&status_code) {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::Other,
+            format!("health endpoint returned HTTP {status_code}"),
+        )));
+    }
+
+    // Parse headers for Content-Length and Transfer-Encoding so we can
+    // pick the correct framing for the response body.
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    for line in header_lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().ok();
+            } else if name.eq_ignore_ascii_case("transfer-encoding")
+                && value.eq_ignore_ascii_case("chunked")
+            {
+                chunked = true;
+            }
+        }
+    }
+
+    let payload: Vec<u8> = if chunked {
+        decode_chunked(body)?
+    } else if let Some(len) = content_length {
+        if body.len() < len {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "HTTP body shorter than Content-Length",
+            )));
+        }
+        body[..len].to_vec()
+    } else {
+        body.to_vec()
+    };
+
+    let snap: HealthSnapshot = serde_json::from_slice(&payload)?;
     Ok(snap)
+}
+
+/// Minimal RFC 7230 `Transfer-Encoding: chunked` decoder. Reads
+/// `<hex-size>\r\n<bytes>\r\n` frames until a zero-sized chunk and
+/// returns the concatenated payload. Trailer headers (if any) are
+/// ignored.
+fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut out = Vec::with_capacity(body.len());
+    loop {
+        let line_end = body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("malformed chunked body (missing chunk size CRLF)")?;
+        let size_line = std::str::from_utf8(&body[..line_end])?;
+        // Chunk extensions (after `;`) are ignored per RFC 7230 §4.1.1.
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| "malformed chunked body (invalid chunk size)")?;
+        body = &body[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        if body.len() < size + 2 {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "chunked body shorter than declared chunk size",
+            )));
+        }
+        out.extend_from_slice(&body[..size]);
+        if &body[size..size + 2] != b"\r\n" {
+            return Err("malformed chunked body (missing chunk trailer CRLF)".into());
+        }
+        body = &body[size + 2..];
+    }
+    Ok(out)
 }
