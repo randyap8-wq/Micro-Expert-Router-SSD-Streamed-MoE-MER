@@ -393,7 +393,10 @@ async fn fetch_health(url_base: &str) -> Result<HealthSnapshot, Box<dyn std::err
     // Strip transfer-encoding: chunked artefacts if present (the server
     // serialises a small JSON body and uses Content-Length, so this is
     // a defensive trim of trailing CRLFs only).
-    let json = std::str::from_utf8(body)?.trim_matches(|c: char| c == '\r' || c == '\n' || c == '0');
-    let snap: HealthSnapshot = serde_json::from_str(json)?;
+    let json = std::str::from_utf8(body)?.trim_matches(|c: char| c == '\r' || c == '\n');
+    // If the server sent a chunked body, strip a trailing "0" chunk-size
+    // line after the last newline-trim above so the JSON parses cleanly.
+    let json = json.trim_end_matches('\u{0}');
+    let snap: HealthSnapshot = serde_json::from_str(json.trim())?;
     Ok(snap)
 }
