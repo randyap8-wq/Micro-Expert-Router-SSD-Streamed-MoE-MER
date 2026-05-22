@@ -14,7 +14,7 @@ publish = false
 # Tokio drives the orchestration (scheduling, prefetch tasks, channels).
 # We use `block_in_place` from `rt-multi-thread` to dispatch blocking
 # `pread(2)` syscalls without satisfying `'static` lifetimes.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 
 # Fixed-capacity LRU cache for resident experts.
 lru = "0.12"
@@ -102,13 +102,22 @@ io-uring = { version = "0.6", optional = true }
 # keeps the dependency lean (CPU only, no Accelerate / MKL / CUDA).
 candle-core = { version = "0.10", default-features = false }
 
+# Native terminal dashboard — Phase 4 of the three-tier hierarchy. The
+# `mer-cli monitor` subcommand uses these to render a live, polling
+# overview of the SSD → RAM → VRAM hit grid, hit rates, VRAM
+# utilisation, and I/O reactor pulse. Behind the `tui` cargo feature
+# (on by default; turn off via `--no-default-features` for embedded
+# builds).
+ratatui = { version = "0.28", optional = true, default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", optional = true }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
 debug = 1
 
 [features]
-default = []
+default = ["tui"]
 # Real HuggingFace tokenizer support. Off by default because the
 # `tokenizers` crate pulls in `onig` (C library) which slows the build
 # noticeably; the engine exposes a byte-level fallback tokenizer when
@@ -155,3 +164,16 @@ amx = []
 # "gpu"`. Off by default to keep CPU-only builds buildable on
 # toolchains and hosts without a GPU driver.
 gpu = []
+# CUDA compute plane (Phase 3, three-tier hierarchy). When enabled,
+# `inference::run_inference_gpu` performs the per-expert SwiGLU forward
+# through candle-core's CUDA backend; the engine still falls back
+# gracefully to the CPU path at runtime when no device is present.
+# Pulls in `candle-core/cuda` and therefore requires a working CUDA
+# toolkit on the build host — off by default to keep the standard
+# CPU-only build buildable.
+cuda = ["candle-core/cuda"]
+# Native terminal dashboard (Phase 4). Enables the `mer-cli monitor`
+# subcommand backed by ratatui + crossterm. On by default because the
+# extra deps are pure-Rust and small; can be turned off with
+# `--no-default-features` for the minimal embedded build.
+tui = ["dep:ratatui", "dep:crossterm"]

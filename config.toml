@@ -213,3 +213,37 @@ speculator_hidden_dim = 128
 # Top-K experts pulled from the speculator each routing step. 0 ⇒
 # inherit `model.top_k`.
 speculator_top_k = 0
+
+# 3-tier heterogeneous memory cache (SSD → RAM → VRAM).
+#
+# When `enabled = false` (the default), the engine runs the legacy
+# 2-tier (SSD → RAM) path bit-for-bit. When `enabled = true`, hot
+# experts are promoted from the RAM-resident `ExpertCache` into an
+# Anchor + LRU-Edge VRAM cache (`GpuExpertCache`) on a background
+# tokio task, exposed via:
+#   * `mer_vram_used_bytes` / `mer_vram_capacity_bytes` gauges
+#   * `mer_gpu_cache_hits_total` / `mer_gpu_cache_misses_total`
+#   * `mer_promotions_total` counter
+#   * extended `/v1/admin/health/experts` JSON
+#
+# On CPU-only builds (no `cuda` feature) the VRAM tier is emulated
+# host-side and inference still runs through the existing CPU path —
+# the cache only changes *where the bytes live*, not how they are
+# computed. With `--features cuda`, `run_inference_gpu` dispatches
+# the matmul through candle-core's CUDA backend.
+[gpu_cache]
+enabled = false
+# VRAM budget in MiB. 0 ⇒ cache created with zero capacity, every
+# lookup misses through to RAM. Leave headroom for the dense body
+# and KV cache; a 16 GiB card typically uses 4096–8192 here.
+vram_capacity_mb = 0
+# Hit count an expert must accumulate in RAM before it is pinned
+# into the Anchor Core. 0 disables promotion (LRU Edge only).
+promote_after_hits = 16
+# Fraction of VRAM reserved for the Anchor Core; the remainder is
+# the LRU Edge. 0.0..=1.0.
+vram_anchor_ratio = 0.5
+# On-device dtype for resident bytes: "f32", "f16", "int8", "q4k",
+# "q4_0", "q8_0". "f16" typically halves the VRAM footprint of
+# "f32" with no perceptible quality loss.
+dtype = "f16"

@@ -12,8 +12,9 @@
 
 use prometheus::{
     register_counter_vec_with_registry, register_counter_with_registry,
-    register_histogram_vec_with_registry, register_histogram_with_registry, Counter, CounterVec,
-    Encoder, Histogram, HistogramVec, Registry, TextEncoder,
+    register_histogram_vec_with_registry, register_histogram_with_registry,
+    register_int_gauge_with_registry, Counter, CounterVec, Encoder, Histogram, HistogramVec,
+    IntGauge, Registry, TextEncoder,
 };
 use std::sync::Arc;
 
@@ -51,6 +52,31 @@ struct MetricsInner {
     /// path that was actually waiting on the storage device, as
     /// distinct from the total I/O time which can overlap compute).
     pub ssd_stall_seconds: Histogram,
+    /// VRAM tier probe hits — lookups for which the requested expert
+    /// was already present in
+    /// [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
+    /// at probe time (Phase 1).
+    pub gpu_cache_hits_total: Counter,
+    /// VRAM tier probe misses — lookups for which the requested expert
+    /// was not present in VRAM at probe time and therefore required
+    /// lower-tier resolution/promotion logic (Phase 1).
+    pub gpu_cache_misses_total: Counter,
+    /// **Gauge** of currently-resident VRAM bytes across the Anchor +
+    /// LRU regions. Phase 1.
+    pub vram_used_bytes: IntGauge,
+    /// **Gauge** of the total VRAM byte budget for the
+    /// [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
+    /// (Anchor + LRU capacity). Set once when the GPU cache is
+    /// installed so dashboards can compute utilisation as
+    /// `mer_vram_used_bytes / mer_vram_capacity_bytes` without
+    /// relying on the `/v1/admin/health/experts` admin endpoint.
+    /// Stays at `0` when the GPU cache is disabled. Phase 1.
+    pub vram_capacity_bytes: IntGauge,
+    /// Total RAM → VRAM promotions performed since startup. Each
+    /// promotion is the result of an `ExpertResident` crossing
+    /// `gpu_cache.promote_after_hits` and being copied into the
+    /// Anchor Core (or the LRU Edge as a fallback). Phase 1.
+    pub promotions_total: Counter,
 }
 
 impl Default for Metrics {
@@ -145,6 +171,36 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_ssd_stall_seconds");
+        let gpu_cache_hits_total = register_counter_with_registry!(
+            "mer_gpu_cache_hits_total",
+            "VRAM-tier expert cache hits (lookups served out of GpuExpertCache).",
+            registry
+        )
+        .expect("metric registration: mer_gpu_cache_hits_total");
+        let gpu_cache_misses_total = register_counter_with_registry!(
+            "mer_gpu_cache_misses_total",
+            "VRAM-tier expert cache misses (lookups that fell through to RAM/NVMe).",
+            registry
+        )
+        .expect("metric registration: mer_gpu_cache_misses_total");
+        let vram_used_bytes = register_int_gauge_with_registry!(
+            "mer_vram_used_bytes",
+            "Currently-resident VRAM bytes across the Anchor Core + LRU Edge regions.",
+            registry
+        )
+        .expect("metric registration: mer_vram_used_bytes");
+        let vram_capacity_bytes = register_int_gauge_with_registry!(
+            "mer_vram_capacity_bytes",
+            "Total VRAM byte budget configured for the GpuExpertCache (Anchor + LRU). 0 when the GPU cache is disabled.",
+            registry
+        )
+        .expect("metric registration: mer_vram_capacity_bytes");
+        let promotions_total = register_counter_with_registry!(
+            "mer_promotions_total",
+            "Total RAM-to-VRAM promotions performed since startup.",
+            registry
+        )
+        .expect("metric registration: mer_promotions_total");
         Self {
             inner: Arc::new(MetricsInner {
                 registry,
@@ -160,6 +216,11 @@ impl Metrics {
                 locality_hits_total,
                 locality_misses_total,
                 ssd_stall_seconds,
+                gpu_cache_hits_total,
+                gpu_cache_misses_total,
+                vram_used_bytes,
+                vram_capacity_bytes,
+                promotions_total,
             }),
         }
     }
@@ -225,6 +286,38 @@ impl Metrics {
         self.inner.ssd_stall_seconds.observe(seconds);
     }
 
+    /// Record one VRAM (GPU) tier cache lookup outcome. Mirrors
+    /// `record_cache` for the new top-tier in the 3-tier hierarchy.
+    pub fn record_gpu_cache(&self, hits: u64, misses: u64) {
+        if hits > 0 {
+            self.inner.gpu_cache_hits_total.inc_by(hits as f64);
+        }
+        if misses > 0 {
+            self.inner.gpu_cache_misses_total.inc_by(misses as f64);
+        }
+    }
+
+    /// Set the currently-resident VRAM bytes gauge. Called by the
+    /// `GpuExpertCache` whenever the resident set changes (insert /
+    /// promote / evict).
+    pub fn set_vram_used_bytes(&self, bytes: u64) {
+        self.inner.vram_used_bytes.set(bytes as i64);
+    }
+
+    /// Set the total VRAM byte budget gauge. Called once when the
+    /// `GpuExpertCache` is installed (constant for the lifetime of
+    /// the process); stays at `0` when the GPU cache is disabled.
+    pub fn set_vram_capacity_bytes(&self, bytes: u64) {
+        self.inner.vram_capacity_bytes.set(bytes as i64);
+    }
+
+    /// Record `n` RAM → VRAM promotions.
+    pub fn record_promotions(&self, n: u64) {
+        if n > 0 {
+            self.inner.promotions_total.inc_by(n as f64);
+        }
+    }
+
     /// Render the registry to a Prometheus text-format payload (the body
     /// of `GET /metrics`).
     pub fn render(&self) -> Result<Vec<u8>, prometheus::Error> {
@@ -250,6 +343,10 @@ mod tests {
         m.record_speculator_top1(1);
         m.record_locality(5, 2);
         m.record_ssd_stall(0.0005);
+        m.record_gpu_cache(2, 1);
+        m.set_vram_used_bytes(1_048_576);
+        m.set_vram_capacity_bytes(8_388_608);
+        m.record_promotions(3);
         let body = String::from_utf8(m.render().unwrap()).unwrap();
         for name in [
             "mer_requests_total",
@@ -264,6 +361,11 @@ mod tests {
             "mer_locality_hits_total",
             "mer_locality_misses_total",
             "mer_ssd_stall_seconds",
+            "mer_gpu_cache_hits_total",
+            "mer_gpu_cache_misses_total",
+            "mer_vram_used_bytes",
+            "mer_vram_capacity_bytes",
+            "mer_promotions_total",
         ] {
             assert!(body.contains(name), "metric {name} missing from /metrics body:\n{body}");
         }

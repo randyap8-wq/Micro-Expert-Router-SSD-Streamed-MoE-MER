@@ -712,6 +712,17 @@ struct ExpertHealth {
     block_pool_capacity: Option<usize>,
     block_pool_overflow_in_use: Option<usize>,
     tokens_generated: u64,
+    /// Phase 1 / 3-tier hierarchy: whether the VRAM (GPU) expert
+    /// cache is configured. When `false` the remaining `vram_*` and
+    /// `gpu_*` fields are still present (0) for stable schema.
+    gpu_cache_enabled: bool,
+    gpu_cache_hits: u64,
+    gpu_cache_misses: u64,
+    gpu_promotions_total: u64,
+    vram_used_bytes: u64,
+    vram_capacity_bytes: u64,
+    gpu_anchor_count: usize,
+    gpu_lru_count: usize,
 }
 
 /// Lightweight production health probe that surfaces the engine's
@@ -744,6 +755,14 @@ async fn admin_health_experts(State(state): State<AppState>) -> Response {
         block_pool_capacity: cap,
         block_pool_overflow_in_use: overflow,
         tokens_generated: report.tokens_processed,
+        gpu_cache_enabled: report.gpu_cache_enabled,
+        gpu_cache_hits: report.gpu_cache_hits,
+        gpu_cache_misses: report.gpu_cache_misses,
+        gpu_promotions_total: report.gpu_promotions,
+        vram_used_bytes: report.vram_used_bytes,
+        vram_capacity_bytes: report.vram_capacity_bytes,
+        gpu_anchor_count: report.gpu_anchor_count,
+        gpu_lru_count: report.gpu_lru_count,
     };
     // Surface degraded health via HTTP status so naive uptime probes
     // (HAProxy health checks, K8s liveness) light up without parsing
@@ -1393,6 +1412,7 @@ mod tests {
             sampling: crate::config::SamplingConfig::default(),
             predictive: crate::config::PredictiveConfig::default(),
             security: crate::config::SecurityConfig::default(),
+            gpu_cache: crate::config::GpuCacheConfig::default(),
         }
     }
 

@@ -1785,6 +1785,77 @@ pub fn run_inference(
     Ok((out, y))
 }
 
+/// GPU SwiGLU forward pass — Phase 3 compute plane.
+///
+/// When the binary is built with the `cuda` cargo feature **and**
+/// candle-core successfully acquires a CUDA device, this function
+/// performs the per-expert SwiGLU forward on the device, copies the
+/// hidden-state result back to host memory, and returns the standard
+/// `(InferenceOutput, HiddenState)` tuple — observably identical to
+/// [`run_inference`]. Without the `cuda` feature, or when the device
+/// acquisition fails at runtime, the call transparently falls back to
+/// the CPU [`run_inference`] path with a `tracing::warn!` on the
+/// first miss, so callers never have to special-case GPU absence.
+///
+/// The function deliberately matches the `run_inference_*` family's
+/// signature so the engine can dispatch into it the same way it
+/// dispatches the dtype-specific variants — no new call shape at the
+/// call site.
+pub fn run_inference_gpu(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    #[cfg(feature = "cuda")]
+    {
+        use candle_core::{Device, Tensor};
+        static CUDA_DEVICE: std::sync::OnceLock<Result<Device, String>> =
+            std::sync::OnceLock::new();
+        let dev = match CUDA_DEVICE
+            .get_or_init(|| Device::new_cuda(0).map_err(|e| e.to_string()))
+        {
+            Ok(dev) => dev,
+            Err(e) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        error = %e,
+                        "candle CUDA device acquisition failed; falling back to CPU \
+                         inference path. Subsequent failures will be silent."
+                    );
+                });
+                return run_inference(token_idx, resident, x, d_model, d_ff);
+            }
+        };
+        let weights = ExpertWeights::from_bytes(resident.data(), d_model, d_ff)?;
+        let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
+        let (gate_t, up_t, down_t) = weights.to_candle_tensors(dev).map_err(map_err)?;
+        let x_t = Tensor::from_slice(x, (d_model, 1), dev).map_err(map_err)?;
+        let g = gate_t.matmul(&x_t).map_err(map_err)?;
+        let u = up_t.matmul(&x_t).map_err(map_err)?;
+        let gated = Tensor::silu(&g).map_err(map_err)?.mul(&u).map_err(map_err)?;
+        let y_t = down_t.matmul(&gated).map_err(map_err)?;
+        let y_t = y_t.squeeze(1).map_err(map_err)?;
+        let y: HiddenState = y_t.to_vec1::<f32>().map_err(map_err)?;
+        let out = summarise_output(token_idx, resident.id, &y);
+        return Ok((out, y));
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "run_inference_gpu invoked on a binary built without the `cuda` cargo \
+                 feature; falling back to CPU `run_inference`. Rebuild with \
+                 `cargo build --release --features cuda` to enable GPU compute."
+            );
+        });
+    }
+    run_inference(token_idx, resident, x, d_model, d_ff)
+}
+
 /// f16 counterpart of [`run_inference`]: dequantises the resident bytes
 /// into an owned `Vec<f32>` (via [`OwnedExpertWeights::from_bytes_f16`])
 /// and runs the same SwiGLU forward pass. Used when the on-disk dtype

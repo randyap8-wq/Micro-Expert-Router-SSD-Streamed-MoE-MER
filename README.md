@@ -296,10 +296,12 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `io_reactor` | **Actor-pattern I/O reactor** (gist Part 5 doc fix). Wraps an `NvmeStorage` behind a single-owner tokio task that runs a **bounded serial loop**: it dequeues read requests from a bounded `mpsc` channel one at a time, `await`s the read inline, replies over the per-request `oneshot`, and only then pulls the next request — the bounded queue therefore also bounds active I/O concurrency. `IoReactorHandle` is cheaply cloneable (the sender side is reference-counted by tokio); workers issue `read_expert(id, buf)` without ever touching a shared `DashMap` shard / `RwLock` write guard. Backpressure is automatic — when the I/O substrate saturates, callers park on `mpsc::send` instead of overflowing a per-thread queue. Exposed as a standalone helper alongside the legacy `engine` path so the in-flight `DashMap<u32, Notify>` deduplicator can retire one subsystem at a time. |
 | `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
-| `config` | TOML schema for `serve --config`: `[server]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`. Validated at startup. |
+| `config` | TOML schema for `serve --config`: `[server]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`, `[gpu_cache]`. Validated at startup. |
+| `expert_cache` (3-tier extension) | Alongside the legacy RAM-resident `ExpertCache`, this module now also defines `GpuExpertCache`, the optional **VRAM tier** of a 3-tier SSD → RAM → VRAM hierarchy. It is an **Anchor Core + LRU Edge** structure: experts whose RAM-side hit count (`ExpertResident::hits`) crosses `[gpu_cache] promote_after_hits` are pinned into the Anchor Core (HashMap, capped at `vram_anchor_ratio * vram_capacity_mb`); all other promotions land in the LRU Edge (capped at the remainder). Engine wiring is hot-path additive — `Engine::generate` / `Engine::moe_step` probe the VRAM tier first, bump RAM hits on a miss, and enqueue a promotion on a background tokio task installed by `Engine::install_gpu_cache`. On CPU-only builds the VRAM bytes are emulated host-side; with `--features cuda`, `inference::run_inference_gpu` dispatches the SwiGLU matmul through `candle-core`'s CUDA backend (falls back to the existing CPU kernel if the device is unavailable). |
+| `tui` (with `--features tui`) | Native terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`mer-cli monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS), a 3-tier cache hit grid (SSD / RAM / VRAM), a VRAM utilisation gauge, and an I/O reactor sparkline. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
 | `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`) wrapped in `InferenceError::RemoteShardFetchFailed`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports (gRPC, RDMA, …) plug in by implementing the trait. |
-| `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-predictor`, and `serve` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2,...` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
+| `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-predictor`, `serve`, and (with `--features tui`, on by default) `monitor` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2,...` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
 
 ### Key design decisions
 
@@ -641,7 +643,8 @@ Endpoints:
 | method   | path                       | purpose                                            |
 | -------- | -------------------------- | -------------------------------------------------- |
 | `GET`    | `/health`                  | liveness probe (`{"status":"ok",...}`)             |
-| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and, when the predictive arms are enabled, `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, `mer_speculator_accuracy_total`, and the `mer_ssd_stall_seconds` histogram |
+| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and, when the predictive arms are enabled, `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, `mer_speculator_accuracy_total`, and the `mer_ssd_stall_seconds` histogram. When `[gpu_cache] enabled = true`, also exports `mer_vram_used_bytes`, `mer_vram_capacity_bytes`, `mer_gpu_cache_hits_total`, `mer_gpu_cache_misses_total`, and `mer_promotions_total` |
+| `GET`    | `/v1/admin/health/experts` | JSON snapshot of the 3-tier hierarchy: per-tier hit/miss counters (SSD, RAM, VRAM), VRAM used / capacity bytes, total RAM→VRAM promotions, and engine status fields. Consumed by `mer-cli monitor`. |
 | `POST`   | `/v1/completions`          | OpenAI text-completion shape (`prompt`, `max_tokens`, ...) |
 | `POST`   | `/v1/chat/completions`     | OpenAI chat-completion shape (`messages`, ...)       |
 | `DELETE` | `/v1/sessions/{id}`        | explicitly drop a saved KV-cache session (see [Session API](#session-api)) |
@@ -1995,6 +1998,10 @@ counters / a histogram on `/metrics`:
 | `mer_locality_hits_total` | Routed experts that were already in the locality monitor's hot set at routing time (would-be cache miss avoided by pinning). |
 | `mer_locality_misses_total` | Routed experts that were not. |
 | `mer_ssd_stall_seconds` | Histogram of cumulative SSD critical-path stall time per token, the wall-clock window the engine spent blocked waiting for cache-miss reads to land. The headline number the L / M arms aim to drive down. |
+| `mer_vram_used_bytes` | Bytes currently resident in the optional GPU/VRAM tier of the 3-tier hierarchy (`[gpu_cache] enabled = true`). Updated by the background promotion task installed via `Engine::install_gpu_cache`. |
+| `mer_vram_capacity_bytes` | VRAM budget the `GpuExpertCache` was sized with (`[gpu_cache] vram_capacity_mb * 1 MiB`). Constant for the lifetime of the process. |
+| `mer_gpu_cache_hits_total` / `mer_gpu_cache_misses_total` | Counters incremented on every probe of the VRAM tier during routing. A non-zero hit count is the proof point that hot experts have actually been promoted off RAM. |
+| `mer_promotions_total` | Total number of RAM → VRAM promotions completed by the background promotion task since startup. |
 
 The CLI run summary (`print_summary`) appends an extra line when
 either arm is enabled, e.g.:
@@ -2047,6 +2054,63 @@ you can verify the energy-saving paths actually engaged.
 
 ---
 
+## 3-tier heterogeneous memory cache (SSD → RAM → VRAM)
+
+The legacy 2-tier `SSD → RAM` substrate is bit-for-bit unchanged when
+`[gpu_cache] enabled = false` (the default). With `enabled = true`,
+the engine layers an Anchor + LRU-Edge **VRAM tier** on top of it:
+
+```
+   ┌──────────┐         ┌──────────────┐          ┌──────────────────────┐
+   │   SSD    │ ──read─▶│  ExpertCache │ ─promote▶│   GpuExpertCache     │
+   │ (NVMe)   │  pread  │   (RAM, LRU) │  hot     │ Anchor Core + LRU Edge│
+   └──────────┘         └──────────────┘          └──────────────────────┘
+```
+
+* **RAM hits are still authoritative.** On a VRAM hit we still resolve
+  from RAM; VRAM only **shadows** the bytes, so the inference contract
+  is identical to the 2-tier path. CPU-only builds emulate VRAM host-
+  side with a `Vec<u8>`; `--features cuda` swaps in `candle-core`'s
+  CUDA backend via [`run_inference_gpu`](rust-engine/src/inference.rs).
+* **Anchor Core.** A HashMap pinning the experts whose RAM hit count
+  has crossed `[gpu_cache] promote_after_hits`. Sized to
+  `vram_anchor_ratio * vram_capacity_mb`.
+* **LRU Edge.** Tracks topical experts that haven't pinned yet, evicted
+  by an `lru::LruCache` driven by the remaining VRAM budget.
+* **Async promotion.** `Engine::install_gpu_cache` spawns a background
+  tokio task that drains an unbounded `mpsc` of promotion intents off
+  the hot path, copies the RAM bytes into the VRAM tier, and bumps
+  `mer_vram_used_bytes` + `mer_promotions_total`.
+* **Configured via [`[gpu_cache]`](config.toml)** — see the annotated
+  TOML for every field.
+* **Observability.** Four new Prometheus metrics (`mer_vram_used_bytes`,
+  `mer_vram_capacity_bytes`, `mer_gpu_cache_hits_total` /
+  `_misses_total`, `mer_promotions_total`) and the extended
+  `/v1/admin/health/experts` JSON. The latter is what the
+  [`monitor` subcommand](#monitor-subcommand) consumes.
+
+### `monitor` subcommand
+
+A native terminal dashboard ships with the engine under `--features tui`
+(on by default). Start the server, then in another shell:
+
+```bash
+mer-cli monitor --url http://127.0.0.1:8080 --refresh-ms 250
+```
+
+It polls `/v1/admin/health/experts` on the refresh interval and renders:
+
+* a header with status / uptime / TPS,
+* a 3-tier cache hit grid (SSD / RAM / VRAM),
+* a VRAM utilisation gauge driven by the new metrics, and
+* an I/O reactor sparkline.
+
+Built with `ratatui` + `crossterm`. Disable with
+`cargo build --release --no-default-features` if you want a TUI-free
+binary.
+
+---
+
 ## Limitations / next steps
 
 The streaming GGUF reader, the Unified Tensor Header (U.T.H.) format,
@@ -2057,15 +2121,17 @@ section above for the user-facing details. The genuinely open items
 are:
 
 - **GPU / alternative math backend.** The per-expert SwiGLU FFN runs
-  through **`candle-core`** (CPU-only build, no `candle-nn`, no GPU
-  backends). Enabling a GPU backend (Candle's `cuda` / `metal`
-  features, or swapping for `tch` / `cudarc`) is a localised change
-  inside `inference.rs` — or, for swappable executors without
-  touching `inference.rs`, an additional `Backend` implementation
-  registered via `backend::set_backend`. See
-  [Decoupled math backend](#decoupled-math-backend). Validating this
-  requires GPU hardware, so it is left to contributors with the
-  appropriate target.
+  through **`candle-core`**. The default build is CPU-only (no
+  `candle-nn`, no GPU backends); building with `--features cuda`
+  unlocks `inference::run_inference_gpu`, which dispatches the
+  matmul through `candle-core::Device::new_cuda(0)` and falls back
+  to the existing CPU kernel if the device is unavailable. For
+  swappable executors without touching `inference.rs`, an additional
+  `Backend` implementation registered via `backend::set_backend` is
+  the alternative path — see
+  [Decoupled math backend](#decoupled-math-backend). Validating the
+  CUDA path requires GPU hardware, so it is left to contributors
+  with the appropriate target.
 - **AMX tile intrinsics.** `--features amx` compiles in the Intel
   AMX tile skeleton in `src/kernels/`, but currently routes back to
   the scalar path on stable Rust until the tile intrinsics

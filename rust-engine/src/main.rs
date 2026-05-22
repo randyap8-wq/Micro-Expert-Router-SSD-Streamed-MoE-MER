@@ -37,6 +37,8 @@ mod session;
 mod tensor_header;
 mod tokenizer;
 mod transformer;
+#[cfg(feature = "tui")]
+mod tui;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -334,6 +336,24 @@ enum Cmd {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Native terminal dashboard — Phase 4 of the three-tier memory
+    /// hierarchy. Polls a running `serve` instance and renders a live
+    /// ratatui view of the SSD → RAM → VRAM hit grid, current cache
+    /// state, VRAM utilisation, and I/O reactor activity. Pure
+    /// observability; the dashboard does not mutate engine state.
+    ///
+    /// Requires the binary to be built with the `tui` cargo feature
+    /// (on by default). With `--no-default-features` this subcommand
+    /// exits with a helpful error message.
+    Monitor {
+        /// Base URL of the `serve` HTTP endpoint to poll. Defaults to
+        /// `http://127.0.0.1:8080` to match the example config.
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+        /// How often to refresh the dashboard, in milliseconds.
+        #[arg(long, default_value_t = 500)]
+        refresh_ms: u64,
+    },
 }
 
 fn init_logging(filter: &str) {
@@ -496,6 +516,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             rt.block_on(cmd_validate_predictor(&trace, &cache_slots))
+        }
+        Cmd::Monitor { url, refresh_ms } => {
+            #[cfg(feature = "tui")]
+            {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(crate::tui::run_monitor(&url, refresh_ms))
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                let _ = (url, refresh_ms);
+                Err("monitor subcommand requires the `tui` cargo feature; \
+                     rebuild without `--no-default-features` to enable it"
+                    .into())
+            }
         }
     }
 }
@@ -753,6 +789,34 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             0xC0FFEE,
         ));
         engine_builder = engine_builder.with_speculator(spec, top_k);
+    }
+    // Phase 2: optional VRAM (GPU) expert cache (3-tier hierarchy
+    // SSD → RAM → VRAM). When `[gpu_cache].enabled = false` (default)
+    // the engine retains its historical 2-tier posture.
+    if cfg.gpu_cache.enabled {
+        // `gpu_cache.dtype` is currently advisory — it is validated by
+        // `AppConfig::validate` (so typos fail fast) and surfaced here
+        // for observability, but the promotion path copies on-disk
+        // bytes into VRAM without conversion or repacking. Parse it
+        // here purely so the startup log records the operator's
+        // declared intent.
+        let dtype_for_logging =
+            crate::inference::WeightDtype::from_str_opt(&cfg.gpu_cache.dtype)
+                .unwrap_or(crate::inference::WeightDtype::F16);
+        let capacity_bytes = (cfg.gpu_cache.vram_capacity_mb as usize) * 1024 * 1024;
+        let gpu = std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(
+            capacity_bytes,
+            cfg.gpu_cache.vram_anchor_ratio,
+            cfg.gpu_cache.promote_after_hits,
+        ));
+        info!(
+            vram_capacity_mb = cfg.gpu_cache.vram_capacity_mb,
+            anchor_ratio = cfg.gpu_cache.vram_anchor_ratio,
+            promote_after_hits = cfg.gpu_cache.promote_after_hits,
+            dtype_advisory = %dtype_for_logging.as_str(),
+            "VRAM (GPU) expert cache enabled — 3-tier SSD→RAM→VRAM hierarchy active (dtype is advisory; bytes copied as-is)"
+        );
+        engine_builder.install_gpu_cache(gpu);
     }
     let engine = Arc::new(engine_builder);
 

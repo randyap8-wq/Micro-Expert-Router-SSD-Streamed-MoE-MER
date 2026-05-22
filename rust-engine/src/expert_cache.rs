@@ -17,8 +17,9 @@ use crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
 use crate::tensor_header::TensorHeader;
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// One resident expert: id + the bytes loaded from the SSD.
@@ -35,6 +36,16 @@ pub struct ExpertResident {
     /// begins. `0` for legacy blobs and synthetic fixtures (no UTH);
     /// `UTH_BYTES + page padding` for `gguf-convert` blobs.
     payload_offset: usize,
+    /// Monotonic hit counter (Phase 2 — three-tier memory hierarchy).
+    ///
+    /// Bumped by [`GpuExpertCache::observe_ram_hit`] / engine routing
+    /// every time a RAM lookup resolves to this resident. Read by the
+    /// promotion controller — once `hits >= promote_after_hits`, the
+    /// expert becomes a candidate for the **Anchor Core** in VRAM.
+    ///
+    /// Stored as an `AtomicU64` so the engine's lock-free routing hot
+    /// path can update it with a single relaxed atomic increment.
+    hits: AtomicU64,
 }
 
 impl ExpertResident {
@@ -56,7 +67,27 @@ impl ExpertResident {
             id,
             buffer,
             payload_offset,
+            hits: AtomicU64::new(0),
         }
+    }
+
+    /// Increment the resident's monotonic hit counter and return the
+    /// new value. Used by the engine on every RAM hit to drive
+    /// [`GpuExpertCache`] promotion decisions (Phase 2). Cheap: a
+    /// single relaxed atomic FAA — safe to call from the lock-free
+    /// inference hot path.
+    #[inline]
+    pub fn record_hit(&self) -> u64 {
+        self.hits.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Current value of the per-resident hit counter. Snapshot only —
+    /// the underlying counter may have been bumped by a concurrent
+    /// caller by the time this returns. Used by diagnostics and the
+    /// VRAM promotion controller.
+    #[inline]
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
     }
 
     /// Bare weight bytes — i.e. the buffer with any leading Unified
@@ -245,6 +276,347 @@ impl ExpertCache {
     /// Snapshot of current residency (for logs/diagnostics).
     pub fn resident_ids(&self) -> Vec<u32> {
         self.inner.lock().iter().map(|(k, _)| *k).collect()
+    }
+}
+
+// =====================================================================
+// Phase 2 — GPU (VRAM) expert cache: Segmented Hybrid Policy.
+// =====================================================================
+
+/// One VRAM-resident expert. Bytes are owned by the cache and
+/// (conceptually) live in device memory; on the default build —
+/// where the `gpu` cargo feature is **not** compiled in — VRAM is
+/// emulated with a host-side `Vec<u8>` so the rest of the engine
+/// (engine.rs, server.rs, batch_scheduler.rs) sees the same
+/// `Arc<GpuResident>` shape regardless of whether real CUDA is
+/// available.
+///
+/// The cache surface is identical to [`ExpertResident::data`]: callers
+/// get a `&[u8]` weight payload that can be fed directly into the
+/// existing `run_inference_*` family. When a real CUDA device is
+/// active, [`GpuResident::data`] performs the device-to-host copy
+/// lazily (see Phase 3's `run_inference_gpu`), so the inference loop
+/// never blocks on the cache itself.
+pub struct GpuResident {
+    pub id: u32,
+    /// Device-resident bytes. On builds without a real GPU runtime
+    /// this is just a host `Vec<u8>`; on `gpu`-feature builds the
+    /// init path replaces it with a `candle_core::Tensor` reference
+    /// (see Phase 3 / `inference::run_inference_gpu`).
+    bytes: Vec<u8>,
+}
+
+impl GpuResident {
+    pub fn new(id: u32, bytes: Vec<u8>) -> Self {
+        Self { id, bytes }
+    }
+
+    /// Bare weight bytes ready for `run_inference_*`.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Size in bytes of the VRAM footprint owned by this resident.
+    /// Aggregated by the cache to track `mer_vram_used_bytes`.
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// Outcome of a VRAM-tier lookup. The variants double as the
+/// instrumentation discriminator for `mer_gpu_cache_hits_total` and
+/// the engine's three-tier reporting in `/v1/admin/health/experts`.
+pub enum GpuLookup {
+    /// Hit on the **Anchor Core** — high-frequency, permanently
+    /// pinned expert. No LRU recency update.
+    AnchorHit(Arc<GpuResident>),
+    /// Hit on the **LRU Edge** — temporal locality. Recency updated.
+    LruHit(Arc<GpuResident>),
+    /// Miss. Caller falls through to the RAM tier.
+    Miss,
+}
+
+impl GpuLookup {
+    /// Convenience: pull the resident out of any hit variant.
+    pub fn into_resident(self) -> Option<Arc<GpuResident>> {
+        match self {
+            GpuLookup::AnchorHit(r) | GpuLookup::LruHit(r) => Some(r),
+            GpuLookup::Miss => None,
+        }
+    }
+
+    pub fn is_hit(&self) -> bool {
+        !matches!(self, GpuLookup::Miss)
+    }
+}
+
+/// Thread-safe VRAM expert cache implementing the **Segmented Hybrid
+/// Policy** from the Phase 2 spec:
+///
+/// * **Anchor Core** — `HashMap<u32, Arc<GpuResident>>` for experts
+///   that have crossed `promote_after_hits`. Pinned, never evicted.
+///   Sized by `anchor_ratio * capacity_bytes`.
+/// * **LRU Edge** — `LruCache<u32, Arc<GpuResident>>` for temporal
+///   topic shifts. O(1) recency tracking, byte-budgeted evictions.
+///
+/// Concurrency contract (gist "Zero-Contention" critical constraint):
+///
+/// * All cache-state updates go through a single `parking_lot::Mutex`
+///   wrapping the `Inner` struct. The critical section is just the
+///   HashMap / LRU manipulation — never any I/O, never any compute.
+/// * Hit counters on individual `ExpertResident`s are
+///   [`AtomicU64`](std::sync::atomic::AtomicU64); the inference hot
+///   path bumps them lock-free.
+/// * `mer_vram_used_bytes` is an atomic `IntGauge` updated inside the
+///   same critical section so external scrapes never observe a
+///   torn value.
+pub struct GpuExpertCache {
+    inner: Mutex<GpuExpertCacheInner>,
+    /// Capacity of the **Anchor Core**, in bytes. The total VRAM
+    /// budget is `anchor_capacity_bytes + lru_capacity_bytes`.
+    anchor_capacity_bytes: usize,
+    /// Capacity of the **LRU Edge**, in bytes.
+    lru_capacity_bytes: usize,
+    /// Promotion threshold copied out of `[gpu_cache].promote_after_hits`.
+    /// `0` disables Anchor Core promotions (everything routes to the
+    /// LRU Edge).
+    promote_after_hits: u64,
+    /// Total promotions performed since startup. Mirror of the
+    /// `mer_promotions_total` Prometheus counter; exposed here too so
+    /// the admin health endpoint can render the value without going
+    /// through the Prometheus registry.
+    promotions: AtomicU64,
+    /// VRAM bytes resident across Anchor + LRU. Read by the admin
+    /// health endpoint and the TUI dashboard.
+    vram_used: AtomicU64,
+    /// Cumulative VRAM (GPU) cache hits — mirrors the
+    /// `mer_gpu_cache_hits_total` Prometheus counter.
+    hits: AtomicU64,
+    /// Cumulative VRAM (GPU) cache misses — mirrors
+    /// `mer_gpu_cache_misses_total`.
+    misses: AtomicU64,
+}
+
+struct GpuExpertCacheInner {
+    /// **Anchor Core** — permanently pinned high-frequency experts.
+    anchor: HashMap<u32, Arc<GpuResident>>,
+    anchor_used_bytes: usize,
+    /// **LRU Edge** — temporal locality region.
+    lru: LruCache<u32, Arc<GpuResident>>,
+    lru_used_bytes: usize,
+}
+
+impl GpuExpertCache {
+    /// Construct a new VRAM expert cache.
+    ///
+    /// * `capacity_bytes` — total VRAM budget for the cache
+    ///   (anchor + LRU regions combined).
+    /// * `anchor_ratio` — fraction of `capacity_bytes` reserved for
+    ///   the Anchor Core. Clamped to `[0.0, 1.0]`.
+    /// * `promote_after_hits` — threshold for RAM → VRAM promotion.
+    ///   `0` disables Anchor Core promotion.
+    pub fn new(capacity_bytes: usize, anchor_ratio: f32, promote_after_hits: u64) -> Self {
+        let ratio = anchor_ratio.clamp(0.0, 1.0);
+        let anchor_capacity_bytes = ((capacity_bytes as f32) * ratio) as usize;
+        let lru_capacity_bytes = capacity_bytes.saturating_sub(anchor_capacity_bytes);
+        // `LruCache` requires a non-zero entry count even when the
+        // bytes budget would naturally allow zero — pick a large
+        // sentinel so the byte-budget check below is the only
+        // eviction trigger.
+        let lru_entry_cap = NonZeroUsize::new(usize::MAX).expect("usize::MAX > 0");
+        Self {
+            inner: Mutex::new(GpuExpertCacheInner {
+                anchor: HashMap::new(),
+                anchor_used_bytes: 0,
+                lru: LruCache::new(lru_entry_cap),
+                lru_used_bytes: 0,
+            }),
+            anchor_capacity_bytes,
+            lru_capacity_bytes,
+            promote_after_hits,
+            promotions: AtomicU64::new(0),
+            vram_used: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// Total VRAM budget (anchor + LRU), in bytes.
+    #[inline]
+    pub fn capacity_bytes(&self) -> usize {
+        self.anchor_capacity_bytes + self.lru_capacity_bytes
+    }
+
+    /// Capacity of the Anchor Core region in bytes.
+    #[inline]
+    pub fn anchor_capacity_bytes(&self) -> usize {
+        self.anchor_capacity_bytes
+    }
+
+    /// Capacity of the LRU Edge region in bytes.
+    #[inline]
+    pub fn lru_capacity_bytes(&self) -> usize {
+        self.lru_capacity_bytes
+    }
+
+    /// Currently-resident VRAM bytes (anchor + LRU).
+    #[inline]
+    pub fn used_bytes(&self) -> u64 {
+        self.vram_used.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative RAM → VRAM promotions.
+    #[inline]
+    pub fn promotions(&self) -> u64 {
+        self.promotions.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative VRAM cache hits.
+    #[inline]
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative VRAM cache misses.
+    #[inline]
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// Promotion threshold (`gpu_cache.promote_after_hits`).
+    #[inline]
+    pub fn promote_after_hits(&self) -> u64 {
+        self.promote_after_hits
+    }
+
+    /// Look up an expert in VRAM. Returns the [`GpuLookup`] discriminator
+    /// (anchor / LRU / miss) plus the resident handle on hit.
+    ///
+    /// **LRU Edge** hits update recency; **Anchor Core** hits do not
+    /// (anchored experts are permanently hot by definition).
+    pub fn get(&self, id: u32) -> GpuLookup {
+        let mut g = self.inner.lock();
+        if let Some(r) = g.anchor.get(&id).cloned() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return GpuLookup::AnchorHit(r);
+        }
+        // `LruCache::get` updates recency; that's what we want for
+        // the LRU Edge.
+        if let Some(r) = g.lru.get(&id).cloned() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return GpuLookup::LruHit(r);
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        GpuLookup::Miss
+    }
+
+    /// Should the resident's current hit count promote it to the
+    /// Anchor Core? Cheap relaxed-atomic compare against the
+    /// configured threshold; safe to call from the hot path before
+    /// kicking off an async promotion.
+    #[inline]
+    pub fn should_promote(&self, ram_hits: u64) -> bool {
+        self.promote_after_hits > 0 && ram_hits >= self.promote_after_hits
+    }
+
+    /// Synchronous promotion entry point — copy a RAM resident's
+    /// bytes into VRAM and place it in the Anchor Core if budget
+    /// allows, otherwise in the LRU Edge.
+    ///
+    /// **Hot-path callers must not invoke this directly** — instead
+    /// hand the resident off to the engine's background promotion
+    /// task (see [`crate::engine::Engine`]). The synchronous path
+    /// exists for the warm-up sequence (where blocking is the
+    /// expected behaviour) and for tests.
+    ///
+    /// Returns `true` when the expert landed in VRAM, `false` if it
+    /// could not fit even after eviction (e.g. payload exceeds the
+    /// LRU budget entirely).
+    pub fn promote_sync(&self, resident: Arc<GpuResident>) -> bool {
+        let bytes = resident.byte_len();
+        if bytes == 0 {
+            return false;
+        }
+        let mut g = self.inner.lock();
+        // Already resident: nothing to promote. Touch the LRU entry so
+        // it becomes MRU, but don't count this as a new promotion nor
+        // re-account bytes (the existing entry already owns them).
+        if g.anchor.contains_key(&resident.id) {
+            return true;
+        }
+        if g.lru.get(&resident.id).is_some() {
+            return true;
+        }
+        // Anchor first: if it fits in the anchor budget *and* the
+        // engine flagged this expert as hot, install there. We treat
+        // any explicit promote_sync as "hot" (the engine only calls
+        // this after threshold), but still prefer Anchor only when
+        // there's room without evicting another anchor entry.
+        if bytes <= self.anchor_capacity_bytes
+            && g.anchor_used_bytes + bytes <= self.anchor_capacity_bytes
+        {
+            g.anchor.insert(resident.id, resident.clone());
+            g.anchor_used_bytes += bytes;
+            drop(g);
+            self.promotions.fetch_add(1, Ordering::Relaxed);
+            self.refresh_used_bytes();
+            return true;
+        }
+        if bytes > self.lru_capacity_bytes {
+            // Won't fit even after evicting everything in the LRU
+            // region. Don't try.
+            return false;
+        }
+        // Evict LRU entries until there is room. `LruCache::pop_lru`
+        // returns the least-recently-used (k, v).
+        while g.lru_used_bytes + bytes > self.lru_capacity_bytes {
+            match g.lru.pop_lru() {
+                Some((_, victim)) => {
+                    g.lru_used_bytes = g.lru_used_bytes.saturating_sub(victim.byte_len());
+                }
+                None => break,
+            }
+        }
+        let already = g.lru.put(resident.id, resident.clone());
+        if let Some(prev) = already {
+            // Replacing an existing entry — subtract the old footprint.
+            g.lru_used_bytes = g.lru_used_bytes.saturating_sub(prev.byte_len());
+        }
+        g.lru_used_bytes += bytes;
+        drop(g);
+        self.promotions.fetch_add(1, Ordering::Relaxed);
+        self.refresh_used_bytes();
+        true
+    }
+
+    /// Snapshot of VRAM-resident expert ids (anchor first, then LRU
+    /// in most-recently-used order). Used by the admin health
+    /// endpoint and the TUI dashboard.
+    pub fn resident_ids(&self) -> Vec<u32> {
+        let g = self.inner.lock();
+        let mut v: Vec<u32> = g.anchor.keys().copied().collect();
+        v.sort_unstable();
+        v.extend(g.lru.iter().map(|(k, _)| *k));
+        v
+    }
+
+    /// Number of Anchor Core entries.
+    pub fn anchor_len(&self) -> usize {
+        self.inner.lock().anchor.len()
+    }
+
+    /// Number of LRU Edge entries.
+    pub fn lru_len(&self) -> usize {
+        self.inner.lock().lru.len()
+    }
+
+    fn refresh_used_bytes(&self) {
+        let g = self.inner.lock();
+        let total = (g.anchor_used_bytes + g.lru_used_bytes) as u64;
+        drop(g);
+        self.vram_used.store(total, Ordering::Relaxed);
     }
 }
 

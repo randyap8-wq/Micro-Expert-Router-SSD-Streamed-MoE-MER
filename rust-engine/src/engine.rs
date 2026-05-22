@@ -15,7 +15,7 @@
 
 use crate::aligned_buffer::AlignedBuffer;
 use crate::buffer_pool::BufferPool;
-use crate::expert_cache::{ExpertCache, ExpertResident};
+use crate::expert_cache::{ExpertCache, ExpertResident, GpuExpertCache, GpuResident};
 use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::gating::Router;
 use crate::inference::{
@@ -856,6 +856,20 @@ pub(crate) struct EngineCore {
     pub(super) predictor: Arc<PredictiveLoader>,
     pub(super) shape: ModelShape,
     pub(super) options: EngineOptions,
+    /// Optional VRAM (GPU) expert cache — Phase 2 of the three-tier
+    /// memory hierarchy (SSD → RAM → VRAM). `None` (default) leaves
+    /// the engine in its legacy 2-tier posture. When `Some`, every
+    /// cache lookup in [`Engine::generate`] / [`Engine::moe_step`]
+    /// first probes the VRAM tier; misses fall through to the RAM
+    /// `MultiLayerExpertCache` and then to NVMe.
+    pub(super) gpu_cache: Option<Arc<GpuExpertCache>>,
+    /// One-shot sender that feeds the background RAM → VRAM
+    /// promotion task. The receiver lives on a dedicated Tokio task
+    /// spawned by [`Engine::install_gpu_cache`]; the inference hot
+    /// path never blocks on this channel — promotions are pure
+    /// fire-and-forget.
+    pub(super) gpu_promotion_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<(u32, Arc<ExpertResident>)>>,
 }
 
 /// Predictive-routing state: aliasing & frequency-based pinning,
@@ -983,7 +997,7 @@ impl EngineCore {
         shape: ModelShape,
         options: EngineOptions,
     ) -> Self {
-        Self { cache, pool, storage, router, predictor, shape, options }
+        Self { cache, pool, storage, router, predictor, shape, options, gpu_cache: None, gpu_promotion_tx: None }
     }
 }
 
@@ -1174,6 +1188,54 @@ impl Engine {
     pub fn with_kv_cache(mut self, cache: AlignedKvCache) -> Self {
         self.kv_cache = Some(Arc::new(Mutex::new(cache)));
         self
+    }
+
+    /// Attach a VRAM (GPU) expert cache — Phase 2 three-tier hierarchy.
+    ///
+    /// Spawns a background Tokio task that drains an MPSC channel of
+    /// `(expert_id, ram_resident)` promotion requests fed by the
+    /// inference hot path. The hot path itself never blocks on the
+    /// promotion — it `send`s and moves on — so installing this cache
+    /// has no impact on per-token latency. When the channel is
+    /// disconnected (engine drop) the background task exits.
+    ///
+    /// Updates the `mer_vram_used_bytes` Prometheus gauge after every
+    /// successful promotion.
+    pub fn install_gpu_cache(&mut self, gpu: Arc<GpuExpertCache>) {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
+        let gpu_for_task = gpu.clone();
+        let prom_for_task = self.metrics.prom.clone();
+        // Capacity is constant for the lifetime of the cache; publish
+        // it once so `mer_vram_capacity_bytes` is available on the
+        // very first `/metrics` scrape (dashboards compute
+        // utilisation as `mer_vram_used_bytes / mer_vram_capacity_bytes`).
+        if let Some(p) = prom_for_task.as_ref() {
+            p.set_vram_capacity_bytes(gpu.capacity_bytes() as u64);
+        }
+        tokio::spawn(async move {
+            while let Some((id, resident)) = rx.recv().await {
+                // `promote_sync` copies the resident bytes into the
+                // anchor/LRU edge under the parking_lot mutex; safe to
+                // call from a Tokio worker because it never .awaits.
+                let bytes = resident.data().to_vec();
+                let gpu_res = Arc::new(GpuResident::new(id, bytes));
+                let promoted = gpu_for_task.promote_sync(gpu_res);
+                if promoted {
+                    if let Some(p) = prom_for_task.as_ref() {
+                        p.record_promotions(1);
+                        p.set_vram_used_bytes(gpu_for_task.used_bytes() as u64);
+                    }
+                }
+            }
+        });
+        self.core.gpu_cache = Some(gpu);
+        self.core.gpu_promotion_tx = Some(tx);
+    }
+
+    /// Borrow the engine's VRAM (GPU) expert cache, if any.
+    pub fn gpu_cache(&self) -> Option<Arc<GpuExpertCache>> {
+        self.core.gpu_cache.clone()
     }
 
     /// Borrow the engine's KV cache, if any. Callers acquire the
@@ -1388,12 +1450,44 @@ impl Engine {
         let mut cache_hits_per_expert: Vec<bool> = vec![false; target.len()];
         let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
             Vec::new();
+        // VRAM (GPU) tier — aggregate hits/misses across this routing
+        // decision and record once, rather than incrementing Prometheus
+        // counters per activation on the hot path.
+        let mut gpu_hits_acc: u64 = 0;
+        let mut gpu_misses_acc: u64 = 0;
         for (i, &id) in target.iter().enumerate() {
+            // VRAM (GPU) tier — Phase 2 three-tier hierarchy. The cache
+            // shadows RAM; on hit we still resolve the authoritative
+            // `ExpertResident` from RAM below, but the counter reflects
+            // the promotion-policy decision.
+            if let Some(gpu) = self.core.gpu_cache.as_ref() {
+                let lookup = gpu.get(id);
+                if lookup.is_hit() {
+                    gpu_hits_acc += 1;
+                } else {
+                    gpu_misses_acc += 1;
+                }
+            }
             if let Some(r) = self.core.cache.get(id) {
                 self.metrics.counters.hits.fetch_add(1, Ordering::Relaxed);
                 stats.hits += 1;
                 debug!(expert = id, "cache hit");
                 cache_hits_per_expert[i] = true;
+                // RAM hit: bump the per-expert hit counter and, if we
+                // have a VRAM tier configured, enqueue a fire-and-forget
+                // promotion only on the threshold crossing, and only if
+                // the expert is not already resident in the GPU cache.
+                let new_hits = r.record_hit();
+                if let (Some(gpu), Some(tx)) = (
+                    self.core.gpu_cache.as_ref(),
+                    self.core.gpu_promotion_tx.as_ref(),
+                ) {
+                    let crossed_promote_threshold = gpu.should_promote(new_hits)
+                        && !gpu.should_promote(new_hits.saturating_sub(1));
+                    if crossed_promote_threshold && !gpu.get(id).is_hit() {
+                        let _ = tx.send((id, r.clone()));
+                    }
+                }
                 residents[i] = Some(r);
             } else {
                 self.metrics.counters.misses.fetch_add(1, Ordering::Relaxed);
@@ -1404,6 +1498,12 @@ impl Engine {
                     i,
                     tokio::spawn(async move { me.fetch(id).await }),
                 ));
+            }
+        }
+        // Aggregate VRAM-tier outcome for this routing decision.
+        if let Some(p) = self.metrics.prom.as_ref() {
+            if gpu_hits_acc > 0 || gpu_misses_acc > 0 {
+                p.record_gpu_cache(gpu_hits_acc, gpu_misses_acc);
             }
         }
         // Emit a trace record after we know which experts were chosen
@@ -2206,9 +2306,31 @@ impl Engine {
             tokio::task::JoinHandle<Result<Arc<ExpertResident>, ExpertReadError>>,
         )> = Vec::new();
         let mut cache_hits_per_expert: Vec<bool> = Vec::with_capacity(target.len());
+        // VRAM (GPU) tier — aggregate hits/misses across this routing
+        // decision and record once, rather than incrementing Prometheus
+        // counters per activation on the hot path.
+        let mut gpu_hits_acc: u64 = 0;
+        let mut gpu_misses_acc: u64 = 0;
         for (i, &id) in target.iter().enumerate() {
+            if let Some(gpu) = self.core.gpu_cache.as_ref() {
+                let lookup = gpu.get(id);
+                if lookup.is_hit() {
+                    gpu_hits_acc += 1;
+                } else {
+                    gpu_misses_acc += 1;
+                }
+            }
             if let Some(r) = self.core.cache.get(id) {
                 self.metrics.counters.hits.fetch_add(1, Ordering::Relaxed);
+                let new_hits = r.record_hit();
+                if let (Some(gpu), Some(tx)) = (
+                    self.core.gpu_cache.as_ref(),
+                    self.core.gpu_promotion_tx.as_ref(),
+                ) {
+                    if gpu.should_promote(new_hits) {
+                        let _ = tx.send((id, r.clone()));
+                    }
+                }
                 residents[i] = Some(r);
                 cache_hits_per_expert.push(true);
             } else {
@@ -2219,6 +2341,12 @@ impl Engine {
                     tokio::spawn(async move { me.fetch_with_retry(id).await }),
                 ));
                 cache_hits_per_expert.push(false);
+            }
+        }
+        // Aggregate VRAM-tier outcome for this routing decision.
+        if let Some(p) = self.metrics.prom.as_ref() {
+            if gpu_hits_acc > 0 || gpu_misses_acc > 0 {
+                p.record_gpu_cache(gpu_hits_acc, gpu_misses_acc);
             }
         }
         // Emit one routing-trace record per `moe_step` call — same
@@ -2477,6 +2605,49 @@ impl Engine {
                 .counters
                 .prefetch_dropped_concurrency
                 .load(Ordering::Relaxed),
+            gpu_cache_enabled: self.core.gpu_cache.is_some(),
+            vram_used_bytes: self
+                .core
+                .gpu_cache
+                .as_ref()
+                .map(|g| g.used_bytes() as u64)
+                .unwrap_or(0),
+            vram_capacity_bytes: self
+                .core
+                .gpu_cache
+                .as_ref()
+                .map(|g| g.capacity_bytes() as u64)
+                .unwrap_or(0),
+            gpu_promotions: self
+                .core
+                .gpu_cache
+                .as_ref()
+                .map(|g| g.promotions())
+                .unwrap_or(0),
+            gpu_cache_hits: self
+                .core
+                .gpu_cache
+                .as_ref()
+                .map(|g| g.hits())
+                .unwrap_or(0),
+            gpu_cache_misses: self
+                .core
+                .gpu_cache
+                .as_ref()
+                .map(|g| g.misses())
+                .unwrap_or(0),
+            gpu_anchor_count: self
+                .core
+                .gpu_cache
+                .as_ref()
+                .map(|g| g.anchor_len())
+                .unwrap_or(0),
+            gpu_lru_count: self
+                .core
+                .gpu_cache
+                .as_ref()
+                .map(|g| g.lru_len())
+                .unwrap_or(0),
         }
     }
 
@@ -2633,6 +2804,28 @@ pub struct EngineReport {
     /// Speculative prefetches dropped because
     /// `EngineOptions::max_concurrent_prefetches` was already saturated.
     pub prefetch_dropped_concurrency: u64,
+    /// Phase 2 / 3-tier hierarchy: whether the engine has a VRAM (GPU)
+    /// expert cache attached. `false` keeps the historical 2-tier
+    /// behaviour bit-for-bit; `true` adds the SSD → RAM → VRAM tier.
+    pub gpu_cache_enabled: bool,
+    /// Bytes currently resident in the VRAM tier (sum of anchor + LRU).
+    /// `0` when no VRAM cache is attached.
+    pub vram_used_bytes: u64,
+    /// Total bytes addressable in the VRAM tier (anchor + LRU budget).
+    /// `0` when no VRAM cache is attached.
+    pub vram_capacity_bytes: u64,
+    /// Cumulative RAM → VRAM promotions performed by the background
+    /// promotion task. Promotions are gated by the per-expert
+    /// `promote_after_hits` threshold.
+    pub gpu_promotions: u64,
+    /// VRAM cache hit count (anchor + LRU).
+    pub gpu_cache_hits: u64,
+    /// VRAM cache miss count.
+    pub gpu_cache_misses: u64,
+    /// Number of experts in the VRAM anchor (hot-pin) region.
+    pub gpu_anchor_count: usize,
+    /// Number of experts in the VRAM LRU (cold-edge) region.
+    pub gpu_lru_count: usize,
 }
 
 #[cfg(test)]
