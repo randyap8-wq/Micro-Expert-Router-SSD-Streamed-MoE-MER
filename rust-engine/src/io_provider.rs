@@ -165,6 +165,27 @@ fn is_transient_io_error(e: &io::Error) -> bool {
         || e.raw_os_error() == Some(libc::EBUSY)
 }
 
+/// Saturating `fetch_add(1)` for an `AtomicU32`. Returns the post-
+/// increment value, clamped at `u32::MAX`. The breaker thresholds
+/// fit comfortably in `u32` (single digits), so a naive `fetch_add`
+/// can theoretically wrap to 0 after 2^32 consecutive failures and
+/// silently un-trip the breaker. Implemented as a CAS loop on the
+/// load — at the rate the failure path runs in practice this loop
+/// completes in a single iteration. (F3.2 in the audit.)
+#[inline]
+fn saturating_increment_u32(c: &AtomicU32) -> u32 {
+    let mut cur = c.load(Ordering::Acquire);
+    loop {
+        if cur == u32::MAX {
+            return u32::MAX;
+        }
+        match c.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return cur + 1,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
 
 /// Configuration for the storage layer.
 #[derive(Clone, Debug)]
@@ -640,47 +661,54 @@ impl NvmeStorage {
     /// expert independently does.
     fn note_read_failure(&self, id: u32) -> (bool, u32, bool, u32) {
         let b = self.breaker(id);
-        let n = b.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        let just_tripped =
-            n >= STORAGE_BREAKER_THRESHOLD && !b.tripped.swap(true, Ordering::AcqRel);
-        if just_tripped {
-            // Stamp the trip time so the half-open probe gate
-            // (`try_admit_probe`) knows when to start admitting
-            // recovery probes.
-            b.tripped_at_ms
-                .store(breaker_now_ms(), Ordering::Release);
-            tracing::error!(
-                expert_id = id,
-                consecutive_failures = n,
-                "circuit breaker tripped — expert unavailable until probe succeeds"
-            );
-        } else if b.tripped.load(Ordering::Acquire) {
-            // A probe that itself failed: restamp so the next probe
-            // is held off for another full
-            // `STORAGE_BREAKER_PROBE_INTERVAL`. Without this restamp
-            // the gate would let every read through once the
-            // initial interval elapsed.
-            b.tripped_at_ms
-                .store(breaker_now_ms(), Ordering::Release);
-        }
+        let n = saturating_increment_u32(&b.consecutive_failures);
+        let just_tripped = if n >= STORAGE_BREAKER_THRESHOLD {
+            // F3.1: stamp `tripped_at_ms` BEFORE publishing the open
+            // state. Otherwise a concurrent reader observing
+            // `tripped == true` from the swap below can race and
+            // load `tripped_at_ms == 0` (the closed-state sentinel),
+            // which `try_admit_probe` would treat as "infinitely
+            // long ago" and admit a probe at trip-instant. The
+            // Release on the timestamp synchronises-with the
+            // Acquire load inside `try_admit_probe` through the
+            // `tripped` swap's AcqRel ordering.
+            let now = breaker_now_ms();
+            b.tripped_at_ms.store(now, Ordering::Release);
+            let became_open = !b.tripped.swap(true, Ordering::AcqRel);
+            if became_open {
+                tracing::error!(
+                    expert_id = id,
+                    consecutive_failures = n,
+                    "circuit breaker tripped — expert unavailable until probe succeeds"
+                );
+            } else {
+                // Already open; this is effectively a failed probe.
+                // The store above restamped the gate so the next
+                // probe is held off another full interval.
+            }
+            became_open
+        } else {
+            false
+        };
         let drive_idx = self.drive_index_for(id);
         let db = &self.drive_breakers[drive_idx];
-        let dn = db.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-        let drive_just_tripped =
-            dn >= STORAGE_DRIVE_BREAKER_THRESHOLD && !db.tripped.swap(true, Ordering::AcqRel);
-        if drive_just_tripped {
-            db.tripped_at_ms
-                .store(breaker_now_ms(), Ordering::Release);
-            tracing::error!(
-                drive_index = drive_idx,
-                consecutive_failures = dn,
-                "drive circuit breaker tripped — no further reads will be routed to this shard"
-            );
-        } else if db.tripped.load(Ordering::Acquire) {
-            // Failed half-open probe: restamp.
-            db.tripped_at_ms
-                .store(breaker_now_ms(), Ordering::Release);
-        }
+        let dn = saturating_increment_u32(&db.consecutive_failures);
+        let drive_just_tripped = if dn >= STORAGE_DRIVE_BREAKER_THRESHOLD {
+            // Same publish-ordering invariant as above.
+            let now = breaker_now_ms();
+            db.tripped_at_ms.store(now, Ordering::Release);
+            let became_open = !db.tripped.swap(true, Ordering::AcqRel);
+            if became_open {
+                tracing::error!(
+                    drive_index = drive_idx,
+                    consecutive_failures = dn,
+                    "drive circuit breaker tripped — no further reads will be routed to this shard"
+                );
+            }
+            became_open
+        } else {
+            false
+        };
         (just_tripped, n, drive_just_tripped, dn)
     }
 
@@ -699,12 +727,18 @@ impl NvmeStorage {
     fn try_admit_probe(tripped_at_ms: &AtomicU64) -> bool {
         let now = breaker_now_ms();
         let last = tripped_at_ms.load(Ordering::Acquire);
-        // `last == 0` is the sentinel for "no trip on record" — used
-        // both before the breaker has ever fired and when a test
-        // (or a manual operator reset) wants to force-admit the
-        // next probe. Treat it as "infinitely long ago".
-        // `breaker_now_ms` always returns >= 1, so a real stamp can
-        // never collide with the sentinel.
+        // `last == 0` is the "force-admit" sentinel used by tests and
+        // by operators to manually reset the rate-limit. The race
+        // that previously made this sentinel observable from a
+        // genuinely-tripped breaker — concurrent reader sees
+        // `tripped == true` from `swap` but `tripped_at_ms == 0`
+        // because the failing thread had not yet stored its
+        // timestamp — is fixed in `note_read_failure`, which now
+        // stamps `tripped_at_ms` (Release) *before* publishing
+        // `tripped = true` via swap (AcqRel). Any caller that
+        // arrived here because they observed `tripped == true`
+        // synchronises-with that Release and therefore reads the
+        // real, non-zero stamp.
         if last != 0
             && now.saturating_sub(last) < STORAGE_BREAKER_PROBE_INTERVAL.as_millis() as u64
         {
