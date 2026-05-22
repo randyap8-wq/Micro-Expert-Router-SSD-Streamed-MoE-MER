@@ -1211,7 +1211,7 @@ impl Engine {
                 // `promote_sync` copies the resident bytes into the
                 // anchor/LRU edge under the parking_lot mutex; safe to
                 // call from a Tokio worker because it never .awaits.
-                let bytes = resident.buffer.as_slice().to_vec();
+                let bytes = resident.data().to_vec();
                 let gpu_res = Arc::new(GpuResident::new(id, bytes));
                 let promoted = gpu_for_task.promote_sync(gpu_res);
                 if promoted {
