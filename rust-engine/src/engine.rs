@@ -1206,6 +1206,13 @@ impl Engine {
             tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
         let gpu_for_task = gpu.clone();
         let prom_for_task = self.metrics.prom.clone();
+        // Capacity is constant for the lifetime of the cache; publish
+        // it once so `mer_vram_capacity_bytes` is available on the
+        // very first `/metrics` scrape (dashboards compute
+        // utilisation as `mer_vram_used_bytes / mer_vram_capacity_bytes`).
+        if let Some(p) = prom_for_task.as_ref() {
+            p.set_vram_capacity_bytes(gpu.capacity_bytes() as u64);
+        }
         tokio::spawn(async move {
             while let Some((id, resident)) = rx.recv().await {
                 // `promote_sync` copies the resident bytes into the

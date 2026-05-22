@@ -64,6 +64,14 @@ struct MetricsInner {
     /// **Gauge** of currently-resident VRAM bytes across the Anchor +
     /// LRU regions. Phase 1.
     pub vram_used_bytes: IntGauge,
+    /// **Gauge** of the total VRAM byte budget for the
+    /// [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
+    /// (Anchor + LRU capacity). Set once when the GPU cache is
+    /// installed so dashboards can compute utilisation as
+    /// `mer_vram_used_bytes / mer_vram_capacity_bytes` without
+    /// relying on the `/v1/admin/health/experts` admin endpoint.
+    /// Stays at `0` when the GPU cache is disabled. Phase 1.
+    pub vram_capacity_bytes: IntGauge,
     /// Total RAM → VRAM promotions performed since startup. Each
     /// promotion is the result of an `ExpertResident` crossing
     /// `gpu_cache.promote_after_hits` and being copied into the
@@ -181,6 +189,12 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_vram_used_bytes");
+        let vram_capacity_bytes = register_int_gauge_with_registry!(
+            "mer_vram_capacity_bytes",
+            "Total VRAM byte budget configured for the GpuExpertCache (Anchor + LRU). 0 when the GPU cache is disabled.",
+            registry
+        )
+        .expect("metric registration: mer_vram_capacity_bytes");
         let promotions_total = register_counter_with_registry!(
             "mer_promotions_total",
             "Total RAM-to-VRAM promotions performed since startup.",
@@ -205,6 +219,7 @@ impl Metrics {
                 gpu_cache_hits_total,
                 gpu_cache_misses_total,
                 vram_used_bytes,
+                vram_capacity_bytes,
                 promotions_total,
             }),
         }
@@ -289,6 +304,13 @@ impl Metrics {
         self.inner.vram_used_bytes.set(bytes as i64);
     }
 
+    /// Set the total VRAM byte budget gauge. Called once when the
+    /// `GpuExpertCache` is installed (constant for the lifetime of
+    /// the process); stays at `0` when the GPU cache is disabled.
+    pub fn set_vram_capacity_bytes(&self, bytes: u64) {
+        self.inner.vram_capacity_bytes.set(bytes as i64);
+    }
+
     /// Record `n` RAM → VRAM promotions.
     pub fn record_promotions(&self, n: u64) {
         if n > 0 {
@@ -323,6 +345,7 @@ mod tests {
         m.record_ssd_stall(0.0005);
         m.record_gpu_cache(2, 1);
         m.set_vram_used_bytes(1_048_576);
+        m.set_vram_capacity_bytes(8_388_608);
         m.record_promotions(3);
         let body = String::from_utf8(m.render().unwrap()).unwrap();
         for name in [
@@ -341,6 +364,7 @@ mod tests {
             "mer_gpu_cache_hits_total",
             "mer_gpu_cache_misses_total",
             "mer_vram_used_bytes",
+            "mer_vram_capacity_bytes",
             "mer_promotions_total",
         ] {
             assert!(body.contains(name), "metric {name} missing from /metrics body:\n{body}");
