@@ -86,12 +86,40 @@ impl Default for IoUringConfig {
 /// the lifetime of the engine). Subsequent reads are
 /// `IORING_OP_READ_FIXED` SQEs that reference a buffer index — no
 /// per-read iovec setup.
+/// io_uring storage backend (gist Part 2). Stages a registered fixed
+/// buffer pool at construction time and submits `READ_FIXED` SQEs from
+/// the engine's async path, avoiding the per-syscall cost of the
+/// `read_at`/pread fallback in [`crate::io_provider::NvmeStorage`].
+///
+/// On non-Linux targets (or when the `io_uring` cargo feature is off)
+/// this becomes a no-op shim that surfaces `Unsupported` errors at
+/// call time, so engine factory code can keep a single code path.
+///
+/// The kernel-side state lives in `linux_impl::Ring`; the [`Ring`]'s
+/// reactor thread is created in `IoUringStorage::new` and joined in
+/// [`IoUringStorage::Drop`] via the inner `Arc<Ring>`. The reactor
+/// owns its `IoUring` instance exclusively; the only path into it is
+/// a bounded mpsc channel of [`ReactorRequest`] envelopes.
+///
+/// `IoUringStorage` retains a [`crate::buffer_pool::BufferPool`]
+/// clone for the lifetime of the backend so the kernel-registered
+/// fixed-buffer pointers (passed to `register_buffers`) remain valid
+/// even if the original `BufferPool` handle is dropped at the call
+/// site. (F2.3 in the audit.) `BufferPool` is `Clone` and internally
+/// reference-counted, so this is a cheap arc-bump.
 pub struct IoUringStorage {
     cfg: IoUringConfig,
     /// Number of buffer slots that were registered. Stored for
     /// validation only — the actual ring + fd state lives in `inner`
     /// when the `io_uring` cargo feature is enabled.
     registered_buffers: usize,
+    /// Buffer pool clone that owns the heap-allocated, page-aligned
+    /// fixed buffers the kernel has registered raw pointers into.
+    /// Holding this `BufferPool` (which is internally an `Arc`)
+    /// guarantees the backing storage outlives the kernel ring.
+    /// Mostly opaque; surfaced via [`Self::buffer_pool`] for tests.
+    #[allow(dead_code)]
+    pool: BufferPool,
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
     inner: std::sync::Arc<linux_impl::Ring>,
 }
@@ -124,10 +152,11 @@ impl IoUringStorage {
 
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
-            let ring = linux_impl::Ring::new(&cfg, iovecs)?;
+            let ring = linux_impl::Ring::new(&cfg, iovecs, pool.clone())?;
             return Ok(Self {
                 cfg,
                 registered_buffers: registered,
+                pool: pool.clone(),
                 inner: std::sync::Arc::new(ring),
             });
         }
@@ -138,6 +167,7 @@ impl IoUringStorage {
             Ok(Self {
                 cfg,
                 registered_buffers: registered,
+                pool: pool.clone(),
             })
         }
     }
@@ -274,7 +304,7 @@ impl IoUringStorage {
     pub async fn read_experts_batch_fixed_promote(
         &self,
         ids: &[u32],
-        mut shadow_bufs: Vec<PooledBuffer>,
+        shadow_bufs: Vec<PooledBuffer>,
         pool: &BufferPool,
     ) -> io::Result<Vec<PooledBuffer>> {
         assert_eq!(
@@ -290,22 +320,39 @@ impl IoUringStorage {
         for buf in shadow_bufs.iter() {
             debug_assert_eq!(buf.len(), self.cfg.expert_size);
         }
-        // Drive the existing batched submission path. We grab mutable
-        // refs to the caller's buffers, fire the batched READ_FIXED,
-        // wait for K completions, then promote each shadow buffer
-        // in-place. No additional allocation beyond the (small) ref
-        // vector required by the batch entry point.
-        {
-            let mut refs: Vec<&mut PooledBuffer> = shadow_bufs.iter_mut().collect();
-            let _n = self.read_experts_batch_fixed(ids, &mut refs).await?;
-        }
+        // Drive the F1.3 cancellation-safe owned-buffer path. The
+        // shadow buffers are moved into the reactor's keep-alive
+        // owner so they cannot return to the buffer pool's free
+        // list until the kernel finishes writing them, even if our
+        // outer future is cancelled at the .await below. Compare to
+        // the legacy `&mut PooledBuffer` API, which leaves the bufs
+        // on the caller's stack — a cancellation there frees the
+        // slot while the kernel is mid-write.
+        let mut shadow_bufs = {
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            {
+                let len = self.cfg.expert_size;
+                let ids_owned: Vec<u32> = ids.to_vec();
+                self.inner
+                    .read_experts_batch_fixed_owned_recover(&ids_owned, shadow_bufs, len)
+                    .await?
+            }
+            #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+            {
+                let _ = ids;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "io_uring backend is unavailable on this build (Linux + `io_uring` cargo feature required)",
+                ));
+            }
+        };
         // Single-syscall completion fence behind us: every byte for
         // every expert in `ids` is now in the matching shadow buffer.
         // Promote each one so the slot accounting flips to primary
         // without an extra copy — this is the zero-latency
         // "speculation confirmed → resident" hand-off.
         let promoted: Vec<PooledBuffer> = shadow_bufs
-            .into_iter()
+            .drain(..)
             .map(|b| pool.promote_shadow(b))
             .collect();
         Ok(promoted)
@@ -381,12 +428,21 @@ mod linux_impl {
         /// Join handle for the reactor thread, joined on Drop so a
         /// torn-down storage doesn't leave a dangling kernel ring.
         reactor: Option<std::thread::JoinHandle<()>>,
+        /// `BufferPool` clone that owns the heap-allocated, page-
+        /// aligned buffers that were `register_buffers`'d into the
+        /// kernel. Holding this `Arc` (BufferPool is `Clone` /
+        /// internally `Arc`'d) for the lifetime of the ring is what
+        /// keeps those buffer addresses valid for as long as the
+        /// kernel might dereference them. (F2.3 in the audit.)
+        #[allow(dead_code)]
+        pool: super::BufferPool,
     }
 
     impl Ring {
         pub(super) fn new(
             cfg: &super::IoUringConfig,
             iovecs: Vec<(*mut u8, usize)>,
+            pool: super::BufferPool,
         ) -> io::Result<Self> {
             // gist Part 3 — buffer alignment validation. The kernel
             // requires every fixed buffer registered via
@@ -481,6 +537,7 @@ mod linux_impl {
                 cfg_base: cfg.base_path.clone(),
                 queue_depth,
                 reactor: Some(reactor),
+                pool,
             })
         }
 
@@ -528,30 +585,109 @@ mod linux_impl {
             self.submit_batch(ids, ptrs, len).await
         }
 
+        /// **F1.3 cancellation-safe owned-buffer entry point.** Takes
+        /// ownership of `bufs`, sends them through the reactor request
+        /// so they're pinned by the request's `_keep_alive` box (via
+        /// an `Arc<Mutex<Option<…>>>` shared with the caller for
+        /// post-reply recovery), then returns them to the caller on
+        /// the reply. If the caller's future is cancelled between
+        /// send and reply, the reactor still processes the request
+        /// and drops its `Arc` clone, leaving the buffers in the
+        /// shared cell on our side; our local `Arc` drop then
+        /// releases them back to the pool — but only *after* the
+        /// kernel finishes writing them. This eliminates the
+        /// buffer-pool vs. kernel-write race the `&mut PooledBuffer`
+        /// API has.
+        pub(super) async fn read_experts_batch_fixed_owned_recover(
+            &self,
+            ids: &[u32],
+            mut bufs: Vec<PooledBuffer>,
+            len: usize,
+        ) -> io::Result<Vec<PooledBuffer>> {
+            // Snapshot raw pointers BEFORE moving `bufs` into the
+            // owner cell. Pointers reference the heap-allocated
+            // `AlignedBuffer` payload, which is stable across moves
+            // of the enclosing `PooledBuffer` (the buffer carries a
+            // `NonNull<u8>` to the underlying allocation, not an
+            // inline array). The transient `&mut` borrows here end
+            // at the semicolon (NLL), so `bufs` becomes movable
+            // immediately after.
+            let ptrs: Vec<*mut u8> = bufs
+                .iter_mut()
+                .map(|b| b.as_mut_slice().as_mut_ptr())
+                .collect();
+            let shared: std::sync::Arc<parking_lot::Mutex<Option<Vec<PooledBuffer>>>> =
+                std::sync::Arc::new(parking_lot::Mutex::new(Some(bufs)));
+            // Owner clone goes into the reactor request; the original
+            // stays here so we can pull buffers back out on success.
+            let reactor_owner = std::sync::Arc::clone(&shared);
+            let owner: Box<dyn std::any::Any + Send> = Box::new(reactor_owner);
+            let res = self.submit_batch_with_owner(ids, &ptrs, len, owner).await;
+            match res {
+                Ok(_n) => {
+                    let recovered = shared
+                        .lock()
+                        .take()
+                        .ok_or_else(|| io::Error::new(
+                            io::ErrorKind::Other,
+                            "io_uring owned-buffer reply lost ownership \
+                             (reactor took the buffers — should not happen)",
+                        ))?;
+                    Ok(recovered)
+                }
+                Err(e) => Err(e),
+            }
+        }
+
         async fn submit_batch(
             &self,
             ids: &[u32],
             ptrs: &[*mut u8],
             len: usize,
         ) -> io::Result<usize> {
+            self.submit_batch_with_owner(ids, ptrs, len, Box::new(()))
+                .await
+        }
+
+        /// Cancellation-safe entry point: same as [`submit_batch`] but
+        /// the caller hands us an owner that we move into the
+        /// `_keep_alive` box. As long as the owner transitively owns
+        /// the [`PooledBuffer`]s whose `*mut u8` we just dereferenced
+        /// (F1.3), the kernel cannot race the buffer pool's free-list:
+        /// even if the caller's outer future is dropped mid-flight,
+        /// the bufs stay alive until the reactor finishes
+        /// `process_one` and drops `_keep_alive`.
+        async fn submit_batch_with_owner(
+            &self,
+            ids: &[u32],
+            ptrs: &[*mut u8],
+            len: usize,
+            owner: Box<dyn std::any::Any + Send>,
+        ) -> io::Result<usize> {
             // Resolve fds + buf indices on the request side (lock-free
             // for the reactor — it never has to touch the fd cache or
             // the buf-index map).
             let mut prepared: Vec<(RawFd, *mut u8, u16, u32)> = Vec::with_capacity(ids.len());
-            let mut keep_alive: Vec<std::sync::Arc<File>> = Vec::with_capacity(ids.len());
+            let mut keep_alive_fds: Vec<std::sync::Arc<File>> = Vec::with_capacity(ids.len());
             for (i, &expert_id) in ids.iter().enumerate() {
                 let buf_idx = self.buf_idx_for(ptrs[i])?;
                 let f = self.fd_for(expert_id)?;
                 let fd = f.as_raw_fd();
                 prepared.push((fd, ptrs[i], buf_idx, expert_id));
-                keep_alive.push(f);
+                keep_alive_fds.push(f);
             }
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            // Pack fds + caller-supplied owner into a single Any. The
+            // reactor never inspects either — it just drops both after
+            // sending the reply, which is what keeps the underlying
+            // buffer memory pinned through the kernel-side write.
+            let combined: Box<dyn std::any::Any + Send> =
+                Box::new((keep_alive_fds, owner));
             let req = ReactorRequest {
                 prepared,
                 len,
                 reply: reply_tx,
-                _keep_alive: Box::new(keep_alive),
+                _keep_alive: combined,
             };
             let tx = self.tx.as_ref().ok_or_else(|| {
                 io::Error::new(
@@ -634,24 +770,39 @@ mod linux_impl {
                     .build()
                     .user_data(expert_id as u64);
                 // SAFETY: SQE references `ptr` and `fd` which are kept
-                // alive by the requester's `_keep_alive` box and its
-                // mutable borrow on the `PooledBuffer`. We do not
-                // panic on submission-queue-full: instead we
-                // `submit()` to flush whatever is already queued
-                // (creating room) and retry. This makes the reactor
-                // robust against a `queue_depth` smaller than `cap`
-                // (e.g. a kernel that downsizes the requested depth).
+                // alive by the requester's `_keep_alive` box (which
+                // holds the `Arc<File>` fd-cache entries and the
+                // owned `PooledBuffer`s — see F1.3) and by the
+                // ring's `pool` clone (F2.3). We do not panic on
+                // submission-queue-full: we `submit()` to flush
+                // whatever is already queued (creating room) and
+                // retry. F3.3: bound the retry count so a kernel
+                // that refuses to drain the SQ cannot wedge the
+                // reactor in an infinite loop.
+                const MAX_PUSH_RETRIES: usize = 16;
+                let mut push_attempts = 0usize;
                 loop {
+                    // SAFETY: io_uring crate's `push` requires us to
+                    // own the SQ uniquely; we do (the reactor is the
+                    // single owner of `ring`). The SQE entry itself
+                    // is a value type.
                     let push_result = unsafe { ring.submission().push(&sqe) };
                     if push_result.is_ok() {
                         break;
                     }
-                    // SQ full — non-blocking flush, then retry. This
-                    // is the only place where we may briefly spin,
-                    // and only when the ring's internal SQ ring is
-                    // smaller than `cap`. submit() is non-blocking
-                    // and never deadlocks against us because we hold
-                    // exclusive access to `ring`.
+                    push_attempts += 1;
+                    if push_attempts > MAX_PUSH_RETRIES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "io_uring: submission queue refused {MAX_PUSH_RETRIES} push retries — kernel not draining SQ"
+                            ),
+                        ));
+                    }
+                    // SQ full — non-blocking flush, then retry. `submit()`
+                    // forwards any kernel-side error (EAGAIN, ENOMEM,
+                    // …) out of the reactor; only `PushError::Full`
+                    // from `push` is treated as "transient, retry".
                     ring.submit()?;
                 }
             }
@@ -664,18 +815,72 @@ mod linux_impl {
         }
         // Single wait barrier for the whole macro-batch.
         ring.submit_and_wait(total)?;
+        // F1.1 + F1.2: drain ALL completions before returning.
+        // Returning early on the first error would orphan the
+        // remaining CQEs in the ring; the next macro-batch would
+        // then dequeue them in `completion().next()` as if they
+        // belonged to the new batch, mixing expert ids across
+        // requests. Verify the per-CQE length against the requested
+        // `len` so a short read surfaces as the failure it is rather
+        // than silently being summed into `totalbytes`.
+        let mut first_err: Option<io::Error> = None;
         let mut totalbytes = 0usize;
-        for _ in 0..total {
-            let cqe = ring.completion().next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "io_uring: missing completion event")
-            })?;
+        let mut drained = 0usize;
+        while drained < total {
+            let cqe = match ring.completion().next() {
+                Some(c) => c,
+                None => {
+                    // CQE not yet available — flush + spin briefly.
+                    // `submit_and_wait(total)` above should have
+                    // guaranteed all are ready, but on aggressive
+                    // SQPOLL kernels there can be a publication lag.
+                    ring.submit()?;
+                    continue;
+                }
+            };
+            drained += 1;
             let result = cqe.result();
+            let user_data = cqe.user_data();
             if result < 0 {
-                return Err(io::Error::from_raw_os_error(-result));
+                let e = io::Error::from_raw_os_error(-result);
+                tracing::warn!(
+                    expert_id = user_data,
+                    error = %e,
+                    "io_uring CQE reported error"
+                );
+                if first_err.is_none() {
+                    first_err = Some(io::Error::new(
+                        e.kind(),
+                        format!("io_uring read on expert {user_data} failed: {e}"),
+                    ));
+                }
+                continue;
             }
-            totalbytes += result as usize;
+            let n = result as usize;
+            if n != len {
+                tracing::warn!(
+                    expert_id = user_data,
+                    got = n,
+                    expected = len,
+                    "io_uring CQE reported short read"
+                );
+                if first_err.is_none() {
+                    first_err = Some(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "io_uring short read on expert {user_data}: got {n} bytes, expected {len}"
+                        ),
+                    ));
+                }
+                continue;
+            }
+            totalbytes += n;
         }
-        Ok(totalbytes)
+        if let Some(e) = first_err {
+            Err(e)
+        } else {
+            Ok(totalbytes)
+        }
     }
 
     /// Best-effort: pin the calling thread to the CPUs reported by

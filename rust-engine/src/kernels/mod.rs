@@ -411,13 +411,31 @@ pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
     debug_assert_eq!(q.len(), x.len());
     #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
     {
-        // The rewritten VNNI kernel requires `avx512f + avx512bw +
-        // avx512vnni`. We gate directly on the cached CPU feature
-        // bits (rather than the coarse `KernelBackend` selector) so
-        // hosts that lack VNNI fall back to scalar even when the
-        // overall backend was picked as `Avx512`.
-        let f = cpu_features();
-        if f.avx512f && f.avx512bw && f.avx512vnni {
+        // **F2.1 precision opt-out.** The VNNI fast-path below
+        // performs a per-call activation requantization that
+        // introduces a quantization error of up to `x_max/254` per
+        // element relative to the f32-accumulator reference. For
+        // workloads that need bit-accuracy parity with the scalar
+        // path (e.g. model-quality regression suites, deterministic
+        // replay), operators can disable the VNNI dispatch by
+        // setting the env var `MER_DISABLE_VNNI_INT8_DEQUANT=1` at
+        // process start. The lookup is cached in a `OnceLock` so
+        // the per-call cost is one relaxed load on the hot path.
+        use std::sync::OnceLock;
+        static DISABLE_VNNI_DEQUANT: OnceLock<bool> = OnceLock::new();
+        let disabled = *DISABLE_VNNI_DEQUANT.get_or_init(|| {
+            std::env::var("MER_DISABLE_VNNI_INT8_DEQUANT")
+                .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+                .unwrap_or(false)
+        });
+        if !disabled {
+            // The rewritten VNNI kernel requires `avx512f + avx512bw +
+            // avx512vnni`. We gate directly on the cached CPU feature
+            // bits (rather than the coarse `KernelBackend` selector) so
+            // hosts that lack VNNI fall back to scalar even when the
+            // overall backend was picked as `Avx512`.
+            let f = cpu_features();
+            if f.avx512f && f.avx512bw && f.avx512vnni {
             // Per-thread reusable scratch buffer for the activation
             // pre-pass. Allocating once per thread (instead of once
             // per call) makes this entry point safe to use from a
@@ -438,6 +456,7 @@ pub fn dequant_int8_dot(scale: f32, q: &[i8], x: &[f32]) -> f32 {
                 // tail explicitly.
                 unsafe { avx512::dequant_int8_dot_avx512(scale, q, x, &mut scratch) }
             });
+            }
         }
     }
     scalar::dequant_int8_dot(scale, q, x)
