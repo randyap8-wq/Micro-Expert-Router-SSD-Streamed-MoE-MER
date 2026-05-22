@@ -540,6 +540,15 @@ impl GpuExpertCache {
             return false;
         }
         let mut g = self.inner.lock();
+        // Already resident: nothing to promote. Touch the LRU entry so
+        // it becomes MRU, but don't count this as a new promotion nor
+        // re-account bytes (the existing entry already owns them).
+        if g.anchor.contains_key(&resident.id) {
+            return true;
+        }
+        if g.lru.get(&resident.id).is_some() {
+            return true;
+        }
         // Anchor first: if it fits in the anchor budget *and* the
         // engine flagged this expert as hot, install there. We treat
         // any explicit promote_sync as "hot" (the engine only calls
@@ -547,7 +556,6 @@ impl GpuExpertCache {
         // there's room without evicting another anchor entry.
         if bytes <= self.anchor_capacity_bytes
             && g.anchor_used_bytes + bytes <= self.anchor_capacity_bytes
-            && !g.anchor.contains_key(&resident.id)
         {
             g.anchor.insert(resident.id, resident.clone());
             g.anchor_used_bytes += bytes;
