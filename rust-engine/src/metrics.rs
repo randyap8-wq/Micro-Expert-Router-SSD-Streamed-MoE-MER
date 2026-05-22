@@ -52,12 +52,14 @@ struct MetricsInner {
     /// path that was actually waiting on the storage device, as
     /// distinct from the total I/O time which can overlap compute).
     pub ssd_stall_seconds: Histogram,
-    /// VRAM tier hits — an `ExpertResident` lookup that was served
-    /// out of the [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
-    /// instead of falling through to RAM/NVMe (Phase 1).
+    /// VRAM tier probe hits — lookups for which the requested expert
+    /// was already present in
+    /// [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
+    /// at probe time (Phase 1).
     pub gpu_cache_hits_total: Counter,
-    /// VRAM tier misses — lookups that fell through to the RAM/NVMe
-    /// tiers because the expert was not (yet) in VRAM (Phase 1).
+    /// VRAM tier probe misses — lookups for which the requested expert
+    /// was not present in VRAM at probe time and therefore required
+    /// lower-tier resolution/promotion logic (Phase 1).
     pub gpu_cache_misses_total: Counter,
     /// **Gauge** of currently-resident VRAM bytes across the Anchor +
     /// LRU regions. Phase 1.
