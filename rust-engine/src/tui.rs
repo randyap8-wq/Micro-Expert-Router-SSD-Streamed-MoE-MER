@@ -366,19 +366,56 @@ fn draw_pulse(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     f.render_widget(sp, area);
 }
 
+fn parse_http_base(url_base: &str) -> Result<(String, String, String), Box<dyn std::error::Error>> {
+    let trimmed = url_base.trim();
+    let without_scheme = if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest
+    } else if trimmed.starts_with("https://") {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "https:// is not supported by fetch_health without TLS support",
+        )));
+    } else {
+        trimmed
+    };
+
+    let (authority, base_path) = match without_scheme.split_once('/') {
+        Some((auth, path)) => (auth, format!("/{}", path.trim_start_matches('/'))),
+        None => (without_scheme, String::new()),
+    };
+
+    if authority.is_empty() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing host in url_base",
+        )));
+    }
+
+    let (connect_addr, host_header) = match authority.rsplit_once(':') {
+        Some((host, port_str)) if !host.is_empty() && port_str.parse::<u16>().is_ok() => (
+            format!("{host}:{port_str}"),
+            authority.to_string(),
+        ),
+        _ => (format!("{authority}:80"), authority.to_string()),
+    };
+
+    let request_path = format!(
+        "{}/v1/admin/health/experts",
+        base_path.trim_end_matches('/')
+    );
+
+    Ok((connect_addr, host_header, request_path))
+}
+
 /// Minimal HTTP/1.1 GET over `tokio::net::TcpStream`. Avoids pulling
 /// in a full HTTP client crate for a single-endpoint poll. Parses an
 /// `application/json` body and decodes it through serde.
 async fn fetch_health(url_base: &str) -> Result<HealthSnapshot, Box<dyn std::error::Error>> {
-    // Strip the scheme and split host:port from the path.
-    let stripped = url_base
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    let host_port = stripped;
+    let (connect_addr, host_header, request_path) = parse_http_base(url_base)?;
     let request = format!(
-        "GET /v1/admin/health/experts HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
+        "GET {request_path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n"
     );
-    let mut socket = TcpStream::connect(host_port).await?;
+    let mut socket = TcpStream::connect(&connect_addr).await?;
     socket.write_all(request.as_bytes()).await?;
     let mut buf = Vec::with_capacity(4096);
     socket.read_to_end(&mut buf).await?;
