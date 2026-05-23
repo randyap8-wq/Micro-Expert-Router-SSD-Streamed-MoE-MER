@@ -2139,7 +2139,7 @@ async fn cmd_validate_predictor(
         // workable on long real-engine traces).
         let mut lru: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
         let mut lru_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for (_token, _layer, experts) in &records {
+        for (_, _, experts) in &records {
             for &e in experts.iter() {
                 if lru_set.contains(&e) {
                     hits += 1;
@@ -2170,7 +2170,7 @@ async fn cmd_validate_predictor(
     // replay so we can consume `records` without cloning each `experts`
     // vector.
     let mut tokens_per_layer: std::collections::BTreeMap<u32, Vec<Vec<u32>>> = Default::default();
-    for (_token, layer, experts) in records.into_iter() {
+    for (_, layer, experts) in records.into_iter() {
         tokens_per_layer.entry(layer).or_default().push(experts);
     }
 
