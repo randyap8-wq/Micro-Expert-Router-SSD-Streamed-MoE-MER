@@ -343,7 +343,7 @@ impl ShardRouter for LocalShardRouter {
 /// ### Mapping `tonic::Status` to [`ShardRouterError`]
 ///
 /// When the real implementation is wired up, each `tonic::Code` is
-/// translated into a [`ShardRouterError`] variant via [`Self::map_tonic_status`]
+/// translated into a [`ShardRouterError`] variant via [`RpcShardRouter::map_tonic_status`]
 /// (a free helper so it is easy to unit-test independently of any
 /// running gRPC server):
 ///

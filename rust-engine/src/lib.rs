@@ -23,8 +23,6 @@
 // roots (`lib.rs` and `main.rs`) because the bin and the lib are
 // compiled as separate crates from this same source tree.
 #![cfg_attr(feature = "nightly-amx", feature(stdarch_x86_amx))]
-
-
 #![allow(dead_code)]
 
 pub mod block_pool;
