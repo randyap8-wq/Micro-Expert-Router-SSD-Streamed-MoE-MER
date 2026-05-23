@@ -1306,6 +1306,30 @@ impl Engine {
         self.core.gpu_cache.clone()
     }
 
+    /// **Test-only** wiring of the GPU promotion channel without
+    /// spawning the background consumer task. Used by the regression
+    /// test in [`tests`] (gist Task 1, "GPU Promotion Regression
+    /// Test") to inspect the `gpu_promotion_tx` MPSC sender side
+    /// directly and assert that after `promote_after_hits` RAM hits
+    /// on the same expert *exactly one* promotion message is emitted.
+    ///
+    /// Returning the `UnboundedReceiver` to the test lets the
+    /// assertion be performed on the raw mpsc traffic — i.e. before
+    /// `promote_sync` consumes it — which is the contract the gist
+    /// asks for ("verify the message count directly, do not use the
+    /// report API").
+    #[cfg(test)]
+    pub(crate) fn install_gpu_cache_for_test(
+        &mut self,
+        gpu: Arc<GpuExpertCache>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(u32, Arc<ExpertResident>)> {
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
+        self.core.gpu_cache = Some(gpu);
+        self.core.gpu_promotion_tx = Some(tx);
+        rx
+    }
+
     /// Borrow the engine's KV cache, if any. Callers acquire the
     /// inner `parking_lot::Mutex` to read or append.
     pub fn kv_cache(&self) -> Option<Arc<Mutex<AlignedKvCache>>> {
@@ -3515,6 +3539,102 @@ mod tests {
         );
         // Sanity: the report surface mirrors the counter.
         assert_eq!(engine.report().prefetch_dropped_concurrency, dropped);
+    }
+
+    /// **Gist Task 1 — GPU Promotion Regression Test.**
+    ///
+    /// After `promote_after_hits` cache hits on the same expert via
+    /// `moe_step`, *exactly one* `(expert_id, resident)` message must
+    /// be emitted on the `gpu_promotion_tx` MPSC. The assertion runs
+    /// directly against the receiver side of the channel — i.e. the
+    /// raw mpsc traffic, before any consumer task processes it — per
+    /// the gist's "verify the message count directly; do not use the
+    /// report API" requirement.
+    ///
+    /// The test installs a custom channel via
+    /// [`Engine::install_gpu_cache_for_test`] so it can observe the
+    /// sender without the background promotion task draining it.
+    /// `promote_after_hits` is chosen small (= 3) to keep the test
+    /// fast; the same logic applies for any positive threshold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moe_step_emits_exactly_one_gpu_promotion_after_threshold_hits() {
+        use crate::expert_cache::GpuExpertCache;
+
+        let dir = TempDir::new("gpu-promotion");
+        let num_experts: u32 = 4;
+        let top_k = 1;
+        let d_model = 16;
+        let d_ff = 32;
+        let cache_slots = 4;
+        let predict_fanout = 1;
+        let seed: u64 = 0xBADC0FFEE0DDF00D_u64;
+
+        // Build a plain engine (no GPU cache yet).
+        let engine = build_engine(
+            &dir.path, num_experts, d_model, d_ff, cache_slots, top_k,
+            predict_fanout, seed,
+        );
+
+        // Warm the RAM cache with one expert so every moe_step is a
+        // RAM hit (the path that drives promotion).
+        let target_id: u32 = 0;
+        engine.warm_with(&[target_id]).await.expect("warm RAM cache");
+        assert!(
+            engine.core.cache.get(target_id).is_some(),
+            "warm_with must leave the expert resident"
+        );
+
+        // Install a GPU cache + custom mpsc channel (no background
+        // consumer). `promote_after_hits = 3` means the *3rd* RAM hit
+        // is the crossing event; the 1st and 2nd RAM hits must not
+        // emit, and the 4th, 5th, … must not emit either (edge
+        // trigger).
+        let promote_after: u64 = 3;
+        let total_hits: u64 = 6;
+        // Capacity must be large enough to fit the expert resident.
+        // expert_weight_bytes() gives the f32 weight footprint.
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let gpu = Arc::new(GpuExpertCache::new(
+            weight_bytes * 4,
+            /*anchor_ratio=*/ 0.5,
+            promote_after,
+        ));
+        // We need `&mut Engine` to install — engine was wrapped in
+        // Arc<Engine> by build_engine, so unwrap it back.
+        let mut engine_owned = Arc::try_unwrap(engine)
+            .map_err(|_| ())
+            .expect("test owns the sole Arc");
+        let mut rx = engine_owned.install_gpu_cache_for_test(gpu.clone());
+        let engine = Arc::new(engine_owned);
+
+        // Drive `moe_step` total_hits times against the same expert.
+        // We bypass the gate by constructing a hidden state directly
+        // and passing the target expert id.
+        let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
+        for t in 0..total_hits {
+            let _ = engine.moe_step(t, /*layer=*/ 0, &hidden, &[target_id]).await;
+        }
+
+        // Drain the channel — must contain exactly one message,
+        // emitted on the threshold-crossing hit.
+        let mut received: Vec<(u32, Arc<ExpertResident>)> = Vec::new();
+        // `try_recv` lets us inspect without blocking — the sender
+        // half is still alive (kept in `engine.core.gpu_promotion_tx`)
+        // so a naive `recv()` would hang indefinitely.
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        assert_eq!(
+            received.len(),
+            1,
+            "exactly one promotion must be enqueued for {total_hits} RAM hits with \
+             promote_after_hits = {promote_after} (got {})",
+            received.len()
+        );
+        assert_eq!(
+            received[0].0, target_id,
+            "the promotion message must carry the target expert id"
+        );
     }
 
     /// `AlignedKvCache::append` extends the resident window until

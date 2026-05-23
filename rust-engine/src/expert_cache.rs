@@ -422,15 +422,15 @@ impl GpuExpertCache {
         let anchor_capacity_bytes = ((capacity_bytes as f32) * ratio) as usize;
         let lru_capacity_bytes = capacity_bytes.saturating_sub(anchor_capacity_bytes);
         // `LruCache` requires a non-zero entry count even when the
-        // bytes budget would naturally allow zero — pick a large
-        // sentinel so the byte-budget check below is the only
-        // eviction trigger.
-        let lru_entry_cap = NonZeroUsize::new(usize::MAX).expect("usize::MAX > 0");
+        // bytes budget would naturally allow zero. Use `unbounded()`
+        // so eviction is driven solely by the byte-budget check
+        // below — passing a sentinel like `usize::MAX` to `new()`
+        // makes the underlying hashbrown allocator overflow.
         Self {
             inner: Mutex::new(GpuExpertCacheInner {
                 anchor: HashMap::new(),
                 anchor_used_bytes: 0,
-                lru: LruCache::new(lru_entry_cap),
+                lru: LruCache::unbounded(),
                 lru_used_bytes: 0,
             }),
             anchor_capacity_bytes,
