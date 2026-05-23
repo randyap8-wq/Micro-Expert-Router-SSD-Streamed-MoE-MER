@@ -66,22 +66,8 @@ pub fn cpu_supports_amx() -> bool {
             return true;
         }
     }
-    cpuinfo_has_flag("amx_tile") && cpuinfo_has_flag("amx_int8")
-}
-
-#[cfg(target_arch = "x86_64")]
-fn cpuinfo_has_flag(flag: &str) -> bool {
-    use std::io::Read;
-    let mut s = String::new();
-    let Ok(mut f) = std::fs::File::open("/proc/cpuinfo") else {
-        return false;
-    };
-    if f.read_to_string(&mut s).is_err() {
-        return false;
-    }
-    s.lines()
-        .filter(|l| l.starts_with("flags") || l.starts_with("Features"))
-        .any(|l| l.split_whitespace().any(|tok| tok == flag))
+    super::cpuinfo::cpuinfo_has_flag("amx_tile")
+        && super::cpuinfo::cpuinfo_has_flag("amx_int8")
 }
 
 #[cfg(not(target_arch = "x86_64"))]
