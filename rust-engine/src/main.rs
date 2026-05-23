@@ -5,6 +5,13 @@
 //!
 //! See README.md at the repository root for architecture and design notes.
 
+// Gist Task 3 — "Nightly AMX feature gating". See the matching
+// comment in `lib.rs`. Off by default; opt in with
+// `--features nightly-amx` and a nightly toolchain to unlock the
+// real Intel AMX tile intrinsic surface. When this feature is not
+// enabled, the AMX dispatch path falls back to AVX-512.
+#![cfg_attr(feature = "nightly-amx", feature(stdarch_x86_amx))]
+
 mod aligned_buffer;
 mod backend;
 mod batch_scheduler;

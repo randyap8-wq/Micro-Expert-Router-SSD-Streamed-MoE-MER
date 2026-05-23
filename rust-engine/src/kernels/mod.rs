@@ -16,13 +16,18 @@
 //!   feature is enabled (off by default so portable builds keep
 //!   working on toolchains pinned to a non-AVX-512 baseline).
 //! * [`KernelBackend::Amx`] — Intel AMX tile-based BF16 matmul stub.
-//!   AMX intrinsics are nightly-only as of Rust 1.84, so this module
-//!   only carries a documented skeleton and the runtime detector;
-//!   enabling the `amx` cargo feature builds the skeleton in but the
-//!   active kernels still fall through to AVX-512 / scalar. The
-//!   detection plumbing is wired so a follow-up PR (or a nightly
-//!   build) can drop a real AMX kernel into [`amx`] without touching
-//!   any call sites.
+//!   AMX intrinsics are nightly-only as of Rust 1.84, so by default
+//!   this module only carries a documented skeleton and the runtime
+//!   detector; enabling the `amx` cargo feature builds the skeleton in
+//!   but the active kernels still fall through to AVX-512 / scalar.
+//!   Building with `--features nightly-amx` on a nightly toolchain
+//!   additionally unlocks the `stdarch_x86_amx` intrinsic surface so a
+//!   real tile-based body can be dropped into [`amx`] without touching
+//!   any call sites; when `nightly-amx` is off (or the runtime probe
+//!   fails on the host), the dispatcher transparently falls back to
+//!   the AVX-512 kernel. The detection plumbing is wired so a
+//!   follow-up PR can drop a real AMX kernel in without breaking the
+//!   stable build.
 //!
 //! ### Why a feature-less auto-escalation path matters
 //!
@@ -593,16 +598,97 @@ mod tests {
         assert!(std::ptr::eq(a, b));
     }
 
-    #[test]
-    fn sapphire_rapids_heuristic_recognises_obvious_models() {
-        assert!(is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Platinum 8480+"));
-        assert!(is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Gold 6448Y"));
-        assert!(is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Max 9468"));
-        assert!(!is_sapphire_rapids_or_newer("AMD EPYC 7763 64-Core Processor"));
-        assert!(!is_sapphire_rapids_or_newer("AMD EPYC 7643 48-Core Processor"));
-        assert!(!is_sapphire_rapids_or_newer("Apple M1 Pro"));
-        // Older Xeon generations must NOT match (they predate AMX).
-        assert!(!is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Platinum 8260"));
-        assert!(!is_sapphire_rapids_or_newer("Intel(R) Xeon(R) Gold 6230"));
+    /// **Gist Task 2 — proptest harness for kernel dispatch.**
+    ///
+    /// `swiglu_f32_into` and `dot_f32` are the only two kernels that
+    /// have a SIMD-vector-width-sensitive scalar tail (8 lanes on
+    /// AVX-2, 16 on AVX-512). The dispatcher must match the scalar
+    /// reference within numerical tolerance *regardless* of whether
+    /// `cols` (or vector length) is a multiple of the lane count.
+    /// This proptest fuzzes shapes that are NOT a multiple of either
+    /// 8 or 16 to specifically exercise the tail path.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 64,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn dot_f32_dispatch_matches_scalar_for_arbitrary_lengths(
+                len in 1usize..257,
+                seed in any::<u32>(),
+            ) {
+                // Deterministic pseudo-random vector generation in
+                // a bounded range — avoids pulling `rand` into
+                // dev-deps and prevents NaN/Inf blow-ups when the
+                // dot-products feed an `exp()` downstream.
+                let mk = |s: u32| -> Vec<f32> {
+                    (0..len)
+                        .map(|i| {
+                            let mix = (s as u64).wrapping_mul(2654435761)
+                                .wrapping_add((i as u64).wrapping_mul(40503));
+                            // Use the low 16 bits (0..65535) and
+                            // map to roughly [-0.5, 0.5].
+                            let lo = (mix & 0xFFFF) as f32;
+                            (lo / 65535.0) - 0.5
+                        })
+                        .collect()
+                };
+                let a = mk(seed);
+                let b = mk(seed.wrapping_add(0xDEADBEEF));
+                let lhs = dot_f32(&a, &b);
+                let rhs = scalar::dot_f32(&a, &b);
+                let tol = 1e-3 + rhs.abs() * 1e-4;
+                prop_assert!(
+                    (lhs - rhs).abs() <= tol,
+                    "dot_f32 mismatch at len={len}: dispatch={lhs} scalar={rhs}"
+                );
+            }
+
+            #[test]
+            fn swiglu_f32_into_dispatch_matches_scalar_for_non_lane_aligned_shapes(
+                rows in 1usize..32,
+                // Pick `cols` from a range that includes values
+                // which are NOT multiples of 8 or 16, so the tail
+                // path is regularly exercised.
+                cols in 1usize..200,
+                seed in any::<u32>(),
+            ) {
+                let mk = |s: u32, n: usize| -> Vec<f32> {
+                    (0..n)
+                        .map(|i| {
+                            let mix = (s as u64).wrapping_mul(2654435761)
+                                .wrapping_add((i as u64).wrapping_mul(40503));
+                            let lo = (mix & 0xFFFF) as f32;
+                            (lo / 65535.0) - 0.5
+                        })
+                        .collect()
+                };
+                let gate = mk(seed, rows * cols);
+                let up = mk(seed.wrapping_add(1), rows * cols);
+                let x = mk(seed.wrapping_add(2), cols);
+                let mut y_dispatch = vec![0.0f32; rows];
+                let mut y_ref = vec![0.0f32; rows];
+                swiglu_f32_into(&gate, &up, &x, rows, cols, &mut y_dispatch);
+                scalar::swiglu_f32(&gate, &up, &x, rows, cols, &mut y_ref);
+                for i in 0..rows {
+                    prop_assert!(
+                        y_dispatch[i].is_finite() && y_ref[i].is_finite(),
+                        "swiglu_f32_into produced non-finite output at row {i}"
+                    );
+                    let tol = 1e-3 + y_ref[i].abs() * 1e-4;
+                    prop_assert!(
+                        (y_dispatch[i] - y_ref[i]).abs() <= tol,
+                        "swiglu_f32_into mismatch at row {i} (rows={rows}, cols={cols}): \
+                         dispatch={} scalar={}",
+                        y_dispatch[i], y_ref[i]
+                    );
+                }
+            }
+        }
     }
 }

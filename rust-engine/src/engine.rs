@@ -288,15 +288,22 @@ impl AlignedKvCache {
     /// when the rolling window is full. `O(seq_len * kv_dim)` byte
     /// moves; cheap relative to one attention sweep.
     fn shift_one_left(&mut self) {
-        let row_bytes = self.kv_dim * std::mem::size_of::<f32>();
-        let live_bytes = (self.seq_len - 1) * row_bytes;
-        if live_bytes == 0 {
+        if self.seq_len == 0 {
             return;
         }
-        let kb = self.keys.as_mut_slice();
-        let vb = self.values.as_mut_slice();
-        kb.copy_within(row_bytes..row_bytes + live_bytes, 0);
-        vb.copy_within(row_bytes..row_bytes + live_bytes, 0);
+        let row_bytes = self.kv_dim * std::mem::size_of::<f32>();
+        let live_bytes = (self.seq_len - 1) * row_bytes;
+        if live_bytes > 0 {
+            let kb = self.keys.as_mut_slice();
+            let vb = self.values.as_mut_slice();
+            kb.copy_within(row_bytes..row_bytes + live_bytes, 0);
+            vb.copy_within(row_bytes..row_bytes + live_bytes, 0);
+        }
+        // Always reflect the eviction in `seq_len`. The early-return
+        // branch above only skips the memcpy when there's nothing
+        // live to keep (window_tokens == 1); the slot count still has
+        // to decrement so the next `append` writes at row 0 and the
+        // window cap is never exceeded.
         self.seq_len -= 1;
     }
 }
@@ -3681,4 +3688,70 @@ mod tests {
         assert_eq!(cache.seq_len(), 0);
         assert_eq!(cache.keys_ptr(), ptr_before, "allocation must be reused");
     }
+
+    /// **Gist Task 2 — proptest for `AlignedKvCache` and the
+    /// `row_floats` slice arithmetic that backs `.key()` / `.value()`.**
+    ///
+    /// Two invariants we want to fuzz:
+    ///   1. `seq_len()` never exceeds `window_tokens()` regardless
+    ///      of how many `append()` calls have been made.
+    ///   2. After any number of appends, `key(i)` / `value(i)` for
+    ///      every `i < seq_len()` returns a slice of length exactly
+    ///      `kv_dim` that lies fully inside the backing
+    ///      `AlignedBuffer`. The row content must equal what was
+    ///      written for the *most recent* `seq_len` appends (i.e.
+    ///      the rolling-window contract).
+    mod aligned_kv_cache_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 48,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn append_respects_window_and_row_slices_are_valid(
+                window_tokens in 1usize..16,
+                kv_dim in 1usize..24,
+                num_appends in 0usize..200,
+            ) {
+                let mut cache = AlignedKvCache::new(window_tokens, kv_dim);
+                // Keep a log of every row written so we can verify
+                // the rolling-window contract against the most
+                // recent `min(num_appends, window_tokens)` entries.
+                let mut history: Vec<(Vec<f32>, Vec<f32>)> = Vec::with_capacity(num_appends);
+                for t in 0..num_appends {
+                    let k: Vec<f32> = (0..kv_dim).map(|j| (t * 1000 + j) as f32).collect();
+                    let v: Vec<f32> = (0..kv_dim).map(|j| (t * 1000 + j) as f32 + 0.25).collect();
+                    cache.append(&k, &v);
+                    history.push((k, v));
+                    // Invariant 1: window cap.
+                    prop_assert!(
+                        cache.seq_len() <= cache.window_tokens(),
+                        "seq_len {} exceeded window {} after {} appends",
+                        cache.seq_len(), cache.window_tokens(), t + 1,
+                    );
+                }
+                // Invariant 2: all live rows have correct length and
+                // hold the most recent values.
+                let live = cache.seq_len();
+                prop_assert_eq!(live, num_appends.min(window_tokens));
+                let history_tail = &history[history.len().saturating_sub(live)..];
+                for i in 0..live {
+                    let k_slice = cache.key(i);
+                    let v_slice = cache.value(i);
+                    prop_assert_eq!(k_slice.len(), kv_dim);
+                    prop_assert_eq!(v_slice.len(), kv_dim);
+                    let (expected_k, expected_v) = &history_tail[i];
+                    for j in 0..kv_dim {
+                        prop_assert_eq!(k_slice[j], expected_k[j]);
+                        prop_assert_eq!(v_slice[j], expected_v[j]);
+                    }
+                }
+            }
+        }
+    }
 }
+// end mod engine::tests

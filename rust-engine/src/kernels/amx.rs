@@ -42,6 +42,21 @@ pub fn cpu_supports_amx() -> bool {
     // stabilised (they were added under the unstable
     // `x86_amx_intrinsics` gate). Until then, fall back to a runtime
     // /proc/cpuinfo probe so the `amx` cargo feature builds on stable.
+    //
+    // Gist Task 3 — when the `nightly-amx` cargo feature is enabled
+    // (along with `stdarch_x86_amx` at the crate root), prefer the
+    // first-class `is_x86_feature_detected!` macro for both runtime
+    // probes. The `/proc/cpuinfo` path remains as a hard fallback
+    // (e.g. running under a sandbox that hides `/proc/cpuinfo` from
+    // the process — `std_detect` itself uses CPUID and doesn't care).
+    #[cfg(feature = "nightly-amx")]
+    {
+        if std::is_x86_feature_detected!("amx-tile")
+            && std::is_x86_feature_detected!("amx-int8")
+        {
+            return true;
+        }
+    }
     cpuinfo_has_flag("amx_tile") && cpuinfo_has_flag("amx_int8")
 }
 
@@ -102,16 +117,26 @@ static AMX_FALLBACK_NOTIFIED: std::sync::OnceLock<()> = std::sync::OnceLock::new
 pub fn init_warn_once() {
     AMX_FALLBACK_NOTIFIED.get_or_init(|| {
         let detected = cpu_supports_amx();
+        // Gist Task 3 — surface the unblocking path so operators
+        // know *exactly* what flag to flip. `nightly-amx` is the
+        // cargo feature that, when paired with a nightly toolchain,
+        // unlocks Rust's `stdarch_x86_amx` intrinsic surface and
+        // lets the AMX kernel run for real. Until then, every
+        // dispatch through this path falls back to AVX-512 / scalar.
+        #[cfg(feature = "nightly-amx")]
+        let nightly = true;
+        #[cfg(not(feature = "nightly-amx"))]
+        let nightly = false;
         tracing::warn!(
             target: "kernels::amx",
             amx_runtime_detected = detected,
+            nightly_amx_feature = nightly,
             "AMX kernel module is compiled (cargo feature `amx`) but the tile-based \
              executor is a structural skeleton; every dispatch through this path \
-             currently routes to the scalar reference kernel. Stable Rust does not \
-             yet expose the AMX tile intrinsics (rust-lang/rust#126622); enable AVX-512 \
-             or recompile against a nightly toolchain that ships a real tile body to \
-             get hardware-accelerated matmul. This warning is emitted at most once \
-             per process.",
+             currently routes to the AVX-512 / scalar fallback kernel. To enable a \
+             real tile-based body, build with `--features nightly-amx` on a nightly \
+             toolchain (unlocks `stdarch_x86_amx`, tracked under rust-lang/rust#126622). \
+             This warning is emitted at most once per process.",
         );
     });
 }
