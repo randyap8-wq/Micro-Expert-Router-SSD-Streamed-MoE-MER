@@ -161,6 +161,27 @@ pub enum ShardRouterError {
     /// variants above. Used by future RDMA / gRPC implementations
     /// for protocol-specific errors.
     Transport { expert: u32, node: NodeAddr, reason: String },
+    /// Batch fetch where some — but not all — of the requested
+    /// experts were delivered. `delivered` is the list of expert ids
+    /// the peer streamed back successfully; the remaining ids in
+    /// `missing` failed (with the per-id reason recorded). The
+    /// scheduler can choose to advance with the delivered subset
+    /// (degraded MoE mixture) and re-issue the missing slice against
+    /// a replica.
+    ///
+    /// Gist Task 1 ("ShardRouter Interface"): this is the variant the
+    /// future `RpcShardRouter` returns when a streaming gRPC call
+    /// completes with `tonic::Status::ok` on the trailing frame but
+    /// individual per-expert sub-responses report an error. Keeping
+    /// it distinct from [`Self::Timeout`] / [`Self::NotFound`] lets
+    /// the scheduler implement a "partial success" fast path
+    /// (continue with what we got) without losing the per-id detail
+    /// needed for retry budgeting.
+    PartialFailure {
+        node: NodeAddr,
+        delivered: Vec<u32>,
+        missing: Vec<(u32, String)>,
+    },
 }
 
 impl std::fmt::Display for ShardRouterError {
@@ -181,6 +202,12 @@ impl std::fmt::Display for ShardRouterError {
             ShardRouterError::Transport { expert, node, reason } => write!(
                 f,
                 "shard transport error: expert {expert} on node {node}: {reason}"
+            ),
+            ShardRouterError::PartialFailure { node, delivered, missing } => write!(
+                f,
+                "shard fetch partially succeeded on node {node}: {} delivered, {} missing",
+                delivered.len(),
+                missing.len(),
             ),
         }
     }
@@ -299,6 +326,160 @@ impl ShardRouter for LocalShardRouter {
     }
 }
 
+// ---------------------------------------------------------------------
+// RpcShardRouter — gist Task 1 ("ShardRouter Interface").
+// ---------------------------------------------------------------------
+
+/// **Future** gRPC-backed [`ShardRouter`] sketch.
+///
+/// This is a **structural skeleton**: it documents the shape an
+/// upcoming `tonic`-based implementation will take so the rest of the
+/// engine can be written against the `ShardRouter` trait surface today
+/// without committing to a transport. The fields are deliberately
+/// `pub(crate)` placeholders — when the real implementation lands they
+/// become a `tonic::transport::Channel` per node plus a
+/// concurrency-bounded client pool.
+///
+/// ### Mapping `tonic::Status` to [`ShardRouterError`]
+///
+/// When the real implementation is wired up, each `tonic::Code` is
+/// translated into a [`ShardRouterError`] variant via [`RpcShardRouter::map_tonic_status`]
+/// (a free helper so it is easy to unit-test independently of any
+/// running gRPC server):
+///
+/// | `tonic::Code`         | [`ShardRouterError`] variant                   |
+/// |-----------------------|------------------------------------------------|
+/// | `DeadlineExceeded`    | [`ShardRouterError::Timeout`]                  |
+/// | `Cancelled`           | [`ShardRouterError::Timeout`]                  |
+/// | `Unavailable`         | [`ShardRouterError::Unreachable`]              |
+/// | `NotFound`            | [`ShardRouterError::NotFound`]                 |
+/// | `Aborted` / partial   | [`ShardRouterError::PartialFailure`]           |
+/// | anything else         | [`ShardRouterError::Transport`]                |
+///
+/// The `PartialFailure` mapping kicks in when a *streaming* RPC closes
+/// with `Code::Ok` on the trailing frame but the per-expert
+/// sub-responses report at least one error: the transport layer
+/// aggregates the delivered / missing ids and surfaces a single
+/// `PartialFailure` rather than dropping the entire batch.
+#[derive(Debug, Clone)]
+pub struct RpcShardRouter {
+    /// Placement map: expert id → node. Today this is an
+    /// `Arc<HashMap<u32, NodeAddr>>`; the per-call deadline is not
+    /// stored alongside the entry but applied uniformly via
+    /// [`Self::default_timeout`]. The real implementation will swap
+    /// in an `arc_swap::ArcSwap<PlacementMap>` so route lookups stay
+    /// lock-free on the hot path.
+    pub(crate) placement: std::sync::Arc<std::collections::HashMap<u32, NodeAddr>>,
+    /// Per-call deadline applied to every remote fetch. The future
+    /// `tonic::Request` is built with `set_timeout(default_timeout)`.
+    pub(crate) default_timeout: Duration,
+}
+
+impl RpcShardRouter {
+    /// Construct a router from a static placement map. Used today
+    /// only by tests; the real implementation will accept a
+    /// configuration source (e.g. an etcd watch) and refresh the map
+    /// behind an `ArcSwap`.
+    pub fn new(
+        placement: std::collections::HashMap<u32, NodeAddr>,
+        default_timeout: Duration,
+    ) -> Self {
+        Self {
+            placement: std::sync::Arc::new(placement),
+            default_timeout,
+        }
+    }
+
+    /// **Free-function form** of the `tonic::Status` → [`ShardRouterError`]
+    /// translation table. Kept as an associated function (rather than
+    /// a method) so unit tests can drive it without instantiating a
+    /// real gRPC channel, and so future implementations can reuse it
+    /// from their streaming-call decoder. The signature uses opaque
+    /// `&str` instead of `tonic::Code` so this skeleton compiles
+    /// without a `tonic` dependency; the real implementation accepts
+    /// a `tonic::Status` directly and forwards the code's Debug name
+    /// (e.g. `format!("{:?}", status.code())`, which yields
+    /// `"DeadlineExceeded"`, `"Unavailable"`, etc.) — *not*
+    /// `status.code().description()`, whose human-readable text would
+    /// not match these arms.
+    pub fn map_tonic_status(
+        expert: u32,
+        node: NodeAddr,
+        code_name: &str,
+        message: &str,
+    ) -> ShardRouterError {
+        match code_name {
+            "DeadlineExceeded" | "Cancelled" => {
+                ShardRouterError::Timeout { expert, node }
+            }
+            "Unavailable" => ShardRouterError::Unreachable {
+                expert,
+                node,
+                reason: message.to_string(),
+            },
+            "NotFound" => ShardRouterError::NotFound { expert, node },
+            // "Aborted" + a per-expert partial-result payload is the
+            // streaming-call partial-success path; the real
+            // implementation reads the per-expert sub-status list off
+            // the trailing frame here. The skeleton surfaces an empty
+            // partial-failure to make the mapping testable.
+            "Aborted" => ShardRouterError::PartialFailure {
+                node,
+                delivered: Vec::new(),
+                missing: vec![(expert, message.to_string())],
+            },
+            other => ShardRouterError::Transport {
+                expert,
+                node,
+                reason: format!("{other}: {message}"),
+            },
+        }
+    }
+}
+
+impl ShardRouter for RpcShardRouter {
+    fn name(&self) -> &'static str {
+        "rpc-tonic-stub"
+    }
+
+    fn route_expert(&self, expert: u32) -> ShardInstruction {
+        match self.placement.get(&expert) {
+            Some(node) => ShardInstruction::Remote {
+                expert,
+                node: node.clone(),
+                timeout: self.default_timeout,
+            },
+            None => ShardInstruction::Local { expert },
+        }
+    }
+
+    fn fetch_remote<'a>(
+        &'a self,
+        instruction: &'a ShardInstruction,
+    ) -> ShardFetchFuture<'a> {
+        Box::pin(async move {
+            match instruction {
+                ShardInstruction::Local { .. } => Ok(()),
+                ShardInstruction::Remote { expert, node, .. } => {
+                    // The real implementation issues a
+                    // `tonic::Client::fetch_expert(ExpertRequest { id })`
+                    // here, then funnels the `Result<_, tonic::Status>`
+                    // through `Self::map_tonic_status`. Until that lands
+                    // the stub returns `Unreachable` so callers exercising
+                    // this path against the skeleton see a structured
+                    // failure rather than a panic.
+                    Err(ShardRouterError::Unreachable {
+                        expert: *expert,
+                        node: node.clone(),
+                        reason: "RpcShardRouter is a skeleton; tonic client not yet wired"
+                            .to_string(),
+                    })
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +541,68 @@ mod tests {
         assert!(s.contains("remote shard fetch failed"), "got: {s}");
         assert!(s.contains("expert 7"), "got: {s}");
         assert!(s.contains("peer-2"), "got: {s}");
+    }
+
+    #[test]
+    fn partial_failure_display_shows_counts() {
+        let pf = ShardRouterError::PartialFailure {
+            node: NodeAddr("peer-3".into()),
+            delivered: vec![1, 2, 5],
+            missing: vec![(7, "EOF".into()), (9, "decode".into())],
+        };
+        let s = format!("{pf}");
+        assert!(s.contains("peer-3"), "got: {s}");
+        assert!(s.contains("3 delivered"), "got: {s}");
+        assert!(s.contains("2 missing"), "got: {s}");
+    }
+
+    #[test]
+    fn rpc_router_maps_tonic_status_codes() {
+        let node = NodeAddr("peer-x".into());
+        // DeadlineExceeded → Timeout
+        match RpcShardRouter::map_tonic_status(1, node.clone(), "DeadlineExceeded", "deadline") {
+            ShardRouterError::Timeout { expert, .. } => assert_eq!(expert, 1),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        // Unavailable → Unreachable
+        match RpcShardRouter::map_tonic_status(2, node.clone(), "Unavailable", "conn refused") {
+            ShardRouterError::Unreachable { expert, reason, .. } => {
+                assert_eq!(expert, 2);
+                assert!(reason.contains("conn refused"));
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+        // NotFound → NotFound
+        match RpcShardRouter::map_tonic_status(3, node.clone(), "NotFound", "n/a") {
+            ShardRouterError::NotFound { expert, .. } => assert_eq!(expert, 3),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        // Aborted → PartialFailure
+        match RpcShardRouter::map_tonic_status(4, node.clone(), "Aborted", "stream end") {
+            ShardRouterError::PartialFailure { missing, .. } => {
+                assert_eq!(missing.len(), 1);
+                assert_eq!(missing[0].0, 4);
+            }
+            other => panic!("expected PartialFailure, got {other:?}"),
+        }
+        // Unknown → Transport
+        match RpcShardRouter::map_tonic_status(5, node, "Internal", "boom") {
+            ShardRouterError::Transport { expert, reason, .. } => {
+                assert_eq!(expert, 5);
+                assert!(reason.contains("Internal"));
+                assert!(reason.contains("boom"));
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_router_local_passthrough_when_unmapped() {
+        // An id not present in the placement map routes locally and
+        // the stub `fetch_remote` is a no-op for `Local`.
+        let r = RpcShardRouter::new(std::collections::HashMap::new(), Duration::from_millis(10));
+        let inst = r.route_expert(42);
+        assert!(inst.is_local());
+        r.fetch_remote(&inst).await.expect("local passthrough");
     }
 }

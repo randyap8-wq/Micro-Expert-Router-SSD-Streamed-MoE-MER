@@ -133,4 +133,81 @@ mod tests {
     fn rejects_size_not_multiple_of_alignment() {
         let _ = AlignedBuffer::new(4097, 4096);
     }
+
+    /// **Gist Task 2 — proptest for `AlignedBuffer` slice
+    /// arithmetic.**
+    ///
+    /// For any (size, align) pair that respects the constructor
+    /// preconditions (align is a power of two, size > 0, and size
+    /// is a multiple of align), the returned buffer must:
+    ///   * be aligned to `align` (the whole point of `O_DIRECT`),
+    ///   * expose a slice of exactly `size` bytes,
+    ///   * start out zeroed,
+    ///   * survive arbitrary in-bounds reads/writes through
+    ///     `as_mut_slice()` without buffer overruns. This indirectly
+    ///     fuzzes the slice arithmetic used by callers like
+    ///     `AlignedKvCache::row_floats`, which does
+    ///     `&buf[pos*row_bytes .. pos*row_bytes+row_bytes]` then
+    ///     reinterprets as `&[f32]`.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 64,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn arbitrary_aligned_buffers_are_aligned_zeroed_and_indexable(
+                // Restrict alignment to plausible block sizes
+                // (powers of two from 512 B to 16 KiB).
+                align_shift in 9u32..15,
+                // Multiplier picks `size = align * mul` so the
+                // "size must be a multiple of align" precondition
+                // always holds.
+                mul in 1usize..32,
+                // Per-row stride and number of rows for the slice-
+                // arithmetic check.
+                rows in 1usize..8,
+            ) {
+                let align = 1usize << align_shift;
+                let size = align * mul;
+                let mut buf = AlignedBuffer::new(size, align);
+                prop_assert_eq!(buf.len(), size);
+                prop_assert_eq!(buf.align(), align);
+                prop_assert_eq!(buf.as_slice().as_ptr() as usize % align, 0);
+                prop_assert!(buf.iter().all(|&b| b == 0), "fresh buffer must be zeroed");
+
+                // Slice-arithmetic exercise: divide the buffer into
+                // `rows` equal stripes and write a per-row marker
+                // byte, then read it back to confirm in-bounds
+                // access never overruns the allocation.
+                let row_bytes = size / rows.max(1);
+                if row_bytes > 0 {
+                    let slice = buf.as_mut_slice();
+                    for r in 0..rows {
+                        let start = r * row_bytes;
+                        let end = start + row_bytes;
+                        if end > slice.len() { break; }
+                        for b in &mut slice[start..end] {
+                            *b = (r as u8).wrapping_add(0x55);
+                        }
+                    }
+                    let read = buf.as_slice();
+                    for r in 0..rows {
+                        let start = r * row_bytes;
+                        let end = start + row_bytes;
+                        if end > read.len() { break; }
+                        let want = (r as u8).wrapping_add(0x55);
+                        prop_assert!(
+                            read[start..end].iter().all(|&b| b == want),
+                            "row {r} arithmetic failed: stride {row_bytes}",
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

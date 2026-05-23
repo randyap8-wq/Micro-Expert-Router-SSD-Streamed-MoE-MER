@@ -13,6 +13,16 @@
 //! cross-module dependencies should be reached from
 //! `tests/` via the binary itself rather than re-exported.
 
+// Gist Task 3 — "Nightly AMX feature gating". Opt-in unstable feature
+// flag that unlocks Rust's `stdarch_x86_amx` intrinsic surface
+// (`_tile_loadd`, `_tile_dpbssd`, `_tile_stored`, …). When the
+// `nightly-amx` cargo feature is OFF (the default), this attribute
+// expands to nothing and the crate continues to build on stable Rust;
+// the AMX dispatch path then falls back to the existing AVX-512
+// kernel via [`crate::kernels::detect`]. Required on both crate
+// roots (`lib.rs` and `main.rs`) because the bin and the lib are
+// compiled as separate crates from this same source tree.
+#![cfg_attr(feature = "nightly-amx", feature(stdarch_x86_amx))]
 #![allow(dead_code)]
 
 pub mod block_pool;

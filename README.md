@@ -211,8 +211,21 @@ experts, no high-end AI GPU required):
   `tracing::warn!` line at startup (latched by a `OnceLock` so it
   fires at most once per process — verbosity-safe even in
   high-throughput deployments) informing operators that every AMX
-  dispatch currently falls back to the scalar reference kernel
+  dispatch currently falls back to the AVX-512 / scalar kernel
   until `rust-lang/rust#126622` stabilises the tile intrinsics.
+* `--features nightly-amx` — opt-in, **requires a nightly Rust
+  toolchain**. Implies `amx` (so the skeleton, runtime probe, and
+  dispatcher all compile in) and additionally adds
+  `#![feature(stdarch_x86_amx)]` at the crate root, unlocking Rust's
+  unstable AMX intrinsic surface (`_tile_loadd`, `_tile_dpbssd`,
+  `_tile_stored`, …). Switches the runtime probe in
+  `kernels::amx::cpu_supports_amx` to the first-class
+  `is_x86_feature_detected!("amx-tile")` path (with the
+  `/proc/cpuinfo` probe kept as a hard fallback). When this feature
+  is **not** enabled — or when the host's runtime probe reports no
+  AMX — the dispatcher transparently falls back to the existing
+  AVX-512 kernel, so production stable-toolchain builds keep
+  working without any changes.
 * `--features gpu` — opt-in. Builds the
   [`backend::GpuBackend`](rust-engine/src/backend/mod.rs) integration
   seam for a future budget-GPU compute path, alongside the
@@ -302,7 +315,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`, plus the operator endpoints `GET /v1/admin/health/experts` and `POST /v1/admin/evict`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
 | `middleware` | Production-readiness HTTP middleware layered onto the `server` router via `axum::middleware::from_fn_with_state`: per-request UUID tracing span, optional **API-key gate** (`[security].api_keys`; `401` when configured and missing/unknown), optional **per-key token-bucket rate limit** (`rate_limit_rps` / `rate_limit_burst`; `429` on overflow), and **admission control** (`[server].max_concurrent_requests`, `[server].admission_min_free_blocks` against the paged-KV pool; `503` when saturated). Defaults are fully permissive so legacy benchmark / development flows are byte-identical. |
 | `rpc` | Sharded `RouteExperts` RPC scaffold (gist Part 4): the deterministic `shard_for_expert` routing function plus the packed `RouteExpertsRequest` / `RouteExpertsResponse` wire frames documented in `docs/distributed.md`. Transport-agnostic on purpose — `tonic` / `prost` are intentionally not pulled into the dependency graph so the CPU-only build stays slim; a concrete transport plugs in by serialising these frames over whatever the deployment already runs. |
-| `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`) wrapped in `InferenceError::RemoteShardFetchFailed`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports (gRPC, RDMA, …) plug in by implementing the trait. |
+| `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`, `PartialFailure { node, delivered, missing }` — the last covers streaming-gRPC partial-success responses where some experts arrived and others did not) wrapped in `InferenceError::RemoteShardFetchFailed`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports plug in by implementing the trait. A `RpcShardRouter` skeleton ships with a `map_tonic_status` helper translating tonic status codes (`DeadlineExceeded`/`Cancelled` → `Timeout`, `Unavailable` → `Unreachable`, `NotFound` → `NotFound`, `Aborted` → `PartialFailure`, others → `Transport`) into the trait's error variants, ready for a gRPC client wire-up. |
 | `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-predictor`, `serve`, and (with `--features tui`, on by default) `monitor` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2,...` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
 
 ### Key design decisions
@@ -563,6 +576,7 @@ cargo build --release --features io_uring   # Linux: enables IoUringStorage
 cargo build --release --features blas       # matrixmultiply SGEMV microkernel for the dense matmul
 cargo build --release --features avx512     # build AVX-512 int8-dequant + dot kernels, plus AVX-512 VNNI int8×int8 dot
 cargo build --release --features amx        # build AMX tile-hint plumbing (executor still falls back)
+cargo +nightly build --release --features nightly-amx  # nightly Rust: implies `amx` + unlocks `stdarch_x86_amx` for the real tile intrinsics; falls back to AVX-512 when the runtime probe doesn't see AMX
 cargo build --release --features gpu        # build the budget-GPU offload integration seam (GpuBackend) — pair with `[real_transformer].compute_offload = "gpu"` in config.toml
 cargo build --release --features tokenizer  # real HuggingFace tokenizer (pulls in `onig`)
 ```
@@ -1070,7 +1084,18 @@ remote router is installed. Remote fetches return a boxed
 decide whether to retry, fall back to a local replica or fail the
 request. The scaffolding is intentionally minimal — wire transports
 (gRPC, RDMA, …) plug in as new `ShardRouter` impls without touching
-the hot inference path.
+the hot inference path. A `PartialFailure { node, delivered,
+missing }` variant covers streaming-gRPC responses where some
+experts in a batched fetch arrived and others did not — callers can
+react by retrying just the `missing` IDs against another replica
+instead of throwing away the `delivered` results. A `RpcShardRouter`
+skeleton ships with a `map_tonic_status` helper that translates
+tonic status codes into the trait's error variants
+(`DeadlineExceeded` / `Cancelled` → `Timeout`, `Unavailable` →
+`Unreachable`, `NotFound` → `NotFound`, `Aborted` → `PartialFailure`,
+everything else → `Transport`), so a real gRPC client wire-up only
+has to populate the placement map and call the helper from its
+`fetch_remote` body.
 
 Tokenization is via the [`tokenizers`] crate when the optional
 `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured,
@@ -1693,6 +1718,49 @@ Covers:
   samples from logits, and the empty-prompt error path returns
   `400 Bad Request`.
 
+### Property-based tests
+
+Building on the example-based suite above, the engine ships a
+[`proptest`] harness (dev-dependency only — production builds do
+not pull it in) that fuzzes three contracts which are very easy to
+get wrong with a handful of hand-picked unit tests:
+
+- **Kernel dispatch** (`src/kernels/mod.rs`). `dot_f32` and
+  `swiglu_f32_into` must match the scalar reference within a small
+  tolerance for any input length / shape, in particular for `cols`
+  values that are NOT multiples of the SIMD lane width (8 on AVX-2,
+  16 on AVX-512) so the scalar-tail path is exercised.
+- **`AlignedKvCache`** (`src/engine.rs`). For arbitrary
+  `window_tokens` / `kv_dim` and any number of `append` calls,
+  `seq_len()` never exceeds `window_tokens()`, and the live
+  `key(i)` / `value(i)` rows always reflect the most recent
+  `min(num_appends, window_tokens)` entries — i.e. the rolling-
+  window contract holds end-to-end through `row_floats`. (This
+  proptest caught a real off-by-one in `shift_one_left` for the
+  `window_tokens == 1` boundary; see commit history.)
+- **`AlignedBuffer`** (`src/aligned_buffer.rs`). For any
+  `(size, align)` pair that respects the constructor preconditions,
+  the returned buffer is aligned, zeroed, exactly `size` bytes long,
+  and survives arbitrary in-bounds reads/writes through
+  `as_mut_slice()` without overruns — fuzzing the slice arithmetic
+  that backs every `O_DIRECT` consumer.
+
+[`proptest`]: https://crates.io/crates/proptest
+
+### GPU promotion regression test
+
+`Engine::moe_step` is responsible for emitting **exactly one**
+`(expert_id, ExpertResident)` message on the
+`gpu_promotion_tx` mpsc channel after `promote_after_hits` RAM hits
+on the same expert — the crossing is edge-triggered so subsequent
+hits must NOT re-fire the promotion. A dedicated unit test
+(`moe_step_emits_exactly_one_gpu_promotion_after_threshold_hits`)
+installs the channel via a test-only helper that skips spawning the
+background consumer task, then drives `moe_step` past the threshold
+and asserts on the raw mpsc traffic. This guards against silent
+regressions in the three-tier SSD → RAM → VRAM promotion logic.
+
+
 ---
 
 ## Energy Efficiency Features
@@ -2172,11 +2240,17 @@ are:
   with the appropriate target.
 - **AMX tile intrinsics.** `--features amx` compiles in the Intel
   AMX tile skeleton in `src/kernels/`, but currently routes back to
-  the scalar path on stable Rust until the tile intrinsics
-  stabilise. The runtime dispatcher already selects between the
-  scalar reference path, AVX2+FMA (always compiled on x86_64), and
-  AVX-512 (`--features avx512`); AMX will slot into the same
-  dispatcher once the intrinsics land.
+  the AVX-512 / scalar path on stable Rust until the tile intrinsics
+  stabilise. To unblock the real tile-based body today, build with
+  `--features nightly-amx` on a nightly toolchain — that opt-in
+  feature flips `#![feature(stdarch_x86_amx)]` on at the crate root
+  and switches the runtime probe to the first-class
+  `is_x86_feature_detected!("amx-tile")` macro. When `nightly-amx`
+  is off (the default) or the runtime probe does not see AMX, the
+  dispatcher transparently falls back to the existing AVX-512
+  kernel. The runtime dispatcher already selects between the scalar
+  reference path, AVX2+FMA (always compiled on x86_64), and AVX-512
+  (`--features avx512`); AMX slots into the same dispatcher.
 - **Per-NUMA-node io_uring rings.** `MER_PIN_CORES=N` is honoured at
   startup to `sched_setaffinity(2)` the process to the first `N`
   CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn
