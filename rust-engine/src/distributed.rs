@@ -363,9 +363,11 @@ impl ShardRouter for LocalShardRouter {
 /// `PartialFailure` rather than dropping the entire batch.
 #[derive(Debug, Clone)]
 pub struct RpcShardRouter {
-    /// Placement map: expert id → (node, deadline). Today this is a
-    /// `Vec<(u32, NodeAddr)>`; the real implementation will swap in
-    /// an `arc_swap::ArcSwap<PlacementMap>` so route lookups stay
+    /// Placement map: expert id → node. Today this is an
+    /// `Arc<HashMap<u32, NodeAddr>>`; the per-call deadline is not
+    /// stored alongside the entry but applied uniformly via
+    /// [`Self::default_timeout`]. The real implementation will swap
+    /// in an `arc_swap::ArcSwap<PlacementMap>` so route lookups stay
     /// lock-free on the hot path.
     pub(crate) placement: std::sync::Arc<std::collections::HashMap<u32, NodeAddr>>,
     /// Per-call deadline applied to every remote fetch. The future
@@ -395,7 +397,11 @@ impl RpcShardRouter {
     /// from their streaming-call decoder. The signature uses opaque
     /// `&str` instead of `tonic::Code` so this skeleton compiles
     /// without a `tonic` dependency; the real implementation accepts
-    /// a `tonic::Status` directly and forwards `status.code().description()`.
+    /// a `tonic::Status` directly and forwards the code's Debug name
+    /// (e.g. `format!("{:?}", status.code())`, which yields
+    /// `"DeadlineExceeded"`, `"Unavailable"`, etc.) — *not*
+    /// `status.code().description()`, whose human-readable text would
+    /// not match these arms.
     pub fn map_tonic_status(
         expert: u32,
         node: NodeAddr,

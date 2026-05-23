@@ -49,6 +49,15 @@ pub fn cpu_supports_amx() -> bool {
     // probes. The `/proc/cpuinfo` path remains as a hard fallback
     // (e.g. running under a sandbox that hides `/proc/cpuinfo` from
     // the process — `std_detect` itself uses CPUID and doesn't care).
+    //
+    // NOTE: this CPUID-based shortcut only affects the warning/probe
+    // path exposed by `cpu_supports_amx()`. Kernel backend selection
+    // (`kernels::detect()` via `super::cpu_features()`) still derives
+    // `amx_tile` / `amx_int8` exclusively from `/proc/cpuinfo`, so in
+    // environments where `/proc/cpuinfo` is filtered the dispatcher
+    // will not pick AMX even when this function returns `true`.
+    // Wiring CPUID into `cpu_features()` under `nightly-amx` is
+    // tracked separately.
     #[cfg(feature = "nightly-amx")]
     {
         if std::is_x86_feature_detected!("amx-tile")
