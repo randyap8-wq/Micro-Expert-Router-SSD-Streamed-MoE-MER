@@ -972,6 +972,40 @@ max_fetch_yields = 128              # gist feedback #1.3 — Engine::fetch_once 
 max_overflow_capacity = 0           # gist Part 1 fix #5 — BlockPool overflow admission cap (0 = unbounded)
 ```
 
+##### How `[real_transformer]` and `[predictive]` interact
+
+The two TOML tables are independent layers and can be toggled
+separately:
+
+* **`[real_transformer]`** decides *what runs the per-token loop*:
+  the full `embedding → attn → MoE → LM head` decoder
+  (`enabled = true`) or the legacy synthetic generator that drives
+  `Engine::generate` directly (`enabled = false`).
+* **`[predictive]`** decides *what feeds the speculative-I/O
+  union-fetch* `E = S ∪ L ∪ M` that overlaps the next token's expert
+  reads with the current token's compute. `S` (Markov `PredictiveLoader`)
+  is always on; `L` (`LocalityMonitor`) and `M` (`NeuralSpeculator`) are
+  opt-in via `locality_enabled` / `speculator_enabled`.
+
+Both layers funnel their expert reads through the same `Engine` (and
+therefore the same `ExpertCache`, `BufferPool`, `NvmeStorage` /
+`IoUringStorage`, and `BatchScheduler`), so the `[predictive]` arms
+work identically whether the per-token loop is the real decoder or
+the synthetic benchmark path. The four useful combinations:
+
+| `[real_transformer].enabled` | `[predictive]` arms on | Behaviour |
+| --- | --- | --- |
+| `false` | none | Legacy synthetic benchmark, Markov-only prefetch. The original `Engine::generate` golden path. |
+| `false` | `L` and/or `M` | Benchmark loop with the predictive union-fetch active. Useful for ablating `L` / `M` against the Markov baseline without the cost of the dense backbone. |
+| `true`  | none | Real decoder, Markov-only prefetch. Smallest config for end-to-end inference on real weights. |
+| `true`  | `L` and/or `M` | Production preset: real decoder plus the full three-signal predictor. The `BatchScheduler`'s pre-pass warm and `Engine::union_prefetch` both consume `S ∪ L ∪ M`. |
+
+Telemetry surfaces the combination automatically: the
+`predictive:` line in `print_summary` (and the
+`mer_locality_*` / `mer_speculator_*` / `mer_ssd_stall_seconds`
+metrics on `/metrics`) only appears when the corresponding `[predictive]`
+arm is enabled, independent of whether `[real_transformer]` is on.
+
 ##### Paged KV cache (block pool)
 
 When the real-transformer pipeline is enabled the per-layer KV
@@ -1295,6 +1329,25 @@ micro-expert-router gguf-convert
 micro-expert-router validate-predictor
   --trace <PATH>             JSONL trace from `run --trace-out`
   --cache-slots <N>...       Cache sizes to sweep (default: 2 4 8 16)
+
+micro-expert-router serve
+  --config <PATH>            TOML config file (see `config.toml` at the
+                              repository root). Drives the OpenAI-compatible
+                              HTTP server: `POST /v1/completions`,
+                              `POST /v1/chat/completions`, and Prometheus
+                              metrics on `GET /metrics`. All engine flags
+                              that `run` accepts on the CLI are configured
+                              here under `[server]`, `[model]`, `[storage]`,
+                              `[tokenizer]`, `[real_transformer]`,
+                              `[predictive]`, and `[gpu_cache]`.
+
+micro-expert-router monitor          # requires `--features tui` (on by default)
+  --url <URL>                Base URL of a running `serve` instance
+                              (default `http://127.0.0.1:8080`). Polls
+                              `/v1/admin/health/experts` and renders the
+                              live SSD → RAM → VRAM dashboard described in
+                              the `monitor` subcommand section below.
+  --refresh-ms <MS>          Dashboard refresh interval (default 500).
 ```
 
 ### Running on real Mixtral weights
