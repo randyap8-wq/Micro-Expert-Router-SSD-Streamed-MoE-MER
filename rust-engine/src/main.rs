@@ -373,6 +373,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // background thread spawns so child threads inherit the affinity
     // mask. See `numa::apply_mer_pin_cores_env` for the contract.
     let pin = crate::numa::apply_mer_pin_cores_env();
+    let startup_pinned = matches!(pin, crate::numa::PinResult::Pinned { .. });
     info!("{}", pin.as_log_line());
 
     // `MER_PIN_CORES` is now consumed centrally at process start via the
@@ -452,7 +453,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
                         .ok_or_else(|| format!("--dtype: unknown value {dtype:?} (use 'f32' or 'f16')"))?;
-                    cmd_run(RunArgs {
+                    cmd_run(
+                        RunArgs {
                         data_dir,
                         num_experts,
                         expert_size,
@@ -481,7 +483,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         router_matrix,
                         gate_weights,
                         trace_out,
-                    })
+                        },
+                        startup_pinned,
+                    )
                     .await
                 } else {
                     unreachable!()
@@ -1171,7 +1175,7 @@ struct RunArgs {
     trace_out: Option<PathBuf>,
 }
 
-async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn std::error::Error>> {
     // 0) If `metadata.json` exists alongside the expert blobs (e.g. as
     //    written by `scripts/extract_mixtral_experts.py`), use it to fill
     //    in any args the user didn't override on the command line. We
@@ -1305,19 +1309,18 @@ async fn cmd_run(mut args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         // owns CPU 0 to avoid cross-socket DRAM hops on every io_uring
         // completion. Honored only on Linux.
         //
-        // Note: `MER_PIN_CORES` is consumed centrally at process start
-        // (see `numa::apply_mer_pin_cores_env` in `main`) and then
-        // cleared, so re-reading it here would be dead code (gist
-        // feedback #2.3). Instead the io_uring path always pins to
-        // `min(8, available_parallelism)` cores when enabled — a
-        // reasonable starting point for a single-socket workstation
-        // and required for stable completion-queue latency.
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8);
-        if let Err(e) = pin_to_local_cores(n) {
-            warn!(error = %e, "could not set CPU affinity (continuing without pinning)");
+        // Respect startup `MER_PIN_CORES` affinity if it already pinned
+        // the process; otherwise fall back to the io_uring default.
+        if startup_pinned {
+            info!("startup affinity already applied; skipping io_uring repin");
+        } else {
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(8);
+            if let Err(e) = pin_to_local_cores(n) {
+                warn!(error = %e, "could not set CPU affinity (continuing without pinning)");
+            }
         }
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
@@ -2111,17 +2114,6 @@ async fn cmd_validate_predictor(
     // for token T+1, etc. — which is what the LRU saw in production.
     records.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
-    // Group sorted records into per-layer buckets *after* sorting
-    // so the Markov accuracy pass downstream still sees one
-    // monotone-in-token sequence per layer.
-    let mut tokens_per_layer: std::collections::BTreeMap<u32, Vec<Vec<u32>>> = Default::default();
-    for (_token, layer, experts) in &records {
-        tokens_per_layer
-            .entry(*layer)
-            .or_default()
-            .push(experts.clone());
-    }
-
     // Per-cache-size simulation: maintain a single LRU shared across
     // *all* layers in the trace and count hits. This matches
     // `scripts/compute_transition_matrix.py::simulate_lru`, which
@@ -2172,6 +2164,14 @@ async fn cmd_validate_predictor(
             0.0
         };
         println!("  cache_slots={k:>3}  hit_rate={rate:>6.3}  hits={hits}/{total}");
+    }
+
+    // Group sorted records into per-layer buckets *after* the LRU
+    // replay so we can consume `records` without cloning each `experts`
+    // vector.
+    let mut tokens_per_layer: std::collections::BTreeMap<u32, Vec<Vec<u32>>> = Default::default();
+    for (_token, layer, experts) in records.into_iter() {
+        tokens_per_layer.entry(layer).or_default().push(experts);
     }
 
     // Top-1 / Top-2 predictor accuracy: replay one-step-ahead via a
