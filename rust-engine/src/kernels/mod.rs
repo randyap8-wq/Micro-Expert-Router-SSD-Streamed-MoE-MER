@@ -160,10 +160,20 @@ fn probe_cpu() -> CpuFeatures {
     f.avx512vnni = std::is_x86_feature_detected!("avx512vnni");
     // `is_x86_feature_detected!("amx-tile")` is gated behind the
     // unstable `x86_amx_intrinsics` feature on stable Rust as of
-    // 1.84, so we additionally consult /proc/cpuinfo on Linux.
+    // 1.84, so we additionally consult /proc/cpuinfo on Linux. When
+    // the `nightly-amx` cargo feature is enabled we also consult the
+    // first-class CPUID-based probe so kernel backend selection stays
+    // consistent with `amx::cpu_supports_amx()` in environments where
+    // `/proc/cpuinfo` is filtered (e.g. sandboxes).
     f.amx_tile = cpuinfo_has_flag("amx_tile");
     f.amx_int8 = cpuinfo_has_flag("amx_int8");
     f.amx_bf16 = cpuinfo_has_flag("amx_bf16");
+    #[cfg(feature = "nightly-amx")]
+    {
+        f.amx_tile = f.amx_tile || std::is_x86_feature_detected!("amx-tile");
+        f.amx_int8 = f.amx_int8 || std::is_x86_feature_detected!("amx-int8");
+        f.amx_bf16 = f.amx_bf16 || std::is_x86_feature_detected!("amx-bf16");
+    }
     if let Some((vendor, model)) = cpuinfo_vendor_model() {
         f.sapphire_rapids_or_newer = is_sapphire_rapids_or_newer(&model);
         f.vendor = vendor;
