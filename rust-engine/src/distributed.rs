@@ -353,14 +353,19 @@ impl ShardRouter for LocalShardRouter {
 /// | `Cancelled`           | [`ShardRouterError::Timeout`]                  |
 /// | `Unavailable`         | [`ShardRouterError::Unreachable`]              |
 /// | `NotFound`            | [`ShardRouterError::NotFound`]                 |
-/// | `Aborted` / partial   | [`ShardRouterError::PartialFailure`]           |
+/// | `Aborted`             | [`ShardRouterError::Transport`] (see note below) |
 /// | anything else         | [`ShardRouterError::Transport`]                |
 ///
-/// The `PartialFailure` mapping kicks in when a *streaming* RPC closes
-/// with `Code::Ok` on the trailing frame but the per-expert
-/// sub-responses report at least one error: the transport layer
-/// aggregates the delivered / missing ids and surfaces a single
-/// `PartialFailure` rather than dropping the entire batch.
+/// `PartialFailure` is reserved for the *application-level* streaming
+/// path: when a streaming RPC closes with `Code::Ok` on the trailing
+/// frame but the per-expert sub-responses report at least one error,
+/// the transport layer aggregates the delivered / missing ids and
+/// surfaces a single `PartialFailure` rather than dropping the entire
+/// batch. `tonic::Code::Aborted` is a *transactional* abort (e.g. a
+/// contention abort from a transactional expert store), not a
+/// partial-batch signal, so it is mapped to `Transport` here. True
+/// partial-batch detection happens at the application payload level,
+/// not the tonic status code.
 #[derive(Debug, Clone)]
 pub struct RpcShardRouter {
     /// Placement map: expert id → node. Today this is an
@@ -418,15 +423,27 @@ impl RpcShardRouter {
                 reason: message.to_string(),
             },
             "NotFound" => ShardRouterError::NotFound { expert, node },
-            // "Aborted" + a per-expert partial-result payload is the
-            // streaming-call partial-success path; the real
-            // implementation reads the per-expert sub-status list off
-            // the trailing frame here. The skeleton surfaces an empty
-            // partial-failure to make the mapping testable.
-            "Aborted" => ShardRouterError::PartialFailure {
+            // `tonic::Code::Aborted` is a *transactional* abort (e.g.
+            // a contention abort from a transactional expert store),
+            // not a partial-batch success signal. True partial-batch
+            // detection happens at the application payload level: a
+            // streaming RPC delivers `Code::Ok` on the trailing frame
+            // and the per-expert sub-status list (read by the
+            // streaming-call decoder) is what determines whether to
+            // surface `PartialFailure`. So at the `tonic::Status`
+            // level we treat `Aborted` as a transport failure and
+            // leave `PartialFailure` construction to the payload
+            // decoder.
+            //
+            // TODO: when the real streaming-call decoder lands (see
+            // module-level docs on `RpcShardRouter`), it should
+            // inspect the per-expert sub-status list on the trailing
+            // frame and emit `ShardRouterError::PartialFailure`
+            // directly — not via this mapping.
+            "Aborted" => ShardRouterError::Transport {
+                expert,
                 node,
-                delivered: Vec::new(),
-                missing: vec![(expert, message.to_string())],
+                reason: format!("Aborted: {message}"),
             },
             other => ShardRouterError::Transport {
                 expert,
@@ -577,13 +594,15 @@ mod tests {
             ShardRouterError::NotFound { expert, .. } => assert_eq!(expert, 3),
             other => panic!("expected NotFound, got {other:?}"),
         }
-        // Aborted → PartialFailure
+        // Aborted → Transport (transactional abort, not partial-batch;
+        // true partial-batch detection happens at the payload level)
         match RpcShardRouter::map_tonic_status(4, node.clone(), "Aborted", "stream end") {
-            ShardRouterError::PartialFailure { missing, .. } => {
-                assert_eq!(missing.len(), 1);
-                assert_eq!(missing[0].0, 4);
+            ShardRouterError::Transport { expert, reason, .. } => {
+                assert_eq!(expert, 4);
+                assert!(reason.contains("Aborted"));
+                assert!(reason.contains("stream end"));
             }
-            other => panic!("expected PartialFailure, got {other:?}"),
+            other => panic!("expected Transport, got {other:?}"),
         }
         // Unknown → Transport
         match RpcShardRouter::map_tonic_status(5, node, "Internal", "boom") {

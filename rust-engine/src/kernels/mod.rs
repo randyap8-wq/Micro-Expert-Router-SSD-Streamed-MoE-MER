@@ -56,6 +56,9 @@
 
 pub mod scalar;
 
+mod cpuinfo;
+use cpuinfo::{cpuinfo_has_flag, read_proc_cpuinfo};
+
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
 
@@ -240,13 +243,6 @@ fn is_sapphire_rapids_or_newer(model: &str) -> bool {
     SKU_TOKENS.iter().any(|tok| s.contains(tok))
 }
 
-fn cpuinfo_has_flag(flag: &str) -> bool {
-    let Some(s) = read_proc_cpuinfo() else { return false };
-    s.lines()
-        .filter(|l| l.starts_with("flags") || l.starts_with("Features"))
-        .any(|l| l.split_whitespace().any(|tok| tok == flag))
-}
-
 fn cpuinfo_vendor_model() -> Option<(String, String)> {
     let s = read_proc_cpuinfo()?;
     let mut vendor = None;
@@ -263,14 +259,6 @@ fn cpuinfo_vendor_model() -> Option<(String, String)> {
     }
     Some((vendor.unwrap_or_else(|| "unknown".into()),
           model.unwrap_or_else(|| "unknown".into())))
-}
-
-fn read_proc_cpuinfo() -> Option<String> {
-    use std::io::Read;
-    let mut s = String::new();
-    let mut f = std::fs::File::open("/proc/cpuinfo").ok()?;
-    f.read_to_string(&mut s).ok()?;
-    Some(s)
 }
 
 /// Runtime CPU-feature probe. Order of preference:
