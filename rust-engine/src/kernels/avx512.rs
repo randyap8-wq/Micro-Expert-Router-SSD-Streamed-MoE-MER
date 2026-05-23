@@ -32,6 +32,16 @@ use std::arch::x86_64::*;
 pub unsafe fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let n = a.len();
+    // Defensive bound-check (gist feedback #1.1): see the matching
+    // assertion in [`super::avx2::dot_f32_avx2`]. The unrolled loop is
+    // already safe for any `n` (including `0` and `1`), but pinning
+    // the invariants here makes a future refactor that breaks pointer
+    // arithmetic fail loudly in debug builds.
+    debug_assert!(
+        n == 0 || (a.as_ptr() as usize % core::mem::align_of::<f32>() == 0
+            && b.as_ptr() as usize % core::mem::align_of::<f32>() == 0),
+        "dot_f32_avx512: non-empty slices must be `f32`-aligned"
+    );
     // Four independent f32x16 accumulators — 64 lanes per iteration,
     // breaks the FMA latency chain on the issue port.
     let mut acc0 = _mm512_setzero_ps();
