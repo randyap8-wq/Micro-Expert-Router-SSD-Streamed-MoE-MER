@@ -48,11 +48,11 @@ all `N` experts you have two options:
 ### End-to-end pipeline
 
 ```
-        +------------+    +-------------+    +-----------+    +------------------+
-token → |   Router   | → | Expert IDs   | → | LRU Cache | → | SwiGLU FFN        |
+        +------------+    +-------------+   +-----------+   +-------------------+
+token → |   Router   | → | Expert IDs   | → | LRU Cache | →  | SwiGLU FFN        |
         | LinearGate |   |  e.g. [3,7]  |   +-----+-----+    | per expert,       |
         |  or Markov |   +------+-------+         | miss     | gate-weighted sum |
-        +-----+------+          |                 ↓          +------------------+
+        +-----+------+          |                 ↓          +-------------------+
               │                 │        +------------------+
               │ hidden state    │        | BufferPool slot  | ←─────┐
               ↓                 │        |  (aligned, pre-  |       │
