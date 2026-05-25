@@ -552,7 +552,8 @@ impl RealModel {
         {
             let layer = &self.layers[0];
             let mut kv0 = kv[0].clone();
-            let attn_out = layer.attn_block(&embed, pos, &mut kv0);
+            let backend = crate::backend::current();
+            let attn_out = layer.attn_block(&embed, pos, 0, &mut kv0, &*backend);
             let (_normed, routing) = layer.moe_pre(&attn_out);
             for &local in &routing.experts {
                 out.push(self.global_expert_id(0, local));
@@ -608,9 +609,10 @@ impl RealModel {
             "kv cache slice must have one entry per layer"
         );
         let mut x = self.embed(token_id);
+        let backend = crate::backend::current();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
-            x = layer.attn_block(&x, pos, &mut kv[layer_idx]);
+            x = layer.attn_block(&x, pos, layer_idx, &mut kv[layer_idx], &*backend);
             // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
             let (normed, routing) = layer.moe_pre(&x);
             let global_ids: Vec<u32> = routing

@@ -578,6 +578,26 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // The startup log below reports the actual device runtime
     // (`cpu-fallback` / `cuda-0` / `wgpu-vulkan`) as `GpuBackend::name`
     // surfaces it — no more stale hardcoded `"gpu-fallback"` strings.
+    //
+    // The GPU expert cache is constructed up-front so the same `Arc`
+    // can be threaded into both `GpuBackend` (which checks VRAM
+    // residency before falling back to NVMe streaming) and
+    // `Engine::install_gpu_cache` further below. When
+    // `[gpu_cache].enabled = false` we still allocate a zero-capacity
+    // cache to satisfy the `BackendBox::init_blocking` signature —
+    // the cache simply never promotes anything in that mode.
+    let gpu_expert_cache = {
+        let capacity_bytes = if cfg.gpu_cache.enabled {
+            (cfg.gpu_cache.vram_capacity_mb as usize) * 1024 * 1024
+        } else {
+            0
+        };
+        std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(
+            capacity_bytes,
+            cfg.gpu_cache.vram_anchor_ratio,
+            cfg.gpu_cache.promote_after_hits,
+        ))
+    };
     if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu {
         let num_layers = cfg.model.num_layers;
         let max_seq_len = if cfg.real_transformer.window_size == 0 { 4096 } else { cfg.real_transformer.window_size };
@@ -587,7 +607,13 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         } else {
             cfg.real_transformer.head_dim
         };
-        let backend_box = crate::backend::BackendBox::init_blocking(num_layers, max_seq_len, num_heads, head_dim);
+        let backend_box = crate::backend::BackendBox::init_blocking(
+            num_layers,
+            max_seq_len,
+            num_heads,
+            head_dim,
+            gpu_expert_cache.clone(),
+        );
         let has_device = backend_box.is_gpu();
         let device_name = backend_box.device_name().to_string();
         let gpu = std::sync::Arc::new(backend_box);
@@ -817,12 +843,6 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let dtype_for_logging =
             crate::inference::WeightDtype::from_str_opt(&cfg.gpu_cache.dtype)
                 .unwrap_or(crate::inference::WeightDtype::F16);
-        let capacity_bytes = (cfg.gpu_cache.vram_capacity_mb as usize) * 1024 * 1024;
-        let gpu = std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(
-            capacity_bytes,
-            cfg.gpu_cache.vram_anchor_ratio,
-            cfg.gpu_cache.promote_after_hits,
-        ));
         info!(
             vram_capacity_mb = cfg.gpu_cache.vram_capacity_mb,
             anchor_ratio = cfg.gpu_cache.vram_anchor_ratio,
@@ -830,7 +850,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             dtype_advisory = %dtype_for_logging.as_str(),
             "VRAM (GPU) expert cache enabled — 3-tier SSD→RAM→VRAM hierarchy active (dtype is advisory; bytes copied as-is)"
         );
-        engine_builder.install_gpu_cache(gpu);
+        engine_builder.install_gpu_cache(gpu_expert_cache.clone());
     }
     let engine = Arc::new(engine_builder);
 
