@@ -753,13 +753,13 @@ impl BatchScheduler {
         //     cost.
         {
             let backend = crate::backend::current();
-            let rows = 4usize;
-            let cols = 8usize;
-            let gate: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.01).collect();
-            let up: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.02).collect();
-            let x: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.03).collect();
-            let mut y = vec![0.0f32; rows];
-            backend.swiglu_into(&gate, &up, &x, rows, cols, &mut y);
+            let gate_f16 = vec![half::f16::from_f32(0.1); 16];
+            let up_f16 = vec![half::f16::from_f32(0.2); 16];
+            let mut out_f16 = vec![half::f16::ZERO; 16];
+            let gate_view = crate::backend::TensorView { data: &gate_f16, rows: 4, cols: 4 };
+            let up_view = crate::backend::TensorView { data: &up_f16, rows: 4, cols: 4 };
+            let mut out_view = crate::backend::TensorViewMut { data: &mut out_f16, rows: 4, cols: 4 };
+            let _ = backend.swiglu_into(gate_view, up_view, &mut out_view);
         }
 
         // (3) Drive a *single* synthetic decoder step through the

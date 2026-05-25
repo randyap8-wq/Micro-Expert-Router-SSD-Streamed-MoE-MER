@@ -409,7 +409,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !matches!(cli.cmd, Cmd::Serve { .. }) {
         crate::backend::install_default();
         let b = crate::backend::current();
-        info!(backend = b.name(), "math backend installed");
+        info!(backend = b.device_name(), "math backend installed");
     }
 
     match cli.cmd {
@@ -579,10 +579,18 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // (`cpu-fallback` / `cuda-0` / `wgpu-vulkan`) as `GpuBackend::name`
     // surfaces it — no more stale hardcoded `"gpu-fallback"` strings.
     if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu {
-        let gpu_concrete = crate::backend::GpuBackend::try_new();
-        let has_device = gpu_concrete.has_device();
-        let device_name = gpu_concrete.device_name();
-        let gpu = std::sync::Arc::new(gpu_concrete) as std::sync::Arc<dyn crate::backend::Backend>;
+        let num_layers = cfg.model.num_layers;
+        let max_seq_len = if cfg.real_transformer.window_size == 0 { 4096 } else { cfg.real_transformer.window_size };
+        let num_heads = cfg.real_transformer.num_heads;
+        let head_dim = if cfg.real_transformer.head_dim == 0 {
+            if num_heads > 0 { cfg.model.d_model / num_heads } else { 64 }
+        } else {
+            cfg.real_transformer.head_dim
+        };
+        let backend_box = crate::backend::BackendBox::init_blocking(num_layers, max_seq_len, num_heads, head_dim);
+        let has_device = backend_box.is_gpu();
+        let device_name = backend_box.device_name().to_string();
+        let gpu = std::sync::Arc::new(backend_box);
         if let Err(e) = crate::backend::set_backend(gpu) {
             warn!(
                 error = e,
@@ -600,7 +608,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     {
         let b = crate::backend::current();
         info!(
-            backend = b.name(),
+            backend = b.device_name(),
             compute_offload = ?cfg.real_transformer.compute_offload,
             "math backend installed"
         );

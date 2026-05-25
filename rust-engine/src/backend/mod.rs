@@ -1,310 +1,1046 @@
-//! Decoupled math-backend trait (gist Task 2 — Plugin System).
-//!
-//! The engine's I/O substrate (`expert_cache`, `buffer_pool`,
-//! `io_provider`, the O_DIRECT `pread(2)` pipeline) is intentionally
-//! independent from the math library used to crunch the bytes once
-//! they land in RAM.  This module defines the **`Backend`** trait that
-//! every math implementation must satisfy, and exposes a small registry
-//! of named implementations the rest of the engine can pick from at
-//! startup — without `cfg(feature = …)` walls inside the hot path and
-//! without coupling `EngineCore` to any one tensor library.
-//!
-//! Today we ship two implementations:
-//!
-//! * [`ScalarBackend`] — pure Rust reference. Always available, no
-//!   external deps. Used as the validation oracle every other backend
-//!   is tested against and as the fallback when no other backend is
-//!   selected.
-//! * [`CandleBackend`] — wraps the existing `candle-core` CPU path that
-//!   `inference.rs` already drives the per-expert SwiGLU forward pass
-//!   through. Selected by default at startup so the production codepath
-//!   is bit-for-bit unchanged.
-//!
-//! Future backends (Burn, Tract, a custom CUDA / Vulkan executor)
-//! simply implement `Backend` and call [`set_backend`] before the first
-//! token is generated. Because the trait is object-safe and lives
-//! behind an `Arc<dyn Backend>`, swapping is a drop-in pointer change;
-//! no recompile of the rest of the crate is required.
-//!
-//! ### Zero-overhead dispatch
-//!
-//! Per the gist's "Zero-Overhead Dispatch" constraint, [`current`]
-//! resolves the active backend via a `OnceLock` initialised exactly
-//! once at process start (driven by [`install_default`] in
-//! `main.rs`). The hot path therefore pays one atomic load, never a
-//! `cfg!` macro evaluation, a feature-gated branch, or a runtime probe.
+//! Math-backend module connecting GPU execution via wgpu and providing a CPU fallback.
 
-// Forward-looking backend plugin scaffold (gist Task 2). Items here are
-// referenced by future code paths and are intentionally retained as a
-// stable surface; silence noisy per-item `dead_code` warnings at the
-// module level until those paths come online.
-#![allow(dead_code)]
-
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use anyhow::{anyhow, Result};
+
+// Embed WGSL shaders using include_str
+const MATMUL_SHADER: &str = include_str!("wgpu_shaders/matmul.wgsl");
+const SWIGLU_SHADER: &str = include_str!("wgpu_shaders/swiglu.wgsl");
+const SOFTMAX_SHADER: &str = include_str!("wgpu_shaders/softmax.wgsl");
+const ATTENTION_SHADER: &str = include_str!("wgpu_shaders/attention.wgsl");
+
+/// Zero-copy view of a f16 tensor borrowed from the caller.
+#[derive(Copy, Clone, Debug)]
+pub struct TensorView<'a> {
+    pub data: &'a [half::f16],
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Zero-copy mutable view of a f16 tensor borrowed from the caller.
+#[derive(Debug)]
+pub struct TensorViewMut<'a> {
+    pub data: &'a mut [half::f16],
+    pub rows: usize,
+    pub cols: usize,
+}
 
 /// Minimal contract every math backend must satisfy.
-///
-/// The methods are intentionally small and side-effect-free: they take
-/// owned / borrowed slices, return fresh `Vec`s or write into a caller
-/// buffer. This keeps the trait `Send + Sync` and lets implementations
-/// own their own scratch storage (thread-local, arena, whatever) without
-/// leaking lifetimes into the trait surface.
-///
-/// All shape arguments are *logical* dimensions; row-major layout is
-/// assumed for matrix inputs (`W` of shape `[rows × cols]` is
-/// `rows * cols` floats with row `i` starting at `i * cols`). This
-/// matches the on-disk SwiGLU layout the engine streams from NVMe.
 pub trait Backend: Send + Sync + 'static {
-    /// Short human-readable identifier (e.g. `"scalar"`, `"candle"`).
-    /// Logged once at startup so ops can see which executor is live.
-    fn name(&self) -> &'static str;
-
-    /// Row-major matrix-vector multiply `y = W · x`. `W` is
-    /// `[rows × cols]` in row-major order; `x.len() == cols`.
-    /// Implementations must return a fresh `Vec<f32>` of length `rows`.
-    ///
-    /// **Hot-path callers should prefer [`Backend::matmul_into`]** —
-    /// this method exists for older callers that owned the output
-    /// `Vec`. The default `matmul_into` impl delegates here, so
-    /// implementing only `matmul` keeps everything correct;
-    /// implementing `matmul_into` directly eliminates the allocation.
-    fn matmul(&self, w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-        let mut y = vec![0.0f32; rows];
-        self.matmul_into(w, x, rows, cols, &mut y);
-        y
+    fn device_name(&self) -> &str;
+    fn is_gpu(&self) -> bool {
+        false
     }
-
-    /// Row-major matmul that writes into a **caller-owned** `y`
-    /// (`y.len() == rows`). The "no allocation on the hot path"
-    /// performance guardrail: implementations must not allocate new
-    /// `Vec`s here.
-    ///
-    /// Default impl allocates via [`Backend::matmul`] and copies the
-    /// result into `y` — correct, but defeats the no-alloc guardrail.
-    /// Built-in backends override it.
-    fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
-        debug_assert_eq!(y.len(), rows);
-        let v = self.matmul(w, x, rows, cols);
-        y.copy_from_slice(&v);
-    }
-
-    /// Fused SwiGLU FFN inner stage: `y[i] = silu(gate_w[i]·x) * (up_w[i]·x)`.
-    ///
-    /// `gate_w` and `up_w` are row-major `[rows × cols]` matrices.
-    /// `y` is caller-owned (no allocation on the hot path).
-    ///
-    /// Default impl chains two `matmul_into` calls + a scalar SiLU
-    /// fuse — correct on every backend, but built-in backends
-    /// override to keep the gate intermediate hot in registers.
-    fn swiglu_into(
+    fn matmul_into(&self, a: TensorView, b: TensorView, out: &mut TensorViewMut) -> Result<()>;
+    fn swiglu_into(&self, gate: TensorView, up: TensorView, out: &mut TensorViewMut) -> Result<()>;
+    fn softmax(&self, x: &mut TensorViewMut) -> Result<()>;
+    fn kv_cache_insert(
         &self,
-        gate_w: &[f32],
-        up_w: &[f32],
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-        y: &mut [f32],
-    ) {
-        debug_assert_eq!(y.len(), rows);
-        // Caller-owned scratch is not part of the trait surface, so
-        // the default routes through `matmul` (allocation acceptable
-        // on this slow fallback path); overriding backends fuse.
-        let g = self.matmul(gate_w, x, rows, cols);
-        let u = self.matmul(up_w, x, rows, cols);
-        for i in 0..rows {
-            let silu_g = g[i] / (1.0 + (-g[i]).exp());
-            y[i] = silu_g * u[i];
-        }
-    }
-
-    /// In-place softmax over `logits`. Numerically stable; the result
-    /// must be non-negative and sum to exactly 1.0 within `f32`
-    /// rounding (i.e. `(sum - 1.0).abs() < 1e-5`).
-    fn softmax(&self, logits: &mut [f32]);
-
-    /// Elementwise SiLU (a.k.a. swish): `x * sigmoid(x)`, in place.
-    fn silu_inplace(&self, x: &mut [f32]);
+        layer: usize,
+        position: usize,
+        k: TensorView,
+        v: TensorView,
+    ) -> Result<()>;
+    fn kv_attend(
+        &self,
+        layer: usize,
+        q: TensorView,
+        seq_len: usize,
+        out: &mut TensorViewMut,
+    ) -> Result<()>;
 }
 
 // =====================================================================
-// Built-in backends.
+// Push Constants structs (POD, 16 bytes max, byte-identical to WGSL)
 // =====================================================================
 
-/// Pure-Rust scalar reference backend.
-///
-/// Single-threaded; the optimiser is responsible for autovectorising
-/// the inner loops. Always available — no extra crate dependency, no
-/// CPU-feature requirement. Used as the validation oracle for every
-/// other backend (see the `backend_implementations_agree` test below).
-pub struct ScalarBackend;
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatmulPushConstants {
+    m: u32,
+    n: u32,
+    k: u32,
+    _pad: u32,
+}
 
-impl Backend for ScalarBackend {
-    fn name(&self) -> &'static str {
-        "scalar"
-    }
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct SwigluPushConstants {
+    n_elements: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
 
-    fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
-        debug_assert_eq!(w.len(), rows * cols);
-        debug_assert_eq!(x.len(), cols);
-        debug_assert_eq!(y.len(), rows);
-        // Route through the kernel dispatcher so the scalar backend
-        // still auto-escalates to AVX-512 / AVX2 when the host
-        // supports it — same value as the hand-rolled inner loop, no
-        // allocation on the hot path.
-        for i in 0..rows {
-            y[i] = crate::kernels::dot_f32(&w[i * cols..(i + 1) * cols], x);
-        }
-    }
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct SoftmaxPushConstants {
+    rows: u32,
+    cols: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
 
-    fn swiglu_into(
-        &self,
-        gate_w: &[f32],
-        up_w: &[f32],
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-        y: &mut [f32],
-    ) {
-        // Fused dispatcher — picks the AVX-512 fused kernel when
-        // available, otherwise the scalar reference.
-        crate::kernels::swiglu_f32_into(gate_w, up_w, x, rows, cols, y);
-    }
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttentionPushConstants {
+    num_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    layer_offset: u32,
+}
 
-    fn softmax(&self, logits: &mut [f32]) {
-        if logits.is_empty() {
-            return;
-        }
-        let mut maxv = f32::NEG_INFINITY;
-        for &v in logits.iter() {
-            if v > maxv {
-                maxv = v;
-            }
-        }
-        let mut sum = 0.0f32;
-        for v in logits.iter_mut() {
-            *v = (*v - maxv).exp();
-            sum += *v;
-        }
-        if sum > 0.0 {
-            for v in logits.iter_mut() {
-                *v /= sum;
-            }
-        }
-    }
+// =====================================================================
+// GPU VRAM KV Cache
+// =====================================================================
 
-    fn silu_inplace(&self, x: &mut [f32]) {
-        for v in x.iter_mut() {
-            *v = *v / (1.0 + (-*v).exp());
-        }
+pub struct GpuKvCache {
+    pub buffer: wgpu::Buffer,
+    pub num_layers: usize,
+    pub max_seq_len: usize,
+    pub kv_dim: usize,
+}
+
+impl GpuKvCache {
+    pub fn offset_bytes(&self, layer: usize, kv: usize, seq_pos: usize) -> u64 {
+        let idx = ((layer * 2 + kv) * self.max_seq_len + seq_pos) * self.kv_dim;
+        (idx * 4) as u64
     }
 }
 
-/// Hugging Face `candle-core` CPU backend.
-///
-/// Delegates to the existing `Tensor`-based math the engine already
-/// uses for the per-expert SwiGLU forward pass in
-/// [`crate::inference::ExpertWeights::forward_candle`]. Pulled in by
-/// default at startup — the goal of this trait is to give us a clean
-/// swap point, not to change the default executor.
-///
-/// `candle-core` is built with `default-features = false` in
-/// `Cargo.toml`, so this backend remains CPU-only and adds no GPU
-/// runtime requirement to the binary.
+// =====================================================================
+// GPU Backend using wgpu
+// =====================================================================
+
+pub struct GpuBackend {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    device_name: String,
+
+    matmul_pipeline: wgpu::ComputePipeline,
+    swiglu_pipeline: wgpu::ComputePipeline,
+    softmax_pipeline: wgpu::ComputePipeline,
+    attention_pipeline: wgpu::ComputePipeline,
+
+    work_a: wgpu::Buffer,
+    work_b: wgpu::Buffer,
+    work_out: wgpu::Buffer,
+
+    _staging_up: wgpu::Buffer,
+    staging_dn: wgpu::Buffer,
+
+    kv_cache: GpuKvCache,
+
+    matmul_bind_group: wgpu::BindGroup,
+    swiglu_bind_group: wgpu::BindGroup,
+    softmax_bind_group: wgpu::BindGroup,
+    attention_bind_group: wgpu::BindGroup,
+
+    conversion_scratch: UnsafeCell<Vec<f32>>,
+
+    num_heads: usize,
+    head_dim: usize,
+}
+
+// SAFETY: GpuBackend is Sync and Send because the inference pipeline accesses
+// the conversion scratch exclusively in a single-threaded, non-reentrant fashion.
+unsafe impl Sync for GpuBackend {}
+unsafe impl Send for GpuBackend {}
+
+impl GpuBackend {
+    pub async fn try_new(
+        num_layers: usize,
+        max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| anyhow!("No HighPerformance adapter found"))?;
+
+        let info = adapter.get_info();
+        let device_name = format!("wgpu-{:?}-{}", info.backend, info.name);
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("MER-GpuBackend"),
+                    required_features: wgpu::Features::PUSH_CONSTANTS,
+                    required_limits: wgpu::Limits {
+                        max_push_constant_size: 32,
+                        ..wgpu::Limits::default()
+                    },
+                },
+                None,
+            )
+            .await?;
+
+        // Compile modules
+        let matmul_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("matmul_shader"),
+            source: wgpu::ShaderSource::Wgsl(MATMUL_SHADER.into()),
+        });
+
+        let swiglu_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("swiglu_shader"),
+            source: wgpu::ShaderSource::Wgsl(SWIGLU_SHADER.into()),
+        });
+
+        let softmax_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("softmax_shader"),
+            source: wgpu::ShaderSource::Wgsl(SOFTMAX_SHADER.into()),
+        });
+
+        // Compile attention shader, injecting dynamic MAX_SEQ_LEN
+        let attention_src = ATTENTION_SHADER.replace(
+            "const MAX_SEQ_LEN: u32 = 4096u;",
+            &format!("const MAX_SEQ_LEN: u32 = {}u;", max_seq_len),
+        );
+        let attention_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("attention_shader"),
+            source: wgpu::ShaderSource::Wgsl(attention_src.into()),
+        });
+
+        // Setup layouts manually for pipelines since push constants are used
+        let layout_3_buffers = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("layout_3_buffers"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let layout_1_buffer = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("layout_1_buffer"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let matmul_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("matmul_pipeline_layout"),
+            bind_group_layouts: &[&layout_3_buffers],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..16,
+            }],
+        });
+
+        let swiglu_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("swiglu_pipeline_layout"),
+            bind_group_layouts: &[&layout_3_buffers],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..16,
+            }],
+        });
+
+        let softmax_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("softmax_pipeline_layout"),
+            bind_group_layouts: &[&layout_1_buffer],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..16,
+            }],
+        });
+
+        let attention_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("attention_pipeline_layout"),
+            bind_group_layouts: &[&layout_3_buffers],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..16,
+            }],
+        });
+
+        // Compute pipelines
+        let matmul_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("matmul_pipeline"),
+            layout: Some(&matmul_pipeline_layout),
+            module: &matmul_module,
+            entry_point: "matmul_main",
+        });
+
+        let swiglu_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("swiglu_pipeline"),
+            layout: Some(&swiglu_pipeline_layout),
+            module: &swiglu_module,
+            entry_point: "swiglu_main",
+        });
+
+        let softmax_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("softmax_pipeline"),
+            layout: Some(&softmax_pipeline_layout),
+            module: &softmax_module,
+            entry_point: "softmax_main",
+        });
+
+        let attention_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("attention_pipeline"),
+            layout: Some(&attention_pipeline_layout),
+            module: &attention_module,
+            entry_point: "attention_main",
+        });
+
+        // Pre-allocated buffers
+        const MAX_ELEM: usize = 4096 * 4096;
+        let work_a = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("work_a"),
+            size: (MAX_ELEM * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let work_b = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("work_b"),
+            size: (MAX_ELEM * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let work_out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("work_out"),
+            size: (MAX_ELEM * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_up = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging_up"),
+            size: (MAX_ELEM * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_dn = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging_dn"),
+            size: (MAX_ELEM * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // KV cache
+        let kv_dim = num_heads * head_dim;
+        let kv_cache_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kv_cache"),
+            size: (num_layers * 2 * max_seq_len * kv_dim * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let kv_cache = GpuKvCache {
+            buffer: kv_cache_buffer,
+            num_layers,
+            max_seq_len,
+            kv_dim,
+        };
+
+        // Pre-build bind groups
+        let matmul_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("matmul_bind_group"),
+            layout: &layout_3_buffers,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: work_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: work_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: work_out.as_entire_binding() },
+            ],
+        });
+
+        let swiglu_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("swiglu_bind_group"),
+            layout: &layout_3_buffers,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: work_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: work_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: work_out.as_entire_binding() },
+            ],
+        });
+
+        let softmax_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("softmax_bind_group"),
+            layout: &layout_1_buffer,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: work_a.as_entire_binding() },
+            ],
+        });
+
+        let attention_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("attention_bind_group"),
+            layout: &layout_3_buffers,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: work_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: kv_cache.buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: work_out.as_entire_binding() },
+            ],
+        });
+
+        let conversion_scratch = UnsafeCell::new(vec![0.0f32; MAX_ELEM]);
+
+        Ok(Self {
+            device,
+            queue,
+            device_name,
+            matmul_pipeline,
+            swiglu_pipeline,
+            softmax_pipeline,
+            attention_pipeline,
+            work_a,
+            work_b,
+            work_out,
+            _staging_up: staging_up,
+            staging_dn,
+            kv_cache,
+            matmul_bind_group,
+            swiglu_bind_group,
+            softmax_bind_group,
+            attention_bind_group,
+            conversion_scratch,
+            num_heads,
+            head_dim,
+        })
+    }
+}
+
+impl Backend for GpuBackend {
+    fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    fn is_gpu(&self) -> bool {
+        true
+    }
+
+    fn matmul_into(&self, a: TensorView, b: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        let a_len = a.data.len();
+        let b_len = b.data.len();
+        let out_len = out.rows * out.cols;
+
+        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
+        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        assert!(a_len <= scratch.len());
+        assert!(b_len <= scratch.len());
+        assert!(out_len <= scratch.len());
+
+        // Upload A
+        for i in 0..a_len {
+            scratch[i] = a.data[i].to_f32();
+        }
+        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..a_len]));
+
+        // Upload B
+        for i in 0..b_len {
+            scratch[i] = b.data[i].to_f32();
+        }
+        self.queue.write_buffer(&self.work_b, 0, bytemuck::cast_slice(&scratch[..b_len]));
+
+        // Dispatch
+        let pcs = MatmulPushConstants {
+            m: a.rows as u32,
+            n: b.cols as u32,
+            k: a.cols as u32,
+            _pad: 0,
+        };
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("matmul_encoder"),
+        });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("matmul_pass"),
+            });
+            compute_pass.set_pipeline(&self.matmul_pipeline);
+            compute_pass.set_bind_group(0, &self.matmul_bind_group, &[]);
+            compute_pass.set_push_constants(0, bytemuck::bytes_of(&pcs));
+            compute_pass.dispatch_workgroups(
+                (b.cols as u32 + 15) / 16,
+                (a.rows as u32 + 15) / 16,
+                1,
+            );
+        }
+
+        // Readback
+        let out_bytes = (out_len * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.staging_dn.slice(0..out_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.recv()
+            .map_err(|e| anyhow!("Channel error on GPU readback: {:?}", e))?
+            .map_err(|e| anyhow!("Buffer map error on GPU readback: {:?}", e))?;
+
+        {
+            let view = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            for i in 0..out_len {
+                out.data[i] = half::f16::from_f32(floats[i]);
+            }
+        }
+        self.staging_dn.unmap();
+        Ok(())
+    }
+
+    fn swiglu_into(&self, gate: TensorView, up: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        let len = gate.data.len();
+        let out_len = out.rows * out.cols;
+        assert_eq!(up.data.len(), len);
+        assert_eq!(out_len, len);
+
+        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
+        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        assert!(len <= scratch.len());
+
+        // Upload gate
+        for i in 0..len {
+            scratch[i] = gate.data[i].to_f32();
+        }
+        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
+
+        // Upload up
+        for i in 0..len {
+            scratch[i] = up.data[i].to_f32();
+        }
+        self.queue.write_buffer(&self.work_b, 0, bytemuck::cast_slice(&scratch[..len]));
+
+        // Dispatch
+        let pcs = SwigluPushConstants {
+            n_elements: len as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("swiglu_encoder"),
+        });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("swiglu_pass"),
+            });
+            compute_pass.set_pipeline(&self.swiglu_pipeline);
+            compute_pass.set_bind_group(0, &self.swiglu_bind_group, &[]);
+            compute_pass.set_push_constants(0, bytemuck::bytes_of(&pcs));
+            compute_pass.dispatch_workgroups((len as u32 + 255) / 256, 1, 1);
+        }
+
+        // Readback
+        let out_bytes = (len * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.staging_dn.slice(0..out_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.recv()
+            .map_err(|e| anyhow!("Channel error on GPU readback: {:?}", e))?
+            .map_err(|e| anyhow!("Buffer map error on GPU readback: {:?}", e))?;
+
+        {
+            let view = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            for i in 0..len {
+                out.data[i] = half::f16::from_f32(floats[i]);
+            }
+        }
+        self.staging_dn.unmap();
+        Ok(())
+    }
+
+    fn softmax(&self, x: &mut TensorViewMut) -> Result<()> {
+        let len = x.data.len();
+
+        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
+        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        assert!(len <= scratch.len());
+
+        // Upload x
+        for i in 0..len {
+            scratch[i] = x.data[i].to_f32();
+        }
+        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
+
+        // Dispatch
+        let pcs = SoftmaxPushConstants {
+            rows: x.rows as u32,
+            cols: x.cols as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("softmax_encoder"),
+        });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("softmax_pass"),
+            });
+            compute_pass.set_pipeline(&self.softmax_pipeline);
+            compute_pass.set_bind_group(0, &self.softmax_bind_group, &[]);
+            compute_pass.set_push_constants(0, bytemuck::bytes_of(&pcs));
+            compute_pass.dispatch_workgroups(x.rows as u32, 1, 1);
+        }
+
+        // Readback from work_a (in-place)
+        let out_bytes = (len * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.work_a, 0, &self.staging_dn, 0, out_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.staging_dn.slice(0..out_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.recv()
+            .map_err(|e| anyhow!("Channel error on GPU readback: {:?}", e))?
+            .map_err(|e| anyhow!("Buffer map error on GPU readback: {:?}", e))?;
+
+        {
+            let view = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            for i in 0..len {
+                x.data[i] = half::f16::from_f32(floats[i]);
+            }
+        }
+        self.staging_dn.unmap();
+        Ok(())
+    }
+
+    fn kv_cache_insert(
+        &self,
+        layer: usize,
+        position: usize,
+        k: TensorView,
+        v: TensorView,
+    ) -> Result<()> {
+        let k_len = k.data.len();
+        let v_len = v.data.len();
+
+        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
+        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        assert!(k_len <= scratch.len());
+        assert!(v_len <= scratch.len());
+
+        // Upload K
+        for i in 0..k_len {
+            scratch[i] = k.data[i].to_f32();
+        }
+        let offset_k = self.kv_cache.offset_bytes(layer, 0, position);
+        self.queue.write_buffer(
+            &self.kv_cache.buffer,
+            offset_k,
+            bytemuck::cast_slice(&scratch[..k_len]),
+        );
+
+        // Upload V
+        for i in 0..v_len {
+            scratch[i] = v.data[i].to_f32();
+        }
+        let offset_v = self.kv_cache.offset_bytes(layer, 1, position);
+        self.queue.write_buffer(
+            &self.kv_cache.buffer,
+            offset_v,
+            bytemuck::cast_slice(&scratch[..v_len]),
+        );
+
+        Ok(())
+    }
+
+    fn kv_attend(
+        &self,
+        layer: usize,
+        q: TensorView,
+        seq_len: usize,
+        out: &mut TensorViewMut,
+    ) -> Result<()> {
+        let q_len = q.data.len();
+        let out_len = out.rows * out.cols;
+
+        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
+        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        assert!(q_len <= scratch.len());
+        assert!(out_len <= scratch.len());
+
+        // Upload Q
+        for i in 0..q_len {
+            scratch[i] = q.data[i].to_f32();
+        }
+        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..q_len]));
+
+        // Dispatch
+        let pcs = AttentionPushConstants {
+            num_heads: self.num_heads as u32,
+            head_dim: self.head_dim as u32,
+            seq_len: seq_len as u32,
+            layer_offset: self.kv_cache.offset_bytes(layer, 0, 0) as u32,
+        };
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("attention_encoder"),
+        });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("attention_pass"),
+            });
+            compute_pass.set_pipeline(&self.attention_pipeline);
+            compute_pass.set_bind_group(0, &self.attention_bind_group, &[]);
+            compute_pass.set_push_constants(0, bytemuck::bytes_of(&pcs));
+            compute_pass.dispatch_workgroups(self.num_heads as u32, 1, 1);
+        }
+
+        // Readback
+        let out_bytes = (out_len * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.staging_dn.slice(0..out_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.recv()
+            .map_err(|e| anyhow!("Channel error on GPU readback: {:?}", e))?
+            .map_err(|e| anyhow!("Buffer map error on GPU readback: {:?}", e))?;
+
+        {
+            let view = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            for i in 0..out_len {
+                out.data[i] = half::f16::from_f32(floats[i]);
+            }
+        }
+        self.staging_dn.unmap();
+        Ok(())
+    }
+}
+
+// =====================================================================
+// Candle CPU Fallback Backend
+// =====================================================================
+
+#[derive(Clone, Default)]
 pub struct CandleBackend;
 
+impl CandleBackend {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 impl Backend for CandleBackend {
-    fn name(&self) -> &'static str {
-        "candle"
+    fn device_name(&self) -> &str {
+        "cpu-fallback"
     }
 
-    fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
-        // **Performance contract.** The previous revision rebuilt two
-        // `candle_core::Tensor`s from scratch on every call (one
-        // allocation per tensor plus dispatch overhead). For the
-        // small per-expert / per-row shapes the engine actually
-        // calls this with, that setup cost dwarfed the FMA work.
-        //
-        // The optimised path bypasses Candle entirely and dispatches
-        // through [`crate::kernels::dot_f32`], which is the runtime
-        // AVX-512 → AVX2 → scalar auto-escalator. The result is
-        // bit-equivalent to the Candle Tensor matmul within `f32`
-        // reduction rounding (the `backend_implementations_agree`
-        // test enforces a 1e-4 envelope), allocations on the hot
-        // path are zero, and AVX-512 hosts get the fused 4×-unrolled
-        // FMA kernel from `kernels::avx512`.
-        debug_assert_eq!(w.len(), rows * cols);
-        debug_assert_eq!(x.len(), cols);
-        debug_assert_eq!(y.len(), rows);
-        for i in 0..rows {
-            y[i] = crate::kernels::dot_f32(&w[i * cols..(i + 1) * cols], x);
+    fn is_gpu(&self) -> bool {
+        false
+    }
+
+    fn matmul_into(&self, a: TensorView, b: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        let m = a.rows;
+        let k = a.cols;
+        let n = b.cols;
+        assert_eq!(b.rows, k);
+        assert_eq!(out.rows, m);
+        assert_eq!(out.cols, n);
+
+        for val in out.data.iter_mut() {
+            *val = half::f16::ZERO;
         }
+
+        let tile_size = 32;
+        for i_outer in (0..m).step_by(tile_size) {
+            let i_end = (i_outer + tile_size).min(m);
+            for k_outer in (0..k).step_by(tile_size) {
+                let k_end = (k_outer + tile_size).min(k);
+                for j_outer in (0..n).step_by(tile_size) {
+                    let j_end = (j_outer + tile_size).min(n);
+
+                    for i in i_outer..i_end {
+                        let out_row_offset = i * n;
+                        for k_inner in k_outer..k_end {
+                            let a_val = a.data[i * k + k_inner].to_f32();
+                            if a_val == 0.0 {
+                                continue;
+                            }
+                            let b_row_offset = k_inner * n;
+                            for j in j_outer..j_end {
+                                let b_val = b.data[b_row_offset + j].to_f32();
+                                let out_idx = out_row_offset + j;
+                                let cur = out.data[out_idx].to_f32();
+                                out.data[out_idx] = half::f16::from_f32(cur + a_val * b_val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
-    fn swiglu_into(
+    fn swiglu_into(&self, gate: TensorView, up: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        let len = gate.data.len();
+        assert_eq!(up.data.len(), len);
+        assert_eq!(out.data.len(), len);
+
+        for i in 0..len {
+            let g = gate.data[i].to_f32();
+            let u = up.data[i].to_f32();
+            let silu_g = g / (1.0 + (-g).exp());
+            out.data[i] = half::f16::from_f32(silu_g * u);
+        }
+        Ok(())
+    }
+
+    fn softmax(&self, x: &mut TensorViewMut) -> Result<()> {
+        let rows = x.rows;
+        let cols = x.cols;
+        for r in 0..rows {
+            let row_slice = &mut x.data[r * cols..(r + 1) * cols];
+            if row_slice.is_empty() {
+                continue;
+            }
+            let mut maxv = f32::NEG_INFINITY;
+            for &v in row_slice.iter() {
+                let vf = v.to_f32();
+                if vf > maxv {
+                    maxv = vf;
+                }
+            }
+            let mut sum = 0.0f32;
+            for v in row_slice.iter_mut() {
+                let vf = v.to_f32();
+                let ev = (vf - maxv).exp();
+                *v = half::f16::from_f32(ev);
+                sum += ev;
+            }
+            if sum > 0.0 {
+                for v in row_slice.iter_mut() {
+                    *v = half::f16::from_f32(v.to_f32() / sum);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn kv_cache_insert(
         &self,
-        gate_w: &[f32],
-        up_w: &[f32],
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-        y: &mut [f32],
-    ) {
-        // Fused gate + up + SiLU through the kernel dispatcher.
-        // On AVX-512 hosts this is the single-pass
-        // [`crate::kernels::avx512::swiglu_f32_avx512`] kernel
-        // (no candle Tensor round-trip, no scratch allocation).
-        crate::kernels::swiglu_f32_into(gate_w, up_w, x, rows, cols, y);
+        _layer: usize,
+        _position: usize,
+        _k: TensorView,
+        _v: TensorView,
+    ) -> Result<()> {
+        // Managed on the CPU path directly in transformer.rs
+        Ok(())
     }
 
-    fn softmax(&self, logits: &mut [f32]) {
-        // For a 1-D vector the scalar path is faster than a round-trip
-        // through a candle Tensor; the trait contract (sum == 1.0) is
-        // satisfied identically by the scalar reference.
-        ScalarBackend.softmax(logits);
-    }
-
-    fn silu_inplace(&self, x: &mut [f32]) {
-        ScalarBackend.silu_inplace(x);
+    fn kv_attend(
+        &self,
+        _layer: usize,
+        _q: TensorView,
+        _seq_len: usize,
+        _out: &mut TensorViewMut,
+    ) -> Result<()> {
+        // Managed on the CPU path directly in transformer.rs
+        Ok(())
     }
 }
 
 // =====================================================================
-// Hybrid compute offload (gist Part 2, fix #5) — budget GPU integration
-// point.
+// BackendBox Dispatch Enum (Zero-cost dispatch, no dyn/vtable)
 // =====================================================================
 
-/// Operator-facing selector for the math executor (gist Part 2, fix #5).
-///
-/// The runtime traditionally ran every layer's matmul / attention /
-/// LM-head on the CPU through [`CandleBackend`] (auto-escalating to
-/// AVX-512 / AVX2 / scalar via the [`crate::kernels`] dispatcher).
-/// `ComputeOffload::Gpu` plugs in the same `Backend` trait but routes
-/// the compute through a **budget-GPU executor** ([`GpuBackend`]),
-/// keeping the SSD-streamed expert path and the I/O reactor on the
-/// CPU side.
-///
-/// The split is deliberate: cheap consumer / data-centre cards (a
-/// $200-$400 GPU with 8-16 GiB of VRAM) can host the dense
-/// transformer body that's hot every token, while the long-tail MoE
-/// experts continue to stream from NVMe and crunch on the CPU. This
-/// matches the cost-efficiency thesis the gist asks the README to
-/// reflect: "AI cheaper than high-end AI GPUs".
-///
-/// Default = `Cpu`, which preserves the existing single-binary CPU
-/// posture. Operators opt in to GPU offload via the
-/// `[real_transformer].compute_offload` key in `config.toml`.
+pub enum BackendBox {
+    Gpu(GpuBackend),
+    Cpu(CandleBackend),
+}
+
+impl BackendBox {
+    pub async fn init(
+        num_layers: usize,
+        max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, head_dim).await {
+            Ok(gpu) => BackendBox::Gpu(gpu),
+            Err(e) => {
+                tracing::warn!(reason = %e, "GPU init failed — activating CPU fallback");
+                BackendBox::Cpu(CandleBackend::new())
+            }
+        }
+    }
+
+    pub fn init_blocking(
+        num_layers: usize,
+        max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        pollster::block_on(Self::init(num_layers, max_seq_len, num_heads, head_dim))
+    }
+}
+
+impl Backend for BackendBox {
+    fn device_name(&self) -> &str {
+        match self {
+            BackendBox::Gpu(gpu) => gpu.device_name(),
+            BackendBox::Cpu(cpu) => cpu.device_name(),
+        }
+    }
+
+    fn is_gpu(&self) -> bool {
+        match self {
+            BackendBox::Gpu(gpu) => gpu.is_gpu(),
+            BackendBox::Cpu(cpu) => cpu.is_gpu(),
+        }
+    }
+
+    fn matmul_into(&self, a: TensorView, b: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        match self {
+            BackendBox::Gpu(gpu) => gpu.matmul_into(a, b, out),
+            BackendBox::Cpu(cpu) => cpu.matmul_into(a, b, out),
+        }
+    }
+
+    fn swiglu_into(&self, gate: TensorView, up: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        match self {
+            BackendBox::Gpu(gpu) => gpu.swiglu_into(gate, up, out),
+            BackendBox::Cpu(cpu) => cpu.swiglu_into(gate, up, out),
+        }
+    }
+
+    fn softmax(&self, x: &mut TensorViewMut) -> Result<()> {
+        match self {
+            BackendBox::Gpu(gpu) => gpu.softmax(x),
+            BackendBox::Cpu(cpu) => cpu.softmax(x),
+        }
+    }
+
+    fn kv_cache_insert(
+        &self,
+        layer: usize,
+        position: usize,
+        k: TensorView,
+        v: TensorView,
+    ) -> Result<()> {
+        match self {
+            BackendBox::Gpu(gpu) => gpu.kv_cache_insert(layer, position, k, v),
+            BackendBox::Cpu(cpu) => cpu.kv_cache_insert(layer, position, k, v),
+        }
+    }
+
+    fn kv_attend(
+        &self,
+        layer: usize,
+        q: TensorView,
+        seq_len: usize,
+        out: &mut TensorViewMut,
+    ) -> Result<()> {
+        match self {
+            BackendBox::Gpu(gpu) => gpu.kv_attend(layer, q, seq_len, out),
+            BackendBox::Cpu(cpu) => cpu.kv_attend(layer, q, seq_len, out),
+        }
+    }
+}
+
+// =====================================================================
+// Global active backend Registry
+// =====================================================================
+
+static BACKEND: OnceLock<Arc<BackendBox>> = OnceLock::new();
+
+/// Install `b` as the process-wide active backend. Returns `Err` if a
+/// backend has already been installed.
+pub fn set_backend(b: Arc<BackendBox>) -> Result<(), &'static str> {
+    BACKEND
+        .set(b)
+        .map_err(|_| "backend already installed; call before any token is generated")
+}
+
+/// Install the default backend (`CandleBackend`) if none has been set yet.
+pub fn install_default() {
+    let _ = BACKEND.set(Arc::new(BackendBox::Cpu(CandleBackend::new())));
+}
+
+/// Active backend. Falls back to a CPU reference backend when nothing has
+/// been installed.
+pub fn current() -> Arc<BackendBox> {
+    BACKEND
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(BackendBox::Cpu(CandleBackend::new())))
+}
+
+// =====================================================================
+// Operator-facing ComputeOffload Enum
+// =====================================================================
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ComputeOffload {
-    /// Default: CPU executor via [`CandleBackend`]. No GPU runtime
-    /// required.
     Cpu,
-    /// Budget-GPU executor via [`GpuBackend`]. The backend itself is
-    /// always present (so `compute_offload = "gpu"` parses on every
-    /// build); whether it actually targets a GPU vs falling back to
-    /// CPU depends on the `gpu` cargo feature and on runtime device
-    /// availability.
     Gpu,
 }
 
@@ -314,316 +1050,118 @@ impl Default for ComputeOffload {
     }
 }
 
-/// Budget-GPU executor — wraps a wgpu-style compute dispatcher behind
-/// the same [`Backend`] trait every other math executor implements.
-///
-/// **This is the architectural seam, not the GPU driver.** Pulling
-/// the actual `wgpu` runtime into the default dependency graph would
-/// add hundreds of transitive crates and inflate the CPU-only build
-/// time — the gist's "budget GPU" target is an *opt-in* path, not a
-/// mandatory one. The integration model is:
-///
-/// 1. Operator picks `compute_offload = "gpu"` in `config.toml`.
-/// 2. `main.rs` calls [`GpuBackend::try_new`].
-/// 3. If the `gpu` cargo feature is built **and** a compute-capable
-///    GPU adapter is present, the wgpu pipeline takes over the
-///    `matmul_into` / `swiglu_into` / `softmax` entry points; the
-///    SSD-streamed expert path stays CPU-side via the existing
-///    `kernels` dispatcher.
-/// 4. If either pre-condition fails, `GpuBackend` logs the reason
-///    and degrades to a thin pass-through over [`CandleBackend`] so
-///    the binary remains usable on hardware without a discrete GPU.
-///
-/// The trait surface is identical to [`CandleBackend`] — swapping is
-/// a single pointer change in the `BACKEND` `OnceLock` — so callers
-/// (the transformer body in `transformer.rs`, the LM-head in
-/// `model.rs`) need no `cfg(feature = "gpu")` branches.
-pub struct GpuBackend {
-    /// CPU fallback used when the GPU pipeline is unavailable.
-    /// Holding a concrete `CandleBackend` here avoids one level of
-    /// `Arc<dyn Backend>` indirection on the hot path.
-    fallback: CandleBackend,
-    /// `true` when a GPU device was successfully acquired at
-    /// construction. Exposed via [`Self::has_device`] for the
-    /// startup log so ops can see whether offload is actually live.
-    has_device: bool,
-    /// Identifier for the underlying device runtime. Reported by
-    /// [`Backend::name`] so operators can see the *actual* device in
-    /// the startup log instead of the previous stale hardcoded
-    /// `"gpu-fallback"` string (gist Part 2, fix #6).
-    ///
-    /// Convention:
-    /// * `"cpu-fallback"` — no GPU runtime is live (default for
-    ///   binaries without the `gpu` cargo feature, or when device
-    ///   probing fails at startup).
-    /// * `"cuda-0"`, `"cuda-1"`, … — a CUDA device acquired via
-    ///   `cudarc`. The trailing index is the visible device id.
-    /// * `"wgpu-vulkan"`, `"wgpu-metal"`, `"wgpu-dx12"` — a `wgpu`
-    ///   adapter backed by the named graphics API.
-    ///
-    /// Kept as `&'static str` because the `Backend::name` contract
-    /// returns one; the GPU init path picks the right literal from a
-    /// curated set when it acquires the device.
-    device_name: &'static str,
-}
-
-impl GpuBackend {
-    /// Try to construct a GPU-backed executor. On builds without the
-    /// `gpu` cargo feature, this always returns a pass-through to
-    /// [`CandleBackend`] (`has_device == false`, `device_name ==
-    /// "cpu-fallback"`) and logs a single warning so the operator
-    /// notices their `compute_offload = "gpu"` config has no effect.
-    /// On `gpu`-feature builds the constructor will (in a follow-up
-    /// PR that owns the wgpu / cudarc runtime) probe for an adapter,
-    /// request a device + queue, compile the matmul / SwiGLU WGSL
-    /// shaders, and set `device_name` to the actual runtime
-    /// identifier (e.g. `"cuda-0"` or `"wgpu-vulkan"`). The compute
-    /// shaders live in `backend/wgpu_shaders/`.
-    pub fn try_new() -> Self {
-        #[cfg(not(feature = "gpu"))]
-        {
-            tracing::warn!(
-                "[real_transformer].compute_offload = \"gpu\" requested, but binary was \
-                 built without the `gpu` cargo feature; falling back to CPU executor. \
-                 Rebuild with `cargo build --release --features gpu` to enable budget-GPU \
-                 offload."
-            );
-            return Self {
-                fallback: CandleBackend,
-                has_device: false,
-                device_name: "cpu-fallback",
-            };
-        }
-        #[cfg(feature = "gpu")]
-        {
-            // gist Part 2, fix #6 — opt-in wgpu / cudarc device
-            // acquisition. The `gpu` cargo feature pulls in the
-            // device-init crates; the device-init / shader-compile
-            // logic lives behind that feature so default builds stay
-            // lean. This branch is the integration point: when the
-            // wgpu / cudarc dependency is wired in, replace the
-            // `device_name = "cpu-fallback"` line below with the
-            // probe's runtime label (e.g. `"cuda-0"` /
-            // `"wgpu-vulkan"`). Until then the `gpu`-feature build
-            // is identical to the CPU path (so feature-gated CI
-            // still passes), and the device label transparently
-            // reports `"cpu-fallback"` so the startup log does not
-            // claim a GPU is active when it isn't.
-            tracing::info!(
-                "GpuBackend built with `gpu` feature; runtime device acquisition is a \
-                 follow-up integration step. Operating as a CandleBackend pass-through \
-                 for this binary."
-            );
-            Self {
-                fallback: CandleBackend,
-                has_device: false,
-                device_name: "cpu-fallback",
-            }
-        }
-    }
-
-    /// Whether a real GPU device is currently servicing requests.
-    /// Exposed for the startup-log diagnostic so ops can see whether
-    /// their `compute_offload = "gpu"` config actually engaged.
-    pub fn has_device(&self) -> bool {
-        self.has_device
-    }
-
-    /// Identifier of the underlying device runtime (e.g. `"cuda-0"`,
-    /// `"wgpu-vulkan"`, or `"cpu-fallback"` when no GPU is live).
-    /// Same string [`Backend::name`] returns — exposed inherently so
-    /// `main.rs` can read the runtime tag without re-routing through
-    /// the `Backend` trait object.
-    pub fn device_name(&self) -> &'static str {
-        self.device_name
-    }
-}
-
-impl Backend for GpuBackend {
-    fn name(&self) -> &'static str {
-        // gist Part 2, fix #6: report the *actual* device runtime
-        // instead of the stale hardcoded `"gpu-fallback"` string the
-        // previous revision returned. `has_device` is the truth
-        // source for "did the GPU pipeline come up?"; `device_name`
-        // carries the human-readable runtime label.
-        self.device_name
-    }
-
-    fn matmul_into(&self, w: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
-        // When a real GPU device is wired in, this is where the wgpu
-        // compute shader gets dispatched. Until then we keep the CPU
-        // fallback so the trait contract still holds and the engine
-        // remains usable.
-        self.fallback.matmul_into(w, x, rows, cols, y);
-    }
-
-    fn swiglu_into(
-        &self,
-        gate_w: &[f32],
-        up_w: &[f32],
-        x: &[f32],
-        rows: usize,
-        cols: usize,
-        y: &mut [f32],
-    ) {
-        self.fallback.swiglu_into(gate_w, up_w, x, rows, cols, y);
-    }
-
-    fn softmax(&self, logits: &mut [f32]) {
-        self.fallback.softmax(logits);
-    }
-
-    fn silu_inplace(&self, x: &mut [f32]) {
-        self.fallback.silu_inplace(x);
-    }
-}
-
 // =====================================================================
-// Global registry — set once at startup, read on every hot-path call.
+// Unit Tests
 // =====================================================================
-
-static BACKEND: OnceLock<Arc<dyn Backend>> = OnceLock::new();
-
-/// Install `b` as the process-wide active backend. Returns `Err` if a
-/// backend has already been installed — the trait is intentionally a
-/// "set once at startup" contract so the hot path can rely on a single
-/// atomic load.
-pub fn set_backend(b: Arc<dyn Backend>) -> Result<(), &'static str> {
-    BACKEND
-        .set(b)
-        .map_err(|_| "backend already installed; call before any token is generated")
-}
-
-/// Install the default backend (`CandleBackend`) if none has been set
-/// yet. Called from `main` at startup; safe to call multiple times.
-///
-/// Precedence is first-writer-wins:
-/// - if [`set_backend`] was called earlier, this is a no-op and the
-///   caller-provided backend remains active;
-/// - if this function runs first, later calls to [`set_backend`] will
-///   return `Err` because the process-wide backend has already been
-///   installed.
-pub fn install_default() {
-    let _ = BACKEND.set(Arc::new(CandleBackend) as Arc<dyn Backend>);
-}
-
-/// Active backend. Falls back to [`ScalarBackend`] when nothing has
-/// been installed — useful in tests where `main` hasn't run. On a
-/// production binary `main` always installs `CandleBackend` before
-/// the first request, so the fallback is purely a belt-and-braces
-/// measure.
-pub fn current() -> Arc<dyn Backend> {
-    BACKEND
-        .get()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(ScalarBackend) as Arc<dyn Backend>)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// All built-in backends must agree on small reference inputs
-    /// within `f32` tolerance. This is the property-style "swap is
-    /// safe" check the gist asks for in Task 2.
     #[test]
-    fn backend_implementations_agree() {
-        let rows = 7usize;
-        let cols = 13usize;
-        let w: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.1).sin()).collect();
-        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.3).cos()).collect();
-        let s = ScalarBackend.matmul(&w, &x, rows, cols);
-        let c = CandleBackend.matmul(&w, &x, rows, cols);
-        assert_eq!(s.len(), c.len());
-        for i in 0..rows {
-            assert!(
-                (s[i] - c[i]).abs() < 1e-4,
-                "scalar vs candle matmul mismatch at {i}: {} vs {}",
-                s[i],
-                c[i]
-            );
-        }
+    fn test_candle_matmul_correctness() {
+        let backend = CandleBackend::new();
+        let a_data = [
+            half::f16::from_f32(1.0),
+            half::f16::from_f32(2.0),
+            half::f16::from_f32(3.0),
+            half::f16::from_f32(4.0),
+        ];
+        let b_data = [
+            half::f16::from_f32(5.0),
+            half::f16::from_f32(6.0),
+            half::f16::from_f32(7.0),
+            half::f16::from_f32(8.0),
+        ];
+        let mut out_data = [half::f16::ZERO; 4];
+
+        let a = TensorView {
+            data: &a_data,
+            rows: 2,
+            cols: 2,
+        };
+        let b = TensorView {
+            data: &b_data,
+            rows: 2,
+            cols: 2,
+        };
+        let mut out = TensorViewMut {
+            data: &mut out_data,
+            rows: 2,
+            cols: 2,
+        };
+
+        backend.matmul_into(a, b, &mut out).unwrap();
+
+        // Expected:
+        // [1*5 + 2*7, 1*6 + 2*8] = [19, 22]
+        // [3*5 + 4*7, 3*6 + 4*8] = [43, 50]
+        assert_eq!(out_data[0].to_f32(), 19.0);
+        assert_eq!(out_data[1].to_f32(), 22.0);
+        assert_eq!(out_data[2].to_f32(), 43.0);
+        assert_eq!(out_data[3].to_f32(), 50.0);
     }
 
     #[test]
-    fn matmul_into_writes_into_caller_buffer_without_allocating() {
-        // The new `_into` entry points satisfy the "no allocation on
-        // the hot path" guardrail: the caller owns `y`.
-        let rows = 5usize;
-        let cols = 9usize;
-        let w: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.2 - 1.0).collect();
-        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.4).sin()).collect();
-        let mut y_scalar = vec![0.0f32; rows];
-        let mut y_candle = vec![0.0f32; rows];
-        ScalarBackend.matmul_into(&w, &x, rows, cols, &mut y_scalar);
-        CandleBackend.matmul_into(&w, &x, rows, cols, &mut y_candle);
-        for i in 0..rows {
-            assert!((y_scalar[i] - y_candle[i]).abs() < 1e-4);
-        }
+    fn test_candle_swiglu_correctness() {
+        let backend = CandleBackend::new();
+        let gate_data = [half::f16::from_f32(0.0), half::f16::from_f32(1.0)];
+        let up_data = [half::f16::from_f32(2.0), half::f16::from_f32(3.0)];
+        let mut out_data = [half::f16::ZERO; 2];
+
+        let gate = TensorView {
+            data: &gate_data,
+            rows: 1,
+            cols: 2,
+        };
+        let up = TensorView {
+            data: &up_data,
+            rows: 1,
+            cols: 2,
+        };
+        let mut out = TensorViewMut {
+            data: &mut out_data,
+            rows: 1,
+            cols: 2,
+        };
+
+        backend.swiglu_into(gate, up, &mut out).unwrap();
+
+        // Expected:
+        // out[0] = silu(0) * 2 = 0 * 2 = 0
+        // out[1] = silu(1) * 3 = (1 / (1 + exp(-1))) * 3 = 0.7310586 * 3 = 2.1931758
+        assert!((out_data[0].to_f32() - 0.0).abs() < 1e-4);
+        assert!((out_data[1].to_f32() - 2.1931758).abs() < 1e-3);
     }
 
     #[test]
-    fn swiglu_into_agrees_across_backends_and_with_unfused_reference() {
-        let rows = 6usize;
-        let cols = 11usize;
-        let gate: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.21).sin()).collect();
-        let up: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.17).cos()).collect();
-        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.31).cos() * 0.4).collect();
+    fn test_candle_softmax_correctness() {
+        let backend = CandleBackend::new();
+        let mut data = [
+            half::f16::from_f32(1.0),
+            half::f16::from_f32(2.0),
+            half::f16::from_f32(3.0),
+            half::f16::from_f32(-1.0),
+            half::f16::from_f32(0.0),
+            half::f16::from_f32(4.0),
+        ];
+        let mut out = TensorViewMut {
+            data: &mut data,
+            rows: 2,
+            cols: 3,
+        };
 
-        let mut y_scalar = vec![0.0f32; rows];
-        let mut y_candle = vec![0.0f32; rows];
-        ScalarBackend.swiglu_into(&gate, &up, &x, rows, cols, &mut y_scalar);
-        CandleBackend.swiglu_into(&gate, &up, &x, rows, cols, &mut y_candle);
+        backend.softmax(&mut out).unwrap();
 
-        // Reference: unfused matmul + scalar SiLU + multiply.
-        let g = ScalarBackend.matmul(&gate, &x, rows, cols);
-        let u = ScalarBackend.matmul(&up, &x, rows, cols);
-        let expected: Vec<f32> = g
-            .iter()
-            .zip(u.iter())
-            .map(|(&gi, &ui)| (gi / (1.0 + (-gi).exp())) * ui)
-            .collect();
-        for i in 0..rows {
-            assert!(
-                (y_scalar[i] - expected[i]).abs() < 1e-4,
-                "scalar swiglu mismatch at {i}: {} vs {}",
-                y_scalar[i],
-                expected[i]
-            );
-            assert!(
-                (y_candle[i] - expected[i]).abs() < 1e-4,
-                "candle swiglu mismatch at {i}: {} vs {}",
-                y_candle[i],
-                expected[i]
-            );
-        }
-    }
+        // Row 1 sum: exp(1-3) + exp(2-3) + exp(3-3) = exp(-2) + exp(-1) + 1.0 = 0.1353 + 0.3679 + 1.0 = 1.5032
+        // Row 1 values: exp(-2)/1.5032 = 0.0900, exp(-1)/1.5032 = 0.2447, 1.0/1.5032 = 0.6653
+        // Sum of Row 1 should be 1.0
+        let sum1 = data[0].to_f32() + data[1].to_f32() + data[2].to_f32();
+        assert!((sum1 - 1.0).abs() < 1e-3);
 
-    #[test]
-    fn softmax_sums_to_one() {
-        let mut logits = vec![1.0, 2.0, -3.0, 0.5, 4.2];
-        ScalarBackend.softmax(&mut logits);
-        let s: f32 = logits.iter().sum();
-        assert!((s - 1.0).abs() < 1e-5, "softmax sum {s}");
-        for &v in &logits {
-            assert!(v >= 0.0);
-        }
-    }
-
-    #[test]
-    fn silu_matches_reference() {
-        let xs = [-2.0f32, -0.5, 0.0, 0.5, 2.0];
-        let expected: Vec<f32> = xs.iter().map(|x| x / (1.0 + (-x).exp())).collect();
-        let mut got = xs.to_vec();
-        ScalarBackend.silu_inplace(&mut got);
-        for i in 0..xs.len() {
-            assert!((got[i] - expected[i]).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn current_always_resolves() {
-        let b = current();
-        let _ = b.name();
+        // Row 2 sum: exp(-1-4) + exp(0-4) + exp(4-4) = exp(-5) + exp(-4) + 1.0 = 0.0067 + 0.0183 + 1.0 = 1.0250
+        // Sum of Row 2 should be 1.0
+        let sum2 = data[3].to_f32() + data[4].to_f32() + data[5].to_f32();
+        assert!((sum2 - 1.0).abs() < 1e-3);
     }
 }

@@ -89,6 +89,10 @@ matrixmultiply = { version = "0.3", optional = true }
 # bytes-per-parameter halves every SSD read, which is the single highest-
 # leverage energy reduction in this engine.
 half = { version = "2", features = ["bytemuck"] }
+wgpu = { version = "0.20", features = ["wgsl"] }
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+anyhow = "1"
 
 # io_uring with registered fixed buffers (Linux-only, behind `io_uring`
 # cargo feature). The default build does not require this crate.
