@@ -156,7 +156,7 @@ impl GpuBackend {
         num_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
@@ -182,8 +182,8 @@ impl GpuBackend {
                         max_push_constant_size: 32,
                         ..wgpu::Limits::default()
                     },
+                    memory_hints: wgpu::MemoryHints::default(),
                 },
-                None,
             )
             .await?;
 
@@ -207,6 +207,9 @@ impl GpuBackend {
         let attention_src = ATTENTION_SHADER.replace(
             "const MAX_SEQ_LEN: u32 = 4096u;",
             &format!("const MAX_SEQ_LEN: u32 = {}u;", max_seq_len),
+        ).replace(
+            "const MAX_HEAD_DIM: u32 = 256u;",
+            &format!("const MAX_HEAD_DIM: u32 = {}u;", head_dim),
         );
         let attention_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("attention_shader"),
@@ -307,28 +310,28 @@ impl GpuBackend {
             label: Some("matmul_pipeline"),
             layout: Some(&matmul_pipeline_layout),
             module: &matmul_module,
-            entry_point: "matmul_main",
+            entry_point: Some("matmul_main"),
         });
 
         let swiglu_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("swiglu_pipeline"),
             layout: Some(&swiglu_pipeline_layout),
             module: &swiglu_module,
-            entry_point: "swiglu_main",
+            entry_point: Some("swiglu_main"),
         });
 
         let softmax_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("softmax_pipeline"),
             layout: Some(&softmax_pipeline_layout),
             module: &softmax_module,
-            entry_point: "softmax_main",
+            entry_point: Some("softmax_main"),
         });
 
         let attention_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("attention_pipeline"),
             layout: Some(&attention_pipeline_layout),
             module: &attention_module,
-            entry_point: "attention_main",
+            entry_point: Some("attention_main"),
         });
 
         // Pre-allocated buffers
@@ -496,6 +499,7 @@ impl Backend for GpuBackend {
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("matmul_pass"),
+                timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.matmul_pipeline);
             compute_pass.set_bind_group(0, &self.matmul_bind_group, &[]);
@@ -570,6 +574,7 @@ impl Backend for GpuBackend {
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("swiglu_pass"),
+                timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.swiglu_pipeline);
             compute_pass.set_bind_group(0, &self.swiglu_bind_group, &[]);
@@ -631,6 +636,7 @@ impl Backend for GpuBackend {
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("softmax_pass"),
+                timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.softmax_pipeline);
             compute_pass.set_bind_group(0, &self.softmax_bind_group, &[]);
@@ -740,6 +746,7 @@ impl Backend for GpuBackend {
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("attention_pass"),
+                timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.attention_pipeline);
             compute_pass.set_bind_group(0, &self.attention_bind_group, &[]);

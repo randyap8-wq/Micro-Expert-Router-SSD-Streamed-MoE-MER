@@ -13,12 +13,13 @@ var<push_constant> pc: PushConstants;
 @group(0) @binding(2) var<storage, read_write> OUT: array<f32>;
 
 var<workgroup> shared_dot: array<f32, 32>;
-var<workgroup> shared_out: array<f32, 256>;
+var<workgroup> shared_out: array<f32, MAX_HEAD_DIM>;
 var<workgroup> wg_m: f32;
 var<workgroup> wg_d: f32;
 
 // MAX_SEQ_LEN is defined at compile time and will be replaced dynamically at runtime
 const MAX_SEQ_LEN: u32 = 4096u;
+const MAX_HEAD_DIM: u32 = 256u;
 
 @compute @workgroup_size(32, 1, 1)
 fn attention_main(
