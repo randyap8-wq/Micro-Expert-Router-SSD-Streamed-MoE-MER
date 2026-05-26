@@ -1136,12 +1136,8 @@ fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_mode
                             for (i, slot) in out_chunk.iter_mut().enumerate() {
                                 let g_row = &g_slice[i * d_model..(i + 1) * d_model];
                                 let u_row = &u_slice[i * d_model..(i + 1) * d_model];
-                                let mut g = 0.0f32;
-                                let mut u = 0.0f32;
-                                for j in 0..d_model {
-                                    g += g_row[j] * x_ref[j];
-                                    u += u_row[j] * x_ref[j];
-                                }
+                                let g = crate::kernels::dot_f32(g_row, x_ref);
+                                let u = crate::kernels::dot_f32(u_row, x_ref);
                                 *slot = silu(g) * u;
                             }
                         }));
@@ -1161,13 +1157,8 @@ fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_mode
         let row = i * d_model;
         let g_row = &gate[row..row + d_model];
         let u_row = &up[row..row + d_model];
-        let mut g = 0.0f32;
-        let mut u = 0.0f32;
-        for j in 0..d_model {
-            g += g_row[j] * x[j];
-            u += u_row[j] * x[j];
-        }
-        gated[i] = silu(g) * u;
+        gated[i] = silu(crate::kernels::dot_f32(g_row, x))
+                 * crate::kernels::dot_f32(u_row, x);
     }
 }
 
@@ -1212,12 +1203,7 @@ fn down_proj(down: &[f32], gated: &[f32], y: &mut [f32], d_ff: usize) {
                         let g_ref = gated;
                         handles.push(s.spawn(move || {
                             for (i, slot) in out_chunk.iter_mut().enumerate() {
-                                let d_row = &d_slice[i * d_ff..(i + 1) * d_ff];
-                                let mut acc = 0.0f32;
-                                for j in 0..d_ff {
-                                    acc += d_row[j] * g_ref[j];
-                                }
-                                *slot = acc;
+                                *slot = crate::kernels::dot_f32(&d_slice[i * d_ff..(i + 1) * d_ff], g_ref);
                             }
                         }));
                     }
@@ -1234,12 +1220,7 @@ fn down_proj(down: &[f32], gated: &[f32], y: &mut [f32], d_ff: usize) {
     let d_model = y.len();
     for i in 0..d_model {
         let row = i * d_ff;
-        let d_row = &down[row..row + d_ff];
-        let mut acc = 0.0f32;
-        for j in 0..d_ff {
-            acc += d_row[j] * gated[j];
-        }
-        y[i] = acc;
+        y[i] = crate::kernels::dot_f32(&down[row..row + d_ff], gated);
     }
 }
 

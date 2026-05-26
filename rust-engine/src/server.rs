@@ -75,6 +75,18 @@ pub struct AppState {
     /// single batch so multiple HTTP clients share each round of
     /// SSD-streamed expert FFN compute.
     pub batch_scheduler: Option<Arc<BatchScheduler>>,
+    /// Draft engine for speculative decoding. When `Some`, the generation
+    /// loop calls `RealModel::step_speculative` instead of sequential
+    /// `step_through_scheduler` calls, verifying `speculation_k` draft
+    /// tokens per step with a single batched expert prefetch.
+    /// Built from the main model's embedding via `DraftEngine::from_main`
+    /// when `cfg.predictive.speculator_enabled = true`.
+    pub draft_engine: Option<Arc<crate::draft::DraftEngine>>,
+
+    /// Number of draft tokens to attempt per speculative step.
+    /// Populated from `cfg.real_transformer.speculation_base_depth`.
+    /// `0` or `1` disables speculation (falls back to sequential).
+    pub speculation_k: usize,
     /// Live, atomically-swappable runtime configuration. Reads on the
     /// hot path (sampling defaults, `max_tokens` cap) go through a
     /// single relaxed atomic load — no mutex, no contention across
@@ -519,12 +531,43 @@ async fn generate(
         }
 
         // Now generate `max_tokens` real tokens.
+        // When a draft engine is configured and speculation_k > 1, use
+        // `step_speculative` which verifies k draft tokens per call with a
+        // single batched SSD prefetch (gist Phase 2). Falls back to the
+        // sequential `step_through_scheduler` path otherwise.
         let mut last = *prompt_ids.last().unwrap_or(&0u32);
-        for _ in 0..max_tokens {
-            let next = step_through_scheduler(state, model, last, start_pos, &mut kv, &params).await;
-            completion_ids.push(next);
-            last = next;
-            start_pos += 1;
+        let k = state.speculation_k;
+        if k > 1 && state.draft_engine.is_some() {
+            let draft = state.draft_engine.as_ref().expect("draft_engine is_some checked above").clone();
+            while completion_ids.len() < max_tokens {
+                let remaining = max_tokens - completion_ids.len();
+                let step_k = k.min(remaining);
+                let result = model
+                    .step_speculative(
+                        &state.engine,
+                        draft.as_ref(),
+                        last,
+                        start_pos,
+                        &mut kv,
+                        step_k,
+                    )
+                    .await;
+                for &tok in &result.accepted {
+                    if completion_ids.len() >= max_tokens {
+                        break;
+                    }
+                    completion_ids.push(tok);
+                    start_pos += 1;
+                }
+                last = *result.accepted.last().unwrap_or(&last);
+            }
+        } else {
+            for _ in 0..max_tokens {
+                let next = step_through_scheduler(state, model, last, start_pos, &mut kv, &params).await;
+                completion_ids.push(next);
+                last = next;
+                start_pos += 1;
+            }
         }
         save_session_kv(state, session_id.as_deref(), kv, start_pos, checkout);
         let post = state.engine.report();
@@ -1491,6 +1534,8 @@ mod tests {
             metrics: Metrics::new(),
             real_model: None,
             batch_scheduler: None,
+            draft_engine: None,
+            speculation_k: 0,
             runtime: crate::config::LiveConfig::from_config(&{
                 let mut c = test_minimal_cfg();
                 c.server.max_tokens = 32;
@@ -1835,6 +1880,8 @@ mod tests {
             metrics: Metrics::new(),
             real_model: Some(model),
             batch_scheduler: Some(scheduler),
+            draft_engine: None,
+            speculation_k: 0,
             runtime: crate::config::LiveConfig::from_config(&{
                 let mut c = test_minimal_cfg();
                 c.server.max_tokens = 16;
