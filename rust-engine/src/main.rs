@@ -54,6 +54,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::backend::Backend;
 use crate::buffer_pool::BufferPool;
 use crate::engine::{Engine, EngineOptions, ModelShape};
 use crate::expert_cache::ExpertCache;

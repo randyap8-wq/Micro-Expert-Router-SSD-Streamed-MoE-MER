@@ -512,6 +512,13 @@ impl GpuExpertCache {
         GpuLookup::Miss
     }
 
+    /// Check whether an expert is currently resident in either the
+    /// anchor or LRU regions, without mutating recency or counters.
+    pub fn contains(&self, id: u32) -> bool {
+        let g = self.inner.lock();
+        g.anchor.contains_key(&id) || g.lru.peek(&id).is_some()
+    }
+
     /// Should the resident's current hit count promote it to the
     /// Anchor Core? Cheap relaxed-atomic compare against the
     /// configured threshold; safe to call from the hot path before

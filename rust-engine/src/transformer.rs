@@ -321,101 +321,10 @@ impl MultiHeadSelfAttention {
         debug_assert_eq!(x.len(), self.d_model);
         debug_assert_eq!(kv.kv_dim, self.kv_dim());
 
-        // ── Helpers: f32 ↔ f16 conversion at the backend boundary ────────────
-        // These allocations happen once per token (not in the inner loop) and
-        // are therefore outside the hot-path allocation budget.
-        let to_f16 = |v: &[f32]| -> Vec<f16> {
-            v.iter().map(|&f| f16::from_f32(f)).collect()
-        };
-        let to_f32 = |v: &[f16]| -> Vec<f32> {
-            v.iter().map(|h| h.to_f32()).collect()
-        };
-
-        let x_f16 = to_f16(x);
-
-        // ── 1) Project Q, K, V via backend ───────────────────────────────────
-        let wq_f16 = to_f16(&self.wq);
-        let wk_f16 = to_f16(&self.wk);
-        let wv_f16 = to_f16(&self.wv);
-
         let q_dim  = self.q_dim();
         let kv_dim = self.kv_dim();
-
-        let mut q_f16  = vec![f16::ZERO; q_dim];
-        let mut k_f16  = vec![f16::ZERO; kv_dim];
-        let mut v_f16  = vec![f16::ZERO; kv_dim];
-
-        backend.matmul_into(
-            TensorView { data: &wq_f16, rows: q_dim,  cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut q_f16, rows: q_dim, cols: 1 },
-        ).expect("Q projection failed");
-
-        backend.matmul_into(
-            TensorView { data: &wk_f16, rows: kv_dim, cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut k_f16, rows: kv_dim, cols: 1 },
-        ).expect("K projection failed");
-
-        backend.matmul_into(
-            TensorView { data: &wv_f16, rows: kv_dim, cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut v_f16, rows: kv_dim, cols: 1 },
-        ).expect("V projection failed");
-
-        // ── 2) Apply RoPE in f32 (cheap; stays on CPU regardless of backend) ─
-        let mut q = to_f32(&q_f16);
-        let mut k = to_f32(&k_f16);
-
-        for h in 0..self.num_heads {
-            let s = h * self.head_dim;
-            apply_rope_inplace(&mut q[s..s + self.head_dim], pos, self.rope_base);
-        }
-        for h in 0..self.num_kv_heads {
-            let s = h * self.head_dim;
-            apply_rope_inplace(&mut k[s..s + self.head_dim], pos, self.rope_base);
-        }
-
-        // ── 3) KV insert + attention ──────────────────────────────────────────
-        let k_f16_rope = to_f16(&k);
-        let v_f16_rope = v_f16; // V is not RoPE'd
-
-        let mut attn_out = vec![0.0f32; q_dim];
-
-        if backend.is_gpu() {
-            // GPU path: K and V written directly into VRAM; attention kernel
-            // runs over VRAM-resident KV — zero round-trip to system RAM.
-            backend.kv_cache_insert(
-                layer_idx,
-                pos,
-                TensorView { data: &k_f16_rope, rows: 1, cols: kv_dim },
-                TensorView { data: &v_f16_rope, rows: 1, cols: kv_dim },
-            ).expect("kv_cache_insert failed");
-
-            // Keep the CPU-side paged KV cache in sync so any downstream
-            // consumer that still reads `kv` directly observes the same
-            // sequence length and per-position K/V bytes the GPU sees.
-            let v_for_cpu = to_f32(&v_f16_rope);
-            kv.append(&k, &v_for_cpu);
-
-            // seq_len after the insert = pos + 1
-            let seq_len = pos + 1;
-            let q_f16_rope = to_f16(&q);
-            let mut out_f16 = vec![f16::ZERO; q_dim];
-
-            backend.kv_attend(
-                layer_idx,
-                TensorView { data: &q_f16_rope, rows: self.num_heads, cols: self.head_dim },
-                seq_len,
-                &mut TensorViewMut { data: &mut out_f16, rows: self.num_heads, cols: self.head_dim },
-            ).expect("kv_attend failed");
-
-            attn_out = to_f32(&out_f16);
-        } else {
-            // CPU path: existing paged-attention loop unchanged.
-            let v = to_f32(&v_f16_rope);
-            kv.append(&k, &v);
-
+        let cpu_attend = |q: &[f32], kv: &KvCache| -> Vec<f32> {
+            let mut attn_out = vec![0.0f32; q_dim];
             let scale   = 1.0 / (self.head_dim as f32).sqrt();
             let t_max   = kv.seq_len;
             let t_start = match self.window_size {
@@ -446,20 +355,130 @@ impl MultiHeadSelfAttention {
                     for j in 0..self.head_dim { out_h[j] += score * v_h[j]; }
                 }
             }
+            attn_out
+        };
+        let mut cpu_forward = || {
+            let mut q = matmul_row_major(&self.wq, x, q_dim, self.d_model);
+            let mut k = matmul_row_major(&self.wk, x, kv_dim, self.d_model);
+            let v = matmul_row_major(&self.wv, x, kv_dim, self.d_model);
+            for h in 0..self.num_heads {
+                let s = h * self.head_dim;
+                apply_rope_inplace(&mut q[s..s + self.head_dim], pos, self.rope_base);
+            }
+            for h in 0..self.num_kv_heads {
+                let s = h * self.head_dim;
+                apply_rope_inplace(&mut k[s..s + self.head_dim], pos, self.rope_base);
+            }
+            kv.append(&k, &v);
+            let attn_out = cpu_attend(&q, kv);
+            matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim)
+        };
+        if !backend.is_gpu() {
+            return cpu_forward();
         }
+
+        // ── Helpers: f32 ↔ f16 conversion at the backend boundary ────────────
+        let to_f16 = |v: &[f32]| -> Vec<f16> {
+            v.iter().map(|&f| f16::from_f32(f)).collect()
+        };
+        let to_f32 = |v: &[f16]| -> Vec<f32> {
+            v.iter().map(|h| h.to_f32()).collect()
+        };
+
+        let x_f16 = to_f16(x);
+        let wq_f16 = to_f16(&self.wq);
+        let wk_f16 = to_f16(&self.wk);
+        let wv_f16 = to_f16(&self.wv);
+
+        let mut q_f16  = vec![f16::ZERO; q_dim];
+        let mut k_f16  = vec![f16::ZERO; kv_dim];
+        let mut v_f16  = vec![f16::ZERO; kv_dim];
+
+        if backend.matmul_into(
+            TensorView { data: &wq_f16, rows: q_dim,  cols: self.d_model },
+            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
+            &mut TensorViewMut { data: &mut q_f16, rows: q_dim, cols: 1 },
+        ).is_err() {
+            return cpu_forward();
+        }
+
+        if backend.matmul_into(
+            TensorView { data: &wk_f16, rows: kv_dim, cols: self.d_model },
+            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
+            &mut TensorViewMut { data: &mut k_f16, rows: kv_dim, cols: 1 },
+        ).is_err() {
+            return cpu_forward();
+        }
+
+        if backend.matmul_into(
+            TensorView { data: &wv_f16, rows: kv_dim, cols: self.d_model },
+            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
+            &mut TensorViewMut { data: &mut v_f16, rows: kv_dim, cols: 1 },
+        ).is_err() {
+            return cpu_forward();
+        }
+
+        // ── 2) Apply RoPE in f32 (cheap; stays on CPU regardless of backend) ─
+        let mut q = to_f32(&q_f16);
+        let mut k = to_f32(&k_f16);
+
+        for h in 0..self.num_heads {
+            let s = h * self.head_dim;
+            apply_rope_inplace(&mut q[s..s + self.head_dim], pos, self.rope_base);
+        }
+        for h in 0..self.num_kv_heads {
+            let s = h * self.head_dim;
+            apply_rope_inplace(&mut k[s..s + self.head_dim], pos, self.rope_base);
+        }
+
+        // ── 3) KV insert + attention ──────────────────────────────────────────
+        let k_f16_rope = to_f16(&k);
+        let v_f16_rope = v_f16; // V is not RoPE'd
+
+        // Generation must advance strictly one token at a time: before we append
+        // the new KV for `pos`, the cache length should equal that position.
+        debug_assert_eq!(pos, kv.seq_len);
+        let v_for_cpu = to_f32(&v_f16_rope);
+        kv.append(&k, &v_for_cpu);
+        let seq_len = kv.seq_len;
+
+        if backend.kv_cache_insert(
+            layer_idx,
+            pos,
+            TensorView { data: &k_f16_rope, rows: 1, cols: kv_dim },
+            TensorView { data: &v_f16_rope, rows: 1, cols: kv_dim },
+        ).is_err() {
+            let attn_out = cpu_attend(&q, kv);
+            return matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
+        }
+
+        let q_f16_rope = to_f16(&q);
+        let mut out_f16 = vec![f16::ZERO; q_dim];
+        let attn_out = if backend.kv_attend(
+            layer_idx,
+            TensorView { data: &q_f16_rope, rows: self.num_heads, cols: self.head_dim },
+            seq_len,
+            &mut TensorViewMut { data: &mut out_f16, rows: self.num_heads, cols: self.head_dim },
+        ).is_ok() {
+            to_f32(&out_f16)
+        } else {
+            cpu_attend(&q, kv)
+        };
 
         // ── 4) Output projection via backend ──────────────────────────────────
         let wo_f16      = to_f16(&self.wo);
         let attn_f16    = to_f16(&attn_out);
         let mut out_f16 = vec![f16::ZERO; self.d_model];
 
-        backend.matmul_into(
+        if backend.matmul_into(
             TensorView { data: &wo_f16,   rows: self.d_model, cols: q_dim },
             TensorView { data: &attn_f16, rows: q_dim,        cols: 1 },
             &mut TensorViewMut { data: &mut out_f16, rows: self.d_model, cols: 1 },
-        ).expect("output projection failed");
-
-        to_f32(&out_f16)
+        ).is_ok() {
+            to_f32(&out_f16)
+        } else {
+            matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim)
+        }
     }
 }
 
@@ -1128,10 +1147,10 @@ mod tests {
         // fixture is non-degenerate).
         let attn_full = make_window_attn(None);
         let mut kv2 = KvCache::new(attn_full.kv_dim());
-        let _ = attn_full.forward(&big, 0, &mut kv2);
-        let _ = attn_full.forward(&small, 1, &mut kv2);
-        let _ = attn_full.forward(&small, 2, &mut kv2);
-        let y_full = attn_full.forward(&small, 3, &mut kv2);
+        let _ = attn_full.forward(&big, 0, 0, &mut kv2, &cpu_backend());
+        let _ = attn_full.forward(&small, 1, 0, &mut kv2, &cpu_backend());
+        let _ = attn_full.forward(&small, 2, 0, &mut kv2, &cpu_backend());
+        let y_full = attn_full.forward(&small, 3, 0, &mut kv2, &cpu_backend());
         assert!(y_full[0] > 0.5, "full attention should see t=0 spike: {y_full:?}");
     }
 
@@ -1149,8 +1168,8 @@ mod tests {
             vec![0.0, 0.0, 1.0, 0.0],
         ];
         for (pos, x) in xs.iter().enumerate() {
-            let y_w = attn_w.forward(x, pos, &mut kv1);
-            let y_n = attn_n.forward(x, pos, &mut kv2);
+            let y_w = attn_w.forward(x, pos, 0, &mut kv1, &cpu_backend());
+            let y_n = attn_n.forward(x, pos, 0, &mut kv2, &cpu_backend());
             for (a, b) in y_w.iter().zip(y_n.iter()) {
                 assert!((a - b).abs() < 1e-5);
             }

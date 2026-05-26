@@ -52,6 +52,7 @@
 //! see [`crate::engine`] for details.
 
 use crate::block_pool::{BlockManager, BlockPool, PressureLevel};
+use crate::backend::Backend;
 use crate::engine::Engine;
 use crate::model::RealModel;
 use crate::router::SpeculationController;

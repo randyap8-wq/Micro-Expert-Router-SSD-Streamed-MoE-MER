@@ -62,6 +62,7 @@ pub trait Backend: Send + Sync + 'static {
     /// `out`     : output buffer        [d_model]
     fn expert_matmul(
         &self,
+        layer_idx: usize,
         expert_id: u32,
         x:        TensorView<'_>,
         d_model:  usize,
@@ -183,7 +184,7 @@ impl GpuBackend {
         head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     ) -> Result<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
@@ -209,8 +210,8 @@ impl GpuBackend {
                         max_push_constant_size: 32,
                         ..wgpu::Limits::default()
                     },
-                    memory_hints: wgpu::MemoryHints::default(),
                 },
+                None,
             )
             .await?;
 
@@ -337,28 +338,32 @@ impl GpuBackend {
             label: Some("matmul_pipeline"),
             layout: Some(&matmul_pipeline_layout),
             module: &matmul_module,
-            entry_point: Some("matmul_main"),
+            entry_point: "matmul_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
         let swiglu_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("swiglu_pipeline"),
             layout: Some(&swiglu_pipeline_layout),
             module: &swiglu_module,
-            entry_point: Some("swiglu_main"),
+            entry_point: "swiglu_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
         let softmax_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("softmax_pipeline"),
             layout: Some(&softmax_pipeline_layout),
             module: &softmax_module,
-            entry_point: Some("softmax_main"),
+            entry_point: "softmax_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
         let attention_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("attention_pipeline"),
             layout: Some(&attention_pipeline_layout),
             module: &attention_module,
-            entry_point: Some("attention_main"),
+            entry_point: "attention_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
         // Pre-allocated buffers
@@ -490,23 +495,16 @@ impl GpuBackend {
     fn expert_matmul_from_vram(
         &self,
         _weight_buf: &wgpu::Buffer,
-        x:           TensorView<'_>,
-        d_model:     usize,
+        _x:          TensorView<'_>,
+        _d_model:    usize,
         _d_ff:       usize,
-        out:         &mut TensorViewMut<'_>,
+        _out:        &mut TensorViewMut<'_>,
     ) -> Result<()> {
         // Phase 3 TODO: dispatch dedicated SwiGLU + GEMM kernel sequence
         // using `_weight_buf` as binding 0 and `work_a` as the x buffer.
-        // For now, copy x → out (identity pass-through) so the pipeline
-        // compiles and the CPU fallback in `run_expert_forward` can be
-        // called by the engine when this returns the sentinel error.
-        //
         // Replace this body with real WGSL dispatch once the expert-FFN
-        // shader exists (Phase 3).
-        debug_assert_eq!(x.data.len(), d_model);
-        debug_assert_eq!(out.data.len(), d_model);
-        out.data.copy_from_slice(x.data);
-        Ok(())
+        // shader exists (Phase 3). Until then force caller fallback.
+        anyhow::bail!("GPU expert execution not yet implemented (planned for Phase 3)")
     }
 }
 
@@ -840,6 +838,7 @@ impl Backend for GpuBackend {
 
     fn expert_matmul(
         &self,
+        layer_idx: usize,
         expert_id: u32,
         x:        TensorView<'_>,
         d_model:  usize,
@@ -847,6 +846,7 @@ impl Backend for GpuBackend {
         out:      &mut TensorViewMut<'_>,
     ) -> Result<()> {
         use crate::expert_cache::GpuLookup;
+        let _ = layer_idx;
 
         // ── 1. Check VRAM buffer map first (zero-lock fast path) ─────────────
         {
@@ -858,26 +858,27 @@ impl Backend for GpuBackend {
             }
         }
 
+        // Slow path: reconcile stale VRAM buffers after cache evictions.
+        self.vram_expert_bufs
+            .lock()
+            .retain(|id, _| self.gpu_expert_cache.contains(*id));
+
         // ── 2. Check GpuExpertCache (may trigger LRU promotion) ──────────────
         match self.gpu_expert_cache.get(expert_id) {
             GpuLookup::AnchorHit(r) | GpuLookup::LruHit(r) => {
                 // GpuResident bytes are the weight payload. Upload to VRAM,
                 // cache the buffer, then run the matmul.
                 let weight_bytes = r.data();
-                let weight_f32: Vec<f32> = weight_bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
 
                 // Allocate a new VRAM buffer sized to this expert's weight.
                 let vram_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label:              Some("vram_expert"),
-                    size:               (weight_f32.len() * 4) as u64,
+                    size:               weight_bytes.len() as u64,
                     usage:              wgpu::BufferUsages::STORAGE
                                       | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                self.queue.write_buffer(&vram_buf, 0, bytemuck::cast_slice(&weight_f32));
+                self.queue.write_buffer(&vram_buf, 0, weight_bytes);
 
                 let result = self.expert_matmul_from_vram(&vram_buf, x, d_model, d_ff, out);
 
@@ -1031,18 +1032,14 @@ impl Backend for CandleBackend {
 
     fn expert_matmul(
         &self,
+        _layer_idx: usize,
         _expert_id: u32,
         _x:        TensorView<'_>,
         _d_model:  usize,
         _d_ff:     usize,
         _out:      &mut TensorViewMut<'_>,
     ) -> Result<()> {
-        // CPU path: expert execution is handled by `run_expert_forward` in
-        // transformer.rs which reads directly from the RAM-resident
-        // ExpertResident buffer. This method is intentionally a no-op;
-        // the engine checks `backend.is_gpu()` before deciding which path
-        // to take.
-        Ok(())
+        anyhow::bail!("expert_matmul should not be called on CPU backend; use direct NVMe streaming path instead")
     }
 }
 
@@ -1153,6 +1150,7 @@ impl Backend for BackendBox {
 
     fn expert_matmul(
         &self,
+        layer_idx: usize,
         expert_id: u32,
         x:        TensorView<'_>,
         d_model:  usize,
@@ -1160,8 +1158,8 @@ impl Backend for BackendBox {
         out:      &mut TensorViewMut<'_>,
     ) -> Result<()> {
         match self {
-            Self::Gpu(g) => g.expert_matmul(expert_id, x, d_model, d_ff, out),
-            Self::Cpu(c) => c.expert_matmul(expert_id, x, d_model, d_ff, out),
+            Self::Gpu(g) => g.expert_matmul(layer_idx, expert_id, x, d_model, d_ff, out),
+            Self::Cpu(c) => c.expert_matmul(layer_idx, expert_id, x, d_model, d_ff, out),
         }
     }
 }

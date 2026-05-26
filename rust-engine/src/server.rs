@@ -26,6 +26,7 @@
 //! HTTP shape doesn't change.
 
 use crate::batch_scheduler::BatchScheduler;
+use crate::backend::Backend;
 use crate::config::LiveConfig;
 use crate::engine::Engine;
 use crate::metrics::Metrics;
