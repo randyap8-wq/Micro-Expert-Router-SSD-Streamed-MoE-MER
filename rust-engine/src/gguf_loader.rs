@@ -284,7 +284,33 @@ pub fn extract_experts_from_source(
         DEFAULT_BLOCK_ALIGN,
     );
     let header_overhead = if opts.emit_uth { DEFAULT_BLOCK_ALIGN } else { 0 };
-    let expert_size = payload_size + header_overhead;
+    // Defensive: an adversarially-large `llama.embedding_length` /
+    // `llama.feed_forward_length` pair could push `payload_size` close
+    // to `usize::MAX` and wrap to a small `expert_size` here, which
+    // would later cause out-of-bounds writes into the per-expert byte
+    // buffer. Surface the overflow as a clean `InvalidData` instead.
+    let expert_size = payload_size.checked_add(header_overhead).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expert size overflows usize: payload_size={payload_size}, \
+                 header_overhead={header_overhead}"
+            ),
+        )
+    })?;
+    // Same hardening for the global id arithmetic below: a corrupt
+    // metadata block claiming `num_experts * num_layers > usize::MAX`
+    // would wrap into a small id and start overwriting expert files
+    // from earlier layers. Refuse to start in that case.
+    let total_experts = num_experts.checked_mul(num_layers).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "num_experts * num_layers overflows usize: \
+                 num_experts={num_experts}, num_layers={num_layers}"
+            ),
+        )
+    })?;
 
     for layer in 0..num_layers {
         info!(layer, "extracting layer experts");
@@ -296,6 +322,9 @@ pub fn extract_experts_from_source(
                 let per_expert =
                     load_layer_expert_native_quant(gguf, layer, num_experts, d_model, d_ff, d)?;
                 for (e, (gate, up, down)) in per_expert.into_iter().enumerate() {
+                    // Safe: `layer < num_layers` and `e < num_experts`,
+                    // so `layer * num_experts + e < total_experts`,
+                    // which we proved above does not overflow.
                     let global_id = layer * num_experts + e;
                     let path = out_dir.join(format!("expert_{global_id}.bin"));
                     let mut bytes = Vec::with_capacity(expert_size);
@@ -319,6 +348,7 @@ pub fn extract_experts_from_source(
                 let per_expert =
                     load_layer_expert_matrices(gguf, layer, num_experts, d_model, d_ff)?;
                 for (e, (gate, up, down)) in per_expert.into_iter().enumerate() {
+                    // Safe by the same `total_experts` check above.
                     let global_id = layer * num_experts + e;
                     let path = out_dir.join(format!("expert_{global_id}.bin"));
                     let mut bytes = Vec::with_capacity(expert_size);
@@ -438,7 +468,7 @@ pub fn extract_experts_from_source(
     let meta = ExtractedMetadata {
         model: model_name,
         layer: if num_layers == 1 { 0 } else { -1 },
-        num_experts: num_experts * num_layers,
+        num_experts: total_experts,
         top_k,
         d_model,
         d_ff,

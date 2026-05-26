@@ -535,9 +535,18 @@ async fn generate(
         // `step_speculative` which verifies k draft tokens per call with a
         // single batched SSD prefetch (gist Phase 2). Falls back to the
         // sequential `step_through_scheduler` path otherwise.
+        //
+        // **Sampling-correctness gate.** `step_speculative` verifies and
+        // emits tokens with `SamplingParams::greedy()` internally (see
+        // `draft.rs::step_speculative`), so taking the speculative branch
+        // for a request with `temperature > 0`, `top_p`, `top_k`, or a
+        // non-default `seed` would silently downgrade it to greedy
+        // decoding. Restrict the fast path to greedy requests; everything
+        // else falls through to the sequential sampler that honours
+        // `params` end-to-end.
         let mut last = *prompt_ids.last().unwrap_or(&0u32);
         let k = state.speculation_k;
-        if k > 1 && state.draft_engine.is_some() {
+        if k > 1 && state.draft_engine.is_some() && params.is_greedy() {
             let draft = state.draft_engine.as_ref().expect("draft_engine is_some checked above").clone();
             while completion_ids.len() < max_tokens {
                 let remaining = max_tokens - completion_ids.len();

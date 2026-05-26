@@ -756,7 +756,12 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
 
     // Build draft engine for speculative decoding when the speculator is
     // enabled and a real model is available. `DraftEngine::from_main`
-    // shares the embedding table — no extra weight loading required.
+    // avoids loading any extra weights from disk, but it currently
+    // **clones** the main model's embedding into a fresh `Arc<Vec<f32>>`
+    // rather than sharing the `RealModel`'s allocation, so enabling this
+    // path costs one additional `vocab_size * d_model * 4` bytes of
+    // resident memory. See `draft::DraftEngine::from_main` for the exact
+    // allocation site.
     let draft_engine: Option<Arc<crate::draft::DraftEngine>> =
         if cfg.predictive.speculator_enabled {
             real_model.as_ref().map(|m| {

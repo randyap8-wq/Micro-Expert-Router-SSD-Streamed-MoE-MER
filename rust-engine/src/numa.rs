@@ -147,6 +147,9 @@ fn node0_cpus() -> std::io::Result<Vec<usize>> {
 fn num_cpus_online() -> usize {
     // `sysconf(_SC_NPROCESSORS_ONLN)` — well-supported and avoids the
     // `num_cpus` crate dep.
+    // SAFETY: `libc::sysconf` is an FFI call into the C library that
+    // takes a single integer constant and returns an integer. It has
+    // no memory-safety preconditions and is thread-safe per POSIX.
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if n > 0 { n as usize } else { 1 }
 }
