@@ -224,6 +224,8 @@ pub struct GpuBackend {
     /// Reference to the VRAM expert cache. Used to check whether an expert
     /// is GPU-resident before falling back to the NVMe → CPU path.
     gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+    /// Serializes the expert FFN path, which reuses shared staging buffers.
+    expert_execution_lock: ParkingMutex<()>,
 }
 
 // SAFETY: GpuBackend is Sync and Send because the inference pipeline accesses
@@ -557,6 +559,7 @@ impl GpuBackend {
             head_dim,
             vram_expert_bufs: ParkingMutex::new(std::collections::HashMap::new()),
             gpu_expert_cache,
+            expert_execution_lock: ParkingMutex::new(()),
         })
     }
 
@@ -577,6 +580,12 @@ impl GpuBackend {
         use std::num::NonZeroU64;
 
         let proj_bytes = d_ff * d_model * 4;  // bytes per projection matrix
+        anyhow::ensure!(
+            proj_bytes > 0,
+            "invalid expert shape: d_ff={} d_model={} produces zero-byte projections",
+            d_ff,
+            d_model
+        );
         anyhow::ensure!(
             weight_bytes.len() >= 3 * proj_bytes,
             "expert weight buffer too small: got {} bytes, need {} (3 × d_ff={} × d_model={} × 4)",
@@ -601,6 +610,19 @@ impl GpuBackend {
         let gate_offset  = 0u64;
         let up_offset    = proj_bytes as u64;
         let down_offset  = 2 * proj_bytes as u64;
+        let min_align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
+        anyhow::ensure!(
+            up_offset % min_align == 0,
+            "expert projection slice offset {} is not aligned to min_storage_buffer_offset_alignment={}",
+            up_offset,
+            min_align
+        );
+        anyhow::ensure!(
+            down_offset % min_align == 0,
+            "expert projection slice offset {} is not aligned to min_storage_buffer_offset_alignment={}",
+            down_offset,
+            min_align
+        );
         let slice_size   = NonZeroU64::new(proj_bytes as u64).unwrap();
 
         // ── Bind group layout (3 buffers: read, read, read-write) ─────────────
@@ -716,6 +738,7 @@ impl GpuBackend {
         x:     TensorView<'_>,
         out:   &mut TensorViewMut<'_>,
     ) -> Result<()> {
+        let _exec_guard = self.expert_execution_lock.lock();
         let d_model = entry.d_model;
         let d_ff    = entry.d_ff;
 
@@ -749,8 +772,8 @@ impl GpuBackend {
             cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                 m: d_ff as u32, n: 1, k: d_model as u32, _pad: 0,
             }));
-            let wg_x = (d_ff as u32 + 15) / 16;
-            cpass.dispatch_workgroups(wg_x, 1, 1);
+            let wg_y = (d_ff as u32 + 15) / 16;
+            cpass.dispatch_workgroups(1, wg_y, 1);
         }
 
         // Pass 2: up_proj × x → work_mid_2   (M=d_ff, K=d_model, N=1)
@@ -764,8 +787,8 @@ impl GpuBackend {
             cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                 m: d_ff as u32, n: 1, k: d_model as u32, _pad: 0,
             }));
-            let wg_x = (d_ff as u32 + 15) / 16;
-            cpass.dispatch_workgroups(wg_x, 1, 1);
+            let wg_y = (d_ff as u32 + 15) / 16;
+            cpass.dispatch_workgroups(1, wg_y, 1);
         }
 
         // Pass 3: SwiGLU(work_mid_1, work_mid_2) → work_out   (n_elements=d_ff)
@@ -794,8 +817,8 @@ impl GpuBackend {
             cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                 m: d_model as u32, n: 1, k: d_ff as u32, _pad: 0,
             }));
-            let wg_x = (d_model as u32 + 15) / 16;
-            cpass.dispatch_workgroups(wg_x, 1, 1);
+            let wg_y = (d_model as u32 + 15) / 16;
+            cpass.dispatch_workgroups(1, wg_y, 1);
         }
 
         // ── Readback work_mid_1 → out ─────────────────────────────────────────

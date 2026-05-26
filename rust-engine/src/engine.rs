@@ -1241,6 +1241,22 @@ fn dispatch_expert_forward(
     }
 }
 
+fn summarise_output_like_cpu(token_idx: u64, expert_id: u32, y: &[f32]) -> InferenceOutput {
+    let mut sum_sq = 0.0f64;
+    for &v in y {
+        sum_sq += (v as f64) * (v as f64);
+    }
+    let out_norm = sum_sq.sqrt() as f32;
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut digest = FNV_OFFSET ^ token_idx ^ (expert_id as u64);
+    for &v in y {
+        digest ^= v.to_bits() as u64;
+        digest = digest.wrapping_mul(FNV_PRIME);
+    }
+    InferenceOutput { expert_id, digest, out_norm }
+}
+
 impl Engine {
     pub fn new(
         cache: Arc<MultiLayerExpertCache>,
@@ -1775,16 +1791,8 @@ impl Engine {
                 };
 
                 let res = if let Some(gpu_out) = gpu_result {
-                    let digest = gpu_out
-                        .iter()
-                        .fold(0u64, |a, &v| a.wrapping_add(v.to_bits() as u64));
-                    let out_norm = gpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
                     Ok((
-                        InferenceOutput {
-                            expert_id: r.id,
-                            digest,
-                            out_norm,
-                        },
+                        summarise_output_like_cpu(token_idx, r.id, &gpu_out),
                         gpu_out,
                     ))
                 } else {
@@ -2677,16 +2685,8 @@ impl Engine {
             let res = if let Some(gpu_out) = gpu_result {
                 // Synthesize an InferenceOutput so downstream logging stays
                 // shape-compatible with the CPU path.
-                let digest = gpu_out
-                    .iter()
-                    .fold(0u64, |a, &v| a.wrapping_add(v.to_bits() as u64));
-                let out_norm = gpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
                 Ok((
-                    InferenceOutput {
-                        expert_id: r.id,
-                        digest,
-                        out_norm,
-                    },
+                    summarise_output_like_cpu(token_idx, r.id, &gpu_out),
                     gpu_out,
                 ))
             } else {
