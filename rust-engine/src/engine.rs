@@ -1757,7 +1757,9 @@ impl Engine {
                 // CandleBackend::expert_matmul bails unconditionally, so we
                 // always guard behind is_gpu(). A VRAM miss returns Err
                 // and we fall through to the CPU path below.
-                let gpu_result = if self.core.backend.is_gpu() {
+                let gpu_result = if self.core.backend.is_gpu()
+                    && self.core.options.dtype == WeightDtype::F32
+                {
                     let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
                     let x_f16: Vec<half::f16> =
                         x.iter().map(|&f| half::f16::from_f32(f)).collect();
@@ -2653,7 +2655,9 @@ impl Engine {
             // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
             // unconditionally, so we always guard behind is_gpu(). A VRAM
             // miss returns Err and we fall through to the CPU path below.
-            let gpu_result = if self.core.backend.is_gpu() {
+            let gpu_result = if self.core.backend.is_gpu()
+                && self.core.options.dtype == WeightDtype::F32
+            {
                 let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
                 let x_f16: Vec<half::f16> =
                     x.iter().map(|&f| half::f16::from_f32(f)).collect();

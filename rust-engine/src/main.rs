@@ -754,6 +754,26 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         None
     };
 
+    // Build draft engine for speculative decoding when the speculator is
+    // enabled and a real model is available. `DraftEngine::from_main`
+    // shares the embedding table — no extra weight loading required.
+    let draft_engine: Option<Arc<crate::draft::DraftEngine>> =
+        if cfg.predictive.speculator_enabled {
+            real_model.as_ref().map(|m| {
+                let d = crate::draft::DraftEngine::from_main(m);
+                tracing::info!(
+                    vocab_size = m.config.vocab_size,
+                    d_model = m.config.d_model,
+                    "draft engine built for speculative decoding"
+                );
+                Arc::new(d)
+            })
+        } else {
+            None
+        };
+
+    let speculation_k = cfg.real_transformer.speculation_base_depth.max(1);
+
     let router = if let Some(ref m) = real_model {
         // Production routing path: the engine's `route()` runs the
         // first layer's `softmax(W_gate · x) → top-K` (Mixtral-style)
@@ -1002,6 +1022,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         metrics: Metrics::new(),
         real_model,
         batch_scheduler,
+        draft_engine,
+        speculation_k,
         runtime: runtime.clone(),
         sessions,
         middleware: middleware_state,
