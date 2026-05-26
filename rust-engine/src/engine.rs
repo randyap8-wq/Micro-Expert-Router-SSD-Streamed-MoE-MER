@@ -14,6 +14,7 @@
 //! 6. Record per-token latency and emit structured tracing events.
 
 use crate::aligned_buffer::AlignedBuffer;
+use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertCache, ExpertResident, GpuExpertCache, GpuResident};
 use crate::multi_layer_cache::MultiLayerExpertCache;
@@ -958,6 +959,13 @@ pub(crate) struct EngineCore {
     /// failure to acquire drops the prefetch and increments
     /// `EngineMetrics::counters::prefetch_dropped_concurrency`.
     pub(super) prefetch_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Math backend used for the Phase 3 GPU expert FFN fast-path. When
+    /// the expert is VRAM-resident, [`Engine::moe_step`] / [`Engine::generate`]
+    /// route the per-expert SwiGLU forward through this backend instead
+    /// of `dispatch_expert_forward`. `BackendBox::init_blocking` returns
+    /// `BackendBox::Cpu` automatically if no GPU is available, so this
+    /// field is always installed (see gist Phase 3, CHANGE 3).
+    pub(super) backend: Arc<crate::backend::BackendBox>,
 }
 
 /// Predictive-routing state: aliasing & frequency-based pinning,
@@ -1099,6 +1107,12 @@ impl EngineCore {
             kv_cache: None,
             in_flight: Arc::new(DashMap::new()),
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
+            // Default to the CPU backend; `install_gpu_cache` swaps in a
+            // real `GpuBackend` (or leaves CPU when no adapter is available)
+            // once a `GpuExpertCache` is wired up.
+            backend: Arc::new(crate::backend::BackendBox::Cpu(
+                crate::backend::CandleBackend::new(),
+            )),
         }
     }
 }
@@ -1304,8 +1318,25 @@ impl Engine {
                 }
             }
         });
-        self.core.gpu_cache = Some(gpu);
+        self.core.gpu_cache = Some(gpu.clone());
         self.core.gpu_promotion_tx = Some(tx);
+
+        // Phase 3: try to bring up a real `GpuBackend` now that a
+        // `GpuExpertCache` is available. The `num_layers`/`max_seq_len`/
+        // `num_heads`/`head_dim` parameters drive `GpuKvCache` sizing,
+        // which is **not** on the expert-FFN dispatch path; the engine
+        // already owns its own KV cache (see `EngineCore::kv_cache`).
+        // `BackendBox::init_blocking` returns `BackendBox::Cpu`
+        // automatically when no adapter is present, so this never
+        // panics.
+        let backend = crate::backend::BackendBox::init_blocking(
+            /* num_layers  = */ 1,
+            /* max_seq_len = */ 1,
+            /* num_heads   = */ 1,
+            /* head_dim    = */ 1,
+            gpu,
+        );
+        self.core.backend = Arc::new(backend);
     }
 
     /// Borrow the engine's VRAM (GPU) expert cache, if any.
@@ -1706,19 +1737,67 @@ impl Engine {
             let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
             let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
             for r in &residents {
-                // TODO(Phase 3): when backend.is_gpu() and the expert is VRAM-resident,
-                // replace this with backend.expert_matmul(layer, expert_id, ...).
-                // CandleBackend::expert_matmul bails unconditionally — always guard
-                // behind backend.is_gpu() before calling it.
-                let res = dispatch_expert_forward(
-                    self.core.options.dtype,
-                    self.core.options.use_qmm_for_q4,
-                    token_idx,
-                    r,
-                    x,
-                    self.core.shape.d_model,
-                    self.core.shape.d_ff,
-                );
+                // ── Phase 3: GPU fast path ────────────────────────────────
+                // CandleBackend::expert_matmul bails unconditionally, so we
+                // always guard behind is_gpu(). A VRAM miss returns Err
+                // and we fall through to the CPU path below.
+                let gpu_result = if self.core.backend.is_gpu() {
+                    let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
+                    let x_f16: Vec<half::f16> =
+                        x.iter().map(|&f| half::f16::from_f32(f)).collect();
+                    let x_view = crate::backend::TensorView {
+                        data: &x_f16,
+                        rows: 1,
+                        cols: self.core.shape.d_model,
+                    };
+                    let mut out_view = crate::backend::TensorViewMut {
+                        data: &mut out_f16,
+                        rows: 1,
+                        cols: self.core.shape.d_model,
+                    };
+                    // `generate` is the synthetic-benchmark path; it has no
+                    // per-layer iteration, so we route everything through
+                    // layer 0 — `expert_matmul` ignores `layer_idx` anyway
+                    // (the trait API takes it only for future logging).
+                    match self.core.backend.expert_matmul(
+                        0,
+                        r.id,
+                        x_view,
+                        self.core.shape.d_model,
+                        self.core.shape.d_ff,
+                        &mut out_view,
+                    ) {
+                        Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                let res = if let Some(gpu_out) = gpu_result {
+                    let digest = gpu_out
+                        .iter()
+                        .fold(0u64, |a, &v| a.wrapping_add(v.to_bits() as u64));
+                    let out_norm = gpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    Ok((
+                        InferenceOutput {
+                            expert_id: r.id,
+                            digest,
+                            out_norm,
+                        },
+                        gpu_out,
+                    ))
+                } else {
+                    dispatch_expert_forward(
+                        self.core.options.dtype,
+                        self.core.options.use_qmm_for_q4,
+                        token_idx,
+                        r,
+                        x,
+                        self.core.shape.d_model,
+                        self.core.shape.d_ff,
+                    )
+                };
                 match res {
                     Ok((out, y)) => {
                         outputs.push(out);
@@ -2561,19 +2640,66 @@ impl Engine {
                     continue;
                 }
             };
-            // TODO(Phase 3): when backend.is_gpu() and the expert is VRAM-resident,
-            // replace this with backend.expert_matmul(layer, expert_id, ...).
-            // CandleBackend::expert_matmul bails unconditionally — always guard
-            // behind backend.is_gpu() before calling it.
-            let res = dispatch_expert_forward(
-                self.core.options.dtype,
-                self.core.options.use_qmm_for_q4,
-                token_idx,
-                r,
-                x,
-                self.core.shape.d_model,
-                self.core.shape.d_ff,
-            );
+            // ── Phase 3: GPU fast path ────────────────────────────────────
+            // If the backend is GPU and the expert is VRAM-resident, dispatch
+            // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
+            // unconditionally, so we always guard behind is_gpu(). A VRAM
+            // miss returns Err and we fall through to the CPU path below.
+            let gpu_result = if self.core.backend.is_gpu() {
+                let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
+                let x_f16: Vec<half::f16> =
+                    x.iter().map(|&f| half::f16::from_f32(f)).collect();
+                let x_view = crate::backend::TensorView {
+                    data: &x_f16,
+                    rows: 1,
+                    cols: self.core.shape.d_model,
+                };
+                let mut out_view = crate::backend::TensorViewMut {
+                    data: &mut out_f16,
+                    rows: 1,
+                    cols: self.core.shape.d_model,
+                };
+                match self.core.backend.expert_matmul(
+                    layer as usize,
+                    r.id,
+                    x_view,
+                    self.core.shape.d_model,
+                    self.core.shape.d_ff,
+                    &mut out_view,
+                ) {
+                    Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
+                    Err(_) => None, // VRAM miss — fall through to CPU
+                }
+            } else {
+                None
+            };
+
+            let res = if let Some(gpu_out) = gpu_result {
+                // Synthesize an InferenceOutput so downstream logging stays
+                // shape-compatible with the CPU path.
+                let digest = gpu_out
+                    .iter()
+                    .fold(0u64, |a, &v| a.wrapping_add(v.to_bits() as u64));
+                let out_norm = gpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
+                Ok((
+                    InferenceOutput {
+                        expert_id: r.id,
+                        digest,
+                        out_norm,
+                    },
+                    gpu_out,
+                ))
+            } else {
+                dispatch_expert_forward(
+                    self.core.options.dtype,
+                    self.core.options.use_qmm_for_q4,
+                    token_idx,
+                    r,
+                    x,
+                    self.core.shape.d_model,
+                    self.core.shape.d_ff,
+                )
+            };
             match res {
                 Ok((_out, y)) => per_expert_y.push(y),
                 Err(e) => {

@@ -325,6 +325,15 @@ impl GpuResident {
     }
 }
 
+impl crate::backend::GpuStorage for GpuResident {
+    fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+    fn as_wgpu_buffer(&self) -> Option<&wgpu::Buffer> {
+        None   // GpuResident is host-side only; VRAM lives in VramExpertEntry
+    }
+}
+
 /// Outcome of a VRAM-tier lookup. The variants double as the
 /// instrumentation discriminator for `mer_gpu_cache_hits_total` and
 /// the engine's three-tier reporting in `/v1/admin/health/experts`.
