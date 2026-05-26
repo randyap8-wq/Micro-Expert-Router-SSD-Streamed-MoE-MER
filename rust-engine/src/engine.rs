@@ -1706,6 +1706,10 @@ impl Engine {
             let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
             let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
             for r in &residents {
+                // TODO(Phase 3): when backend.is_gpu() and the expert is VRAM-resident,
+                // replace this with backend.expert_matmul(layer, expert_id, ...).
+                // CandleBackend::expert_matmul bails unconditionally — always guard
+                // behind backend.is_gpu() before calling it.
                 let res = dispatch_expert_forward(
                     self.core.options.dtype,
                     self.core.options.use_qmm_for_q4,
@@ -2557,6 +2561,10 @@ impl Engine {
                     continue;
                 }
             };
+            // TODO(Phase 3): when backend.is_gpu() and the expert is VRAM-resident,
+            // replace this with backend.expert_matmul(layer, expert_id, ...).
+            // CandleBackend::expert_matmul bails unconditionally — always guard
+            // behind backend.is_gpu() before calling it.
             let res = dispatch_expert_forward(
                 self.core.options.dtype,
                 self.core.options.use_qmm_for_q4,
