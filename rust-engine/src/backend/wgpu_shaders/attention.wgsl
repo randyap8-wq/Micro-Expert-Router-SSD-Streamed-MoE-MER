@@ -44,8 +44,11 @@ var<push_constant> pc: PushConstants;
 @group(0) @binding(2) var<storage, read_write> OUT: array<f32>;
 
 // ── Runtime-substituted constants ─────────────────────────────────────────────
-const MAX_SEQ_LEN: u32 = 4096u;   // replaced by GpuBackend::try_new
-const MAX_HEAD_DIM: u32 = 256u;   // replaced by GpuBackend::try_new
+// NOTE: these two lines are substituted verbatim by GpuBackend::try_new() via
+// str::replace. Keep them on a single line with no trailing comments/spaces so
+// the literal-string match in `backend/mod.rs` continues to find them.
+const MAX_SEQ_LEN: u32 = 4096u;
+const MAX_HEAD_DIM: u32 = 256u;
 
 // ── Workgroup size ─────────────────────────────────────────────────────────────
 const WG: u32 = 32u;
@@ -56,10 +59,13 @@ const WG: u32 = 32u;
 var<workgroup> run_m: f32;   // running global max
 var<workgroup> run_d: f32;   // running denominator  = sum_t exp(s_t - run_m)
 
-// Per-tile scratch: one score per thread + tree-reduction buffers.
-var<workgroup> shared_scores: array<f32, 32u>;
-var<workgroup> shared_m:      array<f32, 32u>;
-var<workgroup> shared_d:      array<f32, 32u>;
+// Per-tile scratch: one score per thread + tree-reduction buffers + per-tile
+// softmax weights (w_t = exp(s_t - new_run_m)) precomputed once per tile and
+// reused across the j-loop in V accumulation.
+var<workgroup> shared_scores:  array<f32, 32u>;
+var<workgroup> shared_m:       array<f32, 32u>;
+var<workgroup> shared_d:       array<f32, 32u>;
+var<workgroup> shared_weights: array<f32, 32u>;
 
 // Running weighted-V accumulator across all tiles [head_dim].
 var<workgroup> shared_out: array<f32, MAX_HEAD_DIM>;
@@ -146,6 +152,15 @@ fn attention_main(
         let new_run_m  = max(old_run_m, tile_m);
         let factor_old = exp(old_run_m - new_run_m);  // rescale factor for shared_out
 
+        // Precompute per-tile softmax weights once per `tl` (depends only on
+        // shared_scores[tl] and new_run_m, not on j). Each thread writes its
+        // own slot, then all threads read them from workgroup memory in the
+        // inner V loop — avoids head_dim/WG redundant exp() calls per tile.
+        if tid < t_count {
+            shared_weights[tid] = exp(shared_scores[tid] - new_run_m);
+        }
+        workgroupBarrier();
+
         // Thread tid owns j = tid, tid+WG, tid+2*WG, ... of shared_out.
         // For each j, loops over all t_count valid positions in the tile and
         // accumulates the weighted V contribution. Because each thread owns a
@@ -153,7 +168,7 @@ fn attention_main(
         for (var j = tid; j < pc.head_dim; j += WG) {
             var v_acc = shared_out[j] * factor_old;
             for (var tl = 0u; tl < t_count; tl++) {
-                let w     = exp(shared_scores[tl] - new_run_m);
+                let w     = shared_weights[tl];
                 let t_abs = tile * WG + tl;
                 let v_off = f32_off
                           + MAX_SEQ_LEN * kv_dim    // jump past K slice
