@@ -1241,7 +1241,7 @@ fn dispatch_expert_forward(
     }
 }
 
-fn summarize_output_like_cpu(token_idx: u64, expert_id: u32, y: &[f32]) -> InferenceOutput {
+fn summarise_output_like_cpu(token_idx: u64, expert_id: u32, y: &[f32]) -> InferenceOutput {
     let mut sum_sq = 0.0f64;
     for &v in y {
         sum_sq += (v as f64) * (v as f64);
@@ -1792,7 +1792,7 @@ impl Engine {
 
                 let res = if let Some(gpu_out) = gpu_result {
                     Ok((
-                        summarize_output_like_cpu(token_idx, r.id, &gpu_out),
+                        summarise_output_like_cpu(token_idx, r.id, &gpu_out),
                         gpu_out,
                     ))
                 } else {
@@ -2686,7 +2686,7 @@ impl Engine {
                 // Synthesize an InferenceOutput so downstream logging stays
                 // shape-compatible with the CPU path.
                 Ok((
-                    summarize_output_like_cpu(token_idx, r.id, &gpu_out),
+                    summarise_output_like_cpu(token_idx, r.id, &gpu_out),
                     gpu_out,
                 ))
             } else {

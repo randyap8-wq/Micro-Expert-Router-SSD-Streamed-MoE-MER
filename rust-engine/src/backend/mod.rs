@@ -699,6 +699,7 @@ impl GpuBackend {
         });
 
         // ── Pass 4: down matmul — weight_buf[down] × work_out → work_mid_1 ──
+        let down_slice_size = NonZeroU64::new(proj_bytes as u64).unwrap(); // same shape
         let down_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label:   Some("expert_down_bg"),
             layout:  &matmul_bgl,
@@ -708,7 +709,7 @@ impl GpuBackend {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &weight_buf,
                         offset: down_offset,
-                        size:   Some(slice_size),
+                        size:   Some(down_slice_size),
                     }),
                 },
                 wgpu::BindGroupEntry {
