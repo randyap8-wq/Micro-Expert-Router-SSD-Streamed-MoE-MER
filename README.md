@@ -2367,3 +2367,15 @@ are:
   would still need one io_uring ring per node and per-node buffer
   pools, a deeper refactor of `IoUringStorage` and `BufferPool`.
 
+
+---
+
+<p align="center">
+  <a href="https://amalgafy.com">
+    <img src="https://raw.githubusercontent.com/randyap8-wq/Clean-Shot/main/public/amalgafy-icon.svg" alt="Amalgafy" width="200" />
+  </a>
+</p>
+
+<p align="center">
+  Built by the <a href="https://amalgafy.com"><strong>Amalgafy</strong></a> team.
+</p>
