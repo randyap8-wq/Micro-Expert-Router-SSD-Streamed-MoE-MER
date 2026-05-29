@@ -1812,7 +1812,7 @@ pub fn run_inference_gpu(
         };
         let weights = ExpertWeights::from_bytes(resident.data(), d_model, d_ff)?;
         let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
-        let (gate_t, up_t, down_t) = weights.to_candle_tensors(dev).map_err(map_err)?;
+        let (gate_t, up_t, down_t) = weights.to_candle_tensors(dev)?;
         let x_t = Tensor::from_slice(x, (d_model, 1), dev).map_err(map_err)?;
         let g = gate_t.matmul(&x_t).map_err(map_err)?;
         let u = up_t.matmul(&x_t).map_err(map_err)?;
