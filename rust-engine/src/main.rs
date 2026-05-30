@@ -150,8 +150,11 @@ enum Cmd {
         /// Predictive prefetch fanout (how many candidates to issue per token).
         #[arg(long, default_value_t = 2)]
         predict_fanout: usize,
-        /// Don't prefetch below this transition probability.
-        #[arg(long, default_value_t = 0.05)]
+        /// Don't prefetch below this transition probability. The default
+        /// (`0.0`) auto-scales the threshold to `1 / (num_experts * 4)` so
+        /// it remains achievable as the expert pool grows; pass an
+        /// explicit positive value to override (e.g. `--predict-min-prob 0.05`).
+        #[arg(long, default_value_t = 0.0)]
         predict_min_prob: f64,
         /// Disable O_DIRECT (use buffered reads). Required on tmpfs/overlay/CI
         /// and on macOS, where O_DIRECT is not supported. When set, the run
@@ -362,6 +365,23 @@ enum Cmd {
         #[arg(long, default_value_t = 500)]
         refresh_ms: u64,
     },
+}
+
+/// Resolve the effective `predict_min_prob` for a given expert-pool size.
+///
+/// A configured value of `0.0` (or negative — treated identically) is the
+/// "auto" sentinel and scales the threshold to `1 / (num_experts * 4)`, so
+/// the Laplace-smoothed posteriors in [`PredictiveLoader::predict_next`]
+/// can actually clear the gate as the pool grows (a fixed `0.05` becomes
+/// mathematically unreachable past ~20 experts). Any positive value is
+/// passed through unchanged, preserving operator overrides.
+fn resolve_predict_min_prob(configured: f64, num_experts: u32) -> f64 {
+    if configured > 0.0 {
+        configured
+    } else {
+        let n = num_experts.max(1) as f64;
+        1.0 / (n * 4.0)
+    }
 }
 
 fn init_logging(filter: &str) {
@@ -705,7 +725,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     let predictor = Arc::new(PredictiveLoader::new(
         total_experts,
         cfg.storage.predict_fanout,
-        cfg.storage.predict_min_prob,
+        resolve_predict_min_prob(cfg.storage.predict_min_prob, total_experts),
         0xC0FFEE,
     ));
 
@@ -1524,7 +1544,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     let predictor = Arc::new(PredictiveLoader::new(
         args.num_experts,
         if args.no_prefetch { 0 } else { args.predict_fanout },
-        args.predict_min_prob,
+        resolve_predict_min_prob(args.predict_min_prob, args.num_experts),
         args.seed,
     ));
 
