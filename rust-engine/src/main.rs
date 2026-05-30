@@ -380,7 +380,7 @@ fn resolve_predict_min_prob(configured: f64, num_experts: u32) -> f64 {
         configured
     } else {
         let n = num_experts.max(1) as f64;
-        1.0 / (n * 4.0)
+        2.0 / n
     }
 }
 
