@@ -461,11 +461,18 @@ impl PredictiveLoader {
             .filter(|&(_, p)| p >= self.min_prob)
             .collect();
 
-        // If the smoothing prior alone clears `min_prob` and we still have
-        // room in the fanout, fill in unseen successors (all tied at
-        // `prior_p`). Iterate in id order for determinism.
+        // Top up the result with unseen successors at the smoothed
+        // prior probability when there is still room in the fanout. The
+        // fanout cap is the only bound we need here — previously this
+        // path was also gated by `prior_p >= self.min_prob`, but with
+        // `prior_p = 1 / (total_observed + num_experts)` that guard is
+        // mathematically impossible to clear once `num_experts` is even
+        // modestly large (e.g. `min_prob = 0.05`, `num_experts = 64`
+        // requires negative observations), which silently killed all
+        // speculative prefetches in production-sized configurations.
+        // Iterate in id order for determinism.
         let prior_p = prior_f / total_f;
-        if prior_p >= self.min_prob && probs.len() < self.fanout {
+        if probs.len() < self.fanout {
             for id in 0..n as u32 {
                 if probs.len() >= self.fanout {
                     break;
@@ -2266,10 +2273,19 @@ mod tests {
 
     #[test]
     fn predictor_respects_min_prob_threshold() {
+        // The `min_prob` filter applies to *observed* successors: a row
+        // with one observation that doesn't clear the threshold must
+        // not surface that observed id. The unseen-successor prior-fill
+        // is intentionally not subject to this filter (the fanout cap
+        // is the only bound there), so we verify the observed id is
+        // absent from the result rather than asserting an empty set.
         let p = PredictiveLoader::new(64, 4, 0.5, 1);
-        // No real observations -> uniform prior gives p ~ 1/64, below 0.5.
+        p.observe(0, 7);
         let preds = p.predict_next(0);
-        assert!(preds.is_empty());
+        assert!(
+            preds.iter().all(|&(id, _)| id != 7),
+            "observed successor below min_prob must be filtered out: got {preds:?}"
+        );
     }
 
     #[test]

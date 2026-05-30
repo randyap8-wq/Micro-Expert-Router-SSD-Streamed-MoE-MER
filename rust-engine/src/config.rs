@@ -188,7 +188,9 @@ pub struct StorageConfigToml {
     #[serde(default = "default_predict_fanout")]
     pub predict_fanout: usize,
 
-    /// Don't prefetch below this transition probability.
+    /// Don't prefetch below this transition probability. `0.0` (the
+    /// default) auto-scales the threshold to `1 / (num_experts * 4)` at
+    /// engine wiring time so it stays achievable for large expert pools.
     #[serde(default = "default_predict_min_prob")]
     pub predict_min_prob: f64,
 
@@ -213,7 +215,7 @@ fn default_pin_after_observations() -> u64 { 0 }
 fn default_cache_slots() -> usize { 4 }
 fn default_block_align() -> usize { 4096 }
 fn default_predict_fanout() -> usize { 2 }
-fn default_predict_min_prob() -> f64 { 0.05 }
+fn default_predict_min_prob() -> f64 { 0.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenizerConfig {
@@ -938,7 +940,7 @@ mod tests {
                 block_align: 4096,
                 no_direct: false,
                 predict_fanout: 2,
-                predict_min_prob: 0.05,
+                predict_min_prob: 0.0,
                 partial_load_fraction: 1.0,
                 pin_after_observations: 0,
             },
