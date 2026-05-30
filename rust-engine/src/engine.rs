@@ -1093,7 +1093,28 @@ impl EngineCore {
         shape: ModelShape,
         options: EngineOptions,
     ) -> Self {
-        let prefetch_permits = options.max_concurrent_prefetches.max(1);
+        // Bound the speculative-prefetch semaphore by the buffer
+        // pool's *actual* headroom (`pool_slots − cache_slots`), not
+        // just by the operator-facing `max_concurrent_prefetches`
+        // ceiling. The pool is sized as `cache_slots + headroom` (see
+        // `cmd_run` / `cmd_serve` in `main.rs`), so allowing more than
+        // `headroom` prefetches in flight at once is a contract
+        // violation: every in-flight prefetch holds a `PooledBuffer`
+        // for the duration of its I/O, and when the cache is fully
+        // pinned a foreground fetch has nowhere to land — surfacing as
+        // the `expert fetch starved: buffer pool exhausted with cache
+        // pinned` panic at `Engine::fetch` even though
+        // `max_concurrent_prefetches=64` looks innocuous on paper.
+        //
+        // Take the min of the user ceiling and the pool headroom, then
+        // clamp to ≥1 so a misconfigured pool (headroom = 0) still
+        // allows one prefetch attempt at a time rather than silently
+        // disabling the speculative loader.
+        let pool_headroom = pool.capacity().saturating_sub(cache.capacity());
+        let prefetch_permits = options
+            .max_concurrent_prefetches
+            .min(pool_headroom)
+            .max(1);
         Self {
             cache,
             pool,
@@ -3684,6 +3705,81 @@ mod tests {
         );
         // Sanity: the report surface mirrors the counter.
         assert_eq!(engine.report().prefetch_dropped_concurrency, dropped);
+    }
+
+    /// Regression test for the post-`predict_min_prob` panic:
+    /// `expert fetch starved: buffer pool exhausted with cache pinned`.
+    ///
+    /// The buffer pool is sized as `cache_slots + headroom`. If the
+    /// prefetch semaphore is set to the operator-facing default
+    /// (`DEFAULT_MAX_CONCURRENT_PREFETCHES = 64`) without being
+    /// clamped, every in-flight prefetch holds a `PooledBuffer` for
+    /// the duration of its I/O — so when the cache is fully pinned a
+    /// foreground fetch has nowhere to land. The fix is to clamp the
+    /// semaphore at construction time to the pool's actual headroom
+    /// (`pool_slots − cache_slots`), keeping `max_concurrent_prefetches`
+    /// as an additional user ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prefetch_semaphore_is_clamped_to_pool_headroom() {
+        let dir = TempDir::new("prefetch-clamp");
+        let num_experts: u32 = 8;
+        let d_model = 16;
+        let d_ff = 32;
+        let cache_slots = 4;
+        let predict_fanout = 2;
+        let seed = 0xBADC0DEu64;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        crate::io_provider::generate_synthetic_experts(
+            &dir.path, num_experts, expert_size, d_model, d_ff,
+        )
+        .expect("generate experts");
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .unwrap(),
+        );
+        storage.warmup_fds(0..num_experts).expect("warmup");
+
+        // Same pool sizing as `cmd_run` / `cmd_serve`: cache_slots + headroom.
+        let pool_slots = cache_slots + predict_fanout; // headroom = predict_fanout = 2
+        let pool = BufferPool::new(pool_slots, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(cache_slots));
+        let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(num_experts, predict_fanout, 0.05, seed));
+
+        // Operator ceiling is the runaway default — without the clamp
+        // it would allow 64 concurrent prefetches even though only 2
+        // pool buffers are available beyond the pinned cache slots.
+        let mut opts = EngineOptions::default();
+        opts.max_concurrent_prefetches = DEFAULT_MAX_CONCURRENT_PREFETCHES;
+        let engine = Arc::new(Engine::with_options(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape { d_model, d_ff, hidden_seed: seed },
+            opts,
+        ));
+
+        let headroom = pool_slots - cache_slots;
+        let available = engine.core.prefetch_semaphore.available_permits();
+        assert_eq!(
+            available, headroom,
+            "prefetch semaphore must be clamped to pool headroom \
+             (pool_slots={pool_slots} - cache_slots={cache_slots} = {headroom}); got {available}"
+        );
+        assert!(
+            available < DEFAULT_MAX_CONCURRENT_PREFETCHES,
+            "clamp must strictly tighten the user ceiling when pool headroom is smaller"
+        );
     }
 
     /// **Gist Task 1 — GPU Promotion Regression Test.**
