@@ -1107,14 +1107,23 @@ impl EngineCore {
         // `max_concurrent_prefetches=64` looks innocuous on paper.
         //
         // Take the min of the user ceiling and the pool headroom, then
-        // clamp to ≥1 so a misconfigured pool (headroom = 0) still
-        // allows one prefetch attempt at a time rather than silently
-        // disabling the speculative loader.
+        // *reserve one headroom slot exclusively for the critical
+        // path*. Clamping only to the full headroom is not enough: when
+        // the cache is fully pinned and prefetch is running at full
+        // concurrency, every headroom buffer is held by an in-flight
+        // prefetch for the duration of its (multi-millisecond, 672 MB)
+        // read, so a foreground miss has nowhere to land and the engine
+        // panics at `Engine::fetch`. Subtracting one guarantees there is
+        // always at least one buffer a prefetch can never take, so a
+        // foreground fetch is assured a slot even under worst-case
+        // pinning + saturated speculation. If the reserved-slot
+        // subtraction leaves zero permits (headroom ≤ 1) prefetch is
+        // disabled entirely for this configuration rather than starving
+        // the critical path.
         let pool_headroom = pool.capacity().saturating_sub(cache.capacity());
         let prefetch_permits = options
             .max_concurrent_prefetches
-            .min(pool_headroom)
-            .max(1);
+            .min(pool_headroom.saturating_sub(1));
         Self {
             cache,
             pool,
@@ -2086,45 +2095,29 @@ impl Engine {
         id: u32,
     ) -> Result<Arc<ExpertResident>, FetchOnceError> {
         let io_start = Instant::now();
-        // Race-free acquire-with-eviction: in a loop, evict an LRU entry
-        // if the cache is at capacity (which releases its `PooledBuffer` on
-        // Arc drop), then try to acquire. If a concurrent prefetch task
-        // grabbed the freed slot before we did, we evict another LRU and
-        // retry.
+        // Acquire-with-eviction: evict an LRU entry if the cache is at
+        // capacity (which releases its `PooledBuffer` on `Arc` drop),
+        // then wait for a free buffer.
         //
-        // Bounded by `EngineOptions::max_fetch_yields` (default
-        // [`DEFAULT_MAX_FETCH_YIELDS`] = 128, gist feedback #1.3 —
-        // lowered from `1024` so latency-sensitive callers surface
-        // a pool-sizing misconfiguration in milliseconds rather than
-        // tens of milliseconds): if the cache is full of pinned
-        // entries *and* the buffer pool has no free slot, no amount
-        // of yielding will help — we're hard-blocked on a
-        // configuration bug (more pinned experts than the pool can
-        // keep resident). Return `PoolStarved` rather than spin
-        // forever.
-        let max_yields = self.core.options.max_fetch_yields.max(1);
-        let mut yields = 0usize;
-        let mut buf;
-        loop {
-            if self.core.cache.len() >= self.core.cache.capacity() {
-                if let Some(evicted) = self.core.cache.evict_lru() {
-                    debug!(evicted = evicted.id, "evicted LRU to make room");
-                    drop(evicted);
-                }
+        // The critical-path fetch must outwait a multi-millisecond
+        // prefetch read — an in-flight prefetch holds a pool buffer for
+        // the *entire* duration of its 672 MB read, so a bounded
+        // `yield_now()` spin (which completes in microseconds) gives up
+        // long before any prefetch can release its buffer and surfaces a
+        // spurious `PoolStarved` panic. Instead we park on the pool's
+        // async `acquire()`, which registers on the pool's `Notify` and
+        // wakes the instant a buffer is released. `EngineCore::new`
+        // reserves one headroom slot that prefetch can never take, so a
+        // foreground fetch is always guaranteed a buffer becomes
+        // available — `acquire()` therefore cannot block forever even
+        // when the cache is fully pinned and speculation is saturated.
+        if self.core.cache.len() >= self.core.cache.capacity() {
+            if let Some(evicted) = self.core.cache.evict_lru() {
+                debug!(evicted = evicted.id, "evicted LRU to make room");
+                drop(evicted);
             }
-            if let Some(b) = self.core.pool.try_acquire() {
-                buf = b;
-                break;
-            }
-            // Pool is empty even though cache is below capacity — i.e. some
-            // other task (prefetch or another fetch) is holding buffers.
-            // Yield to the runtime briefly to let them make progress.
-            yields += 1;
-            if yields > max_yields {
-                return Err(FetchOnceError::PoolStarved);
-            }
-            tokio::task::yield_now().await;
         }
+        let mut buf = self.core.pool.acquire().await;
         match self.core.storage.read_expert(id, &mut buf).await {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
@@ -3717,8 +3710,9 @@ mod tests {
     /// the duration of its I/O — so when the cache is fully pinned a
     /// foreground fetch has nowhere to land. The fix is to clamp the
     /// semaphore at construction time to the pool's actual headroom
-    /// (`pool_slots − cache_slots`), keeping `max_concurrent_prefetches`
-    /// as an additional user ceiling.
+    /// (`pool_slots − cache_slots`) **minus one slot reserved for the
+    /// critical path**, keeping `max_concurrent_prefetches` as an
+    /// additional user ceiling.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prefetch_semaphore_is_clamped_to_pool_headroom() {
         let dir = TempDir::new("prefetch-clamp");
@@ -3750,14 +3744,18 @@ mod tests {
         );
 
         // Same pool sizing as `cmd_run` / `cmd_serve` and `build_engine`:
-        // cache_slots + headroom.
+        // cache_slots + headroom. The clamp now *reserves one headroom
+        // slot for the critical path*, so the prefetch semaphore is sized
+        // at `headroom - 1`, not the full headroom.
         let pool_slots = cache_slots + predict_fanout.max(1); // headroom = predict_fanout = 2
         let headroom = pool_slots - cache_slots;
+        let expected_permits = headroom - 1; // one slot reserved for the foreground fetch
         let available = engine.core.prefetch_semaphore.available_permits();
         assert_eq!(
-            available, headroom,
-            "prefetch semaphore must be clamped to pool headroom \
-             (pool_slots={pool_slots} - cache_slots={cache_slots} = {headroom}); got {available}"
+            available, expected_permits,
+            "prefetch semaphore must be clamped to pool headroom minus one reserved \
+             critical-path slot (pool_slots={pool_slots} - cache_slots={cache_slots} - 1 \
+             = {expected_permits}); got {available}"
         );
         assert!(
             available < DEFAULT_MAX_CONCURRENT_PREFETCHES,
