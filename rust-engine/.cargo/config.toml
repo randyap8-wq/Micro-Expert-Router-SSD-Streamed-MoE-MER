@@ -1,0 +1,26 @@
+# Cargo configuration for the rust-engine crate.
+#
+# The `[env]` block below provides *non-forcing* defaults for the CUDA
+# toolkit location so that `cargo build --features cuda` can find the
+# CUDA libraries on hosts (e.g. GCP Deep Learning VMs, Ubuntu 24.04 +
+# CUDA 12.x) where the toolkit is installed under /usr/local/cuda but
+# the environment variables are not exported.
+#
+# These variables are consumed by cudarc's build script (pulled in via
+# `candle-core/cuda`) to locate `libcuda`, `libcudart`, etc. when it
+# emits its `cargo:rustc-link-search` directives.
+#
+# `force = false` (the default) means any value you already export in
+# your shell wins, so a non-standard install (e.g. /usr/local/cuda-12.9)
+# is respected simply by exporting CUDA_HOME yourself or by sourcing
+# `scripts/setup_cuda_env.sh`.
+#
+# NOTE: cudarc detects the CUDA *version* by running `nvcc --version`
+# from PATH. Cargo's `[env]` cannot portably prepend to PATH, so make
+# sure `<cuda>/bin` is on PATH before building with `--features cuda`.
+# The easiest way is to run `source scripts/setup_cuda_env.sh` first;
+# see the "Building with CUDA" section of the README.
+[env]
+CUDA_HOME = { value = "/usr/local/cuda", force = false }
+CUDA_PATH = { value = "/usr/local/cuda", force = false }
+CUDA_ROOT = { value = "/usr/local/cuda", force = false }
