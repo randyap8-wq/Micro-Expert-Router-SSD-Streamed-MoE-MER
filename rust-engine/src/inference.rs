@@ -1442,6 +1442,8 @@ impl OwnedExpertWeights {
         }
         Ok(out)
     }
+
+    /// Build an owned weight set by dequantising a **Q8_0** byte buffer
     /// (GGUF Q8_0 layout) into a fresh `Vec<f32>`. The buffer is
     /// expected to be a contiguous stream of [`Q8_0_BLOCK_BYTES`]-sized
     /// blocks covering the three weight matrices in the same

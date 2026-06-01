@@ -1325,6 +1325,25 @@ impl Engine {
         self
     }
 
+    /// Whether the configured expert dtype is eligible for the GPU
+    /// `Backend::expert_matmul` fast path. F32 always qualifies. Q4_0
+    /// qualifies only when both `d_model` and `d_ff` are
+    /// Q4_0-block-aligned: the promotion-time dequant in
+    /// [`Engine::install_gpu_cache`] then produces a tight F32 weight
+    /// stream (`[gate || up || down]`) with no inter-tensor padding,
+    /// exactly what the GPU SwiGLU kernels expect. All other dtypes
+    /// stay on the CPU path.
+    fn gpu_eligible_dtype(&self) -> bool {
+        match self.core.options.dtype {
+            WeightDtype::F32 => true,
+            WeightDtype::Q4_0 => {
+                self.core.shape.d_model % Q4_0_BLOCK_ELEMS == 0
+                    && self.core.shape.d_ff % Q4_0_BLOCK_ELEMS == 0
+            }
+            _ => false,
+        }
+    }
+
     /// Attach a VRAM (GPU) expert cache — Phase 2 three-tier hierarchy.
     ///
     /// Spawns a background Tokio task that drains an MPSC channel of
@@ -1818,24 +1837,10 @@ impl Engine {
                 // ── Phase 3: GPU fast path ────────────────────────────────
                 // CandleBackend::expert_matmul bails unconditionally, so we
                 // always guard behind is_gpu(). A VRAM miss returns Err
-                // and we fall through to the CPU path below.
-                //
-                // Both F32 and Q4_0 experts are eligible: Q4_0 weights
-                // are dequantised to F32 during VRAM promotion (see
-                // `install_gpu_cache`), so the GPU SwiGLU kernels see
-                // F32 in both cases. Q4_0 additionally requires
-                // block-aligned dims so the dequantised stream has no
-                // inter-tensor padding.
-                let dtype = self.core.options.dtype;
-                let gpu_eligible_dtype = match dtype {
-                    WeightDtype::F32 => true,
-                    WeightDtype::Q4_0 => {
-                        self.core.shape.d_model % Q4_0_BLOCK_ELEMS == 0
-                            && self.core.shape.d_ff % Q4_0_BLOCK_ELEMS == 0
-                    }
-                    _ => false,
-                };
-                let gpu_result = if self.core.backend.is_gpu() && gpu_eligible_dtype
+                // and we fall through to the CPU path below. Both F32 and
+                // (block-aligned) Q4_0 experts are eligible — see
+                // `Engine::gpu_eligible_dtype`.
+                let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
                 {
                     let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
                     let x_f16: Vec<half::f16> =
@@ -2716,22 +2721,9 @@ impl Engine {
             // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
             // unconditionally, so we always guard behind is_gpu(). A VRAM
             // miss returns Err and we fall through to the CPU path below.
-            //
-            // Both F32 and Q4_0 experts are eligible: Q4_0 weights are
-            // dequantised to F32 during VRAM promotion (see
-            // `install_gpu_cache`), so the GPU SwiGLU kernels see F32 in
-            // both cases. Q4_0 additionally requires block-aligned dims
-            // so the dequantised stream has no inter-tensor padding.
-            let dtype = self.core.options.dtype;
-            let gpu_eligible_dtype = match dtype {
-                WeightDtype::F32 => true,
-                WeightDtype::Q4_0 => {
-                    self.core.shape.d_model % Q4_0_BLOCK_ELEMS == 0
-                        && self.core.shape.d_ff % Q4_0_BLOCK_ELEMS == 0
-                }
-                _ => false,
-            };
-            let gpu_result = if self.core.backend.is_gpu() && gpu_eligible_dtype
+            // Both F32 and (block-aligned) Q4_0 experts are eligible —
+            // see `Engine::gpu_eligible_dtype`.
+            let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
             {
                 let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
                 let x_f16: Vec<half::f16> =
