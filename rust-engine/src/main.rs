@@ -59,7 +59,7 @@ use crate::buffer_pool::BufferPool;
 use crate::engine::{Engine, EngineOptions, ModelShape};
 use crate::expert_cache::ExpertCache;
 use crate::multi_layer_cache::MultiLayerExpertCache;
-use crate::inference::expert_weight_bytes;
+use crate::inference::expert_weight_bytes_for;
 use crate::io_provider::{NvmeStorage, StorageConfig};
 use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter};
 
