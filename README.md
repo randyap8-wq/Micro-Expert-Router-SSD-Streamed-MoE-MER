@@ -756,6 +756,13 @@ To reproduce the **exact spec example** (router selects expert 3 and 7 first):
   --first-token 3,7
 ```
 
+> **GPU inference path:** the per-expert SwiGLU forward only runs on the
+> GPU when the binary is built with `--features cuda` (CUDA toolkit
+> required) and `[real_transformer].compute_offload = "gpu"` is set in
+> `config.toml`; otherwise the benchmark stays on the CPU path. This
+> covers all expert dtypes routed through `Backend::expert_matmul`,
+> including `q4_0` (dequantised to F32 before the GPU matmul).
+
 ### Run as an OpenAI-compatible HTTP server
 
 The same engine, same SSD-streaming expert cache, same `O_DIRECT`

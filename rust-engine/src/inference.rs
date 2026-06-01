@@ -1403,7 +1403,45 @@ impl OwnedExpertWeights {
         })
     }
 
-    /// Build an owned weight set by dequantising a **Q8_0** byte buffer
+    /// Dequantise a **Q4_0** expert byte buffer into a tightly-packed
+    /// `[gate_proj || up_proj || down_proj]` F32 byte stream suitable
+    /// for upload to a GPU expert weight buffer (see
+    /// [`crate::backend`]'s `build_expert_entry`, which interprets the
+    /// VRAM bytes as three contiguous `d_ff × d_model` F32 matrices).
+    ///
+    /// This reuses the existing Q4_0 dequant logic
+    /// ([`OwnedExpertWeights::from_bytes_q4_0`]) and then drops any
+    /// per-tensor block padding so the output is exactly
+    /// `3 × d_ff × d_model × 4` bytes — the layout the GPU matmul
+    /// expects. Callers that route Q4_0 experts through the GPU
+    /// `Backend::expert_matmul` fast path use this to convert the
+    /// SSD-streamed Q4_0 blocks to F32 *before* the weights reach
+    /// VRAM, since the GPU SwiGLU kernels operate on F32 weights.
+    pub fn dequantize_q4_0_expert_to_f32_bytes(
+        bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Vec<u8>, ExpertWeightsError> {
+        let owned = OwnedExpertWeights::from_bytes_q4_0(bytes, d_model, d_ff)?;
+        let gate_n = d_ff.saturating_mul(d_model);
+        let up_n = d_ff.saturating_mul(d_model);
+        let down_n = d_model.saturating_mul(d_ff);
+        // `from_bytes_q4_0` rounds each tensor up to a whole Q4_0 block,
+        // so the decoded vectors may carry a few trailing pad floats.
+        // Truncate each tensor to its exact element count so the
+        // concatenated stream matches the GPU's tight F32 layout.
+        let mut out = Vec::with_capacity((gate_n + up_n + down_n) * 4);
+        for &v in &owned.gate[..gate_n] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &owned.up[..up_n] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &owned.down[..down_n] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Ok(out)
+    }
     /// (GGUF Q8_0 layout) into a fresh `Vec<f32>`. The buffer is
     /// expected to be a contiguous stream of [`Q8_0_BLOCK_BYTES`]-sized
     /// blocks covering the three weight matrices in the same
@@ -2941,6 +2979,61 @@ mod tests {
         let d_ff = 32;
         let bytes = vec![0u8; 16]; // way too small
         let res = OwnedExpertWeights::from_bytes_q4_0(&bytes, d_model, d_ff);
+        assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
+    }
+
+    #[test]
+    fn dequantize_q4_0_expert_to_f32_bytes_matches_owned_layout() {
+        // Block-aligned dims (the only case routed to the GPU): the
+        // tight F32 stream must be exactly 3 × d_ff × d_model × 4 bytes
+        // and bit-identical to concatenating the dequantised
+        // gate/up/down matrices — the layout `build_expert_entry`
+        // expects when uploading expert weights to VRAM.
+        let d_model: usize = 32;
+        let d_ff: usize = 32; // each tensor = 1024 weights = 32 blocks.
+        let blocks_per_matrix = (d_model * d_ff).div_ceil(Q4_0_BLOCK_ELEMS);
+        let src = [0.5f32; Q4_0_BLOCK_ELEMS];
+        let mut blk = [0u8; Q4_0_BLOCK_BYTES];
+        quantize_q4_0_block(&src, &mut blk);
+        let mut bytes = Vec::new();
+        for _ in 0..(3 * blocks_per_matrix) {
+            bytes.extend_from_slice(&blk);
+        }
+
+        let f32_bytes =
+            OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(&bytes, d_model, d_ff)
+                .unwrap();
+        // Exactly three tightly-packed F32 projection matrices.
+        assert_eq!(f32_bytes.len(), 3 * d_model * d_ff * 4);
+
+        // Reconstruct the expected tight stream from the owned dequant.
+        let owned = OwnedExpertWeights::from_bytes_q4_0(&bytes, d_model, d_ff).unwrap();
+        let n = d_model * d_ff;
+        let mut expected = Vec::with_capacity(3 * n * 4);
+        for &v in owned.gate[..n]
+            .iter()
+            .chain(owned.up[..n].iter())
+            .chain(owned.down[..n].iter())
+        {
+            expected.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(f32_bytes, expected);
+
+        // Reinterpreted as f32, every weight is ≈ 0.5 (within Q4_0 error).
+        let floats: &[f32] = bytemuck::cast_slice(&f32_bytes);
+        assert_eq!(floats.len(), 3 * n);
+        for &v in floats {
+            assert!((v - 0.5).abs() < 0.1, "weight {v} too far from 0.5");
+        }
+    }
+
+    #[test]
+    fn dequantize_q4_0_expert_to_f32_bytes_rejects_short_buffer() {
+        let d_model = 32;
+        let d_ff = 32;
+        let bytes = vec![0u8; 16]; // far too small
+        let res =
+            OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(&bytes, d_model, d_ff);
         assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
     }
 

@@ -1341,6 +1341,17 @@ impl Engine {
             tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
         let gpu_for_task = gpu.clone();
         let prom_for_task = self.metrics.prom.clone();
+        // Snapshot the (immutable) expert dtype + shape so the
+        // promotion task can dequantise Q4_0 experts to F32 *before*
+        // the bytes land in VRAM. The GPU SwiGLU kernels operate on
+        // F32 weight buffers (see `backend::build_expert_entry`), so a
+        // Q4_0 expert that reaches VRAM as raw 4-bit blocks would be
+        // misinterpreted. Converting here keeps the GPU
+        // `expert_matmul` fast path correct for Q4_0 while leaving the
+        // F32 path byte-for-byte unchanged.
+        let promote_dtype = self.core.options.dtype;
+        let promote_d_model = self.core.shape.d_model;
+        let promote_d_ff = self.core.shape.d_ff;
         // Capacity is constant for the lifetime of the cache; publish
         // it once so `mer_vram_capacity_bytes` is available on the
         // very first `/metrics` scrape (dashboards compute
@@ -1353,7 +1364,28 @@ impl Engine {
                 // `promote_sync` copies the resident bytes into the
                 // anchor/LRU edge under the parking_lot mutex; safe to
                 // call from a Tokio worker because it never .awaits.
-                let bytes = resident.data().to_vec();
+                let bytes = if promote_dtype == WeightDtype::Q4_0 {
+                    // Dequantise Q4_0 blocks → tight F32 stream so the
+                    // GPU matmul sees F32 weights. On any decode error
+                    // (e.g. an unexpectedly short buffer) fall back to
+                    // the raw bytes; `build_expert_entry` will then
+                    // reject the entry and the engine drops back to the
+                    // CPU path, preserving correctness.
+                    match crate::inference::OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(
+                        resident.data(),
+                        promote_d_model,
+                        promote_d_ff,
+                    ) {
+                        Ok(f32_bytes) => f32_bytes,
+                        Err(e) => {
+                            warn!(expert = id, error = %e,
+                                "Q4_0→F32 dequant for GPU promotion failed; promoting raw bytes");
+                            resident.data().to_vec()
+                        }
+                    }
+                } else {
+                    resident.data().to_vec()
+                };
                 let gpu_res = Arc::new(GpuResident::new(id, bytes));
                 let promoted = gpu_for_task.promote_sync(gpu_res);
                 if promoted {
@@ -1787,8 +1819,23 @@ impl Engine {
                 // CandleBackend::expert_matmul bails unconditionally, so we
                 // always guard behind is_gpu(). A VRAM miss returns Err
                 // and we fall through to the CPU path below.
-                let gpu_result = if self.core.backend.is_gpu()
-                    && self.core.options.dtype == WeightDtype::F32
+                //
+                // Both F32 and Q4_0 experts are eligible: Q4_0 weights
+                // are dequantised to F32 during VRAM promotion (see
+                // `install_gpu_cache`), so the GPU SwiGLU kernels see
+                // F32 in both cases. Q4_0 additionally requires
+                // block-aligned dims so the dequantised stream has no
+                // inter-tensor padding.
+                let dtype = self.core.options.dtype;
+                let gpu_eligible_dtype = match dtype {
+                    WeightDtype::F32 => true,
+                    WeightDtype::Q4_0 => {
+                        self.core.shape.d_model % Q4_0_BLOCK_ELEMS == 0
+                            && self.core.shape.d_ff % Q4_0_BLOCK_ELEMS == 0
+                    }
+                    _ => false,
+                };
+                let gpu_result = if self.core.backend.is_gpu() && gpu_eligible_dtype
                 {
                     let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
                     let x_f16: Vec<half::f16> =
@@ -2669,8 +2716,22 @@ impl Engine {
             // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
             // unconditionally, so we always guard behind is_gpu(). A VRAM
             // miss returns Err and we fall through to the CPU path below.
-            let gpu_result = if self.core.backend.is_gpu()
-                && self.core.options.dtype == WeightDtype::F32
+            //
+            // Both F32 and Q4_0 experts are eligible: Q4_0 weights are
+            // dequantised to F32 during VRAM promotion (see
+            // `install_gpu_cache`), so the GPU SwiGLU kernels see F32 in
+            // both cases. Q4_0 additionally requires block-aligned dims
+            // so the dequantised stream has no inter-tensor padding.
+            let dtype = self.core.options.dtype;
+            let gpu_eligible_dtype = match dtype {
+                WeightDtype::F32 => true,
+                WeightDtype::Q4_0 => {
+                    self.core.shape.d_model % Q4_0_BLOCK_ELEMS == 0
+                        && self.core.shape.d_ff % Q4_0_BLOCK_ELEMS == 0
+                }
+                _ => false,
+            };
+            let gpu_result = if self.core.backend.is_gpu() && gpu_eligible_dtype
             {
                 let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
                 let x_f16: Vec<half::f16> =
