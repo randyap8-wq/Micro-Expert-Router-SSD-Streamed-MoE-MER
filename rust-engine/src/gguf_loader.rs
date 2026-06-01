@@ -1088,7 +1088,7 @@ fn load_layer_expert_native_quant(
         // tensors whose whole quantised body is exactly that expert's
         // payload (one full block run, no slicing).
         let read_per_expert = |name: String| -> io::Result<Vec<u8>> {
-            let buf = read_tensor(name.clone())?;
+            let mut buf = read_tensor(name.clone())?;
             if buf.len() < per_expert_bytes {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1101,7 +1101,6 @@ fn load_layer_expert_native_quant(
             // GGUF rounds a quantised tensor up to a whole block, so the
             // body length matches `per_expert_bytes` exactly; truncate
             // defensively in case of any trailing alignment padding.
-            let mut buf = buf;
             buf.truncate(per_expert_bytes);
             Ok(buf)
         };
@@ -1522,7 +1521,7 @@ mod tests {
                             name: &str,
                             shape: &[u64],
                             dtype: u32,
-                            blob: Vec<u8>| {
+                            mut blob: Vec<u8>| {
             let nb = name.as_bytes();
             out.extend_from_slice(&(nb.len() as u64).to_le_bytes());
             out.extend_from_slice(nb);
@@ -1532,7 +1531,6 @@ mod tests {
             }
             out.extend_from_slice(&dtype.to_le_bytes());
             out.extend_from_slice(&cur_off.to_le_bytes());
-            let mut blob = blob;
             cur_off += blob.len() as u64;
             while cur_off % 32 != 0 {
                 blob.push(0);
