@@ -371,6 +371,7 @@ mod linux_impl {
     //! the `IoUringStorage` public surface is identical regardless of
     //! cargo features.
 
+    use crate::buffer_pool::PooledBuffer;
     use io_uring::{opcode, types, IoUring};
     use parking_lot::RwLock;
     use std::collections::HashMap;
@@ -834,7 +835,12 @@ mod linux_impl {
         let mut totalbytes = 0usize;
         let mut drained = 0usize;
         while drained < total {
-            let cqe = match ring.completion().next() {
+            // Splitting the completion-queue access into its own scope
+            // drops the `CompletionQueue` (and its mutable borrow on
+            // `ring`) before we call `ring.submit()` below; the returned
+            // CQE `Entry` is an owned copy, so it outlives the queue.
+            let next = { ring.completion().next() };
+            let cqe = match next {
                 Some(c) => c,
                 None => {
                     // CQE not yet available — flush + spin briefly.
@@ -893,7 +899,10 @@ mod linux_impl {
     fn drain_submitted_completions(ring: &mut IoUring, submitted: usize) -> io::Result<()> {
         let mut drained = 0usize;
         while drained < submitted {
-            match ring.completion().next() {
+            // Drop the `CompletionQueue` borrow before calling
+            // `ring.submit_and_wait(1)`; the `Entry` is an owned copy.
+            let next = { ring.completion().next() };
+            match next {
                 Some(_) => drained += 1,
                 None => {
                     ring.submit_and_wait(1)?;
