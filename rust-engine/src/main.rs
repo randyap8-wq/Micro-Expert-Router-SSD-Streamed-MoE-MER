@@ -1780,6 +1780,14 @@ fn apply_metadata_if_present(args: &mut RunArgs) {
         cli_defaults::EXPERT_SIZE as u64,
         &mut |v| args.expert_size = v as usize,
     );
+    if args.dtype == crate::inference::WeightDtype::F32 {
+        if let Some(dtype_str) = parse_json_string(&body, "dtype") {
+            if let Some(dtype) = crate::inference::WeightDtype::from_str_opt(&dtype_str) {
+                args.dtype = dtype;
+                overrode_anything = true;
+            }
+        }
+    }
     if overrode_anything {
         info!(
             num_experts = args.num_experts,
@@ -1815,6 +1823,16 @@ fn parse_json_number(body: &str, key: &str) -> Option<u64> {
         return None;
     }
     after[..end].parse::<u64>().ok()
+}
+
+fn parse_json_string(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = body.find(&needle)? + needle.len();
+    let rest = body[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// Parse a tiny JSON object of the form `{ "src_id": canonical_id, ... }`
