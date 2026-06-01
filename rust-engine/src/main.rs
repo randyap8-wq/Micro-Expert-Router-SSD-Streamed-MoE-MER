@@ -1266,7 +1266,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     //    — anyone who actually passes a flag overrides the metadata.
     apply_metadata_if_present(&mut args);
 
-    let weight_bytes = expert_weight_bytes(args.d_model, args.d_ff);
+    let weight_bytes = expert_weight_bytes_for(args.d_model, args.d_ff, args.dtype);
     info!(
         num_experts = args.num_experts,
         top_k = args.top_k,
