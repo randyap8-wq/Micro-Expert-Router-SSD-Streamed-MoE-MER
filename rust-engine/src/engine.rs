@@ -1369,6 +1369,7 @@ impl Engine {
         // `expert_matmul` fast path correct for Q4_0 while leaving the
         // F32 path byte-for-byte unchanged.
         let promote_dtype = self.core.options.dtype;
+        let promote_q4_0_for_gpu = promote_dtype == WeightDtype::Q4_0 && self.gpu_eligible_dtype();
         let promote_d_model = self.core.shape.d_model;
         let promote_d_ff = self.core.shape.d_ff;
         // Capacity is constant for the lifetime of the cache; publish
@@ -1383,7 +1384,7 @@ impl Engine {
                 // `promote_sync` copies the resident bytes into the
                 // anchor/LRU edge under the parking_lot mutex; safe to
                 // call from a Tokio worker because it never .awaits.
-                let bytes = if promote_dtype == WeightDtype::Q4_0 {
+                let bytes = if promote_q4_0_for_gpu {
                     // Dequantise Q4_0 blocks → tight F32 stream so the
                     // GPU matmul sees F32 weights. On any decode error
                     // (e.g. an unexpectedly short buffer) fall back to

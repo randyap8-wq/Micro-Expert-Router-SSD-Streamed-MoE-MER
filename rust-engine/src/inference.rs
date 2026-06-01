@@ -1407,7 +1407,9 @@ impl OwnedExpertWeights {
     /// `[gate_proj || up_proj || down_proj]` F32 byte stream suitable
     /// for upload to a GPU expert weight buffer (see
     /// [`crate::backend`]'s `build_expert_entry`, which interprets the
-    /// VRAM bytes as three contiguous `d_ff × d_model` F32 matrices).
+    /// VRAM bytes as three contiguous F32 matrices:
+    /// `gate[d_ff × d_model]`, `up[d_ff × d_model]`, and
+    /// `down[d_model × d_ff]`).
     ///
     /// This reuses the existing Q4_0 dequant logic
     /// ([`OwnedExpertWeights::from_bytes_q4_0`]) and then drops any
@@ -1426,10 +1428,6 @@ impl OwnedExpertWeights {
         let gate_n = d_ff.saturating_mul(d_model);
         let up_n = d_ff.saturating_mul(d_model);
         let down_n = d_model.saturating_mul(d_ff);
-        // `from_bytes_q4_0` rounds each tensor up to a whole Q4_0 block,
-        // so the decoded vectors may carry a few trailing pad floats.
-        // Truncate each tensor to its exact element count so the
-        // concatenated stream matches the GPU's tight F32 layout.
         let mut out = Vec::with_capacity((gate_n + up_n + down_n) * 4);
         for &v in &owned.gate[..gate_n] {
             out.extend_from_slice(&v.to_le_bytes());
