@@ -634,6 +634,7 @@ cargo build --release --features avx512     # build AVX-512 int8-dequant + dot k
 cargo build --release --features amx        # build AMX tile-hint plumbing (executor still falls back)
 cargo +nightly build --release --features nightly-amx  # nightly Rust: implies `amx` + unlocks `stdarch_x86_amx` for the real tile intrinsics; falls back to AVX-512 when the runtime probe doesn't see AMX
 cargo build --release --features gpu        # build the budget-GPU offload integration seam (GpuBackend), pair with `[real_transformer].compute_offload = "gpu"` in config.toml
+cargo build --release --features cuda       # CUDA SwiGLU via candle-core (needs CUDA 12.x toolkit; see "Building with CUDA" below)
 cargo build --release --features tokenizer  # real HuggingFace tokenizer (pulls in `onig`)
 ```
 
@@ -643,6 +644,63 @@ now always compiled, so a single binary picks the best available
 kernel (scalar / parallel / AVX2 / AVX-512 / AMX) on the host at
 startup without recompilation. See [Hardware auto-escalation](#hardware-auto-escalation)
 below.
+
+### Building with CUDA
+
+The optional `cuda` feature routes the per-expert SwiGLU forward pass
+through `candle-core`'s CUDA backend (see
+[`run_inference_gpu`](rust-engine/src/inference.rs)). It pulls in
+`cudarc`, whose build script needs to (a) detect the toolkit version by
+running `nvcc --version` from `PATH`, and (b) locate the CUDA libraries
+via `CUDA_HOME` / `CUDA_PATH` / `CUDA_ROOT`.
+
+**Requirements**
+
+* **CUDA toolkit 12.x** installed (tested on Ubuntu 24.04 + CUDA 12.9,
+  e.g. GCP Deep Learning VMs). The *full* toolkit is required — `nvcc`
+  must be present, not just the runtime libraries.
+* An NVIDIA GPU + driver at run time. The build only needs the toolkit;
+  the engine still falls back to the CPU kernel when no device is
+  present at run time.
+
+**Environment setup.** On many installs (including the GCP Deep
+Learning VMs) the toolkit lives at `/usr/local/cuda` but `nvcc` is not
+on `PATH`, so the build fails with:
+
+```text
+`nvcc --version` failed.
+Err(Os { code: 2, kind: NotFound, message: "No such file or directory" })
+```
+
+Source the helper script once per shell to put `nvcc` on `PATH` and
+export the `CUDA_*` variables (it auto-detects `/usr/local/cuda` or the
+newest `/usr/local/cuda-*`, and honours a pre-set `CUDA_HOME`):
+
+```bash
+source scripts/setup_cuda_env.sh        # or: CUDA_HOME=/usr/local/cuda-12.9 source scripts/setup_cuda_env.sh
+```
+
+Equivalently, export the variables by hand:
+
+```bash
+export CUDA_HOME=/usr/local/cuda
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+```
+
+`rust-engine/.cargo/config.toml` already provides non-forcing
+`CUDA_HOME` / `CUDA_PATH` / `CUDA_ROOT` defaults pointing at
+`/usr/local/cuda` (so the linker finds the CUDA libraries even if you
+forget to export them); the only thing the script/exports add on top is
+`nvcc` on `PATH` for cudarc's version probe. Anything you export in your
+shell overrides those defaults.
+
+**Build command.**
+
+```bash
+cd rust-engine
+cargo build --release --features "cuda,avx512,tokenizer"
+```
 
 ### Generate synthetic expert files
 
