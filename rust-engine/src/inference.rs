@@ -3012,11 +3012,11 @@ mod tests {
         let owned = OwnedExpertWeights::from_bytes_q4_0(&bytes, d_model, d_ff).unwrap();
         let n = d_model * d_ff;
         let mut expected = Vec::with_capacity(3 * n * 4);
-        for &v in owned.gate[..n]
+        let chained = owned.gate[..n]
             .iter()
             .chain(owned.up[..n].iter())
-            .chain(owned.down[..n].iter())
-        {
+            .chain(owned.down[..n].iter());
+        for &v in chained {
             expected.extend_from_slice(&v.to_le_bytes());
         }
         assert_eq!(f32_bytes, expected);
