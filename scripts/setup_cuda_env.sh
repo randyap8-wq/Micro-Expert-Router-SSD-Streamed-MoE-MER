@@ -69,7 +69,7 @@ esac
 
 # Help the dynamic linker find libcudart/libcublas at run time.
 case ":${LD_LIBRARY_PATH-}:" in
-    *":${CUDA_HOME}/lib64:"*) : ;;
+    *":${CUDA_HOME}/lib64:"*) : ;;                     # already present
     *) export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
 esac
 
