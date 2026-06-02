@@ -2016,7 +2016,9 @@ use std::sync::Arc as StdArc;
 pub(crate) const EXPERT_SIZE_TOLERANCE_BYTES: usize =
     crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
 
-/// Return a view over `bytes` that is at least `need` bytes long.
+/// Return a buffer that is at least `need` bytes long — either a
+/// borrowed view of `bytes` or, when `bytes` is slightly short, an
+/// owned zero-padded copy.
 ///
 /// * `bytes.len() >= need` → borrow the buffer unchanged (the common
 ///   path; any trailing `O_DIRECT` padding past `need` is ignored by
@@ -2040,6 +2042,10 @@ fn q4_expert_bytes_with_tolerance(
     if bytes.len() >= need {
         Ok(Cow::Borrowed(bytes))
     } else if need > EXPERT_SIZE_TOLERANCE_BYTES
+        // The `need > tolerance` guard is checked first and is critical:
+        // for experts smaller than one page a one-page shortfall would
+        // be most (or all) of the data, so we must require an exact
+        // size there rather than zero-padding mostly-empty garbage.
         && need - bytes.len() <= EXPERT_SIZE_TOLERANCE_BYTES
     {
         let mut padded = Vec::with_capacity(need);

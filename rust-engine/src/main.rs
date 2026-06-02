@@ -600,6 +600,10 @@ fn install_run_gpu_backend() {
     // which the synthetic `run` benchmark does not exercise — it routes
     // everything through `expert_matmul`. Modest, model-independent
     // defaults keep the allocation negligible.
+    // `GpuExpertCache::new(capacity_bytes, vram_anchor_ratio,
+    // promote_after_hits)`: zero VRAM capacity (run never promotes
+    // experts), 0.5 anchor ratio and a 16-hit promotion threshold —
+    // inert here but required by the constructor signature.
     let gpu_expert_cache = std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(0, 0.5, 16));
     let backend_box = crate::backend::BackendBox::init_blocking(
         1,    // num_layers

@@ -1231,8 +1231,8 @@ fn dispatch_expert_forward(
     // size mismatches immediately at INFO, instead of only becoming
     // visible once an expert is skipped with a "buffer too small"
     // warning.
-    static FIRST_EXPERT_SIZE_LOG: std::sync::Once = std::sync::Once::new();
-    FIRST_EXPERT_SIZE_LOG.call_once(|| {
+    static LOG_FIRST_EXPERT_SIZE_ONCE: std::sync::Once = std::sync::Once::new();
+    LOG_FIRST_EXPERT_SIZE_ONCE.call_once(|| {
         let actual = r.data().len();
         let expected = crate::inference::expert_weight_bytes_for(d_model, d_ff, dtype);
         info!(
