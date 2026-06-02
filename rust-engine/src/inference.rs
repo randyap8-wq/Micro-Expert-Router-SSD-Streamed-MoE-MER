@@ -2029,9 +2029,9 @@ pub(crate) const EXPERT_SIZE_TOLERANCE_BYTES: usize =
 ///   owned copy zero-padded up to `need`, so a file that is up to one
 ///   page short is still usable (the missing tail decodes to a final
 ///   block of zero-weights instead of aborting the expert). The
-///   `need > EXPERT_SIZE_TOLERANCE_BYTES` guard keeps the tolerance
-///   from swallowing genuinely truncated small/synthetic buffers,
-///   where a one-page shortfall would be most of the data.
+///   `need > EXPERT_SIZE_TOLERANCE_BYTES` guard only prevents applying
+///   tolerance to very small payloads (`need <= block_align`), where a
+///   one-page shortfall could be all (or most) of the data.
 /// * otherwise → [`ExpertWeightsError::BufferTooSmall`].
 fn q4_expert_bytes_with_tolerance(
     bytes: &[u8],
@@ -2129,28 +2129,37 @@ pub fn run_inference_q4_0_qmm(
     d_model: usize,
     d_ff: usize,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
-    let y = forward_q4_0_qmm_from_bytes(resident.data(), x, d_model, d_ff)?;
-    let out = summarise_output(token_idx, resident.id, &y);
-    Ok((out, y))
-}
-
-/// Bytes-in / `Vec<f32>`-out helper that powers
-/// [`run_inference_q4_0_qmm`]. Exposed at crate-private visibility
-/// so the numerical-equivalence test can compare against
-/// [`OwnedExpertWeights::from_bytes_q4_0`] without having to
-/// construct a full [`ExpertResident`] / [`PooledBuffer`] pair.
-pub(crate) fn forward_q4_0_qmm_from_bytes(
-    bytes: &[u8],
-    x: &[f32],
-    d_model: usize,
-    d_ff: usize,
-) -> Result<HiddenState, ExpertWeightsError> {
     let one = d_ff.saturating_mul(d_model);
     let one_blocks = one.div_ceil(Q4_0_BLOCK_ELEMS);
     let one_bytes = one_blocks * Q4_0_BLOCK_BYTES;
     let need = one_bytes * 3;
-    let buf = q4_expert_bytes_with_tolerance(bytes, need, d_model, d_ff)?;
-    let bytes: &[u8] = &buf;
+    let resident_bytes = resident.data();
+    let padded = resident.q4_0_padded_payload(need, EXPERT_SIZE_TOLERANCE_BYTES);
+    let bytes: &[u8] = if resident_bytes.len() >= need {
+        resident_bytes
+    } else if let Some(ref cached) = padded {
+        cached.as_ref()
+    } else {
+        return Err(ExpertWeightsError::BufferTooSmall {
+            have: resident_bytes.len(),
+            need,
+            d_model,
+            d_ff,
+        });
+    };
+    let y = forward_q4_0_qmm_from_exact_bytes(bytes, x, d_model, d_ff, one_bytes)?;
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+#[inline]
+fn forward_q4_0_qmm_from_exact_bytes(
+    bytes: &[u8],
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    one_bytes: usize,
+) -> Result<HiddenState, ExpertWeightsError> {
     let gate_b = &bytes[0..one_bytes];
     let up_b = &bytes[one_bytes..2 * one_bytes];
     let down_b = &bytes[2 * one_bytes..3 * one_bytes];
@@ -2169,6 +2178,25 @@ pub(crate) fn forward_q4_0_qmm_from_bytes(
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
     forward_qmm(gate, up, down, x, d_model)
+}
+
+/// Bytes-in / `Vec<f32>`-out helper that powers
+/// [`run_inference_q4_0_qmm`]. Exposed at crate-private visibility
+/// so the numerical-equivalence test can compare against
+/// [`OwnedExpertWeights::from_bytes_q4_0`] without having to
+/// construct a full [`ExpertResident`] / [`PooledBuffer`] pair.
+pub(crate) fn forward_q4_0_qmm_from_bytes(
+    bytes: &[u8],
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<HiddenState, ExpertWeightsError> {
+    let one = d_ff.saturating_mul(d_model);
+    let one_blocks = one.div_ceil(Q4_0_BLOCK_ELEMS);
+    let one_bytes = one_blocks * Q4_0_BLOCK_BYTES;
+    let need = one_bytes * 3;
+    let buf = q4_expert_bytes_with_tolerance(bytes, need, d_model, d_ff)?;
+    forward_q4_0_qmm_from_exact_bytes(&buf, x, d_model, d_ff, one_bytes)
 }
 
 /// **Q4_K SwiGLU forward pass via candle's `QMatMul`** — no F32
