@@ -702,6 +702,23 @@ cd rust-engine
 cargo build --release --features "cuda,avx512,tokenizer"
 ```
 
+**glibc 2.41 / CUDA 12.4 compatibility (Debian 13, GCC 13).** On glibc
+2.41 the C23 `sinpi` / `cospi` / `sinpif` / `cospif` declarations clash
+with CUDA's `crt/math_functions.h`, so the `candle-kernels` CUDA build
+fails with `exception specification is incompatible with that of
+previous function "cospi"`. The build script that compiles those kernels
+(`cudaforge`) ignores `NVCC_PREPEND_FLAGS`, so this repo ships a vendored
+copy of `candle-kernels` v0.10.2 under
+[`rust-engine/vendor/candle-kernels`](rust-engine/vendor/candle-kernels)
+(wired in via `[patch.crates-io]` in `rust-engine/Cargo.toml`). Its only
+delta from upstream is a `build.rs` that force-includes
+[`rust-engine/cuda/glibc_cuda_compat.h`](rust-engine/cuda/glibc_cuda_compat.h)
+(via nvcc `-include`), masking the conflicting glibc declarations. The
+header is guarded by `__GLIBC_PREREQ(2, 41)`, so it is a strict no-op on
+older glibc, macOS and Windows — no system-header edits or CUDA upgrade
+required. Nothing extra to run; it applies automatically on `--features
+cuda` builds.
+
 ### Generate synthetic expert files
 
 ```bash
