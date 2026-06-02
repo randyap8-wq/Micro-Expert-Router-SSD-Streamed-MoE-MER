@@ -267,6 +267,14 @@ enum Cmd {
         /// `validate-predictor` subcommand.
         #[arg(long)]
         trace_out: Option<PathBuf>,
+        /// Initialise the GPU compute backend before running the
+        /// benchmark so the FFN forward pass uses GPU matmul where
+        /// available. Mirrors the `serve` subcommand's GPU init: a
+        /// zero-capacity `GpuExpertCache` is used (the `run` path does
+        /// not promote experts into VRAM). Falls back to the default
+        /// CPU backend with a warning if GPU init fails.
+        #[arg(long)]
+        gpu: bool,
     },
 
     /// Convert a GGUF checkpoint (Mixtral-style) into the engine's
@@ -427,7 +435,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // *before* `install_default` claims the OnceLock. Other
     // subcommands keep the immediate install so their math path is
     // ready as soon as `main` returns into them.
-    if !matches!(cli.cmd, Cmd::Serve { .. }) {
+    //
+    // The `run` subcommand grows one extra wrinkle: when invoked with
+    // `--gpu` it must initialise the GPU compute backend *before* the
+    // default CPU backend claims the `OnceLock` (gist Fix 2), mirroring
+    // `cmd_serve`. A failed GPU init falls back to `install_default`.
+    if matches!(cli.cmd, Cmd::Run { gpu: true, .. }) {
+        install_run_gpu_backend();
+    } else if !matches!(cli.cmd, Cmd::Serve { .. }) {
         crate::backend::install_default();
         let b = crate::backend::current();
         info!(backend = b.device_name(), "math backend installed");
@@ -477,6 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     router_matrix,
                     gate_weights,
                     trace_out,
+                    gpu: _,
                 } = cli.cmd
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
@@ -565,6 +581,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into())
             }
         }
+    }
+}
+
+/// Install the GPU compute backend for the `run` subcommand (gist
+/// Fix 2).
+///
+/// Mirrors the GPU init path in [`cmd_serve`]: it builds a
+/// **zero-capacity** [`GpuExpertCache`] (the benchmark `run` path
+/// never promotes experts into VRAM) and initialises a
+/// [`BackendBox`](crate::backend::BackendBox) before the default CPU
+/// backend claims the `OnceLock`. On any failure — no GPU device or a
+/// `set_backend` race — it falls back to
+/// [`install_default`](crate::backend::install_default) with a
+/// warning so the benchmark still runs on CPU.
+fn install_run_gpu_backend() {
+    // The KV-cache geometry below only sizes the dense-backbone cache,
+    // which the synthetic `run` benchmark does not exercise — it routes
+    // everything through `expert_matmul`. Modest, model-independent
+    // defaults keep the allocation negligible.
+    let gpu_expert_cache = std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(0, 0.5, 16));
+    let backend_box = crate::backend::BackendBox::init_blocking(
+        1,    // num_layers
+        4096, // max_seq_len
+        8,    // num_heads
+        64,   // head_dim
+        gpu_expert_cache,
+    );
+    if !backend_box.is_gpu() {
+        warn!("--gpu requested but no GPU device available; falling back to default backend");
+        crate::backend::install_default();
+        let b = crate::backend::current();
+        info!(backend = b.device_name(), "math backend installed");
+        return;
+    }
+    let device_name = backend_box.device_name().to_string();
+    let gpu = std::sync::Arc::new(backend_box);
+    if let Err(e) = crate::backend::set_backend(gpu) {
+        warn!(error = e, "failed to install GpuBackend for run; falling back to default");
+        crate::backend::install_default();
+        let b = crate::backend::current();
+        info!(backend = b.device_name(), "math backend installed");
+    } else {
+        info!(device = device_name, "GpuBackend installed for run benchmark");
     }
 }
 
