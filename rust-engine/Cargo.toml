@@ -199,3 +199,26 @@ cuda = ["candle-core/cuda"]
 # extra deps are pure-Rust and small; can be turned off with
 # `--no-default-features` for the minimal embedded build.
 tui = ["dep:ratatui", "dep:crossterm"]
+
+# --------------------------------------------------------------------
+# Vendored, patched `candle-kernels`.
+#
+# Building with `--features cuda` pulls in `candle-core/cuda` ->
+# `candle-kernels`, whose CUDA `.cu` files are compiled by nvcc via the
+# `cudaforge` crate. On Debian 13 (glibc 2.41) + CUDA 12.4 that build
+# fails because glibc 2.41 redeclares the C23 `sinpi`/`cospi`/`sinpif`/
+# `cospif` functions with an exception specification that conflicts with
+# CUDA's `crt/math_functions.h`:
+#
+#     exception specification is incompatible with that of previous
+#     function "cospi"
+#
+# cudaforge ignores `NVCC_PREPEND_FLAGS`, so the only way to inject the
+# fix is through its `KernelBuilder::arg()` API. The vendored copy patches
+# `build.rs` to force-include `cuda/glibc_cuda_compat.h` (via `-include`),
+# which masks the conflicting glibc declarations before <math.h> pulls
+# them in. The header is guarded by `__GLIBC_PREREQ(2, 41)`, so the patch
+# is a strict no-op on older glibc, macOS and Windows. The only delta from
+# the upstream v0.10.2 crate is the `-include` wiring in `build.rs`.
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }
