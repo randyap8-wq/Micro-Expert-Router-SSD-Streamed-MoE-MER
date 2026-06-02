@@ -1362,14 +1362,8 @@ impl OwnedExpertWeights {
         let down_blocks = down_n.div_ceil(Q4_0_BLOCK_ELEMS);
         let need_bytes = (gate_blocks + up_blocks + down_blocks)
             .saturating_mul(Q4_0_BLOCK_BYTES);
-        if bytes.len() < need_bytes {
-            return Err(ExpertWeightsError::BufferTooSmall {
-                have: bytes.len(),
-                need: need_bytes,
-                d_model,
-                d_ff,
-            });
-        }
+        let buf = q4_expert_bytes_with_tolerance(bytes, need_bytes, d_model, d_ff)?;
+        let bytes: &[u8] = &buf;
 
         let mut off = 0;
         let mut gate_buf: Vec<f32> = Vec::new();
@@ -2008,6 +2002,66 @@ use candle_core::Module;
 use std::borrow::Cow;
 use std::sync::Arc as StdArc;
 
+/// Maximum shortfall (in bytes) tolerated when validating an on-disk
+/// quantised expert buffer against the engine's computed 3-matrix
+/// SwiGLU blob.
+///
+/// Real GGUF Q4_0 expert files can land exactly one `block_align`
+/// (page) short of the size the engine derives from `d_model`/`d_ff`
+/// — e.g. a Mixtral expert whose blob should be 99,090,432 bytes
+/// arrives as 99,086,336 (4,096 bytes / one page smaller). Rather
+/// than skipping the expert, we accept files within one block
+/// alignment of the expected size and zero-pad the (≤ one page) tail
+/// so the per-matrix block slices stay in-bounds. See gist Fix 1.
+pub(crate) const EXPERT_SIZE_TOLERANCE_BYTES: usize =
+    crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
+
+/// Return a buffer that is at least `need` bytes long — either a
+/// borrowed view of `bytes` or, when `bytes` is slightly short, an
+/// owned zero-padded copy.
+///
+/// * `bytes.len() >= need` → borrow the buffer unchanged (the common
+///   path; any trailing `O_DIRECT` padding past `need` is ignored by
+///   the caller's slicing).
+/// * the expert is larger than one `block_align` and the buffer is no
+///   more than one `block_align` short
+///   (`need - bytes.len() <= EXPERT_SIZE_TOLERANCE_BYTES`) → return an
+///   owned copy zero-padded up to `need`, so a file that is up to one
+///   page short is still usable (the missing tail decodes to a final
+///   block of zero-weights instead of aborting the expert). The
+///   `need > EXPERT_SIZE_TOLERANCE_BYTES` guard only prevents applying
+///   tolerance to very small payloads (`need <= block_align`), where a
+///   one-page shortfall could be all (or most) of the data.
+/// * otherwise → [`ExpertWeightsError::BufferTooSmall`].
+fn q4_expert_bytes_with_tolerance(
+    bytes: &[u8],
+    need: usize,
+    d_model: usize,
+    d_ff: usize,
+) -> Result<Cow<'_, [u8]>, ExpertWeightsError> {
+    if bytes.len() >= need {
+        Ok(Cow::Borrowed(bytes))
+    } else if need > EXPERT_SIZE_TOLERANCE_BYTES
+        // The `need > tolerance` guard is checked first and is critical:
+        // for experts smaller than one page a one-page shortfall would
+        // be most (or all) of the data, so we must require an exact
+        // size there rather than zero-padding mostly-empty garbage.
+        && need - bytes.len() <= EXPERT_SIZE_TOLERANCE_BYTES
+    {
+        let mut padded = Vec::with_capacity(need);
+        padded.extend_from_slice(bytes);
+        padded.resize(need, 0);
+        Ok(Cow::Owned(padded))
+    } else {
+        Err(ExpertWeightsError::BufferTooSmall {
+            have: bytes.len(),
+            need,
+            d_model,
+            d_ff,
+        })
+    }
+}
+
 /// Build a CPU [`QTensor`] of shape `[rows, cols]` from a borrowed
 /// run of GGUF-format quantised blocks. The buffer is *copied* into
 /// candle's owned per-tensor block storage (this is the only
@@ -2075,34 +2129,37 @@ pub fn run_inference_q4_0_qmm(
     d_model: usize,
     d_ff: usize,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
-    let y = forward_q4_0_qmm_from_bytes(resident.data(), x, d_model, d_ff)?;
-    let out = summarise_output(token_idx, resident.id, &y);
-    Ok((out, y))
-}
-
-/// Bytes-in / `Vec<f32>`-out helper that powers
-/// [`run_inference_q4_0_qmm`]. Exposed at crate-private visibility
-/// so the numerical-equivalence test can compare against
-/// [`OwnedExpertWeights::from_bytes_q4_0`] without having to
-/// construct a full [`ExpertResident`] / [`PooledBuffer`] pair.
-pub(crate) fn forward_q4_0_qmm_from_bytes(
-    bytes: &[u8],
-    x: &[f32],
-    d_model: usize,
-    d_ff: usize,
-) -> Result<HiddenState, ExpertWeightsError> {
     let one = d_ff.saturating_mul(d_model);
     let one_blocks = one.div_ceil(Q4_0_BLOCK_ELEMS);
     let one_bytes = one_blocks * Q4_0_BLOCK_BYTES;
     let need = one_bytes * 3;
-    if bytes.len() < need {
+    let resident_bytes = resident.data();
+    let padded = resident.q4_0_padded_payload(need, EXPERT_SIZE_TOLERANCE_BYTES);
+    let bytes: &[u8] = if resident_bytes.len() >= need {
+        resident_bytes
+    } else if let Some(ref cached) = padded {
+        cached.as_ref()
+    } else {
         return Err(ExpertWeightsError::BufferTooSmall {
-            have: bytes.len(),
+            have: resident_bytes.len(),
             need,
             d_model,
             d_ff,
         });
-    }
+    };
+    let y = forward_q4_0_qmm_from_exact_bytes(bytes, x, d_model, d_ff, one_bytes)?;
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+#[inline]
+fn forward_q4_0_qmm_from_exact_bytes(
+    bytes: &[u8],
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    one_bytes: usize,
+) -> Result<HiddenState, ExpertWeightsError> {
     let gate_b = &bytes[0..one_bytes];
     let up_b = &bytes[one_bytes..2 * one_bytes];
     let down_b = &bytes[2 * one_bytes..3 * one_bytes];
@@ -2121,6 +2178,25 @@ pub(crate) fn forward_q4_0_qmm_from_bytes(
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
     forward_qmm(gate, up, down, x, d_model)
+}
+
+/// Bytes-in / `Vec<f32>`-out helper that powers
+/// [`run_inference_q4_0_qmm`]. Exposed at crate-private visibility
+/// so the numerical-equivalence test can compare against
+/// [`OwnedExpertWeights::from_bytes_q4_0`] without having to
+/// construct a full [`ExpertResident`] / [`PooledBuffer`] pair.
+pub(crate) fn forward_q4_0_qmm_from_bytes(
+    bytes: &[u8],
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<HiddenState, ExpertWeightsError> {
+    let one = d_ff.saturating_mul(d_model);
+    let one_blocks = one.div_ceil(Q4_0_BLOCK_ELEMS);
+    let one_bytes = one_blocks * Q4_0_BLOCK_BYTES;
+    let need = one_bytes * 3;
+    let buf = q4_expert_bytes_with_tolerance(bytes, need, d_model, d_ff)?;
+    forward_q4_0_qmm_from_exact_bytes(&buf, x, d_model, d_ff, one_bytes)
 }
 
 /// **Q4_K SwiGLU forward pass via candle's `QMatMul`** — no F32
@@ -3186,5 +3262,53 @@ mod tests {
                 "QMatMul Q4_0 path diverged at {i}: baseline={a} qmm={b} (tol={tol})"
             );
         }
+    }
+
+    /// gist Fix 1: an on-disk Q4_0 expert that is up to one
+    /// `block_align` (4,096 bytes) shorter than the exact 3-matrix
+    /// blob must still decode (the missing tail is zero-padded), while
+    /// a buffer short by *more* than one page is still rejected.
+    #[test]
+    fn q4_0_tolerates_one_block_align_short_buffer() {
+        // Dims chosen so the full blob is comfortably larger than one
+        // page (need = 13,824 bytes > 4,096) and block-aligned for the
+        // QMatMul path (both dims are multiples of 32).
+        let d_model = 64usize;
+        let d_ff = 128usize;
+        let blocks_per_matrix = (d_model * d_ff).div_ceil(Q4_0_BLOCK_ELEMS);
+        let mut blk = [0u8; Q4_0_BLOCK_BYTES];
+        let scale16 = half::f16::from_f32(0.05).to_bits().to_le_bytes();
+        blk[0..2].copy_from_slice(&scale16);
+        for i in 2..Q4_0_BLOCK_BYTES {
+            blk[i] = 9u8 | (9u8 << 4);
+        }
+        let mut bytes = Vec::new();
+        for _ in 0..(3 * blocks_per_matrix) {
+            bytes.extend_from_slice(&blk);
+        }
+        let need = bytes.len();
+        assert!(need > EXPERT_SIZE_TOLERANCE_BYTES);
+
+        let x = synth_hidden_state(0, d_model, 1);
+
+        // Exactly one block_align short → accepted (zero-padded tail).
+        let short_one_page = &bytes[..need - EXPERT_SIZE_TOLERANCE_BYTES];
+        let qmm = forward_q4_0_qmm_from_bytes(short_one_page, &x, d_model, d_ff)
+            .expect("one-page-short qmm should be tolerated");
+        assert_eq!(qmm.len(), d_model);
+        assert!(qmm.iter().all(|v| v.is_finite()));
+        OwnedExpertWeights::from_bytes_q4_0(short_one_page, d_model, d_ff)
+            .expect("one-page-short dequant should be tolerated");
+
+        // One byte more than a block_align short → rejected.
+        let too_short = &bytes[..need - EXPERT_SIZE_TOLERANCE_BYTES - 1];
+        assert!(matches!(
+            forward_q4_0_qmm_from_bytes(too_short, &x, d_model, d_ff),
+            Err(ExpertWeightsError::BufferTooSmall { .. })
+        ));
+        assert!(matches!(
+            OwnedExpertWeights::from_bytes_q4_0(too_short, d_model, d_ff),
+            Err(ExpertWeightsError::BufferTooSmall { .. })
+        ));
     }
 }

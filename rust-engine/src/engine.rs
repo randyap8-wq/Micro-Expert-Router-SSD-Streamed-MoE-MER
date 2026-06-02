@@ -1225,6 +1225,26 @@ fn dispatch_expert_forward(
     d_model: usize,
     d_ff: usize,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    // One-time diagnostic: log the actual resident buffer size against
+    // the size the engine expects for this dtype/shape on the very
+    // first expert forward pass (gist Fix 3). This surfaces on-disk
+    // size mismatches immediately at INFO, instead of only becoming
+    // visible once an expert is skipped with a "buffer too small"
+    // warning.
+    static LOG_FIRST_EXPERT_SIZE_ONCE: std::sync::Once = std::sync::Once::new();
+    LOG_FIRST_EXPERT_SIZE_ONCE.call_once(|| {
+        let actual = r.data().len();
+        let expected = crate::inference::expert_weight_bytes_for(d_model, d_ff, dtype);
+        info!(
+            expert = r.id,
+            dtype = dtype.as_str(),
+            actual_bytes = actual,
+            expected_bytes = expected,
+            d_model,
+            d_ff,
+            "first expert load: actual vs expected buffer size"
+        );
+    });
     match dtype {
         WeightDtype::F32 => run_inference(token_idx, r, x, d_model, d_ff),
         WeightDtype::F16 => run_inference_f16(token_idx, r, x, d_model, d_ff),

@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 /// One resident expert: id + the bytes loaded from the SSD.
 ///
@@ -46,6 +46,10 @@ pub struct ExpertResident {
     /// Stored as an `AtomicU64` so the engine's lock-free routing hot
     /// path can update it with a single relaxed atomic increment.
     hits: AtomicU64,
+    /// Cached once-per-resident Q4_0 zero-padded payload used when the
+    /// on-disk bytes are slightly short (≤ one block/page) of the
+    /// derived expected size.
+    q4_0_padded: StdMutex<Option<(usize, Arc<[u8]>)>>,
 }
 
 impl ExpertResident {
@@ -68,6 +72,7 @@ impl ExpertResident {
             buffer,
             payload_offset,
             hits: AtomicU64::new(0),
+            q4_0_padded: StdMutex::new(None),
         }
     }
 
@@ -98,6 +103,33 @@ impl ExpertResident {
     #[inline]
     pub fn data(&self) -> &[u8] {
         &self.buffer.as_slice()[self.payload_offset..]
+    }
+
+    /// Return a cached zero-padded Q4_0 payload when the resident is at
+    /// most `tolerance` bytes short of `need`. The padded allocation is
+    /// created at most once per `need` for this resident.
+    pub fn q4_0_padded_payload(&self, need: usize, tolerance: usize) -> Option<Arc<[u8]>> {
+        let data = self.data();
+        if data.len() >= need {
+            return None;
+        }
+        let shortfall = need - data.len();
+        if need <= tolerance || shortfall > tolerance {
+            return None;
+        }
+
+        let mut guard = self.q4_0_padded.lock().expect("q4_0_padded poisoned");
+        if let Some((cached_need, cached)) = guard.as_ref() {
+            if *cached_need == need {
+                return Some(cached.clone());
+            }
+        }
+        let mut padded = Vec::with_capacity(need);
+        padded.extend_from_slice(data);
+        padded.resize(need, 0);
+        let cached: Arc<[u8]> = Arc::from(padded.into_boxed_slice());
+        *guard = Some((need, cached.clone()));
+        Some(cached)
     }
 
     /// Raw buffer bytes, including any U.T.H. prefix. Used by paths
