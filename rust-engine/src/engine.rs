@@ -1867,6 +1867,11 @@ impl Engine {
                     gpu_eligible_dtype = self.gpu_eligible_dtype(),
                     "generate GPU fast-path guard"
                 );
+                info!(
+                    is_gpu = self.core.backend.is_gpu(),
+                    gpu_eligible = self.gpu_eligible_dtype(),
+                    "generate GPU fast-path guard check"
+                );
                 let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
                 {
                     let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
