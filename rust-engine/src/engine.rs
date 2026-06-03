@@ -2759,14 +2759,30 @@ impl Engine {
                     rows: 1,
                     cols: self.core.shape.d_model,
                 };
-                match self.core.backend.expert_matmul(
+                debug!(
+                    layer = layer,
+                    expert = r.id,
+                    is_gpu = self.core.backend.is_gpu(),
+                    dtype = ?self.core.options.dtype,
+                    "calling backend.expert_matmul"
+                );
+                let matmul_res = self.core.backend.expert_matmul(
                     layer as usize,
                     r.id,
                     x_view,
                     self.core.shape.d_model,
                     self.core.shape.d_ff,
                     &mut out_view,
-                ) {
+                );
+                debug!(
+                    layer = layer,
+                    expert = r.id,
+                    is_gpu = self.core.backend.is_gpu(),
+                    dtype = ?self.core.options.dtype,
+                    ok = matmul_res.is_ok(),
+                    "returned from backend.expert_matmul"
+                );
+                match matmul_res {
                     Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
                     Err(_) => None, // VRAM miss — fall through to CPU
                 }
