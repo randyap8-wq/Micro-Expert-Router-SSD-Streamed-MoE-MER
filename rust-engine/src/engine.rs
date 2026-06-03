@@ -1861,6 +1861,12 @@ impl Engine {
                 // and we fall through to the CPU path below. Both F32 and
                 // (block-aligned) Q4_0 experts are eligible — see
                 // `Engine::gpu_eligible_dtype`.
+                debug!(
+                    expert = r.id,
+                    is_gpu = self.core.backend.is_gpu(),
+                    gpu_eligible_dtype = self.gpu_eligible_dtype(),
+                    "generate GPU fast-path guard"
+                );
                 let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
                 {
                     let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
@@ -1880,14 +1886,28 @@ impl Engine {
                     // per-layer iteration, so we route everything through
                     // layer 0 — `expert_matmul` ignores `layer_idx` anyway
                     // (the trait API takes it only for future logging).
-                    match self.core.backend.expert_matmul(
+                    debug!(
+                        expert = r.id,
+                        is_gpu = self.core.backend.is_gpu(),
+                        dtype = ?self.core.options.dtype,
+                        "calling backend.expert_matmul"
+                    );
+                    let matmul_res = self.core.backend.expert_matmul(
                         0,
                         r.id,
                         x_view,
                         self.core.shape.d_model,
                         self.core.shape.d_ff,
                         &mut out_view,
-                    ) {
+                    );
+                    debug!(
+                        expert = r.id,
+                        is_gpu = self.core.backend.is_gpu(),
+                        dtype = ?self.core.options.dtype,
+                        ok = matmul_res.is_ok(),
+                        "returned from backend.expert_matmul"
+                    );
+                    match matmul_res {
                         Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
                         Err(_) => None,
                     }
@@ -2759,13 +2779,6 @@ impl Engine {
                     rows: 1,
                     cols: self.core.shape.d_model,
                 };
-                debug!(
-                    layer = layer,
-                    expert = r.id,
-                    is_gpu = self.core.backend.is_gpu(),
-                    dtype = ?self.core.options.dtype,
-                    "calling backend.expert_matmul"
-                );
                 let matmul_res = self.core.backend.expert_matmul(
                     layer as usize,
                     r.id,
@@ -2773,14 +2786,6 @@ impl Engine {
                     self.core.shape.d_model,
                     self.core.shape.d_ff,
                     &mut out_view,
-                );
-                debug!(
-                    layer = layer,
-                    expert = r.id,
-                    is_gpu = self.core.backend.is_gpu(),
-                    dtype = ?self.core.options.dtype,
-                    ok = matmul_res.is_ok(),
-                    "returned from backend.expert_matmul"
                 );
                 match matmul_res {
                     Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
