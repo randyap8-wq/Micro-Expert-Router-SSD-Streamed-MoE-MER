@@ -1381,10 +1381,10 @@ impl Engine {
     /// The byte conversion mirrors the background task exactly: Q4_0
     /// experts are dequantised to a tight F32 stream (the GPU SwiGLU
     /// kernels operate on F32 weights) before landing in VRAM, while
-    /// F32 experts are promoted byte-for-byte. `promote_sync` itself
-    /// is budget-aware — it returns `false` (a no-op) once the cache
-    /// is full — so this never evicts past capacity and never blocks
-    /// the CPU fallback path.
+    /// F32 experts are promoted byte-for-byte. `promote_sync` enforces the
+    /// cache budgets by evicting LRU-edge entries as needed, and returns
+    /// `false` only when the resident cannot fit even after eviction
+    /// (e.g. payload exceeds the LRU byte budget).
     fn try_promote_resident_to_gpu(&self, resident: &Arc<ExpertResident>) {
         // Only meaningful when a GPU backend is live and the dtype is
         // one the GPU kernels can actually consume; otherwise the
