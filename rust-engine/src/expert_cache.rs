@@ -639,6 +639,48 @@ impl GpuExpertCache {
         true
     }
 
+    /// Non-evicting LRU-only promotion — install `resident` into the
+    /// **LRU Edge** if and only if it fits in the remaining LRU byte
+    /// budget without evicting any existing entry, and never place it
+    /// in the Anchor Core.
+    ///
+    /// This is the warm-up counterpart to [`Self::promote_sync`]: the
+    /// synchronous NVMe-miss path in the engine uses it to pin a freshly
+    /// loaded expert in VRAM without (a) evicting threshold-promoted
+    /// hot experts already resident in the LRU Edge, or (b) consuming
+    /// Anchor Core slots that the hit-threshold policy reserves for
+    /// genuinely hot experts. Anchor Core promotion remains the
+    /// exclusive responsibility of the threshold-driven background
+    /// promotion task wired up in
+    /// [`crate::engine::Engine::install_gpu_cache`].
+    ///
+    /// Returns `true` when the expert was installed in the LRU Edge,
+    /// `false` if it was already resident or would not fit without
+    /// eviction.
+    pub fn try_promote_lru_no_evict(&self, resident: Arc<GpuResident>) -> bool {
+        let bytes = resident.byte_len();
+        if bytes == 0 {
+            return false;
+        }
+        let mut g = self.inner.lock();
+        // Already resident anywhere: nothing to do. Don't touch LRU
+        // recency — the caller is a warm-up path, not a real access.
+        if g.anchor.contains_key(&resident.id) || g.lru.peek(&resident.id).is_some() {
+            return false;
+        }
+        // Strictly non-evicting: must fit in whatever LRU budget is
+        // currently free.
+        if g.lru_used_bytes + bytes > self.lru_capacity_bytes {
+            return false;
+        }
+        g.lru.put(resident.id, resident.clone());
+        g.lru_used_bytes += bytes;
+        drop(g);
+        self.promotions.fetch_add(1, Ordering::Relaxed);
+        self.refresh_used_bytes();
+        true
+    }
+
     /// Snapshot of VRAM-resident expert ids (anchor first, then LRU
     /// in most-recently-used order). Used by the admin health
     /// endpoint and the TUI dashboard.
@@ -782,5 +824,50 @@ mod tests {
         // buffer that `make(2, ...)` consumed, the pool should have
         // strictly more free slots than it did at the rejection.
         assert!(pool.try_acquire().is_some());
+    }
+
+    fn gpu_res(id: u32, bytes: usize) -> Arc<GpuResident> {
+        Arc::new(GpuResident::new(id, vec![0u8; bytes]))
+    }
+
+    #[test]
+    fn try_promote_lru_no_evict_skips_when_lru_full() {
+        // anchor_ratio = 0.0 → entire budget is LRU; capacity = 100B.
+        let cache = GpuExpertCache::new(100, 0.0, 0);
+        // Fill the LRU Edge exactly.
+        assert!(cache.try_promote_lru_no_evict(gpu_res(1, 60)));
+        assert!(cache.try_promote_lru_no_evict(gpu_res(2, 40)));
+        assert_eq!(cache.lru_len(), 2);
+        // No room left, and the helper must NOT evict.
+        assert!(!cache.try_promote_lru_no_evict(gpu_res(3, 1)));
+        assert!(cache.contains(1));
+        assert!(cache.contains(2));
+        assert!(!cache.contains(3));
+        // Promotion counter only advanced for the two successful installs.
+        assert_eq!(cache.promotions(), 2);
+    }
+
+    #[test]
+    fn try_promote_lru_no_evict_never_uses_anchor_core() {
+        // Anchor gets 50B; LRU gets 50B. A 40B entry would *fit* the
+        // anchor budget (and `promote_sync` would place it there), but
+        // the no-evict helper must keep it in the LRU Edge so the
+        // threshold-driven background task is the only thing that ever
+        // promotes into the Anchor Core.
+        let cache = GpuExpertCache::new(100, 0.5, 0);
+        assert!(cache.try_promote_lru_no_evict(gpu_res(7, 40)));
+        assert_eq!(cache.anchor_len(), 0);
+        assert_eq!(cache.lru_len(), 1);
+    }
+
+    #[test]
+    fn try_promote_lru_no_evict_is_idempotent() {
+        let cache = GpuExpertCache::new(100, 0.0, 0);
+        assert!(cache.try_promote_lru_no_evict(gpu_res(9, 32)));
+        // Second call for the same id is a no-op (already resident),
+        // and must not double-count the promotion counter or bytes.
+        assert!(!cache.try_promote_lru_no_evict(gpu_res(9, 32)));
+        assert_eq!(cache.promotions(), 1);
+        assert_eq!(cache.used_bytes(), 32);
     }
 }
