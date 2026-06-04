@@ -1381,10 +1381,14 @@ impl Engine {
     /// The byte conversion mirrors the background task exactly: Q4_0
     /// experts are dequantised to a tight F32 stream (the GPU SwiGLU
     /// kernels operate on F32 weights) before landing in VRAM, while
-    /// F32 experts are promoted byte-for-byte. `promote_sync` enforces the
-    /// cache budgets by evicting LRU-edge entries as needed, and returns
-    /// `false` only when the resident cannot fit even after eviction
-    /// (e.g. payload exceeds the LRU byte budget).
+    /// F32 experts are promoted byte-for-byte. The synchronous path
+    /// uses [`GpuExpertCache::try_promote_lru_no_evict`] so it never
+    /// evicts already-resident hot experts and never consumes Anchor
+    /// Core slots — anchor promotion stays the exclusive job of the
+    /// threshold-driven background task in
+    /// [`Engine::install_gpu_cache`]. When the LRU Edge is already
+    /// full, this call is a no-op and the expert stays on the CPU
+    /// path until the background task anchors it.
     fn try_promote_resident_to_gpu(&self, resident: &Arc<ExpertResident>) {
         // Only meaningful when a GPU backend is live and the dtype is
         // one the GPU kernels can actually consume; otherwise the
@@ -1397,7 +1401,7 @@ impl Engine {
             return;
         };
         let id = resident.id;
-        // Already VRAM-resident: nothing to do (and `promote_sync`
+        // Already VRAM-resident: nothing to do (and the LRU helper
         // would short-circuit anyway). Skip the byte copy entirely.
         if gpu.contains(id) {
             return;
@@ -1411,7 +1415,7 @@ impl Engine {
             self.core.shape.d_ff,
         );
         let gpu_res = Arc::new(GpuResident::new(id, bytes));
-        if gpu.promote_sync(gpu_res) {
+        if gpu.try_promote_lru_no_evict(gpu_res) {
             if let Some(p) = self.metrics.prom.as_ref() {
                 p.record_promotions(1);
                 p.set_vram_used_bytes(gpu.used_bytes() as u64);
