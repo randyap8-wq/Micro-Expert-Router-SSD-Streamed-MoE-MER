@@ -1364,6 +1364,69 @@ impl Engine {
         }
     }
 
+    /// Synchronously promote a freshly-loaded RAM resident into the
+    /// VRAM (GPU) expert cache, if one is installed and the expert's
+    /// dtype is GPU-eligible.
+    ///
+    /// This is the warm-up counterpart to the background promotion
+    /// task wired up in [`Engine::install_gpu_cache`]: the background
+    /// task only fires after an expert crosses the RAM-hit promotion
+    /// threshold, which means the *first* loads of an expert always
+    /// miss VRAM and `GpuBackend::expert_matmul` returns `Err(Miss)`,
+    /// forcing the CPU fallback for the entire warm-up window. Calling
+    /// this immediately after an NVMe load pins the expert in VRAM so
+    /// the *next* dispatch of the same expert hits the GPU fast path
+    /// instead.
+    ///
+    /// The byte conversion mirrors the background task exactly: Q4_0
+    /// experts are dequantised to a tight F32 stream (the GPU SwiGLU
+    /// kernels operate on F32 weights) before landing in VRAM, while
+    /// F32 experts are promoted byte-for-byte. `promote_sync` itself
+    /// is budget-aware — it returns `false` (a no-op) once the cache
+    /// is full — so this never evicts past capacity and never blocks
+    /// the CPU fallback path.
+    fn try_promote_resident_to_gpu(&self, resident: &Arc<ExpertResident>) {
+        // Only meaningful when a GPU backend is live and the dtype is
+        // one the GPU kernels can actually consume; otherwise the
+        // promotion would just waste a VRAM slot on bytes the fast
+        // path can never use.
+        if !self.core.backend.is_gpu() || !self.gpu_eligible_dtype() {
+            return;
+        }
+        let Some(gpu) = self.core.gpu_cache.as_ref() else {
+            return;
+        };
+        let id = resident.id;
+        // Already VRAM-resident: nothing to do (and `promote_sync`
+        // would short-circuit anyway). Skip the byte copy entirely.
+        if gpu.contains(id) {
+            return;
+        }
+        let bytes = if self.core.options.dtype == WeightDtype::Q4_0 {
+            match crate::inference::OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(
+                resident.data(),
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+            ) {
+                Ok(f32_bytes) => f32_bytes,
+                Err(e) => {
+                    warn!(expert = id, error = %e,
+                        "Q4_0→F32 dequant for synchronous GPU promotion failed; promoting raw bytes");
+                    resident.data().to_vec()
+                }
+            }
+        } else {
+            resident.data().to_vec()
+        };
+        let gpu_res = Arc::new(GpuResident::new(id, bytes));
+        if gpu.promote_sync(gpu_res) {
+            if let Some(p) = self.metrics.prom.as_ref() {
+                p.record_promotions(1);
+                p.set_vram_used_bytes(gpu.used_bytes() as u64);
+            }
+        }
+    }
+
     /// Attach a VRAM (GPU) expert cache — Phase 2 three-tier hierarchy.
     ///
     /// Spawns a background Tokio task that drains an MPSC channel of
@@ -1777,6 +1840,14 @@ impl Engine {
             // it again — that would double-count every miss after
             // SSD-read dedup (gist Phase 1) was introduced.
             stats.bytes_read += r.buffer.len() as u64;
+            // Synchronous VRAM promotion: this miss just paid the full
+            // NVMe load cost, so pin the freshly-loaded expert into the
+            // GpuExpertCache now (budget permitting). The *next* dispatch
+            // of this expert then hits `GpuBackend::expert_matmul`'s VRAM
+            // fast path instead of returning `Err(Miss)` and falling back
+            // to CPU. No-op when no GPU cache is installed or the dtype
+            // is not GPU-eligible; never touches the CPU fallback path.
+            self.try_promote_resident_to_gpu(&r);
             residents[i] = Some(r);
         }
         let io_wait_us = if had_misses {
