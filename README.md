@@ -32,6 +32,7 @@ The engine lives under [`rust-engine/`](./rust-engine).
 Our first real-world benchmark run demonstrates highly efficient out-of-core MoE execution with minimal I/O overhead:
 
 ### System Configuration
+* **Model:** `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`
 * **Hardware:** VM `g2-standard-32` (32 vCPU, 16 core, 128 GB RAM)
 * **GPU:** None (CPU-only execution)
 * **Memory Pool:** All 256 cache slots resident in RAM
