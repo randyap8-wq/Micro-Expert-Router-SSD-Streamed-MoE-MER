@@ -27,8 +27,55 @@ The engine lives under [`rust-engine/`](./rust-engine).
 
 ---
 
+## 🚀 Benchmark Results
+
+Our first real-world benchmark run demonstrates highly efficient out-of-core MoE execution with minimal I/O overhead:
+
+### System Configuration
+* **Model:** `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`
+* **Hardware:** VM `g2-standard-32` (32 vCPU, 16 core, 128 GB RAM)
+* **GPU:** None (CPU-only execution)
+* **Memory Pool:** All 256 cache slots resident in RAM
+
+### Performance Metrics
+| Metric | Value |
+| :--- | :--- |
+| **Sustained Token Throughput** | **21.38 tps** |
+| **Wall Time** | 233.83 s |
+| **Average Throughput** | 103.46 MiB/s |
+| **Expert Cache Hit Rate** | **97.46%** (9,746 hits, 254 misses) |
+| **I/O Share of Cycle Time** | **12.37%** (only 12.37% of token cycle time spent waiting on SSD reads) |
+
+### Key Latency Stats (SwiGLU FFN per Token)
+| Operation | p50 | p95 | p99 |
+| :--- | :--- | :--- | :--- |
+| **Compute Latency** | 40.26 ms | 41.63 ms | 60.74 ms |
+| **I/O Latency** | 116.54 ms | 233.60 ms | 360.19 ms |
+| **Cycle Latency** | 40.29 ms | 42.05 ms | 286.98 ms |
+
+### Raw Run Summary
+```text
+2026-06-04T15:10:41.520446Z  INFO stream complete wall_s=233.828879846 sustained_tps=21.383158501605987 avg_throughput_mibps=103.46455072587074 hit_rate_pct=97.46000000000001
+2026-06-04T15:10:41.520511Z  INFO ===================== run summary =====================
+2026-06-04T15:10:41.520519Z  INFO experts:       256 (top-2), cache=256 slots, pool=258 slots
+2026-06-04T15:10:41.520522Z  INFO ffn shape:     d_model=4096  d_ff=14336  bytes/expert=99090432 (dtype=q4_0)
+2026-06-04T15:10:41.520534Z  INFO lookups:       hits=9746  misses=254  hit_rate=97.46%
+2026-06-04T15:10:41.520540Z  INFO prefetches:    completed=2  predictor_observations=19996
+2026-06-04T15:10:41.520546Z  INFO i/o:           reads=254  bytes=24193.00 MiB
+2026-06-04T15:10:41.520557Z  INFO i/o latency:   p50=116543us  p95=233599us  p99=360191us
+2026-06-04T15:10:41.520563Z  INFO compute:       p50=40255us  p95=41631us  p99=60735us  (SwiGLU FFN per token)
+2026-06-04T15:10:41.520569Z  INFO cycle latency: p50=40287us  p95=42047us  p99=286975us  max=431615us
+2026-06-04T15:10:41.520576Z  INFO per-token avg: io_wait=5772.7us  compute=40850.5us  (over 5000 tokens)
+2026-06-04T15:10:41.520582Z  INFO I/O share:     12.37% of token cycle time spent waiting on SSD reads
+2026-06-04T15:10:41.520588Z  INFO energy knobs:  dtype=q4_0  partial_load_fraction=1.00  pinned=0  alias_redirects=0
+2026-06-04T15:10:41.520595Z  INFO =======================================================
+```
+
+---
+
 ## Table of Contents
 
+- [Benchmark Results](#-benchmark-results)
 - [What it actually does](#what-it-actually-does)
   - [End-to-end pipeline](#end-to-end-pipeline)
   - [What "running" actually does](#what-running-actually-does)
