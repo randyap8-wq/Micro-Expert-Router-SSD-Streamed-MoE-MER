@@ -1402,28 +1402,54 @@ impl Engine {
         if gpu.contains(id) {
             return;
         }
-        let bytes = if self.core.options.dtype == WeightDtype::Q4_0 {
-            match crate::inference::OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(
-                resident.data(),
-                self.core.shape.d_model,
-                self.core.shape.d_ff,
-            ) {
-                Ok(f32_bytes) => f32_bytes,
-                Err(e) => {
-                    warn!(expert = id, error = %e,
-                        "Q4_0→F32 dequant for synchronous GPU promotion failed; promoting raw bytes");
-                    resident.data().to_vec()
-                }
-            }
-        } else {
-            resident.data().to_vec()
-        };
+        let promote_q4_0 = self.core.options.dtype == WeightDtype::Q4_0;
+        let bytes = Self::resident_bytes_for_gpu(
+            id,
+            resident.data(),
+            promote_q4_0,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+        );
         let gpu_res = Arc::new(GpuResident::new(id, bytes));
         if gpu.promote_sync(gpu_res) {
             if let Some(p) = self.metrics.prom.as_ref() {
                 p.record_promotions(1);
                 p.set_vram_used_bytes(gpu.used_bytes() as u64);
             }
+        }
+    }
+
+    /// Convert a RAM resident's weight bytes into the form the GPU
+    /// SwiGLU kernels expect before they land in VRAM. Q4_0 experts
+    /// are dequantised to a tight F32 stream (`promote_q4_0 == true`);
+    /// every other (already GPU-eligible) dtype is copied verbatim.
+    /// On a dequant error the raw bytes are returned so
+    /// `build_expert_entry` can reject the entry and the engine drops
+    /// back to the CPU path, preserving correctness.
+    ///
+    /// Shared by the synchronous warm-up promotion path
+    /// ([`Engine::try_promote_resident_to_gpu`]) and the background
+    /// promotion task spawned in [`Engine::install_gpu_cache`].
+    fn resident_bytes_for_gpu(
+        id: u32,
+        data: &[u8],
+        promote_q4_0: bool,
+        d_model: usize,
+        d_ff: usize,
+    ) -> Vec<u8> {
+        if promote_q4_0 {
+            match crate::inference::OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(
+                data, d_model, d_ff,
+            ) {
+                Ok(f32_bytes) => f32_bytes,
+                Err(e) => {
+                    warn!(expert = id, error = %e,
+                        "Q4_0→F32 dequant for GPU promotion failed; promoting raw bytes");
+                    data.to_vec()
+                }
+            }
+        } else {
+            data.to_vec()
         }
     }
 
@@ -1467,28 +1493,16 @@ impl Engine {
                 // `promote_sync` copies the resident bytes into the
                 // anchor/LRU edge under the parking_lot mutex; safe to
                 // call from a Tokio worker because it never .awaits.
-                let bytes = if promote_q4_0_for_gpu {
-                    // Dequantise Q4_0 blocks → tight F32 stream so the
-                    // GPU matmul sees F32 weights. On any decode error
-                    // (e.g. an unexpectedly short buffer) fall back to
-                    // the raw bytes; `build_expert_entry` will then
-                    // reject the entry and the engine drops back to the
-                    // CPU path, preserving correctness.
-                    match crate::inference::OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(
-                        resident.data(),
-                        promote_d_model,
-                        promote_d_ff,
-                    ) {
-                        Ok(f32_bytes) => f32_bytes,
-                        Err(e) => {
-                            warn!(expert = id, error = %e,
-                                "Q4_0→F32 dequant for GPU promotion failed; promoting raw bytes");
-                            resident.data().to_vec()
-                        }
-                    }
-                } else {
-                    resident.data().to_vec()
-                };
+                // Q4_0 experts are dequantised to a tight F32 stream so
+                // the GPU matmul sees F32 weights (shared with the
+                // synchronous warm-up promotion path).
+                let bytes = Self::resident_bytes_for_gpu(
+                    id,
+                    resident.data(),
+                    promote_q4_0_for_gpu,
+                    promote_d_model,
+                    promote_d_ff,
+                );
                 let gpu_res = Arc::new(GpuResident::new(id, bytes));
                 let promoted = gpu_for_task.promote_sync(gpu_res);
                 if promoted {
