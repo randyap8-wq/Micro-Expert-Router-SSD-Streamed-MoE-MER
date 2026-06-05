@@ -61,6 +61,7 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
 2026-06-05T18:57:42.055410Z  INFO cycle latency: p50=56.83ms p95=58.34ms p99=65.15ms
 2026-06-05T18:57:42.055422Z  INFO per-token avg: io_wait=233.0us compute=57118.4us
 2026-06-05T18:57:42.055428Z  INFO I/O share:     0.41% of token cycle time spent waiting on SSD reads
+
 ---
 
 ## Table of Contents
