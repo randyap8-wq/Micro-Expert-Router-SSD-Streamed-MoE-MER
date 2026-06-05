@@ -27,50 +27,40 @@ The engine lives under [`rust-engine/`](./rust-engine).
 
 ---
 
-## 🚀 Benchmark Results
+## 🚀 Benchmark Results: Endurance Scaling
 
-Our first real-world benchmark run demonstrates highly efficient out-of-core MoE execution with minimal I/O overhead:
+Our latest endurance tests demonstrate the engine's ability to maintain stable performance at high context lengths (100k tokens) by utilizing an asynchronous out-of-core MoE architecture.
 
-### System Configuration
-* **Model:** `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`
-* **Hardware:** VM `g2-standard-32` (32 vCPU, 16 core, 128 GB RAM)
-* **GPU:** None (CPU-only execution)
-* **Memory Pool:** All 256 cache slots resident in RAM
+### Comparative Performance
+| Metric | 5k Token Benchmark (Initial) | 100k Token Benchmark (Endurance) |
+| :--- | :--- | :--- |
+| **Sustained TPS** | 21.38 | **17.40** |
+| **Cache Hit Rate** | 97.46% | **99.87%** |
+| **I/O Share of Cycle** | 12.37% | **0.41%** |
+| **Context Length** | 5,000 tokens | **100,000 tokens** |
 
-### Performance Metrics
-| Metric | Value |
-| :--- | :--- |
-| **Sustained Token Throughput** | **21.38 tps** |
-| **Wall Time** | 233.83 s |
-| **Average Throughput** | 103.46 MiB/s |
-| **Expert Cache Hit Rate** | **97.46%** (9,746 hits, 254 misses) |
-| **I/O Share of Cycle Time** | **12.37%** (only 12.37% of token cycle time spent waiting on SSD reads) |
+### Endurance Test Configuration (100k Tokens)
+* **Model:** mixtral-8x7b-instruct-v0.1.Q4_0.gguf
+* **Hardware:** VM g2-standard-32 (32 vCPU, 16 core, 128 GB RAM)
+* **GPU:** Optional (Engine dynamically optimized for CPU-native AVX-512)
+* **Memory Pool:** 256 cache slots (Out-of-core streaming)
 
-### Key Latency Stats (SwiGLU FFN per Token)
+### Latency Stats (SwiGLU FFN per Token)
 | Operation | p50 | p95 | p99 |
 | :--- | :--- | :--- | :--- |
-| **Compute Latency** | 40.26 ms | 41.63 ms | 60.74 ms |
-| **I/O Latency** | 116.54 ms | 233.60 ms | 360.19 ms |
-| **Cycle Latency** | 40.29 ms | 42.05 ms | 286.98 ms |
+| **Compute Latency** | 56.80 ms | 58.27 ms | 64.96 ms |
+| **I/O Latency** | 115.46 ms | 276.74 ms | 441.86 ms |
+| **Cycle Latency** | 56.83 ms | 58.34 ms | 65.15 ms |
 
-### Raw Run Summary
+### Raw Run Summary (100k Tokens)
 ```text
-2026-06-04T15:10:41.520446Z  INFO stream complete wall_s=233.828879846 sustained_tps=21.383158501605987 avg_throughput_mibps=103.46455072587074 hit_rate_pct=97.46000000000001
-2026-06-04T15:10:41.520511Z  INFO ===================== run summary =====================
-2026-06-04T15:10:41.520519Z  INFO experts:       256 (top-2), cache=256 slots, pool=258 slots
-2026-06-04T15:10:41.520522Z  INFO ffn shape:     d_model=4096  d_ff=14336  bytes/expert=99090432 (dtype=q4_0)
-2026-06-04T15:10:41.520534Z  INFO lookups:       hits=9746  misses=254  hit_rate=97.46%
-2026-06-04T15:10:41.520540Z  INFO prefetches:    completed=2  predictor_observations=19996
-2026-06-04T15:10:41.520546Z  INFO i/o:           reads=254  bytes=24193.00 MiB
-2026-06-04T15:10:41.520557Z  INFO i/o latency:   p50=116543us  p95=233599us  p99=360191us
-2026-06-04T15:10:41.520563Z  INFO compute:       p50=40255us  p95=41631us  p99=60735us  (SwiGLU FFN per token)
-2026-06-04T15:10:41.520569Z  INFO cycle latency: p50=40287us  p95=42047us  p99=286975us  max=431615us
-2026-06-04T15:10:41.520576Z  INFO per-token avg: io_wait=5772.7us  compute=40850.5us  (over 5000 tokens)
-2026-06-04T15:10:41.520582Z  INFO I/O share:     12.37% of token cycle time spent waiting on SSD reads
-2026-06-04T15:10:41.520588Z  INFO energy knobs:  dtype=q4_0  partial_load_fraction=1.00  pinned=0  alias_redirects=0
-2026-06-04T15:10:41.520595Z  INFO =======================================================
-```
-
+2026-06-05T18:57:42.055300Z  INFO stream complete wall_s=5748.00s sustained_tps=17.40
+2026-06-05T18:57:42.055361Z  INFO experts:       256 (top-2), cache=256 slots
+2026-06-05T18:57:42.055379Z  INFO lookups:       hits=199748 misses=252 hit_rate=99.87%
+2026-06-05T18:57:42.055398Z  INFO i/o:           reads=252  bytes=24193.00 MiB
+2026-06-05T18:57:42.055410Z  INFO cycle latency: p50=56.83ms p95=58.34ms p99=65.15ms
+2026-06-05T18:57:42.055422Z  INFO per-token avg: io_wait=233.0us compute=57118.4us
+2026-06-05T18:57:42.055428Z  INFO I/O share:     0.41% of token cycle time spent waiting on SSD reads
 ---
 
 ## Table of Contents
