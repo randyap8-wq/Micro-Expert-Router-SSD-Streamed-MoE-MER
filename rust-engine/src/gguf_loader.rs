@@ -25,7 +25,7 @@
 //! (`expert_size` is the same for every expert, the file is page-padded,
 //! and `metadata.json::dtype` correctly describes the contents).
 
-use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo};
+use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo, GgufValue};
 use crate::inference::{
     dequantize_f16_to_f32, expert_weight_bytes_for, WeightDtype,
     Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS,
@@ -172,54 +172,69 @@ pub fn extract_experts_from_source(
 ) -> io::Result<ExtractionReport> {
     fs::create_dir_all(out_dir)?;
 
+    // Architecture-agnostic metadata resolution. GGUF namespaces hyper-
+    // parameter keys under the model's architecture (e.g. `llama.block_count`,
+    // `qwen2moe.block_count`, `deepseek2.block_count`). Resolve the active
+    // architecture from `general.architecture` and probe, in order:
+    //   1. `llama.<suffix>`            (mainline llama.cpp convention)
+    //   2. `<general.architecture>.<suffix>` (the file's declared arch)
+    //   3. any metadata key ending in `.<suffix>` (last-resort agnostic scan)
+    // so conversions succeed regardless of which architecture produced the file.
+    let meta = gguf.metadata();
+    let arch = meta.get("general.architecture").and_then(|v| v.as_str());
+    let lookup = |suffix: &str| -> Option<&GgufValue> {
+        let dotted = format!(".{suffix}");
+        meta.get(&format!("llama.{suffix}"))
+            .or_else(|| arch.and_then(|a| meta.get(&format!("{a}.{suffix}"))))
+            .or_else(|| {
+                // `meta` is a `HashMap`, so iteration order is
+                // non-deterministic. When several metadata keys end in
+                // `.<suffix>` (e.g. multiple architecture namespaces),
+                // pick the lexicographically smallest key so the chosen
+                // hyperparameter value is stable across runs.
+                meta.iter()
+                    .filter(|(k, _)| k.ends_with(&dotted))
+                    .min_by(|(a, _), (b, _)| a.cmp(b))
+                    .map(|(_, v)| v)
+            })
+    };
+
     let num_layers = if num_layers_hint > 0 {
         num_layers_hint
     } else {
-        gguf.metadata()
-            .get("llama.block_count")
+        lookup("block_count")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "GGUF missing `llama.block_count`; pass --num-layers explicitly",
+                    "GGUF missing `block_count`; pass --num-layers explicitly",
                 )
             })? as usize
     };
     let num_experts = if num_experts_hint > 0 {
         num_experts_hint
     } else {
-        gguf.metadata()
-            .get("llama.expert_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize
+        lookup("expert_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize
     };
     if num_experts == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "GGUF has no `llama.expert_count` and no --num-experts override",
+            "GGUF has no `expert_count` and no --num-experts override",
         ));
     }
 
     // Required shape parameters.
-    let d_model = gguf
-        .metadata()
-        .get("llama.embedding_length")
+    let d_model = lookup("embedding_length")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing llama.embedding_length")
+            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing embedding_length")
         })? as usize;
-    let d_ff = gguf
-        .metadata()
-        .get("llama.feed_forward_length")
+    let d_ff = lookup("feed_forward_length")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing llama.feed_forward_length")
+            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing feed_forward_length")
         })? as usize;
-    let top_k = gguf
-        .metadata()
-        .get("llama.expert_used_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(2) as usize;
+    let top_k = lookup("expert_used_count").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
 
     info!(
         num_layers,
@@ -1290,6 +1305,19 @@ mod tests {
     }
 
     fn build_synth_gguf(d_model: usize, d_ff: usize, num_experts: usize) -> Vec<u8> {
+        build_synth_gguf_arch(d_model, d_ff, num_experts, "llama")
+    }
+
+    /// Like [`build_synth_gguf`] but namespaces the hyperparameter
+    /// metadata under an arbitrary `arch` (and declares it via
+    /// `general.architecture`). Used to exercise the architecture-
+    /// agnostic metadata resolution path for non-llama producers.
+    fn build_synth_gguf_arch(
+        d_model: usize,
+        d_ff: usize,
+        num_experts: usize,
+        arch: &str,
+    ) -> Vec<u8> {
         use crate::gguf::GGUF_MAGIC;
         let mut out = Vec::new();
         out.extend_from_slice(GGUF_MAGIC);
@@ -1301,13 +1329,33 @@ mod tests {
         // metadata
         let kvs: Vec<(&str, u32, Vec<u8>)> = vec![
             ("general.alignment", 4, 32u32.to_le_bytes().to_vec()),
-            ("general.architecture", 8, lstring(b"llama")),
+            ("general.architecture", 8, lstring(arch.as_bytes())),
             ("general.name", 8, lstring(b"synth")),
-            ("llama.block_count", 4, 1u32.to_le_bytes().to_vec()),
-            ("llama.expert_count", 4, (num_experts as u32).to_le_bytes().to_vec()),
-            ("llama.embedding_length", 4, (d_model as u32).to_le_bytes().to_vec()),
-            ("llama.feed_forward_length", 4, (d_ff as u32).to_le_bytes().to_vec()),
-            ("llama.expert_used_count", 4, 2u32.to_le_bytes().to_vec()),
+            (
+                leak_str(format!("{arch}.block_count")),
+                4,
+                1u32.to_le_bytes().to_vec(),
+            ),
+            (
+                leak_str(format!("{arch}.expert_count")),
+                4,
+                (num_experts as u32).to_le_bytes().to_vec(),
+            ),
+            (
+                leak_str(format!("{arch}.embedding_length")),
+                4,
+                (d_model as u32).to_le_bytes().to_vec(),
+            ),
+            (
+                leak_str(format!("{arch}.feed_forward_length")),
+                4,
+                (d_ff as u32).to_le_bytes().to_vec(),
+            ),
+            (
+                leak_str(format!("{arch}.expert_used_count")),
+                4,
+                2u32.to_le_bytes().to_vec(),
+            ),
         ];
         out.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
         for (k, ty, payload) in &kvs {
@@ -1442,7 +1490,43 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// Unit test for the byte-level slicing math: per-expert byte
+    /// Regression test for the architecture-agnostic metadata
+    /// resolution. Builds a synthetic GGUF whose hyperparameters live
+    /// under a non-llama namespace (`qwen2moe.*`) and calls
+    /// `extract_experts_from_source` with **zero** layer/expert hints,
+    /// forcing `lookup(...)` down the `<general.architecture>.<suffix>`
+    /// auto-detect branch (the `llama.<suffix>` probe misses entirely).
+    #[test]
+    fn extract_auto_detects_non_llama_architecture_metadata() {
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let num_experts = 2usize;
+        let bytes = build_synth_gguf_arch(d_model, d_ff, num_experts, "qwen2moe");
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+
+        // 0 hints → all shape/layout params must be auto-detected from
+        // the `qwen2moe.*` namespace.
+        let out = tmp.join("auto-detect");
+        let report = extract_experts_from_source(
+            &gguf,
+            &out,
+            0,
+            0,
+            ExtractOptions::default(),
+        )
+        .expect("extract");
+        assert_eq!(report.experts_written, num_experts);
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(meta["d_model"], d_model);
+        assert_eq!(meta["d_ff"], d_ff);
+        assert_eq!(meta["num_experts"], num_experts);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     /// stride is `(d_ff*d_model / block_elems) * block_bytes`, and
     /// the eligibility check rejects `d_ff*d_model` values that
     /// don't divide cleanly by the block size.
@@ -1468,6 +1552,14 @@ mod tests {
         out.extend_from_slice(&(s.len() as u64).to_le_bytes());
         out.extend_from_slice(s);
         out
+    }
+
+    /// Leak an owned `String` into a `'static str`. Test-only helper for
+    /// building metadata key tables whose names are computed at runtime
+    /// (e.g. `<arch>.block_count`); the small leak is bounded by the
+    /// number of synthetic GGUFs a test run constructs.
+    fn leak_str(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
     }
 
     /// Build a per-expert-layout GGUF whose FFN expert tensors are raw
