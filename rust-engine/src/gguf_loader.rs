@@ -1635,7 +1635,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-
+    /// stride is `(d_ff*d_model / block_elems) * block_bytes`, and
     /// the eligibility check rejects `d_ff*d_model` values that
     /// don't divide cleanly by the block size.
     #[test]
