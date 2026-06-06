@@ -36,7 +36,8 @@
 
 
 use crate::expert_cache::ExpertResident;
-use crate::inference::{ExpertWeights, HiddenState};
+use crate::inference::{forward_candle_tensors, ExpertWeights, HiddenState};
+use candle_core::{Device, Tensor};
 use half::f16;
 
 /// RMSNorm: `y = x * rsqrt(mean(x^2) + eps) * weight`.
@@ -729,6 +730,14 @@ pub struct SharedExpert {
     /// Optional sigmoid gate weights `[d_model]` (Qwen2-MoE). `None`
     /// means the shared expert output is added unscaled (DeepSeek-MoE).
     pub gate_inp: Option<Vec<f32>>,
+    /// Pre-built `(gate, up, down)` `candle-core` tensors, materialised
+    /// **once** at construction. The shared expert is always-on (it runs
+    /// for every token), so building the Candle weight tensors per call
+    /// would re-copy all weights into Candle storage on every token and
+    /// dominate runtime. Caching them here makes the per-token cost just
+    /// the matmuls. `None` only if the one-time tensor build failed, in
+    /// which case [`Self::forward`] falls back to the per-call view path.
+    tensors: Option<(Tensor, Tensor, Tensor)>,
 }
 
 impl SharedExpert {
@@ -761,26 +770,56 @@ impl SharedExpert {
         weights.extend_from_slice(gate);
         weights.extend_from_slice(up);
         weights.extend_from_slice(down);
-        Some(Self { d_model, d_ff, weights, gate_inp })
+        // Materialise the Candle weight tensors once: the shared expert
+        // runs on every token, so this avoids per-token full-weight
+        // copies in the forward pass.
+        let tensors = ExpertWeights::from_floats(&weights, d_model, d_ff)
+            .ok()
+            .and_then(|w| w.to_candle_tensors(&Device::Cpu).ok());
+        Some(Self { d_model, d_ff, weights, gate_inp, tensors })
     }
 
     /// Run the dense SwiGLU forward over `x` (the MoE-normalised hidden
     /// state) and apply the optional sigmoid gate. Reuses the routed
     /// expert kernel so the math matches the streamed experts exactly.
     pub fn forward(&self, x: &[f32]) -> HiddenState {
-        let weights = match ExpertWeights::from_floats(&self.weights, self.d_model, self.d_ff) {
-            Ok(w) => w,
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    d_model = self.d_model,
-                    d_ff = self.d_ff,
-                    "shared expert weight view failed; skipping shared expert"
-                );
-                return vec![0.0f32; self.d_model];
+        // Fast path: reuse the Candle weight tensors built once at
+        // construction so the per-token cost is just the matmuls, not a
+        // full copy of every weight into Candle storage.
+        let mut out = match self.tensors.as_ref() {
+            Some((gate_t, up_t, down_t)) => {
+                match forward_candle_tensors(gate_t, up_t, down_t, self.d_model, x) {
+                    Ok(y) => y,
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            d_model = self.d_model,
+                            d_ff = self.d_ff,
+                            "shared expert SwiGLU forward failed; skipping shared expert"
+                        );
+                        return vec![0.0f32; self.d_model];
+                    }
+                }
+            }
+            None => {
+                // Degraded path: the one-time tensor build failed, so
+                // rebuild a view per call (still correct, just slower).
+                let weights =
+                    match ExpertWeights::from_floats(&self.weights, self.d_model, self.d_ff) {
+                        Ok(w) => w,
+                        Err(err) => {
+                            tracing::error!(
+                                error = %err,
+                                d_model = self.d_model,
+                                d_ff = self.d_ff,
+                                "shared expert weight view failed; skipping shared expert"
+                            );
+                            return vec![0.0f32; self.d_model];
+                        }
+                    };
+                weights.forward(x)
             }
         };
-        let mut out = weights.forward(x);
         if let Some(gate_inp) = self.gate_inp.as_ref() {
             // sigmoid(W_gate · x): a single scalar that scales the whole
             // shared expert output (Qwen2-MoE `shared_expert_gate`).

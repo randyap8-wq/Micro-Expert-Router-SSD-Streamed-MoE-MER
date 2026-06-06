@@ -312,16 +312,32 @@ impl RealModel {
     /// returns the *entire* tensor, which the shared-expert loader needs
     /// in order to infer the shared intermediate size from the length.
     fn read_full_f32(path: &Path) -> Option<Vec<f32>> {
+        use std::io::Read;
         if !path.is_file() {
             return None;
         }
-        let bytes = std::fs::read(path).ok()?;
-        if bytes.is_empty() || bytes.len() % 4 != 0 {
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len == 0 || len % 4 != 0 {
             return None;
         }
-        let mut out = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.chunks_exact(4) {
-            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        // Stream-decode 4 bytes at a time straight into the `Vec<f32>`
+        // rather than slurping the whole file into a `Vec<u8>` first; the
+        // `BufReader` batches the underlying reads, so peak memory is just
+        // the output buffer (no second full-size byte buffer).
+        let mut reader = std::io::BufReader::new(file);
+        let want = (len / 4) as usize;
+        let mut out = Vec::with_capacity(want);
+        let mut chunk = [0u8; 4];
+        loop {
+            match reader.read_exact(&mut chunk) {
+                Ok(()) => out.push(f32::from_le_bytes(chunk)),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(_) => return None,
+            }
+        }
+        if out.len() != want {
+            return None;
         }
         Some(out)
     }

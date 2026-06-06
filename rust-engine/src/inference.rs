@@ -1022,30 +1022,50 @@ impl<'a> ExpertWeights<'a> {
     /// them. Useful in tests and for callers that want to fail loudly
     /// rather than substitute a zero output.
     pub fn forward_candle(&self, x: &[f32]) -> Result<HiddenState, ExpertWeightsError> {
-        let device = Device::Cpu;
-        let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
-
-        let (gate_t, up_t, down_t) = self.to_candle_tensors(&device)?;
-        // x as a column vector [d_model, 1] so the row-major matmuls
-        // line up: gate[d_ff, d_model] · x[d_model, 1] -> [d_ff, 1].
-        let x_t = Tensor::from_slice(x, (self.d_model, 1), &device).map_err(map_err)?;
-
-        let g = gate_t.matmul(&x_t).map_err(map_err)?;
-        let u = up_t.matmul(&x_t).map_err(map_err)?;
-
-        // SwiGLU: silu(g) ⊙ u
-        let gated = candle_core::Tensor::silu(&g)
-            .map_err(map_err)?
-            .mul(&u)
-            .map_err(map_err)?;
-
-        // Down projection: down[d_model, d_ff] · gated[d_ff, 1] -> [d_model, 1].
-        let y = down_t.matmul(&gated).map_err(map_err)?;
-
-        // Squeeze the trailing dim and convert back to Vec<f32>.
-        let y = y.squeeze(1).map_err(map_err)?;
-        y.to_vec1::<f32>().map_err(map_err)
+        let (gate_t, up_t, down_t) = self.to_candle_tensors(&Device::Cpu)?;
+        forward_candle_tensors(&gate_t, &up_t, &down_t, self.d_model, x)
     }
+}
+
+/// Run the SwiGLU forward pass over pre-built `candle-core` weight
+/// tensors (`gate`/`up` shaped `[d_ff, d_model]`, `down` shaped
+/// `[d_model, d_ff]`).
+///
+/// This is the matmul core of [`ExpertWeights::forward_candle`], split
+/// out so callers that hold *resident* weights — notably the always-on
+/// shared expert, which runs for every token — can build the three
+/// tensors **once** and reuse them, instead of re-copying all weights
+/// into Candle storage (via [`ExpertWeights::to_candle_tensors`]) on
+/// every call.
+pub fn forward_candle_tensors(
+    gate_t: &Tensor,
+    up_t: &Tensor,
+    down_t: &Tensor,
+    d_model: usize,
+    x: &[f32],
+) -> Result<HiddenState, ExpertWeightsError> {
+    let device = Device::Cpu;
+    let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
+
+    // x as a column vector [d_model, 1] so the row-major matmuls
+    // line up: gate[d_ff, d_model] · x[d_model, 1] -> [d_ff, 1].
+    let x_t = Tensor::from_slice(x, (d_model, 1), &device).map_err(map_err)?;
+
+    let g = gate_t.matmul(&x_t).map_err(map_err)?;
+    let u = up_t.matmul(&x_t).map_err(map_err)?;
+
+    // SwiGLU: silu(g) ⊙ u
+    let gated = candle_core::Tensor::silu(&g)
+        .map_err(map_err)?
+        .mul(&u)
+        .map_err(map_err)?;
+
+    // Down projection: down[d_model, d_ff] · gated[d_ff, 1] -> [d_model, 1].
+    let y = down_t.matmul(&gated).map_err(map_err)?;
+
+    // Squeeze the trailing dim and convert back to Vec<f32>.
+    let y = y.squeeze(1).map_err(map_err)?;
+    y.to_vec1::<f32>().map_err(map_err)
 }
 
 /// Fused gate / up SwiGLU projection: `gated[i] = silu(gate[i,:]·x) * (up[i,:]·x)`.
