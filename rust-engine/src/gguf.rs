@@ -547,10 +547,10 @@ impl GgufStreamReader {
             // the buffer unboundedly on a corrupt file. Real GGUF
             // headers are at most a few hundred MiB even at extreme
             // tensor counts.
-            if header_bytes.len() > 512 * 1024 * 1024 {
+            if header_bytes.len() > 2048 * 1024 * 1024 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "GGUF header exceeds 512 MiB; refusing to grow further",
+                    "GGUF header exceeds 2048 MiB; refusing to grow further",
                 ));
             }
         }
