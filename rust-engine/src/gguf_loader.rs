@@ -25,7 +25,7 @@
 //! (`expert_size` is the same for every expert, the file is page-padded,
 //! and `metadata.json::dtype` correctly describes the contents).
 
-use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo};
+use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo, GgufValue};
 use crate::inference::{
     dequantize_f16_to_f32, expert_weight_bytes_for, WeightDtype,
     Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS,
@@ -172,54 +172,63 @@ pub fn extract_experts_from_source(
 ) -> io::Result<ExtractionReport> {
     fs::create_dir_all(out_dir)?;
 
+    // Architecture-agnostic metadata resolution. GGUF namespaces hyper-
+    // parameter keys under the model's architecture (e.g. `llama.block_count`,
+    // `qwen2moe.block_count`, `deepseek2.block_count`). Resolve the active
+    // architecture from `general.architecture` and probe, in order:
+    //   1. `llama.<suffix>`            (mainline llama.cpp convention)
+    //   2. `<general.architecture>.<suffix>` (the file's declared arch)
+    //   3. any metadata key ending in `.<suffix>` (last-resort agnostic scan)
+    // so conversions succeed regardless of which architecture produced the file.
+    let meta = gguf.metadata();
+    let arch = meta.get("general.architecture").and_then(|v| v.as_str());
+    let lookup = |suffix: &str| -> Option<&GgufValue> {
+        let dotted = format!(".{suffix}");
+        meta.get(&format!("llama.{suffix}"))
+            .or_else(|| arch.and_then(|a| meta.get(&format!("{a}.{suffix}"))))
+            .or_else(|| {
+                meta.iter()
+                    .find(|(k, _)| k.ends_with(&dotted))
+                    .map(|(_, v)| v)
+            })
+    };
+
     let num_layers = if num_layers_hint > 0 {
         num_layers_hint
     } else {
-        gguf.metadata()
-            .get("llama.block_count")
+        lookup("block_count")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "GGUF missing `llama.block_count`; pass --num-layers explicitly",
+                    "GGUF missing `block_count`; pass --num-layers explicitly",
                 )
             })? as usize
     };
     let num_experts = if num_experts_hint > 0 {
         num_experts_hint
     } else {
-        gguf.metadata()
-            .get("llama.expert_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize
+        lookup("expert_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize
     };
     if num_experts == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "GGUF has no `llama.expert_count` and no --num-experts override",
+            "GGUF has no `expert_count` and no --num-experts override",
         ));
     }
 
     // Required shape parameters.
-    let d_model = gguf
-        .metadata()
-        .get("llama.embedding_length")
+    let d_model = lookup("embedding_length")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing llama.embedding_length")
+            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing embedding_length")
         })? as usize;
-    let d_ff = gguf
-        .metadata()
-        .get("llama.feed_forward_length")
+    let d_ff = lookup("feed_forward_length")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing llama.feed_forward_length")
+            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing feed_forward_length")
         })? as usize;
-    let top_k = gguf
-        .metadata()
-        .get("llama.expert_used_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(2) as usize;
+    let top_k = lookup("expert_used_count").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
 
     info!(
         num_layers,
