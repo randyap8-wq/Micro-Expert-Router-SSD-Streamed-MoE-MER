@@ -36,7 +36,7 @@
 use crate::engine::Engine;
 use crate::gating::LinearGate;
 use crate::transformer::{
-    KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, TransformerLayer,
+    KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, SharedExpert, TransformerLayer,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -165,6 +165,12 @@ impl RealModel {
                     config.d_model,
                     config.top_k,
                 ),
+                // Shared experts are an optional, architecture-specific
+                // tensor (Qwen2-MoE / DeepSeek-MoE). The seeded fallback
+                // leaves them absent so non-shared-expert models and the
+                // synthetic smoke path behave identically to before; real
+                // shared experts are populated by the on-disk loaders.
+                shared_expert: None,
             })
             .collect();
         let final_rms = RmsNorm::new(vec![1.0; config.d_model], config.rms_eps);
@@ -279,6 +285,17 @@ impl RealModel {
                     config.top_k,
                 );
             });
+            // Optional Qwen2-MoE / DeepSeek-MoE shared expert. The shared
+            // expert's intermediate size is independent of the routed
+            // `d_ff`, so we infer it from the on-disk tensor length
+            // (`gate floats / d_model`) rather than the model config.
+            // Files are emitted by the GGUF extractor under the
+            // `layer_{l}_shexp_*` names; absence (Mixtral) is a no-op.
+            tried += 1;
+            if let Some(se) = Self::load_shared_expert_bin(dir, l, d_model) {
+                model.layers[l].shared_expert = Some(se);
+                loaded += 1;
+            }
         }
         info!(
             dir = %dir.display(),
@@ -287,6 +304,73 @@ impl RealModel {
             "real transformer weights loaded (missing tensors fell back to seeded init)"
         );
         Ok(model)
+    }
+
+    /// Read a whole little-endian `f32` `.bin` file into a `Vec<f32>`.
+    /// Returns `None` if the file is absent, unreadable, or not a whole
+    /// number of `f32`s. Unlike the size-capped `try_load` helper this
+    /// returns the *entire* tensor, which the shared-expert loader needs
+    /// in order to infer the shared intermediate size from the length.
+    fn read_full_f32(path: &Path) -> Option<Vec<f32>> {
+        use std::io::Read;
+        if !path.is_file() {
+            return None;
+        }
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len == 0 || len % 4 != 0 {
+            return None;
+        }
+        // Stream-decode 4 bytes at a time straight into the `Vec<f32>`
+        // rather than slurping the whole file into a `Vec<u8>` first; the
+        // `BufReader` batches the underlying reads, so peak memory is just
+        // the output buffer (no second full-size byte buffer).
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+        let want = (len / 4) as usize;
+        let mut out = Vec::with_capacity(want);
+        let mut chunk = [0u8; 4];
+        loop {
+            match reader.read_exact(&mut chunk) {
+                Ok(()) => out.push(f32::from_le_bytes(chunk)),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(_) => return None,
+            }
+        }
+        if out.len() != want {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Load a layer's optional shared expert from the GGUF-extractor
+    /// `.bin` files (`layer_{l}_shexp_{gate,up,down,gate_inp}.bin`). The
+    /// shared intermediate size is inferred from the gate tensor length;
+    /// inconsistent or partial tensor sets degrade to `None` so a missing
+    /// or malformed shared expert never aborts the load.
+    fn load_shared_expert_bin(dir: &Path, l: usize, d_model: usize) -> Option<SharedExpert> {
+        let gate = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_gate.bin")))?;
+        let up = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_up.bin")))?;
+        let down = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_down.bin")))?;
+        if d_model == 0 || gate.len() % d_model != 0 {
+            return None;
+        }
+        let shared_d_ff = gate.len() / d_model;
+        if shared_d_ff == 0 {
+            return None;
+        }
+        // The sigmoid gate (Qwen2-MoE) is optional; DeepSeek-MoE omits it.
+        let gate_inp = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_gate_inp.bin")))
+            .filter(|g| g.len() == d_model);
+        let se = SharedExpert::from_projections(d_model, shared_d_ff, &gate, &up, &down, gate_inp);
+        if se.is_none() {
+            warn!(
+                layer = l,
+                shared_d_ff,
+                d_model,
+                "shared expert tensors present but shapes are inconsistent; ignoring"
+            );
+        }
+        se
     }
 
     /// Like [`Self::from_dir`] but loads dense weights from
@@ -382,6 +466,21 @@ impl RealModel {
             None
         };
 
+        // Closure: search every shard for the first matching `name` and
+        // return its decoded f32 data regardless of length. Used by the
+        // shared-expert loader, which infers the shared intermediate size
+        // from the tensor length rather than asserting a configured one.
+        let find_f32_any = |names: &[String]| -> Option<Vec<f32>> {
+            for name in names {
+                for st in &parsed {
+                    if let Ok(view) = st.tensor(name) {
+                        return Some(decode_safetensor_to_f32(&view));
+                    }
+                }
+            }
+            None
+        };
+
         let mut tried = 0usize;
         let mut loaded = 0usize;
         macro_rules! maybe {
@@ -447,6 +546,49 @@ impl RealModel {
                     );
                 }
             );
+            // Optional shared expert (Qwen2-MoE / DeepSeek-MoE). Different
+            // checkpoints name the FFN block `mlp` and the shared expert
+            // either `shared_expert` (Qwen2-MoE) or `shared_experts`
+            // (DeepSeek-MoE), so we probe both. The shared intermediate
+            // size is inferred from the gate tensor length. Mixtral has no
+            // such tensor, so this is a no-op there.
+            tried += 1;
+            let shexp_gate = find_f32_any(&[
+                format!("model.layers.{l}.mlp.shared_expert.gate_proj.weight"),
+                format!("model.layers.{l}.mlp.shared_experts.gate_proj.weight"),
+            ]);
+            let shexp_up = find_f32_any(&[
+                format!("model.layers.{l}.mlp.shared_expert.up_proj.weight"),
+                format!("model.layers.{l}.mlp.shared_experts.up_proj.weight"),
+            ]);
+            let shexp_down = find_f32_any(&[
+                format!("model.layers.{l}.mlp.shared_expert.down_proj.weight"),
+                format!("model.layers.{l}.mlp.shared_experts.down_proj.weight"),
+            ]);
+            if let (Some(gate), Some(up), Some(down)) = (shexp_gate, shexp_up, shexp_down) {
+                if d_model != 0 && gate.len() % d_model == 0 && gate.len() / d_model != 0 {
+                    let shared_d_ff = gate.len() / d_model;
+                    // Sigmoid gate is Qwen2-MoE-only (`shared_expert_gate`).
+                    let gate_inp = find_f32_any(&[format!(
+                        "model.layers.{l}.mlp.shared_expert_gate.weight"
+                    )])
+                    .filter(|g| g.len() == d_model);
+                    match SharedExpert::from_projections(
+                        d_model, shared_d_ff, &gate, &up, &down, gate_inp,
+                    ) {
+                        Some(se) => {
+                            model.layers[l].shared_expert = Some(se);
+                            loaded += 1;
+                        }
+                        None => warn!(
+                            layer = l,
+                            shared_d_ff,
+                            d_model,
+                            "shared expert tensors present but shapes are inconsistent; ignoring"
+                        ),
+                    }
+                }
+            }
         }
         info!(
             dir = %dir.display(),
@@ -629,6 +771,13 @@ impl RealModel {
                 .await;
             debug_assert_eq!(expert_outs.len(), routing.weights.len());
             x = layer.moe_combine(&x, &expert_outs, &routing.weights);
+            // Qwen2-MoE / DeepSeek-MoE shared expert: a dense always-on
+            // FFN over the same MoE-normalised hidden, added to the
+            // residual alongside the routed experts. `None` for Mixtral
+            // (no-op), keeping the engine MoE-architecture-agnostic.
+            if let Some(shared) = layer.shared_expert_forward(&normed) {
+                x = crate::transformer::add_residual(&x, &shared);
+            }
         }
         let normed = self.final_rms.forward(&x);
         self.lm_head.sample(&normed, params, pos as u64)
@@ -995,5 +1144,124 @@ mod tests {
         .unwrap();
         let model = RealModel::from_dir_auto(cfg, &st_dir.path, 7).unwrap();
         assert!(model.embedding.iter().all(|&x| x == 0.75));
+    }
+
+    /// Helper: write a slice of f32 as a little-endian `.bin` file.
+    fn write_bin(path: &std::path::Path, v: &[f32]) {
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// `from_dir` must pick up the GGUF-extractor shared-expert `.bin`
+    /// files, infer the shared intermediate size from the gate tensor
+    /// length, and populate `TransformerLayer::shared_expert`. Models
+    /// without those files (Mixtral) keep `shared_expert == None`.
+    #[test]
+    fn from_dir_loads_shared_expert_and_infers_d_ff() {
+        let cfg = RealModelConfig::tiny();
+        let d_model = cfg.d_model;
+        let shared_d_ff = 5; // deliberately != routed d_ff (64)
+        let dir = TempDir::new("shexp_bin");
+
+        write_bin(
+            &dir.path.join("layer_0_shexp_gate.bin"),
+            &vec![0.1f32; shared_d_ff * d_model],
+        );
+        write_bin(
+            &dir.path.join("layer_0_shexp_up.bin"),
+            &vec![0.2f32; shared_d_ff * d_model],
+        );
+        write_bin(
+            &dir.path.join("layer_0_shexp_down.bin"),
+            &vec![0.3f32; d_model * shared_d_ff],
+        );
+        write_bin(
+            &dir.path.join("layer_0_shexp_gate_inp.bin"),
+            &vec![0.0f32; d_model],
+        );
+
+        let model = RealModel::from_dir(cfg.clone(), &dir.path, 1).unwrap();
+        let se = model.layers[0]
+            .shared_expert
+            .as_ref()
+            .expect("shared expert should be loaded");
+        assert_eq!(se.d_ff, shared_d_ff, "d_ff inferred from gate tensor length");
+        assert_eq!(se.d_model, d_model);
+        assert!(se.gate_inp.is_some(), "sigmoid gate present");
+        // forward produces a finite, d_model-length vector.
+        let x: Vec<f32> = (0..d_model).map(|i| 0.01 * i as f32).collect();
+        let y = se.forward(&x);
+        assert_eq!(y.len(), d_model);
+        assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    /// A layer with no shared-expert files stays `None`, so Mixtral-style
+    /// models are unaffected.
+    #[test]
+    fn from_dir_without_shared_expert_is_none() {
+        let cfg = RealModelConfig::tiny();
+        let dir = TempDir::new("shexp_absent");
+        let model = RealModel::from_dir(cfg, &dir.path, 1).unwrap();
+        assert!(model.layers[0].shared_expert.is_none());
+    }
+
+    /// Inconsistent shared-expert tensors (down proj wrong length) must
+    /// degrade to `None` rather than abort the load.
+    #[test]
+    fn from_dir_inconsistent_shared_expert_is_ignored() {
+        let cfg = RealModelConfig::tiny();
+        let d_model = cfg.d_model;
+        let shared_d_ff = 5;
+        let dir = TempDir::new("shexp_bad");
+        write_bin(
+            &dir.path.join("layer_0_shexp_gate.bin"),
+            &vec![0.1f32; shared_d_ff * d_model],
+        );
+        write_bin(
+            &dir.path.join("layer_0_shexp_up.bin"),
+            &vec![0.2f32; shared_d_ff * d_model],
+        );
+        // Wrong length for down -> from_projections returns None.
+        write_bin(
+            &dir.path.join("layer_0_shexp_down.bin"),
+            &vec![0.3f32; d_model * shared_d_ff + 1],
+        );
+        let model = RealModel::from_dir(cfg, &dir.path, 1).unwrap();
+        assert!(model.layers[0].shared_expert.is_none());
+    }
+
+    /// The Qwen2-MoE sigmoid gate scales the shared expert output by
+    /// `sigmoid(W_gate · x)`. A zero gate vector yields a 0.5 scale; an
+    /// absent gate yields an unscaled (1.0) output (DeepSeek-MoE).
+    #[test]
+    fn shared_expert_sigmoid_gate_scales_output() {
+        let d_model = 4;
+        let d_ff = 3;
+        let gate = vec![0.05f32; d_ff * d_model];
+        let up = vec![0.07f32; d_ff * d_model];
+        let down = vec![0.09f32; d_model * d_ff];
+        let x: Vec<f32> = vec![0.5, -0.25, 0.1, 0.2];
+
+        let ungated =
+            SharedExpert::from_projections(d_model, d_ff, &gate, &up, &down, None).unwrap();
+        let y_ungated = ungated.forward(&x);
+
+        // Zero gate -> sigmoid(0) = 0.5 -> output halved.
+        let gated = SharedExpert::from_projections(
+            d_model,
+            d_ff,
+            &gate,
+            &up,
+            &down,
+            Some(vec![0.0f32; d_model]),
+        )
+        .unwrap();
+        let y_gated = gated.forward(&x);
+        for (a, b) in y_ungated.iter().zip(y_gated.iter()) {
+            assert!((a * 0.5 - b).abs() < 1e-6, "gate=0 must halve output: {a} {b}");
+        }
     }
 }
