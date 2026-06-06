@@ -2635,6 +2635,53 @@ impl Engine {
         preds
     }
 
+    /// **Layer-ahead speculation (Part 1).** While layer `current_layer`
+    /// is about to run, ask the neural speculator which experts the
+    /// *next* layer (`current_layer + 1`) will most likely activate and
+    /// kick off their prefetches now, so the io_uring reads for `L+1`
+    /// are in flight during `L`'s compute. By the time the router
+    /// reaches `L+1`, S ∪ L ∪ M for that layer has been submitted a full
+    /// layer-compute earlier — the difference between a blocking SSD
+    /// stall and a sub-millisecond cache hit.
+    ///
+    /// The feature fed to M is the residual stream *entering* `L` (the
+    /// `x` already on hand), which is one layer stale for `L+1`. That is
+    /// acceptable: the speculator is only a prefetch hint, exactly the
+    /// staleness `speculator_predict_and_train` already tolerates.
+    ///
+    /// No-op (and zero added latency) when the speculator is absent, the
+    /// hidden width disagrees, the layer-count geometry is unknown
+    /// (`num_experts_per_layer` not configured), or `L+1` is past the
+    /// last layer. Predicted ids draw from the shadow (Buffer B) pool
+    /// like every other speculative prefetch, so a wrong guess can never
+    /// steal a buffer from a real miss.
+    fn speculate_layer_ahead(self: &Arc<Self>, x: &[f32], current_layer: u32) {
+        let Some(spec) = self.speculation.speculator.as_ref() else {
+            return;
+        };
+        if x.len() != spec.d_model() {
+            return;
+        }
+        let Some(per_layer) = self.core.storage.config().num_experts_per_layer else {
+            // Without a layer-qualified id geometry we cannot restrict
+            // the speculator's global output head to the next layer's
+            // slice, so layer-ahead prediction is disabled.
+            return;
+        };
+        let next_layer = current_layer + 1;
+        let preds =
+            spec.predict_topk_for_layer(x, next_layer, per_layer, self.speculation.speculator_topk);
+        for id in preds {
+            let canon = self.resolve_alias(id);
+            if !self.core.cache.contains(canon) {
+                // Flat 0.5 mirrors the speculator's probability tag in
+                // `union_prefetch`; the shadow-pool bound and prefetch
+                // semaphore keep this look-ahead from over-committing.
+                self.spawn_prefetch(canon, 0.5);
+            }
+        }
+    }
+
     /// Prefetch every id in the union `S ∪ L ∪ M` that isn't already
     /// resident — the **speculative I/O union-fetch** described in the
     /// design spec. `s_markov` is the predictor's Markov-chain top-K
@@ -2654,25 +2701,57 @@ impl Engine {
         // enough to be visibly different in the prefetch logs from
         // a real Markov-chain prediction).
         let mut seen: HashSet<u32> = already_in_flight.clone();
+        // Collect the deduplicated S ∪ L ∪ M candidate set with each
+        // id's best-evidence probability, *then* rank and truncate
+        // before spawning (Part 4.3). When the shadow (Buffer B) half
+        // cannot hold the whole union, we want to keep the
+        // highest-expected-value experts rather than whichever arm
+        // happened to be iterated first — so a confident 2nd-order
+        // Markov prediction (p≈0.9) is never dropped in favour of an
+        // opportunistic locality/speculator id (flat p=0.5). If an id
+        // appears in more than one arm we keep its largest probability.
+        let mut candidates: Vec<(u32, f64)> = Vec::new();
+        let mut push = |seen: &mut HashSet<u32>, candidates: &mut Vec<(u32, f64)>, canon: u32, p: f64| {
+            if seen.insert(canon) {
+                candidates.push((canon, p));
+            }
+        };
         for &(id, p) in s_markov {
             let canon = self.resolve_alias(id);
-            if seen.insert(canon) && !self.core.cache.contains(canon) {
-                self.spawn_prefetch(canon, p);
+            if !self.core.cache.contains(canon) {
+                push(&mut seen, &mut candidates, canon, p);
             }
         }
         if let Some(monitor) = self.speculation.locality.as_ref() {
             for id in monitor.hot_set(self.speculation.locality_threshold_pct) {
                 let canon = self.resolve_alias(id);
-                if seen.insert(canon) && !self.core.cache.contains(canon) {
-                    self.spawn_prefetch(canon, 0.5);
+                if !self.core.cache.contains(canon) {
+                    push(&mut seen, &mut candidates, canon, 0.5);
                 }
             }
         }
         for &id in m_speculator {
             let canon = self.resolve_alias(id);
-            if seen.insert(canon) && !self.core.cache.contains(canon) {
-                self.spawn_prefetch(canon, 0.5);
+            if !self.core.cache.contains(canon) {
+                push(&mut seen, &mut candidates, canon, 0.5);
             }
+        }
+        // Rank by probability descending so the highest-EV predictions
+        // are submitted first and survive truncation.
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Truncate to the shadow-slot budget: in-flight speculation can
+        // never exceed Buffer B's capacity, so anything past that would
+        // be dropped by `spawn_prefetch`'s `try_acquire_shadow` anyway.
+        // Truncating here keeps the *best* ids instead of letting
+        // arbitrary spawn ordering decide which survive. A zero shadow
+        // capacity means the legacy single-pool layout, where the
+        // semaphore alone bounds concurrency — leave the list intact.
+        let budget = self.core.pool.shadow_capacity();
+        if budget > 0 && candidates.len() > budget {
+            candidates.truncate(budget);
+        }
+        for (canon, p) in candidates {
+            self.spawn_prefetch(canon, p);
         }
     }
 
@@ -2799,6 +2878,13 @@ impl Engine {
             drop(last_last);
             self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
         }
+
+        // **Layer-ahead look-ahead (Part 1).** Independently of the
+        // current layer's union prefetch above, predict the *next*
+        // layer's experts from the residual entering this layer and
+        // submit their reads now, so they overlap this layer's compute
+        // and the next layer finds them already resident.
+        self.speculate_layer_ahead(x, layer);
 
         // Concurrent miss fetches; hits resolved inline.
         let io_wait_start = Instant::now();
