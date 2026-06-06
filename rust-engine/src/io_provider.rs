@@ -175,7 +175,11 @@ fn default_fd_cache_cap() -> usize {
     let soft = unsafe {
         let mut rl: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
-            rl.rlim_cur as usize
+            // `rlim_cur` is a 64-bit `rlim_t`; on a 32-bit `usize`
+            // platform an effectively-unlimited limit (`RLIM_INFINITY`)
+            // would truncate, so fall back to the conservative default
+            // and let the clamp below cap it.
+            usize::try_from(rl.rlim_cur).unwrap_or(1024)
         } else {
             // Conservative default if the rlimit query fails.
             1024
@@ -491,6 +495,11 @@ impl NvmeStorage {
     /// is derived from `RLIMIT_NOFILE` via [`default_fd_cache_cap`];
     /// callers that know the exact working set (or want a tighter bound
     /// in tests) can pin it here. `cap` is clamped to at least 1.
+    ///
+    /// Call this **before** any fd-opening operation (e.g. before
+    /// `warmup_fds`): it replaces the cache wholesale, dropping any
+    /// descriptors already opened. In practice it is only used at
+    /// construction, immediately after `new`, so the cache is empty.
     pub fn with_max_open_files(self, cap: usize) -> Self {
         let cap = NonZeroUsize::new(cap.max(1)).expect("cap.max(1) >= 1");
         *self.files.lock() = LruCache::new(cap);

@@ -1271,7 +1271,10 @@ impl NeuralSpeculator {
     /// Returns global ids in descending-logit order (ties broken by
     /// ascending id, matching [`predict_topk`]). An out-of-range layer,
     /// `per_layer == 0`, `k == 0`, or a mismatched feature width yields
-    /// an empty vector.
+    /// an empty vector. Non-finite logits (only possible if the weights
+    /// diverge) sort as equal, matching [`predict_topk`] /
+    /// [`predict_topk_with_probs`]; a wrong but bounded ranking is
+    /// acceptable for a prefetch hint.
     pub fn predict_topk_for_layer(
         &self,
         x: &[f32],

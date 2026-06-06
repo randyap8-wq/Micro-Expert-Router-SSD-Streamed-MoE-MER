@@ -2737,7 +2737,11 @@ impl Engine {
             }
         }
         // Rank by probability descending so the highest-EV predictions
-        // are submitted first and survive truncation.
+        // are submitted first and survive truncation. Probabilities
+        // originate from the Markov predictor (finite by construction)
+        // or the flat 0.5 locality/speculator tag, so NaN is not
+        // expected; if one ever appears it sorts as equal rather than
+        // panicking, which at worst mis-orders one prefetch hint.
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         // Truncate to the shadow-slot budget: in-flight speculation can
         // never exceed Buffer B's capacity, so anything past that would
