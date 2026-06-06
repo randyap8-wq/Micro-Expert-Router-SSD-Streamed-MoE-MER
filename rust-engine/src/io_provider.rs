@@ -38,10 +38,12 @@
 use crate::buffer_pool::PooledBuffer;
 use crate::inference::WeightDtype;
 use crate::tensor_header::{TensorHeader, UTH_BYTES};
-use parking_lot::RwLock;
+use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -146,6 +148,40 @@ fn breaker_now_ms() -> u64 {
     // indistinguishable from a never-tripped breaker, and
     // `try_admit_probe` would admit traffic immediately.
     (breaker_clock_origin().elapsed().as_millis() as u64).max(1)
+}
+
+/// Default upper bound on the number of expert file descriptors kept
+/// open in [`NvmeStorage`]'s bounded fd cache, derived from the
+/// process's `RLIMIT_NOFILE` soft limit.
+///
+/// The legacy fd cache was an unbounded `HashMap<u32, Arc<File>>` —
+/// one fd per *distinct* expert, never evicted. With per-expert files
+/// and a low cache-hit rate (the SSD-streamed regime this engine
+/// targets) that map grows without bound and the process eventually
+/// hits `EMFILE` ("Too many open files"). Bounding the cache to a
+/// fraction of the soft limit keeps the steady-state fd count flat
+/// regardless of how many experts stream past.
+///
+/// We reserve headroom for the rest of the engine's fds (listening
+/// sockets, the cold-start manifest, log files, in-flight read fds
+/// whose `Arc<File>` outlived their cache slot) and clamp the result
+/// to a sane `[64, 65536]` range so a tiny `ulimit -n` cannot disable
+/// caching entirely and an effectively-unlimited rlimit does not try
+/// to keep millions of descriptors resident.
+fn default_fd_cache_cap() -> usize {
+    const RESERVED_FDS: usize = 128;
+    const MIN_CAP: usize = 64;
+    const MAX_CAP: usize = 65_536;
+    let soft = unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+            rl.rlim_cur as usize
+        } else {
+            // Conservative default if the rlimit query fails.
+            1024
+        }
+    };
+    soft.saturating_sub(RESERVED_FDS).clamp(MIN_CAP, MAX_CAP)
 }
 
 /// Classify an `io::Error` as transient (worth retrying) vs. fatal
@@ -381,7 +417,19 @@ impl From<HardwareFailure> for io::Error {
 
 pub struct NvmeStorage {
     cfg: StorageConfig,
-    files: RwLock<HashMap<u32, Arc<File>>>,
+    /// **Bounded** LRU cache of open expert file descriptors.
+    ///
+    /// Replaces the former unbounded `HashMap<u32, Arc<File>>`, which
+    /// kept one fd per distinct expert forever and made the engine
+    /// crash with `EMFILE` ("Too many open files") once enough experts
+    /// streamed past in a low-cache-hit-rate run. The cache holds at
+    /// most [`Self::max_open_files`] descriptors; opening a new expert
+    /// once the cache is full evicts the least-recently-used fd. An
+    /// evicted fd whose `Arc<File>` is still referenced by an in-flight
+    /// read stays open until that read drops its clone, so eviction is
+    /// always safe. Guarded by a [`Mutex`] (not an `RwLock`) because
+    /// `LruCache::get` mutates recency order.
+    files: Mutex<LruCache<u32, Arc<File>>>,
     /// Optional multi-drive layout. When non-empty, expert `id` lives at
     /// `extra_paths[id as usize % extra_paths.len()] / expert_<id>.bin`
     /// (with `cfg.base_path` *included* as `extra_paths[0]`). When
@@ -425,12 +473,33 @@ impl NvmeStorage {
 
         Ok(Self {
             cfg,
-            files: RwLock::new(HashMap::new()),
+            files: Mutex::new(LruCache::new(
+                NonZeroUsize::new(default_fd_cache_cap())
+                    .expect("default_fd_cache_cap() is clamped to >= 64"),
+            )),
             striped_paths: Vec::new(),
             manifest: None,
             breakers: RwLock::new(HashMap::new()),
             drive_breakers: vec![Arc::new(DriveBreakerState::default())],
         })
+    }
+
+    /// Override the bounded fd-cache capacity (see [`Self::files`]).
+    ///
+    /// Builder-style for chaining at construction
+    /// (`NvmeStorage::new(cfg)?.with_max_open_files(4096)`). The default
+    /// is derived from `RLIMIT_NOFILE` via [`default_fd_cache_cap`];
+    /// callers that know the exact working set (or want a tighter bound
+    /// in tests) can pin it here. `cap` is clamped to at least 1.
+    pub fn with_max_open_files(self, cap: usize) -> Self {
+        let cap = NonZeroUsize::new(cap.max(1)).expect("cap.max(1) >= 1");
+        *self.files.lock() = LruCache::new(cap);
+        self
+    }
+
+    /// Current bound on the number of simultaneously-open expert fds.
+    pub fn max_open_files(&self) -> usize {
+        self.files.lock().cap().get()
     }
 
     /// Construct a multi-drive striped storage. Experts are distributed
@@ -549,17 +618,32 @@ impl NvmeStorage {
         Ok(Arc::new(file))
     }
 
-    /// Get (and cache) the file handle for an expert id.
+    /// Get (and cache) the file handle for an expert id, bounded by the
+    /// LRU fd cache (see [`Self::files`]).
     fn fd_for(&self, id: u32) -> io::Result<Arc<File>> {
-        if let Some(f) = self.files.read().get(&id) {
-            return Ok(f.clone());
+        // Fast path: already resident. `get` mutates LRU recency, so
+        // this needs the write-capable `Mutex` guard.
+        {
+            let mut guard = self.files.lock();
+            if let Some(f) = guard.get(&id) {
+                return Ok(f.clone());
+            }
         }
-        let mut guard = self.files.write();
-        if let Some(f) = guard.get(&id) {
-            return Ok(f.clone());
-        }
+        // Open *outside* the lock so a slow `open()` syscall (or an
+        // O_DIRECT EINVAL probe) never serialises every other reader.
         let f = self.open_one(id)?;
-        guard.insert(id, f.clone());
+        let mut guard = self.files.lock();
+        // A concurrent caller may have opened the same id while we were
+        // unlocked. Prefer the entry already in the cache so every
+        // reader shares a single fd; our freshly-opened `File` drops.
+        if let Some(existing) = guard.get(&id) {
+            return Ok(existing.clone());
+        }
+        // `put` evicts the least-recently-used fd when the cache is at
+        // capacity. The evicted `Arc<File>` is dropped here only if no
+        // in-flight read still holds a clone, so the fd stays valid for
+        // any read already in progress against it.
+        guard.put(id, f.clone());
         Ok(f)
     }
 
@@ -913,7 +997,14 @@ impl NvmeStorage {
         }
     }
 
-    /// Pre-open all expert fds to take that cost out of the steady-state path.
+    /// Warm the fd cache by pre-opening expert fds, taking the `open()`
+    /// cost out of the steady-state path.
+    ///
+    /// Bounded by the LRU fd cache (see [`Self::files`]): warming more
+    /// than [`Self::max_open_files`] ids leaves only the most-recently
+    /// warmed `max_open_files` fds resident, which is exactly the
+    /// behaviour that keeps the engine under its `RLIMIT_NOFILE` budget
+    /// for models with more experts than the cache can hold.
     pub fn warmup_fds(&self, ids: impl IntoIterator<Item = u32>) -> io::Result<()> {
         for id in ids {
             self.fd_for(id)?;
@@ -1993,6 +2084,59 @@ mod tests {
         }
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bounded fd cache must (a) keep at most `max_open_files`
+    /// descriptors resident, evicting the least-recently-used when a
+    /// new expert is opened, and (b) still return correct bytes for an
+    /// expert whose fd was evicted (it is simply re-opened on demand).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fd_cache_evicts_lru_and_rereads() {
+        let dir = tempdir("fdcache");
+        let num_experts = 8u32;
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let block = 4096usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let expert_size = weight_bytes.div_ceil(block) * block;
+        for id in 0..num_experts {
+            let path = dir.join(format!("expert_{id}.bin"));
+            let mut blob = vec![0u8; expert_size];
+            for b in blob.iter_mut() {
+                *b = (id as u8).wrapping_add(0x20);
+            }
+            std::fs::write(&path, &blob).unwrap();
+        }
+        // Cap the fd cache to 2 — far below the 8-expert working set.
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap()
+        .with_max_open_files(2);
+        assert_eq!(storage.max_open_files(), 2);
+
+        let pool = BufferPool::new(2, expert_size, block);
+        // Read every expert; each read is correct even though most of
+        // them were evicted from the 2-slot fd cache before being read
+        // again.
+        for round in 0..2 {
+            for id in 0..num_experts {
+                let mut buf = pool.acquire().await;
+                storage.read_expert(id, &mut buf).await.unwrap();
+                assert_eq!(
+                    buf.as_slice()[0],
+                    (id as u8).wrapping_add(0x20),
+                    "wrong bytes for expert {id} on round {round}"
+                );
+                // The cache never exceeds its bound.
+                assert!(storage.files.lock().len() <= 2);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
