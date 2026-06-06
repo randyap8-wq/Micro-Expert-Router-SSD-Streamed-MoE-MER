@@ -763,9 +763,27 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     let total_experts = (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts);
     storage.warmup_fds(0..total_experts)?;
 
-    let prefetch_headroom = cfg.storage.predict_fanout.max(1);
-    let pool_slots = cfg.storage.cache_slots + prefetch_headroom;
-    let pool = BufferPool::new(pool_slots, cfg.model.expert_size, cfg.storage.block_align);
+    // Double-buffered pool (Parts 1–2): split the RAM buffers into a
+    // **primary** (Buffer A) half that backs the resident LRU plus one
+    // reserved slot the foreground miss path is always guaranteed, and a
+    // **shadow** (Buffer B) half that backs speculative look-ahead
+    // prefetches. Sizing the shadow half to the prefetch fanout
+    // (pipeline_depth = 1 layer ahead) means a layer-ahead speculation
+    // can never steal the buffer a real cache miss needs. A fanout of 0
+    // disables Buffer B and the engine falls back to the legacy
+    // single-pool prefetch path.
+    let shadow_slots = cfg.storage.predict_fanout;
+    let primary_slots = cfg.storage.cache_slots + 1;
+    let pool = if shadow_slots > 0 {
+        BufferPool::new_with_shadow(
+            primary_slots,
+            shadow_slots,
+            cfg.model.expert_size,
+            cfg.storage.block_align,
+        )
+    } else {
+        BufferPool::new(primary_slots, cfg.model.expert_size, cfg.storage.block_align)
+    };
     let cache = {
         let num_layers = cfg.model.num_layers.max(1);
         let per_layer = cfg.model.num_experts.max(1) as u32;
@@ -1561,7 +1579,14 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     storage.warmup_fds(0..args.num_experts)?;
 
     let prefetch_headroom = if args.no_prefetch { 0 } else { args.predict_fanout.max(1) };
-    let pool_slots = args.cache_slots + prefetch_headroom;
+    // Double-buffered pool: primary (Buffer A) = resident LRU + one
+    // reserved foreground slot; shadow (Buffer B) = speculative
+    // look-ahead prefetches (sized to the prefetch fanout). See
+    // `cmd_run` for the full rationale. `--no-prefetch` (headroom 0)
+    // disables Buffer B and keeps the legacy single-pool layout.
+    let shadow_slots = prefetch_headroom;
+    let primary_slots = args.cache_slots + 1;
+    let pool_slots = primary_slots + shadow_slots;
 
     // Rough RAM heuristic: we don't want to pin more than ~1/4 of total
     // RAM in the buffer pool. This is *advisory* — we warn rather than
@@ -1589,7 +1614,16 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         prefetch_headroom = prefetch_headroom,
         "buffer pool sized with prefetch headroom"
     );
-    let pool = BufferPool::new(pool_slots, args.expert_size, args.block_align);
+    let pool = if shadow_slots > 0 {
+        BufferPool::new_with_shadow(
+            primary_slots,
+            shadow_slots,
+            args.expert_size,
+            args.block_align,
+        )
+    } else {
+        BufferPool::new(primary_slots, args.expert_size, args.block_align)
+    };
     let cache = Arc::new(MultiLayerExpertCache::single_layer(args.cache_slots));
 
     // Build the Markov router. If the user supplied a precomputed matrix

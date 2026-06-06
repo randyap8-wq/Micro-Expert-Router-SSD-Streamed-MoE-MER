@@ -1121,9 +1121,28 @@ impl EngineCore {
         // disabled entirely for this configuration rather than starving
         // the critical path.
         let pool_headroom = pool.capacity().saturating_sub(cache.capacity());
-        let prefetch_permits = options
-            .max_concurrent_prefetches
-            .min(pool_headroom.saturating_sub(1));
+        let prefetch_permits = if pool.shadow_capacity() > 0 {
+            // Double-buffered layout: speculative look-ahead prefetches
+            // draw exclusively from the **shadow** (Buffer B) half of the
+            // pool, which is fully reserved for them. The primary (Buffer
+            // A) half backs the resident LRU and the foreground miss
+            // path, so speculation can never starve a real cache miss no
+            // matter how many prefetches are in flight. Bound concurrency
+            // by the shadow capacity directly — there is no need to
+            // reserve a primary headroom slot because the two halves no
+            // longer share buffers.
+            options
+                .max_concurrent_prefetches
+                .min(pool.shadow_capacity())
+        } else {
+            // Legacy single-pool layout: speculation shares the primary
+            // pool with the resident LRU, so reserve one headroom slot
+            // exclusively for the critical path (see the long-form
+            // rationale above) by subtracting one from the headroom.
+            options
+                .max_concurrent_prefetches
+                .min(pool_headroom.saturating_sub(1))
+        };
         Self {
             cache,
             pool,
@@ -2378,14 +2397,63 @@ impl Engine {
             if me.core.cache.contains(id) {
                 return;
             }
-            // Prefetches are *speculative*. They must never evict resident
-            // experts (which could starve a real cache miss) and must never
-            // block waiting for a buffer (same reason). The buffer pool is
-            // sized with extra slots specifically for in-flight prefetches.
-            let mut buf = match me.core.pool.try_acquire() {
+            // **Get-or-wait join (Part 3).** Register this prefetch in
+            // the singleflight `in_flight` map *before* issuing the
+            // read, using the exact same leader/follower protocol as
+            // `fetch_with_retry`. The payoff: a foreground cache miss
+            // for the same id (the gate reaching a layer whose experts
+            // we predicted a layer ahead) becomes a *follower* that
+            // parks on this prefetch's `Notify` and re-checks the cache
+            // when it lands — turning what used to be a duplicate
+            // blocking SSD read into a sub-millisecond wait on an
+            // already-in-flight speculation. If someone else (a
+            // foreground leader, or another prefetch) already owns the
+            // in-flight slot, there is nothing useful to do: they are
+            // already fetching this id, so drop.
+            let notify = match me.core.in_flight.entry(id) {
+                dashmap::mapref::entry::Entry::Occupied(_) => return,
+                dashmap::mapref::entry::Entry::Vacant(vac) => {
+                    let n = Arc::new(Notify::new());
+                    vac.insert(n.clone());
+                    n
+                }
+            };
+            // The guard removes the in-flight slot and notifies every
+            // parked follower on *every* exit path below (buffer-starved
+            // early return, read error, or success). Followers then
+            // re-check the cache: a hit on success, or a re-contention
+            // for leadership on failure — never a wedged stale entry.
+            let _guard = SingleflightLeaderGuard {
+                map: me.core.in_flight.clone(),
+                id,
+                notify,
+                armed: true,
+            };
+            // **Double-buffered acquire (Part 2).** Speculation draws
+            // from the **shadow** (Buffer B) half of the pool, never the
+            // primary (Buffer A) half that backs the resident LRU and
+            // the foreground miss path. This is the invariant that
+            // protects compute on Buffer A: a speculative look-ahead can
+            // never steal the buffer a real cache miss needs. When the
+            // shadow half is disabled (legacy single-pool configs that
+            // call `BufferPool::new`), fall back to the previous
+            // non-evicting primary `try_acquire` so those deployments
+            // keep prefetching exactly as before. Either way we *never*
+            // block or evict: a busy pool simply drops the speculative
+            // load.
+            let mut buf = match me.core.pool.try_acquire_shadow() {
                 Some(b) => b,
+                None if me.core.pool.shadow_capacity() == 0 => {
+                    match me.core.pool.try_acquire() {
+                        Some(b) => b,
+                        None => {
+                            debug!(expert = id, "skipping prefetch: pool busy");
+                            return;
+                        }
+                    }
+                }
                 None => {
-                    debug!(expert = id, "skipping prefetch: pool busy");
+                    debug!(expert = id, "skipping prefetch: shadow pool busy");
                     return;
                 }
             };
@@ -2396,11 +2464,26 @@ impl Engine {
                     me.metrics.counters
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                    // **Self-balancing shadow accounting.** We insert the
+                    // resident still holding its *shadow*-tagged buffer
+                    // rather than calling `BufferPool::promote_shadow`
+                    // first. Promotion permanently re-tags the slot as
+                    // primary, so on eviction it would return to the
+                    // primary free-list — over a long-running serve every
+                    // confirmed-then-evicted prefetch would migrate one
+                    // buffer from shadow to primary, draining Buffer B to
+                    // zero and silently disabling look-ahead. Keeping the
+                    // buffer shadow-tagged means it returns to the shadow
+                    // free-list on eviction, holding Buffer B's capacity
+                    // constant for the life of the process. The bytes are
+                    // identical either way (promotion only changes the
+                    // drop destination), and a shadow-backed resident
+                    // serves cache hits exactly like a primary-backed one.
                     let resident = Arc::new(ExpertResident::new(id, buf));
                     // Prefetches are best-effort: if the cache rejects
                     // the insert (every slot pinned), the resident drops
-                    // here and its buffer returns to the pool — exactly
-                    // the right behaviour for a speculative load.
+                    // here and its buffer returns to the shadow pool —
+                    // exactly the right behaviour for a speculative load.
                     if let Err(_rejected) = me.core.cache.insert(resident) {
                         debug!(
                             expert = id,
@@ -2414,6 +2497,9 @@ impl Engine {
                         elapsed_us = started.elapsed().as_micros() as u64,
                         "prefetch complete"
                     );
+                    // `_guard` drops here: the in-flight slot is removed
+                    // and any foreground follower waiting on this id is
+                    // woken to re-check the cache — where it now hits.
                 }
                 Err(e) => warn!(expert = id, error = %e, "prefetch failed"),
             }
