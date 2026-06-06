@@ -325,7 +325,7 @@ impl RealModel {
         // rather than slurping the whole file into a `Vec<u8>` first; the
         // `BufReader` batches the underlying reads, so peak memory is just
         // the output buffer (no second full-size byte buffer).
-        let mut reader = std::io::BufReader::new(file);
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
         let want = (len / 4) as usize;
         let mut out = Vec::with_capacity(want);
         let mut chunk = [0u8; 4];
