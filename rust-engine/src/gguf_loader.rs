@@ -229,7 +229,17 @@ pub fn extract_experts_from_source(
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "GGUF missing embedding_length")
         })? as usize;
-    let d_ff = lookup("feed_forward_length")
+    // For Mixture-of-Experts files the *routed* experts use a dedicated
+    // hidden dimension that is typically much smaller than the dense-layer
+    // `feed_forward_length`. Architectures like Qwen2-MoE expose it under
+    // `expert_feed_forward_length` (namespaced, e.g. `qwen2moe.<suffix>`).
+    // Prefer that key when present so the `num_experts * d_ff * d_model`
+    // element math matches the actual expert tensor byte count; fall back
+    // to the standard `feed_forward_length` so non-MoE-specific files
+    // (e.g. Mixtral, which sizes its experts with `feed_forward_length`)
+    // keep converting unchanged.
+    let d_ff = lookup("expert_feed_forward_length")
+        .or_else(|| lookup("feed_forward_length"))
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "GGUF missing feed_forward_length")
@@ -474,6 +484,29 @@ pub fn extract_experts_from_source(
         emit(
             format!("blk.{layer}.ffn_gate_inp.weight"),
             vec![format!("gate_{layer}.bin")],
+        )?;
+        // Qwen2-MoE-style "shared experts" — dense FFN tensors applied to
+        // *every* token in addition to the routed experts. They are stored
+        // under the `_shexp` suffix and were previously dropped, leaving the
+        // converted engine missing weights. Emit them as dense `.bin` files
+        // (both the gguf-style name and an engine-friendly alias). Files are
+        // only written when the tensor exists, so non-MoE / no-shared-expert
+        // architectures (e.g. Mixtral) are unaffected.
+        emit(
+            format!("blk.{layer}.ffn_gate_shexp.weight"),
+            vec![format!("layer_{layer}_shexp_gate.bin")],
+        )?;
+        emit(
+            format!("blk.{layer}.ffn_up_shexp.weight"),
+            vec![format!("layer_{layer}_shexp_up.bin")],
+        )?;
+        emit(
+            format!("blk.{layer}.ffn_down_shexp.weight"),
+            vec![format!("layer_{layer}_shexp_down.bin")],
+        )?;
+        emit(
+            format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+            vec![format!("layer_{layer}_shexp_gate_inp.bin")],
         )?;
     }
 
@@ -1318,6 +1351,22 @@ mod tests {
         num_experts: usize,
         arch: &str,
     ) -> Vec<u8> {
+        build_synth_gguf_arch_ext(d_model, d_ff, num_experts, arch, None)
+    }
+
+    /// Like [`build_synth_gguf_arch`] but, when `dense_ffl` is `Some`,
+    /// declares a *larger* dense `feed_forward_length` while sizing the
+    /// expert tensors with `expert_d_ff` and exposing the latter under
+    /// `expert_feed_forward_length`. Exercises the MoE-specific `d_ff`
+    /// preference (Qwen2-MoE) without disturbing the dense default.
+    fn build_synth_gguf_arch_ext(
+        d_model: usize,
+        expert_d_ff: usize,
+        num_experts: usize,
+        arch: &str,
+        dense_ffl: Option<usize>,
+    ) -> Vec<u8> {
+        let d_ff = expert_d_ff;
         use crate::gguf::GGUF_MAGIC;
         let mut out = Vec::new();
         out.extend_from_slice(GGUF_MAGIC);
@@ -1349,7 +1398,7 @@ mod tests {
             (
                 leak_str(format!("{arch}.feed_forward_length")),
                 4,
-                (d_ff as u32).to_le_bytes().to_vec(),
+                (dense_ffl.unwrap_or(d_ff) as u32).to_le_bytes().to_vec(),
             ),
             (
                 leak_str(format!("{arch}.expert_used_count")),
@@ -1357,6 +1406,18 @@ mod tests {
                 2u32.to_le_bytes().to_vec(),
             ),
         ];
+        // MoE files expose the routed-expert hidden dim separately.
+        let kvs = {
+            let mut kvs = kvs;
+            if dense_ffl.is_some() {
+                kvs.push((
+                    leak_str(format!("{arch}.expert_feed_forward_length")),
+                    4,
+                    (expert_d_ff as u32).to_le_bytes().to_vec(),
+                ));
+            }
+            kvs
+        };
         out.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
         for (k, ty, payload) in &kvs {
             let kb = k.as_bytes();
@@ -1527,7 +1588,54 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// stride is `(d_ff*d_model / block_elems) * block_bytes`, and
+    /// Regression test for the MoE `d_ff` extraction. Qwen2-MoE files
+    /// size their routed experts with `expert_feed_forward_length`, a
+    /// value distinct from (and usually much smaller than) the dense
+    /// `feed_forward_length`. The converter must prefer the former so
+    /// the `num_experts * d_ff * d_model` element math matches the
+    /// actual expert tensor byte count. Builds a GGUF whose dense
+    /// `feed_forward_length` (32) disagrees with the expert hidden dim
+    /// (8) and asserts the expert files / metadata use the expert dim.
+    #[test]
+    fn extract_moe_prefers_expert_feed_forward_length() {
+        let d_model = 4usize;
+        let expert_d_ff = 8usize;
+        let dense_ffl = 32usize; // deliberately larger / wrong for experts
+        let num_experts = 2usize;
+        let bytes = build_synth_gguf_arch_ext(
+            d_model,
+            expert_d_ff,
+            num_experts,
+            "qwen2moe",
+            Some(dense_ffl),
+        );
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+
+        // 0 hints → d_ff must be auto-detected from
+        // `qwen2moe.expert_feed_forward_length`, not the dense key.
+        let out = tmp.join("moe-d-ff");
+        let report = extract_experts_from_source(
+            &gguf,
+            &out,
+            0,
+            0,
+            ExtractOptions::default(),
+        )
+        .expect("extract");
+        assert_eq!(report.experts_written, num_experts);
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(
+            meta["d_ff"], expert_d_ff,
+            "MoE conversion must use expert_feed_forward_length"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+
     /// the eligibility check rejects `d_ff*d_model` values that
     /// don't divide cleanly by the block size.
     #[test]
