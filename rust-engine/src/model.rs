@@ -356,6 +356,8 @@ impl RealModel {
         }
         se
     }
+
+    /// Like [`Self::from_dir`] but loads dense weights from
     /// HuggingFace-style `.safetensors` shards instead of per-tensor
     /// `.bin` files. The layout mirrors what
     /// `transformers.AutoModelForCausalLM.save_pretrained` writes:
