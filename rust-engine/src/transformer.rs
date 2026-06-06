@@ -692,28 +692,141 @@ pub fn add_residual(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
 }
 
+/// A dense ("shared") expert FFN that is applied to **every** token in a
+/// layer, in addition to the routed top-K experts.
+///
+/// This is the architectural feature that distinguishes Qwen2-MoE,
+/// DeepSeek-MoE and OLMoE-style MoEs from a vanilla Mixtral block: the
+/// router picks K experts per token, *and* a separate always-on FFN
+/// (the "shared expert") contributes to every token's output. Mixtral
+/// has no such tensor, so [`TransformerLayer::shared_expert`] is an
+/// `Option` and stays `None` for those models — the engine remains MoE-
+/// architecture-agnostic and incurs zero extra work when the weights are
+/// absent.
+///
+/// The three projection matrices are concatenated in the same
+/// `[gate || up || down]` SwiGLU layout the routed experts use on disk,
+/// so the forward pass can reuse the exact same
+/// [`crate::inference::ExpertWeights`] kernel and stay numerically
+/// consistent with the routed path. `d_ff` is the shared expert's own
+/// intermediate size, which in Qwen2-MoE differs from the routed
+/// `moe_intermediate_size`; it is therefore stored per shared expert
+/// rather than read from the layer/model config.
+///
+/// `gate_inp`, when present, is the Qwen2-MoE "shared expert gate"
+/// (`ffn_gate_inp_shexp` / `shared_expert_gate`): a `[d_model] → 1`
+/// linear whose `sigmoid` scales the shared expert output. DeepSeek-MoE
+/// shared experts have no such gate (they are unconditionally added), so
+/// it is optional; absence is treated as a scale of `1.0`.
+#[derive(Debug, Clone)]
+pub struct SharedExpert {
+    pub d_model: usize,
+    pub d_ff: usize,
+    /// `[gate || up || down]` concatenated, row-major, exactly the
+    /// layout [`crate::inference::ExpertWeights::from_floats`] expects:
+    /// `gate`/`up` are `[d_ff, d_model]` and `down` is `[d_model, d_ff]`.
+    pub weights: Vec<f32>,
+    /// Optional sigmoid gate weights `[d_model]` (Qwen2-MoE). `None`
+    /// means the shared expert output is added unscaled (DeepSeek-MoE).
+    pub gate_inp: Option<Vec<f32>>,
+}
+
+impl SharedExpert {
+    /// Build a shared expert from its three separate projection matrices
+    /// (each row-major) plus an optional sigmoid-gate vector. The
+    /// matrices are concatenated into the `[gate || up || down]` layout
+    /// the SwiGLU kernel consumes. Returns `None` if the shapes are
+    /// inconsistent, so a malformed on-disk tensor degrades gracefully
+    /// to "no shared expert" instead of aborting the load.
+    pub fn from_projections(
+        d_model: usize,
+        d_ff: usize,
+        gate: &[f32],
+        up: &[f32],
+        down: &[f32],
+        gate_inp: Option<Vec<f32>>,
+    ) -> Option<Self> {
+        if gate.len() != d_ff * d_model
+            || up.len() != d_ff * d_model
+            || down.len() != d_model * d_ff
+        {
+            return None;
+        }
+        if let Some(g) = gate_inp.as_ref() {
+            if g.len() != d_model {
+                return None;
+            }
+        }
+        let mut weights = Vec::with_capacity(gate.len() + up.len() + down.len());
+        weights.extend_from_slice(gate);
+        weights.extend_from_slice(up);
+        weights.extend_from_slice(down);
+        Some(Self { d_model, d_ff, weights, gate_inp })
+    }
+
+    /// Run the dense SwiGLU forward over `x` (the MoE-normalised hidden
+    /// state) and apply the optional sigmoid gate. Reuses the routed
+    /// expert kernel so the math matches the streamed experts exactly.
+    pub fn forward(&self, x: &[f32]) -> HiddenState {
+        let weights = match ExpertWeights::from_floats(&self.weights, self.d_model, self.d_ff) {
+            Ok(w) => w,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    d_model = self.d_model,
+                    d_ff = self.d_ff,
+                    "shared expert weight view failed; skipping shared expert"
+                );
+                return vec![0.0f32; self.d_model];
+            }
+        };
+        let mut out = weights.forward(x);
+        if let Some(gate_inp) = self.gate_inp.as_ref() {
+            // sigmoid(W_gate · x): a single scalar that scales the whole
+            // shared expert output (Qwen2-MoE `shared_expert_gate`).
+            let mut logit = 0.0f32;
+            for (w, &xi) in gate_inp.iter().zip(x.iter()) {
+                logit += w * xi;
+            }
+            let scale = 1.0 / (1.0 + (-logit).exp());
+            for v in out.iter_mut() {
+                *v *= scale;
+            }
+        }
+        out
+    }
+}
+
 /// One Llama / Mixtral-style transformer decoder layer.
 ///
 /// Holds the dense (resident) weights — RMSNorms, attention projections,
-/// and the routing gate — but **not** the expert FFN weights themselves.
-/// Those are streamed from SSD per token by the engine's
+/// and the routing gate — but **not** the routed expert FFN weights
+/// themselves. Those are streamed from SSD per token by the engine's
 /// [`crate::expert_cache::ExpertCache`] and handed back here as already-
 /// loaded `ExpertResident`s for the [`Self::moe_combine`] step.
 ///
-/// The layer is intentionally split into three sync helpers
-/// ([`Self::attn_block`], [`Self::moe_pre`], [`Self::moe_combine`])
-/// rather than one monolithic `forward` because expert loading is
-/// **async** (it issues `pread(2)` to NVMe). The async driver in
-/// `crate::model::RealModel::step` calls `attn_block`, then `moe_pre`,
-/// then `await`s expert fetches via the engine, then calls
-/// `moe_combine` to fold the per-expert FFN outputs back into the
-/// residual stream — exactly the pseudocode the gist gives.
+/// `shared_expert` is the optional always-on dense FFN used by
+/// Qwen2-MoE / DeepSeek-MoE / OLMoE (see [`SharedExpert`]). It is held
+/// resident (it runs for every token, so streaming it would be pure
+/// overhead) and is `None` for architectures without one (e.g. Mixtral).
+///
+/// The layer is intentionally split into sync helpers
+/// ([`Self::attn_block`], [`Self::moe_pre`], [`Self::moe_combine`],
+/// [`Self::shared_expert_forward`]) rather than one monolithic `forward`
+/// because routed expert loading is **async** (it issues `pread(2)` to
+/// NVMe). The async driver in `crate::model::RealModel::step` calls
+/// `attn_block`, then `moe_pre`, then `await`s expert fetches via the
+/// engine, then calls `moe_combine` to fold the per-expert FFN outputs
+/// back into the residual stream — exactly the pseudocode the gist gives.
 #[derive(Debug, Clone)]
 pub struct TransformerLayer {
     pub rms_attn: RmsNorm,
     pub attn: MultiHeadSelfAttention,
     pub rms_moe: RmsNorm,
     pub gate: crate::gating::LinearGate,
+    /// Optional always-on dense FFN (Qwen2-MoE / DeepSeek-MoE shared
+    /// expert). `None` for Mixtral-style MoEs.
+    pub shared_expert: Option<SharedExpert>,
 }
 
 impl TransformerLayer {
@@ -757,6 +870,14 @@ impl TransformerLayer {
     ) -> Vec<f32> {
         let moe = combine_moe_outputs(expert_outputs, weights, self.attn.d_model);
         add_residual(hidden, &moe)
+    }
+
+    /// Run the layer's optional shared expert over the MoE-normalised
+    /// hidden state `normed` (the same input the routed experts consume).
+    /// Returns `None` when the layer has no shared expert (Mixtral), so
+    /// the caller can skip the residual add entirely.
+    pub fn shared_expert_forward(&self, normed: &[f32]) -> Option<HiddenState> {
+        self.shared_expert.as_ref().map(|se| se.forward(normed))
     }
 }
 
@@ -1042,6 +1163,7 @@ mod tests {
                 d_model,
                 top_k,
             ),
+            shared_expert: None,
         }
     }
 
