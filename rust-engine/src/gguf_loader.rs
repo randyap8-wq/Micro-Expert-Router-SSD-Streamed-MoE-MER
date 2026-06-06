@@ -187,8 +187,14 @@ pub fn extract_experts_from_source(
         meta.get(&format!("llama.{suffix}"))
             .or_else(|| arch.and_then(|a| meta.get(&format!("{a}.{suffix}"))))
             .or_else(|| {
+                // `meta` is a `HashMap`, so iteration order is
+                // non-deterministic. When several metadata keys end in
+                // `.<suffix>` (e.g. multiple architecture namespaces),
+                // pick the lexicographically smallest key so the chosen
+                // hyperparameter value is stable across runs.
                 meta.iter()
-                    .find(|(k, _)| k.ends_with(&dotted))
+                    .filter(|(k, _)| k.ends_with(&dotted))
+                    .min_by(|(a, _), (b, _)| a.cmp(b))
                     .map(|(_, v)| v)
             })
     };
@@ -1299,6 +1305,19 @@ mod tests {
     }
 
     fn build_synth_gguf(d_model: usize, d_ff: usize, num_experts: usize) -> Vec<u8> {
+        build_synth_gguf_arch(d_model, d_ff, num_experts, "llama")
+    }
+
+    /// Like [`build_synth_gguf`] but namespaces the hyperparameter
+    /// metadata under an arbitrary `arch` (and declares it via
+    /// `general.architecture`). Used to exercise the architecture-
+    /// agnostic metadata resolution path for non-llama producers.
+    fn build_synth_gguf_arch(
+        d_model: usize,
+        d_ff: usize,
+        num_experts: usize,
+        arch: &str,
+    ) -> Vec<u8> {
         use crate::gguf::GGUF_MAGIC;
         let mut out = Vec::new();
         out.extend_from_slice(GGUF_MAGIC);
@@ -1310,13 +1329,33 @@ mod tests {
         // metadata
         let kvs: Vec<(&str, u32, Vec<u8>)> = vec![
             ("general.alignment", 4, 32u32.to_le_bytes().to_vec()),
-            ("general.architecture", 8, lstring(b"llama")),
+            ("general.architecture", 8, lstring(arch.as_bytes())),
             ("general.name", 8, lstring(b"synth")),
-            ("llama.block_count", 4, 1u32.to_le_bytes().to_vec()),
-            ("llama.expert_count", 4, (num_experts as u32).to_le_bytes().to_vec()),
-            ("llama.embedding_length", 4, (d_model as u32).to_le_bytes().to_vec()),
-            ("llama.feed_forward_length", 4, (d_ff as u32).to_le_bytes().to_vec()),
-            ("llama.expert_used_count", 4, 2u32.to_le_bytes().to_vec()),
+            (
+                leak_str(format!("{arch}.block_count")),
+                4,
+                1u32.to_le_bytes().to_vec(),
+            ),
+            (
+                leak_str(format!("{arch}.expert_count")),
+                4,
+                (num_experts as u32).to_le_bytes().to_vec(),
+            ),
+            (
+                leak_str(format!("{arch}.embedding_length")),
+                4,
+                (d_model as u32).to_le_bytes().to_vec(),
+            ),
+            (
+                leak_str(format!("{arch}.feed_forward_length")),
+                4,
+                (d_ff as u32).to_le_bytes().to_vec(),
+            ),
+            (
+                leak_str(format!("{arch}.expert_used_count")),
+                4,
+                2u32.to_le_bytes().to_vec(),
+            ),
         ];
         out.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
         for (k, ty, payload) in &kvs {
@@ -1451,7 +1490,43 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// Unit test for the byte-level slicing math: per-expert byte
+    /// Regression test for the architecture-agnostic metadata
+    /// resolution. Builds a synthetic GGUF whose hyperparameters live
+    /// under a non-llama namespace (`qwen2moe.*`) and calls
+    /// `extract_experts_from_source` with **zero** layer/expert hints,
+    /// forcing `lookup(...)` down the `<general.architecture>.<suffix>`
+    /// auto-detect branch (the `llama.<suffix>` probe misses entirely).
+    #[test]
+    fn extract_auto_detects_non_llama_architecture_metadata() {
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let num_experts = 2usize;
+        let bytes = build_synth_gguf_arch(d_model, d_ff, num_experts, "qwen2moe");
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+
+        // 0 hints → all shape/layout params must be auto-detected from
+        // the `qwen2moe.*` namespace.
+        let out = tmp.join("auto-detect");
+        let report = extract_experts_from_source(
+            &gguf,
+            &out,
+            0,
+            0,
+            ExtractOptions::default(),
+        )
+        .expect("extract");
+        assert_eq!(report.experts_written, num_experts);
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(meta["d_model"], d_model);
+        assert_eq!(meta["d_ff"], d_ff);
+        assert_eq!(meta["num_experts"], num_experts);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     /// stride is `(d_ff*d_model / block_elems) * block_bytes`, and
     /// the eligibility check rejects `d_ff*d_model` values that
     /// don't divide cleanly by the block size.
@@ -1477,6 +1552,14 @@ mod tests {
         out.extend_from_slice(&(s.len() as u64).to_le_bytes());
         out.extend_from_slice(s);
         out
+    }
+
+    /// Leak an owned `String` into a `'static str`. Test-only helper for
+    /// building metadata key tables whose names are computed at runtime
+    /// (e.g. `<arch>.block_count`); the small leak is bounded by the
+    /// number of synthetic GGUFs a test run constructs.
+    fn leak_str(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
     }
 
     /// Build a per-expert-layout GGUF whose FFN expert tensors are raw
