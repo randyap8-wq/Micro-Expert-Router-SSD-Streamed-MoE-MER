@@ -61,7 +61,9 @@ use crate::expert_cache::ExpertCache;
 use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::inference::expert_weight_bytes_for;
 use crate::io_provider::{NvmeStorage, StorageConfig};
-use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter};
+use crate::router::{
+    LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter,
+};
 
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
 #[derive(Parser, Debug)]
@@ -968,6 +970,22 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             0xC0FFEE,
         ));
         engine_builder = engine_builder.with_speculator(spec, top_k);
+    }
+    // Per-layer expert-affinity arm: tracks which experts co-fire inside
+    // the same MoE layer and folds their co-fired + disk-adjacent
+    // neighbours into the prefetch union. Sized in the *layer-local* id
+    // namespace (one `num_experts × num_experts` matrix per layer); the
+    // engine maps global ids ↔ layer-local before observing / looking up
+    // neighbours. Only effective when the model exposes a
+    // layer-qualified geometry (`num_experts_per_layer`).
+    if cfg.predictive.affinity_enabled {
+        let num_layers = cfg.model.num_layers.max(1);
+        let affinity = Arc::new(LayeredExpertAffinity::new(num_layers, cfg.model.num_experts));
+        engine_builder = engine_builder.with_affinity(
+            affinity,
+            cfg.predictive.affinity_neighbors_k,
+            cfg.predictive.affinity_decay_epoch,
+        );
     }
     // Phase 2: optional VRAM (GPU) expert cache (3-tier hierarchy
     // SSD → RAM → VRAM). When `[gpu_cache].enabled = false` (default)

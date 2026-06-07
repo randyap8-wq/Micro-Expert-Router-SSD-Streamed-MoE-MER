@@ -573,47 +573,69 @@ impl PredictiveLoader {
         hidden: &[f32],
         speculator_k: usize,
     ) -> Vec<(u32, f32)> {
-        // Weights for each predictive arm. Normalised so a unanimous
-        // expert (Markov p=1, locality hot, speculator top-K) tops
-        // out at exactly 1.0. Relative ordering: the speculator is
-        // the strongest signal (semantic intent → likely to be
-        // correct), Markov is next (statistical smoothing of
-        // observed transitions), and locality is the weakest tie-
-        // breaker (a flat "this expert is generally hot lately").
-        const W_SPECULATOR: f32 = 0.42;
-        const W_MARKOV: f32 = 0.33;
-        const W_LOCALITY: f32 = 0.25;
-        // Compile-time invariant: the weights sum to 1.0 (within
-        // f32 epsilon). Kept as a debug_assert so a future tweak
-        // that breaks the contract trips a test rather than
-        // silently producing >1 scores.
+        // Gather the three predictive arms, then fuse them with the
+        // canonical weights via [`Self::combine_unified_arms`]. Keeping
+        // the gather/fuse split lets the engine's hot path reuse the
+        // exact same weighting with a speculator top-K it already has in
+        // hand (so it never re-runs the forward), while this offline API
+        // stays a one-call convenience.
+        let markov = match prev_prev {
+            Some(pp) => self.predict_next2(pp, prev),
+            None => self.predict_next(prev),
+        };
+        let locality_ids: Vec<u32> = monitor
+            .map(|m| m.get_hot_experts(threshold_pct))
+            .unwrap_or_default();
+        let speculator_ids: Vec<u32> = match speculator {
+            Some(s) if speculator_k > 0 => s.predict_topk(hidden, speculator_k),
+            _ => Vec::new(),
+        };
+        let mut out = self.combine_unified_arms(&markov, &locality_ids, &speculator_ids);
+        // Honour the loader's fanout when set; otherwise return all.
+        if self.fanout > 0 {
+            out.truncate(self.fanout);
+        }
+        out
+    }
+
+    /// Fuse three **precomputed** predictive arms into a single ranked
+    /// `(expert_id, score)` list using the canonical unified weights
+    /// ([`W_MARKOV`] / [`W_LOCALITY`] / [`W_SPECULATOR`]). Each arm's
+    /// contribution sums, so an id hit by multiple arms outranks one hit
+    /// by a single arm; the result is sorted by descending score (ties
+    /// broken by ascending id for determinism).
+    ///
+    /// Unlike [`Self::predict_unified`] this takes the arms as inputs
+    /// rather than computing them, so a caller that already evaluated
+    /// the neural speculator (e.g. the engine, which runs and trains it
+    /// once per token) can apply the documented weighting without a
+    /// second forward pass. The result is **not** truncated to the
+    /// loader's fanout — callers that want that apply it themselves.
+    pub fn combine_unified_arms(
+        &self,
+        markov: &[(u32, f64)],
+        locality_ids: &[u32],
+        speculator_ids: &[u32],
+    ) -> Vec<(u32, f32)> {
+        // Compile-time invariant: the headline weights sum to 1.0 (within
+        // f32 epsilon). Kept as a debug_assert so a future tweak that
+        // breaks the contract trips a test rather than silently producing
+        // >1 scores.
         debug_assert!((W_SPECULATOR + W_MARKOV + W_LOCALITY - 1.0).abs() < 1e-6);
 
         let mut combined: HashMap<u32, f32> = HashMap::new();
 
         // 1) Markov contribution.
-        let markov = match prev_prev {
-            Some(pp) => self.predict_next2(pp, prev),
-            None => self.predict_next(prev),
-        };
-        for (id, p) in markov {
+        for &(id, p) in markov {
             *combined.entry(id).or_insert(0.0) += W_MARKOV * (p as f32);
         }
-
-        // 2) Locality contribution.
-        if let Some(m) = monitor {
-            for id in m.get_hot_experts(threshold_pct) {
-                *combined.entry(id).or_insert(0.0) += W_LOCALITY;
-            }
+        // 2) Locality contribution (flat weight per hot expert).
+        for &id in locality_ids {
+            *combined.entry(id).or_insert(0.0) += W_LOCALITY;
         }
-
-        // 3) Speculator contribution.
-        if let Some(s) = speculator {
-            if speculator_k > 0 {
-                for id in s.predict_topk(hidden, speculator_k) {
-                    *combined.entry(id).or_insert(0.0) += W_SPECULATOR;
-                }
-            }
+        // 3) Speculator contribution (flat weight per top-K id).
+        for &id in speculator_ids {
+            *combined.entry(id).or_insert(0.0) += W_SPECULATOR;
         }
 
         let mut out: Vec<(u32, f32)> = combined
@@ -625,10 +647,6 @@ impl PredictiveLoader {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        // Honour the loader's fanout when set; otherwise return all.
-        if self.fanout > 0 {
-            out.truncate(self.fanout);
-        }
         out
     }
 
@@ -665,14 +683,6 @@ impl PredictiveLoader {
         affinity: Option<&ExpertAffinity>,
         affinity_k: usize,
     ) -> Vec<(u32, f32)> {
-        // Weights for the auxiliary spatial / affinity arms. Both are
-        // small relative to the headline Markov / locality /
-        // speculator weights because they're *neighbour* signals: we
-        // want them in the prefetch set when the seed is already
-        // confident, not driving the fanout on their own.
-        const W_AFFINITY: f32 = 0.10;
-        const W_SPATIAL: f32 = 0.05;
-
         let base = self.predict_unified(
             prev_prev,
             prev,
@@ -682,8 +692,31 @@ impl PredictiveLoader {
             hidden,
             speculator_k,
         );
+        let mut out = self.fold_spatial_affinity(base, affinity, affinity_k);
+        if self.fanout > 0 {
+            out.truncate(self.fanout);
+        }
+        out
+    }
+
+    /// Fold the auxiliary **spatial** (UTH disk-adjacency) and
+    /// **affinity** (observed co-occurrence) neighbour arms onto an
+    /// already-scored candidate list. For every seed scoring
+    /// `>= SPATIAL_CONFIDENCE_THRESHOLD`, its immediate UTH neighbours
+    /// gain [`W_SPATIAL`] and its top-`affinity_k` co-fired neighbours
+    /// gain [`W_AFFINITY`]. Returns the re-ranked list (descending
+    /// score); the caller applies any fanout truncation.
+    ///
+    /// Shared by [`Self::predict_unified_with_spatial`] and the engine's
+    /// hot-path prefetch so both apply identical neighbour weights.
+    pub fn fold_spatial_affinity(
+        &self,
+        base: Vec<(u32, f32)>,
+        affinity: Option<&ExpertAffinity>,
+        affinity_k: usize,
+    ) -> Vec<(u32, f32)> {
         // Identify high-confidence seeds (scores >= the spatial
-        // threshold). Cloned into a Vec so we can mutate the combined
+        // threshold). Collected into a Vec so we can mutate the combined
         // map without invalidating the iterator.
         let seeds: Vec<u32> = base
             .iter()
@@ -727,9 +760,6 @@ impl PredictiveLoader {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
-        if self.fanout > 0 {
-            out.truncate(self.fanout);
-        }
         out
     }
 
@@ -1643,6 +1673,24 @@ fn speculator_training_loop(
 /// predictor should also issue a spatial prefetch for an expert's
 /// immediate UTH neighbours. 0.80 matches the gist's example.
 pub const SPATIAL_CONFIDENCE_THRESHOLD: f32 = 0.80;
+
+// Unified-ranking arm weights. Hoisted to module scope (out of the
+// individual `predict_unified*` method bodies) so the engine's hot-path
+// `union_prefetch` consumes the *same* constants as the offline
+// `predict_unified` API instead of re-deriving its own ad-hoc scheme.
+// The three headline weights sum to 1.0 so a unanimously-predicted
+// expert tops out at exactly 1.0; relative ordering encodes the design
+// intent "speculator > Markov > locality".
+pub const W_SPECULATOR: f32 = 0.42;
+pub const W_MARKOV: f32 = 0.33;
+pub const W_LOCALITY: f32 = 0.25;
+// Auxiliary neighbour-arm weights for `predict_unified_with_spatial` /
+// the engine's affinity+spatial fold. Small relative to the headline
+// arms: they should pull a co-fired / disk-adjacent neighbour into the
+// prefetch set when a seed is already confident, never drive the
+// fanout on their own.
+pub const W_AFFINITY: f32 = 0.10;
+pub const W_SPATIAL: f32 = 0.05;
 
 /// Default cap on the speculation window after a latency bump. The
 /// controller never grows the window beyond `base_depth +
@@ -2602,6 +2650,43 @@ mod tests {
         let from_orig = m.hot_set(0.10);
         assert_eq!(from_alias, from_orig);
         assert!(from_alias.contains(&2));
+    }
+
+    #[test]
+    fn unified_headline_weights_sum_to_one() {
+        // The three headline arms (speculator + markov + locality) must
+        // partition a probability of 1.0 so `combine_unified_arms` never
+        // produces a score > 1 for a single-source id. Asserting it here
+        // makes the contract a test-time guarantee independent of the
+        // per-call `debug_assert` in `combine_unified_arms`.
+        assert!((W_SPECULATOR + W_MARKOV + W_LOCALITY - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn combine_unified_arms_applies_documented_weights() {
+        // The engine's hot path consumes `combine_unified_arms` with
+        // precomputed arms; assert it applies the canonical weights
+        // (0.33 markov, 0.25 locality, 0.42 speculator) and that an id
+        // hit by multiple arms outranks one hit by a single arm.
+        let p = PredictiveLoader::new(8, 8, 0.0, 1);
+        // Markov arm: id=1 at p=1.0; locality arm: id=2; speculator arm:
+        // id=3 and id=1 (so id=1 is hit by markov + speculator).
+        let markov = vec![(1u32, 1.0f64)];
+        let locality = vec![2u32];
+        let speculator = vec![3u32, 1u32];
+        let out = p.combine_unified_arms(&markov, &locality, &speculator);
+        let score = |id: u32| out.iter().find(|(i, _)| *i == id).map(|(_, s)| *s);
+        // id=1: W_MARKOV*1.0 + W_SPECULATOR = 0.33 + 0.42 = 0.75
+        assert!((score(1).unwrap() - (W_MARKOV + W_SPECULATOR)).abs() < 1e-6);
+        // id=3: W_SPECULATOR = 0.42
+        assert!((score(3).unwrap() - W_SPECULATOR).abs() < 1e-6);
+        // id=2: W_LOCALITY = 0.25
+        assert!((score(2).unwrap() - W_LOCALITY).abs() < 1e-6);
+        // Ranking: multi-arm id=1 first, then speculator id=3, then
+        // locality id=2.
+        assert_eq!(out.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 3, 2]);
+        // Result is not truncated to fanout (caller's responsibility).
+        assert_eq!(out.len(), 3);
     }
 
     #[test]

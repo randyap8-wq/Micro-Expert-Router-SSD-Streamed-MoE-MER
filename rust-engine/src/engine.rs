@@ -28,7 +28,9 @@ use crate::inference::{
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
-use crate::router::{LocalityMonitor, NeuralSpeculator, PredictiveLoader};
+use crate::router::{
+    DecayWorkerHandle, LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader,
+};
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
 use parking_lot::{Mutex, RwLock};
@@ -55,6 +57,22 @@ pub const KV_CACHE_BLOCK_ALIGN: usize = 4096;
 /// transformer attention pattern. Zero means "unbounded": the cache
 /// will keep growing until the host runs out of memory.
 pub const KV_CACHE_DEFAULT_WINDOW_TOKENS: usize = 4096;
+
+/// Decompose a **global** expert id into its `(layer, layer-local)`
+/// pair given a layer-qualified geometry of `per_layer` experts each
+/// (`global = layer * per_layer + local`). The inverse of
+/// [`layer_local_to_global`]. Callers must ensure `per_layer > 0`.
+#[inline]
+fn global_to_layer_local(global: u32, per_layer: u32) -> (u32, u32) {
+    (global / per_layer, global % per_layer)
+}
+
+/// Recompose a `(layer, layer-local)` pair into its **global** expert
+/// id. The inverse of [`global_to_layer_local`].
+#[inline]
+fn layer_local_to_global(layer: u32, local: u32, per_layer: u32) -> u32 {
+    layer * per_layer + local
+}
 
 /// **Persistent, page-aligned KV cache** complementing the per-layer
 /// paged KV cache in `transformer.rs`. The transformer module's
@@ -1038,6 +1056,22 @@ pub(crate) struct EngineSpeculation {
     /// Cumulative count of tokens for which the speculator was
     /// invoked. Denominator of the top-1 accuracy ratio.
     pub(super) spec_tokens: AtomicU64,
+    /// Per-layer expert co-occurrence matrix — the **affinity** arm.
+    /// When present (and the model exposes a layer-qualified id
+    /// geometry), `moe_step` records the layer's routed set into the
+    /// matrix and `union_prefetch` folds each high-confidence seed's
+    /// top co-fired neighbours into the prefetch union. `None` keeps
+    /// the engine's behaviour identical to a deployment without the
+    /// affinity arm.
+    pub(super) affinity: Option<Arc<LayeredExpertAffinity>>,
+    /// Number of co-fired neighbours pulled per high-confidence seed
+    /// when [`Self::affinity`] is set.
+    pub(super) affinity_neighbors_k: usize,
+    /// Owned supervisor for the background exponential-decay worker
+    /// that ages the affinity matrix. Retained for the engine's
+    /// lifetime; dropping it stops the worker. `None` when the
+    /// affinity arm is disabled.
+    pub(super) affinity_decay: Option<DecayWorkerHandle>,
 }
 
 /// Observability: latency histograms, cumulative timing atomics,
@@ -1185,6 +1219,9 @@ impl EngineSpeculation {
             spec_misses: AtomicU64::new(0),
             spec_top1_matches: AtomicU64::new(0),
             spec_tokens: AtomicU64::new(0),
+            affinity: None,
+            affinity_neighbors_k: 0,
+            affinity_decay: None,
         }
     }
 }
@@ -1707,6 +1744,36 @@ impl Engine {
         self
     }
 
+    /// Install a per-layer [`LayeredExpertAffinity`] co-occurrence
+    /// matrix — the **affinity** arm. When set, `moe_step` records each
+    /// layer's routed set into the matrix and `union_prefetch` folds the
+    /// top-`neighbors_k` co-fired neighbours (plus UTH disk-adjacent
+    /// neighbours) of every high-confidence prediction into the
+    /// speculative prefetch union. A background exponential-decay worker
+    /// is spawned to age the counters every `decay_epoch` cumulative
+    /// observations; its handle is retained for the engine's lifetime
+    /// (dropping the engine stops the worker).
+    pub fn with_affinity(
+        mut self,
+        affinity: Arc<LayeredExpertAffinity>,
+        neighbors_k: usize,
+        decay_epoch: u64,
+    ) -> Self {
+        // `bits = 1` halves every counter per epoch; the 250 ms poll is
+        // the upper bound on how long a saturated counter lingers before
+        // the next shift. Both mirror the defaults documented on
+        // `LayeredExpertAffinity::spawn_decay_worker`.
+        let handle = affinity.clone().spawn_decay_worker(
+            decay_epoch.max(1),
+            1,
+            std::time::Duration::from_millis(250),
+        );
+        self.speculation.affinity = Some(affinity);
+        self.speculation.affinity_neighbors_k = neighbors_k.max(1);
+        self.speculation.affinity_decay = Some(handle);
+        self
+    }
+
     /// Wire a Prometheus metrics sink. The engine will mirror its
     /// telemetry counters (locality / speculator hits & misses, SSD
     /// stall) into the metrics registry alongside its own atomics.
@@ -2114,7 +2181,9 @@ impl Engine {
             // the speculator's d_model matches; otherwise this is
             // a no-op — see `speculator_predict_and_train`).
             let m_speculator = self.speculator_predict_and_train(&hidden, &target);
-            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
+            // Synthetic single-layer benchmark path: no layer-qualified
+            // id geometry, so the affinity fold is not applicable.
+            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new(), None);
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
@@ -2682,71 +2751,106 @@ impl Engine {
         }
     }
 
-    /// Prefetch every id in the union `S ∪ L ∪ M` that isn't already
-    /// resident — the **speculative I/O union-fetch** described in the
-    /// design spec. `s_markov` is the predictor's Markov-chain top-K
-    /// (already prob-ranked), `m_speculator` is the neural speculator's
-    /// top-K, `target_seed` is used to dedupe against ids that the
-    /// caller already kicked off via the regular cache-miss path.
+    /// Prefetch every id in the union `S ∪ L ∪ M` (plus the optional
+    /// affinity/spatial neighbour fold) that isn't already resident —
+    /// the **speculative I/O union-fetch** described in the design spec.
+    /// `s_markov` is the predictor's Markov-chain top-K (already
+    /// prob-ranked), `m_speculator` is the neural speculator's top-K,
+    /// `already_in_flight` dedupes against ids the caller already kicked
+    /// off via the regular cache-miss path, and `layer` is the current
+    /// MoE layer (when known) used to scope the per-layer affinity fold.
+    ///
+    /// The three headline arms are fused with the **canonical unified
+    /// weights** (`0.33·markov + 0.25·locality + 0.42·speculator`) via
+    /// [`PredictiveLoader::combine_unified_arms`] — the same scoring the
+    /// offline [`PredictiveLoader::predict_unified`] API exposes — so the
+    /// documented prioritisation (speculator > Markov > locality) drives
+    /// the prefetch ranking and the truncation to the shadow budget,
+    /// rather than the previous flat `p = 0.5` tag. The speculator top-K
+    /// is passed in precomputed (the engine already ran and trained the
+    /// speculator once this token), so no second forward pass is issued.
     fn union_prefetch(
         self: &Arc<Self>,
         s_markov: &[(u32, f64)],
         m_speculator: &[u32],
         already_in_flight: &HashSet<u32>,
+        layer: Option<u32>,
     ) {
-        // Preserve the predictor's per-id probability when it has one;
-        // ids that come only from the locality / speculator arms
-        // borrow the speculator's "best guess" probability of 0.5
-        // (high enough to clear most prefetch budget thresholds, low
-        // enough to be visibly different in the prefetch logs from
-        // a real Markov-chain prediction).
-        let mut seen: HashSet<u32> = already_in_flight.clone();
-        // Collect the deduplicated S ∪ L ∪ M candidate set with each
-        // id's best-evidence probability, *then* rank and truncate
-        // before spawning (Part 4.3). When the shadow (Buffer B) half
-        // cannot hold the whole union, we want to keep the
-        // highest-expected-value experts rather than whichever arm
-        // happened to be iterated first — so a confident 2nd-order
-        // Markov prediction (p≈0.9) is never dropped in favour of an
-        // opportunistic locality/speculator id (flat p=0.5). If an id
-        // appears in more than one arm we keep its largest probability.
-        let mut candidates: Vec<(u32, f64)> = Vec::new();
-        let mut push = |seen: &mut HashSet<u32>, candidates: &mut Vec<(u32, f64)>, canon: u32, p: f64| {
-            if seen.insert(canon) {
-                candidates.push((canon, p));
-            } else if let Some((_, existing_p)) = candidates.iter_mut().find(|(id, _)| *id == canon) {
-                if p > *existing_p {
-                    *existing_p = p;
-                }
+        // Locality (L) arm — the monitor's current hot set, or empty.
+        let mut locality_ids: Vec<u32> = self
+            .speculation
+            .locality
+            .as_ref()
+            .map(|m| m.hot_set(self.speculation.locality_threshold_pct))
+            .unwrap_or_default();
+
+        // If expert aliasing is enabled, canonicalize ids *before* scoring so
+        // evidence isn't split across aliases and neighbour folds operate on
+        // the same ids the cache ultimately uses.
+        let mut scored = if self.speculation.alias_map.is_some() {
+            // Canonicalize + dedupe flat-weight arms after alias resolution.
+            for id in locality_ids.iter_mut() {
+                *id = self.resolve_alias(*id);
             }
-        };
-        for &(id, p) in s_markov {
-            let canon = self.resolve_alias(id);
-            if !self.core.cache.contains(canon) {
-                push(&mut seen, &mut candidates, canon, p);
-            }
-        }
-        if let Some(monitor) = self.speculation.locality.as_ref() {
-            for id in monitor.hot_set(self.speculation.locality_threshold_pct) {
+            locality_ids.sort_unstable();
+            locality_ids.dedup();
+
+            let mut speculator_ids: Vec<u32> =
+                m_speculator.iter().map(|&id| self.resolve_alias(id)).collect();
+            speculator_ids.sort_unstable();
+            speculator_ids.dedup();
+
+            // Canonicalize Markov ids, keeping the max probability when multiple ids
+            // map to the same canonical expert.
+            let mut markov: HashMap<u32, f64> = HashMap::new();
+            for &(id, p) in s_markov {
                 let canon = self.resolve_alias(id);
-                if !self.core.cache.contains(canon) {
-                    push(&mut seen, &mut candidates, canon, 0.5);
+                markov
+                    .entry(canon)
+                    .and_modify(|cur| *cur = cur.max(p))
+                    .or_insert(p);
+            }
+            let markov: Vec<(u32, f64)> = markov.into_iter().collect();
+            self.core
+                .predictor
+                .combine_unified_arms(&markov, &locality_ids, &speculator_ids)
+        } else {
+            self.core
+                .predictor
+                .combine_unified_arms(s_markov, &locality_ids, m_speculator)
+        };
+        // Optional affinity + spatial neighbour fold: for every
+        // high-confidence seed, pull its top co-fired (per-layer
+        // affinity) and disk-adjacent (UTH spatial) neighbours into the
+        // prefetch set. Gated on the affinity arm being installed *and*
+        // a layer-qualified id geometry being available.
+        if let Some(affinity) = self.speculation.affinity.as_ref() {
+            // `layer` is only `Some` on the `moe_step` path, where the
+            // current MoE layer is known — the affinity fold is scoped
+            // per-layer, so skip it on the layer-less `generate` path.
+            if layer.is_some() {
+                if let Some(per_layer) = self.core.storage.config().num_experts_per_layer {
+                    if per_layer > 0 {
+                        scored = self.fold_affinity_spatial(scored, affinity, per_layer);
+                    }
                 }
             }
         }
-        for &id in m_speculator {
+        // Resolve aliases, drop residents, and dedupe against ids
+        // already in flight — preserving the descending-score order from
+        // the fuse/fold above (we only ever skip ids, never reorder). On
+        // an alias collision the first (higher-scored) id wins.
+        let mut seen: HashSet<u32> = already_in_flight.clone();
+        let mut candidates: Vec<(u32, f64)> = Vec::with_capacity(scored.len());
+        for (id, score) in scored {
             let canon = self.resolve_alias(id);
-            if !self.core.cache.contains(canon) {
-                push(&mut seen, &mut candidates, canon, 0.5);
+            if self.core.cache.contains(canon) {
+                continue;
+            }
+            if seen.insert(canon) {
+                candidates.push((canon, score as f64));
             }
         }
-        // Rank by probability descending so the highest-EV predictions
-        // are submitted first and survive truncation. Probabilities
-        // originate from the Markov predictor (finite by construction)
-        // or the flat 0.5 locality/speculator tag, so NaN is not
-        // expected; if one ever appears it sorts as equal rather than
-        // panicking, which at worst mis-orders one prefetch hint.
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         // Truncate to the shadow-slot budget: in-flight speculation can
         // never exceed Buffer B's capacity, so anything past that would
         // be dropped by `spawn_prefetch`'s `try_acquire_shadow` anyway.
@@ -2761,6 +2865,62 @@ impl Engine {
         for (canon, p) in candidates {
             self.spawn_prefetch(canon, p);
         }
+    }
+
+    /// Fold the **affinity** (per-layer co-occurrence) and **spatial**
+    /// (UTH disk-adjacency) neighbour arms onto an already-scored
+    /// candidate list, mirroring
+    /// [`PredictiveLoader::fold_spatial_affinity`] but in the engine's
+    /// *global* id namespace.
+    ///
+    /// Spatial neighbours use the global namespace directly (expert
+    /// `g ± 1` is the disk-adjacent record). Affinity is per-layer, so a
+    /// seed is split into `(seed_layer, local)`, its co-fired neighbours
+    /// are looked up in `seed_layer`'s matrix, and each local neighbour
+    /// is mapped back to its global id. Only seeds scoring at least
+    /// [`crate::router::SPATIAL_CONFIDENCE_THRESHOLD`] contribute.
+    fn fold_affinity_spatial(
+        &self,
+        base: Vec<(u32, f32)>,
+        affinity: &LayeredExpertAffinity,
+        per_layer: u32,
+    ) -> Vec<(u32, f32)> {
+        use crate::router::{spatial_neighbors, SPATIAL_CONFIDENCE_THRESHOLD, W_AFFINITY, W_SPATIAL};
+        let seeds: Vec<u32> = base
+            .iter()
+            .filter(|(_, s)| *s >= SPATIAL_CONFIDENCE_THRESHOLD)
+            .map(|(id, _)| *id)
+            .collect();
+        if seeds.is_empty() {
+            return base;
+        }
+        let global_n = self.core.router.num_experts();
+        let k = self.speculation.affinity_neighbors_k.max(1);
+        let mut combined: HashMap<u32, f32> = base.into_iter().collect();
+        for &seed in &seeds {
+            // Spatial: global disk adjacency.
+            for nbr in spatial_neighbors(seed, global_n, 2) {
+                *combined.entry(nbr).or_insert(0.0) += W_SPATIAL;
+            }
+            // Affinity: co-occurrence within the seed's own layer.
+            let (seed_layer, local) = global_to_layer_local(seed, per_layer);
+            for local_nbr in affinity.neighbors(seed_layer as usize, local, k) {
+                let global_nbr = layer_local_to_global(seed_layer, local_nbr, per_layer);
+                if global_nbr < global_n {
+                    *combined.entry(global_nbr).or_insert(0.0) += W_AFFINITY;
+                }
+            }
+        }
+        let mut out: Vec<(u32, f32)> = combined
+            .into_iter()
+            .filter(|&(_, p)| p > 0.0)
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
     }
 
     /// Snapshot of the engine's predictive-architecture telemetry. The
@@ -2839,6 +2999,23 @@ impl Engine {
         // semantics as in `generate`.
         self.locality_observe_and_reconcile(&target);
 
+        // Affinity arm: record which experts the gate co-activated in
+        // *this* layer. The matrix is per-layer in the local id
+        // namespace, so map the global ids back to their layer-local
+        // index before observing. No-op unless the affinity arm is
+        // installed and the model exposes a layer-qualified geometry.
+        if let Some(affinity) = self.speculation.affinity.as_ref() {
+            if let Some(per_layer) = self.core.storage.config().num_experts_per_layer {
+                if per_layer > 0 {
+                    let locals: Vec<u32> = target
+                        .iter()
+                        .map(|&g| global_to_layer_local(g, per_layer).1)
+                        .collect();
+                    affinity.observe_layer(layer as usize, &locals);
+                }
+            }
+        }
+
         // Speculator: predict against the *real* hidden state (this is
         // the path where d_model matches by construction) and train
         // online against the gate's actual top-K decision.
@@ -2884,7 +3061,7 @@ impl Engine {
                 None => self.core.predictor.predict_next(seed),
             };
             drop(last_last);
-            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
+            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new(), Some(layer));
         }
 
         // **Layer-ahead look-ahead (Part 1).** Independently of the
@@ -4226,6 +4403,78 @@ mod tests {
             received[0].0, target_id,
             "the promotion message must carry the target expert id"
         );
+    }
+
+    /// **Affinity arm wiring (end-to-end).** With a layer-qualified id
+    /// geometry and an installed [`LayeredExpertAffinity`], driving
+    /// `moe_step` for a layer must record the layer's co-fired experts
+    /// into *that layer's* matrix (in the layer-local id namespace),
+    /// and must not leak co-firings into other layers' matrices. This
+    /// exercises the `observe_layer` call wired into `moe_step` and the
+    /// global→local id mapping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moe_step_records_layer_affinity_co_firings() {
+        let dir = TempDir::new("affinity-wiring");
+        let per_layer: u32 = 4;
+        let num_layers: usize = 2;
+        let total_experts: u32 = per_layer * num_layers as u32; // 8 global ids
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed: u64 = 0xA5A5_F00D_u64;
+
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, total_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                // Layer-qualified geometry: global id = layer*per_layer + local.
+                num_experts_per_layer: Some(per_layer),
+            })
+            .expect("storage init"),
+        );
+        storage.warmup_fds(0..total_experts).expect("pre-open fds");
+
+        let pool = BufferPool::new(total_experts as usize + 2, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(total_experts as usize));
+        let router = Router::Markov(Arc::new(TopKRouter::new(total_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(total_experts, 2, 0.05, seed));
+
+        // Keep a clone of the affinity matrix so we can assert on it
+        // after it is moved into the engine.
+        let affinity = Arc::new(LayeredExpertAffinity::new(num_layers, per_layer));
+        let engine = Arc::new(
+            Engine::new(
+                cache,
+                pool,
+                storage,
+                router,
+                predictor,
+                ModelShape { d_model, d_ff, hidden_seed: seed },
+            )
+            .with_affinity(affinity.clone(), /*neighbors_k=*/ 2, /*decay_epoch=*/ 1_000_000),
+        );
+
+        // Co-fire global experts {4,5} in layer 1 (local {0,1}) a few
+        // times so the pair's co-occurrence is unambiguous.
+        let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
+        for t in 0..3u64 {
+            let _ = engine.moe_step(t, /*layer=*/ 1, &hidden, &[4, 5]).await;
+        }
+
+        // Layer 1's matrix (local namespace) must show 0 and 1 as mutual
+        // neighbours.
+        assert_eq!(affinity.neighbors(1, 0, 2), vec![1], "local 0's neighbour in layer 1");
+        assert_eq!(affinity.neighbors(1, 1, 2), vec![0], "local 1's neighbour in layer 1");
+        assert_eq!(affinity.affinity(1, 0, 1), 3, "co-fired three times");
+        // No leakage into layer 0's matrix.
+        assert!(affinity.neighbors(0, 0, 2).is_empty(), "layer 0 must be untouched");
     }
 
     /// `AlignedKvCache::append` extends the resident window until

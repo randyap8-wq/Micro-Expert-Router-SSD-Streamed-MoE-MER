@@ -189,26 +189,41 @@ speculative I/O. The weights encode the intent that the **speculator
 is the strongest signal** (it conditions on the actual hidden state),
 the **Markov chain is next** (statistical smoothing of transitions),
 and **locality is the weakest tiebreaker** (a coarse "recently hot"
-prior); see `PredictiveLoader::predict_unified` in `router.rs` for
-the canonical constants. Prefetches use `try_acquire` only and
-**never evict a resident slot**, speculation can't starve real work.
+prior). The constants live once, as module-level `pub const`s
+(`W_SPECULATOR`/`W_MARKOV`/`W_LOCALITY`/`W_AFFINITY`/`W_SPATIAL`), and
+the scoring core is factored into `PredictiveLoader::combine_unified_arms`
+so the engine's hot path can apply the **exact same weighting** without
+re-running the speculator forward pass (it already runs+trains the
+speculator once per token). `predict_unified` is now a thin wrapper
+that gathers the arms and delegates to `combine_unified_arms`; see
+`router.rs` for the canonical constants. Prefetches use `try_acquire`
+only and **never evict a resident slot**, so speculation can't starve
+real work.
 
 On top of the unified S ∪ L ∪ M ranking, the predictor also exposes
-**`predict_unified_with_spatial(…)`** which folds two more arms in:
+**`predict_unified_with_spatial(…)`** (and the engine-side
+`fold_affinity_spatial`) which fold two more arms in. These are
+**opt-in**, gated behind `[predictive] affinity_enabled` (default
+`false`, mirroring `locality_enabled`/`speculator_enabled`) so default
+behaviour and per-token cost are unchanged:
 
-* **Expert-affinity matrix (`router::ExpertAffinity`).** A pre-allocated
-  `N×N` `AtomicU32` co-occurrence heat-map of which experts fire
-  together inside the same MoE layer. Hot-path updates are lock-free
-  saturating atomic increments implemented with a compare-exchange
-  retry loop, no allocation, no `RwLock`. When a seed expert
-  scores ≥ `SPATIAL_CONFIDENCE_THRESHOLD` (0.80) in the unified
-  ranking, its top-K co-fired neighbours from the matrix are added
-  to the prefetch set at a small (+0.10) weight.
+* **Expert-affinity matrix (`router::LayeredExpertAffinity`).** A
+  per-layer set of `AtomicU32` co-occurrence heat-maps of which experts
+  fire together inside the same MoE layer. Hot-path updates are
+  lock-free saturating atomic increments implemented with a
+  compare-exchange retry loop, no allocation, no `RwLock`. When
+  `affinity_enabled`, `Engine::moe_step` calls `observe_layer` per token
+  with that layer's routed set, and a seed expert's top-K co-fired
+  neighbours (`affinity_neighbors_k`, default 2) are folded into the
+  prefetch set at a small (`W_AFFINITY` = +0.10) weight. A background
+  **exponential-decay worker** (spawned by `Engine::with_affinity`)
+  right-shifts the counter matrix per `affinity_decay_epoch` cumulative
+  observations to prevent atomic saturation.
 * **Spatial prefetching (`router::spatial_neighbors`).** For the
-  same high-confidence seeds, the immediate UTH-layout neighbours
-  (`id ± 1`, clipped to `[0, num_experts)`) are also enqueued at a
-  small (+0.05) weight. Pulling them from the SSD piggy-backs on the
-  drive's sequential-read locality.
+  same high-confidence seeds, up to two nearby UTH-layout neighbours
+  (typically `id ± 1`, but at the boundaries possibly `id ± 2`) are also enqueued at a
+  small (`W_SPATIAL` = +0.05) weight. Pulling them from the SSD
+  piggy-backs on the drive's sequential-read locality.
 
 Latency-aware speculation depth is controlled by
 **`router::SpeculationController`**, a lock-free atomic state machine
@@ -1074,6 +1089,9 @@ locality_threshold_pct = 0.10   # heat ratio for declaring an expert "hot"
 speculator_enabled     = true   # turn on the NeuralSpeculator (M arm)
 speculator_hidden_dim  = 128    # MLP hidden size; 128 is the spec recommendation
 speculator_top_k       = 0      # 0 ⇒ inherit `model.top_k`
+affinity_enabled       = false  # turn on per-layer expert-affinity + UTH-spatial folds
+affinity_neighbors_k   = 2      # co-fired neighbours to fold in per seed
+affinity_decay_epoch   = 100000 # cumulative observations before a decay right-shift
 ```
 
 The defaults (everything off) reproduce the legacy Markov-only
@@ -2278,14 +2296,21 @@ prev)` Markov hint `S`, (b) the locality monitor's `hot_set(threshold)`
 `L`, and (c) the speculator's `predict_topk(hidden_state)` `M`,
 deduplicates against ids already in flight or already resident,
 and spawns prefetches for the rest. The unified ranking is computed by
-`PredictiveLoader::predict_unified`, which combines all three signals
+`PredictiveLoader::combine_unified_arms` (the shared scoring core that
+also backs `predict_unified`), which combines all three signals
 with weights `0.42 · speculator + 0.33 · markov + 0.25 · locality` and
 returns the top-fanout ids; an expert that lights up in every arm is
-therefore prioritised over one that lights up in only one. The
-weighting encodes "speculator is the strongest signal, Markov is
-next, locality is the weakest tiebreaker", see
-`PredictiveLoader::predict_unified` in `router.rs` for the canonical
-constants.
+therefore prioritised over one that lights up in only one. The engine
+calls `combine_unified_arms` directly (rather than `predict_unified`) so
+it reuses the speculator output it already computed for this token
+instead of running a second forward pass. The weighting encodes
+"speculator is the strongest signal, Markov is next, locality is the
+weakest tiebreaker", see the `W_SPECULATOR`/`W_MARKOV`/`W_LOCALITY`
+`pub const`s in `router.rs` for the canonical constants. When
+`[predictive] affinity_enabled` is set, `union_prefetch` additionally
+folds in the per-layer expert-affinity neighbours and UTH-spatial
+neighbours (`W_AFFINITY` = +0.10, `W_SPATIAL` = +0.05) for the seeds it
+just scored.
 
 Online speculator training is **dispatched to an off-path worker
 thread** through a bounded queue, so a `predict_topk` on the hot
