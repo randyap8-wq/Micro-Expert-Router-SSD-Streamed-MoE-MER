@@ -1470,6 +1470,7 @@ mod tests {
                 block_align: 4096,
                 no_direct: true,
                 predict_fanout: 2,
+                pipeline_depth: crate::engine::DEFAULT_PIPELINE_DEPTH,
                 predict_min_prob: 0.05,
                 partial_load_fraction: 1.0,
                 pin_after_observations: 0,

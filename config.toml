@@ -123,6 +123,13 @@ block_align = 4096
 no_direct = false
 # Predictive prefetcher fanout (0 disables prefetching entirely).
 predict_fanout = 2
+# Look-ahead pipeline depth: how many MoE layers ahead the speculator
+# prefetches (the sliding window `layer + 1 ..= layer + pipeline_depth`),
+# hiding cold SSD reads behind compute. Set to roughly
+# ceil(io_latency / compute_latency) — 3 buries a ~206 ms read under
+# ~231 ms of compute. 1 reproduces the legacy single-layer look-ahead.
+# Also scales the shadow buffer-pool budget (predict_fanout * pipeline_depth).
+pipeline_depth = 3
 # Don't issue prefetches whose Markov-predicted probability falls below
 # this threshold.
 predict_min_prob = 0.05

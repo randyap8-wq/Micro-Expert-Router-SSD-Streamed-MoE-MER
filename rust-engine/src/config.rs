@@ -188,6 +188,17 @@ pub struct StorageConfigToml {
     #[serde(default = "default_predict_fanout")]
     pub predict_fanout: usize,
 
+    /// **Look-ahead pipeline depth.** Layers of compute the engine keeps
+    /// the SSD reads running ahead of: the speculator prefetches the
+    /// experts of the sliding window `layer + 1 ..= layer + pipeline_depth`
+    /// so their reads overlap the current layers' compute. Set to roughly
+    /// `ceil(io_latency / compute_latency)` (default `3`) to hide a cold
+    /// expert read behind compute; `1` reproduces the legacy single-layer
+    /// look-ahead. Also scales the shadow buffer-pool budget
+    /// (`predict_fanout * pipeline_depth`).
+    #[serde(default = "default_pipeline_depth")]
+    pub pipeline_depth: u32,
+
     /// Don't prefetch below this transition probability. `0.0` (the
     /// default) auto-scales the threshold to `1 / (num_experts * 4)` at
     /// engine wiring time so it stays achievable for large expert pools.
@@ -215,6 +226,7 @@ fn default_pin_after_observations() -> u64 { 0 }
 fn default_cache_slots() -> usize { 4 }
 fn default_block_align() -> usize { 4096 }
 fn default_predict_fanout() -> usize { 2 }
+fn default_pipeline_depth() -> u32 { crate::engine::DEFAULT_PIPELINE_DEPTH }
 fn default_predict_min_prob() -> f64 { 0.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -962,6 +974,7 @@ mod tests {
                 block_align: 4096,
                 no_direct: false,
                 predict_fanout: 2,
+                pipeline_depth: crate::engine::DEFAULT_PIPELINE_DEPTH,
                 predict_min_prob: 0.0,
                 partial_load_fraction: 1.0,
                 pin_after_observations: 0,

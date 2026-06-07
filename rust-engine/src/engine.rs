@@ -889,6 +889,16 @@ pub const DEFAULT_MAX_CONCURRENT_PREFETCHES: usize = 64;
 /// burst of concurrent prefetches without spurious failures.
 pub const DEFAULT_MAX_FETCH_YIELDS: usize = 128;
 
+/// Default look-ahead **pipeline depth** for [`Engine::speculate_layer_ahead`]:
+/// how many MoE layers of compute the engine tries to keep the SSD reads
+/// running ahead of. Set to roughly `ceil(io_latency / compute_latency)`
+/// — three layers of ~77 ms SwiGLU compute (≈ 231 ms) is enough to fully
+/// hide a ~206 ms cold expert read, so the data lands resident before the
+/// execution thread reaches that layer. Tunable per-deployment via the
+/// `[storage] pipeline_depth` TOML key (serve) or `--pipeline-depth` (run);
+/// `1` reproduces the legacy single-layer look-ahead.
+pub const DEFAULT_PIPELINE_DEPTH: u32 = 3;
+
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
@@ -1044,6 +1054,16 @@ pub(crate) struct EngineSpeculation {
     /// Number of speculator predictions pulled per token (top-K size
     /// for the M arm). Defaults to the router's `top_k`.
     pub(super) speculator_topk: usize,
+    /// **Look-ahead pipeline depth** for [`Engine::speculate_layer_ahead`]:
+    /// the engine prefetches the experts of the sliding window of layers
+    /// `current_layer + 1 ..= current_layer + pipeline_depth`, so the SSD
+    /// reads for the next several layers are already in flight while the
+    /// current layer computes. Deeper look-ahead hides more of the SSD
+    /// read latency behind compute (see [`DEFAULT_PIPELINE_DEPTH`]); `1`
+    /// reproduces the legacy single-layer look-ahead. Predictions further
+    /// out are staler, so the per-layer fanout is tapered with distance to
+    /// keep low-confidence far-layer reads from flooding the SSD.
+    pub(super) pipeline_depth: u32,
     /// Cumulative speculator hit count (predictions that intersected
     /// the gate's actual top-K).
     pub(super) spec_hits: AtomicU64,
@@ -1215,6 +1235,7 @@ impl EngineSpeculation {
             locality_misses: AtomicU64::new(0),
             speculator: None,
             speculator_topk: speculator_topk_default,
+            pipeline_depth: DEFAULT_PIPELINE_DEPTH,
             spec_hits: AtomicU64::new(0),
             spec_misses: AtomicU64::new(0),
             spec_top1_matches: AtomicU64::new(0),
@@ -1741,6 +1762,18 @@ impl Engine {
         spec.spawn_training_worker();
         self.speculation.speculator = Some(spec);
         self.speculation.speculator_topk = top_k.max(1);
+        self
+    }
+
+    /// Set the look-ahead **pipeline depth** — how many MoE layers ahead
+    /// [`Self::speculate_layer_ahead`] prefetches (the sliding window
+    /// `current_layer + 1 ..= current_layer + depth`). Sized to roughly
+    /// `ceil(io_latency / compute_latency)` so the SSD reads for the next
+    /// several layers complete behind the current layer's compute; see
+    /// [`DEFAULT_PIPELINE_DEPTH`]. Clamped to at least `1` (a value of `1`
+    /// reproduces the legacy single-layer look-ahead).
+    pub fn with_pipeline_depth(mut self, depth: u32) -> Self {
+        self.speculation.pipeline_depth = depth.max(1);
         self
     }
 
@@ -2706,22 +2739,36 @@ impl Engine {
 
     /// **Layer-ahead speculation (Part 1).** While layer `current_layer`
     /// is about to run, ask the neural speculator which experts the
-    /// *next* layer (`current_layer + 1`) will most likely activate and
-    /// kick off their prefetches now, so the io_uring reads for `L+1`
-    /// are in flight during `L`'s compute. By the time the router
-    /// reaches `L+1`, S ∪ L ∪ M for that layer has been submitted a full
-    /// layer-compute earlier — the difference between a blocking SSD
-    /// stall and a sub-millisecond cache hit.
+    /// *upcoming* layers in the sliding window
+    /// `current_layer + 1 ..= current_layer + pipeline_depth` will most
+    /// likely activate and kick off their prefetches now, so the io_uring
+    /// reads for those layers are in flight during `L`'s compute. By the
+    /// time the router reaches `L+d`, that layer's predicted experts have
+    /// had up to `d` layer-computes of head start — enough, at the default
+    /// `pipeline_depth = 3`, to bury a ~206 ms cold expert read under
+    /// ~231 ms of overlapping SwiGLU compute, turning a blocking SSD stall
+    /// into a sub-millisecond cache hit. A windowed (rather than single
+    /// farthest-layer) look-ahead is robust to dropped speculative
+    /// prefetches: every layer in the pipeline is kept primed, so one
+    /// dropped read cannot leave a hole that stalls a later layer.
     ///
     /// The feature fed to M is the residual stream *entering* `L` (the
-    /// `x` already on hand), which is one layer stale for `L+1`. That is
-    /// acceptable: the speculator is only a prefetch hint, exactly the
-    /// staleness `speculator_predict_and_train` already tolerates.
+    /// `x` already on hand), which is increasingly stale for layers
+    /// further out in the window. That is acceptable: the speculator is
+    /// only a prefetch hint, exactly the staleness
+    /// `speculator_predict_and_train` already tolerates. Because deeper
+    /// predictions are staler (and therefore lower-confidence), the
+    /// per-layer fanout is **tapered with distance** — full
+    /// `speculator_topk` at `L+1`, narrower further out — so low-value
+    /// far-layer guesses don't flood the SSD bandwidth the near layers
+    /// depend on. Nearer layers are also issued first, so they win the
+    /// shadow buffers under contention.
     ///
     /// No-op (and zero added latency) when the speculator is absent, the
-    /// hidden width disagrees, the layer-count geometry is unknown
-    /// (`num_experts_per_layer` not configured), or `L+1` is past the
-    /// last layer. Predicted ids draw from the shadow (Buffer B) pool
+    /// hidden width disagrees, or the layer-count geometry is unknown
+    /// (`num_experts_per_layer` not configured). Layers past the last one
+    /// yield no predictions (`predict_topk_for_layer` returns empty) and
+    /// are skipped. Predicted ids draw from the shadow (Buffer B) pool
     /// like every other speculative prefetch, so a wrong guess can never
     /// steal a buffer from a real miss.
     fn speculate_layer_ahead(self: &Arc<Self>, x: &[f32], current_layer: u32) {
@@ -2737,16 +2784,36 @@ impl Engine {
             // slice, so layer-ahead prediction is disabled.
             return;
         };
-        let next_layer = current_layer + 1;
-        let preds =
-            spec.predict_topk_for_layer(x, next_layer, per_layer, self.speculation.speculator_topk);
-        for id in preds {
-            let canon = self.resolve_alias(id);
-            if !self.core.cache.contains(canon) {
-                // Flat 0.5 mirrors the speculator's probability tag in
-                // `union_prefetch`; the shadow-pool bound and prefetch
-                // semaphore keep this look-ahead from over-committing.
-                self.spawn_prefetch(canon, 0.5);
+        let depth = self.speculation.pipeline_depth.max(1);
+        let base_k = self.speculation.speculator_topk;
+        // Walk the look-ahead window nearest-first so the most valuable
+        // (least stale) layers acquire shadow buffers before the deeper,
+        // lower-confidence ones under contention.
+        for distance in 1..=depth {
+            let Some(next_layer) = current_layer.checked_add(distance) else {
+                break;
+            };
+            // Taper the fanout with distance: full `speculator_topk` at
+            // `L+1`, then `topk / distance` (at least 1) further out. This
+            // keeps the SSD bandwidth focused on the high-confidence near
+            // layers rather than flooding it with stale far-layer guesses.
+            let k = (base_k / distance as usize).max(1);
+            let preds = spec.predict_topk_for_layer(x, next_layer, per_layer, k);
+            // A past-the-last-layer index yields no predictions; the
+            // remaining (even deeper) layers can only be emptier, so stop.
+            if preds.is_empty() {
+                break;
+            }
+            // Confidence tag decays with distance, mirroring the taper —
+            // surfaced in the prefetch-complete debug log.
+            let prob = 0.5 / distance as f64;
+            for id in preds {
+                let canon = self.resolve_alias(id);
+                if !self.core.cache.contains(canon) {
+                    // The shadow-pool bound and prefetch semaphore keep
+                    // this windowed look-ahead from over-committing.
+                    self.spawn_prefetch(canon, prob);
+                }
             }
         }
     }
@@ -4475,6 +4542,117 @@ mod tests {
         assert_eq!(affinity.affinity(1, 0, 1), 3, "co-fired three times");
         // No leakage into layer 0's matrix.
         assert!(affinity.neighbors(0, 0, 2).is_empty(), "layer 0 must be untouched");
+    }
+
+    /// **Windowed depth-N look-ahead (`speculate_layer_ahead`).** With a
+    /// layer-qualified geometry, an installed speculator, and
+    /// `pipeline_depth = 3`, driving `moe_step` for layer 0 must submit
+    /// speculative prefetches for the sliding window of layers
+    /// `1 ..= 3` — not just the next layer. We detect the depth by
+    /// asserting that at least one expert from a layer `>= 2` (global id
+    /// `>= 2 * per_layer`, unreachable with the legacy single-layer
+    /// look-ahead) becomes resident after the look-ahead fires. The
+    /// `pipeline_depth = 1` control must never reach those layers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn speculate_layer_ahead_primes_window_of_upcoming_layers() {
+        async fn deepest_prefetched_layer(pipeline_depth: u32, per_layer: u32) -> u32 {
+            let dir = TempDir::new("layer-ahead-window");
+            let num_layers: usize = 4;
+            let total_experts: u32 = per_layer * num_layers as u32;
+            let d_model = 16usize;
+            let d_ff = 32usize;
+            let seed: u64 = 0x1234_5678_9ABC_DEF0;
+
+            let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+            let block_align = 4096usize;
+            let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+            generate_synthetic_experts(&dir.path, total_experts, expert_size, d_model, d_ff)
+                .expect("generate synthetic experts");
+
+            let storage = Arc::new(
+                NvmeStorage::new(StorageConfig {
+                    base_path: dir.path.clone(),
+                    expert_size,
+                    block_align,
+                    use_direct_io: false,
+                    num_experts_per_layer: Some(per_layer),
+                })
+                .expect("storage init"),
+            );
+            storage.warmup_fds(0..total_experts).expect("pre-open fds");
+
+            // Generous pool so neither the foreground misses nor the
+            // speculative window starve for buffers in this test.
+            let pool = BufferPool::new(total_experts as usize + 8, expert_size, block_align);
+            let cache = Arc::new(MultiLayerExpertCache::single_layer(total_experts as usize));
+            let router = Router::Markov(Arc::new(TopKRouter::new(total_experts, 2, seed)));
+            let predictor = Arc::new(PredictiveLoader::new(total_experts, 2, 0.05, seed));
+            let spec = Arc::new(NeuralSpeculator::new(d_model, 8, total_experts, seed));
+
+            let engine = Arc::new(
+                Engine::new(
+                    cache,
+                    pool,
+                    storage,
+                    router,
+                    predictor,
+                    ModelShape { d_model, d_ff, hidden_seed: seed },
+                )
+                .with_speculator(spec, /*top_k=*/ 2)
+                .with_pipeline_depth(pipeline_depth),
+            );
+
+            // Fire the windowed look-ahead in isolation (calling
+            // `speculate_layer_ahead` directly rather than `moe_step`, so
+            // the global `union_prefetch` arm — which primes arbitrary
+            // layers regardless of `pipeline_depth` — doesn't confound the
+            // depth measurement). The window spans layers
+            // `1 ..= pipeline_depth` off the residual entering layer 0.
+            let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
+            engine.speculate_layer_ahead(&hidden, /*current_layer=*/ 0);
+
+            // The look-ahead spawns one prefetch per predicted id with the
+            // distance-tapered fanout (full `top_k` at L+1, `top_k/distance`
+            // further out). Against an initially-empty cache none are deduped,
+            // so this is exactly how many background reads must complete.
+            let top_k = 2usize;
+            let expected_spawns: u64 = (1..=pipeline_depth)
+                .map(|distance| (top_k / distance as usize).max(1) as u64)
+                .sum();
+
+            // Speculative prefetches run on background tasks; wait for the
+            // expected number to complete (bounded), then measure how many
+            // layers deep the primed experts reach.
+            let mut deepest = 0u32;
+            for _ in 0..300 {
+                if engine.report().prefetch_completed >= expected_spawns {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            for id in 0..total_experts {
+                if engine.core.cache.contains(id) {
+                    deepest = deepest.max(id / per_layer);
+                }
+            }
+            deepest
+        }
+
+        let per_layer: u32 = 4;
+        // Depth 3 must reach at least layer 2 (ids >= 8) — only possible
+        // because the look-ahead window spans multiple upcoming layers.
+        let deep = deepest_prefetched_layer(3, per_layer).await;
+        assert!(
+            deep >= 2,
+            "pipeline_depth=3 must prime experts at least 2 layers ahead (got deepest layer {deep})"
+        );
+        // Depth 1 is the legacy single-layer look-ahead: it can only ever
+        // reach layer 1, never layer 2+.
+        let shallow = deepest_prefetched_layer(1, per_layer).await;
+        assert!(
+            shallow <= 1,
+            "pipeline_depth=1 must never prime beyond the next layer (got deepest layer {shallow})"
+        );
     }
 
     /// `AlignedKvCache::append` extends the resident window until

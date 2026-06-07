@@ -152,6 +152,15 @@ enum Cmd {
         /// Predictive prefetch fanout (how many candidates to issue per token).
         #[arg(long, default_value_t = 2)]
         predict_fanout: usize,
+        /// **Look-ahead pipeline depth.** In serve mode, controls how many MoE
+        /// layers ahead the speculator prefetches (the sliding window
+        /// `layer + 1 ..= layer + pipeline_depth`), hiding cold SSD reads behind
+        /// compute. `1` reproduces the legacy single-layer look-ahead.
+        ///
+        /// In `run`, this currently only scales speculative prefetch headroom
+        /// (shadow buffer budget = `predict_fanout * pipeline_depth`).
+        #[arg(long, default_value_t = crate::engine::DEFAULT_PIPELINE_DEPTH)]
+        pipeline_depth: u32,
         /// Don't prefetch below this transition probability. The default
         /// (`0.0`) auto-scales the threshold to `1 / (num_experts * 4)` so
         /// it remains achievable as the expert pool grows; pass an
@@ -498,6 +507,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gate_weights,
                     trace_out,
                     gpu,
+                    pipeline_depth,
                 } = cli.cmd
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
@@ -533,6 +543,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         gate_weights,
                         trace_out,
                         gpu_expert_cache: if gpu { run_gpu_cache.clone() } else { None },
+                        pipeline_depth,
                         },
                         startup_pinned,
                     )
@@ -769,12 +780,17 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // **primary** (Buffer A) half that backs the resident LRU plus one
     // reserved slot the foreground miss path is always guaranteed, and a
     // **shadow** (Buffer B) half that backs speculative look-ahead
-    // prefetches. Sizing the shadow half to the prefetch fanout
-    // (pipeline_depth = 1 layer ahead) means a layer-ahead speculation
-    // can never steal the buffer a real cache miss needs. A fanout of 0
+    // prefetches. The shadow half is sized to the prefetch fanout scaled
+    // by the look-ahead `pipeline_depth` (`predict_fanout * pipeline_depth`)
+    // so a depth-N windowed look-ahead (`speculate_layer_ahead` priming
+    // `layer + 1 ..= layer + pipeline_depth`) has a buffer per in-flight
+    // layer and can never steal the buffer a real cache miss needs. The
+    // prefetch semaphore is derived from this shadow capacity in
+    // `Engine::with_options`, so it scales automatically. A fanout of 0
     // disables Buffer B and the engine falls back to the legacy
     // single-pool prefetch path.
-    let shadow_slots = cfg.storage.predict_fanout;
+    let pipeline_depth = cfg.storage.pipeline_depth.max(1) as usize;
+    let shadow_slots = cfg.storage.predict_fanout.saturating_mul(pipeline_depth);
     let primary_slots = cfg.storage.cache_slots + 1;
     let pool = if shadow_slots > 0 {
         BufferPool::new_with_shadow(
@@ -945,6 +961,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             max_fetch_yields: cfg.real_transformer.max_fetch_yields,
         },
     );
+    // Apply the configured look-ahead pipeline depth (`[storage]
+    // pipeline_depth`). Controls how many layers ahead
+    // `speculate_layer_ahead` primes; sized in tandem with the shadow
+    // buffer-pool budget above.
+    engine_builder = engine_builder.with_pipeline_depth(cfg.storage.pipeline_depth);
     // Attach the speculative-architecture components requested via
     // the `[predictive]` config section. Sized against the global
     // expert namespace (see `total_experts` above) so multi-layer
@@ -1368,6 +1389,7 @@ struct RunArgs {
     gate_weights: Option<PathBuf>,
     trace_out: Option<PathBuf>,
     gpu_expert_cache: Option<Arc<crate::expert_cache::GpuExpertCache>>,
+    pipeline_depth: u32,
 }
 
 async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -1596,11 +1618,21 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     });
     storage.warmup_fds(0..args.num_experts)?;
 
-    let prefetch_headroom = if args.no_prefetch { 0 } else { args.predict_fanout.max(1) };
+    let pipeline_depth = args.pipeline_depth.max(1) as usize;
+    let prefetch_headroom = if args.no_prefetch || args.predict_fanout == 0 {
+        0
+    } else {
+        // Scale the speculative headroom by the look-ahead pipeline depth:
+        // a depth-N windowed look-ahead (`speculate_layer_ahead` priming
+        // `layer + 1 ..= layer + pipeline_depth`) needs a shadow buffer per
+        // in-flight layer. The prefetch semaphore is derived from this
+        // shadow capacity in `Engine::with_options`, so it scales with it.
+        args.predict_fanout.saturating_mul(pipeline_depth)
+    };
     // Double-buffered pool: primary (Buffer A) = resident LRU + one
     // reserved foreground slot; shadow (Buffer B) = speculative
-    // look-ahead prefetches (sized to the prefetch fanout). See
-    // `cmd_serve` for the full rationale. `--no-prefetch` (headroom 0)
+    // look-ahead prefetches (sized to `predict_fanout * pipeline_depth`).
+    // See `cmd_serve` for the full rationale. `--no-prefetch` (headroom 0)
     // disables Buffer B and keeps the legacy single-pool layout.
     let shadow_slots = prefetch_headroom;
     let primary_slots = args.cache_slots + 1;
@@ -1619,7 +1651,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 budget_mib = budget / (1024 * 1024),
                 total_ram_mib = total_ram / (1024 * 1024),
                 "buffer pool ({} slots × {:.1} MiB/expert) exceeds 1/4 of total RAM. \
-                 Lower --cache-slots / --predict-fanout or risk OOM / heavy swapping.",
+                 Lower --cache-slots / --predict-fanout / --pipeline-depth or risk OOM / heavy swapping.",
                 pool_slots,
                 args.expert_size as f64 / (1024.0 * 1024.0)
             );
@@ -1630,7 +1662,8 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         cache_slots = args.cache_slots,
         pool_slots = pool_slots,
         prefetch_headroom = prefetch_headroom,
-        "buffer pool sized with prefetch headroom"
+        pipeline_depth = pipeline_depth,
+        "buffer pool sized with prefetch headroom (shadow = predict_fanout × pipeline_depth)"
     );
     let pool = if shadow_slots > 0 {
         BufferPool::new_with_shadow(
@@ -1701,6 +1734,11 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         if let Some(gpu_cache) = args.gpu_expert_cache.clone() {
             base.install_gpu_cache(gpu_cache);
         }
+        // Apply the configured look-ahead pipeline depth (sized in tandem
+        // with the shadow buffer-pool budget above). No-op for the legacy
+        // Markov path (no speculator installed); takes effect when a
+        // speculator drives `speculate_layer_ahead`.
+        let base = base.with_pipeline_depth(args.pipeline_depth);
         // Optional alias map (Change 6: expert deduplication).
         match args.alias_map_path.as_ref() {
             Some(path) => {
