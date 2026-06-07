@@ -152,12 +152,13 @@ enum Cmd {
         /// Predictive prefetch fanout (how many candidates to issue per token).
         #[arg(long, default_value_t = 2)]
         predict_fanout: usize,
-        /// **Look-ahead pipeline depth.** How many MoE layers ahead the
-        /// speculator prefetches (the sliding window `layer + 1 ..= layer +
-        /// pipeline_depth`), hiding cold SSD reads behind compute. Set to
-        /// roughly `ceil(io_latency / compute_latency)`; `1` reproduces the
-        /// legacy single-layer look-ahead. Also scales the shadow buffer-pool
-        /// budget (`predict_fanout * pipeline_depth`).
+        /// **Look-ahead pipeline depth.** In serve mode, controls how many MoE
+        /// layers ahead the speculator prefetches (the sliding window
+        /// `layer + 1 ..= layer + pipeline_depth`), hiding cold SSD reads behind
+        /// compute. `1` reproduces the legacy single-layer look-ahead.
+        ///
+        /// In `run`, this currently only scales speculative prefetch headroom
+        /// (shadow buffer budget = `predict_fanout * pipeline_depth`).
         #[arg(long, default_value_t = crate::engine::DEFAULT_PIPELINE_DEPTH)]
         pipeline_depth: u32,
         /// Don't prefetch below this transition probability. The default
