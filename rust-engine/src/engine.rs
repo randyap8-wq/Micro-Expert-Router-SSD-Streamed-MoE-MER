@@ -2777,15 +2777,48 @@ impl Engine {
         layer: Option<u32>,
     ) {
         // Locality (L) arm — the monitor's current hot set, or empty.
-        let locality_ids: Vec<u32> = self
+        let mut locality_ids: Vec<u32> = self
             .speculation
             .locality
             .as_ref()
             .map(|m| m.hot_set(self.speculation.locality_threshold_pct))
             .unwrap_or_default();
-        // Fuse S ∪ L ∪ M with the documented unified weighting.
-        let mut scored =
-            self.core.predictor.combine_unified_arms(s_markov, &locality_ids, m_speculator);
+
+        // If expert aliasing is enabled, canonicalize ids *before* scoring so
+        // evidence isn't split across aliases and neighbour folds operate on
+        // the same ids the cache ultimately uses.
+        let mut scored = if self.speculation.alias_map.is_some() {
+            // Canonicalize + dedupe flat-weight arms after alias resolution.
+            for id in locality_ids.iter_mut() {
+                *id = self.resolve_alias(*id);
+            }
+            locality_ids.sort_unstable();
+            locality_ids.dedup();
+
+            let mut speculator_ids: Vec<u32> =
+                m_speculator.iter().map(|&id| self.resolve_alias(id)).collect();
+            speculator_ids.sort_unstable();
+            speculator_ids.dedup();
+
+            // Canonicalize Markov ids, keeping the max probability when multiple ids
+            // map to the same canonical expert.
+            let mut markov: HashMap<u32, f64> = HashMap::new();
+            for &(id, p) in s_markov {
+                let canon = self.resolve_alias(id);
+                markov
+                    .entry(canon)
+                    .and_modify(|cur| *cur = cur.max(p))
+                    .or_insert(p);
+            }
+            let markov: Vec<(u32, f64)> = markov.into_iter().collect();
+            self.core
+                .predictor
+                .combine_unified_arms(&markov, &locality_ids, &speculator_ids)
+        } else {
+            self.core
+                .predictor
+                .combine_unified_arms(s_markov, &locality_ids, m_speculator)
+        };
         // Optional affinity + spatial neighbour fold: for every
         // high-confidence seed, pull its top co-fired (per-layer
         // affinity) and disk-adjacent (UTH spatial) neighbours into the
