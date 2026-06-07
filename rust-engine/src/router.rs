@@ -1255,6 +1255,55 @@ impl NeuralSpeculator {
         idx
     }
 
+    /// Predict the top-`k` expert ids **restricted to a single layer's
+    /// slice of the global id space** (Part 1, layer-ahead prefetch).
+    ///
+    /// Expert ids in this engine are layer-qualified global ids:
+    /// `global = layer * per_layer + local`. The speculator's output
+    /// head spans every global id, so to predict the experts that will
+    /// fire in a *specific* layer we score the full logit vector and
+    /// then keep only the ids falling in that layer's window
+    /// `[layer * per_layer, (layer + 1) * per_layer)`. This lets
+    /// `moe_step` ask "what will layer L+1 want?" while it is still
+    /// computing layer L, so the io_uring reads for L+1 are in flight a
+    /// full layer-compute early.
+    ///
+    /// Returns global ids in descending-logit order (ties broken by
+    /// ascending id, matching [`predict_topk`]). An out-of-range layer,
+    /// `per_layer == 0`, `k == 0`, or a mismatched feature width yields
+    /// an empty vector. Non-finite logits (only possible if the weights
+    /// diverge) sort as equal, matching [`predict_topk`] /
+    /// [`predict_topk_with_probs`]; a wrong but bounded ranking is
+    /// acceptable for a prefetch hint.
+    pub fn predict_topk_for_layer(
+        &self,
+        x: &[f32],
+        layer: u32,
+        per_layer: u32,
+        k: usize,
+    ) -> Vec<u32> {
+        if k == 0 || per_layer == 0 || x.len() != self.d_model {
+            return Vec::new();
+        }
+        let n = self.num_experts;
+        let base = match layer.checked_mul(per_layer) {
+            Some(b) if b < n => b,
+            _ => return Vec::new(),
+        };
+        let end = base.saturating_add(per_layer).min(n);
+        let logits = self.forward(x);
+        let mut idx: Vec<(u32, f32)> = (base..end)
+            .map(|i| (i, logits[i as usize]))
+            .collect();
+        idx.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        idx.truncate(k.min((end - base) as usize));
+        idx.into_iter().map(|(i, _)| i).collect()
+    }
+
     /// One step of online SGD against a soft-target distribution that
     /// places mass `1/|actual|` on each id in `actual_top_k` and 0
     /// elsewhere. The loss is cross-entropy on top of softmax; the
@@ -2483,6 +2532,63 @@ mod tests {
         // Sorted descending by probability.
         for w in preds.windows(2) {
             assert!(w[0].1 + 1e-6 >= w[1].1);
+        }
+    }
+
+    #[test]
+    fn speculator_predict_topk_for_layer_restricts_to_window() {
+        // 3 layers * 4 experts/layer = 12 global ids.
+        let s = NeuralSpeculator::new(8, 16, 12, 5);
+        let x: Vec<f32> = (0..8).map(|i| (i as f32).cos()).collect();
+        let per_layer = 4u32;
+        for layer in 0..3u32 {
+            let preds = s.predict_topk_for_layer(&x, layer, per_layer, 2);
+            assert!(preds.len() <= 2);
+            let base = layer * per_layer;
+            for id in preds {
+                assert!(
+                    (base..base + per_layer).contains(&id),
+                    "id {id} outside layer {layer} window [{base},{})",
+                    base + per_layer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn speculator_predict_topk_for_layer_descending_and_deterministic() {
+        let s = NeuralSpeculator::new(8, 16, 12, 9);
+        let x: Vec<f32> = vec![0.2; 8];
+        // Full window, ranked: must be descending by the slice's logits.
+        let preds = s.predict_topk_for_layer(&x, 1, 4, 4);
+        assert_eq!(preds.len(), 4);
+        let logits = s.forward(&x);
+        for w in preds.windows(2) {
+            assert!(
+                logits[w[0] as usize] >= logits[w[1] as usize],
+                "not descending by logit"
+            );
+        }
+        // Deterministic.
+        assert_eq!(preds, s.predict_topk_for_layer(&x, 1, 4, 4));
+    }
+
+    #[test]
+    fn speculator_predict_topk_for_layer_guards_invalid_input() {
+        let s = NeuralSpeculator::new(4, 8, 8, 1); // 8 global ids
+        // per_layer == 0 -> empty.
+        assert!(s.predict_topk_for_layer(&[0.1; 4], 0, 0, 2).is_empty());
+        // k == 0 -> empty.
+        assert!(s.predict_topk_for_layer(&[0.1; 4], 0, 4, 0).is_empty());
+        // Wrong feature width -> empty (no panic).
+        assert!(s.predict_topk_for_layer(&[0.1; 8], 0, 4, 2).is_empty());
+        // Layer past the id space -> empty (base = 4*4 = 16 >= 8).
+        assert!(s.predict_topk_for_layer(&[0.1; 4], 4, 4, 2).is_empty());
+        // Final partial window is clamped to the id count (base 4, end min(8,8)).
+        let last = s.predict_topk_for_layer(&[0.1; 4], 1, 4, 9);
+        assert!(last.len() <= 4);
+        for id in last {
+            assert!((4..8).contains(&id));
         }
     }
 

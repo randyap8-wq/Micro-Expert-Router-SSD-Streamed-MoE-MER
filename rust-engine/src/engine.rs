@@ -1121,9 +1121,28 @@ impl EngineCore {
         // disabled entirely for this configuration rather than starving
         // the critical path.
         let pool_headroom = pool.capacity().saturating_sub(cache.capacity());
-        let prefetch_permits = options
-            .max_concurrent_prefetches
-            .min(pool_headroom.saturating_sub(1));
+        let prefetch_permits = if pool.shadow_capacity() > 0 {
+            // Double-buffered layout: speculative look-ahead prefetches
+            // draw exclusively from the **shadow** (Buffer B) half of the
+            // pool, which is fully reserved for them. The primary (Buffer
+            // A) half backs the resident LRU and the foreground miss
+            // path, so speculation can never starve a real cache miss no
+            // matter how many prefetches are in flight. Bound concurrency
+            // by the shadow capacity directly — there is no need to
+            // reserve a primary headroom slot because the two halves no
+            // longer share buffers.
+            options
+                .max_concurrent_prefetches
+                .min(pool.shadow_capacity())
+        } else {
+            // Legacy single-pool layout: speculation shares the primary
+            // pool with the resident LRU, so reserve one headroom slot
+            // exclusively for the critical path (see the long-form
+            // rationale above) by subtracting one from the headroom.
+            options
+                .max_concurrent_prefetches
+                .min(pool_headroom.saturating_sub(1))
+        };
         Self {
             cache,
             pool,
@@ -2378,14 +2397,63 @@ impl Engine {
             if me.core.cache.contains(id) {
                 return;
             }
-            // Prefetches are *speculative*. They must never evict resident
-            // experts (which could starve a real cache miss) and must never
-            // block waiting for a buffer (same reason). The buffer pool is
-            // sized with extra slots specifically for in-flight prefetches.
-            let mut buf = match me.core.pool.try_acquire() {
+            // **Get-or-wait join (Part 3).** Register this prefetch in
+            // the singleflight `in_flight` map *before* issuing the
+            // read, using the exact same leader/follower protocol as
+            // `fetch_with_retry`. The payoff: a foreground cache miss
+            // for the same id (the gate reaching a layer whose experts
+            // we predicted a layer ahead) becomes a *follower* that
+            // parks on this prefetch's `Notify` and re-checks the cache
+            // when it lands — turning what used to be a duplicate
+            // blocking SSD read into a sub-millisecond wait on an
+            // already-in-flight speculation. If someone else (a
+            // foreground leader, or another prefetch) already owns the
+            // in-flight slot, there is nothing useful to do: they are
+            // already fetching this id, so drop.
+            let notify = match me.core.in_flight.entry(id) {
+                dashmap::mapref::entry::Entry::Occupied(_) => return,
+                dashmap::mapref::entry::Entry::Vacant(vac) => {
+                    let n = Arc::new(Notify::new());
+                    vac.insert(n.clone());
+                    n
+                }
+            };
+            // The guard removes the in-flight slot and notifies every
+            // parked follower on *every* exit path below (buffer-starved
+            // early return, read error, or success). Followers then
+            // re-check the cache: a hit on success, or a re-contention
+            // for leadership on failure — never a wedged stale entry.
+            let _guard = SingleflightLeaderGuard {
+                map: me.core.in_flight.clone(),
+                id,
+                notify,
+                armed: true,
+            };
+            // **Double-buffered acquire (Part 2).** Speculation draws
+            // from the **shadow** (Buffer B) half of the pool, never the
+            // primary (Buffer A) half that backs the resident LRU and
+            // the foreground miss path. This is the invariant that
+            // protects compute on Buffer A: a speculative look-ahead can
+            // never steal the buffer a real cache miss needs. When the
+            // shadow half is disabled (legacy single-pool configs that
+            // call `BufferPool::new`), fall back to the previous
+            // non-evicting primary `try_acquire` so those deployments
+            // keep prefetching exactly as before. Either way we *never*
+            // block or evict: a busy pool simply drops the speculative
+            // load.
+            let mut buf = match me.core.pool.try_acquire_shadow() {
                 Some(b) => b,
+                None if me.core.pool.shadow_capacity() == 0 => {
+                    match me.core.pool.try_acquire() {
+                        Some(b) => b,
+                        None => {
+                            debug!(expert = id, "skipping prefetch: pool busy");
+                            return;
+                        }
+                    }
+                }
                 None => {
-                    debug!(expert = id, "skipping prefetch: pool busy");
+                    debug!(expert = id, "skipping prefetch: shadow pool busy");
                     return;
                 }
             };
@@ -2396,11 +2464,26 @@ impl Engine {
                     me.metrics.counters
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                    // **Self-balancing shadow accounting.** We insert the
+                    // resident still holding its *shadow*-tagged buffer
+                    // rather than calling `BufferPool::promote_shadow`
+                    // first. Promotion permanently re-tags the slot as
+                    // primary, so on eviction it would return to the
+                    // primary free-list — over a long-running serve every
+                    // confirmed-then-evicted prefetch would migrate one
+                    // buffer from shadow to primary, draining Buffer B to
+                    // zero and silently disabling look-ahead. Keeping the
+                    // buffer shadow-tagged means it returns to the shadow
+                    // free-list on eviction, holding Buffer B's capacity
+                    // constant for the life of the process. The bytes are
+                    // identical either way (promotion only changes the
+                    // drop destination), and a shadow-backed resident
+                    // serves cache hits exactly like a primary-backed one.
                     let resident = Arc::new(ExpertResident::new(id, buf));
                     // Prefetches are best-effort: if the cache rejects
                     // the insert (every slot pinned), the resident drops
-                    // here and its buffer returns to the pool — exactly
-                    // the right behaviour for a speculative load.
+                    // here and its buffer returns to the shadow pool —
+                    // exactly the right behaviour for a speculative load.
                     if let Err(_rejected) = me.core.cache.insert(resident) {
                         debug!(
                             expert = id,
@@ -2414,6 +2497,9 @@ impl Engine {
                         elapsed_us = started.elapsed().as_micros() as u64,
                         "prefetch complete"
                     );
+                    // `_guard` drops here: the in-flight slot is removed
+                    // and any foreground follower waiting on this id is
+                    // woken to re-check the cache — where it now hits.
                 }
                 Err(e) => warn!(expert = id, error = %e, "prefetch failed"),
             }
@@ -2549,6 +2635,53 @@ impl Engine {
         preds
     }
 
+    /// **Layer-ahead speculation (Part 1).** While layer `current_layer`
+    /// is about to run, ask the neural speculator which experts the
+    /// *next* layer (`current_layer + 1`) will most likely activate and
+    /// kick off their prefetches now, so the io_uring reads for `L+1`
+    /// are in flight during `L`'s compute. By the time the router
+    /// reaches `L+1`, S ∪ L ∪ M for that layer has been submitted a full
+    /// layer-compute earlier — the difference between a blocking SSD
+    /// stall and a sub-millisecond cache hit.
+    ///
+    /// The feature fed to M is the residual stream *entering* `L` (the
+    /// `x` already on hand), which is one layer stale for `L+1`. That is
+    /// acceptable: the speculator is only a prefetch hint, exactly the
+    /// staleness `speculator_predict_and_train` already tolerates.
+    ///
+    /// No-op (and zero added latency) when the speculator is absent, the
+    /// hidden width disagrees, the layer-count geometry is unknown
+    /// (`num_experts_per_layer` not configured), or `L+1` is past the
+    /// last layer. Predicted ids draw from the shadow (Buffer B) pool
+    /// like every other speculative prefetch, so a wrong guess can never
+    /// steal a buffer from a real miss.
+    fn speculate_layer_ahead(self: &Arc<Self>, x: &[f32], current_layer: u32) {
+        let Some(spec) = self.speculation.speculator.as_ref() else {
+            return;
+        };
+        if x.len() != spec.d_model() {
+            return;
+        }
+        let Some(per_layer) = self.core.storage.config().num_experts_per_layer else {
+            // Without a layer-qualified id geometry we cannot restrict
+            // the speculator's global output head to the next layer's
+            // slice, so layer-ahead prediction is disabled.
+            return;
+        };
+        let next_layer = current_layer + 1;
+        let preds =
+            spec.predict_topk_for_layer(x, next_layer, per_layer, self.speculation.speculator_topk);
+        for id in preds {
+            let canon = self.resolve_alias(id);
+            if !self.core.cache.contains(canon) {
+                // Flat 0.5 mirrors the speculator's probability tag in
+                // `union_prefetch`; the shadow-pool bound and prefetch
+                // semaphore keep this look-ahead from over-committing.
+                self.spawn_prefetch(canon, 0.5);
+            }
+        }
+    }
+
     /// Prefetch every id in the union `S ∪ L ∪ M` that isn't already
     /// resident — the **speculative I/O union-fetch** described in the
     /// design spec. `s_markov` is the predictor's Markov-chain top-K
@@ -2568,25 +2701,65 @@ impl Engine {
         // enough to be visibly different in the prefetch logs from
         // a real Markov-chain prediction).
         let mut seen: HashSet<u32> = already_in_flight.clone();
+        // Collect the deduplicated S ∪ L ∪ M candidate set with each
+        // id's best-evidence probability, *then* rank and truncate
+        // before spawning (Part 4.3). When the shadow (Buffer B) half
+        // cannot hold the whole union, we want to keep the
+        // highest-expected-value experts rather than whichever arm
+        // happened to be iterated first — so a confident 2nd-order
+        // Markov prediction (p≈0.9) is never dropped in favour of an
+        // opportunistic locality/speculator id (flat p=0.5). If an id
+        // appears in more than one arm we keep its largest probability.
+        let mut candidates: Vec<(u32, f64)> = Vec::new();
+        let mut push = |seen: &mut HashSet<u32>, candidates: &mut Vec<(u32, f64)>, canon: u32, p: f64| {
+            if seen.insert(canon) {
+                candidates.push((canon, p));
+            } else if let Some((_, existing_p)) = candidates.iter_mut().find(|(id, _)| *id == canon) {
+                if p > *existing_p {
+                    *existing_p = p;
+                }
+            }
+        };
         for &(id, p) in s_markov {
             let canon = self.resolve_alias(id);
-            if seen.insert(canon) && !self.core.cache.contains(canon) {
-                self.spawn_prefetch(canon, p);
+            if !self.core.cache.contains(canon) {
+                push(&mut seen, &mut candidates, canon, p);
             }
         }
         if let Some(monitor) = self.speculation.locality.as_ref() {
             for id in monitor.hot_set(self.speculation.locality_threshold_pct) {
                 let canon = self.resolve_alias(id);
-                if seen.insert(canon) && !self.core.cache.contains(canon) {
-                    self.spawn_prefetch(canon, 0.5);
+                if !self.core.cache.contains(canon) {
+                    push(&mut seen, &mut candidates, canon, 0.5);
                 }
             }
         }
         for &id in m_speculator {
             let canon = self.resolve_alias(id);
-            if seen.insert(canon) && !self.core.cache.contains(canon) {
-                self.spawn_prefetch(canon, 0.5);
+            if !self.core.cache.contains(canon) {
+                push(&mut seen, &mut candidates, canon, 0.5);
             }
+        }
+        // Rank by probability descending so the highest-EV predictions
+        // are submitted first and survive truncation. Probabilities
+        // originate from the Markov predictor (finite by construction)
+        // or the flat 0.5 locality/speculator tag, so NaN is not
+        // expected; if one ever appears it sorts as equal rather than
+        // panicking, which at worst mis-orders one prefetch hint.
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Truncate to the shadow-slot budget: in-flight speculation can
+        // never exceed Buffer B's capacity, so anything past that would
+        // be dropped by `spawn_prefetch`'s `try_acquire_shadow` anyway.
+        // Truncating here keeps the *best* ids instead of letting
+        // arbitrary spawn ordering decide which survive. A zero shadow
+        // capacity means the legacy single-pool layout, where the
+        // semaphore alone bounds concurrency — leave the list intact.
+        let budget = self.core.pool.shadow_capacity();
+        if budget > 0 && candidates.len() > budget {
+            candidates.truncate(budget);
+        }
+        for (canon, p) in candidates {
+            self.spawn_prefetch(canon, p);
         }
     }
 
@@ -2713,6 +2886,13 @@ impl Engine {
             drop(last_last);
             self.union_prefetch(&s_markov, &m_speculator, &HashSet::new());
         }
+
+        // **Layer-ahead look-ahead (Part 1).** Independently of the
+        // current layer's union prefetch above, predict the *next*
+        // layer's experts from the residual entering this layer and
+        // submit their reads now, so they overlap this layer's compute
+        // and the next layer finds them already resident.
+        self.speculate_layer_ahead(x, layer);
 
         // Concurrent miss fetches; hits resolved inline.
         let io_wait_start = Instant::now();
