@@ -2714,6 +2714,10 @@ impl Engine {
         let mut push = |seen: &mut HashSet<u32>, candidates: &mut Vec<(u32, f64)>, canon: u32, p: f64| {
             if seen.insert(canon) {
                 candidates.push((canon, p));
+            } else if let Some((_, existing_p)) = candidates.iter_mut().find(|(id, _)| *id == canon) {
+                if p > *existing_p {
+                    *existing_p = p;
+                }
             }
         };
         for &(id, p) in s_markov {
