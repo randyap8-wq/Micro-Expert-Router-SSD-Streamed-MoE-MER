@@ -220,8 +220,8 @@ behaviour and per-token cost are unchanged:
   right-shifts the counter matrix per `affinity_decay_epoch` cumulative
   observations to prevent atomic saturation.
 * **Spatial prefetching (`router::spatial_neighbors`).** For the
-  same high-confidence seeds, the immediate UTH-layout neighbours
-  (`id ± 1`, clipped to `[0, num_experts)`) are also enqueued at a
+  same high-confidence seeds, up to two nearby UTH-layout neighbours
+  (typically `id ± 1`, but at the boundaries possibly `id ± 2`) are also enqueued at a
   small (`W_SPATIAL` = +0.05) weight. Pulling them from the SSD
   piggy-backs on the drive's sequential-read locality.
 
