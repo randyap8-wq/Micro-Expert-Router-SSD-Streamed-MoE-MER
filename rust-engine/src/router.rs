@@ -2653,6 +2653,16 @@ mod tests {
     }
 
     #[test]
+    fn unified_headline_weights_sum_to_one() {
+        // The three headline arms (speculator + markov + locality) must
+        // partition a probability of 1.0 so `combine_unified_arms` never
+        // produces a score > 1 for a single-source id. Asserting it here
+        // makes the contract a test-time guarantee independent of the
+        // per-call `debug_assert` in `combine_unified_arms`.
+        assert!((W_SPECULATOR + W_MARKOV + W_LOCALITY - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn combine_unified_arms_applies_documented_weights() {
         // The engine's hot path consumes `combine_unified_arms` with
         // precomputed arms; assert it applies the canonical weights

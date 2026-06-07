@@ -58,6 +58,22 @@ pub const KV_CACHE_BLOCK_ALIGN: usize = 4096;
 /// will keep growing until the host runs out of memory.
 pub const KV_CACHE_DEFAULT_WINDOW_TOKENS: usize = 4096;
 
+/// Decompose a **global** expert id into its `(layer, layer-local)`
+/// pair given a layer-qualified geometry of `per_layer` experts each
+/// (`global = layer * per_layer + local`). The inverse of
+/// [`layer_local_to_global`]. Callers must ensure `per_layer > 0`.
+#[inline]
+fn global_to_layer_local(global: u32, per_layer: u32) -> (u32, u32) {
+    (global / per_layer, global % per_layer)
+}
+
+/// Recompose a `(layer, layer-local)` pair into its **global** expert
+/// id. The inverse of [`global_to_layer_local`].
+#[inline]
+fn layer_local_to_global(layer: u32, local: u32, per_layer: u32) -> u32 {
+    layer * per_layer + local
+}
+
 /// **Persistent, page-aligned KV cache** complementing the per-layer
 /// paged KV cache in `transformer.rs`. The transformer module's
 /// `KvCache` is a `Vec`-backed paged cache used inside one model
@@ -2775,10 +2791,15 @@ impl Engine {
         // affinity) and disk-adjacent (UTH spatial) neighbours into the
         // prefetch set. Gated on the affinity arm being installed *and*
         // a layer-qualified id geometry being available.
-        if let (Some(affinity), Some(_layer)) = (self.speculation.affinity.as_ref(), layer) {
-            if let Some(per_layer) = self.core.storage.config().num_experts_per_layer {
-                if per_layer > 0 {
-                    scored = self.fold_affinity_spatial(scored, affinity, per_layer);
+        if let Some(affinity) = self.speculation.affinity.as_ref() {
+            // `layer` is only `Some` on the `moe_step` path, where the
+            // current MoE layer is known — the affinity fold is scoped
+            // per-layer, so skip it on the layer-less `generate` path.
+            if layer.is_some() {
+                if let Some(per_layer) = self.core.storage.config().num_experts_per_layer {
+                    if per_layer > 0 {
+                        scored = self.fold_affinity_spatial(scored, affinity, per_layer);
+                    }
                 }
             }
         }
@@ -2849,10 +2870,9 @@ impl Engine {
                 *combined.entry(nbr).or_insert(0.0) += W_SPATIAL;
             }
             // Affinity: co-occurrence within the seed's own layer.
-            let seed_layer = seed / per_layer;
-            let local = seed % per_layer;
+            let (seed_layer, local) = global_to_layer_local(seed, per_layer);
             for local_nbr in affinity.neighbors(seed_layer as usize, local, k) {
-                let global_nbr = seed_layer * per_layer + local_nbr;
+                let global_nbr = layer_local_to_global(seed_layer, local_nbr, per_layer);
                 if global_nbr < global_n {
                     *combined.entry(global_nbr).or_insert(0.0) += W_AFFINITY;
                 }
@@ -2954,7 +2974,10 @@ impl Engine {
         if let Some(affinity) = self.speculation.affinity.as_ref() {
             if let Some(per_layer) = self.core.storage.config().num_experts_per_layer {
                 if per_layer > 0 {
-                    let locals: Vec<u32> = target.iter().map(|&g| g % per_layer).collect();
+                    let locals: Vec<u32> = target
+                        .iter()
+                        .map(|&g| global_to_layer_local(g, per_layer).1)
+                        .collect();
                     affinity.observe_layer(layer as usize, &locals);
                 }
             }
