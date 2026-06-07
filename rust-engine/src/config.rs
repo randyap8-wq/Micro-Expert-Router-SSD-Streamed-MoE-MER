@@ -436,11 +436,30 @@ pub struct PredictiveConfig {
     /// decision. Defaults to the router's `top_k` when zero.
     #[serde(default)]
     pub speculator_top_k: usize,
+
+    /// Enable the per-layer [`crate::router::LayeredExpertAffinity`]
+    /// co-occurrence arm. When set (and the model exposes a
+    /// layer-qualified id geometry), the engine records which experts
+    /// fire together inside each MoE layer and folds the top
+    /// co-fired + disk-adjacent neighbours of high-confidence
+    /// predictions into the speculative prefetch union.
+    #[serde(default)]
+    pub affinity_enabled: bool,
+    /// Number of co-fired neighbours pulled per high-confidence seed.
+    #[serde(default = "default_affinity_neighbors_k")]
+    pub affinity_neighbors_k: usize,
+    /// Cumulative `observe_layer` calls between background decay passes
+    /// (right-shift of every counter). Keeps the heat map responsive to
+    /// distribution shifts and prevents `u32::MAX` saturation.
+    #[serde(default = "default_affinity_decay_epoch")]
+    pub affinity_decay_epoch: u64,
 }
 
 fn default_locality_window() -> usize { 256 }
 fn default_locality_threshold() -> f32 { 0.10 }
 fn default_speculator_hidden() -> usize { 128 }
+fn default_affinity_neighbors_k() -> usize { 2 }
+fn default_affinity_decay_epoch() -> u64 { 100_000 }
 
 impl Default for PredictiveConfig {
     fn default() -> Self {
@@ -451,6 +470,9 @@ impl Default for PredictiveConfig {
             speculator_enabled: false,
             speculator_hidden_dim: default_speculator_hidden(),
             speculator_top_k: 0,
+            affinity_enabled: false,
+            affinity_neighbors_k: default_affinity_neighbors_k(),
+            affinity_decay_epoch: default_affinity_decay_epoch(),
         }
     }
 }
