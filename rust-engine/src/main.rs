@@ -1582,7 +1582,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     // Double-buffered pool: primary (Buffer A) = resident LRU + one
     // reserved foreground slot; shadow (Buffer B) = speculative
     // look-ahead prefetches (sized to the prefetch fanout). See
-    // `cmd_run` for the full rationale. `--no-prefetch` (headroom 0)
+    // `cmd_serve` for the full rationale. `--no-prefetch` (headroom 0)
     // disables Buffer B and keeps the legacy single-pool layout.
     let shadow_slots = prefetch_headroom;
     let primary_slots = args.cache_slots + 1;
