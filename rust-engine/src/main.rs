@@ -1618,7 +1618,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     storage.warmup_fds(0..args.num_experts)?;
 
     let pipeline_depth = args.pipeline_depth.max(1) as usize;
-    let prefetch_headroom = if args.no_prefetch {
+    let prefetch_headroom = if args.no_prefetch || args.predict_fanout == 0 {
         0
     } else {
         // Scale the speculative headroom by the look-ahead pipeline depth:
@@ -1626,7 +1626,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         // `layer + 1 ..= layer + pipeline_depth`) needs a shadow buffer per
         // in-flight layer. The prefetch semaphore is derived from this
         // shadow capacity in `Engine::with_options`, so it scales with it.
-        args.predict_fanout.max(1).saturating_mul(pipeline_depth)
+        args.predict_fanout.saturating_mul(pipeline_depth)
     };
     // Double-buffered pool: primary (Buffer A) = resident LRU + one
     // reserved foreground slot; shadow (Buffer B) = speculative
