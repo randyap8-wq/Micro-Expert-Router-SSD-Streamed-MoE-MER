@@ -7,8 +7,8 @@ The engine writes one record per token to the trace path passed via
 
     {"token": 42, "layer": 0, "experts": [3, 7], "cache_hit": [false, true], "predicted": [3, 9]}
 
-The optional `predicted` field (present when `run --speculator` is set)
-is the speculator's top-K guess for that token; this script ignores it,
+The `predicted` field is always present in the trace; it is empty when no speculator is
+wired (i.e. when `run --speculator` is not set). This script ignores it,
 but it lets other tooling diff Predicted vs. Actual experts per layer.
 
 This script:
