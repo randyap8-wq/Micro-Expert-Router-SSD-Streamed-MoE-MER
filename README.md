@@ -1430,7 +1430,7 @@ line above, and `--trace-out` records the speculator's guess in the
 # Add layer-ahead look-ahead + per-layer affinity (needs a real gate
 # matrix and the layer-qualified id geometry):
 ./target/release/micro-expert-router run \
-  --data-dir ./data --num-experts 64 --cache-slots 64 \
+  --data-dir ./data --num-experts 256 --cache-slots 64 \
   --tokens 2000 --gate-weights gate.bin \
   --num-experts-per-layer 8 --num-layers 32 \
   --speculator --locality --affinity
