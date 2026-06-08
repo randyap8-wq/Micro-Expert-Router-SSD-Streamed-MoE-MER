@@ -2320,7 +2320,12 @@ fn read_gate_dir_concatenated(
 /// `None` for any name that doesn't match that exact pattern (so
 /// unrelated files in the directory are simply ignored).
 fn parse_gate_layer_index(name: &str) -> Option<u32> {
-    name.strip_prefix("gate_")?.strip_suffix(".bin")?.parse::<u32>().ok()
+    let idx = name.strip_prefix("gate_")?.strip_suffix(".bin")?;
+    if idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    idx.parse::<u32>().ok()
+}
 }
 
 /// Best-effort total-RAM probe. Returns `None` (heuristic disabled) on
