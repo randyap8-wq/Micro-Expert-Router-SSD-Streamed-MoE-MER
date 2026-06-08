@@ -2276,7 +2276,7 @@ fn read_gate_dir_concatenated(
     if entries.is_empty() {
         return Err(format!(
             "no gate_<layer>.bin files found in directory {}; expected per-layer files \
-             named like gate_0.bin, gate_1.bin, … (one [num_experts × d_model] f32 matrix each)",
+             named like gate_0.bin, gate_1.bin, … (each file is a little-endian f32 shard; concatenation must total [num_experts × d_model])",
             dir.display()
         )
         .into());
