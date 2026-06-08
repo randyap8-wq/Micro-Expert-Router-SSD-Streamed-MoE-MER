@@ -501,6 +501,13 @@ struct TraceRecord {
     layer: u32,
     experts: Vec<u32>,
     cache_hit: Vec<bool>,
+    /// The predictive controller's guess for this token's experts (the
+    /// neural speculator's top-K when installed; empty when no
+    /// speculator is wired). Logged alongside the gate's actual
+    /// `experts` so offline analysis can diff *Predicted vs. Actual*
+    /// per layer — isolating "wrong layer" from "wrong expert within
+    /// the correct layer".
+    predicted: Vec<u32>,
     /// Monotonic sequence number assigned at enqueue time so `flush`
     /// can wait for the worker to catch up to a specific point.
     seq: u64,
@@ -564,6 +571,11 @@ impl TraceWriter {
                             if i > 0 { s.push(','); }
                             s.push_str(if *h { "true" } else { "false" });
                         }
+                        s.push_str("],\"predicted\":[");
+                        for (i, e) in rec.predicted.iter().enumerate() {
+                            if i > 0 { s.push(','); }
+                            s.push_str(&e.to_string());
+                        }
                         s.push_str("]}\n");
                         if !latched_failure {
                             if let Err(e) = writer.write_all(s.as_bytes()) {
@@ -620,7 +632,14 @@ impl TraceWriter {
         })
     }
 
-    pub fn write_record(&self, token: u64, layer: u32, experts: &[u32], cache_hit: &[bool]) {
+    pub fn write_record(
+        &self,
+        token: u64,
+        layer: u32,
+        experts: &[u32],
+        cache_hit: &[bool],
+        predicted: &[u32],
+    ) {
         // Assign a monotonic per-writer sequence so flush() has
         // something to wait on.
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -629,6 +648,7 @@ impl TraceWriter {
             layer,
             experts: experts.to_vec(),
             cache_hit: cache_hit.to_vec(),
+            predicted: predicted.to_vec(),
             seq,
         };
         let guard = self.tx.lock();
@@ -1958,9 +1978,13 @@ impl Engine {
         // and which were already resident. Layer is `0` for the
         // single-namespace flat router path; the multi-layer path
         // (`moe_step`) emits its own record with the caller-supplied
-        // layer id.
+        // layer id. The `predicted` set is the neural speculator's
+        // top-K guess for this token (empty when no speculator is
+        // wired), logged so offline tooling can diff Predicted vs.
+        // Actual without a second engine pass.
         if let Some(tw) = self.metrics.trace_writer.read().as_ref() {
-            tw.write_record(token_idx, 0, &target, &cache_hits_per_expert);
+            let predicted = self.trace_prediction(&hidden);
+            tw.write_record(token_idx, 0, &target, &cache_hits_per_expert, &predicted);
         }
         let had_misses = !miss_handles.is_empty();
         for (i, h) in miss_handles {
@@ -2613,6 +2637,32 @@ impl Engine {
         self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The predictive controller's expert guess for the current token,
+    /// used purely as the `predicted` column of the routing trace
+    /// (`--trace-out`). Returns the neural speculator's top-K over the
+    /// supplied hidden state — alias-resolved so it lines up with the
+    /// `experts` column — or an empty vec when no speculator is wired
+    /// (or its `d_model` disagrees with the hidden width). This is a
+    /// *read-only* prediction: it never trains the speculator, so
+    /// logging the trace cannot perturb the online-SGD accuracy
+    /// telemetry.
+    fn trace_prediction(&self, hidden: &[f32]) -> Vec<u32> {
+        let Some(spec) = self.speculation.speculator.as_ref() else {
+            return Vec::new();
+        };
+        if hidden.len() != spec.d_model() {
+            return Vec::new();
+        }
+        // `speculator_topk` is `>= 1` whenever a speculator is installed
+        // (`with_speculator` clamps it), so this yields a non-empty guess
+        // on the live path; an empty `predicted` column therefore signals
+        // "no speculator wired" rather than "speculator predicted nothing".
+        spec.predict_topk(hidden, self.speculation.speculator_topk)
+            .into_iter()
+            .map(|id| self.resolve_alias(id))
+            .collect()
+    }
+
     // -----------------------------------------------------------------
     // Locality / speculator integration helpers.
     //
@@ -3205,9 +3255,14 @@ impl Engine {
         // contract as `generate`, but with the real per-layer index
         // supplied by the caller. This is what makes `--trace-out`
         // useful for the `--gate-weights` and real-transformer paths
-        // (which go through `moe_step`, not `generate`).
+        // (which go through `moe_step`, not `generate`). `m_speculator`
+        // is the speculator's top-K prediction already computed (and
+        // trained) above this token, so we reuse it as the `predicted`
+        // column rather than running a second forward.
         if let Some(tw) = self.metrics.trace_writer.read().as_ref() {
-            tw.write_record(token_idx, layer, &target, &cache_hits_per_expert);
+            let predicted: Vec<u32> =
+                m_speculator.iter().map(|&id| self.resolve_alias(id)).collect();
+            tw.write_record(token_idx, layer, &target, &cache_hits_per_expert, &predicted);
         }
         let had_misses = !miss_handles.is_empty();
         // Track expert slots whose fetch task failed: we'll drop them

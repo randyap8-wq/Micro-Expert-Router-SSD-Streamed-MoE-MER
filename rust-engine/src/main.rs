@@ -286,6 +286,63 @@ enum Cmd {
         /// with a warning if GPU init fails.
         #[arg(long)]
         gpu: bool,
+        /// Enable the **neural speculator** (arm `M`): a 2-layer MLP
+        /// trained online against the gate's actual top-K. Predicts
+        /// from the residual stream — the same feature the gate sees —
+        /// so it is the strongest single prefetch signal and the one
+        /// that actually drives `speculate_layer_ahead`. Off by default
+        /// so the legacy Markov-only path is unchanged; turn it on to
+        /// measure whether the predictive arms move the hit rate.
+        #[arg(long)]
+        speculator: bool,
+        /// Hidden width of the speculator MLP (only when `--speculator`).
+        #[arg(long, default_value_t = 128)]
+        speculator_hidden_dim: usize,
+        /// Top-K experts pulled from the speculator each step. `0`
+        /// inherits `--top-k`.
+        #[arg(long, default_value_t = 0)]
+        speculator_top_k: usize,
+        /// Enable the **locality monitor** (arm `L`): a sliding window
+        /// over recent activations whose hot set is unioned into the
+        /// prefetch set *and* pinned in the LRU so genuinely hot experts
+        /// stop being evicted by cold ones — a frequency-aware upgrade
+        /// over plain LRU eviction.
+        #[arg(long)]
+        locality: bool,
+        /// Locality sliding-window size, in routing observations.
+        #[arg(long, default_value_t = 256)]
+        locality_window: usize,
+        /// Heat threshold: an expert is "hot" once it appears in this
+        /// fraction of the locality window. `0.10` ≈ 10% of recent
+        /// activations.
+        #[arg(long, default_value_t = 0.10)]
+        locality_threshold_pct: f32,
+        /// Enable the **per-layer expert-affinity** arm: folds co-fired
+        /// and disk-adjacent neighbours of high-confidence predictions
+        /// into the prefetch union. Only effective on multi-layer runs
+        /// (`--num-experts-per-layer` set).
+        #[arg(long)]
+        affinity: bool,
+        /// Number of co-fired neighbours pulled per seed (with `--affinity`).
+        #[arg(long, default_value_t = 4)]
+        affinity_neighbors_k: usize,
+        /// Exponential-decay epoch for the affinity counters, in
+        /// cumulative observations (with `--affinity`).
+        #[arg(long, default_value_t = 10_000)]
+        affinity_decay_epoch: u64,
+        /// Number of transformer layers, used to size the affinity
+        /// matrix. `1` (default) is the single-namespace synthetic
+        /// benchmark.
+        #[arg(long, default_value_t = 1)]
+        num_layers: u32,
+        /// Experts **per layer** for a layer-qualified id geometry. When
+        /// set, `speculate_layer_ahead` restricts the speculator's
+        /// global head to the next layer's slice and actually prefetches
+        /// `layer + 1 ..= layer + pipeline_depth` ahead — the mechanism
+        /// that hides SSD latency behind compute. Leave unset for the
+        /// flat single-namespace benchmark (no layer-ahead).
+        #[arg(long)]
+        num_experts_per_layer: Option<u32>,
     },
 
     /// Convert a GGUF checkpoint (Mixtral-style) into the engine's
@@ -508,6 +565,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     trace_out,
                     gpu,
                     pipeline_depth,
+                    speculator,
+                    speculator_hidden_dim,
+                    speculator_top_k,
+                    locality,
+                    locality_window,
+                    locality_threshold_pct,
+                    affinity,
+                    affinity_neighbors_k,
+                    affinity_decay_epoch,
+                    num_layers,
+                    num_experts_per_layer,
                 } = cli.cmd
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
@@ -544,6 +612,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         trace_out,
                         gpu_expert_cache: if gpu { run_gpu_cache.clone() } else { None },
                         pipeline_depth,
+                        speculator,
+                        speculator_hidden_dim,
+                        speculator_top_k,
+                        locality,
+                        locality_window,
+                        locality_threshold_pct,
+                        affinity,
+                        affinity_neighbors_k,
+                        affinity_decay_epoch,
+                        num_layers,
+                        num_experts_per_layer,
                         },
                         startup_pinned,
                     )
@@ -1390,6 +1469,17 @@ struct RunArgs {
     trace_out: Option<PathBuf>,
     gpu_expert_cache: Option<Arc<crate::expert_cache::GpuExpertCache>>,
     pipeline_depth: u32,
+    speculator: bool,
+    speculator_hidden_dim: usize,
+    speculator_top_k: usize,
+    locality: bool,
+    locality_window: usize,
+    locality_threshold_pct: f32,
+    affinity: bool,
+    affinity_neighbors_k: usize,
+    affinity_decay_epoch: u64,
+    num_layers: u32,
+    num_experts_per_layer: Option<u32>,
 }
 
 async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -1609,7 +1699,10 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         // The CLI `generate` path is a single-namespace benchmark
         // (`gen-data` produces `expert_<id>.bin`); the multi-layer
         // fallback is only relevant to the `serve` HF-extractor path.
-        num_experts_per_layer: None,
+        // `--num-experts-per-layer` opts a `run` into the same
+        // layer-qualified geometry so `speculate_layer_ahead` can
+        // restrict the speculator head per layer and prefetch ahead.
+        num_experts_per_layer: args.num_experts_per_layer,
     };
     let storage = Arc::new(if data_dirs.len() > 1 {
         NvmeStorage::striped(storage_cfg, data_dirs.clone())?
@@ -1738,7 +1831,63 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         // with the shadow buffer-pool budget above). No-op for the legacy
         // Markov path (no speculator installed); takes effect when a
         // speculator drives `speculate_layer_ahead`.
-        let base = base.with_pipeline_depth(args.pipeline_depth);
+        let mut base = base.with_pipeline_depth(args.pipeline_depth);
+        // Predictive arms (opt-in, mirroring `cmd_serve`'s `[predictive]`
+        // wiring). These are what turn the speculative-I/O union-fetch
+        // `E = S ∪ L ∪ M` from "Markov-only" into the full predictor:
+        //   * M — neural speculator over the residual stream (also the
+        //     only arm that drives `speculate_layer_ahead` look-ahead),
+        //   * L — sliding-window locality monitor whose hot set is pinned
+        //     (frequency-aware eviction on top of plain LRU),
+        //   * affinity — per-layer co-occurrence + disk-adjacency fold.
+        // All off by default so the legacy benchmark is bit-for-bit; turn
+        // them on to measure whether they move the hit rate / I/O share.
+        if args.locality {
+            let monitor = Arc::new(LocalityMonitor::new(
+                args.num_experts,
+                args.locality_window,
+            ));
+            base = base.with_locality_monitor(monitor, args.locality_threshold_pct);
+        }
+        if args.speculator {
+            let top_k = if args.speculator_top_k == 0 {
+                args.top_k
+            } else {
+                args.speculator_top_k
+            };
+            let spec = Arc::new(NeuralSpeculator::new(
+                args.d_model,
+                args.speculator_hidden_dim,
+                args.num_experts,
+                args.seed,
+            ));
+            base = base.with_speculator(spec, top_k);
+        }
+        if args.affinity {
+            // The affinity arm is only consulted on the layer-qualified
+            // `moe_step` path (the `--gate-weights` / multi-layer route);
+            // the flat single-namespace `generate` benchmark never folds
+            // it in. Warn rather than silently no-op when the user asks
+            // for affinity without a layer geometry.
+            if args.num_experts_per_layer.is_none() {
+                warn!(
+                    "--affinity has no effect without --num-experts-per-layer: the \
+                     affinity fold only runs on the layer-qualified moe_step path. \
+                     Pass --num-experts-per-layer (and typically --gate-weights) to \
+                     exercise it."
+                );
+            }
+            let per_layer = args.num_experts_per_layer.unwrap_or(args.num_experts);
+            let affinity = Arc::new(LayeredExpertAffinity::new(
+                args.num_layers.max(1) as usize,
+                per_layer,
+            ));
+            base = base.with_affinity(
+                affinity,
+                args.affinity_neighbors_k,
+                args.affinity_decay_epoch,
+            );
+        }
         // Optional alias map (Change 6: expert deduplication).
         match args.alias_map_path.as_ref() {
             Some(path) => {

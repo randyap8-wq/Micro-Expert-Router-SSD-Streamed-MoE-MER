@@ -94,6 +94,7 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
     - [Speculative engine warm-up](#speculative-engine-warm-up)
     - [Distributed expert sharding](#distributed-expert-sharding)
   - [Sample output](#sample-output)
+    - [Enabling the predictive prefetcher (and A/B testing it)](#enabling-the-predictive-prefetcher-and-ab-testing-it)
   - [CLI reference](#cli-reference)
   - [Running on real Mixtral weights](#running-on-real-mixtral-weights)
   - [Routing model, Markov chain, transition matrix, or LinearGate](#routing-model-markov-chain-transition-matrix-or-lineargate)
@@ -1401,6 +1402,56 @@ When the predictive `L` / `M` arms are enabled, one extra line is appended:
 INFO predictive:    locality=on (hit_rate=64.32%)  speculator=on (accuracy=58.10%)  ssd_stall=12.4ms
 ```
 
+#### Enabling the predictive prefetcher (and A/B testing it)
+
+The predictive arms (`E = S ∪ L ∪ M` plus the opt-in affinity fold) are
+**off by default in both `run` and `serve`**, so the baseline is the
+legacy Markov-only prefetch path. They are a **manual opt-in**: nothing
+turns them on for you. Enable them explicitly to measure whether they
+move the cache hit rate / I/O share.
+
+**`run` (benchmark) mode — CLI flags.** Add the arm flags to any
+existing `run` command. The summary then prints the extra `predictive:`
+line above, and `--trace-out` records the speculator's guess in the
+`predicted` column for an offline Predicted-vs-Actual diff:
+
+```bash
+# Baseline (legacy Markov path) — no predictive flags:
+./target/release/micro-expert-router run \
+  --data-dir ./data --num-experts 64 --cache-slots 64 \
+  --tokens 2000 --trace-out baseline.jsonl
+
+# Predictive (speculator + locality arms on):
+./target/release/micro-expert-router run \
+  --data-dir ./data --num-experts 64 --cache-slots 64 \
+  --tokens 2000 --trace-out predictive.jsonl \
+  --speculator --locality
+
+# Add layer-ahead look-ahead + per-layer affinity (needs a real gate
+# matrix and the layer-qualified id geometry):
+./target/release/micro-expert-router run \
+  --data-dir ./data --num-experts 256 --cache-slots 64 \
+  --tokens 2000 --gate-weights gate.bin \
+  --num-experts-per-layer 8 --num-layers 32 \
+  --speculator --locality --affinity
+```
+
+Compare the `hit_rate` / `I/O share` lines (and the new `predictive:`
+line) between the two runs to see whether the predictor helps on your
+workload. `--num-experts-per-layer` is required for `speculate_layer_ahead`
+to prefetch the next layers ahead; `--affinity` without it only warns and
+falls back to the flat single-namespace path.
+
+**`serve` (HTTP) mode — `config.toml`.** There are no CLI flags for the
+server; the same arms are enabled via the `[predictive]` block documented
+under [Predictive architecture (`[predictive]`)](#predictive-architecture-predictive).
+Set `locality_enabled` / `speculator_enabled` (and optionally
+`affinity_enabled`) to `true`, and tune `[storage] pipeline_depth` for the
+layer-ahead window. Re-running with the block absent (or all flags `false`)
+reproduces the baseline Markov path bit-for-bit, so the same A/B recipe
+applies: start the server once with the arms off, once on, and compare the
+`mer_locality_*` / `mer_speculator_*` / cache-hit-rate counters on `/metrics`.
+
 The `compute` row is the actual SwiGLU forward pass (per-token, summed
 over the K active experts). The trailing **`per-token avg`** + **`I/O
 share`** lines are the headline numbers: they tell you, on this run,
@@ -1496,8 +1547,40 @@ micro-expert-router run
   --token-pause-us <N>       Sleep between tokens to throttle the stream
   --seed <U64>               PRNG seed for reproducibility
   --trace-out <PATH>         Append a JSONL routing trace (one record per
-                              token). Feed into `validate-predictor` or
+                              token: {token, layer, experts, cache_hit,
+                              predicted}). The `predicted` column is the
+                              neural speculator's top-K guess for that
+                              token (empty when --speculator is off), so
+                              the trace alone supports a Predicted-vs-Actual
+                              diff. Feed into `validate-predictor` or
                               `scripts/compute_transition_matrix.py`.
+
+  # Predictive prefetch arms (all off by default = legacy Markov path).
+  # Turning these on lets you measure whether the predictor moves the
+  # hit rate / I/O share; the run summary then prints a `predictive:` line
+  # with live speculator accuracy and locality hit-rate.
+  --speculator               Enable the neural speculator (arm M): an MLP
+                              over the residual stream, trained online
+                              against the gate's actual top-K. Also the
+                              only arm that drives layer-ahead look-ahead.
+  --speculator-hidden-dim <N>  Speculator MLP hidden width (default 128).
+  --speculator-top-k <N>     Top-K pulled from the speculator (0 = --top-k).
+  --locality                 Enable the locality monitor (arm L): a sliding
+                              window whose hot set is pinned in the LRU
+                              (frequency-aware eviction over plain LRU).
+  --locality-window <N>      Locality window size (default 256).
+  --locality-threshold-pct <F>  Heat threshold fraction (default 0.10).
+  --affinity                 Enable per-layer expert-affinity prefetch
+                              (co-firing + disk-adjacency fold; needs
+                              --num-experts-per-layer to be effective).
+  --affinity-neighbors-k <N> Co-fired neighbours per seed (default 4).
+  --affinity-decay-epoch <N> Affinity counter decay epoch (default 10000).
+  --num-layers <N>           Layer count for affinity sizing (default 1).
+  --num-experts-per-layer <N>  Opt into a layer-qualified id geometry so
+                              `speculate_layer_ahead` prefetches
+                              layer+1..=layer+pipeline_depth ahead (hides
+                              SSD latency behind compute). Unset = flat
+                              single-namespace benchmark (no look-ahead).
 
   # Multi-drive striping:
   --data-dir <DIR1,DIR2...> Comma-separated list of mountpoints shards
