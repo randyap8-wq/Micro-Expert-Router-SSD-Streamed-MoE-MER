@@ -269,6 +269,11 @@ enum Cmd {
         /// use the seeded synthetic fallback if you only want to
         /// exercise the path (omit this flag to keep the legacy
         /// Markov router).
+        ///
+        /// May also point at a **directory** of per-layer `gate_<L>.bin`
+        /// files (the same naming the model loader uses): they are
+        /// auto-discovered, sorted by layer index, and concatenated in
+        /// order, so you don't have to `cat` them into one file first.
         #[arg(long)]
         gate_weights: Option<PathBuf>,
         /// Optional path to write a JSONL **routing trace** to. Each
@@ -2198,21 +2203,34 @@ fn load_alias_map(
 /// for `block_sparse_moe.gate.weight` after `astype(np.float32)`. A
 /// future PR can teach this to read `safetensors` directly so the user
 /// can point it at a HuggingFace shard without a conversion step.
+///
+/// **Directory input.** When `path` is a directory rather than a file,
+/// the per-layer `gate_<L>.bin` files inside it (the same naming the
+/// real-model loader writes/reads in `model.rs`) are auto-discovered,
+/// sorted ascending by layer index, and concatenated in layer order.
+/// This is the in-memory equivalent of
+/// `cat gate_0.bin gate_1.bin … gate_N.bin > real_gate.bin`, so users
+/// can point `--gate-weights` straight at a model directory instead of
+/// hand-concatenating a non-standard monolithic file.
 fn load_gate_weights(
     path: &std::path::Path,
     num_experts: usize,
     d_model: usize,
     top_k: usize,
 ) -> Result<crate::gating::LinearGate, Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("failed to read gate weights {}: {e}", path.display()))?;
+    let bytes = if path.is_dir() {
+        read_gate_dir_concatenated(path)?
+    } else {
+        std::fs::read(path)
+            .map_err(|e| format!("failed to read gate weights {}: {e}", path.display()))?
+    };
     let expected = num_experts
         .checked_mul(d_model)
         .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
         .ok_or_else(|| "num_experts * d_model overflowed".to_string())?;
     if bytes.len() != expected {
         return Err(format!(
-            "gate weights file {} has {} bytes, expected {} ({} experts × {} d_model × 4 bytes/f32)",
+            "gate weights {} have {} bytes, expected {} ({} experts × {} d_model × 4 bytes/f32)",
             path.display(),
             bytes.len(),
             expected,
@@ -2228,6 +2246,86 @@ fn load_gate_weights(
         weights.push(f32::from_le_bytes(buf));
     }
     Ok(crate::gating::LinearGate::new(weights, num_experts, d_model, top_k))
+}
+
+/// Discover and concatenate the per-layer `gate_<L>.bin` files in `dir`,
+/// sorted ascending by layer index. Returns the concatenated raw bytes,
+/// which [`load_gate_weights`] then validates against the expected
+/// `num_experts × d_model × 4` total — exactly as if the caller had run
+/// `cat gate_0.bin gate_1.bin … > real_gate.bin` first.
+fn read_gate_dir_concatenated(
+    dir: &std::path::Path,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut entries: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to scan gate-weights directory {}: {e}", dir.display()))?
+    {
+        let entry = entry
+            .map_err(|e| format!("failed to read a directory entry in {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some(idx) = parse_gate_layer_index(name) {
+            entries.push((idx, path));
+        }
+    }
+    if entries.is_empty() {
+        return Err(format!(
+            "no gate_<layer>.bin files found in directory {}; expected per-layer files \
+             named like gate_0.bin, gate_1.bin, … (each file is a little-endian f32 shard; concatenation must total [num_experts × d_model])",
+            dir.display()
+        )
+        .into());
+    }
+    entries.sort_by_key(|(idx, _)| *idx);
+    // Reject duplicate layer indices: the concatenation order would be
+    // ambiguous and almost certainly indicates a stray file.
+    for w in entries.windows(2) {
+        if w[0].0 == w[1].0 {
+            return Err(format!(
+                "duplicate gate layer index {} in directory {} ({} and {})",
+                w[0].0,
+                dir.display(),
+                w[0].1.display(),
+                w[1].1.display()
+            )
+            .into());
+        }
+    }
+    // `entries` is guaranteed non-empty here (early return above), so the
+    // first/last layer indices are always present.
+    let first_layer = entries.first().map(|(i, _)| *i).expect("entries non-empty");
+    let last_layer = entries.last().map(|(i, _)| *i).expect("entries non-empty");
+    info!(
+        dir = %dir.display(),
+        files = entries.len(),
+        first_layer,
+        last_layer,
+        "discovered per-layer gate files; concatenating in ascending layer order"
+    );
+    let mut bytes = Vec::new();
+    for (idx, p) in &entries {
+        let mut chunk = std::fs::read(p)
+            .map_err(|e| format!("failed to read gate file {} (layer {idx}): {e}", p.display()))?;
+        bytes.append(&mut chunk);
+    }
+    Ok(bytes)
+}
+
+/// Parse the layer index `N` out of a `gate_<N>.bin` filename. Returns
+/// `None` for any name that doesn't match that exact pattern (so
+/// unrelated files in the directory are simply ignored).
+fn parse_gate_layer_index(name: &str) -> Option<u32> {
+    let idx = name.strip_prefix("gate_")?.strip_suffix(".bin")?;
+    if idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    idx.parse::<u32>().ok()
+}
 }
 
 /// Best-effort total-RAM probe. Returns `None` (heuristic disabled) on
@@ -2673,5 +2771,70 @@ mod tests {
         let body = "{\n  \"num_experts\" : 16,\n  \"d_model\" : 512\n}";
         assert_eq!(parse_json_number(body, "num_experts"), Some(16));
         assert_eq!(parse_json_number(body, "d_model"), Some(512));
+    }
+
+    #[test]
+    fn parses_gate_layer_index_only_for_exact_pattern() {
+        assert_eq!(parse_gate_layer_index("gate_0.bin"), Some(0));
+        assert_eq!(parse_gate_layer_index("gate_31.bin"), Some(31));
+        // Anything that isn't exactly `gate_<digits>.bin` is ignored.
+        assert_eq!(parse_gate_layer_index("gate_.bin"), None);
+        assert_eq!(parse_gate_layer_index("gate_1x.bin"), None);
+        assert_eq!(parse_gate_layer_index("gate_1.bin.bak"), None);
+        assert_eq!(parse_gate_layer_index("rms_moe_1.bin"), None);
+        assert_eq!(parse_gate_layer_index("gate.bin"), None);
+    }
+
+    #[test]
+    fn load_gate_weights_concatenates_directory_in_layer_order() {
+        // Global num_experts=2 spread over 2 layers (1 expert/layer) with
+        // d_model=2, so each per-layer file holds [1 expert × 2 d_model]
+        // = 2 f32s, and the concatenation is 2 × 2 = 4 f32s = the expected
+        // [num_experts × d_model] matrix. Written out of order on disk to
+        // prove discovery sorts by layer index.
+        let dir = tempdir_unique("gate-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, vals: &[f32]| {
+            let mut bytes = Vec::new();
+            for v in vals {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(dir.join(name), bytes).unwrap();
+        };
+        // Intentionally write layer 1 before layer 0 and add a decoy.
+        write("gate_1.bin", &[3.0, 4.0]);
+        write("gate_0.bin", &[1.0, 2.0]);
+        write("notes.txt", &[]);
+
+        let gate = load_gate_weights(&dir, /*num_experts=*/ 2, /*d_model=*/ 2, /*top_k=*/ 1)
+            .expect("directory gate load should succeed");
+        // Concatenation must be layer 0 then layer 1.
+        assert_eq!(gate.weights, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(gate.num_experts, 2);
+        assert_eq!(gate.d_model, 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_gate_weights_errors_on_empty_directory() {
+        let dir = tempdir_unique("gate-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = load_gate_weights(&dir, 2, 2, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("no gate_<layer>.bin files"),
+            "unexpected error: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tiny unique temp-dir helper (avoids pulling a dev-dependency for
+    /// these filesystem tests).
+    fn tempdir_unique(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }
