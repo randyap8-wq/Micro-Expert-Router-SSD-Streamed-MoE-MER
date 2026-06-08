@@ -5,7 +5,11 @@ table from a JSONL routing trace produced by the engine.
 The engine writes one record per token to the trace path passed via
 `run --trace-out PATH`:
 
-    {"token": 42, "layer": 0, "experts": [3, 7], "cache_hit": [false, true]}
+    {"token": 42, "layer": 0, "experts": [3, 7], "cache_hit": [false, true], "predicted": [3, 9]}
+
+The optional `predicted` field (present when `run --speculator` is set)
+is the speculator's top-K guess for that token; this script ignores it,
+but it lets other tooling diff Predicted vs. Actual experts per layer.
 
 This script:
 

@@ -1496,8 +1496,40 @@ micro-expert-router run
   --token-pause-us <N>       Sleep between tokens to throttle the stream
   --seed <U64>               PRNG seed for reproducibility
   --trace-out <PATH>         Append a JSONL routing trace (one record per
-                              token). Feed into `validate-predictor` or
+                              token: {token, layer, experts, cache_hit,
+                              predicted}). The `predicted` column is the
+                              neural speculator's top-K guess for that
+                              token (empty when --speculator is off), so
+                              the trace alone supports a Predicted-vs-Actual
+                              diff. Feed into `validate-predictor` or
                               `scripts/compute_transition_matrix.py`.
+
+  # Predictive prefetch arms (all off by default = legacy Markov path).
+  # Turning these on lets you measure whether the predictor moves the
+  # hit rate / I/O share; the run summary then prints a `predictive:` line
+  # with live speculator accuracy and locality hit-rate.
+  --speculator               Enable the neural speculator (arm M): an MLP
+                              over the residual stream, trained online
+                              against the gate's actual top-K. Also the
+                              only arm that drives layer-ahead look-ahead.
+  --speculator-hidden-dim <N>  Speculator MLP hidden width (default 128).
+  --speculator-top-k <N>     Top-K pulled from the speculator (0 = --top-k).
+  --locality                 Enable the locality monitor (arm L): a sliding
+                              window whose hot set is pinned in the LRU
+                              (frequency-aware eviction over plain LRU).
+  --locality-window <N>      Locality window size (default 256).
+  --locality-threshold-pct <F>  Heat threshold fraction (default 0.10).
+  --affinity                 Enable per-layer expert-affinity prefetch
+                              (co-firing + disk-adjacency fold; needs
+                              --num-experts-per-layer to be effective).
+  --affinity-neighbors-k <N> Co-fired neighbours per seed (default 4).
+  --affinity-decay-epoch <N> Affinity counter decay epoch (default 10000).
+  --num-layers <N>           Layer count for affinity sizing (default 1).
+  --num-experts-per-layer <N>  Opt into a layer-qualified id geometry so
+                              `speculate_layer_ahead` prefetches
+                              layer+1..=layer+pipeline_depth ahead (hides
+                              SSD latency behind compute). Unset = flat
+                              single-namespace benchmark (no look-ahead).
 
   # Multi-drive striping:
   --data-dir <DIR1,DIR2...> Comma-separated list of mountpoints shards
