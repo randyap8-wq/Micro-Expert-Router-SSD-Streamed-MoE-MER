@@ -94,6 +94,7 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
     - [Speculative engine warm-up](#speculative-engine-warm-up)
     - [Distributed expert sharding](#distributed-expert-sharding)
   - [Sample output](#sample-output)
+    - [Enabling the predictive prefetcher (and A/B testing it)](#enabling-the-predictive-prefetcher-and-ab-testing-it)
   - [CLI reference](#cli-reference)
   - [Running on real Mixtral weights](#running-on-real-mixtral-weights)
   - [Routing model, Markov chain, transition matrix, or LinearGate](#routing-model-markov-chain-transition-matrix-or-lineargate)
@@ -1400,6 +1401,56 @@ When the predictive `L` / `M` arms are enabled, one extra line is appended:
 ```
 INFO predictive:    locality=on (hit_rate=64.32%)  speculator=on (accuracy=58.10%)  ssd_stall=12.4ms
 ```
+
+#### Enabling the predictive prefetcher (and A/B testing it)
+
+The predictive arms (`E = S ∪ L ∪ M` plus the opt-in affinity fold) are
+**off by default in both `run` and `serve`**, so the baseline is the
+legacy Markov-only prefetch path. They are a **manual opt-in**: nothing
+turns them on for you. Enable them explicitly to measure whether they
+move the cache hit rate / I/O share.
+
+**`run` (benchmark) mode — CLI flags.** Add the arm flags to any
+existing `run` command. The summary then prints the extra `predictive:`
+line above, and `--trace-out` records the speculator's guess in the
+`predicted` column for an offline Predicted-vs-Actual diff:
+
+```bash
+# Baseline (legacy Markov path) — no predictive flags:
+./target/release/micro-expert-router run \
+  --data-dir ./data --num-experts 64 --cache-slots 64 \
+  --tokens 2000 --trace-out baseline.jsonl
+
+# Predictive (speculator + locality arms on):
+./target/release/micro-expert-router run \
+  --data-dir ./data --num-experts 64 --cache-slots 64 \
+  --tokens 2000 --trace-out predictive.jsonl \
+  --speculator --locality
+
+# Add layer-ahead look-ahead + per-layer affinity (needs a real gate
+# matrix and the layer-qualified id geometry):
+./target/release/micro-expert-router run \
+  --data-dir ./data --num-experts 64 --cache-slots 64 \
+  --tokens 2000 --gate-weights gate.bin \
+  --num-experts-per-layer 8 --num-layers 32 \
+  --speculator --locality --affinity
+```
+
+Compare the `hit_rate` / `I/O share` lines (and the new `predictive:`
+line) between the two runs to see whether the predictor helps on your
+workload. `--num-experts-per-layer` is required for `speculate_layer_ahead`
+to prefetch the next layers ahead; `--affinity` without it only warns and
+falls back to the flat single-namespace path.
+
+**`serve` (HTTP) mode — `config.toml`.** There are no CLI flags for the
+server; the same arms are enabled via the `[predictive]` block documented
+under [Predictive architecture (`[predictive]`)](#predictive-architecture-predictive).
+Set `locality_enabled` / `speculator_enabled` (and optionally
+`affinity_enabled`) to `true`, and tune `[storage] pipeline_depth` for the
+layer-ahead window. Re-running with the block absent (or all flags `false`)
+reproduces the baseline Markov path bit-for-bit, so the same A/B recipe
+applies: start the server once with the arms off, once on, and compare the
+`mer_locality_*` / `mer_speculator_*` / cache-hit-rate counters on `/metrics`.
 
 The `compute` row is the actual SwiGLU forward pass (per-token, summed
 over the K active experts). The trailing **`per-token avg`** + **`I/O

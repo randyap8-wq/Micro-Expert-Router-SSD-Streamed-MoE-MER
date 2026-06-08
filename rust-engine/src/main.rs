@@ -1864,6 +1864,19 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
             base = base.with_speculator(spec, top_k);
         }
         if args.affinity {
+            // The affinity arm is only consulted on the layer-qualified
+            // `moe_step` path (the `--gate-weights` / multi-layer route);
+            // the flat single-namespace `generate` benchmark never folds
+            // it in. Warn rather than silently no-op when the user asks
+            // for affinity without a layer geometry.
+            if args.num_experts_per_layer.is_none() {
+                warn!(
+                    "--affinity has no effect without --num-experts-per-layer: the \
+                     affinity fold only runs on the layer-qualified moe_step path. \
+                     Pass --num-experts-per-layer (and typically --gate-weights) to \
+                     exercise it."
+                );
+            }
             let per_layer = args.num_experts_per_layer.unwrap_or(args.num_experts);
             let affinity = Arc::new(LayeredExpertAffinity::new(
                 args.num_layers.max(1) as usize,

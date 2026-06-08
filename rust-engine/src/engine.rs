@@ -2653,6 +2653,10 @@ impl Engine {
         if hidden.len() != spec.d_model() {
             return Vec::new();
         }
+        // `speculator_topk` is `>= 1` whenever a speculator is installed
+        // (`with_speculator` clamps it), so this yields a non-empty guess
+        // on the live path; an empty `predicted` column therefore signals
+        // "no speculator wired" rather than "speculator predicted nothing".
         spec.predict_topk(hidden, self.speculation.speculator_topk)
             .into_iter()
             .map(|id| self.resolve_alias(id))
