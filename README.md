@@ -1507,7 +1507,10 @@ micro-expert-router run
   --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 | q8_0 (default f32).
                               Must match gen-data / the offline extractor.
   --predict-fanout <N>       Prefetch candidates per token (default 2)
-  --predict-min-prob <P>     Skip prefetch below this probability (default 0.05)
+  --predict-min-prob <P>     Skip prefetch below this probability. The default
+                              (0.0) auto-scales the threshold to
+                              1 / (num_experts * 4); pass a positive value
+                              (e.g. 0.05) to override.
   --partial-load-fraction <F>  Fraction (0.1..=1.0) of input dimensions
                               loaded per expert. 1.0 (default) loads the
                               full expert.
