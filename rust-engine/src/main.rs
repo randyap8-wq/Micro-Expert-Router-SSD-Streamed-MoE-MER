@@ -2296,11 +2296,15 @@ fn read_gate_dir_concatenated(
             .into());
         }
     }
+    // `entries` is guaranteed non-empty here (early return above), so the
+    // first/last layer indices are always present.
+    let first_layer = entries.first().map(|(i, _)| *i).expect("entries non-empty");
+    let last_layer = entries.last().map(|(i, _)| *i).expect("entries non-empty");
     info!(
         dir = %dir.display(),
         files = entries.len(),
-        first_layer = entries.first().map(|(i, _)| *i).unwrap_or(0),
-        last_layer = entries.last().map(|(i, _)| *i).unwrap_or(0),
+        first_layer,
+        last_layer,
         "discovered per-layer gate files; concatenating in ascending layer order"
     );
     let mut bytes = Vec::new();
@@ -2778,9 +2782,11 @@ mod tests {
 
     #[test]
     fn load_gate_weights_concatenates_directory_in_layer_order() {
-        // Two layers × 1 expert × 2 d_model = 4 f32s total. Each layer's
-        // file holds [num_experts × d_model] = 2 f32s. Written out of
-        // order on disk to prove discovery sorts by layer index.
+        // Global num_experts=2 spread over 2 layers (1 expert/layer) with
+        // d_model=2, so each per-layer file holds [1 expert × 2 d_model]
+        // = 2 f32s, and the concatenation is 2 × 2 = 4 f32s = the expected
+        // [num_experts × d_model] matrix. Written out of order on disk to
+        // prove discovery sorts by layer index.
         let dir = tempdir_unique("gate-dir");
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, vals: &[f32]| {
