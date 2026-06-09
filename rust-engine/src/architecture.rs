@@ -487,10 +487,17 @@ fn as_f32(v: &serde_json::Value) -> Option<f32> {
 
 impl HfConfig {
     /// Read and parse `<dir>/config.json`.
-    pub fn from_dir(dir: &Path) -> Result<Self, ArchitectureError> {
+    /// Read and parse `<dir>/config.json`. Returns `Ok(None)` when the
+    /// file does not exist (so callers can fall back to TOML-derived
+    /// config), `Ok(Some(_))` on success, and `Err` for a malformed file
+    /// or an unrecognised architecture (fail-loud).
+    pub fn from_dir(dir: &Path) -> Result<Option<Self>, ArchitectureError> {
         let path = dir.join("config.json");
-        let text = std::fs::read_to_string(&path)?;
-        Self::from_json_str(&text)
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::from_json_str(&text).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ArchitectureError::from(e)),
+        }
     }
 
     /// Parse a `config.json` document from a string.

@@ -1923,6 +1923,8 @@ mod tests {
             rope_base: 10_000.0,
             rms_eps: 1e-6,
             window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
         };
         let (state, _tmp) = make_state_with_real_model(cfg).await;
         let app = build_router(state.clone());

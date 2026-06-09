@@ -947,7 +947,9 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             rt.head_dim
         };
         let num_kv_heads = if rt.num_kv_heads == 0 { rt.num_heads } else { rt.num_kv_heads };
-        let model_cfg = crate::model::RealModelConfig {
+        // Base config from the TOML `[model]` / `[real_transformer]`
+        // sections. Defaults to Mixtral naming/behaviour.
+        let mut model_cfg = crate::model::RealModelConfig {
             d_model: cfg.model.d_model,
             d_ff: cfg.model.d_ff,
             num_heads: rt.num_heads,
@@ -960,7 +962,49 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             rope_base: rt.rope_base,
             rms_eps: rt.rms_eps,
             window_size: if rt.window_size == 0 { None } else { Some(rt.window_size) },
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
         };
+        // Resolve the architecture. Precedence:
+        //   1. explicit `[real_transformer] architecture = "…"` override
+        //      (exact HF `model_type`; unknown value is a hard error), or
+        //   2. auto-detected from a `config.json` in `weights_dir` — which
+        //      also remaps all hyperparameters so a real checkpoint loads
+        //      without hand-editing the TOML.
+        // Unsupported-but-recognised families (DeepSeek-V3: MLA + FP8) are
+        // accepted here and fail loud later in the loader, never silently.
+        if let Some(arch_str) = rt.architecture.as_deref() {
+            let arch = crate::architecture::Architecture::from_model_type(arch_str)
+                .ok_or_else(|| {
+                    format!(
+                        "[real_transformer] architecture = \"{arch_str}\" is not a recognised \
+                         model_type (expected one of: mixtral, qwen3, qwen3_moe, deepseek_v3, \
+                         mistral3, phi3)"
+                    )
+                })?;
+            model_cfg.architecture = arch;
+        } else if let Some(dir) = rt.weights_dir.as_ref() {
+            match crate::architecture::HfConfig::from_dir(dir) {
+                Ok(Some(hf)) => {
+                    info!(
+                        architecture = ?hf.architecture,
+                        "loaded HF config.json; mapping hyperparameters"
+                    );
+                    model_cfg = crate::model::RealModelConfig::from_hf_config(&hf);
+                }
+                Ok(None) => {} // no config.json — keep TOML-derived Mixtral config
+                Err(e) => {
+                    // Unknown architecture is fail-loud; other parse errors
+                    // (malformed/partial config.json) also surface rather
+                    // than silently mislabelling the model.
+                    return Err(format!(
+                        "failed to read config.json from {}: {e}",
+                        dir.display()
+                    )
+                    .into());
+                }
+            }
+        }
         let m = match rt.weights_dir.as_ref() {
             Some(dir) => crate::model::RealModel::from_dir_auto(model_cfg, dir, rt.seed)?,
             None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),

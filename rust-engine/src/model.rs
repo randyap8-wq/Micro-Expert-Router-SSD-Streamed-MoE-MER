@@ -34,6 +34,7 @@
 //! and prefetcher keep working without per-layer sharding.
 
 use crate::engine::Engine;
+use crate::architecture::{Architecture, ComputeSupport, FfnKind, TensorNaming};
 use crate::gating::LinearGate;
 use crate::transformer::{
     KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, SharedExpert, TransformerLayer,
@@ -63,6 +64,16 @@ pub struct RealModelConfig {
     /// Sliding-window attention span. `None` (default) = full causal
     /// attention. Mixtral uses `Some(4096)`.
     pub window_size: Option<usize>,
+    /// Model family this config describes. Drives tensor-name mapping in
+    /// the `.safetensors` loader (gate name, `language_model.` prefix,
+    /// fused Phi-4 projections) and whether the forward-compute path is
+    /// supported. Defaults to [`Architecture::Mixtral`], preserving the
+    /// historical behaviour for every existing call site.
+    pub architecture: Architecture,
+    /// Number of leading dense layers for DeepSeek-style MoE
+    /// (`first_k_dense_replace`). `0` (default) means every MoE layer is
+    /// sparse, matching Mixtral / Qwen3-MoE.
+    pub first_k_dense_replace: usize,
 }
 
 impl RealModelConfig {
@@ -81,11 +92,25 @@ impl RealModelConfig {
             rope_base: 10_000.0,
             rms_eps: 1e-6,
             window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.head_dim * self.num_heads != self.d_model {
+        if self.head_dim == 0 || self.num_heads == 0 {
+            return Err("head_dim and num_heads must both be > 0".into());
+        }
+        // Mixtral ties the attention projection width to the residual
+        // stream (`num_heads * head_dim == d_model`). Newer families
+        // (e.g. Qwen3) specify an explicit `head_dim` that does NOT equal
+        // `d_model / num_heads`; `MultiHeadSelfAttention` already supports
+        // a query width independent of `d_model` (`wo` maps the
+        // `num_heads * head_dim` query space back to `d_model`), so we only
+        // enforce the tie for Mixtral.
+        if self.architecture == Architecture::Mixtral
+            && self.head_dim * self.num_heads != self.d_model
+        {
             return Err(format!(
                 "head_dim * num_heads ({} * {} = {}) must equal d_model ({})",
                 self.head_dim,
@@ -112,7 +137,49 @@ impl RealModelConfig {
         if self.vocab_size == 0 {
             return Err("vocab_size must be > 0".into());
         }
+        if self.first_k_dense_replace > self.num_layers {
+            return Err(format!(
+                "first_k_dense_replace ({}) must not exceed num_layers ({})",
+                self.first_k_dense_replace, self.num_layers
+            ));
+        }
         Ok(())
+    }
+
+    /// Per-architecture tensor-name mapping for this config, carrying the
+    /// `first_k_dense_replace` dense/MoE boundary.
+    pub fn tensor_naming(&self) -> TensorNaming {
+        TensorNaming::new(self.architecture, self.first_k_dense_replace)
+    }
+
+    /// Build a [`RealModelConfig`] from a parsed Hugging Face `config.json`
+    /// ([`HfConfig`]). Maps the architecture and hyperparameters so a real
+    /// checkpoint can be loaded without hand-editing the TOML `[model]` /
+    /// `[real_transformer]` sections. Dense families (no routed experts)
+    /// collapse to a single expert with `top_k = 1`.
+    pub fn from_hf_config(hf: &crate::architecture::HfConfig) -> Self {
+        let num_experts = hf.num_routed_experts.unwrap_or(1).max(1);
+        let top_k = hf.num_experts_per_tok.unwrap_or(1).clamp(1, num_experts);
+        Self {
+            d_model: hf.hidden_size,
+            d_ff: hf.resolved_d_ff(),
+            num_heads: hf.num_attention_heads,
+            num_kv_heads: if hf.num_key_value_heads == 0 {
+                hf.num_attention_heads
+            } else {
+                hf.num_key_value_heads
+            },
+            head_dim: hf.resolved_head_dim(),
+            vocab_size: hf.vocab_size,
+            num_layers: hf.num_hidden_layers,
+            num_experts,
+            top_k,
+            rope_base: hf.rope_theta,
+            rms_eps: hf.rms_norm_eps,
+            window_size: hf.sliding_window,
+            architecture: hf.architecture,
+            first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
+        }
     }
 }
 
@@ -408,7 +475,27 @@ impl RealModel {
         config
             .validate()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        // Fail loud — *before* touching the (potentially multi-hundred-GB)
+        // shards — for architectures we can map tensor names for but
+        // cannot actually execute. DeepSeek-V3 is recognised (its expert
+        // and `weight_scale_inv` names are mapped by `TensorNaming`) but
+        // needs MLA latent-KV attention and FP8 dequantisation that are
+        // not implemented; running it would route on garbage activations,
+        // so we refuse rather than silently produce nonsense.
+        if let ComputeSupport::Unsupported { reason } = config.architecture.compute_support() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "cannot build a runnable `{}` model from {}: {reason}",
+                    config.architecture.model_type(),
+                    dir.display()
+                ),
+            ));
+        }
+
         let mut model = Self::new_seeded(config.clone(), seed);
+        let naming = config.tensor_naming();
 
         // Discover .safetensors shards in `dir`. We hold each shard's
         // bytes for the duration of the load (SafeTensors borrows from
@@ -497,80 +584,92 @@ impl RealModel {
         let q_dim = config.num_heads * config.head_dim;
         let kv_dim = config.num_kv_heads * config.head_dim;
 
-        maybe!("model.embed_tokens.weight", config.vocab_size * d_model, |v| {
+        maybe!(&naming.embed(), config.vocab_size * d_model, |v| {
             model.embedding = v;
         });
-        maybe!("model.norm.weight", d_model, |v| {
+        maybe!(&naming.final_norm(), d_model, |v| {
             model.final_rms = RmsNorm::new(v, config.rms_eps);
         });
-        maybe!("lm_head.weight", config.vocab_size * d_model, |v| {
+        maybe!(&naming.lm_head(), config.vocab_size * d_model, |v| {
             model.lm_head = LMHead::new(v, config.vocab_size, d_model);
         });
         for l in 0..config.num_layers {
-            maybe!(
-                &format!("model.layers.{l}.input_layernorm.weight"),
-                d_model,
-                |v| { model.layers[l].rms_attn = RmsNorm::new(v, config.rms_eps); }
-            );
-            maybe!(
-                &format!("model.layers.{l}.post_attention_layernorm.weight"),
-                d_model,
-                |v| { model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps); }
-            );
-            maybe!(
-                &format!("model.layers.{l}.self_attn.q_proj.weight"),
-                q_dim * d_model,
-                |v| { model.layers[l].attn.wq = v; }
-            );
-            maybe!(
-                &format!("model.layers.{l}.self_attn.k_proj.weight"),
-                kv_dim * d_model,
-                |v| { model.layers[l].attn.wk = v; }
-            );
-            maybe!(
-                &format!("model.layers.{l}.self_attn.v_proj.weight"),
-                kv_dim * d_model,
-                |v| { model.layers[l].attn.wv = v; }
-            );
-            maybe!(
-                &format!("model.layers.{l}.self_attn.o_proj.weight"),
-                d_model * q_dim,
-                |v| { model.layers[l].attn.wo = v; }
-            );
-            maybe!(
-                &format!("model.layers.{l}.block_sparse_moe.gate.weight"),
-                config.num_experts * d_model,
-                |v| {
+            maybe!(&naming.input_layernorm(l), d_model, |v| {
+                model.layers[l].rms_attn = RmsNorm::new(v, config.rms_eps);
+            });
+            maybe!(&naming.post_attention_layernorm(l), d_model, |v| {
+                model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps);
+            });
+
+            // Attention projections. Phi-4 ships a single fused
+            // `qkv_proj` ([(num_heads + 2*num_kv_heads) * head_dim,
+            // d_model], row-major) that we split into the engine's
+            // separate Q/K/V weights; every other family has discrete
+            // `q_proj` / `k_proj` / `v_proj` tensors.
+            if naming.attn_qkv_fused() {
+                tried += 1;
+                if let Some(v) = find_f32(&naming.attn_qkv(l), (q_dim + 2 * kv_dim) * d_model) {
+                    let (q_part, rest) = v.split_at(q_dim * d_model);
+                    let (k_part, v_part) = rest.split_at(kv_dim * d_model);
+                    model.layers[l].attn.wq = q_part.to_vec();
+                    model.layers[l].attn.wk = k_part.to_vec();
+                    model.layers[l].attn.wv = v_part.to_vec();
+                    loaded += 1;
+                }
+            } else {
+                maybe!(&naming.attn_q(l), q_dim * d_model, |v| {
+                    model.layers[l].attn.wq = v;
+                });
+                maybe!(&naming.attn_k(l), kv_dim * d_model, |v| {
+                    model.layers[l].attn.wk = v;
+                });
+                maybe!(&naming.attn_v(l), kv_dim * d_model, |v| {
+                    model.layers[l].attn.wv = v;
+                });
+            }
+            maybe!(&naming.attn_o(l), d_model * q_dim, |v| {
+                model.layers[l].attn.wo = v;
+            });
+
+            // Routed MoE gate. Only present on sparse layers — DeepSeek's
+            // first `first_k_dense_replace` layers and the dense families
+            // (Mistral Small 3, Phi-4, dense Qwen3) have no router. The
+            // gate name differs per family (`block_sparse_moe.gate` for
+            // Mixtral vs `mlp.gate` for Qwen3-MoE / DeepSeek).
+            if config.architecture.is_moe() && naming.ffn_kind(l) == FfnKind::Moe {
+                maybe!(&naming.moe_gate(l), config.num_experts * d_model, |v| {
                     model.layers[l].gate = LinearGate::new(
                         v, config.num_experts, d_model, config.top_k,
                     );
-                }
-            );
+                });
+            }
             // Optional shared expert (Qwen2-MoE / DeepSeek-MoE). Different
             // checkpoints name the FFN block `mlp` and the shared expert
             // either `shared_expert` (Qwen2-MoE) or `shared_experts`
             // (DeepSeek-MoE), so we probe both. The shared intermediate
             // size is inferred from the gate tensor length. Mixtral has no
-            // such tensor, so this is a no-op there.
+            // such tensor, so this is a no-op there. Prefix-aware so the
+            // `language_model.` checkpoints resolve correctly.
+            let p = naming.prefix();
             tried += 1;
             let shexp_gate = find_f32_any(&[
-                format!("model.layers.{l}.mlp.shared_expert.gate_proj.weight"),
-                format!("model.layers.{l}.mlp.shared_experts.gate_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_expert.gate_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_experts.gate_proj.weight"),
             ]);
             let shexp_up = find_f32_any(&[
-                format!("model.layers.{l}.mlp.shared_expert.up_proj.weight"),
-                format!("model.layers.{l}.mlp.shared_experts.up_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_expert.up_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_experts.up_proj.weight"),
             ]);
             let shexp_down = find_f32_any(&[
-                format!("model.layers.{l}.mlp.shared_expert.down_proj.weight"),
-                format!("model.layers.{l}.mlp.shared_experts.down_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_expert.down_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_experts.down_proj.weight"),
             ]);
             if let (Some(gate), Some(up), Some(down)) = (shexp_gate, shexp_up, shexp_down) {
                 if d_model != 0 && gate.len() % d_model == 0 && gate.len() / d_model != 0 {
                     let shared_d_ff = gate.len() / d_model;
                     // Sigmoid gate is Qwen2-MoE-only (`shared_expert_gate`).
                     let gate_inp = find_f32_any(&[format!(
-                        "model.layers.{l}.mlp.shared_expert_gate.weight"
+                        "{p}model.layers.{l}.mlp.shared_expert_gate.weight"
                     )])
                     .filter(|g| g.len() == d_model);
                     match SharedExpert::from_projections(
@@ -1045,6 +1144,8 @@ mod tests {
             rope_base: 10_000.0,
             rms_eps: 1e-6,
             window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
         };
         let q_dim = cfg.num_heads * cfg.head_dim;
         let dir = TempDir::new("safetensors_load");
@@ -1117,6 +1218,8 @@ mod tests {
             rope_base: 10_000.0,
             rms_eps: 1e-6,
             window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
         };
 
         // 1) Empty dir without safetensors falls back to from_dir
