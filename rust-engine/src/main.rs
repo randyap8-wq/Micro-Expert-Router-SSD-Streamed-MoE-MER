@@ -162,7 +162,7 @@ enum Cmd {
         #[arg(long, default_value_t = crate::engine::DEFAULT_PIPELINE_DEPTH)]
         pipeline_depth: u32,
         /// Don't prefetch below this transition probability. The default
-        /// (`0.0`) auto-scales the threshold to `1 / (num_experts * 4)` so
+        /// (`0.0`) auto-scales the threshold to `2 / num_experts` so
         /// it remains achievable as the expert pool grows; pass an
         /// explicit positive value to override (e.g. `--predict-min-prob 0.05`).
         #[arg(long, default_value_t = 0.0)]
@@ -451,7 +451,7 @@ enum Cmd {
 /// Resolve the effective `predict_min_prob` for a given expert-pool size.
 ///
 /// A configured value of `0.0` (or negative — treated identically) is the
-/// "auto" sentinel and scales the threshold to `1 / (num_experts * 4)`, so
+/// "auto" sentinel and scales the threshold to `2 / num_experts`, so
 /// the Laplace-smoothed posteriors in [`PredictiveLoader::predict_next`]
 /// can actually clear the gate as the pool grows (a fixed `0.05` becomes
 /// mathematically unreachable past ~20 experts). Any positive value is

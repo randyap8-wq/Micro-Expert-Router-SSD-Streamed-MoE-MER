@@ -337,23 +337,25 @@ experts, no high-end AI GPU required):
   AMX, the dispatcher transparently falls back to the existing
   AVX-512 kernel, so production stable-toolchain builds keep
   working without any changes.
-* `--features gpu`, opt-in. Builds the
-  [`backend::GpuBackend`](rust-engine/src/backend/mod.rs) integration
-  seam for a future budget-GPU compute path, alongside the
-  [`transformer::DenseBackbone`](rust-engine/src/transformer.rs)
-  trait that abstracts `attn_block`, `RmsNorm`, and `LMHead` so a
-  device-side backbone can take over the dense body while the
-  SSD-streaming MoE path stays CPU-side (gist Part 2). Setting
-  `[real_transformer].compute_offload = "gpu"` in `config.toml`
-  selects that backend before the legacy CPU `CandleBackend`
-  claims the `OnceLock`, so operators can exercise the config /
-  selection path now; however, in this release device
-  initialization and shader/compute kernels have not landed yet, so
-  the backend delegates to the CPU `CandleBackend` rather than
-  running the dense transformer body (attention + matmul + LM-head)
-  on GPU. The SSD-streamed MoE experts likewise continue to crunch
-  on the CPU through the same auto-escalating SIMD dispatcher.
-  Builds without the feature still use the normal CPU path, and the
+* `--features gpu`, **no-op / retained for backwards compatibility.**
+  The `wgpu` dependency and the
+  [`backend::GpuBackend`](rust-engine/src/backend/mod.rs) dense-compute
+  path are now compiled **unconditionally** (nothing is gated behind
+  `cfg(feature = "gpu")`), so passing this flag changes nothing; new
+  builds may omit it. The GPU compute plane is selected at **runtime**,
+  not build time: setting `[real_transformer].compute_offload = "gpu"`
+  in `config.toml` installs `GpuBackend` ahead of the CPU
+  `CandleBackend` in the backend `OnceLock`. `GpuBackend::try_new`
+  initialises a real `wgpu` device and uploads WGSL compute shaders, and
+  the dense transformer body, matmul, SwiGLU, softmax, and attention,
+  runs through those shaders via the
+  [`transformer::DenseBackbone`](rust-engine/src/transformer.rs) trait
+  (`attn_block`, `RmsNorm`, `LMHead`). When no GPU device can be
+  acquired at startup the backend transparently falls back to the CPU
+  `CandleBackend` (`BackendBox::init` logs `GPU init failed — activating
+  CPU fallback`). The SSD-streamed MoE experts continue to crunch on the
+  CPU auto-escalating SIMD dispatcher (or, with `--features cuda`, the
+  candle CUDA path, see [Building with CUDA](#building-with-cuda)). The
   backend logs the **actual device runtime** (`cpu-fallback`,
   `cuda-0`, `wgpu-vulkan` …) at startup, gist Part 2 retired the
   previous stale `gpu-fallback` label so the log faithfully reports
@@ -370,9 +372,10 @@ INFO math backend installed backend=candle compute_offload=Cpu
 The **per-expert SwiGLU FFN itself** runs through Hugging Face
 [`candle-core`](https://github.com/huggingface/candle) on CPU
 by default (no `candle-nn`, no GPU backends pulled into the default
-build). When the `gpu` feature is on and `compute_offload = "gpu"`,
-the dense transformer body's matmuls and SwiGLU rows are dispatched
-through `GpuBackend`'s wgpu-style compute pipeline; the per-expert
+build). When `compute_offload = "gpu"` selects the `wgpu`-backed
+`GpuBackend` at runtime (no cargo feature required), the dense
+transformer body's matmuls and SwiGLU rows are dispatched
+through `GpuBackend`'s wgpu compute pipeline; the per-expert
 SwiGLU FFN remains on the CPU path so the SSD-streaming guarantees
 hold (page-aligned `&[u8]` from `ExpertResident::data()` →
 `candle_core::Tensor` via `ExpertWeights::to_candle_tensors`). The
@@ -416,7 +419,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q8_0` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files for the 4-bit dtypes, ~4× smaller for `Q8_0`; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
 | `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
 | `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()` + `cpu_features()`), with `scalar.rs` (always on, also home of the `swiglu_f32` reference oracle plus the `dot_int8_int8` scalar reference for VNNI), `avx2.rs` (always compiled on x86_64, no cargo feature; the `#[target_feature]` entry points are gated on the runtime probe), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot, the 4×-unrolled `dot_f32_avx512`, the fused per-row `swiglu_f32_avx512` kernel, **and** the AVX-512 VNNI int8×int8 dot `dot_int8_int8_avx512_vnni` built on `_mm512_dpbusd_epi32`, gist Part 2 fix #8, with the i8→u8 bias-trick correction so the inner reduction stays in i32 integer registers), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The dispatcher also exposes `swiglu_f32_into(gate_w, up_w, x, rows, cols, y)` which routes to the AVX-512 fused kernel on capable hosts and the scalar reference elsewhere, caller owns `y`, no allocation on the hot path. The probe reads `/proc/cpuinfo` to recognise Sapphire-Rapids-class Xeons so AMX can be preferred on the chips it ships on. The selected backend is logged once at startup. |
-| `backend` | Plugin-system math `Backend` trait (`matmul`, `matmul_into`, `swiglu_into`, `softmax`, `silu_inplace`) with three built-in implementations: `ScalarBackend` (pure Rust reference), `CandleBackend` (default CPU executor, dispatches through `kernels::dot_f32` / `kernels::swiglu_f32_into`, no `candle_core::Tensor` rebuild on the hot path, **zero allocation** in either call), and `GpuBackend` (gist Part 2 fix #5, opt-in budget-GPU executor selected by `[real_transformer].compute_offload = "gpu"`; the integration seam compiles on every build, the wgpu compute pipeline lights up behind the `gpu` cargo feature). Both CPU backends override `matmul_into` to dispatch through `kernels::dot_f32` (auto-escalates AVX-512 → AVX2 → scalar). The active backend is installed once at startup via `backend::install_default()` (or, when `compute_offload = "gpu"`, `set_backend(GpuBackend::try_new())` runs first) and resolved on the hot path through `backend::current()`, a single `OnceLock` load, no `cfg!` dispatch. New executors (Burn, Tract, custom CUDA) implement `Backend` and call `set_backend(Arc<dyn Backend>)` before the first token is generated. |
+| `backend` | Plugin-system math `Backend` trait (`matmul`, `matmul_into`, `swiglu_into`, `softmax`, `silu_inplace`) with three built-in implementations: `ScalarBackend` (pure Rust reference), `CandleBackend` (default CPU executor, dispatches through `kernels::dot_f32` / `kernels::swiglu_f32_into`, no `candle_core::Tensor` rebuild on the hot path, **zero allocation** in either call), and `GpuBackend` (gist Part 2 fix #5, budget-GPU executor selected by `[real_transformer].compute_offload = "gpu"`; both the integration seam and the `wgpu` compute pipeline compile on every build, the `gpu` cargo feature is now a no-op kept only for backwards compatibility). Both CPU backends override `matmul_into` to dispatch through `kernels::dot_f32` (auto-escalates AVX-512 → AVX2 → scalar). The active backend is installed once at startup via `backend::install_default()` (or, when `compute_offload = "gpu"`, `set_backend(GpuBackend::try_new())` runs first) and resolved on the hot path through `backend::current()`, a single `OnceLock` load, no `cfg!` dispatch. New executors (Burn, Tract, custom CUDA) implement `Backend` and call `set_backend(Arc<dyn Backend>)` before the first token is generated. |
 | `io_reactor` | **Actor-pattern I/O reactor** (gist Part 5 doc fix). Wraps an `NvmeStorage` behind a single-owner tokio task that runs a **bounded serial loop**: it dequeues read requests from a bounded `mpsc` channel one at a time, `await`s the read inline, replies over the per-request `oneshot`, and only then pulls the next request, the bounded queue therefore also bounds active I/O concurrency. `IoReactorHandle` is cheaply cloneable (the sender side is reference-counted by tokio); workers issue `read_expert(id, buf)` without ever touching a shared `DashMap` shard / `RwLock` write guard. Backpressure is automatic, when the I/O substrate saturates, callers park on `mpsc::send` instead of overflowing a per-thread queue. Exposed as a standalone helper alongside the legacy `engine` path so the in-flight `DashMap<u32, Notify>` deduplicator can retire one subsystem at a time. |
 | `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
@@ -688,7 +691,7 @@ cargo build --release --features blas       # matrixmultiply SGEMV microkernel f
 cargo build --release --features avx512     # build AVX-512 int8-dequant + dot kernels, plus AVX-512 VNNI int8×int8 dot
 cargo build --release --features amx        # build AMX tile-hint plumbing (executor still falls back)
 cargo +nightly build --release --features nightly-amx  # nightly Rust: implies `amx` + unlocks `stdarch_x86_amx` for the real tile intrinsics; falls back to AVX-512 when the runtime probe doesn't see AMX
-cargo build --release --features gpu        # build the budget-GPU offload integration seam (GpuBackend), pair with `[real_transformer].compute_offload = "gpu"` in config.toml
+cargo build --release --features gpu        # no-op (kept for back-compat); GpuBackend + wgpu compile on every build. Enable GPU at runtime via `[real_transformer].compute_offload = "gpu"` in config.toml
 cargo build --release --features cuda       # CUDA SwiGLU via candle-core (needs CUDA 12.x toolkit; see "Building with CUDA" below)
 cargo build --release --features tokenizer  # real HuggingFace tokenizer (pulls in `onig`)
 ```
@@ -829,8 +832,9 @@ To reproduce the **exact spec example** (router selects expert 3 and 7 first):
 ```
 
 > **GPU inference path:** the per-expert SwiGLU forward only runs on the
-> GPU when the binary is built with `--features gpu` and
-> `[real_transformer].compute_offload = "gpu"` is set in `config.toml`;
+> GPU when `[real_transformer].compute_offload = "gpu"` is set in
+> `config.toml` (selecting the `wgpu`-backed `GpuBackend` — no cargo
+> feature required) and a GPU device is acquired at startup;
 > otherwise the benchmark stays on the CPU path. This covers expert
 > dtypes routed through `Backend::expert_matmul`; `q4_0` uses this path
 > when `d_model` and `d_ff` are both multiples of 32 (it is dequantised
@@ -1522,7 +1526,7 @@ micro-expert-router run
                               pipeline_depth).
   --predict-min-prob <P>     Skip prefetch below this probability. The default
                               (0.0) auto-scales the threshold to
-                              1 / (num_experts * 4); pass a positive value
+                              2 / num_experts; pass a positive value
                               (e.g. 0.05) to override.
   --partial-load-fraction <F>  Fraction (0.1..=1.0) of input dimensions
                               loaded per expert. 1.0 (default) loads the

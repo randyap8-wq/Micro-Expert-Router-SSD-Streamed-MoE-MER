@@ -3950,7 +3950,17 @@ mod tests {
             "report bytes_read ({}) must include at least the critical-path bytes ({total_bytes})",
             r.bytes_read
         );
-        assert!(r.io_count >= total_misses, "io histogram must record every miss");
+        // The I/O histogram records one sample per *physical* SSD read
+        // (a singleflight leader inside `fetch_once`), which is neither an
+        // upper nor a lower bound on `total_misses`:
+        //   * a foreground miss that joins an in-flight prefetch/leader
+        //     becomes a singleflight *follower* — it counts as a miss but
+        //     issues no read, so it records no histogram sample; and
+        //   * a speculative prefetch leader records a sample for an expert
+        //     that was never a foreground miss.
+        // The only guaranteed invariant is that the cold-start miss forces
+        // at least one physical read, so the histogram is non-empty.
+        assert!(r.io_count > 0, "io histogram must record at least the cold-start read");
         // Latency histograms must have observed at least one sample of each
         // category (compute always, I/O at least once because a cold start
         // forces a miss).
