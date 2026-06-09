@@ -177,14 +177,16 @@ amx = []
 # runtime probe fails on the host), the dispatcher transparently falls
 # back to the AVX-512 kernel. Requires a nightly toolchain.
 nightly-amx = ["amx"]
-# **Budget-GPU offload** (gist Part 2, fix #5). Opt-in build flag that
-# enables the `GpuBackend` integration path in `backend/mod.rs`. The
-# default CPU build (no feature) keeps the binary lean; turning this
-# on prepares the runtime for a follow-up PR that wires in a real
-# `wgpu` compute dispatcher for the dense transformer body. The
-# config-level toggle is `[real_transformer].compute_offload =
-# "gpu"`. Off by default to keep CPU-only builds buildable on
-# toolchains and hosts without a GPU driver.
+# **Budget-GPU offload** (gist Part 2, fix #5). **Deprecated / no-op:**
+# the `wgpu` dependency and the `GpuBackend` dense-compute path in
+# `backend/mod.rs` are now compiled unconditionally, and nothing is
+# gated behind `cfg(feature = "gpu")`, so this flag changes nothing.
+# It is retained only for backwards compatibility with build scripts
+# that still pass `--features gpu`; new builds should omit it. The GPU
+# compute plane is selected at runtime via
+# `[real_transformer].compute_offload = "gpu"`, which installs the
+# `wgpu`-backed `GpuBackend` and falls back to the CPU `CandleBackend`
+# when no device can be acquired.
 gpu = []
 # CUDA compute plane (Phase 3, three-tier hierarchy). When enabled,
 # `inference::run_inference_gpu` performs the per-expert SwiGLU forward

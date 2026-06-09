@@ -58,7 +58,6 @@ use tracing_subscriber::EnvFilter;
 use crate::backend::Backend;
 use crate::buffer_pool::BufferPool;
 use crate::engine::{Engine, EngineOptions, ModelShape};
-use crate::expert_cache::ExpertCache;
 use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::inference::expert_weight_bytes_for;
 use crate::io_provider::{NvmeStorage, StorageConfig};
@@ -163,7 +162,7 @@ enum Cmd {
         #[arg(long, default_value_t = crate::engine::DEFAULT_PIPELINE_DEPTH)]
         pipeline_depth: u32,
         /// Don't prefetch below this transition probability. The default
-        /// (`0.0`) auto-scales the threshold to `1 / (num_experts * 4)` so
+        /// (`0.0`) auto-scales the threshold to `2 / num_experts` so
         /// it remains achievable as the expert pool grows; pass an
         /// explicit positive value to override (e.g. `--predict-min-prob 0.05`).
         #[arg(long, default_value_t = 0.0)]
@@ -452,7 +451,7 @@ enum Cmd {
 /// Resolve the effective `predict_min_prob` for a given expert-pool size.
 ///
 /// A configured value of `0.0` (or negative — treated identically) is the
-/// "auto" sentinel and scales the threshold to `1 / (num_experts * 4)`, so
+/// "auto" sentinel and scales the threshold to `2 / num_experts`, so
 /// the Laplace-smoothed posteriors in [`PredictiveLoader::predict_next`]
 /// can actually clear the gate as the pool grows (a fixed `0.05` becomes
 /// mathematically unreachable past ~20 experts). Any positive value is
@@ -773,6 +772,15 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // architecture is a hard error — we never silently mislabel a model.
     let mut resolved_architecture = crate::architecture::Architecture::Mixtral;
     let mut resolved_first_k_dense_replace = 0usize;
+    // Advanced routing surface (DeepSeek-V3 aux-loss-free balancing:
+    // sigmoid scoring, group-limited top-K, routed scaling, plus
+    // `norm_topk_prob`). Reconciled from `config.json` alongside the
+    // dims below so the real model's per-layer `LinearGate` is built via
+    // `with_routing` with the checkpoint's actual scoring function — not
+    // silently defaulted to Mixtral-style softmax. Mixtral / Qwen3-MoE
+    // checkpoints map to the same values `AdvancedConfig::default()`
+    // already carries, so this is behaviour-preserving for them.
+    let mut resolved_advanced = crate::model::AdvancedConfig::default();
     if cfg.real_transformer.enabled {
         if let Some(arch_str) = cfg.real_transformer.architecture.clone() {
             resolved_architecture = crate::architecture::Architecture::from_model_type(&arch_str)
@@ -792,6 +800,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                     );
                     resolved_architecture = hf.architecture;
                     resolved_first_k_dense_replace = hf.first_k_dense_replace.unwrap_or(0);
+                    // Map the checkpoint's routing hyperparameters (scoring
+                    // function, group-limited top-K, routed scaling factor,
+                    // `norm_topk_prob`) so they reach the per-layer gate.
+                    resolved_advanced =
+                        crate::model::RealModelConfig::from_hf_config(&hf).advanced;
                     // Engine-visible dims (cache + expert namespace + router).
                     cfg.model.d_model = hf.hidden_size;
                     cfg.model.d_ff = hf.resolved_d_ff();
@@ -1040,7 +1053,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             window_size: if rt.window_size == 0 { None } else { Some(rt.window_size) },
             architecture: resolved_architecture,
             first_k_dense_replace: resolved_first_k_dense_replace,
-            advanced: Default::default(),
+            advanced: resolved_advanced,
         };
         let m = match rt.weights_dir.as_ref() {
             Some(dir) => crate::model::RealModel::from_dir_auto(model_cfg, dir, rt.seed)?,

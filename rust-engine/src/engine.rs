@@ -16,11 +16,11 @@
 use crate::aligned_buffer::AlignedBuffer;
 use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
-use crate::expert_cache::{ExpertCache, ExpertResident, GpuExpertCache, GpuResident};
+use crate::expert_cache::{ExpertResident, GpuExpertCache, GpuResident};
 use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::gating::Router;
 use crate::inference::{
-    combine_outputs, run_inference, run_inference_f16, run_inference_int8, run_inference_q4_0,
+    combine_outputs, run_inference_f16, run_inference_int8, run_inference_q4_0,
     run_inference_q4_0_qmm, run_inference_q4k, run_inference_q4k_qmm,
     run_inference_q8_0, run_inference_q8_0_qmm, synth_hidden_state,
     uniform_scores, ExpertWeightsError, HiddenState,
@@ -1343,7 +1343,18 @@ fn dispatch_expert_forward(
         );
     });
     match dtype {
-        WeightDtype::F32 => run_inference(token_idx, r, x, d_model, d_ff),
+        // Phase 3 compute plane: when built with `--features cuda`,
+        // route the F32 SwiGLU through candle-core's CUDA backend via
+        // `run_inference_gpu`, which transparently falls back to the CPU
+        // `run_inference` kernel at runtime when no device is present.
+        // Without the feature this is a direct call to the CPU path, so
+        // default builds are byte-for-byte unchanged.
+        #[cfg(feature = "cuda")]
+        WeightDtype::F32 => {
+            crate::inference::run_inference_gpu(token_idx, r, x, d_model, d_ff)
+        }
+        #[cfg(not(feature = "cuda"))]
+        WeightDtype::F32 => crate::inference::run_inference(token_idx, r, x, d_model, d_ff),
         WeightDtype::F16 => run_inference_f16(token_idx, r, x, d_model, d_ff),
         WeightDtype::Int8 => run_inference_int8(token_idx, r, x, d_model, d_ff),
         WeightDtype::Q4K if use_qmm
@@ -3939,7 +3950,17 @@ mod tests {
             "report bytes_read ({}) must include at least the critical-path bytes ({total_bytes})",
             r.bytes_read
         );
-        assert!(r.io_count >= total_misses, "io histogram must record every miss");
+        // The I/O histogram records one sample per *physical* SSD read
+        // (a singleflight leader inside `fetch_once`), which is neither an
+        // upper nor a lower bound on `total_misses`:
+        //   * a foreground miss that joins an in-flight prefetch/leader
+        //     becomes a singleflight *follower* — it counts as a miss but
+        //     issues no read, so it records no histogram sample; and
+        //   * a speculative prefetch leader records a sample for an expert
+        //     that was never a foreground miss.
+        // The only guaranteed invariant is that the cold-start miss forces
+        // at least one physical read, so the histogram is non-empty.
+        assert!(r.io_count > 0, "io histogram must record at least the cold-start read");
         // Latency histograms must have observed at least one sample of each
         // category (compute always, I/O at least once because a cold start
         // forces a miss).

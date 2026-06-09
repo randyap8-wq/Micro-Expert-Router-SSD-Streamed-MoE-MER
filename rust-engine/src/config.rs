@@ -200,7 +200,7 @@ pub struct StorageConfigToml {
     pub pipeline_depth: u32,
 
     /// Don't prefetch below this transition probability. `0.0` (the
-    /// default) auto-scales the threshold to `1 / (num_experts * 4)` at
+    /// default) auto-scales the threshold to `2 / num_experts` at
     /// engine wiring time so it stays achievable for large expert pools.
     #[serde(default = "default_predict_min_prob")]
     pub predict_min_prob: f64,
