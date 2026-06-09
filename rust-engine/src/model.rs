@@ -876,44 +876,43 @@ impl RealModel {
             // both. The shared intermediate size is inferred from the gate
             // tensor length. Prefix-aware so the `language_model.`
             // checkpoints resolve correctly.
-            if config.advanced.num_shared_experts == 0 {
-                continue;
-            }
-            let p = naming.prefix();
-            tried += 1;
-            let shexp_gate = find_f32_any(&[
-                format!("{p}model.layers.{l}.mlp.shared_expert.gate_proj.weight"),
-                format!("{p}model.layers.{l}.mlp.shared_experts.gate_proj.weight"),
-            ]);
-            let shexp_up = find_f32_any(&[
-                format!("{p}model.layers.{l}.mlp.shared_expert.up_proj.weight"),
-                format!("{p}model.layers.{l}.mlp.shared_experts.up_proj.weight"),
-            ]);
-            let shexp_down = find_f32_any(&[
-                format!("{p}model.layers.{l}.mlp.shared_expert.down_proj.weight"),
-                format!("{p}model.layers.{l}.mlp.shared_experts.down_proj.weight"),
-            ]);
-            if let (Some(gate), Some(up), Some(down)) = (shexp_gate, shexp_up, shexp_down) {
-                if d_model != 0 && gate.len() % d_model == 0 && gate.len() / d_model != 0 {
-                    let shared_d_ff = gate.len() / d_model;
-                    // Sigmoid gate is Qwen2-MoE-only (`shared_expert_gate`).
-                    let gate_inp = find_f32_any(&[format!(
-                        "{p}model.layers.{l}.mlp.shared_expert_gate.weight"
-                    )])
-                    .filter(|g| g.len() == d_model);
-                    match SharedExpert::from_projections(
-                        d_model, shared_d_ff, &gate, &up, &down, gate_inp,
-                    ) {
-                        Some(se) => {
-                            model.layers[l].shared_expert = Some(se);
-                            loaded += 1;
+            if config.advanced.num_shared_experts > 0 {
+                let p = naming.prefix();
+                tried += 1;
+                let shexp_gate = find_f32_any(&[
+                    format!("{p}model.layers.{l}.mlp.shared_expert.gate_proj.weight"),
+                    format!("{p}model.layers.{l}.mlp.shared_experts.gate_proj.weight"),
+                ]);
+                let shexp_up = find_f32_any(&[
+                    format!("{p}model.layers.{l}.mlp.shared_expert.up_proj.weight"),
+                    format!("{p}model.layers.{l}.mlp.shared_experts.up_proj.weight"),
+                ]);
+                let shexp_down = find_f32_any(&[
+                    format!("{p}model.layers.{l}.mlp.shared_expert.down_proj.weight"),
+                    format!("{p}model.layers.{l}.mlp.shared_experts.down_proj.weight"),
+                ]);
+                if let (Some(gate), Some(up), Some(down)) = (shexp_gate, shexp_up, shexp_down) {
+                    if d_model != 0 && gate.len() % d_model == 0 && gate.len() / d_model != 0 {
+                        let shared_d_ff = gate.len() / d_model;
+                        // Sigmoid gate is Qwen2-MoE-only (`shared_expert_gate`).
+                        let gate_inp = find_f32_any(&[format!(
+                            "{p}model.layers.{l}.mlp.shared_expert_gate.weight"
+                        )])
+                        .filter(|g| g.len() == d_model);
+                        match SharedExpert::from_projections(
+                            d_model, shared_d_ff, &gate, &up, &down, gate_inp,
+                        ) {
+                            Some(se) => {
+                                model.layers[l].shared_expert = Some(se);
+                                loaded += 1;
+                            }
+                            None => warn!(
+                                layer = l,
+                                shared_d_ff,
+                                d_model,
+                                "shared expert tensors present but shapes are inconsistent; ignoring"
+                            ),
                         }
-                        None => warn!(
-                            layer = l,
-                            shared_d_ff,
-                            d_model,
-                            "shared expert tensors present but shapes are inconsistent; ignoring"
-                        ),
                     }
                 }
             }
