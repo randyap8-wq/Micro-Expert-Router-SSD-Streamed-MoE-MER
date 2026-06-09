@@ -1512,6 +1512,14 @@ micro-expert-router run
   --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 | q8_0 (default f32).
                               Must match gen-data / the offline extractor.
   --predict-fanout <N>       Prefetch candidates per token (default 2)
+  --pipeline-depth <N>       Look-ahead pipeline depth (default 3). In serve
+                              mode, how many MoE layers ahead the speculator
+                              prefetches (sliding window
+                              `layer+1..=layer+pipeline_depth`); `1`
+                              reproduces the legacy single-layer look-ahead.
+                              In `run`, scales speculative prefetch headroom
+                              (shadow buffer budget = predict_fanout *
+                              pipeline_depth).
   --predict-min-prob <P>     Skip prefetch below this probability. The default
                               (0.0) auto-scales the threshold to
                               1 / (num_experts * 4); pass a positive value
@@ -1530,6 +1538,12 @@ micro-expert-router run
   --first-token <IDS>        Comma-separated expert ids to warm into cache
   --no-prefetch              Disable predictive loader (for ablation)
   --io-only                  Skip the SwiGLU FFN; XOR every byte to isolate I/O cost
+  --gpu                      Initialise the GPU compute backend before the
+                              benchmark so the FFN forward uses GPU matmul
+                              where available, and install a bounded VRAM
+                              `GpuExpertCache` so hot experts can promote and
+                              be served from device memory. Falls back to the
+                              CPU backend with a warning if GPU init fails.
   --force-ssd                Refuse to run with anything that lets the OS serve
                               experts from RAM (requires O_DIRECT on Linux)
   --router-clusters <N>      Markov router cluster count (default 4)
