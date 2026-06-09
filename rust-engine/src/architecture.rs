@@ -486,7 +486,6 @@ fn as_f32(v: &serde_json::Value) -> Option<f32> {
 }
 
 impl HfConfig {
-    /// Read and parse `<dir>/config.json`.
     /// Read and parse `<dir>/config.json`. Returns `Ok(None)` when the
     /// file does not exist (so callers can fall back to TOML-derived
     /// config), `Ok(Some(_))` on success, and `Err` for a malformed file
