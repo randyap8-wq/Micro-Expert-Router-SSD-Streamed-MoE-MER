@@ -1925,6 +1925,7 @@ mod tests {
             window_size: None,
             architecture: crate::architecture::Architecture::Mixtral,
             first_k_dense_replace: 0,
+            advanced: Default::default(),
         };
         let (state, _tmp) = make_state_with_real_model(cfg).await;
         let app = build_router(state.clone());

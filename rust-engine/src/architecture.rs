@@ -126,6 +126,13 @@ impl Architecture {
         matches!(self, Self::Mixtral | Self::Qwen3Moe | Self::DeepSeekV3)
     }
 
+    /// `true` if the architecture applies per-head QK-Norm (a `head_dim`
+    /// RMSNorm on Q and K before RoPE). Qwen3 and Qwen3-MoE do; Mixtral,
+    /// Mistral Small 3, Phi-4 and DeepSeek-V3 do not.
+    pub fn uses_qk_norm(&self) -> bool {
+        matches!(self, Self::Qwen3 | Self::Qwen3Moe)
+    }
+
     /// Whether the forward-compute path can execute this architecture.
     ///
     /// Stage 1 maps and loads tensors for every variant, but DeepSeek-V3
@@ -276,6 +283,17 @@ impl TensorNaming {
         format!("{}model.layers.{l}.self_attn.o_proj.weight", self.prefix)
     }
 
+    /// Per-head Q RMSNorm weight (Qwen3 / Qwen3-MoE "QK-Norm"). Length
+    /// `head_dim`. Only present for [`Architecture::uses_qk_norm`] families.
+    pub fn attn_q_norm(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.q_norm.weight", self.prefix)
+    }
+
+    /// Per-head K RMSNorm weight (Qwen3 / Qwen3-MoE). Length `head_dim`.
+    pub fn attn_k_norm(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.k_norm.weight", self.prefix)
+    }
+
     // -- MoE gate --------------------------------------------------------
 
     /// Router/gate weight for a MoE layer. Mixtral nests it under
@@ -287,6 +305,13 @@ impl TensorNaming {
             }
             _ => format!("{}model.layers.{l}.mlp.gate.weight", self.prefix),
         }
+    }
+
+    /// DeepSeek-V3 per-expert score-correction bias (`e_score_correction_bias`),
+    /// stored alongside the gate. Used for selection only (aux-loss-free
+    /// load balancing). Absent on Mixtral / Qwen3-MoE.
+    pub fn moe_gate_correction_bias(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.mlp.gate.e_score_correction_bias", self.prefix)
     }
 
     // -- Dense FFN (non-MoE layers) --------------------------------------
@@ -439,6 +464,37 @@ impl From<serde_json::Error> for ArchitectureError {
     }
 }
 
+/// Multi-head latent attention (MLA) projection dims (DeepSeek-V3/V3.1).
+///
+/// Carried through the loader/config so the future MLA compute workstream
+/// has them. They are **not** consumed by the current attention block —
+/// DeepSeek-V3 fails loud at load time ([`Architecture::compute_support`])
+/// precisely because MLA is not yet implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlaDims {
+    pub q_lora_rank: usize,
+    pub kv_lora_rank: usize,
+    pub qk_rope_head_dim: usize,
+    pub qk_nope_head_dim: usize,
+    pub v_head_dim: usize,
+}
+
+/// RoPE scaling parameters (YaRN), needed by DeepSeek / long-context
+/// configs. Carried through from `config.json`'s `rope_scaling` block.
+/// Like [`MlaDims`], this is plumbing for the staged MLA/long-context
+/// workstream; the standard RoPE path ignores it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RopeScaling {
+    /// `rope_scaling.type` / `rope_type` — e.g. `"yarn"`.
+    pub rope_type: String,
+    pub factor: f32,
+    pub original_max_position_embeddings: usize,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub mscale: f32,
+    pub mscale_all_dim: f32,
+}
+
 /// Parsed view of a HuggingFace `config.json`, normalised across the
 /// per-family key spellings. Every value is sourced from the file — there
 /// are no hard-coded layer or expert counts.
@@ -475,6 +531,14 @@ pub struct HfConfig {
     pub topk_group: Option<usize>,
     pub routed_scaling_factor: Option<f32>,
     pub norm_topk_prob: Option<bool>,
+    // -- MLA (DeepSeek-V3) --
+    pub q_lora_rank: Option<usize>,
+    pub kv_lora_rank: Option<usize>,
+    pub qk_rope_head_dim: Option<usize>,
+    pub qk_nope_head_dim: Option<usize>,
+    pub v_head_dim: Option<usize>,
+    // -- RoPE scaling (YaRN) --
+    pub rope_scaling: Option<RopeScaling>,
 }
 
 fn as_usize(v: &serde_json::Value) -> Option<usize> {
@@ -483,6 +547,33 @@ fn as_usize(v: &serde_json::Value) -> Option<usize> {
 
 fn as_f32(v: &serde_json::Value) -> Option<f32> {
     v.as_f64().map(|n| n as f32)
+}
+
+/// Parse a `config.json` `rope_scaling` object into [`RopeScaling`].
+/// Accepts both the `rope_type` and legacy `type` spellings. Returns
+/// `None` for a missing/non-object value or one without a `factor`.
+fn parse_rope_scaling(v: &serde_json::Value) -> Option<RopeScaling> {
+    let obj = v.as_object()?;
+    let rope_type = obj
+        .get("rope_type")
+        .or_else(|| obj.get("type"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let factor = obj.get("factor").and_then(as_f32)?;
+    let getf = |k: &str, d: f32| obj.get(k).and_then(as_f32).unwrap_or(d);
+    Some(RopeScaling {
+        rope_type,
+        factor,
+        original_max_position_embeddings: obj
+            .get("original_max_position_embeddings")
+            .and_then(as_usize)
+            .unwrap_or(0),
+        beta_fast: getf("beta_fast", 32.0),
+        beta_slow: getf("beta_slow", 1.0),
+        mscale: getf("mscale", 1.0),
+        mscale_all_dim: getf("mscale_all_dim", 0.0),
+    })
 }
 
 impl HfConfig {
@@ -579,6 +670,12 @@ impl HfConfig {
             topk_group: get("topk_group").and_then(as_usize),
             routed_scaling_factor: get("routed_scaling_factor").and_then(as_f32),
             norm_topk_prob: get("norm_topk_prob").and_then(|v| v.as_bool()),
+            q_lora_rank: get("q_lora_rank").and_then(as_usize),
+            kv_lora_rank: get("kv_lora_rank").and_then(as_usize),
+            qk_rope_head_dim: get("qk_rope_head_dim").and_then(as_usize),
+            qk_nope_head_dim: get("qk_nope_head_dim").and_then(as_usize),
+            v_head_dim: get("v_head_dim").and_then(as_usize),
+            rope_scaling: get("rope_scaling").and_then(parse_rope_scaling),
         })
     }
 

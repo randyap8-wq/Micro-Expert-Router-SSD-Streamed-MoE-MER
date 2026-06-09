@@ -289,6 +289,15 @@ pub struct MultiHeadSelfAttention {
     /// `None` recovers full causal attention (backward compatible
     /// default used by every existing test).
     pub window_size: Option<usize>,
+    /// Optional per-head RMSNorm applied to **Q** before RoPE (Qwen3 /
+    /// Qwen3-MoE "QK-Norm"). The weight vector has length `head_dim` and
+    /// is applied independently to each of the `num_heads` query heads.
+    /// `None` (Mixtral / Llama / Mistral / Phi-4) leaves Q untouched.
+    pub q_norm: Option<RmsNorm>,
+    /// Optional per-head RMSNorm applied to **K** before RoPE (Qwen3 /
+    /// Qwen3-MoE). Weight length `head_dim`, applied to each of the
+    /// `num_kv_heads` key heads. `None` leaves K untouched.
+    pub k_norm: Option<RmsNorm>,
 }
 
 impl MultiHeadSelfAttention {
@@ -298,6 +307,30 @@ impl MultiHeadSelfAttention {
 
     pub fn kv_dim(&self) -> usize {
         self.num_kv_heads * self.head_dim
+    }
+
+    /// Apply the optional per-head Q RMSNorm (QK-Norm) in place. No-op when
+    /// `q_norm` is `None`. `q` is the full `num_heads * head_dim` query
+    /// vector; each head's `head_dim` slice is normalised independently.
+    fn apply_q_norm(&self, q: &mut [f32]) {
+        if let Some(norm) = self.q_norm.as_ref() {
+            for h in 0..self.num_heads {
+                let s = h * self.head_dim;
+                norm.forward_inplace(&mut q[s..s + self.head_dim]);
+            }
+        }
+    }
+
+    /// Apply the optional per-head K RMSNorm (QK-Norm) in place. No-op when
+    /// `k_norm` is `None`. `k` is the full `num_kv_heads * head_dim` key
+    /// vector; each KV head's `head_dim` slice is normalised independently.
+    fn apply_k_norm(&self, k: &mut [f32]) {
+        if let Some(norm) = self.k_norm.as_ref() {
+            for h in 0..self.num_kv_heads {
+                let s = h * self.head_dim;
+                norm.forward_inplace(&mut k[s..s + self.head_dim]);
+            }
+        }
     }
 
     /// Forward one token at absolute position `pos`. Updates `kv` with
@@ -362,6 +395,9 @@ impl MultiHeadSelfAttention {
             let mut q = matmul_row_major(&self.wq, x, q_dim, self.d_model);
             let mut k = matmul_row_major(&self.wk, x, kv_dim, self.d_model);
             let v = matmul_row_major(&self.wv, x, kv_dim, self.d_model);
+            // QK-Norm (Qwen3): per-head RMSNorm on Q and K *before* RoPE.
+            self.apply_q_norm(&mut q);
+            self.apply_k_norm(&mut k);
             for h in 0..self.num_heads {
                 let s = h * self.head_dim;
                 apply_rope_inplace(&mut q[s..s + self.head_dim], pos, self.rope_base);
@@ -422,6 +458,11 @@ impl MultiHeadSelfAttention {
         // ── 2) Apply RoPE in f32 (cheap; stays on CPU regardless of backend) ─
         let mut q = to_f32(&q_f16);
         let mut k = to_f32(&k_f16);
+
+        // QK-Norm (Qwen3): per-head RMSNorm on Q and K *before* RoPE, mirror
+        // of the CPU path so the GPU and CPU attention agree numerically.
+        self.apply_q_norm(&mut q);
+        self.apply_k_norm(&mut k);
 
         for h in 0..self.num_heads {
             let s = h * self.head_dim;
@@ -866,6 +907,14 @@ pub struct TransformerLayer {
     /// Optional always-on dense FFN (Qwen2-MoE / DeepSeek-MoE shared
     /// expert). `None` for Mixtral-style MoEs.
     pub shared_expert: Option<SharedExpert>,
+    /// Dense SwiGLU FFN for **dense layers** (Mistral Small 3, Phi-4, and
+    /// DeepSeek's `first_k_dense_replace` leading layers). When `Some`,
+    /// this layer bypasses the SSD-streamed expert path entirely:
+    /// `RealModel::step` runs this resident FFN over the post-attention
+    /// normalised hidden state instead of routing to streamed experts.
+    /// `None` means the layer is sparse and routes through the engine's
+    /// expert cache (Mixtral / Qwen3-MoE / DeepSeek sparse layers).
+    pub dense_ffn: Option<SharedExpert>,
 }
 
 impl TransformerLayer {
@@ -917,6 +966,26 @@ impl TransformerLayer {
     /// the caller can skip the residual add entirely.
     pub fn shared_expert_forward(&self, normed: &[f32]) -> Option<HiddenState> {
         self.shared_expert.as_ref().map(|se| se.forward(normed))
+    }
+
+    /// `true` if this layer is a **dense** FFN layer (Mistral Small 3,
+    /// Phi-4, or a DeepSeek `first_k_dense_replace` prefix layer). Dense
+    /// layers bypass the SSD-streamed expert path entirely.
+    pub fn is_dense(&self) -> bool {
+        self.dense_ffn.is_some()
+    }
+
+    /// Run the resident dense SwiGLU FFN of a dense layer over `hidden`:
+    /// `hidden -> rms_moe -> dense_ffn -> + residual`. Returns `None` for
+    /// sparse (routed-MoE) layers so the caller falls back to the streamed
+    /// expert path. Dense layers never touch the engine's expert cache, so
+    /// they do not exercise SSD streaming (by design — they have no experts
+    /// to stream).
+    pub fn dense_forward(&self, hidden: &[f32]) -> Option<Vec<f32>> {
+        let ffn = self.dense_ffn.as_ref()?;
+        let normed = self.rms_moe.forward(hidden);
+        let out = ffn.forward(&normed);
+        Some(add_residual(hidden, &out))
     }
 }
 
@@ -1113,6 +1182,8 @@ mod tests {
             wv: mk(kv_dim, d_model),
             wo: mk(d_model, q_dim),
             window_size: None,
+            q_norm: None,
+            k_norm: None,
         };
         let mut kv = KvCache::new(kv_dim);
         let x: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32).collect();
@@ -1127,7 +1198,57 @@ mod tests {
     }
 
     #[test]
-    fn combine_moe_outputs_is_weighted_sum() {
+    fn qk_norm_changes_attention_output_and_stays_finite() {
+        // Two otherwise-identical attention blocks: one with QK-Norm, one
+        // without. QK-Norm must (a) keep outputs finite and (b) change the
+        // result (it renormalises Q and K per head before RoPE).
+        let d_model = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mk = |rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols).map(|i| ((i % 5) as f32 - 2.0) * 0.2).collect()
+        };
+        let base = MultiHeadSelfAttention {
+            d_model,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_base: 10000.0,
+            wq: mk(q_dim, d_model),
+            wk: mk(kv_dim, d_model),
+            wv: mk(kv_dim, d_model),
+            wo: mk(d_model, q_dim),
+            window_size: None,
+            q_norm: None,
+            k_norm: None,
+        };
+        let mut normed = base.clone();
+        // Non-unit per-head norm weights so the effect is visible.
+        normed.q_norm = Some(RmsNorm::new(vec![1.5, 0.5, 1.0, 2.0], 1e-6));
+        normed.k_norm = Some(RmsNorm::new(vec![0.7, 1.2, 1.0, 0.9], 1e-6));
+
+        let x: Vec<f32> = (0..d_model).map(|i| 0.15 * i as f32 - 0.3).collect();
+        let mut kv_a = KvCache::new(kv_dim);
+        let mut kv_b = KvCache::new(kv_dim);
+        // Prime position 0 so the cache holds two keys: with a single key
+        // the softmax is trivially 1.0 and the Q/K scaling cannot change
+        // the attention output. The QK-Norm effect is only visible once
+        // there are at least two positions to attend over.
+        let _ = base.forward(&x, 0, 0, &mut kv_a, &cpu_backend());
+        let _ = normed.forward(&x, 0, 0, &mut kv_b, &cpu_backend());
+        let x1: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32 + 0.05).collect();
+        let y_plain = base.forward(&x1, 1, 0, &mut kv_a, &cpu_backend());
+        let y_norm = normed.forward(&x1, 1, 0, &mut kv_b, &cpu_backend());
+        assert!(y_norm.iter().all(|v| v.is_finite()));
+        let diff: f32 = y_plain.iter().zip(&y_norm).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-4, "QK-Norm should change the output (diff={diff})");
+    }
+
+    #[test]
+    fn combine_moe_outputs_weights_correctly() {
         let d = 4;
         let outs = vec![vec![1.0; d], vec![2.0; d], vec![4.0; d]];
         let scores = vec![0.5, 0.25, 0.25];
@@ -1194,6 +1315,8 @@ mod tests {
                 wv: mk(kv_dim, d_model, 0.05),
                 wo: mk(d_model, q_dim, 0.05),
                 window_size: None,
+                q_norm: None,
+                k_norm: None,
             },
             rms_moe: RmsNorm::new(vec![1.0; d_model], 1e-6),
             gate: crate::gating::LinearGate::new(
@@ -1203,6 +1326,7 @@ mod tests {
                 top_k,
             ),
             shared_expert: None,
+            dense_ffn: None,
         }
     }
 
@@ -1277,6 +1401,8 @@ mod tests {
             wv: identity(d_model),
             wo: identity(d_model),
             window_size: window,
+            q_norm: None,
+            k_norm: None,
         }
     }
 
@@ -1404,6 +1530,8 @@ mod tests {
             wv: mk(kv_dim, d_model),
             wo: mk(d_model, q_dim),
             window_size: None,
+            q_norm: None,
+            k_norm: None,
         };
         let mut kv = KvCache::new(kv_dim);
         // Walk past the first block boundary to exercise multi-block
