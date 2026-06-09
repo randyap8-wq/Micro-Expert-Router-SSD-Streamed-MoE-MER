@@ -1834,6 +1834,11 @@ pub fn run_inference(
 /// signature so the engine can dispatch into it the same way it
 /// dispatches the dtype-specific variants — no new call shape at the
 /// call site.
+//
+// Only the `cuda` build dispatches into this from
+// `engine::dispatch_expert_forward`; on the default CPU build the
+// F32 arm calls `run_inference` directly, so the symbol is dead there.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub fn run_inference_gpu(
     token_idx: u64,
     resident: &ExpertResident,
