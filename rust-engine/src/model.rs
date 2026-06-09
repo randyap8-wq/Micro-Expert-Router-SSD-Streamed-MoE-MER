@@ -816,16 +816,8 @@ impl RealModel {
                 }
             }};
         }
-        // FP8-dequant-aware variant of `maybe!` for DeepSeek-V3 weights.
-        macro_rules! maybe_q {
-            ($name:expr, $expected:expr, $assign:expr) => {{
-                tried += 1;
-                if let Some(v) = find_f32_dequant($name, $expected) {
-                    $assign(v);
-                    loaded += 1;
-                }
-            }};
-        }
+        // FP8 dequant happens via `find_f32_dequant` / `find_f32_any`
+        // directly (e.g. in `load_mla_layer`); no extra macro needed.
 
         let d_model = config.d_model;
         let q_dim = config.num_heads * config.head_dim;

@@ -330,19 +330,27 @@ impl ShardRouter for LocalShardRouter {
 // RpcShardRouter — gist Task 1 ("ShardRouter Interface").
 // ---------------------------------------------------------------------
 
-/// **Future** gRPC-backed [`ShardRouter`] sketch.
+/// gRPC-backed [`ShardRouter`]: routes experts to remote shards and
+/// verifies reachability over tonic.
 ///
-/// This is a **structural skeleton**: it documents the shape an
-/// upcoming `tonic`-based implementation will take so the rest of the
-/// engine can be written against the `ShardRouter` trait surface today
-/// without committing to a transport. The fields are deliberately
-/// `pub(crate)` placeholders — when the real implementation lands they
-/// become a `tonic::transport::Channel` per node plus a
-/// concurrency-bounded client pool.
+/// `route_expert` consults the placement map to decide whether an
+/// expert is local or lives on a remote shard. For remote experts,
+/// [`Self::fetch_remote`] performs a real gRPC reachability probe
+/// (a `Health` round-trip) against the owning node **when the crate is
+/// built with the `grpc` cargo feature** — see [`crate::grpc`]. Without
+/// that feature, `tonic` is not compiled in and the remote path returns
+/// a structured [`ShardRouterError::Unreachable`] instead of panicking,
+/// so the single-node build stays lean. The actual per-expert FFN data
+/// transfer uses [`crate::grpc::ShardClient::route_experts`].
+///
+/// The fields are `pub(crate)`; a follow-up can swap the placement
+/// `HashMap` for an `arc_swap::ArcSwap<PlacementMap>` and add a
+/// per-node `tonic::transport::Channel` pool without changing the
+/// `ShardRouter` trait surface callers depend on.
 ///
 /// ### Mapping `tonic::Status` to [`ShardRouterError`]
 ///
-/// When the real implementation is wired up, each `tonic::Code` is
+/// Each `tonic::Code` is
 /// translated into a [`ShardRouterError`] variant via [`RpcShardRouter::map_tonic_status`]
 /// (a free helper so it is easy to unit-test independently of any
 /// running gRPC server):
@@ -456,7 +464,7 @@ impl RpcShardRouter {
 
 impl ShardRouter for RpcShardRouter {
     fn name(&self) -> &'static str {
-        "rpc-tonic-stub"
+        "rpc-tonic"
     }
 
     fn route_expert(&self, expert: u32) -> ShardInstruction {
@@ -477,20 +485,30 @@ impl ShardRouter for RpcShardRouter {
         Box::pin(async move {
             match instruction {
                 ShardInstruction::Local { .. } => Ok(()),
-                ShardInstruction::Remote { expert, node, .. } => {
-                    // The real implementation issues a
-                    // `tonic::Client::fetch_expert(ExpertRequest { id })`
-                    // here, then funnels the `Result<_, tonic::Status>`
-                    // through `Self::map_tonic_status`. Until that lands
-                    // the stub returns `Unreachable` so callers exercising
-                    // this path against the skeleton see a structured
-                    // failure rather than a panic.
-                    Err(ShardRouterError::Unreachable {
-                        expert: *expert,
-                        node: node.clone(),
-                        reason: "RpcShardRouter is a skeleton; tonic client not yet wired"
-                            .to_string(),
-                    })
+                ShardInstruction::Remote { expert, node, timeout } => {
+                    // With the `grpc` feature enabled, perform a real
+                    // gRPC reachability probe against the owning shard
+                    // (a `Health` round-trip), funnelling any
+                    // `tonic::Status` through `Self::map_tonic_status`.
+                    #[cfg(feature = "grpc")]
+                    {
+                        crate::grpc::probe_remote(*expert, node.clone(), *timeout).await
+                    }
+                    // Without the feature there is no tonic client, so
+                    // the skeleton returns a structured `Unreachable`
+                    // rather than panicking — callers exercising this
+                    // path see a typed failure they can handle.
+                    #[cfg(not(feature = "grpc"))]
+                    {
+                        let _ = timeout;
+                        Err(ShardRouterError::Unreachable {
+                            expert: *expert,
+                            node: node.clone(),
+                            reason: "RpcShardRouter requires the `grpc` cargo feature; \
+                                     tonic client not compiled in"
+                                .to_string(),
+                        })
+                    }
                 }
             }
         })

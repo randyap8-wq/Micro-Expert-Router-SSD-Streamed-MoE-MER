@@ -26,6 +26,10 @@ mod expert_cache;
 mod gating;
 mod gguf;
 mod gguf_loader;
+#[cfg(feature = "grpc")]
+mod grpc;
+#[cfg(feature = "grpc")]
+mod grpc_gen;
 mod inference;
 mod io_provider;
 mod io_reactor;
