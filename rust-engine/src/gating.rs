@@ -255,6 +255,7 @@ impl LinearGate {
                 .partial_cmp(&selection[a as usize])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        idx.retain(|&i| selection[i as usize].is_finite());
         idx.truncate(self.top_k);
 
         // Mixing weights are the *original* scores at the chosen experts.
