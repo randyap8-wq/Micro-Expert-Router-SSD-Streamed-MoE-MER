@@ -468,11 +468,20 @@ def main() -> int:
     # them up front so a non-MoE model fails clearly rather than with a
     # late KeyError deep in the state-dict walk.
     resolved = resolve_moe_config(config, arch)
-    missing = [k for k in ("num_experts", "top_k", "d_model", "d_ff") if resolved[k] is None]
+    # The config attribute names tried for each resolved field, surfaced
+    # in the error message so a malformed config is easy to debug.
+    field_sources = {
+        "num_experts": ["num_local_experts", "num_experts", "n_routed_experts"],
+        "top_k": ["num_experts_per_tok"],
+        "d_model": ["hidden_size"],
+        "d_ff": ["intermediate_size"] if arch == "mixtral" else ["moe_intermediate_size", "intermediate_size"],
+    }
+    missing = [k for k in field_sources if resolved[k] is None]
     if missing:
+        detail = "; ".join(f"{k} (tried {field_sources[k]})" for k in missing)
         print(
             f"error: model {args.model!r} ({arch!r}) is missing MoE config "
-            f"fields {missing}; is this actually a {arch} MoE checkpoint?",
+            f"fields: {detail}. Is this actually a {arch} MoE checkpoint?",
             file=sys.stderr,
         )
         return 2
