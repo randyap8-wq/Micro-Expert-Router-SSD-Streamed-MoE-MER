@@ -75,7 +75,12 @@ impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
             scoring_func: ScoringFunc::Softmax,
-            norm_topk_prob: true,
+            // Mixtral renormalises differently and has no `norm_topk_prob`
+            // key; defaulting to `false` keeps TOML-only (no config.json)
+            // Mixtral runs from silently applying Qwen3-style top-K
+            // renormalisation. `true` is only set when a checkpoint's
+            // config.json explicitly requests it (see `from_hf_config`).
+            norm_topk_prob: false,
             n_group: 1,
             topk_group: 1,
             routed_scaling_factor: 1.0,
@@ -253,7 +258,7 @@ impl RealModelConfig {
         };
         let advanced = AdvancedConfig {
             scoring_func,
-            norm_topk_prob: hf.norm_topk_prob.unwrap_or(true),
+            norm_topk_prob: hf.norm_topk_prob.unwrap_or(false),
             n_group: hf.n_group.unwrap_or(1).max(1),
             topk_group: hf.topk_group.unwrap_or(1).max(1),
             routed_scaling_factor: hf.routed_scaling_factor.unwrap_or(1.0),
@@ -830,11 +835,23 @@ impl RealModel {
             // Mixtral vs `mlp.gate` for Qwen3-MoE / DeepSeek).
             if config.architecture.is_moe() && naming.ffn_kind(l) == FfnKind::Moe {
                 let adv = &config.advanced;
+                let expected = config.num_experts * d_model;
                 // DeepSeek-V3 aux-loss-free balancing: a per-expert bias
                 // added to selection scores only. Absent on Mixtral/Qwen3.
                 let correction_bias = find_f32_any(&[naming.moe_gate_correction_bias(l)])
                     .filter(|b| b.len() == config.num_experts);
-                maybe!(&naming.moe_gate(l), config.num_experts * d_model, |v| {
+                // Prefer an extracted `gate_<L>.bin` sitting alongside the
+                // shards over re-deriving the gate inline from the
+                // checkpoint, so the two loader paths (`from_dir` /
+                // `from_safetensors`, dispatched by `from_dir_auto`) agree
+                // when both sources are present. The on-disk bin is only
+                // honoured when its length matches the configured shape;
+                // otherwise we fall back to the inline `moe_gate` tensor.
+                tried += 1;
+                let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
+                    .filter(|v| v.len() == expected)
+                    .or_else(|| find_f32(&naming.moe_gate(l), expected));
+                if let Some(v) = gate_vec {
                     model.layers[l].gate = LinearGate::with_routing(
                         v,
                         config.num_experts,
@@ -847,15 +864,21 @@ impl RealModel {
                         adv.topk_group,
                         adv.routed_scaling_factor,
                     );
-                });
+                    loaded += 1;
+                }
             }
-            // Optional shared expert (Qwen2-MoE / DeepSeek-MoE). Different
-            // checkpoints name the FFN block `mlp` and the shared expert
-            // either `shared_expert` (Qwen2-MoE) or `shared_experts`
-            // (DeepSeek-MoE), so we probe both. The shared intermediate
-            // size is inferred from the gate tensor length. Mixtral has no
-            // such tensor, so this is a no-op there. Prefix-aware so the
-            // `language_model.` checkpoints resolve correctly.
+            // Optional shared expert (Qwen2-MoE / DeepSeek-MoE). Only
+            // attempt the load when the checkpoint actually declares
+            // always-on shared experts (`n_shared_experts > 0`): Qwen3-MoE
+            // and Mixtral have none, so probing there is pure wasted I/O.
+            // Checkpoints name the shared expert either `shared_expert`
+            // (Qwen2-MoE) or `shared_experts` (DeepSeek-MoE), so we probe
+            // both. The shared intermediate size is inferred from the gate
+            // tensor length. Prefix-aware so the `language_model.`
+            // checkpoints resolve correctly.
+            if config.advanced.num_shared_experts == 0 {
+                continue;
+            }
             let p = naming.prefix();
             tried += 1;
             let shexp_gate = find_f32_any(&[
@@ -1700,6 +1723,15 @@ mod tests {
         let dir = TempDir::new("shexp_absent");
         let model = RealModel::from_dir(cfg, &dir.path, 1).unwrap();
         assert!(model.layers[0].shared_expert.is_none());
+    }
+
+    /// `norm_topk_prob` must default to `false` so a TOML-only (no
+    /// `config.json`) Mixtral run does not silently apply Qwen3-style
+    /// top-K renormalisation. Explicit `true` is only honoured when a
+    /// checkpoint's `config.json` sets it (see `from_hf_config`).
+    #[test]
+    fn advanced_config_norm_topk_prob_defaults_false() {
+        assert!(!AdvancedConfig::default().norm_topk_prob);
     }
 
     /// Inconsistent shared-expert tensors (down proj wrong length) must
