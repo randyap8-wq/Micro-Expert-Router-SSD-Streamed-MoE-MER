@@ -1728,11 +1728,11 @@ error — the engine never silently mislabels a checkpoint.
 | Family | `model_type` | Status | Notes |
 |---|---|---|---|
 | Mixtral / Llama-MoE | `mixtral` | ✅ Full | `block_sparse_moe.{gate,experts.*}` names, softmax top-K routing. The original, fully streamed path. |
-| Qwen3-MoE | `qwen3_moe` | ✅ Loadable | `mlp.{gate,experts.{i}.{gate,up,down}_proj}` names; explicit `head_dim` (≠ `d_model/num_heads`) supported. QK-Norm attention is Stage 2. |
-| Qwen3 (dense) | `qwen3` | ⚠️ Partial | Attention + norms + embeddings map correctly; the dense FFN compute path is Stage 4 (names are mapped, weights are not yet executed). |
-| Mistral Small 3 | `mistral3` | ⚠️ Partial (dense) | Multimodal checkpoint: LM tensors carry a `language_model.` prefix (stripped automatically) and the vision tower is ignored. Dense FFN compute is Stage 4; dense models do **not** exercise SSD expert streaming. |
-| Phi-4 | `phi3` | ⚠️ Partial (dense) | Fused `qkv_proj` is split into separate Q/K/V at load; fused `gate_up_proj` dense FFN is Stage 4. Dense models do **not** exercise SSD expert streaming. |
-| DeepSeek-V3 / V3.1 | `deepseek_v3` | ⛔ Fail-loud | Tensor names (incl. `weight_scale_inv` FP8 scales, parked in a side table) are mapped, and the dense-vs-MoE split honours `first_k_dense_replace`. But MLA latent-KV attention and FP8 dequant are unimplemented, so the loader **refuses** rather than route on garbage. Sigmoid + bias-corrected grouped top-K routing and MLA are later stages. |
+| Qwen3-MoE | `qwen3_moe` | ✅ Loadable | `mlp.{gate,experts.{i}.{gate,up,down}_proj}` names; explicit `head_dim` (≠ `d_model/num_heads`) supported. QK-Norm attention is applied (per-head `head_dim` RMSNorm on Q and K before RoPE). |
+| Qwen3 (dense) | `qwen3` | ✅ Full (dense) | Attention + QK-Norm + norms + embeddings map and run; the dense SwiGLU FFN is executed from resident weights. Being dense it does **not** exercise SSD expert streaming. |
+| Mistral Small 3 | `mistral3` | ✅ Full (dense) | Multimodal checkpoint: LM tensors carry a `language_model.` prefix (stripped automatically) and the vision tower is ignored. The dense SwiGLU FFN is executed; dense models do **not** exercise SSD expert streaming. |
+| Phi-4 | `phi3` | ✅ Full (dense) | Fused `qkv_proj` is split into separate Q/K/V at load; the fused `gate_up_proj` dense FFN is split and executed. Dense models do **not** exercise SSD expert streaming. |
+| DeepSeek-V3 / V3.1 | `deepseek_v3` | ⛔ Fail-loud | Tensor names (incl. `weight_scale_inv` FP8 scales, parked in a side table) are mapped, and the dense-vs-MoE split honours `first_k_dense_replace`. Sigmoid + bias-corrected grouped top-K routing is implemented. But MLA latent-KV attention and FP8 dequant are unimplemented, so the loader **refuses** rather than route on garbage. MLA + YaRN long-context are later stages. |
 
 Because Mistral Small 3 and Phi-4 are fully **dense**, they bypass the
 per-token expert-streaming substrate entirely — the feature the engine
@@ -1777,25 +1777,26 @@ Per-family specifics:
   128-expert router and `mlp.experts.*` names load automatically. Expert
   FFNs still stream from `--data-dir`; extract them the same way as
   Mixtral but with the Qwen3 naming (see the extractor notes below).
-  Attention runs without QK-Norm until Stage 2, so generation quality is
-  approximate.
-* **Qwen3 dense (`qwen3`) — ⚠️ partial.** Loads attention + norms +
-  embeddings; the dense FFN is not yet executed (Stage 4). Runnable for
-  plumbing/benchmarks, not for faithful output.
-* **Mistral Small 3 (`mistral3`) — ⚠️ partial, dense.** Point
+  Attention applies QK-Norm (per-head RMSNorm on Q and K before RoPE),
+  matching the reference architecture.
+* **Qwen3 dense (`qwen3`) — ✅ runs, dense.** Loads attention + QK-Norm +
+  norms + embeddings and executes the dense SwiGLU FFN from resident
+  weights. Being dense it does **not** exercise SSD streaming.
+* **Mistral Small 3 (`mistral3`) — ✅ runs, dense.** Point
   `weights_dir` at the multimodal checkpoint; the `language_model.`
-  prefix is handled and the vision tower is ignored. Dense FFN compute is
-  Stage 4, and being dense it does **not** exercise SSD streaming.
-* **Phi-4 (`phi3`) — ⚠️ partial, dense.** The fused `qkv_proj` is split
-  into Q/K/V automatically; the fused `gate_up_proj` dense FFN is Stage 4.
-  Dense, so no expert streaming.
+  prefix is handled and the vision tower is ignored. The dense SwiGLU FFN
+  is executed; being dense it does **not** exercise SSD streaming.
+* **Phi-4 (`phi3`) — ✅ runs, dense.** The fused `qkv_proj` is split
+  into Q/K/V automatically and the fused `gate_up_proj` dense FFN is split
+  and executed. Dense, so no expert streaming.
 * **DeepSeek-V3 / V3.1 (`deepseek_v3`) — ⛔ fails loud.** Configuring it
   is accepted (names, the `first_k_dense_replace` dense/MoE split, and the
   `weight_scale_inv` FP8 side table are all mapped), but `serve` returns
   an `Unsupported` error at load time because MLA latent-KV attention and
   FP8 dequant are not implemented. This is intentional — the engine
-  refuses rather than route on garbage activations. Full support is a
-  later, larger stage (MLA + YaRN + bias-corrected sigmoid grouped top-K).
+  refuses rather than route on garbage activations. The sigmoid +
+  bias-corrected grouped top-K router is already implemented; full support
+  is a later, larger stage (MLA + YaRN long-context).
 
 **Per-expert sizes for Mixtral-8x7B** (`d_model = 4096`, `d_ff = 14336`,
 ~176 M weights per expert across the three SwiGLU matrices, plus a small

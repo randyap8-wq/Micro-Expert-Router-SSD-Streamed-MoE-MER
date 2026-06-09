@@ -148,9 +148,9 @@ impl Architecture {
                          is recognised, but the model cannot be executed)",
             },
             // Dense families (Mistral Small 3, Phi-4) and dense Qwen3 run
-            // through the standard attention + SwiGLU path; the
-            // dense-FFN-as-single-expert wiring is a later stage but the
-            // architecture itself is executable.
+            // through the standard attention + SwiGLU path; the resident
+            // dense FFN is executed directly (it has no experts to stream),
+            // so the architecture itself is executable.
             _ => ComputeSupport::Supported,
         }
     }
