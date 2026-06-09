@@ -13,6 +13,7 @@
 #![cfg_attr(feature = "nightly-amx", feature(stdarch_x86_amx))]
 
 mod aligned_buffer;
+mod architecture;
 mod backend;
 mod batch_scheduler;
 mod block_pool;
@@ -2325,7 +2326,6 @@ fn parse_gate_layer_index(name: &str) -> Option<u32> {
         return None;
     }
     idx.parse::<u32>().ok()
-}
 }
 
 /// Best-effort total-RAM probe. Returns `None` (heuristic disabled) on
