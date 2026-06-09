@@ -34,13 +34,58 @@
 //! and prefetcher keep working without per-layer sharding.
 
 use crate::engine::Engine;
-use crate::gating::LinearGate;
+use crate::architecture::{
+    Architecture, ComputeSupport, FfnKind, MlaDims, RopeScaling, TensorNaming,
+};
+use crate::gating::{LinearGate, ScoringFunc};
 use crate::transformer::{
     KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, SharedExpert, TransformerLayer,
 };
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Advanced routing / attention parameters that only some architectures
+/// use. Defaults reproduce Mixtral / Qwen3 behaviour exactly (softmax
+/// routing, top-K renormalisation, no grouping, unit scaling, no MLA, no
+/// RoPE scaling), so configs that don't set them are unaffected.
+#[derive(Debug, Clone)]
+pub struct AdvancedConfig {
+    /// Router score function (DeepSeek-V3 uses `Sigmoid`).
+    pub scoring_func: ScoringFunc,
+    /// Re-normalise the selected top-K mixing weights (`norm_topk_prob`).
+    pub norm_topk_prob: bool,
+    /// Group-limited routing group count (`n_group`); `1` disables it.
+    pub n_group: usize,
+    /// Surviving groups in group-limited routing (`topk_group`).
+    pub topk_group: usize,
+    /// Final routed-weight multiplier (`routed_scaling_factor`).
+    pub routed_scaling_factor: f32,
+    /// Always-on shared experts per MoE layer (`n_shared_experts`).
+    pub num_shared_experts: usize,
+    /// Top-K selection method string (`topk_method`), e.g. `"noaux_tc"`.
+    pub topk_method: Option<String>,
+    /// MLA projection dims (DeepSeek-V3); `None` for every other family.
+    pub mla: Option<MlaDims>,
+    /// RoPE scaling (YaRN) parameters; `None` when absent.
+    pub rope_scaling: Option<RopeScaling>,
+}
+
+impl Default for AdvancedConfig {
+    fn default() -> Self {
+        Self {
+            scoring_func: ScoringFunc::Softmax,
+            norm_topk_prob: true,
+            n_group: 1,
+            topk_group: 1,
+            routed_scaling_factor: 1.0,
+            num_shared_experts: 0,
+            topk_method: None,
+            mla: None,
+            rope_scaling: None,
+        }
+    }
+}
 
 /// Hyperparameters of the real transformer.
 #[derive(Debug, Clone)]
@@ -63,6 +108,19 @@ pub struct RealModelConfig {
     /// Sliding-window attention span. `None` (default) = full causal
     /// attention. Mixtral uses `Some(4096)`.
     pub window_size: Option<usize>,
+    /// Model family this config describes. Drives tensor-name mapping in
+    /// the `.safetensors` loader (gate name, `language_model.` prefix,
+    /// fused Phi-4 projections) and whether the forward-compute path is
+    /// supported. Defaults to [`Architecture::Mixtral`], preserving the
+    /// historical behaviour for every existing call site.
+    pub architecture: Architecture,
+    /// Number of leading dense layers for DeepSeek-style MoE
+    /// (`first_k_dense_replace`). `0` (default) means every MoE layer is
+    /// sparse, matching Mixtral / Qwen3-MoE.
+    pub first_k_dense_replace: usize,
+    /// Advanced routing / MLA / RoPE-scaling parameters. Defaults to the
+    /// Mixtral/Qwen3 behaviour; populated from `config.json` for DeepSeek.
+    pub advanced: AdvancedConfig,
 }
 
 impl RealModelConfig {
@@ -81,11 +139,26 @@ impl RealModelConfig {
             rope_base: 10_000.0,
             rms_eps: 1e-6,
             window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: AdvancedConfig::default(),
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.head_dim * self.num_heads != self.d_model {
+        if self.head_dim == 0 || self.num_heads == 0 {
+            return Err("head_dim and num_heads must both be > 0".into());
+        }
+        // Mixtral ties the attention projection width to the residual
+        // stream (`num_heads * head_dim == d_model`). Newer families
+        // (e.g. Qwen3) specify an explicit `head_dim` that does NOT equal
+        // `d_model / num_heads`; `MultiHeadSelfAttention` already supports
+        // a query width independent of `d_model` (`wo` maps the
+        // `num_heads * head_dim` query space back to `d_model`), so we only
+        // enforce the tie for Mixtral.
+        if self.architecture == Architecture::Mixtral
+            && self.head_dim * self.num_heads != self.d_model
+        {
             return Err(format!(
                 "head_dim * num_heads ({} * {} = {}) must equal d_model ({})",
                 self.head_dim,
@@ -112,7 +185,104 @@ impl RealModelConfig {
         if self.vocab_size == 0 {
             return Err("vocab_size must be > 0".into());
         }
+        if self.first_k_dense_replace > self.num_layers {
+            return Err(format!(
+                "first_k_dense_replace ({}) must not exceed num_layers ({})",
+                self.first_k_dense_replace, self.num_layers
+            ));
+        }
+        let adv = &self.advanced;
+        if adv.n_group == 0 || adv.topk_group == 0 {
+            return Err("n_group and topk_group must both be > 0".into());
+        }
+        if adv.topk_group > adv.n_group {
+            return Err(format!(
+                "topk_group ({}) must not exceed n_group ({})",
+                adv.topk_group, adv.n_group
+            ));
+        }
+        if adv.n_group > 1 && self.num_experts % adv.n_group != 0 {
+            return Err(format!(
+                "num_experts ({}) must be divisible by n_group ({})",
+                self.num_experts, adv.n_group
+            ));
+        }
+        if !adv.routed_scaling_factor.is_finite() || adv.routed_scaling_factor <= 0.0 {
+            return Err(format!(
+                "routed_scaling_factor ({}) must be a positive, finite number",
+                adv.routed_scaling_factor
+            ));
+        }
         Ok(())
+    }
+
+    /// Per-architecture tensor-name mapping for this config, carrying the
+    /// `first_k_dense_replace` dense/MoE boundary.
+    pub fn tensor_naming(&self) -> TensorNaming {
+        TensorNaming::new(self.architecture, self.first_k_dense_replace)
+    }
+
+    /// Build a [`RealModelConfig`] from a parsed Hugging Face `config.json`
+    /// ([`HfConfig`]). Maps the architecture and hyperparameters so a real
+    /// checkpoint can be loaded without hand-editing the TOML `[model]` /
+    /// `[real_transformer]` sections. Dense families (no routed experts)
+    /// collapse to a single expert with `top_k = 1`.
+    pub fn from_hf_config(hf: &crate::architecture::HfConfig) -> Self {
+        let num_experts = hf.num_routed_experts.unwrap_or(1).max(1);
+        let top_k = hf.num_experts_per_tok.unwrap_or(1).clamp(1, num_experts);
+        let scoring_func = match hf.scoring_func.as_deref() {
+            Some("sigmoid") => ScoringFunc::Sigmoid,
+            _ => ScoringFunc::Softmax,
+        };
+        // Assemble MLA dims only when the config carries the full set.
+        let mla = match (
+            hf.q_lora_rank,
+            hf.kv_lora_rank,
+            hf.qk_rope_head_dim,
+            hf.qk_nope_head_dim,
+            hf.v_head_dim,
+        ) {
+            (Some(q), Some(kv), Some(rope), Some(nope), Some(v)) => Some(MlaDims {
+                q_lora_rank: q,
+                kv_lora_rank: kv,
+                qk_rope_head_dim: rope,
+                qk_nope_head_dim: nope,
+                v_head_dim: v,
+            }),
+            _ => None,
+        };
+        let advanced = AdvancedConfig {
+            scoring_func,
+            norm_topk_prob: hf.norm_topk_prob.unwrap_or(true),
+            n_group: hf.n_group.unwrap_or(1).max(1),
+            topk_group: hf.topk_group.unwrap_or(1).max(1),
+            routed_scaling_factor: hf.routed_scaling_factor.unwrap_or(1.0),
+            num_shared_experts: hf.num_shared_experts.unwrap_or(0),
+            topk_method: hf.topk_method.clone(),
+            mla,
+            rope_scaling: hf.rope_scaling.clone(),
+        };
+        Self {
+            d_model: hf.hidden_size,
+            d_ff: hf.resolved_d_ff(),
+            num_heads: hf.num_attention_heads,
+            num_kv_heads: if hf.num_key_value_heads == 0 {
+                hf.num_attention_heads
+            } else {
+                hf.num_key_value_heads
+            },
+            head_dim: hf.resolved_head_dim(),
+            vocab_size: hf.vocab_size,
+            num_layers: hf.num_hidden_layers,
+            num_experts,
+            top_k,
+            rope_base: hf.rope_theta,
+            rms_eps: hf.rms_norm_eps,
+            window_size: hf.sliding_window,
+            architecture: hf.architecture,
+            first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
+            advanced,
+        }
     }
 }
 
@@ -143,8 +313,25 @@ impl RealModel {
         // stream doesn't blow up across many layers.
         let proj_scale = (1.0 / (config.d_model as f32).sqrt()).min(0.05);
 
+        // QK-Norm (Qwen3 / Qwen3-MoE): seed unit-weight per-head RMSNorms so
+        // the QK-Norm path is active and ready to receive the loaded
+        // `self_attn.{q,k}_norm.weight` tensors. Architectures without
+        // QK-Norm (Mixtral, Mistral, Phi-4, DeepSeek) leave these `None`.
+        let seed_qk_norm = || -> (Option<RmsNorm>, Option<RmsNorm>) {
+            if config.architecture.uses_qk_norm() {
+                (
+                    Some(RmsNorm::new(vec![1.0; config.head_dim], config.rms_eps)),
+                    Some(RmsNorm::new(vec![1.0; config.head_dim], config.rms_eps)),
+                )
+            } else {
+                (None, None)
+            }
+        };
+
         let layers: Vec<TransformerLayer> = (0..config.num_layers)
-            .map(|_| TransformerLayer {
+            .map(|_| {
+                let (q_norm, k_norm) = seed_qk_norm();
+                TransformerLayer {
                 rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 attn: MultiHeadSelfAttention {
                     d_model: config.d_model,
@@ -157,6 +344,8 @@ impl RealModel {
                     wv: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
                     wo: sample_uniform_vec(&mut rng, config.d_model * q_dim, proj_scale),
                     window_size: config.window_size,
+                    q_norm,
+                    k_norm,
                 },
                 rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 gate: LinearGate::new(
@@ -171,6 +360,12 @@ impl RealModel {
                 // synthetic smoke path behave identically to before; real
                 // shared experts are populated by the on-disk loaders.
                 shared_expert: None,
+                // Dense FFN (Mistral Small 3 / Phi-4 / DeepSeek dense
+                // prefix). Populated by the on-disk loaders for dense
+                // layers; `None` means this layer routes to streamed
+                // experts (Mixtral / Qwen3-MoE / DeepSeek sparse layers).
+                dense_ffn: None,
+            }
             })
             .collect();
         let final_rms = RmsNorm::new(vec![1.0; config.d_model], config.rms_eps);
@@ -408,7 +603,27 @@ impl RealModel {
         config
             .validate()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        // Fail loud — *before* touching the (potentially multi-hundred-GB)
+        // shards — for architectures we can map tensor names for but
+        // cannot actually execute. DeepSeek-V3 is recognised (its expert
+        // and `weight_scale_inv` names are mapped by `TensorNaming`) but
+        // needs MLA latent-KV attention and FP8 dequantisation that are
+        // not implemented; running it would route on garbage activations,
+        // so we refuse rather than silently produce nonsense.
+        if let ComputeSupport::Unsupported { reason } = config.architecture.compute_support() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "cannot build a runnable `{}` model from {}: {reason}",
+                    config.architecture.model_type(),
+                    dir.display()
+                ),
+            ));
+        }
+
         let mut model = Self::new_seeded(config.clone(), seed);
+        let naming = config.tensor_naming();
 
         // Discover .safetensors shards in `dir`. We hold each shard's
         // bytes for the duration of the load (SafeTensors borrows from
@@ -497,80 +712,170 @@ impl RealModel {
         let q_dim = config.num_heads * config.head_dim;
         let kv_dim = config.num_kv_heads * config.head_dim;
 
-        maybe!("model.embed_tokens.weight", config.vocab_size * d_model, |v| {
+        maybe!(&naming.embed(), config.vocab_size * d_model, |v| {
             model.embedding = v;
         });
-        maybe!("model.norm.weight", d_model, |v| {
+        maybe!(&naming.final_norm(), d_model, |v| {
             model.final_rms = RmsNorm::new(v, config.rms_eps);
         });
-        maybe!("lm_head.weight", config.vocab_size * d_model, |v| {
+        maybe!(&naming.lm_head(), config.vocab_size * d_model, |v| {
             model.lm_head = LMHead::new(v, config.vocab_size, d_model);
         });
         for l in 0..config.num_layers {
-            maybe!(
-                &format!("model.layers.{l}.input_layernorm.weight"),
-                d_model,
-                |v| { model.layers[l].rms_attn = RmsNorm::new(v, config.rms_eps); }
-            );
-            maybe!(
-                &format!("model.layers.{l}.post_attention_layernorm.weight"),
-                d_model,
-                |v| { model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps); }
-            );
-            maybe!(
-                &format!("model.layers.{l}.self_attn.q_proj.weight"),
-                q_dim * d_model,
-                |v| { model.layers[l].attn.wq = v; }
-            );
-            maybe!(
-                &format!("model.layers.{l}.self_attn.k_proj.weight"),
-                kv_dim * d_model,
-                |v| { model.layers[l].attn.wk = v; }
-            );
-            maybe!(
-                &format!("model.layers.{l}.self_attn.v_proj.weight"),
-                kv_dim * d_model,
-                |v| { model.layers[l].attn.wv = v; }
-            );
-            maybe!(
-                &format!("model.layers.{l}.self_attn.o_proj.weight"),
-                d_model * q_dim,
-                |v| { model.layers[l].attn.wo = v; }
-            );
-            maybe!(
-                &format!("model.layers.{l}.block_sparse_moe.gate.weight"),
-                config.num_experts * d_model,
-                |v| {
-                    model.layers[l].gate = LinearGate::new(
-                        v, config.num_experts, d_model, config.top_k,
-                    );
+            maybe!(&naming.input_layernorm(l), d_model, |v| {
+                model.layers[l].rms_attn = RmsNorm::new(v, config.rms_eps);
+            });
+            maybe!(&naming.post_attention_layernorm(l), d_model, |v| {
+                model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps);
+            });
+
+            // Attention projections. Phi-4 ships a single fused
+            // `qkv_proj` ([(num_heads + 2*num_kv_heads) * head_dim,
+            // d_model], row-major) that we split into the engine's
+            // separate Q/K/V weights; every other family has discrete
+            // `q_proj` / `k_proj` / `v_proj` tensors.
+            if naming.attn_qkv_fused() {
+                tried += 1;
+                if let Some(v) = find_f32(&naming.attn_qkv(l), (q_dim + 2 * kv_dim) * d_model) {
+                    let (q_part, rest) = v.split_at(q_dim * d_model);
+                    let (k_part, v_part) = rest.split_at(kv_dim * d_model);
+                    model.layers[l].attn.wq = q_part.to_vec();
+                    model.layers[l].attn.wk = k_part.to_vec();
+                    model.layers[l].attn.wv = v_part.to_vec();
+                    loaded += 1;
                 }
-            );
+            } else {
+                maybe!(&naming.attn_q(l), q_dim * d_model, |v| {
+                    model.layers[l].attn.wq = v;
+                });
+                maybe!(&naming.attn_k(l), kv_dim * d_model, |v| {
+                    model.layers[l].attn.wk = v;
+                });
+                maybe!(&naming.attn_v(l), kv_dim * d_model, |v| {
+                    model.layers[l].attn.wv = v;
+                });
+            }
+            maybe!(&naming.attn_o(l), d_model * q_dim, |v| {
+                model.layers[l].attn.wo = v;
+            });
+
+            // QK-Norm (Qwen3 / Qwen3-MoE): per-head RMSNorm weights of
+            // length `head_dim`, applied to Q and K before RoPE. Seeded as
+            // unit-weight in `new_seeded` for these architectures; overwrite
+            // with the loaded weights when present.
+            if config.architecture.uses_qk_norm() {
+                maybe!(&naming.attn_q_norm(l), config.head_dim, |v| {
+                    model.layers[l].attn.q_norm = Some(RmsNorm::new(v, config.rms_eps));
+                });
+                maybe!(&naming.attn_k_norm(l), config.head_dim, |v| {
+                    model.layers[l].attn.k_norm = Some(RmsNorm::new(v, config.rms_eps));
+                });
+            }
+
+            // Dense FFN layers (Mistral Small 3, Phi-4, and DeepSeek's
+            // `first_k_dense_replace` prefix) carry a resident SwiGLU FFN
+            // instead of routing to streamed experts. Load it here so
+            // `RealModel::step` can run it directly. Phi-4 fuses gate+up
+            // into a single `mlp.gate_up_proj` that we split.
+            if naming.ffn_kind(l) == FfnKind::Dense {
+                let dense = if naming.mlp_gate_up_fused() {
+                    // Phi-4: `mlp.gate_up_proj` is `[2*d_ff, d_model]`,
+                    // row-major, gate rows first then up rows. `down_proj`
+                    // is `[d_model, d_ff]`.
+                    let gate_up = find_f32_any(&[naming.mlp_gate_up(l)]);
+                    let down = find_f32_any(&[naming.mlp_down(l)]);
+                    match (gate_up, down) {
+                        (Some(gu), Some(down))
+                            if d_model != 0
+                                && gu.len() % (2 * d_model) == 0
+                                && !gu.is_empty() =>
+                        {
+                            let ffn_d = gu.len() / (2 * d_model);
+                            let (gate, up) = gu.split_at(ffn_d * d_model);
+                            SharedExpert::from_projections(
+                                d_model, ffn_d, gate, up, &down, None,
+                            )
+                        }
+                        _ => None,
+                    }
+                } else {
+                    let gate = find_f32_any(&[naming.mlp_gate(l)]);
+                    let up = find_f32_any(&[naming.mlp_up(l)]);
+                    let down = find_f32_any(&[naming.mlp_down(l)]);
+                    match (gate, up, down) {
+                        (Some(gate), Some(up), Some(down))
+                            if d_model != 0
+                                && gate.len() % d_model == 0
+                                && !gate.is_empty() =>
+                        {
+                            let ffn_d = gate.len() / d_model;
+                            SharedExpert::from_projections(
+                                d_model, ffn_d, &gate, &up, &down, None,
+                            )
+                        }
+                        _ => None,
+                    }
+                };
+                tried += 1;
+                if let Some(se) = dense {
+                    model.layers[l].dense_ffn = Some(se);
+                    loaded += 1;
+                }
+            }
+
+            // Routed MoE gate. Only present on sparse layers — DeepSeek's
+            // first `first_k_dense_replace` layers and the dense families
+            // (Mistral Small 3, Phi-4, dense Qwen3) have no router. The
+            // gate name differs per family (`block_sparse_moe.gate` for
+            // Mixtral vs `mlp.gate` for Qwen3-MoE / DeepSeek).
+            if config.architecture.is_moe() && naming.ffn_kind(l) == FfnKind::Moe {
+                let adv = &config.advanced;
+                // DeepSeek-V3 aux-loss-free balancing: a per-expert bias
+                // added to selection scores only. Absent on Mixtral/Qwen3.
+                let correction_bias = find_f32_any(&[naming.moe_gate_correction_bias(l)])
+                    .filter(|b| b.len() == config.num_experts);
+                maybe!(&naming.moe_gate(l), config.num_experts * d_model, |v| {
+                    model.layers[l].gate = LinearGate::with_routing(
+                        v,
+                        config.num_experts,
+                        d_model,
+                        config.top_k,
+                        adv.scoring_func,
+                        adv.norm_topk_prob,
+                        correction_bias.clone(),
+                        adv.n_group,
+                        adv.topk_group,
+                        adv.routed_scaling_factor,
+                    );
+                });
+            }
             // Optional shared expert (Qwen2-MoE / DeepSeek-MoE). Different
             // checkpoints name the FFN block `mlp` and the shared expert
             // either `shared_expert` (Qwen2-MoE) or `shared_experts`
             // (DeepSeek-MoE), so we probe both. The shared intermediate
             // size is inferred from the gate tensor length. Mixtral has no
-            // such tensor, so this is a no-op there.
+            // such tensor, so this is a no-op there. Prefix-aware so the
+            // `language_model.` checkpoints resolve correctly.
+            let p = naming.prefix();
             tried += 1;
             let shexp_gate = find_f32_any(&[
-                format!("model.layers.{l}.mlp.shared_expert.gate_proj.weight"),
-                format!("model.layers.{l}.mlp.shared_experts.gate_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_expert.gate_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_experts.gate_proj.weight"),
             ]);
             let shexp_up = find_f32_any(&[
-                format!("model.layers.{l}.mlp.shared_expert.up_proj.weight"),
-                format!("model.layers.{l}.mlp.shared_experts.up_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_expert.up_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_experts.up_proj.weight"),
             ]);
             let shexp_down = find_f32_any(&[
-                format!("model.layers.{l}.mlp.shared_expert.down_proj.weight"),
-                format!("model.layers.{l}.mlp.shared_experts.down_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_expert.down_proj.weight"),
+                format!("{p}model.layers.{l}.mlp.shared_experts.down_proj.weight"),
             ]);
             if let (Some(gate), Some(up), Some(down)) = (shexp_gate, shexp_up, shexp_down) {
                 if d_model != 0 && gate.len() % d_model == 0 && gate.len() / d_model != 0 {
                     let shared_d_ff = gate.len() / d_model;
                     // Sigmoid gate is Qwen2-MoE-only (`shared_expert_gate`).
                     let gate_inp = find_f32_any(&[format!(
-                        "model.layers.{l}.mlp.shared_expert_gate.weight"
+                        "{p}model.layers.{l}.mlp.shared_expert_gate.weight"
                     )])
                     .filter(|g| g.len() == d_model);
                     match SharedExpert::from_projections(
@@ -755,6 +1060,13 @@ impl RealModel {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
             x = layer.attn_block(&x, pos, layer_idx, &mut kv[layer_idx], &*backend);
+            // Dense FFN layers (Mistral Small 3, Phi-4, DeepSeek dense
+            // prefix) bypass the SSD-streamed expert path entirely: run the
+            // resident SwiGLU FFN and skip routing.
+            if let Some(dense_out) = layer.dense_forward(&x) {
+                x = dense_out;
+                continue;
+            }
             // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
             let (normed, routing) = layer.moe_pre(&x);
             let global_ids: Vec<u32> = routing
@@ -1045,6 +1357,9 @@ mod tests {
             rope_base: 10_000.0,
             rms_eps: 1e-6,
             window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
         };
         let q_dim = cfg.num_heads * cfg.head_dim;
         let dir = TempDir::new("safetensors_load");
@@ -1097,9 +1412,185 @@ mod tests {
         assert!(lm.iter().any(|&x| x != first), "lm_head should remain seeded, not constant");
     }
 
-    /// `from_dir_auto` must dispatch to `from_safetensors` when the
-    /// directory contains a `.safetensors` shard, and otherwise fall
-    /// back to the legacy `from_dir` raw-`.bin` loader.
+    /// Phi-4 (`phi3`) ships a single fused `qkv_proj` tensor. The loader
+    /// must split it into the engine's separate `wq` / `wk` / `wv` slabs at
+    /// the `[q_dim | kv_dim | kv_dim]` row boundaries, in that order.
+    #[test]
+    fn from_safetensors_splits_phi4_fused_qkv() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use safetensors::serialize_to_file;
+        let cfg = RealModelConfig {
+            vocab_size: 8,
+            d_model: 4,
+            d_ff: 8,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            num_layers: 1,
+            num_experts: 1,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::Phi4,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
+        let q_dim = cfg.num_heads * cfg.head_dim; // 4
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim; // 2
+        let dir = TempDir::new("phi4_qkv");
+
+        // Fused qkv: [(q_dim + 2*kv_dim) rows, d_model cols], row-major.
+        // Use a distinct sentinel per region so the split is unambiguous.
+        let mut fused = Vec::new();
+        fused.extend(std::iter::repeat(0.1f32).take(q_dim * cfg.d_model));
+        fused.extend(std::iter::repeat(0.2f32).take(kv_dim * cfg.d_model));
+        fused.extend(std::iter::repeat(0.3f32).take(kv_dim * cfg.d_model));
+        let to_bytes = |v: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            out
+        };
+        let fused_bytes = to_bytes(&fused);
+        let tensors: Vec<(String, TensorView)> = vec![(
+            "model.layers.0.self_attn.qkv_proj.weight".to_string(),
+            TensorView::new(
+                Dtype::F32,
+                vec![q_dim + 2 * kv_dim, cfg.d_model],
+                &fused_bytes,
+            )
+            .unwrap(),
+        )];
+        let out_path = dir.path.join("model.safetensors");
+        serialize_to_file(tensors, &None, &out_path).unwrap();
+
+        let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
+        let attn = &model.layers[0].attn;
+        assert_eq!(attn.wq.len(), q_dim * cfg.d_model);
+        assert_eq!(attn.wk.len(), kv_dim * cfg.d_model);
+        assert_eq!(attn.wv.len(), kv_dim * cfg.d_model);
+        assert!(attn.wq.iter().all(|&x| x == 0.1), "wq region");
+        assert!(attn.wk.iter().all(|&x| x == 0.2), "wk region");
+        assert!(attn.wv.iter().all(|&x| x == 0.3), "wv region");
+    }
+
+    /// Mistral Small 3 (`mistral3`) is multimodal; its language-model
+    /// tensors carry a `language_model.` prefix. The loader must prepend
+    /// that prefix before looking tensors up.
+    #[test]
+    fn from_safetensors_handles_mistral_language_model_prefix() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use safetensors::serialize_to_file;
+        let cfg = RealModelConfig {
+            vocab_size: 8,
+            d_model: 4,
+            d_ff: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 2,
+            num_layers: 1,
+            num_experts: 1,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::MistralSmall3,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
+        let dir = TempDir::new("mistral3_prefix");
+        let embed = vec![0.7f32; cfg.vocab_size * cfg.d_model];
+        let to_bytes = |v: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            out
+        };
+        let embed_bytes = to_bytes(&embed);
+        // Prefixed name (what a real Mistral3 checkpoint emits) plus a
+        // vision-tower tensor the loader must ignore.
+        let vision = vec![9.0f32; 4];
+        let vision_bytes = to_bytes(&vision);
+        let tensors: Vec<(String, TensorView)> = vec![
+            (
+                "language_model.model.embed_tokens.weight".to_string(),
+                TensorView::new(Dtype::F32, vec![cfg.vocab_size, cfg.d_model], &embed_bytes)
+                    .unwrap(),
+            ),
+            (
+                "vision_tower.patch_conv.weight".to_string(),
+                TensorView::new(Dtype::F32, vec![4], &vision_bytes).unwrap(),
+            ),
+        ];
+        let out_path = dir.path.join("model.safetensors");
+        serialize_to_file(tensors, &None, &out_path).unwrap();
+
+        let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
+        assert!(
+            model.embedding.iter().all(|&x| x == 0.7),
+            "prefixed embed_tokens must load via language_model. prefix"
+        );
+    }
+
+    /// DeepSeek-V3 (`deepseek_v3`) is recognised for tensor-name mapping
+    /// but cannot be executed (MLA + FP8 are unimplemented). The loader
+    /// must fail loud with `Unsupported` rather than silently producing a
+    /// garbage model — and it must do so before reading any shards.
+    #[test]
+    fn from_safetensors_deepseek_fails_loud() {
+        let cfg = RealModelConfig {
+            architecture: Architecture::DeepSeekV3,
+            first_k_dense_replace: 3,
+            advanced: Default::default(),
+            num_layers: 4,
+            ..RealModelConfig::tiny()
+        };
+        let dir = TempDir::new("deepseek_unsupported");
+        // Note: no .safetensors written — the fail-loud check must trigger
+        // before shard discovery, so an empty dir is fine.
+        let err = match RealModel::from_safetensors(cfg, &dir.path, 1) {
+            Ok(_) => panic!("DeepSeek-V3 must not build a runnable model"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// `from_hf_config` maps a parsed Qwen3-MoE `config.json` (explicit
+    /// `head_dim` that differs from `hidden_size / num_heads`) into a
+    /// loadable `RealModelConfig` that passes `validate()`.
+    #[test]
+    fn from_hf_config_maps_qwen3_moe() {
+        let json = r#"{
+            "model_type": "qwen3_moe",
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "moe_intermediate_size": 768,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "num_experts": 128,
+            "num_experts_per_tok": 8
+        }"#;
+        let hf = crate::architecture::HfConfig::from_json_str(json).unwrap();
+        let cfg = RealModelConfig::from_hf_config(&hf);
+        assert_eq!(cfg.architecture, Architecture::Qwen3Moe);
+        assert_eq!(cfg.d_model, 2048);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.num_heads, 32);
+        assert_eq!(cfg.num_kv_heads, 4);
+        assert_eq!(cfg.num_experts, 128);
+        assert_eq!(cfg.top_k, 8);
+        // d_ff resolves to the MoE expert width, not the dense one.
+        assert_eq!(cfg.d_ff, 768);
+        // head_dim * num_heads (4096) != d_model (2048) — must still pass
+        // because the Mixtral-only tie is relaxed for other architectures.
+        cfg.validate().expect("Qwen3-MoE config must validate");
+    }
+
+    /// `from_dir_auto`-adjacent dispatch test.
     #[test]
     fn from_dir_auto_dispatches_on_safetensors_presence() {
         use safetensors::tensor::{Dtype, TensorView};
@@ -1117,6 +1608,9 @@ mod tests {
             rope_base: 10_000.0,
             rms_eps: 1e-6,
             window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
         };
 
         // 1) Empty dir without safetensors falls back to from_dir

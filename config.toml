@@ -161,6 +161,15 @@ enabled = false
 # (`embed.bin`, `attn_<L>_q.bin`, `gate_<L>.bin`, …). Tensors not
 # present fall back to a deterministic seeded init.
 # weights_dir = "./data/dense"
+# Optional model-family override (exact Hugging Face `model_type`):
+#   "mixtral" | "qwen3" | "qwen3_moe" | "deepseek_v3" | "mistral3" | "phi3"
+# When omitted, the architecture AND all hyperparameters (num_layers,
+# num_experts, d_model, d_ff, heads, head_dim, rope, …) are auto-detected
+# from a `config.json` in `weights_dir`, overriding the [model] values
+# below so the engine and the model stay consistent. An unrecognised value
+# is a hard error; DeepSeek-V3 loads its names but fails loud (MLA + FP8
+# are unimplemented). See README "Supported model architectures".
+# architecture = "qwen3_moe"
 # Vocab size. Must match the tokenizer (256 for the byte fallback).
 vocab_size = 256
 # Attention head count. For Mixtral 8x7B: 32.

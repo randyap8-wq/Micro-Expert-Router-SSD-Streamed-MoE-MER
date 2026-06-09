@@ -392,6 +392,16 @@ pub struct RealTransformerConfig {
     /// to `None`, so it is treated as unbounded too.
     #[serde(default)]
     pub max_overflow_capacity: Option<usize>,
+
+    /// Optional explicit model family override (e.g. `"qwen3_moe"`,
+    /// `"deepseek_v3"`, `"mistral3"`, `"phi3"`, `"mixtral"`). Matches the
+    /// exact Hugging Face `model_type` string. When omitted, the loader
+    /// auto-detects the architecture from a `config.json` in
+    /// [`Self::weights_dir`] (falling back to Mixtral if neither is
+    /// present). An unrecognised value is a hard error — the engine never
+    /// silently mislabels an architecture.
+    #[serde(default)]
+    pub architecture: Option<String>,
 }
 
 fn default_max_concurrent_prefetches() -> usize {

@@ -1152,6 +1152,11 @@ layer count.
 enabled = true
 # Optional. Missing tensors fall back to a deterministic seeded init.
 # weights_dir = "./data/dense"
+# Optional model-family override (exact Hugging Face `model_type`):
+# "mixtral" | "qwen3" | "qwen3_moe" | "deepseek_v3" | "mistral3" | "phi3".
+# When omitted, the family + all hyperparameters are auto-detected from a
+# `config.json` in `weights_dir`. An unrecognised value is a hard error.
+# architecture = "qwen3_moe"
 vocab_size = 256          # match the tokenizer (256 for the byte fallback)
 num_heads = 8
 num_kv_heads = 2          # 0 = MHA (auto-set to num_heads); GQA otherwise
@@ -1638,16 +1643,29 @@ There are **three** ways to feed real Mixtral / Llama-MoE weights into
 the engine, depending on what format you have them in:
 
 **1. From a Hugging Face checkpoint (per-expert `.bin` files).**
-`scripts/extract_mixtral_experts.py` dumps a single transformer
-layer's expert FFNs from a HuggingFace Mixtral checkpoint into the
-on-disk format the engine expects (`expert_<id>.bin` blobs +
-`metadata.json`):
+`scripts/extract_mixtral_experts.py` dumps a transformer layer's expert
+FFNs from a HuggingFace MoE checkpoint into the on-disk format the engine
+expects (`expert_<id>.bin` blobs + `metadata.json`). It is
+**architecture-aware**: it auto-detects the family from the checkpoint's
+`config.json` and selects the right tensor-name schema — Mixtral
+(`block_sparse_moe.experts.{j}.w1/w3/w2`) or Qwen3-MoE / DeepSeek
+(`mlp.experts.{j}.{gate,up,down}_proj`) — and also emits the resident
+router gate (`gate_<L>.bin`) and any shared expert
+(`layer_<L>_shexp_*.bin`) the `from_dir` loader auto-discovers. Fully
+dense families (Qwen3 dense, Mistral Small 3, Phi-4) and FP8-quantised
+DeepSeek-V3 are refused with a clear error (override detection with
+`--architecture {mixtral,qwen3_moe,deepseek_v3}`):
 
 ```
 pip install 'transformers>=4.38' torch
 python scripts/extract_mixtral_experts.py \
     --model mistralai/Mixtral-8x7B-v0.1 \
     --layer 0 --out ./mixtral-data
+
+# Qwen3-MoE: same script, architecture auto-detected
+python scripts/extract_mixtral_experts.py \
+    --model Qwen/Qwen3-30B-A3B \
+    --layer all --out ./qwen3-data
 
 cargo run --release --manifest-path rust-engine/Cargo.toml -- \
     run --data-dir ./mixtral-data --tokens 200
@@ -1709,6 +1727,91 @@ The `metadata.json` written by `extract_mixtral_experts.py` or
 `gguf-convert` lets `run` auto-fill `--num-experts`, `--d-model`,
 `--d-ff`, `--top-k`, and `--expert-size` so the subsequent commands
 need no further flags.
+
+#### Supported model architectures
+
+The `.safetensors` loader is **architecture-aware**. The model family is
+resolved in this order: an explicit `[real_transformer] architecture =
+"…"` override (the exact Hugging Face `model_type` string), otherwise
+auto-detection from a `config.json` in `weights_dir` (which also remaps
+all hyperparameters, so a real checkpoint loads without hand-editing the
+TOML `[model]` section). An **unrecognised** architecture is a hard
+error — the engine never silently mislabels a checkpoint.
+
+| Family | `model_type` | Status | Notes |
+|---|---|---|---|
+| Mixtral / Llama-MoE | `mixtral` | ✅ Full | `block_sparse_moe.{gate,experts.*}` names, softmax top-K routing. The original, fully streamed path. |
+| Qwen3-MoE | `qwen3_moe` | ✅ Loadable | `mlp.{gate,experts.{i}.{gate,up,down}_proj}` names; explicit `head_dim` (≠ `d_model/num_heads`) supported. QK-Norm attention is applied (per-head `head_dim` RMSNorm on Q and K before RoPE). |
+| Qwen3 (dense) | `qwen3` | ✅ Full (dense) | Attention + QK-Norm + norms + embeddings map and run; the dense SwiGLU FFN is executed from resident weights. Being dense it does **not** exercise SSD expert streaming. |
+| Mistral Small 3 | `mistral3` | ✅ Full (dense) | Multimodal checkpoint: LM tensors carry a `language_model.` prefix (stripped automatically) and the vision tower is ignored. The dense SwiGLU FFN is executed; dense models do **not** exercise SSD expert streaming. |
+| Phi-4 | `phi3` | ✅ Full (dense) | Fused `qkv_proj` is split into separate Q/K/V at load; the fused `gate_up_proj` dense FFN is split and executed. Dense models do **not** exercise SSD expert streaming. |
+| DeepSeek-V3 / V3.1 | `deepseek_v3` | ⛔ Fail-loud | Tensor names (incl. `weight_scale_inv` FP8 scales, parked in a side table) are mapped, and the dense-vs-MoE split honours `first_k_dense_replace`. Sigmoid + bias-corrected grouped top-K routing is implemented. But MLA latent-KV attention and FP8 dequant are unimplemented, so the loader **refuses** rather than route on garbage. MLA + YaRN long-context are later stages. |
+
+Because Mistral Small 3 and Phi-4 are fully **dense**, they bypass the
+per-token expert-streaming substrate entirely — the feature the engine
+exists to demonstrate. They are supported for tensor-name correctness,
+not as showcases of the SSD-streamed MoE pipeline.
+
+##### How to run each model family
+
+In every case point `[real_transformer].weights_dir` at the directory of
+HuggingFace `.safetensors` shards **plus** their `config.json`. With
+`config.json` present you do **not** need to fill in `[model]`
+(`num_layers`, `num_experts`, `d_model`, `d_ff`, `top_k`) or the
+`[real_transformer]` attention fields by hand — they are auto-detected
+from the checkpoint and override the TOML so the engine's expert cache,
+the layer-qualified expert namespace, and the model all agree. Set
+`architecture` explicitly only if a checkpoint ships a non-standard or
+missing `config.json`.
+
+```toml
+# config.toml — common prelude for all families
+[real_transformer]
+enabled    = true
+weights_dir = "/path/to/checkpoint"   # dir with *.safetensors + config.json
+# architecture = "qwen3_moe"          # optional; auto-detected otherwise
+```
+
+Then start the server:
+
+```bash
+./target/release/micro-expert-router serve --config config.toml
+```
+
+Per-family specifics:
+
+* **Mixtral / Llama-MoE (`mixtral`) — ✅ full streaming.** The reference
+  path. For the streamed MoE experience, extract experts to
+  `expert_<layer>_<id>.bin` with `scripts/extract_mixtral_experts.py` or
+  `gguf-convert` (see options 1–2 above) and point `--data-dir` /
+  `[model].data_dir` at them; `weights_dir` supplies the resident dense
+  tensors. `q4_K_M` is the practical default dtype.
+* **Qwen3-MoE (`qwen3_moe`) — ✅ loadable.** Just set `weights_dir`; the
+  128-expert router and `mlp.experts.*` names load automatically. Expert
+  FFNs still stream from `--data-dir`; extract them with
+  `scripts/extract_mixtral_experts.py`, which auto-detects Qwen3-MoE and
+  emits the `mlp.experts.*` per-expert blobs plus the `gate_<L>.bin`
+  router gate (see the extractor notes above). Attention applies QK-Norm
+  (per-head RMSNorm on Q and K before RoPE), matching the reference
+  architecture.
+* **Qwen3 dense (`qwen3`) — ✅ runs, dense.** Loads attention + QK-Norm +
+  norms + embeddings and executes the dense SwiGLU FFN from resident
+  weights. Being dense it does **not** exercise SSD streaming.
+* **Mistral Small 3 (`mistral3`) — ✅ runs, dense.** Point
+  `weights_dir` at the multimodal checkpoint; the `language_model.`
+  prefix is handled and the vision tower is ignored. The dense SwiGLU FFN
+  is executed; being dense it does **not** exercise SSD streaming.
+* **Phi-4 (`phi3`) — ✅ runs, dense.** The fused `qkv_proj` is split
+  into Q/K/V automatically and the fused `gate_up_proj` dense FFN is split
+  and executed. Dense, so no expert streaming.
+* **DeepSeek-V3 / V3.1 (`deepseek_v3`) — ⛔ fails loud.** Configuring it
+  is accepted (names, the `first_k_dense_replace` dense/MoE split, and the
+  `weight_scale_inv` FP8 side table are all mapped), but `serve` returns
+  an `Unsupported` error at load time because MLA latent-KV attention and
+  FP8 dequant are not implemented. This is intentional — the engine
+  refuses rather than route on garbage activations. The sigmoid +
+  bias-corrected grouped top-K router is already implemented; full support
+  is a later, larger stage (MLA + YaRN long-context).
 
 **Per-expert sizes for Mixtral-8x7B** (`d_model = 4096`, `d_ff = 14336`,
 ~176 M weights per expert across the three SwiGLU matrices, plus a small

@@ -1232,6 +1232,8 @@ mod tests {
             vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
             head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
             rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
         let sched = BatchScheduler::spawn(
@@ -1258,6 +1260,8 @@ mod tests {
             vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
             head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
             rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
         let sched = BatchScheduler::spawn(
@@ -1292,6 +1296,8 @@ mod tests {
             vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
             head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
             rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
 
