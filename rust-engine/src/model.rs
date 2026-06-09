@@ -1810,7 +1810,7 @@ mod tests {
     /// DeepSeek-V3 (`deepseek_v3`) is now fully executable: `new_seeded`
     /// builds runnable MLA blocks for every layer instead of the loader
     /// failing loud. This guards against regressing the MLA + FP8
-    /// integration back to the old "unsupported" behaviour.
+    /// integration back to the old "unsupported" behavior.
     #[test]
     fn deepseek_seeds_runnable_mla() {
         let mut advanced = AdvancedConfig::default();

@@ -230,9 +230,9 @@ impl KvCache {
     /// Public read accessor for the i-th cached key (length `kv_dim`).
     ///
     /// Multi-head latent attention ([`crate::mla`]) stores its compressed
-    /// latent `[compressed_kv; k_pe]` in the key slot and reconstructs the
-    /// per-head K/V on the fly, so it needs read access to historical
-    /// entries from outside this module. Standard attention never calls
+    /// latent `[compressed_kv | k_pe]` (concatenation) in the key slot
+    /// and reconstructs the per-head K/V on the fly, so it needs read
+    /// access to historical entries from outside this module. Standard attention never calls
     /// this (it sweeps the cache through the private `key`/`value`
     /// helpers inside `MultiHeadSelfAttention::forward`).
     pub fn key_at(&self, i: usize) -> &[f32] {

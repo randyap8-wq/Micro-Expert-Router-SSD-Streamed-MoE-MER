@@ -267,6 +267,12 @@ impl MultiHeadLatentAttention {
 /// are NaN) to f32. Matches the OCP `e4m3` / DeepSeek `float8_e4m3fn`
 /// definition: the all-exponent-ones encoding is *not* infinity, the max
 /// finite magnitude is 448.
+/// Largest finite magnitude representable in the FP8 `e4m3fn` format
+/// (`S.1110.111` = `1.875 * 2^8`). The `S.1111.111` bit pattern is
+/// reserved for NaN and is clamped to this value so downstream matmuls
+/// stay finite.
+pub const F8_E4M3_MAX_FINITE: f32 = 448.0;
+
 pub fn f8_e4m3_to_f32(b: u8) -> f32 {
     let sign = if (b & 0x80) != 0 { -1.0f32 } else { 1.0f32 };
     let exp = ((b >> 3) & 0x0F) as i32;
@@ -282,7 +288,7 @@ pub fn f8_e4m3_to_f32(b: u8) -> f32 {
     if exp == 0x0F && mant == 0x07 {
         // e4m3fn reserves S.1111.111 for NaN; clamp to a large finite
         // value so downstream matmuls stay finite.
-        return sign * 448.0;
+        return sign * F8_E4M3_MAX_FINITE;
     }
     // Normal: value = (1 + mant/8) * 2^(exp-bias).
     let m = 1.0 + mant as f32 / 8.0;

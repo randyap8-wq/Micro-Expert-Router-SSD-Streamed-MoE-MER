@@ -406,12 +406,11 @@ impl RpcShardRouter {
     /// **Free-function form** of the `tonic::Status` → [`ShardRouterError`]
     /// translation table. Kept as an associated function (rather than
     /// a method) so unit tests can drive it without instantiating a
-    /// real gRPC channel, and so future implementations can reuse it
-    /// from their streaming-call decoder. The signature uses opaque
-    /// `&str` instead of `tonic::Code` so this skeleton compiles
-    /// without a `tonic` dependency; the real implementation accepts
-    /// a `tonic::Status` directly and forwards the code's Debug name
-    /// (e.g. `format!("{:?}", status.code())`, which yields
+    /// real gRPC channel, and so the streaming-call decoder can reuse
+    /// it. The signature uses opaque `&str` instead of `tonic::Code` so
+    /// the routing/wire layer compiles without a `tonic` dependency; the
+    /// `grpc` module (behind `--features grpc`) forwards the code's Debug
+    /// name (e.g. `format!("{:?}", status.code())`, which yields
     /// `"DeadlineExceeded"`, `"Unavailable"`, etc.) — *not*
     /// `status.code().description()`, whose human-readable text would
     /// not match these arms.
