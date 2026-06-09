@@ -1478,7 +1478,7 @@ mod tests {
     /// tensors carry a `language_model.` prefix. The loader must prepend
     /// that prefix before looking tensors up.
     #[test]
-    fn from_safetensors_strips_mistral_language_model_prefix() {
+    fn from_safetensors_handles_mistral_language_model_prefix() {
         use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
         let cfg = RealModelConfig {
