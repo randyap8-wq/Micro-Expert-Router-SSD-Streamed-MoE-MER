@@ -1710,6 +1710,30 @@ The `metadata.json` written by `extract_mixtral_experts.py` or
 `--d-ff`, `--top-k`, and `--expert-size` so the subsequent commands
 need no further flags.
 
+#### Supported model architectures
+
+The `.safetensors` loader is **architecture-aware**. The model family is
+resolved in this order: an explicit `[real_transformer] architecture =
+"…"` override (the exact Hugging Face `model_type` string), otherwise
+auto-detection from a `config.json` in `weights_dir` (which also remaps
+all hyperparameters, so a real checkpoint loads without hand-editing the
+TOML `[model]` section). An **unrecognised** architecture is a hard
+error — the engine never silently mislabels a checkpoint.
+
+| Family | `model_type` | Status | Notes |
+|---|---|---|---|
+| Mixtral / Llama-MoE | `mixtral` | ✅ Full | `block_sparse_moe.{gate,experts.*}` names, softmax top-K routing. The original, fully streamed path. |
+| Qwen3-MoE | `qwen3_moe` | ✅ Loadable | `mlp.{gate,experts.{i}.{gate,up,down}_proj}` names; explicit `head_dim` (≠ `d_model/num_heads`) supported. QK-Norm attention is Stage 2. |
+| Qwen3 (dense) | `qwen3` | ⚠️ Partial | Attention + norms + embeddings map correctly; the dense FFN compute path is Stage 4 (names are mapped, weights are not yet executed). |
+| Mistral Small 3 | `mistral3` | ⚠️ Partial (dense) | Multimodal checkpoint: LM tensors carry a `language_model.` prefix (stripped automatically) and the vision tower is ignored. Dense FFN compute is Stage 4; dense models do **not** exercise SSD expert streaming. |
+| Phi-4 | `phi3` | ⚠️ Partial (dense) | Fused `qkv_proj` is split into separate Q/K/V at load; fused `gate_up_proj` dense FFN is Stage 4. Dense models do **not** exercise SSD expert streaming. |
+| DeepSeek-V3 / V3.1 | `deepseek_v3` | ⛔ Fail-loud | Tensor names (incl. `weight_scale_inv` FP8 scales, parked in a side table) are mapped, and the dense-vs-MoE split honours `first_k_dense_replace`. But MLA latent-KV attention and FP8 dequant are unimplemented, so the loader **refuses** rather than route on garbage. Sigmoid + bias-corrected grouped top-K routing and MLA are later stages. |
+
+Because Mistral Small 3 and Phi-4 are fully **dense**, they bypass the
+per-token expert-streaming substrate entirely — the feature the engine
+exists to demonstrate. They are supported for tensor-name correctness,
+not as showcases of the SSD-streamed MoE pipeline.
+
 **Per-expert sizes for Mixtral-8x7B** (`d_model = 4096`, `d_ff = 14336`,
 ~176 M weights per expert across the three SwiGLU matrices, plus a small
 zero-padding tail so the on-disk blob is a multiple of the 4 KiB

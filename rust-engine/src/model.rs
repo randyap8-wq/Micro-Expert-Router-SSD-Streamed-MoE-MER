@@ -1198,9 +1198,182 @@ mod tests {
         assert!(lm.iter().any(|&x| x != first), "lm_head should remain seeded, not constant");
     }
 
-    /// `from_dir_auto` must dispatch to `from_safetensors` when the
-    /// directory contains a `.safetensors` shard, and otherwise fall
-    /// back to the legacy `from_dir` raw-`.bin` loader.
+    /// Phi-4 (`phi3`) ships a single fused `qkv_proj` tensor. The loader
+    /// must split it into the engine's separate `wq` / `wk` / `wv` slabs at
+    /// the `[q_dim | kv_dim | kv_dim]` row boundaries, in that order.
+    #[test]
+    fn from_safetensors_splits_phi4_fused_qkv() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use safetensors::serialize_to_file;
+        let cfg = RealModelConfig {
+            vocab_size: 8,
+            d_model: 4,
+            d_ff: 8,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            num_layers: 1,
+            num_experts: 1,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::Phi4,
+            first_k_dense_replace: 0,
+        };
+        let q_dim = cfg.num_heads * cfg.head_dim; // 4
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim; // 2
+        let dir = TempDir::new("phi4_qkv");
+
+        // Fused qkv: [(q_dim + 2*kv_dim) rows, d_model cols], row-major.
+        // Use a distinct sentinel per region so the split is unambiguous.
+        let mut fused = Vec::new();
+        fused.extend(std::iter::repeat(0.1f32).take(q_dim * cfg.d_model));
+        fused.extend(std::iter::repeat(0.2f32).take(kv_dim * cfg.d_model));
+        fused.extend(std::iter::repeat(0.3f32).take(kv_dim * cfg.d_model));
+        let to_bytes = |v: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            out
+        };
+        let fused_bytes = to_bytes(&fused);
+        let tensors: Vec<(String, TensorView)> = vec![(
+            "model.layers.0.self_attn.qkv_proj.weight".to_string(),
+            TensorView::new(
+                Dtype::F32,
+                vec![q_dim + 2 * kv_dim, cfg.d_model],
+                &fused_bytes,
+            )
+            .unwrap(),
+        )];
+        let out_path = dir.path.join("model.safetensors");
+        serialize_to_file(tensors, &None, &out_path).unwrap();
+
+        let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
+        let attn = &model.layers[0].attn;
+        assert_eq!(attn.wq.len(), q_dim * cfg.d_model);
+        assert_eq!(attn.wk.len(), kv_dim * cfg.d_model);
+        assert_eq!(attn.wv.len(), kv_dim * cfg.d_model);
+        assert!(attn.wq.iter().all(|&x| x == 0.1), "wq region");
+        assert!(attn.wk.iter().all(|&x| x == 0.2), "wk region");
+        assert!(attn.wv.iter().all(|&x| x == 0.3), "wv region");
+    }
+
+    /// Mistral Small 3 (`mistral3`) is multimodal; its language-model
+    /// tensors carry a `language_model.` prefix. The loader must prepend
+    /// that prefix before looking tensors up.
+    #[test]
+    fn from_safetensors_strips_mistral_language_model_prefix() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use safetensors::serialize_to_file;
+        let cfg = RealModelConfig {
+            vocab_size: 8,
+            d_model: 4,
+            d_ff: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 2,
+            num_layers: 1,
+            num_experts: 1,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::MistralSmall3,
+            first_k_dense_replace: 0,
+        };
+        let dir = TempDir::new("mistral3_prefix");
+        let embed = vec![0.7f32; cfg.vocab_size * cfg.d_model];
+        let to_bytes = |v: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            out
+        };
+        let embed_bytes = to_bytes(&embed);
+        // Prefixed name (what a real Mistral3 checkpoint emits) plus a
+        // vision-tower tensor the loader must ignore.
+        let vision = vec![9.0f32; 4];
+        let vision_bytes = to_bytes(&vision);
+        let tensors: Vec<(String, TensorView)> = vec![
+            (
+                "language_model.model.embed_tokens.weight".to_string(),
+                TensorView::new(Dtype::F32, vec![cfg.vocab_size, cfg.d_model], &embed_bytes)
+                    .unwrap(),
+            ),
+            (
+                "vision_tower.patch_conv.weight".to_string(),
+                TensorView::new(Dtype::F32, vec![4], &vision_bytes).unwrap(),
+            ),
+        ];
+        let out_path = dir.path.join("model.safetensors");
+        serialize_to_file(tensors, &None, &out_path).unwrap();
+
+        let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
+        assert!(
+            model.embedding.iter().all(|&x| x == 0.7),
+            "prefixed embed_tokens must load via language_model. prefix"
+        );
+    }
+
+    /// DeepSeek-V3 (`deepseek_v3`) is recognised for tensor-name mapping
+    /// but cannot be executed (MLA + FP8 are unimplemented). The loader
+    /// must fail loud with `Unsupported` rather than silently producing a
+    /// garbage model — and it must do so before reading any shards.
+    #[test]
+    fn from_safetensors_deepseek_fails_loud() {
+        let cfg = RealModelConfig {
+            architecture: Architecture::DeepSeekV3,
+            first_k_dense_replace: 3,
+            num_layers: 4,
+            ..RealModelConfig::tiny()
+        };
+        let dir = TempDir::new("deepseek_unsupported");
+        // Note: no .safetensors written — the fail-loud check must trigger
+        // before shard discovery, so an empty dir is fine.
+        let err = match RealModel::from_safetensors(cfg, &dir.path, 1) {
+            Ok(_) => panic!("DeepSeek-V3 must not build a runnable model"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// `from_hf_config` maps a parsed Qwen3-MoE `config.json` (explicit
+    /// `head_dim` that differs from `hidden_size / num_heads`) into a
+    /// loadable `RealModelConfig` that passes `validate()`.
+    #[test]
+    fn from_hf_config_maps_qwen3_moe() {
+        let json = r#"{
+            "model_type": "qwen3_moe",
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "moe_intermediate_size": 768,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "num_experts": 128,
+            "num_experts_per_tok": 8
+        }"#;
+        let hf = crate::architecture::HfConfig::from_json_str(json).unwrap();
+        let cfg = RealModelConfig::from_hf_config(&hf);
+        assert_eq!(cfg.architecture, Architecture::Qwen3Moe);
+        assert_eq!(cfg.d_model, 2048);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.num_heads, 32);
+        assert_eq!(cfg.num_kv_heads, 4);
+        assert_eq!(cfg.num_experts, 128);
+        assert_eq!(cfg.top_k, 8);
+        // d_ff resolves to the MoE expert width, not the dense one.
+        assert_eq!(cfg.d_ff, 768);
+        // head_dim * num_heads (4096) != d_model (2048) — must still pass
+        // because the Mixtral-only tie is relaxed for other architectures.
+        cfg.validate().expect("Qwen3-MoE config must validate");
+    }
+
+    /// `from_dir_auto`-adjacent dispatch test.
     #[test]
     fn from_dir_auto_dispatches_on_safetensors_presence() {
         use safetensors::tensor::{Dtype, TensorView};
