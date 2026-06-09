@@ -848,9 +848,16 @@ impl RealModel {
                 // honoured when its length matches the configured shape;
                 // otherwise we fall back to the inline `moe_gate` tensor.
                 tried += 1;
-                let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
-                    .filter(|v| v.len() == expected)
-                    .or_else(|| find_f32(&naming.moe_gate(l), expected));
+let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
+    .and_then(|mut v| {
+        if v.len() < expected {
+            None
+        } else {
+            v.truncate(expected);
+            Some(v)
+        }
+    })
+    .or_else(|| find_f32(&naming.moe_gate(l), expected));
                 if let Some(v) = gate_vec {
                     model.layers[l].gate = LinearGate::with_routing(
                         v,
