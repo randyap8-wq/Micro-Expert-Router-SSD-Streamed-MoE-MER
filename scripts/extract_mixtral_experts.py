@@ -1,11 +1,37 @@
 #!/usr/bin/env python3
 """
-Extract per-expert SwiGLU FFN weights from a Mixtral checkpoint and write
-them as `expert_<id>.bin` files plus a `metadata.json`, in the on-disk
-format expected by `micro-expert-router run`.
+Extract per-expert SwiGLU FFN weights from a Hugging Face MoE checkpoint
+and write them as `expert_<id>.bin` files plus a `metadata.json`, in the
+on-disk format expected by `micro-expert-router run`.
 
 The Rust engine streams real expert weights from SSD; this script is the
-bridge from a Hugging Face Mixtral checkpoint to that on-disk layout.
+bridge from a Hugging Face checkpoint to that on-disk layout.
+
+### Supported architectures
+
+The script is architecture-aware (matching the Rust `Architecture` enum):
+
+* **Mixtral** (`mixtral`) — experts under
+  `model.layers.{L}.block_sparse_moe.experts.{j}.w1/w3/w2.weight`
+  (`w1`=gate, `w3`=up, `w2`=down), router gate
+  `…block_sparse_moe.gate.weight`. No shared expert.
+* **Qwen3-MoE** (`qwen3_moe`) — experts under
+  `model.layers.{L}.mlp.experts.{j}.{gate,up,down}_proj.weight`, router
+  gate `…mlp.gate.weight`. No shared expert.
+* **DeepSeek-V3 / V3.1** (`deepseek_v3`) — same `mlp.experts.{j}.…`
+  expert naming plus an always-on shared expert
+  (`…mlp.shared_experts.{gate,up,down}_proj.weight`). **Refused** when
+  the checkpoint is FP8-quantised (the engine cannot run MLA + FP8 yet);
+  the tensor naming is still understood so a future de-quantised export
+  works.
+
+Fully **dense** architectures (Qwen3 dense `qwen3`, Mistral Small 3
+`mistral3`, Phi-4 `phi3`) have no routed experts to stream and are
+refused with a clear error — run them directly from `.safetensors`
+instead.
+
+The architecture is auto-detected from the checkpoint's `config.json`
+(`architectures` / `model_type`); override with `--architecture`.
 
 ### On-disk layout (per expert, little-endian f32)
 
@@ -15,6 +41,20 @@ bridge from a Hugging Face Mixtral checkpoint to that on-disk layout.
 
 The file is then zero-padded to a multiple of `block_align` (default
 4096) so that `O_DIRECT` reads work without `EINVAL` on Linux NVMe.
+
+For MoE checkpoints the script additionally emits, alongside the
+per-expert files, the resident tensors the engine's `from_dir` loader
+auto-discovers:
+
+    gate_<L>.bin                       : router gate, [num_experts x d_model] f32
+    layer_<L>_shexp_gate.bin           : shared-expert gate_proj  (f32)
+    layer_<L>_shexp_up.bin             : shared-expert up_proj    (f32)
+    layer_<L>_shexp_down.bin           : shared-expert down_proj  (f32)
+    layer_<L>_shexp_gate_inp.bin       : shared-expert sigmoid gate (f32, optional)
+
+Router-gate and shared-expert files are always written as little-endian
+`f32` (the engine reads them through `read_full_f32`), independent of the
+per-expert `--dtype`.
 
 ### metadata.json
 
@@ -46,11 +86,18 @@ automatically (CLI flags still override).
 
 ### Usage
 
+    # Mixtral (auto-detected)
     python scripts/extract_mixtral_experts.py \\
         --model mistralai/Mixtral-8x7B-v0.1 \\
         --layer 0 \\
         --out ./data \\
         --block-align 4096
+
+    # Qwen3-MoE (auto-detected from config.json)
+    python scripts/extract_mixtral_experts.py \\
+        --model Qwen/Qwen3-30B-A3B \\
+        --layer all \\
+        --out ./data-qwen3
 
 Add `--limit N` while iterating to write only the first N experts (handy
 for quick local smoke tests; the full Mixtral expert is ~176 MiB on
@@ -77,6 +124,16 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default="mistralai/Mixtral-8x7B-v0.1",
         help="Hugging Face model id or local path.",
+    )
+    p.add_argument(
+        "--architecture",
+        choices=["auto", "mixtral", "qwen3_moe", "deepseek_v3"],
+        default="auto",
+        help=(
+            "MoE architecture / tensor-name schema. `auto` (default) "
+            "detects it from the checkpoint's config.json (`architectures` "
+            "/ `model_type`). Override only if auto-detection fails."
+        ),
     )
     p.add_argument(
         "--layer",
@@ -177,6 +234,146 @@ def quantize_int8_per_tensor(arr):
     return scale, q.tobytes(order="C")
 
 
+# Per-architecture MoE tensor-name schemas. `{L}` is the layer index and
+# `{j}` the routed-expert id. These match the exact HuggingFace
+# `safetensors` keys for each family and mirror the Rust `TensorNaming`
+# map in `rust-engine/src/architecture.rs`.
+MOE_SCHEMAS: dict[str, dict[str, str | None]] = {
+    "mixtral": {
+        # Mixtral: `w1`=gate_proj, `w3`=up_proj, `w2`=down_proj.
+        "expert_marker": ".block_sparse_moe.experts.",
+        "expert_gate": "model.layers.{L}.block_sparse_moe.experts.{j}.w1.weight",
+        "expert_up": "model.layers.{L}.block_sparse_moe.experts.{j}.w3.weight",
+        "expert_down": "model.layers.{L}.block_sparse_moe.experts.{j}.w2.weight",
+        "router_gate": "model.layers.{L}.block_sparse_moe.gate.weight",
+        # Mixtral has no shared expert.
+        "shared_gate": None,
+        "shared_up": None,
+        "shared_down": None,
+        "shared_gate_inp": None,
+    },
+    "qwen3_moe": {
+        "expert_marker": ".mlp.experts.",
+        "expert_gate": "model.layers.{L}.mlp.experts.{j}.gate_proj.weight",
+        "expert_up": "model.layers.{L}.mlp.experts.{j}.up_proj.weight",
+        "expert_down": "model.layers.{L}.mlp.experts.{j}.down_proj.weight",
+        "router_gate": "model.layers.{L}.mlp.gate.weight",
+        # Qwen3-MoE has no shared expert.
+        "shared_gate": None,
+        "shared_up": None,
+        "shared_down": None,
+        "shared_gate_inp": None,
+    },
+    "deepseek_v3": {
+        "expert_marker": ".mlp.experts.",
+        "expert_gate": "model.layers.{L}.mlp.experts.{j}.gate_proj.weight",
+        "expert_up": "model.layers.{L}.mlp.experts.{j}.up_proj.weight",
+        "expert_down": "model.layers.{L}.mlp.experts.{j}.down_proj.weight",
+        "router_gate": "model.layers.{L}.mlp.gate.weight",
+        # DeepSeek-MoE keeps one always-on shared expert and no sigmoid
+        # shared-gate scalar.
+        "shared_gate": "model.layers.{L}.mlp.shared_experts.gate_proj.weight",
+        "shared_up": "model.layers.{L}.mlp.shared_experts.up_proj.weight",
+        "shared_down": "model.layers.{L}.mlp.shared_experts.down_proj.weight",
+        "shared_gate_inp": None,
+    },
+}
+
+# Fully dense decoder families (no routed experts to stream). Listed so
+# the script can refuse with a clear, architecture-specific message
+# instead of a late "no MoE layers found" error.
+DENSE_ARCHS = {"qwen3", "mistral3", "phi3"}
+
+# HuggingFace `architectures[]` entry -> our schema key.
+_HF_ARCH_TO_KEY = {
+    "MixtralForCausalLM": "mixtral",
+    "Qwen3MoeForCausalLM": "qwen3_moe",
+    "DeepseekV3ForCausalLM": "deepseek_v3",
+    "Qwen3ForCausalLM": "qwen3",
+    "Mistral3ForConditionalGeneration": "mistral3",
+    "Phi3ForCausalLM": "phi3",
+}
+
+
+def detect_architecture(config) -> str | None:
+    """Map an HF `AutoConfig` to one of our schema keys.
+
+    Prefers the `architectures` list (most specific), then falls back to
+    `model_type`. Returns `None` if neither is recognised.
+    """
+    for arch in getattr(config, "architectures", None) or []:
+        if arch in _HF_ARCH_TO_KEY:
+            return _HF_ARCH_TO_KEY[arch]
+    model_type = (getattr(config, "model_type", "") or "").strip()
+    if model_type in MOE_SCHEMAS or model_type in DENSE_ARCHS:
+        return model_type
+    return None
+
+
+def _first_attr(config, names: list[str]):
+    """Return the first present, non-None config attribute among `names`."""
+    for name in names:
+        val = getattr(config, name, None)
+        if val is not None:
+            return int(val)
+    return None
+
+
+def resolve_moe_config(config, arch: str) -> dict:
+    """Resolve the architecture-specific MoE hyperparameters.
+
+    The expert count and FFN-width spelling differ per family:
+    Mixtral uses `num_local_experts` + `intermediate_size`; Qwen3-MoE
+    and DeepSeek use `num_experts` / `n_routed_experts` +
+    `moe_intermediate_size`.
+    """
+    num_experts = _first_attr(
+        config, ["num_local_experts", "num_experts", "n_routed_experts"]
+    )
+    top_k = _first_attr(config, ["num_experts_per_tok"])
+    d_model = _first_attr(config, ["hidden_size"])
+    if arch == "mixtral":
+        d_ff = _first_attr(config, ["intermediate_size"])
+    else:
+        d_ff = _first_attr(config, ["moe_intermediate_size", "intermediate_size"])
+    num_shared_experts = _first_attr(config, ["n_shared_experts"]) or 0
+    first_k_dense_replace = _first_attr(config, ["first_k_dense_replace"]) or 0
+    return {
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "d_model": d_model,
+        "d_ff": d_ff,
+        "num_shared_experts": num_shared_experts,
+        "first_k_dense_replace": first_k_dense_replace,
+    }
+
+
+def detect_fp8(config) -> bool:
+    """True if the checkpoint is FP8 block-quantised (DeepSeek-V3).
+
+    Such weights carry companion `weight_scale_inv` tensors and need FP8
+    de-quantisation that neither this script nor the engine implements.
+    """
+    qc = getattr(config, "quantization_config", None)
+    if qc is None:
+        return False
+    method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
+    return bool(method) and "fp8" in str(method).lower()
+
+
+def write_f32_matrix(path: Path, arr) -> None:
+    """Write a tensor as a row-major little-endian `f32` `.bin` file.
+
+    Used for the router gate and shared-expert tensors, which the Rust
+    `from_dir` loader always reads as `f32` via `read_full_f32`
+    (independent of the per-expert `--dtype`).
+    """
+    import numpy as np
+
+    flat = arr.astype(np.float32, copy=False).reshape(-1)
+    path.write_bytes(flat.tobytes(order="C"))
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -190,14 +387,23 @@ def main() -> int:
         )
         return 2
 
-    # tqdm is optional: if it isn't installed, fall back to a stub that
-    # just yields the iterable unchanged. We don't want to fail a
-    # multi-hour Mixtral dump because someone missed `pip install tqdm`.
+    # tqdm is optional: if it isn't installed, fall back to a no-op
+    # progress shim. We don't want to fail a multi-hour Mixtral dump
+    # because someone missed `pip install tqdm`. The shim mirrors the
+    # subset of the tqdm API used below (`update`/`close`), so it works
+    # with the keyword-only `tqdm(total=..., desc=...)` call.
     try:
         from tqdm import tqdm
     except ImportError:  # pragma: no cover — runtime guidance only
-        def tqdm(iterable, **kwargs):  # type: ignore[no-redef]
-            return iterable
+        class tqdm:  # type: ignore[no-redef]
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def update(self, _n=1):
+                pass
+
+            def close(self):
+                pass
 
     out: Path = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -205,28 +411,78 @@ def main() -> int:
     print(f"loading config + model: {args.model}", file=sys.stderr)
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
 
-    # Mixtral / Llama-MoE expose these names in the HF config; assert up
-    # front so a non-MoE model fails with a clear error rather than a
-    # late KeyError deep in the state-dict walk.
-    required_attrs = {
-        "num_local_experts": "number of experts per MoE layer",
-        "num_experts_per_tok": "top-K experts activated per token",
-        "hidden_size": "d_model (residual-stream dim)",
-        "intermediate_size": "d_ff (FFN intermediate dim)",
-    }
-    for attr, descr in required_attrs.items():
-        if not hasattr(config, attr):
+    # Resolve the architecture (and therefore the tensor-name schema)
+    # from the checkpoint's config, unless explicitly overridden.
+    if args.architecture == "auto":
+        arch = detect_architecture(config)
+        if arch is None:
             print(
-                f"error: model {args.model!r} doesn't look like a Mixtral-style MoE: "
-                f"config is missing `{attr}` ({descr}).",
+                f"error: could not auto-detect the architecture of {args.model!r} "
+                f"(model_type={getattr(config, 'model_type', None)!r}, "
+                f"architectures={getattr(config, 'architectures', None)!r}). "
+                "Pass --architecture {mixtral,qwen3_moe,deepseek_v3} explicitly.",
                 file=sys.stderr,
             )
             return 2
+    else:
+        arch = args.architecture
 
-    num_experts: int = int(config.num_local_experts)
-    top_k: int = int(config.num_experts_per_tok)
-    d_model: int = int(config.hidden_size)
-    d_ff: int = int(config.intermediate_size)
+    # Fail fast on fully dense families: they have no routed experts to
+    # stream off SSD, so there is nothing for this script to extract.
+    if arch in DENSE_ARCHS:
+        print(
+            f"error: {args.model!r} is a dense architecture ({arch!r}) with no "
+            "routed experts to extract. Dense models do not exercise the SSD "
+            "expert-streaming path — run them directly from their .safetensors "
+            "(see the engine's safetensors loader).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if arch not in MOE_SCHEMAS:
+        print(
+            f"error: unsupported architecture {arch!r}; expected one of "
+            f"{sorted(MOE_SCHEMAS)}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # DeepSeek-V3 ships FP8 block-quantised weights (companion
+    # `weight_scale_inv` tensors) that require FP8 de-quantisation this
+    # script does not implement, and the engine refuses to run DeepSeek
+    # (MLA + FP8 unimplemented). Fail fast rather than emit garbage.
+    if detect_fp8(config):
+        print(
+            f"error: {args.model!r} ({arch!r}) is FP8 block-quantised; FP8 "
+            "de-quantisation is not implemented (companion `weight_scale_inv` "
+            "tensors cannot be applied). The tensor naming is understood, but "
+            "the engine cannot run DeepSeek-V3 yet (MLA + FP8 unimplemented). "
+            "Re-export a de-quantised (bf16/f16) checkpoint to extract it.",
+            file=sys.stderr,
+        )
+        return 2
+
+    schema = MOE_SCHEMAS[arch]
+
+    # The expert-count / FFN-width spelling differs per family; resolve
+    # them up front so a non-MoE model fails clearly rather than with a
+    # late KeyError deep in the state-dict walk.
+    resolved = resolve_moe_config(config, arch)
+    missing = [k for k in ("num_experts", "top_k", "d_model", "d_ff") if resolved[k] is None]
+    if missing:
+        print(
+            f"error: model {args.model!r} ({arch!r}) is missing MoE config "
+            f"fields {missing}; is this actually a {arch} MoE checkpoint?",
+            file=sys.stderr,
+        )
+        return 2
+
+    num_experts: int = resolved["num_experts"]
+    top_k: int = resolved["top_k"]
+    d_model: int = resolved["d_model"]
+    d_ff: int = resolved["d_ff"]
+    num_shared_experts: int = resolved["num_shared_experts"]
+    first_k_dense_replace: int = resolved["first_k_dense_replace"]
     # SwiGLU expert holds three weight matrices (gate, up, down). The
     # Rust engine reinterprets the bytes as either `&[f32]` (4 B / weight)
     # or dequantises from little-endian `f16` (2 B / weight) depending on
@@ -246,8 +502,10 @@ def main() -> int:
     expert_size = ((weight_bytes + args.block_align - 1) // args.block_align) * args.block_align
 
     print(
-        f"model has {num_experts} experts/layer, top_k={top_k}, "
-        f"d_model={d_model}, d_ff={d_ff} dtype={args.dtype} -> "
+        f"architecture {arch!r}: {num_experts} experts/layer, top_k={top_k}, "
+        f"d_model={d_model}, d_ff={d_ff} dtype={args.dtype} "
+        f"(shared_experts={num_shared_experts}, first_k_dense_replace="
+        f"{first_k_dense_replace}) -> "
         f"{weight_bytes / 1024 / 1024:.1f} MiB/expert "
         f"(padded to {expert_size / 1024 / 1024:.1f} MiB on disk)",
         file=sys.stderr,
@@ -263,25 +521,24 @@ def main() -> int:
         low_cpu_mem_usage=True,
     )
 
-    # Walk the state dict for the requested layer(s)' experts.
-    # Mixtral parameter names look like:
-    #   model.layers.<layer>.block_sparse_moe.experts.<expert_id>.w1.weight  (gate_proj)
-    #   model.layers.<layer>.block_sparse_moe.experts.<expert_id>.w2.weight  (down_proj)
-    #   model.layers.<layer>.block_sparse_moe.experts.<expert_id>.w3.weight  (up_proj)
-    # Note: Mixtral's `w1` is the gate, `w3` is the up, `w2` is the down.
+    # Walk the state dict for the requested layer(s)' experts, using the
+    # architecture's tensor-name schema (Mixtral `block_sparse_moe.*` vs
+    # Qwen3-MoE / DeepSeek `mlp.experts.{j}.{gate,up,down}_proj`).
     sd = model.state_dict()
 
     # Discover MoE layers present in the state dict, then resolve the
-    # `--layer` spec (or legacy `--all-layers`) against them.
+    # `--layer` spec (or legacy `--all-layers`) against them. The expert
+    # tensors live under an architecture-specific marker.
+    expert_marker = schema["expert_marker"]
     available_layers = sorted({
         int(name.split(".")[2])
         for name in sd.keys()
-        if name.startswith("model.layers.") and ".block_sparse_moe.experts." in name
+        if name.startswith("model.layers.") and expert_marker in name
     })
     if not available_layers:
         print(
-            "error: no MoE layers found in state dict; "
-            "is this actually a Mixtral-style model?",
+            f"error: no MoE layers found in state dict (looked for "
+            f"{expert_marker!r}); is this actually a {arch} model?",
             file=sys.stderr,
         )
         return 1
@@ -327,36 +584,39 @@ def main() -> int:
         file=sys.stderr,
     )
     for layer in layer_ids:
-        prefix = f"model.layers.{layer}.block_sparse_moe.experts"
         for expert_id in range(n):
-            w1 = sd.get(f"{prefix}.{expert_id}.w1.weight")  # gate_proj [d_ff, d_model]
-            w3 = sd.get(f"{prefix}.{expert_id}.w3.weight")  # up_proj   [d_ff, d_model]
-            w2 = sd.get(f"{prefix}.{expert_id}.w2.weight")  # down_proj [d_model, d_ff]
-            if w1 is None or w2 is None or w3 is None:
+            gate_key = schema["expert_gate"].format(L=layer, j=expert_id)
+            up_key = schema["expert_up"].format(L=layer, j=expert_id)
+            down_key = schema["expert_down"].format(L=layer, j=expert_id)
+            w_gate = sd.get(gate_key)  # gate_proj [d_ff, d_model]
+            w_up = sd.get(up_key)      # up_proj   [d_ff, d_model]
+            w_down = sd.get(down_key)  # down_proj [d_model, d_ff]
+            if w_gate is None or w_up is None or w_down is None:
                 progress.close()
                 print(
-                    f"error: missing tensors for expert {expert_id} on layer {layer}; "
-                    "is the layer index correct?",
+                    f"error: missing expert tensors for layer {layer} expert "
+                    f"{expert_id} (looked for {gate_key!r}); is the layer index "
+                    "correct?",
                     file=sys.stderr,
                 )
                 return 1
             # Sanity-check shapes — fail loudly if HF ever changes the layout.
-            assert tuple(w1.shape) == (d_ff, d_model), (
-                f"w1 (gate_proj) for layer {layer} expert {expert_id} has shape "
-                f"{tuple(w1.shape)}, expected ({d_ff}, {d_model})"
+            assert tuple(w_gate.shape) == (d_ff, d_model), (
+                f"gate_proj for layer {layer} expert {expert_id} has shape "
+                f"{tuple(w_gate.shape)}, expected ({d_ff}, {d_model})"
             )
-            assert tuple(w3.shape) == (d_ff, d_model), (
-                f"w3 (up_proj) for layer {layer} expert {expert_id} has shape "
-                f"{tuple(w3.shape)}, expected ({d_ff}, {d_model})"
+            assert tuple(w_up.shape) == (d_ff, d_model), (
+                f"up_proj for layer {layer} expert {expert_id} has shape "
+                f"{tuple(w_up.shape)}, expected ({d_ff}, {d_model})"
             )
-            assert tuple(w2.shape) == (d_model, d_ff), (
-                f"w2 (down_proj) for layer {layer} expert {expert_id} has shape "
-                f"{tuple(w2.shape)}, expected ({d_model}, {d_ff})"
+            assert tuple(w_down.shape) == (d_model, d_ff), (
+                f"down_proj for layer {layer} expert {expert_id} has shape "
+                f"{tuple(w_down.shape)}, expected ({d_model}, {d_ff})"
             )
 
-            gate_f32 = w1.to(torch.float32).contiguous().cpu().numpy()
-            up_f32 = w3.to(torch.float32).contiguous().cpu().numpy()
-            down_f32 = w2.to(torch.float32).contiguous().cpu().numpy()
+            gate_f32 = w_gate.to(torch.float32).contiguous().cpu().numpy()
+            up_f32 = w_up.to(torch.float32).contiguous().cpu().numpy()
+            down_f32 = w_down.to(torch.float32).contiguous().cpu().numpy()
 
             # Multi-layer dumps use a global filename; single-layer
             # dumps keep the legacy name for backward compat.
@@ -396,8 +656,63 @@ def main() -> int:
     progress.close()
     print(f"finished writing {written} expert file(s)", file=sys.stderr)
 
+    # Emit the resident router gate (`gate_<L>.bin`) and any shared expert
+    # (`layer_<L>_shexp_*.bin`) for each dumped layer. The Rust `from_dir`
+    # loader auto-discovers these and reads them as little-endian `f32`
+    # (via `read_full_f32`), independent of the per-expert `--dtype`.
+    gates_written = 0
+    shared_written = 0
+    for layer in layer_ids:
+        gate_w = sd.get(schema["router_gate"].format(L=layer))
+        if gate_w is not None:
+            assert tuple(gate_w.shape) == (num_experts, d_model), (
+                f"router gate for layer {layer} has shape {tuple(gate_w.shape)}, "
+                f"expected ({num_experts}, {d_model})"
+            )
+            write_f32_matrix(
+                out / f"gate_{layer}.bin",
+                gate_w.to(torch.float32).contiguous().cpu().numpy(),
+            )
+            gates_written += 1
+
+        if schema["shared_gate"] is not None:
+            sh_gate = sd.get(schema["shared_gate"].format(L=layer))
+            sh_up = sd.get(schema["shared_up"].format(L=layer))
+            sh_down = sd.get(schema["shared_down"].format(L=layer))
+            if sh_gate is not None and sh_up is not None and sh_down is not None:
+                write_f32_matrix(
+                    out / f"layer_{layer}_shexp_gate.bin",
+                    sh_gate.to(torch.float32).contiguous().cpu().numpy(),
+                )
+                write_f32_matrix(
+                    out / f"layer_{layer}_shexp_up.bin",
+                    sh_up.to(torch.float32).contiguous().cpu().numpy(),
+                )
+                write_f32_matrix(
+                    out / f"layer_{layer}_shexp_down.bin",
+                    sh_down.to(torch.float32).contiguous().cpu().numpy(),
+                )
+                # Optional sigmoid shared-gate scalar (Qwen2-MoE); DeepSeek
+                # omits it. The engine treats it as optional.
+                if schema["shared_gate_inp"] is not None:
+                    sh_gate_inp = sd.get(schema["shared_gate_inp"].format(L=layer))
+                    if sh_gate_inp is not None:
+                        write_f32_matrix(
+                            out / f"layer_{layer}_shexp_gate_inp.bin",
+                            sh_gate_inp.to(torch.float32).contiguous().cpu().numpy(),
+                        )
+                shared_written += 1
+    if gates_written:
+        print(f"wrote {gates_written} router gate file(s) (gate_<L>.bin)", file=sys.stderr)
+    if shared_written:
+        print(
+            f"wrote {shared_written} shared-expert set(s) (layer_<L>_shexp_*.bin)",
+            file=sys.stderr,
+        )
+
     metadata = {
         "model": args.model,
+        "architecture": arch,
         "layer": layer_ids[0] if not multi_layer else None,
         "layers": layer_ids,
         "num_layers": len(layer_ids),
@@ -405,6 +720,8 @@ def main() -> int:
         "top_k": top_k,
         "d_model": d_model,
         "d_ff": d_ff,
+        "num_shared_experts": num_shared_experts,
+        "first_k_dense_replace": first_k_dense_replace,
         "expert_size": expert_size,
         "block_align": args.block_align,
         "dtype": args.dtype,

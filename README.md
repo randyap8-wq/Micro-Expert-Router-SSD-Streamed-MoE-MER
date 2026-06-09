@@ -1643,16 +1643,29 @@ There are **three** ways to feed real Mixtral / Llama-MoE weights into
 the engine, depending on what format you have them in:
 
 **1. From a Hugging Face checkpoint (per-expert `.bin` files).**
-`scripts/extract_mixtral_experts.py` dumps a single transformer
-layer's expert FFNs from a HuggingFace Mixtral checkpoint into the
-on-disk format the engine expects (`expert_<id>.bin` blobs +
-`metadata.json`):
+`scripts/extract_mixtral_experts.py` dumps a transformer layer's expert
+FFNs from a HuggingFace MoE checkpoint into the on-disk format the engine
+expects (`expert_<id>.bin` blobs + `metadata.json`). It is
+**architecture-aware**: it auto-detects the family from the checkpoint's
+`config.json` and selects the right tensor-name schema — Mixtral
+(`block_sparse_moe.experts.{j}.w1/w3/w2`) or Qwen3-MoE / DeepSeek
+(`mlp.experts.{j}.{gate,up,down}_proj`) — and also emits the resident
+router gate (`gate_<L>.bin`) and any shared expert
+(`layer_<L>_shexp_*.bin`) the `from_dir` loader auto-discovers. Fully
+dense families (Qwen3 dense, Mistral Small 3, Phi-4) and FP8-quantised
+DeepSeek-V3 are refused with a clear error (override detection with
+`--architecture {mixtral,qwen3_moe,deepseek_v3}`):
 
 ```
 pip install 'transformers>=4.38' torch
 python scripts/extract_mixtral_experts.py \
     --model mistralai/Mixtral-8x7B-v0.1 \
     --layer 0 --out ./mixtral-data
+
+# Qwen3-MoE: same script, architecture auto-detected
+python scripts/extract_mixtral_experts.py \
+    --model Qwen/Qwen3-30B-A3B \
+    --layer all --out ./qwen3-data
 
 cargo run --release --manifest-path rust-engine/Cargo.toml -- \
     run --data-dir ./mixtral-data --tokens 200
@@ -1775,10 +1788,12 @@ Per-family specifics:
   tensors. `q4_K_M` is the practical default dtype.
 * **Qwen3-MoE (`qwen3_moe`) — ✅ loadable.** Just set `weights_dir`; the
   128-expert router and `mlp.experts.*` names load automatically. Expert
-  FFNs still stream from `--data-dir`; extract them the same way as
-  Mixtral but with the Qwen3 naming (see the extractor notes below).
-  Attention applies QK-Norm (per-head RMSNorm on Q and K before RoPE),
-  matching the reference architecture.
+  FFNs still stream from `--data-dir`; extract them with
+  `scripts/extract_mixtral_experts.py`, which auto-detects Qwen3-MoE and
+  emits the `mlp.experts.*` per-expert blobs plus the `gate_<L>.bin`
+  router gate (see the extractor notes above). Attention applies QK-Norm
+  (per-head RMSNorm on Q and K before RoPE), matching the reference
+  architecture.
 * **Qwen3 dense (`qwen3`) — ✅ runs, dense.** Loads attention + QK-Norm +
   norms + embeddings and executes the dense SwiGLU FFN from resident
   weights. Being dense it does **not** exercise SSD streaming.
