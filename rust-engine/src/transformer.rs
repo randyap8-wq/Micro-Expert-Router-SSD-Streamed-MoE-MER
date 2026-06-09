@@ -227,6 +227,18 @@ impl KvCache {
         &self.keys_blocks[block_idx][start..start + self.kv_dim]
     }
 
+    /// Public read accessor for the i-th cached key (length `kv_dim`).
+    ///
+    /// Multi-head latent attention ([`crate::mla`]) stores its compressed
+    /// latent `[compressed_kv; k_pe]` in the key slot and reconstructs the
+    /// per-head K/V on the fly, so it needs read access to historical
+    /// entries from outside this module. Standard attention never calls
+    /// this (it sweeps the cache through the private `key`/`value`
+    /// helpers inside `MultiHeadSelfAttention::forward`).
+    pub fn key_at(&self, i: usize) -> &[f32] {
+        self.key(i)
+    }
+
     fn value(&self, i: usize) -> &[f32] {
         let block_idx = i / PAGED_BLOCK_TOKENS;
         let in_block = i % PAGED_BLOCK_TOKENS;
@@ -902,6 +914,13 @@ impl SharedExpert {
 pub struct TransformerLayer {
     pub rms_attn: RmsNorm,
     pub attn: MultiHeadSelfAttention,
+    /// Optional multi-head latent attention (DeepSeek-V3). When `Some`,
+    /// [`Self::attn_block`] runs the MLA path against the layer's latent
+    /// KV cache instead of the standard `attn`; `attn` is then unused
+    /// for compute but retained so existing field accessors
+    /// (`attn.d_model`, telemetry) keep working. `None` for every other
+    /// architecture, preserving the standard attention path byte-for-byte.
+    pub mla: Option<crate::mla::MultiHeadLatentAttention>,
     pub rms_moe: RmsNorm,
     pub gate: crate::gating::LinearGate,
     /// Optional always-on dense FFN (Qwen2-MoE / DeepSeek-MoE shared
@@ -931,8 +950,26 @@ impl TransformerLayer {
         backend: &crate::backend::BackendBox,
     ) -> Vec<f32> {
         let normed = self.rms_attn.forward(hidden);
-        let attn_out = self.attn.forward(&normed, pos, layer_idx, kv, backend);
+        let attn_out = match self.mla.as_ref() {
+            // DeepSeek-V3 multi-head latent attention runs on CPU against
+            // the layer's compressed latent KV cache. The GPU attention
+            // kernels are shaped for standard MHA (uniform K/V head dim),
+            // so MLA stays on the reference path; `backend` is unused
+            // here but kept in the signature for the standard path below.
+            Some(mla) => mla.forward(&normed, pos, kv),
+            None => self.attn.forward(&normed, pos, layer_idx, kv, backend),
+        };
         add_residual(hidden, &attn_out)
+    }
+
+    /// KV-cache width this layer needs: the MLA latent dim when latent
+    /// attention is active, otherwise the standard `num_kv_heads *
+    /// head_dim`.
+    pub fn kv_dim(&self) -> usize {
+        match self.mla.as_ref() {
+            Some(mla) => mla.latent_dim(),
+            None => self.attn.kv_dim(),
+        }
     }
 
     /// `hidden -> rmsnorm -> gate.route()`. Returns the normalised
@@ -1318,6 +1355,7 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
             },
+            mla: None,
             rms_moe: RmsNorm::new(vec![1.0; d_model], 1e-6),
             gate: crate::gating::LinearGate::new(
                 mk(num_experts, d_model, 0.1),

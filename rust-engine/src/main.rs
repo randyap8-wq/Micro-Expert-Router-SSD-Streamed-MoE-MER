@@ -34,6 +34,7 @@ mod io_uring_storage;
 mod kernels;
 mod metrics;
 mod middleware;
+mod mla;
 mod model;
 mod multi_layer_cache;
 mod numa;

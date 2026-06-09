@@ -38,6 +38,7 @@ use crate::architecture::{
     Architecture, ComputeSupport, FfnKind, MlaDims, RopeScaling, TensorNaming,
 };
 use crate::gating::{LinearGate, ScoringFunc};
+use crate::mla::MultiHeadLatentAttention;
 use crate::transformer::{
     KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, SharedExpert, TransformerLayer,
 };
@@ -336,6 +337,7 @@ impl RealModel {
         let layers: Vec<TransformerLayer> = (0..config.num_layers)
             .map(|_| {
                 let (q_norm, k_norm) = seed_qk_norm();
+                let mla = seed_mla(&config, &mut rng, proj_scale);
                 TransformerLayer {
                 rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 attn: MultiHeadSelfAttention {
@@ -352,6 +354,7 @@ impl RealModel {
                     q_norm,
                     k_norm,
                 },
+                mla,
                 rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 gate: LinearGate::new(
                     sample_uniform_vec(&mut rng, config.num_experts * config.d_model, proj_scale),
@@ -609,13 +612,13 @@ impl RealModel {
             .validate()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-        // Fail loud — *before* touching the (potentially multi-hundred-GB)
-        // shards — for architectures we can map tensor names for but
-        // cannot actually execute. DeepSeek-V3 is recognised (its expert
-        // and `weight_scale_inv` names are mapped by `TensorNaming`) but
-        // needs MLA latent-KV attention and FP8 dequantisation that are
-        // not implemented; running it would route on garbage activations,
-        // so we refuse rather than silently produce nonsense.
+        // Defensive guard: refuse — *before* touching the (potentially
+        // multi-hundred-GB) shards — to build any architecture whose
+        // forward-compute path is not implemented. Every recognised
+        // architecture is currently executable (DeepSeek-V3 included, via
+        // MLA latent-KV attention + FP8 dequant), so this never triggers
+        // today; it is retained so a future, mapping-only architecture
+        // fails loud here rather than routing on garbage activations.
         if let ComputeSupport::Unsupported { reason } = config.architecture.compute_support() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -690,12 +693,113 @@ impl RealModel {
         // return its decoded f32 data regardless of length. Used by the
         // shared-expert loader, which infers the shared intermediate size
         // from the tensor length rather than asserting a configured one.
+        // DeepSeek-V3 FP8 (`e4m3`) 2D weights are transparently
+        // block-dequantised via their companion `<name>_scale_inv`.
         let find_f32_any = |names: &[String]| -> Option<Vec<f32>> {
+            use safetensors::tensor::Dtype;
             for name in names {
                 for st in &parsed {
                     if let Ok(view) = st.tensor(name) {
+                        if view.dtype() != Dtype::F8_E4M3 {
+                            return Some(decode_safetensor_to_f32(&view));
+                        }
+                        let shape = view.shape();
+                        if shape.len() != 2 {
+                            return None;
+                        }
+                        let (rows, cols) = (shape[0], shape[1]);
+                        let scale_name = format!("{name}_scale_inv");
+                        let mut scale_inv = None;
+                        for s in &parsed {
+                            if let Ok(sv) = s.tensor(&scale_name) {
+                                scale_inv = Some(decode_safetensor_to_f32(&sv));
+                                break;
+                            }
+                        }
+                        let scale_inv = scale_inv?;
+                        let out = crate::mla::dequant_fp8_e4m3_blockwise(
+                            view.data(),
+                            &scale_inv,
+                            rows,
+                            cols,
+                            FP8_BLOCK,
+                        );
+                        if out.is_empty() {
+                            return None;
+                        }
+                        return Some(out);
+                    }
+                }
+            }
+            None
+        };
+
+        // Closure: search every shard for `name`, decoding it as f32 and
+        // transparently dequantising DeepSeek-V3 FP8 (`e4m3`) weights via
+        // their companion `<name>_scale_inv` block-scale tensor. Non-FP8
+        // dtypes route through the standard decoder. Returns `None` when
+        // the tensor is missing or its element count != `expected`.
+        let find_f32_dequant = |name: &str, expected: usize| -> Option<Vec<f32>> {
+            use safetensors::tensor::Dtype;
+            for st in &parsed {
+                if let Ok(view) = st.tensor(name) {
+                    let shape = view.shape();
+                    let n_elem: usize = shape.iter().product();
+                    if n_elem != expected {
+                        warn!(
+                            tensor = name,
+                            have = n_elem,
+                            need = expected,
+                            "safetensors shape mismatch; falling back to seeded init"
+                        );
+                        return None;
+                    }
+                    if view.dtype() != Dtype::F8_E4M3 {
                         return Some(decode_safetensor_to_f32(&view));
                     }
+                    // FP8 block-wise quantised 2D weight. DeepSeek stores a
+                    // companion `<name>_scale_inv` of reciprocal block
+                    // scales ([ceil(rows/128), ceil(cols/128)] f32).
+                    if shape.len() != 2 {
+                        warn!(
+                            tensor = name,
+                            "FP8 weight is not 2D; cannot block-dequantise"
+                        );
+                        return None;
+                    }
+                    let (rows, cols) = (shape[0], shape[1]);
+                    let scale_name = format!("{name}_scale_inv");
+                    let scale_inv = (|| {
+                        for s in &parsed {
+                            if let Ok(sv) = s.tensor(&scale_name) {
+                                return Some(decode_safetensor_to_f32(&sv));
+                            }
+                        }
+                        None
+                    })();
+                    let Some(scale_inv) = scale_inv else {
+                        warn!(
+                            tensor = name,
+                            scale = %scale_name,
+                            "FP8 weight missing companion scale_inv; falling back to seeded init"
+                        );
+                        return None;
+                    };
+                    let out = crate::mla::dequant_fp8_e4m3_blockwise(
+                        view.data(),
+                        &scale_inv,
+                        rows,
+                        cols,
+                        FP8_BLOCK,
+                    );
+                    if out.is_empty() {
+                        warn!(
+                            tensor = name,
+                            "FP8 block-dequant failed (shape mismatch); falling back to seeded init"
+                        );
+                        return None;
+                    }
+                    return Some(out);
                 }
             }
             None
@@ -707,6 +811,16 @@ impl RealModel {
             ($name:expr, $expected:expr, $assign:expr) => {{
                 tried += 1;
                 if let Some(v) = find_f32($name, $expected) {
+                    $assign(v);
+                    loaded += 1;
+                }
+            }};
+        }
+        // FP8-dequant-aware variant of `maybe!` for DeepSeek-V3 weights.
+        macro_rules! maybe_q {
+            ($name:expr, $expected:expr, $assign:expr) => {{
+                tried += 1;
+                if let Some(v) = find_f32_dequant($name, $expected) {
                     $assign(v);
                     loaded += 1;
                 }
@@ -734,12 +848,25 @@ impl RealModel {
                 model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps);
             });
 
-            // Attention projections. Phi-4 ships a single fused
-            // `qkv_proj` ([(num_heads + 2*num_kv_heads) * head_dim,
-            // d_model], row-major) that we split into the engine's
-            // separate Q/K/V weights; every other family has discrete
-            // `q_proj` / `k_proj` / `v_proj` tensors.
-            if naming.attn_qkv_fused() {
+            // Attention projections. DeepSeek-V3 uses MLA (latent-KV)
+            // attention with its own low-rank projection stack; every
+            // other family uses standard dense Q/K/V/O. The presence of an
+            // `mla` block on the seeded layer (built from `config.advanced.mla`)
+            // selects the path.
+            if model.layers[l].mla.is_some() {
+                load_mla_layer(
+                    &mut model.layers[l],
+                    l,
+                    &naming,
+                    &config,
+                    &find_f32_dequant,
+                    &mut tried,
+                    &mut loaded,
+                );
+            } else if naming.attn_qkv_fused() {
+                // Phi-4 ships a single fused `qkv_proj`
+                // ([(num_heads + 2*num_kv_heads) * head_dim, d_model],
+                // row-major) that we split into separate Q/K/V weights.
                 tried += 1;
                 if let Some(v) = find_f32(&naming.attn_qkv(l), (q_dim + 2 * kv_dim) * d_model) {
                     let (q_part, rest) = v.split_at(q_dim * d_model);
@@ -749,6 +876,9 @@ impl RealModel {
                     model.layers[l].attn.wv = v_part.to_vec();
                     loaded += 1;
                 }
+                maybe!(&naming.attn_o(l), d_model * q_dim, |v| {
+                    model.layers[l].attn.wo = v;
+                });
             } else {
                 maybe!(&naming.attn_q(l), q_dim * d_model, |v| {
                     model.layers[l].attn.wq = v;
@@ -759,10 +889,10 @@ impl RealModel {
                 maybe!(&naming.attn_v(l), kv_dim * d_model, |v| {
                     model.layers[l].attn.wv = v;
                 });
+                maybe!(&naming.attn_o(l), d_model * q_dim, |v| {
+                    model.layers[l].attn.wo = v;
+                });
             }
-            maybe!(&naming.attn_o(l), d_model * q_dim, |v| {
-                model.layers[l].attn.wo = v;
-            });
 
             // QK-Norm (Qwen3 / Qwen3-MoE): per-head RMSNorm weights of
             // length `head_dim`, applied to Q and K before RoPE. Seeded as
@@ -961,7 +1091,7 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     pub fn fresh_kv_caches(&self) -> Vec<KvCache> {
         self.layers
             .iter()
-            .map(|l| KvCache::new(l.attn.kv_dim()))
+            .map(|l| KvCache::new(l.kv_dim()))
             .collect()
     }
 
@@ -1156,6 +1286,131 @@ fn sample_uniform_vec(rng: &mut SplitMix64, n: usize, scale: f32) -> Vec<f32> {
         v.push(rng.next_uniform(scale));
     }
     v
+}
+
+/// Build a deterministically seeded [`MultiHeadLatentAttention`] for a
+/// single DeepSeek-V3 layer, or `None` when the config carries no MLA
+/// dims (every non-DeepSeek architecture). The seeded weights let the
+/// engine run DeepSeek-V3 end-to-end through the latent-attention path
+/// even without an on-disk checkpoint, exactly mirroring how the
+/// standard attention path is seeded in [`RealModel::new_seeded`]; the
+/// on-disk loaders overwrite these with real tensors when present.
+fn seed_mla(
+    config: &RealModelConfig,
+    rng: &mut SplitMix64,
+    proj_scale: f32,
+) -> Option<MultiHeadLatentAttention> {
+    let dims = config.advanced.mla?;
+    let n_h = config.num_heads;
+    let qk_head = dims.qk_nope_head_dim + dims.qk_rope_head_dim;
+    let q_total = n_h * qk_head;
+    let kv_proj_dim = dims.kv_lora_rank + dims.qk_rope_head_dim;
+    let kv_b_out = n_h * (dims.qk_nope_head_dim + dims.v_head_dim);
+
+    let (q_a_proj, q_a_layernorm, q_b_proj) = if dims.q_lora_rank > 0 {
+        (
+            sample_uniform_vec(rng, dims.q_lora_rank * config.d_model, proj_scale),
+            Some(RmsNorm::new(vec![1.0; dims.q_lora_rank], config.rms_eps)),
+            sample_uniform_vec(rng, q_total * dims.q_lora_rank, proj_scale),
+        )
+    } else {
+        (
+            Vec::new(),
+            None,
+            sample_uniform_vec(rng, q_total * config.d_model, proj_scale),
+        )
+    };
+
+    Some(MultiHeadLatentAttention {
+        d_model: config.d_model,
+        num_heads: n_h,
+        q_lora_rank: dims.q_lora_rank,
+        kv_lora_rank: dims.kv_lora_rank,
+        qk_nope_head_dim: dims.qk_nope_head_dim,
+        qk_rope_head_dim: dims.qk_rope_head_dim,
+        v_head_dim: dims.v_head_dim,
+        rope_base: config.rope_base,
+        softmax_scale: MultiHeadLatentAttention::default_softmax_scale(
+            dims.qk_nope_head_dim,
+            dims.qk_rope_head_dim,
+        ),
+        q_a_proj,
+        q_a_layernorm,
+        q_b_proj,
+        kv_a_proj_with_mqa: sample_uniform_vec(rng, kv_proj_dim * config.d_model, proj_scale),
+        kv_a_layernorm: RmsNorm::new(vec![1.0; dims.kv_lora_rank], config.rms_eps),
+        kv_b_proj: sample_uniform_vec(rng, kv_b_out * dims.kv_lora_rank, proj_scale),
+        o_proj: sample_uniform_vec(rng, config.d_model * n_h * dims.v_head_dim, proj_scale),
+    })
+}
+
+/// DeepSeek-V3 FP8 block-quantisation edge (`weight_scale_inv` is laid
+/// out over a 128x128 block grid).
+const FP8_BLOCK: usize = 128;
+
+/// Load the on-disk MLA projection tensors for a single DeepSeek-V3
+/// layer, overwriting the seeded weights in `layer.mla`. Missing tensors
+/// keep their seeded values (matching the rest of the loader's
+/// best-effort behaviour). `find` transparently dequantises FP8 weights.
+/// Increments `tried`/`loaded` so the loader's summary stays accurate.
+fn load_mla_layer<F>(
+    layer: &mut TransformerLayer,
+    l: usize,
+    naming: &TensorNaming,
+    config: &RealModelConfig,
+    find: &F,
+    tried: &mut usize,
+    loaded: &mut usize,
+) where
+    F: Fn(&str, usize) -> Option<Vec<f32>>,
+{
+    let Some(mla) = layer.mla.as_mut() else { return };
+    let d_model = config.d_model;
+    let n_h = mla.num_heads;
+    let qk_head = mla.qk_nope_head_dim + mla.qk_rope_head_dim;
+    let q_total = n_h * qk_head;
+    let kv_proj_dim = mla.kv_lora_rank + mla.qk_rope_head_dim;
+    let kv_b_out = n_h * (mla.qk_nope_head_dim + mla.v_head_dim);
+
+    // (name, expected_len) -> Option<Vec<f32>>, counting every attempt.
+    let mut try_load = |name: String, expected: usize| -> Option<Vec<f32>> {
+        *tried += 1;
+        let v = find(&name, expected);
+        if v.is_some() {
+            *loaded += 1;
+        }
+        v
+    };
+
+    if mla.q_lora_rank > 0 {
+        if let Some(v) = try_load(naming.mla_q_a_proj(l), mla.q_lora_rank * d_model) {
+            mla.q_a_proj = v;
+        }
+        if let Some(v) = try_load(naming.mla_q_a_layernorm(l), mla.q_lora_rank) {
+            mla.q_a_layernorm = Some(RmsNorm::new(v, config.rms_eps));
+        }
+        if let Some(v) = try_load(naming.mla_q_b_proj(l), q_total * mla.q_lora_rank) {
+            mla.q_b_proj = v;
+        }
+    } else {
+        // q_lora_rank == 0: a single dense `q_proj` straight from d_model.
+        if let Some(v) = try_load(naming.attn_q(l), q_total * d_model) {
+            mla.q_b_proj = v;
+        }
+    }
+
+    if let Some(v) = try_load(naming.mla_kv_a_proj(l), kv_proj_dim * d_model) {
+        mla.kv_a_proj_with_mqa = v;
+    }
+    if let Some(v) = try_load(naming.mla_kv_a_layernorm(l), mla.kv_lora_rank) {
+        mla.kv_a_layernorm = RmsNorm::new(v, config.rms_eps);
+    }
+    if let Some(v) = try_load(naming.mla_kv_b_proj(l), kv_b_out * mla.kv_lora_rank) {
+        mla.kv_b_proj = v;
+    }
+    if let Some(v) = try_load(naming.attn_o(l), d_model * n_h * mla.v_head_dim) {
+        mla.o_proj = v;
+    }
 }
 
 /// Decode a `safetensors::TensorView` into an owned `Vec<f32>`. We
@@ -1560,27 +1815,33 @@ mod tests {
         );
     }
 
-    /// DeepSeek-V3 (`deepseek_v3`) is recognised for tensor-name mapping
-    /// but cannot be executed (MLA + FP8 are unimplemented). The loader
-    /// must fail loud with `Unsupported` rather than silently producing a
-    /// garbage model — and it must do so before reading any shards.
+    /// DeepSeek-V3 (`deepseek_v3`) is now fully executable: `new_seeded`
+    /// builds runnable MLA blocks for every layer instead of the loader
+    /// failing loud. This guards against regressing the MLA + FP8
+    /// integration back to the old "unsupported" behaviour.
     #[test]
-    fn from_safetensors_deepseek_fails_loud() {
+    fn deepseek_seeds_runnable_mla() {
+        let mut advanced = AdvancedConfig::default();
+        advanced.mla = Some(MlaDims {
+            q_lora_rank: 0,
+            kv_lora_rank: 16,
+            qk_nope_head_dim: 4,
+            qk_rope_head_dim: 4,
+            v_head_dim: 8,
+        });
         let cfg = RealModelConfig {
             architecture: Architecture::DeepSeekV3,
             first_k_dense_replace: 3,
-            advanced: Default::default(),
+            advanced,
             num_layers: 4,
             ..RealModelConfig::tiny()
         };
-        let dir = TempDir::new("deepseek_unsupported");
-        // Note: no .safetensors written — the fail-loud check must trigger
-        // before shard discovery, so an empty dir is fine.
-        let err = match RealModel::from_safetensors(cfg, &dir.path, 1) {
-            Ok(_) => panic!("DeepSeek-V3 must not build a runnable model"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        let model = RealModel::new_seeded(cfg, 1);
+        assert!(model.layers.iter().all(|l| l.mla.is_some()));
+        // The latent KV-cache width must match the MLA latent dim so the
+        // per-layer cache is sized correctly.
+        let kv_dim = model.layers[0].kv_dim();
+        assert_eq!(kv_dim, 16 + 4);
     }
 
     /// `from_hf_config` maps a parsed Qwen3-MoE `config.json` (explicit
