@@ -1,9 +1,9 @@
-# Distributed serving sketch (planned, not yet implemented)
+# Distributed serving (gRPC transport behind `--features grpc`)
 
-The current `micro-expert-router` server runs as a single process.
+The default `micro-expert-router` server runs as a single process.
 This document records the partitioning plan referenced in
-`docs/production.md` so we can implement it incrementally without
-re-doing the design.
+`docs/production.md` and the gRPC transport that now implements it
+behind the off-by-default `grpc` cargo feature.
 
 ## Goals
 
@@ -51,8 +51,11 @@ single-process `combine_moe_outputs` does today. Top-K is small
 
 ## Status
 
-The transport-agnostic scaffolding for the sharded `RouteExperts`
-RPC is **in tree** as of this PR:
+The sharded `RouteExperts` RPC is **implemented**. The dependency-free
+routing/wire layer is always in tree; the `tonic`/`prost` gRPC
+transport compiles in behind `--features grpc`.
+
+Always available (no feature flag, no extra dependencies):
 
 * The shard-routing function ([`crate::rpc::shard_for_expert`]) and
   the top-K bucketing helper
@@ -62,25 +65,51 @@ RPC is **in tree** as of this PR:
 * The packed wire-format frames
   ([`crate::rpc::RouteExpertsRequest`] /
   [`crate::rpc::RouteExpertsResponse`]) with explicit
-  `encode` / `decode` — bit-identical to the layout an eventual
-  `tonic`-generated decoder will produce against the matching
+  `encode` / `decode` — bit-identical to the layout the
+  `tonic`-generated decoder produces against the matching
   `proto/route_experts.proto` schema. Carrying both `hidden_state`
-  and `ffn_out` as packed `bytes` keeps the on-wire path zero-copy.
-* `proto/route_experts.proto` — the gRPC contract a follow-up
-  `tonic` integration consumes. Service surface is two RPCs:
-  `RouteExperts` and `Health`, matching the sketch above.
+  and `ffn_out` as packed `bytes` keeps the on-wire path zero-copy,
+  and the `grpc` module reuses these exact frames + their f16
+  pack/unpack helpers as the single source of truth for the layout.
+* `proto/route_experts.proto` — the gRPC contract. Service surface is
+  two RPCs: `RouteExperts` and `Health`, matching the sketch above.
+* `crate::distributed::RpcShardRouter` and `map_tonic_status` — the
+  `ShardRouter` impl and the tonic-status → `ShardRouterError`
+  translation. Without the `grpc` feature its `fetch_remote` returns a
+  structured `Unreachable` (no `tonic` linked in).
 
-What is **not** in tree yet (and is left to a follow-up so the
-default build stays lean):
+Compiled in with `--features grpc` ([`crate::grpc`]):
 
-* The `tonic` server / client wiring. Bringing it in adds ~150
-  transitive crates; the current scaffold ships the packed
-  byte-stream encoder so a unix-socket prototype can validate the
-  combiner end-to-end before that dependency lands.
-* The runtime shard table — a static `expert_id → worker_address`
-  map driven from `[distributed]` config. The existing single-
-  process path is the trivial special case (`num_workers == 1`).
+* **Server** — implement the `grpc::ShardCompute` trait (produce one
+  FFN output per owned expert id) and call `grpc::serve(addr, backend)`
+  (or `serve_with_shutdown`) to expose the `ExpertShard` gRPC service.
+* **Client** — `grpc::ShardClient::connect(node)` issues one
+  `route_experts` call per shard plus a `health` probe, bridging the
+  packed-f16 `rpc` frames to the generated `prost` messages.
+* **Router probe** — `grpc::probe_remote` performs a `Health`
+  round-trip (with a connect+call timeout) that `RpcShardRouter::
+  fetch_remote` uses to confirm a shard is reachable before routing to
+  it; any `tonic::Status` is mapped through `map_tonic_status`.
 
-This document captures the design so a follow-up change can implement
-it without re-deriving it; the partitioning surface area is recorded
-here and exercised by the unit tests in `src/rpc.rs`.
+### Regenerating the gRPC stubs
+
+The generated tonic/prost code is committed at `src/grpc_gen.rs`, so
+the build needs **no `protoc`** and the default build stays lean
+(`tonic`/`prost` pull in ~150 transitive crates only under
+`--features grpc`). Regenerate it only when `proto/route_experts.proto`
+changes:
+
+1. In a throwaway crate, add `tonic-build` (0.12) as a build
+   dependency and, from a `build.rs`, call
+   `tonic_build::configure().out_dir("gen").compile_protos(
+   &["proto/route_experts.proto"], &["proto"])` (requires `protoc` on
+   the build host).
+2. Copy the generated `gen/*.rs` into `rust-engine/src/grpc_gen.rs`,
+   keeping the header comment and the `#![allow(clippy::all,
+   missing_docs, unreachable_pub)]` lint relaxations at the top.
+3. Rebuild with `cargo build --features grpc` and run
+   `cargo test --features grpc` to confirm the round-trip tests pass.
+
+This document captures the design and the implementation surface; the
+routing/wire layer is exercised by the unit tests in `src/rpc.rs` and
+the gRPC server/client by the live round-trip tests in `src/grpc.rs`.

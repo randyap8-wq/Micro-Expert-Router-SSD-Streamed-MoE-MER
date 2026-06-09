@@ -263,11 +263,13 @@ documented patterns for sharding it:
    `ip_hash`) to keep follow-up requests on the replica that holds
    the cached session.
 
-2. **Expert partitioning** (planned, not yet wired): shard expert ids
-   `id % num_nodes`; each node holds its slice of the expert files
-   and the gating layer dispatches over RPC. The design is captured
-   in `docs/distributed.md` and is intentionally documented ahead of
-   the implementation so the surface area is visible to operators.
+2. **Expert partitioning** (gRPC transport behind `--features grpc`):
+   shard expert ids `id % num_nodes`; each node holds its slice of the
+   expert files and the gating layer dispatches over gRPC. The
+   `ExpertShard` server, `ShardClient`, and `RpcShardRouter` probe are
+   implemented in `src/grpc.rs` (off by default so the standard build
+   stays lean). The design and the wire format are captured in
+   `docs/distributed.md`.
 
 A starter Helm chart with replication and HPA against
 `mer_requests_total` lives at `deploy/helm/mer/`.
