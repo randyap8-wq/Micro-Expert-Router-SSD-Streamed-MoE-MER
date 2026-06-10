@@ -26,6 +26,10 @@ mod expert_cache;
 mod gating;
 mod gguf;
 mod gguf_loader;
+#[cfg(feature = "grpc")]
+mod grpc;
+#[cfg(feature = "grpc")]
+mod grpc_gen;
 mod inference;
 mod io_provider;
 mod io_reactor;
@@ -34,6 +38,7 @@ mod io_uring_storage;
 mod kernels;
 mod metrics;
 mod middleware;
+mod mla;
 mod model;
 mod multi_layer_cache;
 mod numa;

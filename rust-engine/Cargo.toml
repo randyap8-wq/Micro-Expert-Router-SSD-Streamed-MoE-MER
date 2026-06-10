@@ -115,6 +115,16 @@ candle-core = { version = "0.10", default-features = false }
 ratatui = { version = "0.28", optional = true, default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", optional = true }
 
+# gRPC transport for distributed expert sharding (behind the off-by-
+# default `grpc` cargo feature). `tonic` + `prost` pull in ~150 extra
+# crates and slow the build, so they stay optional: the default
+# single-node build, the hand-rolled wire frames in `src/rpc.rs`, and
+# the `RpcShardRouter` skeleton all compile without them. The generated
+# service stubs are committed at `src/grpc_gen.rs`, so no build-time
+# `protoc` is required.
+tonic = { version = "0.12", optional = true }
+prost = { version = "0.13", optional = true }
+
 [dev-dependencies]
 # Property-based testing harness (gist Task 2 — "Add proptest for kernel
 # dispatch + AlignedKvCache + AlignedBuffer"). Pinned to the 1.x line so
@@ -201,6 +211,16 @@ cuda = ["candle-core/cuda"]
 # extra deps are pure-Rust and small; can be turned off with
 # `--no-default-features` for the minimal embedded build.
 tui = ["dep:ratatui", "dep:crossterm"]
+
+# Distributed expert sharding over gRPC (tonic). Off by default: the
+# single-node build, the `RpcShardRouter` skeleton, and the hand-rolled
+# wire frames in `src/rpc.rs` all compile without `tonic`/`prost`. When
+# enabled, `src/grpc.rs` provides a real `ExpertShard` gRPC server +
+# client (using the committed `src/grpc_gen.rs` stubs — no build-time
+# `protoc`), and `RpcShardRouter::fetch_remote` performs a real gRPC
+# reachability probe against the owning shard instead of returning the
+# skeleton stub.
+grpc = ["dep:tonic", "dep:prost"]
 
 # --------------------------------------------------------------------
 # Vendored, patched `candle-kernels`.

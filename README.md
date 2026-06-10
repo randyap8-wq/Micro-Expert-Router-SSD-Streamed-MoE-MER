@@ -360,6 +360,18 @@ experts, no high-end AI GPU required):
   `cuda-0`, `wgpu-vulkan` …) at startup, gist Part 2 retired the
   previous stale `gpu-fallback` label so the log faithfully reports
   whether a real GPU is live.
+* `--features grpc`, opt-in. Compiles the
+  [`grpc`](rust-engine/src/grpc.rs) module — the real `tonic`/`prost`
+  gRPC transport for **distributed expert sharding**. It provides the
+  `ExpertShard` server (`grpc::serve` over a user `ShardCompute`
+  backend), the `ShardClient` (`route_experts` + `health`), and the
+  `probe_remote` reachability check that `RpcShardRouter::fetch_remote`
+  calls. The generated stubs are committed at
+  [`src/grpc_gen.rs`](rust-engine/src/grpc_gen.rs) so the build needs
+  **no `protoc`**. Off by default so `tonic`/`prost` and their
+  transitive crates stay out of the standard CPU-only build; the
+  default build's remote path returns a structured `Unreachable`. See
+  [Distributed expert sharding](#distributed-expert-sharding).
 
 The runtime probe is logged on a single startup line so ops can
 correlate the selected backend with the deployment fleet:
@@ -428,8 +440,9 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`mer-cli monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a 3-tier hit grid with one **delta-calculated** sparkline per tier (VRAM / RAM / SSD, pulse per refresh tick, not a cumulative staircase), a VRAM/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`, plus the operator endpoints `GET /v1/admin/health/experts` and `POST /v1/admin/evict`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
 | `middleware` | Production-readiness HTTP middleware layered onto the `server` router via `axum::middleware::from_fn_with_state`: per-request UUID tracing span, optional **API-key gate** (`[security].api_keys`; `401` when configured and missing/unknown), optional **per-key token-bucket rate limit** (`rate_limit_rps` / `rate_limit_burst`; `429` on overflow), and **admission control** (`[server].max_concurrent_requests`, `[server].admission_min_free_blocks` against the paged-KV pool; `503` when saturated). Defaults are fully permissive so legacy benchmark / development flows are byte-identical. |
-| `rpc` | Sharded `RouteExperts` RPC scaffold (gist Part 4): the deterministic `shard_for_expert` routing function plus the packed `RouteExpertsRequest` / `RouteExpertsResponse` wire frames documented in `docs/distributed.md`. Transport-agnostic on purpose, `tonic` / `prost` are intentionally not pulled into the dependency graph so the CPU-only build stays slim; a concrete transport plugs in by serialising these frames over whatever the deployment already runs. |
-| `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`, `PartialFailure { node, delivered, missing }`, the last covers streaming-gRPC partial-success responses where some experts arrived and others did not) wrapped in `InferenceError::RemoteShardFetchFailed`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports plug in by implementing the trait. A `RpcShardRouter` skeleton ships with a `map_tonic_status` helper translating tonic status codes (`DeadlineExceeded`/`Cancelled` → `Timeout`, `Unavailable` → `Unreachable`, `NotFound` → `NotFound`, `Aborted` → `PartialFailure`, others → `Transport`) into the trait's error variants, ready for a gRPC client wire-up. |
+| `rpc` | Sharded `RouteExperts` RPC frames (gist Part 4): the deterministic `shard_for_expert` routing function plus the packed `RouteExpertsRequest` / `RouteExpertsResponse` f16 wire frames documented in `docs/distributed.md`. Dependency-free so the default build stays slim; the real `tonic`/`prost` gRPC transport in `grpc` (behind `--features grpc`) reuses these frames and their f16 pack/unpack helpers as the single source of truth for the on-wire layout. |
+| `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`, `PartialFailure { node, delivered, missing }`, the last covers streaming-gRPC partial-success responses where some experts arrived and others did not) wrapped in `InferenceError::RemoteShardFetchFailed`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports plug in by implementing the trait. `RpcShardRouter` is a working gRPC router: with `--features grpc` its `fetch_remote` performs a real tonic `Health` round-trip against the owning shard (via `grpc::probe_remote`) and translates tonic status codes through `map_tonic_status` (`DeadlineExceeded`/`Cancelled` → `Timeout`, `Unavailable` → `Unreachable`, `NotFound` → `NotFound`, `Aborted`/other → `Transport`); without the feature the remote path returns a structured `Unreachable`. |
+| `grpc` | **Real gRPC/tonic transport for expert sharding (behind `--features grpc`).** The `ExpertShard` server (`grpc::serve` over a `ShardCompute` backend), the `ShardClient` (`route_experts` + `health`), and `probe_remote` (the reachability check `RpcShardRouter::fetch_remote` calls). Bridges the packed-f16 `rpc` frames to the committed `prost` stubs in `grpc_gen` (generated from `proto/route_experts.proto`; **no build-time `protoc`**). Off by default so `tonic`/`prost` (~150 crates) stay out of the standard build. |
 | `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-predictor`, `serve`, and (with `--features tui`, on by default) `monitor` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2...` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
 
 ### Key design decisions
@@ -1314,7 +1327,7 @@ invariant on the resident path is preserved.
 The [`distributed`](rust-engine/src/distributed.rs) module defines a
 `ShardRouter` trait that turns expert lookups into
 `ShardInstruction::{Local, Remote}` decisions, plus a
-`LocalShardRouter` default that always routes locally, the engine
+`LocalShardRouter` default that always routes locally, so the engine
 behaves identically to today's single-node deployment until a real
 remote router is installed. Remote fetches return a boxed
 `ShardFetchFuture` so the trait stays object-safe without pulling in
@@ -1322,20 +1335,40 @@ remote router is installed. Remote fetches return a boxed
 (`Timeout`, `Unreachable`, `NotFound`, `Transport`) wrapped in
 `InferenceError::RemoteShardFetchFailed`, which the scheduler can match on to
 decide whether to retry, fall back to a local replica or fail the
-request. The scaffolding is intentionally minimal, wire transports
-(gRPC, RDMA, …) plug in as new `ShardRouter` impls without touching
-the hot inference path. A `PartialFailure { node, delivered,
-missing }` variant covers streaming-gRPC responses where some
-experts in a batched fetch arrived and others did not, callers can
-react by retrying just the `missing` IDs against another replica
-instead of throwing away the `delivered` results. A `RpcShardRouter`
-skeleton ships with a `map_tonic_status` helper that translates
-tonic status codes into the trait's error variants
-(`DeadlineExceeded` / `Cancelled` → `Timeout`, `Unavailable` →
-`Unreachable`, `NotFound` → `NotFound`, `Aborted` → `PartialFailure`,
-everything else → `Transport`), so a real gRPC client wire-up only
-has to populate the placement map and call the helper from its
-`fetch_remote` body.
+request. Wire transports (gRPC, RDMA, …) plug in as new `ShardRouter`
+impls without touching the hot inference path. A `PartialFailure {
+node, delivered, missing }` variant covers streaming-gRPC responses
+where some experts in a batched fetch arrived and others did not,
+callers can react by retrying just the `missing` IDs against another
+replica instead of throwing away the `delivered` results.
+
+**gRPC transport (`--features grpc`).** The `RpcShardRouter` is now a
+working gRPC client/server, not a skeleton. Build with the
+off-by-default `grpc` cargo feature to compile in the
+[`grpc`](rust-engine/src/grpc.rs) module:
+
+* **Server** — implement the `grpc::ShardCompute` trait (one FFN output
+  per owned expert id) and run `grpc::serve(addr, backend)` to expose
+  the `ExpertShard` gRPC service (`RouteExperts` + `Health`) defined in
+  [`proto/route_experts.proto`](rust-engine/proto/route_experts.proto).
+* **Client** — `grpc::ShardClient::connect(node)` issues one
+  `route_experts` call per shard and a `health` probe, bridging the
+  packed-f16 `rpc::RouteExperts{Request,Response}` frames to the
+  generated `prost` messages.
+* **Router** — `RpcShardRouter::fetch_remote` performs a real gRPC
+  `Health` round-trip against the owning node (via `grpc::probe_remote`)
+  and maps any `tonic::Status` through `map_tonic_status`
+  (`DeadlineExceeded` / `Cancelled` → `Timeout`, `Unavailable` →
+  `Unreachable`, `NotFound` → `NotFound`, `Aborted` → `Transport`,
+  everything else → `Transport`). Without the `grpc` feature `tonic` is
+  not compiled in and the remote path returns a structured
+  `Unreachable`, so the default CPU-only build stays slim.
+
+The generated tonic/prost stubs are committed at
+[`rust-engine/src/grpc_gen.rs`](rust-engine/src/grpc_gen.rs), so the
+build needs **no `protoc`**; see
+[`docs/distributed.md`](docs/distributed.md) for how to regenerate them
+when the `.proto` changes.
 
 Tokenization is via the [`tokenizers`] crate when the optional
 `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured,
@@ -1763,7 +1796,7 @@ error — the engine never silently mislabels a checkpoint.
 | Qwen3 (dense) | `qwen3` | ✅ Full (dense) | Attention + QK-Norm + norms + embeddings map and run; the dense SwiGLU FFN is executed from resident weights. Being dense it does **not** exercise SSD expert streaming. |
 | Mistral Small 3 | `mistral3` | ✅ Full (dense) | Multimodal checkpoint: LM tensors carry a `language_model.` prefix (stripped automatically) and the vision tower is ignored. The dense SwiGLU FFN is executed; dense models do **not** exercise SSD expert streaming. |
 | Phi-4 | `phi3` | ✅ Full (dense) | Fused `qkv_proj` is split into separate Q/K/V at load; the fused `gate_up_proj` dense FFN is split and executed. Dense models do **not** exercise SSD expert streaming. |
-| DeepSeek-V3 / V3.1 | `deepseek_v3` | ⛔ Fail-loud | Tensor names (incl. `weight_scale_inv` FP8 scales, parked in a side table) are mapped, and the dense-vs-MoE split honours `first_k_dense_replace`. Sigmoid + bias-corrected grouped top-K routing is implemented. But MLA latent-KV attention and FP8 dequant are unimplemented, so the loader **refuses** rather than route on garbage. MLA + YaRN long-context are later stages. |
+| DeepSeek-V3 / V3.1 | `deepseek_v3` | ✅ Loadable (MLA + FP8) | Tensor names (incl. `weight_scale_inv` FP8 scales) are mapped, and the dense-vs-MoE split honours `first_k_dense_replace`. Sigmoid + bias-corrected grouped top-K routing is implemented. **MLA latent-KV attention** runs through [`crate::mla`] (q/kv LoRA projections, decoupled RoPE, latent KV cache) and **FP8 `e4m3` block-wise weights are dequantised at load time** via their companion `weight_scale_inv` tensors, so the model is built and executed instead of refused. Expert FFNs still stream as `expert_<id>.bin`; YaRN long-context is a later stage. |
 
 Because Mistral Small 3 and Phi-4 are fully **dense**, they bypass the
 per-token expert-streaming substrate entirely — the feature the engine
@@ -1822,14 +1855,20 @@ Per-family specifics:
 * **Phi-4 (`phi3`) — ✅ runs, dense.** The fused `qkv_proj` is split
   into Q/K/V automatically and the fused `gate_up_proj` dense FFN is split
   and executed. Dense, so no expert streaming.
-* **DeepSeek-V3 / V3.1 (`deepseek_v3`) — ⛔ fails loud.** Configuring it
-  is accepted (names, the `first_k_dense_replace` dense/MoE split, and the
-  `weight_scale_inv` FP8 side table are all mapped), but `serve` returns
-  an `Unsupported` error at load time because MLA latent-KV attention and
-  FP8 dequant are not implemented. This is intentional — the engine
-  refuses rather than route on garbage activations. The sigmoid +
-  bias-corrected grouped top-K router is already implemented; full support
-  is a later, larger stage (MLA + YaRN long-context).
+* **DeepSeek-V3 / V3.1 (`deepseek_v3`) — ✅ runs (MLA + FP8).**
+  Configuring it is accepted (names, the `first_k_dense_replace`
+  dense/MoE split, and the `weight_scale_inv` FP8 scales are all mapped)
+  and `serve` now **builds and executes** the model. **MLA latent-KV
+  attention** is implemented in [`crate::mla`] — the q/kv low-rank
+  (LoRA) projections, decoupled RoPE on the `qk_rope_head_dim` slice,
+  and a compressed latent KV cache (`kv_lora_rank + qk_rope_head_dim`
+  wide) reconstructed per-head via `kv_b_proj` at attention time.
+  **FP8 `e4m3` block-wise weights are dequantised at load** using their
+  companion `weight_scale_inv` tensors (`128×128` reciprocal block
+  scales), so resident tensors load as `f32` rather than being refused.
+  The sigmoid + bias-corrected grouped top-K router was already present.
+  Expert FFNs still stream as `expert_<id>.bin`; YaRN long-context
+  scaling remains a later stage.
 
 **Per-expert sizes for Mixtral-8x7B** (`d_model = 4096`, `d_ff = 14336`,
 ~176 M weights per expert across the three SwiGLU matrices, plus a small

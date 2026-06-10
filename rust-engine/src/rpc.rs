@@ -1,15 +1,13 @@
-//! Sharded `RouteExperts` RPC scaffold (gist Part 4).
+//! Sharded `RouteExperts` RPC frames (gist Part 4).
 //!
-//! The single-process server today owns every expert on local NVMe;
-//! the gist's distributed plan in `docs/distributed.md` calls for
-//! splitting the expert population across N worker nodes by hash and
-//! issuing one zero-copy gRPC call per node per token.
+//! The single-process server owns every expert on local NVMe; the
+//! gist's distributed plan in `docs/distributed.md` splits the expert
+//! population across N worker nodes by hash and issues one gRPC call
+//! per node per token.
 //!
-//! This module lays down the *transport-agnostic* primitives the
-//! sharded path needs without pulling in a heavy gRPC runtime
-//! (`tonic` + `prost` would inflate the dependency graph by ~150
-//! crates and make the CPU-only build noticeably slower). Two things
-//! live here:
+//! This module holds the **transport-agnostic** primitives the sharded
+//! path needs, with no dependency on a gRPC runtime so they compile in
+//! the default (single-node) build:
 //!
 //! * [`shard_for_expert`] — the deterministic shard-routing function
 //!   the request-receiving node uses to dispatch the top-K to the
@@ -19,16 +17,17 @@
 //! * [`RouteExpertsRequest`] / [`RouteExpertsResponse`] — packed
 //!   wire-format frames documenting the on-wire layout the gist
 //!   prescribes ("`hidden_state` and `ffn_out` carried as packed
-//!   `bytes` (f16)"). They serialise to a contiguous byte stream so
-//!   a future tonic adapter can pass them through `tonic::Streaming`
-//!   without a re-encode.
+//!   `bytes` (f16)"). They serialise to a contiguous byte stream and
+//!   the f16 pack/unpack helpers ([`pack_hidden_state`],
+//!   [`unpack_hidden_state`], [`f32_to_f16_bits`], [`f16_bits_to_f32`])
+//!   are reused by the real tonic adapter.
 //!
-//! When a follow-up PR wires in `tonic`, the `.proto` schema
-//! mirroring the structs below will live at `proto/route_experts.proto`
-//! (not yet committed). The Rust types in this file are intentionally
-//! *not* derived from `prost`; they hand-roll a tiny length-prefixed
-//! format so the engine can validate end-to-end on a unix socket
-//! before the `tonic` dependency is committed to.
+//! The committed `.proto` schema lives at `proto/route_experts.proto`
+//! and the real `tonic`/`prost` gRPC server + client are in
+//! [`crate::grpc`] (behind the off-by-default `grpc` cargo feature).
+//! `crate::grpc` bridges these hand-rolled frames to the generated
+//! `prost` messages, so the on-wire f16 layout documented here is the
+//! single source of truth for both transports.
 
 // Sharded `RouteExperts` RPC scaffold (gist Part 4). Not yet wired into
 // the single-process server; keep the transport types compilable

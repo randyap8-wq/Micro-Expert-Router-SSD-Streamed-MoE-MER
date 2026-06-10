@@ -135,24 +135,12 @@ impl Architecture {
 
     /// Whether the forward-compute path can execute this architecture.
     ///
-    /// Stage 1 maps and loads tensors for every variant, but DeepSeek-V3
-    /// additionally requires MLA (latent-KV) attention and FP8 weight
-    /// dequantisation, neither of which is implemented. Callers building
-    /// a runnable model must check this and fail loud rather than run on
-    /// garbage activations.
+    /// Every variant — including DeepSeek-V3 — now has a runnable compute
+    /// path: MLA (latent-KV) attention lives in [`crate::mla`] and FP8
+    /// block-wise weight dequantisation is applied at load time, so the
+    /// model can be both mapped and executed.
     pub fn compute_support(&self) -> ComputeSupport {
-        match self {
-            Self::DeepSeekV3 => ComputeSupport::Unsupported {
-                reason: "DeepSeek-V3 requires MLA (latent-KV) attention and FP8 weight \
-                         dequantisation, which are not implemented yet (tensor mapping \
-                         is recognised, but the model cannot be executed)",
-            },
-            // Dense families (Mistral Small 3, Phi-4) and dense Qwen3 run
-            // through the standard attention + SwiGLU path; the resident
-            // dense FFN is executed directly (it has no experts to stream),
-            // so the architecture itself is executable.
-            _ => ComputeSupport::Supported,
-        }
+        ComputeSupport::Supported
     }
 }
 
@@ -292,6 +280,54 @@ impl TensorNaming {
     /// Per-head K RMSNorm weight (Qwen3 / Qwen3-MoE). Length `head_dim`.
     pub fn attn_k_norm(&self, l: usize) -> String {
         format!("{}model.layers.{l}.self_attn.k_norm.weight", self.prefix)
+    }
+
+    // -- MLA projections (DeepSeek-V3 latent attention) ------------------
+    //
+    // DeepSeek-V3 replaces the dense q/k/v/o projections with a
+    // low-rank "multi-head latent attention" stack. The query path is
+    // optionally compressed through `q_a_proj` -> `q_a_layernorm` ->
+    // `q_b_proj` (when `q_lora_rank > 0`), and the key/value path is
+    // always compressed through `kv_a_proj_with_mqa` -> `kv_a_layernorm`
+    // -> `kv_b_proj`. The output projection reuses the standard
+    // [`Self::attn_o`] name.
+
+    /// MLA query down-projection (`d_model -> q_lora_rank`). Only present
+    /// when `q_lora_rank > 0`.
+    pub fn mla_q_a_proj(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.q_a_proj.weight", self.prefix)
+    }
+
+    /// RMSNorm applied to the compressed query latent. Length
+    /// `q_lora_rank`. Only present when `q_lora_rank > 0`.
+    pub fn mla_q_a_layernorm(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.q_a_layernorm.weight", self.prefix)
+    }
+
+    /// MLA query up-projection from the compressed latent
+    /// (`q_lora_rank -> num_heads * (qk_nope + qk_rope)`). Only present
+    /// when `q_lora_rank > 0`; otherwise the loader uses [`Self::attn_q`]
+    /// (the single dense `q_proj` straight from `d_model`).
+    pub fn mla_q_b_proj(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.q_b_proj.weight", self.prefix)
+    }
+
+    /// MLA key/value down-projection with the decoupled RoPE key
+    /// (`d_model -> kv_lora_rank + qk_rope_head_dim`).
+    pub fn mla_kv_a_proj(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.kv_a_proj_with_mqa.weight", self.prefix)
+    }
+
+    /// RMSNorm applied to the compressed key/value latent. Length
+    /// `kv_lora_rank`.
+    pub fn mla_kv_a_layernorm(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.kv_a_layernorm.weight", self.prefix)
+    }
+
+    /// MLA key/value up-projection
+    /// (`kv_lora_rank -> num_heads * (qk_nope + v_head_dim)`).
+    pub fn mla_kv_b_proj(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.kv_b_proj.weight", self.prefix)
     }
 
     // -- MoE gate --------------------------------------------------------
@@ -841,11 +877,10 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_compute_is_unsupported_but_recognised() {
-        assert!(matches!(
-            Architecture::DeepSeekV3.compute_support(),
-            ComputeSupport::Unsupported { .. }
-        ));
+    fn deepseek_compute_is_supported() {
+        // DeepSeek-V3 is now executable: MLA attention + FP8 dequant are
+        // implemented, so every recognised architecture reports Supported.
+        assert_eq!(Architecture::DeepSeekV3.compute_support(), ComputeSupport::Supported);
         assert_eq!(Architecture::Qwen3Moe.compute_support(), ComputeSupport::Supported);
         assert_eq!(Architecture::Mixtral.compute_support(), ComputeSupport::Supported);
     }
