@@ -418,7 +418,9 @@ def dequant_fp8_e4m3_blockwise(q_u8, scale_inv, block: int = FP8_BLOCK):
     if q_u8.ndim != 2 or scale_inv.ndim != 2:
         raise ValueError("dequant_fp8_e4m3_blockwise expects 2-D weight and scale arrays")
     rows, cols = q_u8.shape
-    want = (-(-rows // block), -(-cols // block))  # ceil-div
+    # `-(-x // y)` is integer ceiling division (avoids float round-trips
+    # and a `math` import).
+    want = (-(-rows // block), -(-cols // block))
     if scale_inv.shape != want:
         raise ValueError(
             f"weight_scale_inv shape {scale_inv.shape} does not match the "
@@ -441,6 +443,8 @@ def _np_from_raw(dtype: str, raw: bytes, shape):
     elif dtype == "F16":
         arr = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
     elif dtype == "BF16":
+        # BF16 is the high 16 bits of an F32; shifting left by 16 over a
+        # zeroed low half reconstructs the exact float value.
         u16 = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
         arr = (u16 << 16).view(np.float32)
     else:

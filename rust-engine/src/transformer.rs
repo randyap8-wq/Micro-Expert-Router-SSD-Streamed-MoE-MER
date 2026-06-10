@@ -190,6 +190,10 @@ impl YarnRope {
             .ceil()
             .min((half - 1) as f32)
             .max(low);
+        // Minimum ramp width guard: when beta_fast ≈ beta_slow the
+        // correction range collapses (`high == low`) and the ramp
+        // would divide by zero; clamping to 1e-3 turns it into a step
+        // function at `low` instead.
         let range = (high - low).max(1e-3);
         let mut inv_freq = Vec::with_capacity(half);
         for i in 0..half {
