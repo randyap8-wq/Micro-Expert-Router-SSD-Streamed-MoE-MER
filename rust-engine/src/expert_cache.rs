@@ -211,30 +211,39 @@ impl ExpertCache {
         resident: Arc<ExpertResident>,
     ) -> Result<Option<Arc<ExpertResident>>, Arc<ExpertResident>> {
         let id = resident.id;
-        // Pre-evict a non-pinned entry if we're already at capacity,
-        // so `push` below never has to silently evict a pinned entry.
-        let pre_evicted = {
-            let guard = self.inner.lock();
-            let at_capacity = guard.len() >= self.capacity && guard.peek(&id).is_none();
-            drop(guard);
-            if at_capacity {
-                match self.evict_lru() {
-                    Some(e) => Some(e),
-                    // Cache is full *and* every resident expert is
-                    // pinned. We must refuse the insert: calling
-                    // `push` here would evict a pinned id (LruCache
-                    // has no pinning concept).
-                    None => return Err(resident),
-                }
-            } else {
-                None
-            }
-        };
+        // Lock order: `pinned` before `inner` (matches `evict_lru`).
+        // The capacity check, pre-eviction and `push` must form a
+        // single critical section: releasing the lock in between
+        // would let another thread fill the cache and `push` would
+        // then silently evict the LRU entry — which may be pinned.
+        let pinned = self.pinned.lock();
         let mut guard = self.inner.lock();
+        let mut pre_evicted = None;
+        if guard.len() >= self.capacity && guard.peek(&id).is_none() {
+            // Walk LRU order (`iter()` yields most-recently-used
+            // first, so the *last* item is the LRU) and pop the first
+            // non-pinned entry.
+            let id_order: Vec<u32> = guard.iter().map(|(k, _)| *k).collect();
+            for &cand in id_order.iter().rev() {
+                if !pinned.contains(&cand) {
+                    if let Some(v) = guard.pop(&cand) {
+                        pre_evicted = Some(v);
+                        break;
+                    }
+                }
+            }
+            if pre_evicted.is_none() {
+                // Cache is full *and* every resident expert is
+                // pinned. We must refuse the insert: calling `push`
+                // here would evict a pinned id (LruCache has no
+                // pinning concept).
+                return Err(resident);
+            }
+        }
         // `LruCache::push` returns the (k, v) pair that was evicted, if any.
-        // With the pre-eviction above we shouldn't normally hit a second
-        // eviction path here, but `push` on an existing key returns the
-        // old value — which is fine to surface as "evicted" too.
+        // With the pre-eviction above we never hit a second eviction
+        // path here, but `push` on an existing key returns the old
+        // value — which is fine to surface as "evicted" too.
         let push_evicted = guard.push(id, resident).map(|(_, v)| v);
         Ok(push_evicted.or(pre_evicted))
     }

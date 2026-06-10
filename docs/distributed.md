@@ -73,6 +73,10 @@ self_index = 0
 remote_fetch_timeout_ms = 250
 ```
 
+`[distributed]` requires `[real_transformer] enabled = true` — expert
+sharding is wired through the batch scheduler, which only runs with
+the real transformer (`serve` rejects the config otherwise).
+
 At startup `serve` builds an `RpcShardRouter` over the documented
 `id % num_nodes` placement (`RpcShardRouter::from_modulo_placement`)
 spanning the layer-qualified global expert namespace

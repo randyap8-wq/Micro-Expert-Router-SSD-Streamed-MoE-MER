@@ -282,9 +282,6 @@ impl ShardClient {
                 expected_bytes
             )));
         }
-        if resp.ffn_out_f16.len() % 2 != 0 {
-            return Err(Status::internal("ffn_out_f16 length is not even"));
-        }
         let ffn_out_f16 = resp
             .ffn_out_f16
             .chunks_exact(2)

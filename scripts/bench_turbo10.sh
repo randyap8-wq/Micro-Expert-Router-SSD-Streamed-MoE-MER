@@ -61,7 +61,7 @@ mkdir -p "$DATA_DIR"
 echo ">> Building micro-expert-router with features: ${FEATURES}"
 ( cd "$ROOT/rust-engine" && cargo build --release --features "$FEATURES" >/dev/null )
 
-if [ ! -f "$DATA_DIR/expert_$(printf '%04d' $((NUM_EXPERTS - 1))).bin" ]; then
+if [ ! -f "$DATA_DIR/expert_$((NUM_EXPERTS - 1)).bin" ]; then
   echo ">> Generating ${NUM_EXPERTS} synthetic experts in ${DATA_DIR}"
   "$ROOT/rust-engine/target/release/micro-expert-router" gen-data \
     --data-dir "$DATA_DIR" \

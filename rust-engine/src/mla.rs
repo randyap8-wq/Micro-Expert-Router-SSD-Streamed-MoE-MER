@@ -308,8 +308,8 @@ impl MultiHeadLatentAttention {
 /// finite magnitude is 448.
 /// Largest finite magnitude representable in the FP8 `e4m3fn` format
 /// (`S.1110.111` = `1.875 * 2^8`). The `S.1111.111` bit pattern is
-/// reserved for NaN and is clamped to this value so downstream matmuls
-/// stay finite.
+/// reserved for NaN and is decoded to `0.0` so it contributes nothing
+/// to downstream matmuls.
 pub const F8_E4M3_MAX_FINITE: f32 = 448.0;
 
 pub fn f8_e4m3_to_f32(b: u8) -> f32 {
@@ -325,9 +325,10 @@ pub fn f8_e4m3_to_f32(b: u8) -> f32 {
         return sign * m * 2f32.powi(1 - 7);
     }
     if exp == 0x0F && mant == 0x07 {
-        // e4m3fn reserves S.1111.111 for NaN; clamp to a large finite
-        // value so downstream matmuls stay finite.
-        return sign * F8_E4M3_MAX_FINITE;
+        // e4m3fn reserves S.1111.111 for NaN; decode to 0.0 (a neutral
+        // contribution) rather than propagating NaN or injecting an
+        // extreme ±448 outlier into downstream matmuls.
+        return 0.0;
     }
     // Normal: value = (1 + mant/8) * 2^(exp-bias).
     let m = 1.0 + mant as f32 / 8.0;

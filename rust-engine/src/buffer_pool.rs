@@ -35,6 +35,11 @@ struct Inner {
     /// `None` keeps the legacy single-pool semantics with zero overhead.
     shadow: Option<Mutex<Vec<AlignedBuffer>>>,
     notify: Notify,
+    /// Separate wakeup channel for shadow-pool waiters. A single shared
+    /// `Notify` would let a shadow-buffer drop consume the wakeup of a
+    /// primary waiter (and vice versa), losing the notification for the
+    /// waiter that could actually make progress.
+    notify_shadow: Notify,
     primary_slots: usize,
     shadow_slots: usize,
     buffer_size: usize,
@@ -85,6 +90,7 @@ impl BufferPool {
                 free: Mutex::new(free),
                 shadow,
                 notify: Notify::new(),
+                notify_shadow: Notify::new(),
                 primary_slots,
                 shadow_slots,
                 buffer_size,
@@ -200,7 +206,7 @@ impl BufferPool {
             if let Some(b) = self.try_acquire_shadow() {
                 return Some(b);
             }
-            let notified = self.inner.notify.notified();
+            let notified = self.inner.notify_shadow.notified();
             if let Some(b) = self.try_acquire_shadow() {
                 return Some(b);
             }
@@ -297,6 +303,7 @@ impl Drop for PooledBuffer {
             match self.slot {
                 Slot::Primary => {
                     self.pool.free.lock().push(buf);
+                    self.pool.notify.notify_one();
                 }
                 Slot::Shadow => {
                     // Shadow only exists when the pool was built with
@@ -306,12 +313,13 @@ impl Drop for PooledBuffer {
                     // allocation.
                     if let Some(s) = &self.pool.shadow {
                         s.lock().push(buf);
+                        self.pool.notify_shadow.notify_one();
                     } else {
                         self.pool.free.lock().push(buf);
+                        self.pool.notify.notify_one();
                     }
                 }
             }
-            self.pool.notify.notify_one();
         }
     }
 }

@@ -35,7 +35,7 @@ use crate::middleware::{
 };
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;
-use crate::session::{SessionCheckoutToken, SessionState, SessionStore};
+use crate::session::{SessionCheckout, SessionState, SessionStore};
 use crate::tokenizer::Tokenizer;
 use axum::{
     extract::{Path as AxumPath, State},
@@ -687,7 +687,7 @@ fn load_session_kv(
 ) -> (
     Vec<crate::transformer::KvCache>,
     usize,
-    Option<SessionCheckoutToken>,
+    Option<SessionCheckout>,
 ) {
     if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
         if let Some((prev, checkout)) = store.take(id) {
@@ -709,7 +709,7 @@ fn save_session_kv(
     session_id: Option<&str>,
     kv: Vec<crate::transformer::KvCache>,
     position: usize,
-    checkout: Option<SessionCheckoutToken>,
+    checkout: Option<SessionCheckout>,
 ) {
     if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
         store.put(
@@ -939,7 +939,7 @@ async fn stream_tokens(
             kv: Vec<crate::transformer::KvCache>,
             last_token: u32,
             position: usize,
-            checkout: Option<SessionCheckoutToken>,
+            checkout: Option<SessionCheckout>,
         },
         Legacy {
             base: u64,

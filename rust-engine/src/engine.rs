@@ -1637,10 +1637,11 @@ impl Engine {
         // automatically when no adapter is present, so this never
         // panics.
         let backend = crate::backend::BackendBox::init_blocking(
-            /* num_layers  = */ 1,
-            /* max_seq_len = */ 1,
-            /* num_heads   = */ 1,
-            /* head_dim    = */ 1,
+            /* num_layers   = */ 1,
+            /* max_seq_len  = */ 1,
+            /* num_heads    = */ 1,
+            /* num_kv_heads = */ 1,
+            /* head_dim     = */ 1,
             gpu,
         );
         self.core.backend = Arc::new(backend);
@@ -3177,18 +3178,20 @@ impl Engine {
         // prefetch must overlap the critical-path SSD stall, not run
         // sequentially after it.
         //
-        // We use the predictor's *prior* `last_last_experts` here
-        // (i.e. before observing `target`) so the prefetch sees the
-        // same state it would have at the start of the cycle. The
-        // history update happens after compute below, mirroring
-        // `generate`'s order.
+        // We read `last_experts` here — which still holds the *previous*
+        // step's target set, because the history ring-buffer update
+        // happens after compute below — so the 2nd-order lookup key is
+        // `(prev, current)`, matching the `(prev_prev, prev) -> next`
+        // transitions the predictor was trained on via `observe_step2`
+        // (and matching `generate`, which performs the same lookup
+        // *after* shifting the ring buffer).
         if let Some(&seed) = target.last() {
-            let last_last = self.speculation.last_last_experts.lock();
-            let s_markov = match last_last.last() {
+            let last = self.speculation.last_experts.lock();
+            let s_markov = match last.last() {
                 Some(&pp) => self.core.predictor.predict_next2(pp, seed),
                 None => self.core.predictor.predict_next(seed),
             };
-            drop(last_last);
+            drop(last);
             self.union_prefetch(&s_markov, &m_speculator, &HashSet::new(), Some(layer));
         }
 

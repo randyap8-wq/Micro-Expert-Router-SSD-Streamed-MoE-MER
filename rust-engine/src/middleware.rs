@@ -282,11 +282,15 @@ pub async fn request_id_layer(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    use tracing::Instrument;
     let id = new_request_id();
     let span = tracing::info_span!("http_request", request_id = %id);
-    let _enter = span.enter();
     req.extensions_mut().insert(RequestId(id.clone()));
-    let mut resp = next.run(req).await;
+    // `Instrument` (rather than a `span.enter()` guard) so the span is
+    // correctly entered/exited around every poll — holding an `enter()`
+    // guard across `.await` corrupts span nesting on a multi-threaded
+    // runtime.
+    let mut resp = next.run(req).instrument(span).await;
     if let Ok(hv) = axum::http::HeaderValue::from_str(&id) {
         resp.headers_mut().insert("x-request-id", hv);
     }
