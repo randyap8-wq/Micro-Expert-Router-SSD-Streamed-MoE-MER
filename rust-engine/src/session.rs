@@ -218,18 +218,26 @@ impl SessionStore {
         // pass `None` and must not clear another request's marker.
         let was_checked_out = checkout.is_some();
         if let Some(mut guard) = checkout {
-            // `put` takes over marker management from here; disarm the
-            // guard so its `Drop` doesn't race with the logic below.
-            guard.armed = false;
-            let owns_marker = self
-                .in_flight
-                .get(&id)
-                .map(|v| *v == guard.token)
-                .unwrap_or(false);
+            // Verify the guard belongs to the id being stored *and*
+            // still owns its marker before releasing anything. We must
+            // check this while the guard is still armed: if it is a
+            // mismatched guard (e.g. for a different session id), leave
+            // it armed so its `Drop` clears the original in-flight
+            // marker it legitimately owns instead of leaking it.
+            let owns_marker = guard.id == id
+                && self
+                    .in_flight
+                    .get(&id)
+                    .map(|v| *v == guard.token)
+                    .unwrap_or(false);
             if !owns_marker {
                 state.zeroize_in_place();
                 return;
             }
+            // Ownership confirmed: `put` takes over marker management
+            // from here, so disarm the guard to avoid racing with the
+            // removal below.
+            guard.armed = false;
             self.in_flight.remove(&id);
         }
         if self.tombstones.contains_key(&id) {
