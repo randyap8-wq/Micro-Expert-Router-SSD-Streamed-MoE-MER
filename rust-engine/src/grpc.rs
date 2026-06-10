@@ -274,6 +274,17 @@ impl ShardClient {
             hidden_state_f16,
         };
         let resp = self.inner.route_experts(pb).await?.into_inner();
+        let expected_bytes = resp.expert_ids.len() * resp.d_model as usize * 2;
+        if resp.ffn_out_f16.len() != expected_bytes {
+            return Err(Status::internal(format!(
+                "ffn_out_f16 byte length {} != expected {}",
+                resp.ffn_out_f16.len(),
+                expected_bytes
+            )));
+        }
+        if resp.ffn_out_f16.len() % 2 != 0 {
+            return Err(Status::internal("ffn_out_f16 length is not even"));
+        }
         let ffn_out_f16 = resp
             .ffn_out_f16
             .chunks_exact(2)
