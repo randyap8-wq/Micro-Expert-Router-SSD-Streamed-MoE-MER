@@ -215,7 +215,7 @@ behaviour and per-token cost are unchanged:
   compare-exchange retry loop, no allocation, no `RwLock`. When
   `affinity_enabled`, `Engine::moe_step` calls `observe_layer` per token
   with that layer's routed set, and a seed expert's top-K co-fired
-  neighbours (`affinity_neighbors_k`, default 2) are folded into the
+  neighbours (`affinity_neighbors_k`, default 4) are folded into the
   prefetch set at a small (`W_AFFINITY` = +0.10) weight. A background
   **exponential-decay worker** (spawned by `Engine::with_affinity`)
   right-shifts the counter matrix per `affinity_decay_epoch` cumulative
@@ -437,7 +437,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[security]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`, `[gpu_cache]`. Validated at startup. |
 | `expert_cache` (3-tier extension) | Alongside the legacy RAM-resident `ExpertCache`, this module now also defines `GpuExpertCache`, the optional **VRAM tier** of a 3-tier SSD → RAM → VRAM hierarchy. It is an **Anchor Core + LRU Edge** structure: experts whose RAM-side hit count (`ExpertResident::hits`) crosses `[gpu_cache] promote_after_hits` are pinned into the Anchor Core (HashMap, capped at `vram_anchor_ratio * vram_capacity_mb`); all other promotions land in the LRU Edge (capped at the remainder). Engine wiring is hot-path additive, `Engine::generate` / `Engine::moe_step` probe the VRAM tier first, bump RAM hits on a miss, and enqueue a promotion on a background tokio task installed by `Engine::install_gpu_cache`. On CPU-only builds the VRAM bytes are emulated host-side; with `--features cuda`, `inference::run_inference_gpu` dispatches the SwiGLU matmul through `candle-core`'s CUDA backend (falls back to the existing CPU kernel if the device is unavailable). |
-| `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`mer-cli monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a 3-tier hit grid with one **delta-calculated** sparkline per tier (VRAM / RAM / SSD, pulse per refresh tick, not a cumulative staircase), a VRAM/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
+| `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`micro-expert-router monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a 3-tier hit grid with one **delta-calculated** sparkline per tier (VRAM / RAM / SSD, pulse per refresh tick, not a cumulative staircase), a VRAM/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`, plus the operator endpoints `GET /v1/admin/health/experts` and `POST /v1/admin/evict`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
 | `middleware` | Production-readiness HTTP middleware layered onto the `server` router via `axum::middleware::from_fn_with_state`: per-request UUID tracing span, optional **API-key gate** (`[security].api_keys`; `401` when configured and missing/unknown), optional **per-key token-bucket rate limit** (`rate_limit_rps` / `rate_limit_burst`; `429` on overflow), and **admission control** (`[server].max_concurrent_requests`, `[server].admission_min_free_blocks` against the paged-KV pool; `503` when saturated). Defaults are fully permissive so legacy benchmark / development flows are byte-identical. |
 | `rpc` | Sharded `RouteExperts` RPC frames (gist Part 4): the deterministic `shard_for_expert` routing function plus the packed `RouteExpertsRequest` / `RouteExpertsResponse` f16 wire frames documented in `docs/distributed.md`. Dependency-free so the default build stays slim; the real `tonic`/`prost` gRPC transport in `grpc` (behind `--features grpc`) reuses these frames and their f16 pack/unpack helpers as the single source of truth for the on-wire layout. |
@@ -871,7 +871,7 @@ Endpoints:
 | -------- | -------------------------- | -------------------------------------------------- |
 | `GET`    | `/health`                  | liveness probe (`{"status":"ok"...}`)             |
 | `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and, when the predictive arms are enabled, `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, `mer_speculator_accuracy_total`, and the `mer_ssd_stall_seconds` histogram. When `[gpu_cache] enabled = true`, also exports `mer_vram_used_bytes`, `mer_vram_capacity_bytes`, `mer_gpu_cache_hits_total`, `mer_gpu_cache_misses_total`, and `mer_promotions_total` |
-| `GET`    | `/v1/admin/health/experts` | JSON snapshot of the 3-tier hierarchy: per-tier hit/miss counters (SSD, RAM, VRAM), VRAM used / capacity bytes, total RAM→VRAM promotions, and engine status fields. Consumed by `mer-cli monitor`. |
+| `GET`    | `/v1/admin/health/experts` | JSON snapshot of the 3-tier hierarchy: per-tier hit/miss counters (SSD, RAM, VRAM), VRAM used / capacity bytes, total RAM→VRAM promotions, and engine status fields. Consumed by `micro-expert-router monitor`. |
 | `POST`   | `/v1/admin/evict`          | One-shot reclaim pass on the paged-KV pool's overflow slab. Returns `{"reclaimed_overflow_blocks": N}`. Useful after a transient burst inflated the heap-backed fallback, returns memory to the allocator immediately rather than waiting for the periodic background sweep. |
 | `POST`   | `/v1/completions`          | OpenAI text-completion shape (`prompt`, `max_tokens`...) |
 | `POST`   | `/v1/chat/completions`     | OpenAI chat-completion shape (`messages`...)       |
@@ -1084,7 +1084,9 @@ chat sessions retain their KV memory under pressure.
 Under `BlockPool::PressureLevel::Critical` (≥ 98 % primary
 utilisation) the scheduler **suspends the shared
 `SpeculationController`**, clamping `current_speculation_depth()` to
-0. When the pool reverts to `Normal`/`High` the controller resumes,
+0. The controller stays suspended through `High` (≥ 90 %) and only
+resumes when the pool reverts to `Normal` — resuming at `High` would
+oscillate the pool straight back into `Critical`. Once resumed,
 and the per-batch `update_from_stall(cumulative_ssd_stall_us)` call
 grows the window up to `speculation_base_depth + MAX_LATENCY_BUMP`
 (= base + 2) when SSD stall is rising. The benchmark in
@@ -1108,7 +1110,7 @@ speculator_enabled     = true   # turn on the NeuralSpeculator (M arm)
 speculator_hidden_dim  = 128    # MLP hidden size; 128 is the spec recommendation
 speculator_top_k       = 0      # 0 ⇒ inherit `model.top_k`
 affinity_enabled       = false  # turn on per-layer expert-affinity + UTH-spatial folds
-affinity_neighbors_k   = 2      # co-fired neighbours to fold in per seed
+affinity_neighbors_k   = 4      # co-fired neighbours to fold in per seed
 affinity_decay_epoch   = 100000 # cumulative observations before a decay right-shift
 ```
 
@@ -1282,11 +1284,17 @@ The engine's I/O substrate is intentionally independent from the math
 library used to crunch the bytes once they land in RAM. The
 [`backend`](rust-engine/src/backend/mod.rs) module defines a
 plugin-system `Backend` trait (`matmul`, `matmul_into`, `swiglu_into`,
-`softmax`, `silu_inplace`) with two built-in implementations:
+`softmax`, `silu_inplace`) with three built-in implementations:
 
 * **`ScalarBackend`**, pure-Rust reference, always available, used
   as the validation oracle every other backend is tested against.
-* **`CandleBackend`**, the production default. Installed by
+* **`GpuBackend`**, the `wgpu` compute-pipeline executor selected at
+  runtime via `[real_transformer].compute_offload = "gpu"`; its
+  attention shader is GQA-aware (the KV buffer is sized and strided
+  by `num_kv_heads × head_dim`, and each query head reads its GQA
+  group's KV row) and falls back to `CandleBackend` when no adapter
+  is present.
+* **`CandleBackend`**, the production CPU default. Installed by
   `backend::install_default()` at startup. `matmul_into` and
   `swiglu_into` dispatch through `kernels::dot_f32` /
   `kernels::swiglu_f32_into`, the runtime AVX-512 → AVX2 → scalar
@@ -2692,7 +2700,7 @@ A native terminal dashboard ships with the engine under `--features tui`
 (on by default). Start the server, then in another shell:
 
 ```bash
-mer-cli monitor --url http://127.0.0.1:8080 --refresh-ms 250
+micro-expert-router monitor --url http://127.0.0.1:8080 --refresh-ms 250
 ```
 
 It polls `/v1/admin/health/experts` on the refresh interval and renders
