@@ -836,9 +836,25 @@ impl GpuBackend {
             d_ff, MAX_EXPERT_D_FF
         );
 
-        let blocks_per_proj = (d_ff * d_model) / Q4_0_BLOCK_ELEMS;
-        let proj_bytes = blocks_per_proj * Q4_0_BLOCK_BYTES;
-        let need = 3 * proj_bytes;
+        let blocks_per_proj = d_ff
+            .checked_mul(d_model)
+            .and_then(|elems| elems.checked_div(Q4_0_BLOCK_ELEMS))
+            .ok_or_else(|| anyhow::anyhow!(
+                "Q4_0 expert shape overflow: d_ff={} d_model={}",
+                d_ff, d_model
+            ))?;
+        let proj_bytes = blocks_per_proj
+            .checked_mul(Q4_0_BLOCK_BYTES)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Q4_0 expert proj byte size overflow: {} blocks × {}B",
+                blocks_per_proj, Q4_0_BLOCK_BYTES
+            ))?;
+        let need = proj_bytes
+            .checked_mul(3)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Q4_0 expert total byte size overflow: 3 × {}B",
+                proj_bytes
+            ))?;
         let tol = crate::inference::EXPERT_SIZE_TOLERANCE_BYTES;
         anyhow::ensure!(
             weight_bytes.len() >= need
@@ -948,12 +964,17 @@ impl GpuBackend {
         debug_assert_eq!(out.data.len(), d_model);
 
         // ── Upload x to work_a ────────────────────────────────────────────────
-        let mut scratch = self.conversion_scratch.lock();
-        assert!(d_model <= scratch.len());
-        for i in 0..d_model {
-            scratch[i] = x.data[i].to_f32();
+        // Scope the scratch lock to the host-side f16→f32 conversion + upload
+        // only; releasing it before encoding/submitting GPU work avoids
+        // serializing concurrent callers across the blocking readback below.
+        {
+            let mut scratch = self.conversion_scratch.lock();
+            assert!(d_model <= scratch.len());
+            for i in 0..d_model {
+                scratch[i] = x.data[i].to_f32();
+            }
+            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..d_model]));
         }
-        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..d_model]));
 
         // ── Single command buffer: 4 sequential compute passes ───────────────
         // The GPU executes these in order; no host-side synchronization needed
@@ -1097,22 +1118,27 @@ impl Backend for GpuBackend {
         let b_len = b.data.len();
         let out_len = out.rows * out.cols;
 
-        let mut scratch = self.conversion_scratch.lock();
-        assert!(a_len <= scratch.len());
-        assert!(b_len <= scratch.len());
-        assert!(out_len <= scratch.len());
+        // Scope the scratch lock to the host-side conversions + uploads only,
+        // releasing it before encoding/submitting GPU work so the blocking
+        // readback below doesn't serialize concurrent callers.
+        {
+            let mut scratch = self.conversion_scratch.lock();
+            assert!(a_len <= scratch.len());
+            assert!(b_len <= scratch.len());
+            assert!(out_len <= scratch.len());
 
-        // Upload A
-        for i in 0..a_len {
-            scratch[i] = a.data[i].to_f32();
-        }
-        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..a_len]));
+            // Upload A
+            for i in 0..a_len {
+                scratch[i] = a.data[i].to_f32();
+            }
+            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..a_len]));
 
-        // Upload B
-        for i in 0..b_len {
-            scratch[i] = b.data[i].to_f32();
+            // Upload B
+            for i in 0..b_len {
+                scratch[i] = b.data[i].to_f32();
+            }
+            self.queue.write_buffer(&self.work_b, 0, bytemuck::cast_slice(&scratch[..b_len]));
         }
-        self.queue.write_buffer(&self.work_b, 0, bytemuck::cast_slice(&scratch[..b_len]));
 
         // Dispatch
         let pcs = MatmulPushConstants {
@@ -1173,20 +1199,24 @@ impl Backend for GpuBackend {
         assert_eq!(up.data.len(), len);
         assert_eq!(out_len, len);
 
-        let mut scratch = self.conversion_scratch.lock();
-        assert!(len <= scratch.len());
+        // Scope the scratch lock to the host-side conversions + uploads only,
+        // releasing it before the dispatch + blocking readback below.
+        {
+            let mut scratch = self.conversion_scratch.lock();
+            assert!(len <= scratch.len());
 
-        // Upload gate
-        for i in 0..len {
-            scratch[i] = gate.data[i].to_f32();
-        }
-        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
+            // Upload gate
+            for i in 0..len {
+                scratch[i] = gate.data[i].to_f32();
+            }
+            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
 
-        // Upload up
-        for i in 0..len {
-            scratch[i] = up.data[i].to_f32();
+            // Upload up
+            for i in 0..len {
+                scratch[i] = up.data[i].to_f32();
+            }
+            self.queue.write_buffer(&self.work_b, 0, bytemuck::cast_slice(&scratch[..len]));
         }
-        self.queue.write_buffer(&self.work_b, 0, bytemuck::cast_slice(&scratch[..len]));
 
         // Dispatch
         let pcs = SwigluPushConstants {
@@ -1240,14 +1270,18 @@ impl Backend for GpuBackend {
     fn softmax(&self, x: &mut TensorViewMut) -> Result<()> {
         let len = x.data.len();
 
-        let mut scratch = self.conversion_scratch.lock();
-        assert!(len <= scratch.len());
+        // Scope the scratch lock to the upload only, releasing it before the
+        // softmax dispatch + blocking readback below.
+        {
+            let mut scratch = self.conversion_scratch.lock();
+            assert!(len <= scratch.len());
 
-        // Upload x
-        for i in 0..len {
-            scratch[i] = x.data[i].to_f32();
+            // Upload x
+            for i in 0..len {
+                scratch[i] = x.data[i].to_f32();
+            }
+            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
         }
-        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
 
         // Dispatch
         let pcs = SoftmaxPushConstants {
@@ -1347,15 +1381,19 @@ impl Backend for GpuBackend {
         let q_len = q.data.len();
         let out_len = out.rows * out.cols;
 
-        let mut scratch = self.conversion_scratch.lock();
-        assert!(q_len <= scratch.len());
-        assert!(out_len <= scratch.len());
+        // Scope the scratch lock to the Q upload only, releasing it before the
+        // attention dispatch + blocking readback below.
+        {
+            let mut scratch = self.conversion_scratch.lock();
+            assert!(q_len <= scratch.len());
+            assert!(out_len <= scratch.len());
 
-        // Upload Q
-        for i in 0..q_len {
-            scratch[i] = q.data[i].to_f32();
+            // Upload Q
+            for i in 0..q_len {
+                scratch[i] = q.data[i].to_f32();
+            }
+            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..q_len]));
         }
-        self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..q_len]));
 
         // Dispatch
         // Pass the layer offset in f32 *elements*: a byte offset cast to
