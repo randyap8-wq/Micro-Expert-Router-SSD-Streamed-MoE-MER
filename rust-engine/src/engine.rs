@@ -1456,11 +1456,11 @@ impl Engine {
     /// Whether the configured expert dtype is eligible for the GPU
     /// `Backend::expert_matmul` fast path. F32 always qualifies. Q4_0
     /// qualifies only when both `d_model` and `d_ff` are
-    /// Q4_0-block-aligned: the promotion-time dequant in
-    /// [`Engine::install_gpu_cache`] then produces a tight F32 weight
-    /// stream (`[gate || up || down]`) with no inter-tensor padding,
-    /// exactly what the GPU SwiGLU kernels expect. All other dtypes
-    /// stay on the CPU path.
+    /// Q4_0-block-aligned: the raw block stream then has every matrix
+    /// row starting on a 32-element block boundary, which is what the
+    /// inline-dequant GEMV shader (`matmul_q4_0.wgsl`) assumes when it
+    /// walks `k / 32` blocks per row. All other dtypes stay on the
+    /// CPU path.
     fn gpu_eligible_dtype(&self) -> bool {
         match self.core.options.dtype {
             WeightDtype::F32 => true,
@@ -1486,10 +1486,12 @@ impl Engine {
     /// the *next* dispatch of the same expert hits the GPU fast path
     /// instead.
     ///
-    /// The byte conversion mirrors the background task exactly: Q4_0
-    /// experts are dequantised to a tight F32 stream (the GPU SwiGLU
-    /// kernels operate on F32 weights) before landing in VRAM, while
-    /// F32 experts are promoted byte-for-byte. The synchronous path
+    /// The byte handling mirrors the background task exactly: both
+    /// F32 and Q4_0 experts are promoted byte-for-byte — Q4_0 bytes
+    /// stay in native GGUF blocks (~8× smaller than F32) and are
+    /// dequantised *inline on the GPU* by the `matmul_q4_0.wgsl`
+    /// pipeline; the resident is dtype-tagged so the backend picks
+    /// the right pipeline. The synchronous path
     /// uses [`GpuExpertCache::try_promote_lru_no_evict`] so it never
     /// evicts already-resident hot experts and never consumes Anchor
     /// Core slots — anchor promotion stays the exclusive job of the
@@ -1514,54 +1516,20 @@ impl Engine {
         if gpu.contains(id) {
             return;
         }
-        let promote_q4_0 = self.core.options.dtype == WeightDtype::Q4_0;
-        let bytes = Self::resident_bytes_for_gpu(
+        // Bytes are promoted verbatim and dtype-tagged: Q4_0 experts
+        // stay in native GGUF blocks (~8× fewer bytes across PCIe and
+        // in VRAM than a dequantised F32 stream) and are unpacked
+        // inline by the GPU's `matmul_q4_0.wgsl` pipeline.
+        let gpu_res = Arc::new(GpuResident::new_with_dtype(
             id,
-            resident.data(),
-            promote_q4_0,
-            self.core.shape.d_model,
-            self.core.shape.d_ff,
-        );
-        let gpu_res = Arc::new(GpuResident::new(id, bytes));
+            resident.data().to_vec(),
+            self.core.options.dtype,
+        ));
         if gpu.try_promote_lru_no_evict(gpu_res) {
             if let Some(p) = self.metrics.prom.as_ref() {
                 p.record_promotions(1);
                 p.set_vram_used_bytes(gpu.used_bytes() as u64);
             }
-        }
-    }
-
-    /// Convert a RAM resident's weight bytes into the form the GPU
-    /// SwiGLU kernels expect before they land in VRAM. Q4_0 experts
-    /// are dequantised to a tight F32 stream (`promote_q4_0 == true`);
-    /// every other (already GPU-eligible) dtype is copied verbatim.
-    /// On a dequant error the raw bytes are returned so
-    /// `build_expert_entry` can reject the entry and the engine drops
-    /// back to the CPU path, preserving correctness.
-    ///
-    /// Shared by the synchronous warm-up promotion path
-    /// ([`Engine::try_promote_resident_to_gpu`]) and the background
-    /// promotion task spawned in [`Engine::install_gpu_cache`].
-    fn resident_bytes_for_gpu(
-        id: u32,
-        data: &[u8],
-        promote_q4_0: bool,
-        d_model: usize,
-        d_ff: usize,
-    ) -> Vec<u8> {
-        if promote_q4_0 {
-            match crate::inference::OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(
-                data, d_model, d_ff,
-            ) {
-                Ok(f32_bytes) => f32_bytes,
-                Err(e) => {
-                    warn!(expert = id, error = %e,
-                        "Q4_0→F32 dequant for GPU promotion failed; promoting raw bytes");
-                    data.to_vec()
-                }
-            }
-        } else {
-            data.to_vec()
         }
     }
 
@@ -1581,18 +1549,13 @@ impl Engine {
             tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
         let gpu_for_task = gpu.clone();
         let prom_for_task = self.metrics.prom.clone();
-        // Snapshot the (immutable) expert dtype + shape so the
-        // promotion task can dequantise Q4_0 experts to F32 *before*
-        // the bytes land in VRAM. The GPU SwiGLU kernels operate on
-        // F32 weight buffers (see `backend::build_expert_entry`), so a
-        // Q4_0 expert that reaches VRAM as raw 4-bit blocks would be
-        // misinterpreted. Converting here keeps the GPU
-        // `expert_matmul` fast path correct for Q4_0 while leaving the
-        // F32 path byte-for-byte unchanged.
+        // Snapshot the (immutable) expert dtype so each promoted
+        // resident is dtype-tagged. Q4_0 experts land in VRAM as raw
+        // GGUF blocks (~8× fewer bytes than a dequantised F32 stream)
+        // and are unpacked inline by the GPU's `matmul_q4_0.wgsl`
+        // pipeline (see `backend::build_expert_entry_q4_0`); the F32
+        // path is byte-for-byte unchanged.
         let promote_dtype = self.core.options.dtype;
-        let promote_q4_0_for_gpu = promote_dtype == WeightDtype::Q4_0 && self.gpu_eligible_dtype();
-        let promote_d_model = self.core.shape.d_model;
-        let promote_d_ff = self.core.shape.d_ff;
         // Capacity is constant for the lifetime of the cache; publish
         // it once so `mer_vram_capacity_bytes` is available on the
         // very first `/metrics` scrape (dashboards compute
@@ -1605,17 +1568,14 @@ impl Engine {
                 // `promote_sync` copies the resident bytes into the
                 // anchor/LRU edge under the parking_lot mutex; safe to
                 // call from a Tokio worker because it never .awaits.
-                // Q4_0 experts are dequantised to a tight F32 stream so
-                // the GPU matmul sees F32 weights (shared with the
-                // synchronous warm-up promotion path).
-                let bytes = Self::resident_bytes_for_gpu(
+                // Bytes are promoted verbatim; the dtype tag tells the
+                // GPU backend which matmul pipeline to dispatch (shared
+                // with the synchronous warm-up promotion path).
+                let gpu_res = Arc::new(GpuResident::new_with_dtype(
                     id,
-                    resident.data(),
-                    promote_q4_0_for_gpu,
-                    promote_d_model,
-                    promote_d_ff,
-                );
-                let gpu_res = Arc::new(GpuResident::new(id, bytes));
+                    resident.data().to_vec(),
+                    promote_dtype,
+                ));
                 let promoted = gpu_for_task.promote_sync(gpu_res);
                 if promoted {
                     if let Some(p) = prom_for_task.as_ref() {

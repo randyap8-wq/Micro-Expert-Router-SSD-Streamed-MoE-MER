@@ -345,17 +345,36 @@ pub struct GpuResident {
     /// init path replaces it with a `candle_core::Tensor` reference
     /// (see Phase 3 / `inference::run_inference_gpu`).
     bytes: Vec<u8>,
+    /// On-disk encoding of `bytes`. `F32` residents feed the dense
+    /// matmul pipeline; `Q4_0` residents stay in native GGUF blocks
+    /// and feed the inline-dequant pipeline (`matmul_q4_0.wgsl`) —
+    /// see `GpuBackend::expert_matmul`.
+    dtype: crate::inference::WeightDtype,
 }
 
 impl GpuResident {
     pub fn new(id: u32, bytes: Vec<u8>) -> Self {
-        Self { id, bytes }
+        Self { id, bytes, dtype: crate::inference::WeightDtype::F32 }
+    }
+
+    /// Like [`GpuResident::new`] but tagging the bytes with their
+    /// native on-disk dtype, so the GPU backend can pick the matching
+    /// matmul pipeline (e.g. Q4_0 inline dequant) without guessing
+    /// from the byte length.
+    pub fn new_with_dtype(id: u32, bytes: Vec<u8>, dtype: crate::inference::WeightDtype) -> Self {
+        Self { id, bytes, dtype }
     }
 
     /// Bare weight bytes ready for `run_inference_*`.
     #[inline]
     pub fn data(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Native encoding of [`GpuResident::data`].
+    #[inline]
+    pub fn dtype(&self) -> crate::inference::WeightDtype {
+        self.dtype
     }
 
     /// Size in bytes of the VRAM footprint owned by this resident.
