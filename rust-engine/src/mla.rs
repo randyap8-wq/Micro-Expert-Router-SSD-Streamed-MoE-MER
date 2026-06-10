@@ -211,22 +211,26 @@ impl MultiHeadLatentAttention {
 
         // 3) Causal attention over all cached tokens.
         let mut attn_out = vec![0.0f32; self.num_heads * d_v];
-        // Reconstruct each cached token's per-head K/V once and reuse
-        // across heads.
+        // Reconstruct each cached token's per-head K/V once (O(seq)
+        // matmuls total) and reuse the reconstructed rows across all heads,
+        // rather than re-running `kv_b_proj` per (head, token).
         let kv_b_row = self.qk_nope_head_dim + self.v_head_dim;
+        let mut kv_b_rows: Vec<Vec<f32>> = Vec::with_capacity(t_max);
+        let mut k_pe_rows: Vec<Vec<f32>> = Vec::with_capacity(t_max);
+        for t in 0..t_max {
+            let latent = kv.key_at(t);
+            let (kv_b, k_pe) = self.reconstruct_kv(latent);
+            kv_b_rows.push(kv_b);
+            k_pe_rows.push(k_pe.to_vec());
+        }
         for h in 0..self.num_heads {
             let q_h = &q[h * qk..(h + 1) * qk];
             let mut scores = Vec::with_capacity(t_max);
-            // Per-token reconstruction is O(seq) matmuls; cache the
-            // reconstructed rows for this head across the score and the
-            // value-weighted sum passes.
-            let mut v_rows: Vec<Vec<f32>> = Vec::with_capacity(t_max);
             for t in 0..t_max {
-                let latent = kv.key_at(t);
-                let (kv_b, k_pe) = self.reconstruct_kv(latent);
+                let kv_b = &kv_b_rows[t];
+                let k_pe = &k_pe_rows[t];
                 let head_base = h * kv_b_row;
                 let k_nope = &kv_b[head_base..head_base + nope];
-                let v_t = &kv_b[head_base + nope..head_base + nope + d_v];
                 // score = q_h · [k_nope ; k_pe]
                 let mut s = 0.0f32;
                 for j in 0..nope {
@@ -236,12 +240,12 @@ impl MultiHeadLatentAttention {
                     s += q_h[nope + j] * k_pe[j];
                 }
                 scores.push(s * self.softmax_scale);
-                v_rows.push(v_t.to_vec());
             }
             softmax_inplace(&mut scores);
             let out_h = &mut attn_out[h * d_v..(h + 1) * d_v];
             for (t, score) in scores.iter().enumerate() {
-                let v_t = &v_rows[t];
+                let head_base = h * kv_b_row;
+                let v_t = &kv_b_rows[t][head_base + nope..head_base + nope + d_v];
                 for j in 0..d_v {
                     out_h[j] += score * v_t[j];
                 }
