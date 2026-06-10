@@ -1481,6 +1481,7 @@ mod tests {
             predictive: crate::config::PredictiveConfig::default(),
             security: crate::config::SecurityConfig::default(),
             gpu_cache: crate::config::GpuCacheConfig::default(),
+            distributed: crate::config::DistributedConfig::default(),
         }
     }
 

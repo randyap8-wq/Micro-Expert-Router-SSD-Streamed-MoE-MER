@@ -578,6 +578,59 @@ impl Default for GpuCacheConfig {
     }
 }
 
+/// `[distributed]` — multi-node expert namespace partitioning.
+///
+/// Off by default (single-node, every expert local). When `enabled =
+/// true`, the expert id space is hash-partitioned across `nodes` with
+/// the documented `id % num_nodes` scheme
+/// ([`crate::rpc::shard_for_expert`]): ids whose shard equals
+/// `self_index` stay on the local NVMe path, every other id is routed
+/// to its owning peer through
+/// [`crate::distributed::RpcShardRouter`]. The batch scheduler's warm
+/// pre-pass consults the router so remote ids surface structured
+/// fetch failures instead of redundant local SSD reads.
+///
+/// Remote data transfer rides the gRPC transport (`--features grpc`);
+/// without that feature remote fetches surface a structured
+/// `Unreachable` error rather than panicking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributedConfig {
+    /// Master switch. `false` (default) keeps the single-node
+    /// `LocalShardRouter` (every instruction `Local`).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Every node in the mesh, **in shard order** (`host:port` for the
+    /// gRPC transport). Expert `id` is owned by
+    /// `nodes[id % nodes.len()]`. Must contain at least 2 entries when
+    /// `enabled` (a 1-node mesh is just the local path).
+    #[serde(default)]
+    pub nodes: Vec<String>,
+
+    /// This process's position in `nodes` — the shard whose experts
+    /// stay on the local NVMe path. Must be `< nodes.len()`.
+    #[serde(default)]
+    pub self_index: usize,
+
+    /// Per-call deadline (milliseconds) applied to every remote expert
+    /// fetch. Defaults to 250 ms.
+    #[serde(default = "default_remote_fetch_timeout_ms")]
+    pub remote_fetch_timeout_ms: u64,
+}
+
+fn default_remote_fetch_timeout_ms() -> u64 { 250 }
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            nodes: Vec::new(),
+            self_index: 0,
+            remote_fetch_timeout_ms: default_remote_fetch_timeout_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -602,6 +655,12 @@ pub struct Config {
     /// when this section is absent.
     #[serde(default)]
     pub gpu_cache: GpuCacheConfig,
+    /// Optional `[distributed]` section — multi-node expert namespace
+    /// partitioning over the gRPC shard transport. Off by default;
+    /// single-node deployments behave identically with the section
+    /// absent.
+    #[serde(default)]
+    pub distributed: DistributedConfig,
 }
 
 impl Config {
@@ -675,6 +734,28 @@ impl Config {
                      f32, f16, int8, q4k, q4_0, q8_0)",
                     self.gpu_cache.dtype
                 )));
+            }
+        }
+        // [distributed] validation — only meaningful when enabled.
+        if self.distributed.enabled {
+            if self.distributed.nodes.len() < 2 {
+                return Err(ConfigError::Invalid(format!(
+                    "distributed.nodes must list at least 2 nodes when enabled \
+                     (got {}); a 1-node mesh is just the local path",
+                    self.distributed.nodes.len()
+                )));
+            }
+            if self.distributed.self_index >= self.distributed.nodes.len() {
+                return Err(ConfigError::Invalid(format!(
+                    "distributed.self_index ({}) must be < distributed.nodes.len() ({})",
+                    self.distributed.self_index,
+                    self.distributed.nodes.len()
+                )));
+            }
+            if self.distributed.remote_fetch_timeout_ms == 0 {
+                return Err(ConfigError::Invalid(
+                    "distributed.remote_fetch_timeout_ms must be > 0".into(),
+                ));
             }
         }
         if self.real_transformer.enabled {
@@ -995,6 +1076,7 @@ mod tests {
             predictive: PredictiveConfig::default(),
             security: SecurityConfig::default(),
             gpu_cache: GpuCacheConfig::default(),
+            distributed: DistributedConfig::default(),
         }
     }
 
