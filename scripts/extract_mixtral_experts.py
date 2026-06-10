@@ -427,10 +427,13 @@ def dequant_fp8_e4m3_blockwise(q_u8, scale_inv, block: int = FP8_BLOCK):
             f"{want} block grid of a {rows}x{cols} weight (block={block})"
         )
     out = f8_e4m3_lut()[q_u8]
-    # Expand the per-block scales over the element grid and crop the
-    # ragged trailing blocks.
-    expanded = np.repeat(np.repeat(scale_inv, block, axis=0), block, axis=1)[:rows, :cols]
-    out *= expanded
+    for br in range(want[0]):
+        r0 = br * block
+        r1 = min(r0 + block, rows)
+        for bc in range(want[1]):
+            c0 = bc * block
+            c1 = min(c0 + block, cols)
+            out[r0:r1, c0:c1] *= scale_inv[br, bc]
     return out
 
 
