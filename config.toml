@@ -263,3 +263,22 @@ vram_anchor_ratio = 0.5
 # "q4_0", "q8_0". "f16" typically halves the VRAM footprint of
 # "f32" with no perceptible quality loss.
 dtype = "f16"
+
+# -- Distributed expert partitioning (multi-node, optional) ----------
+#
+# Off by default (single-node; every expert local). When enabled, the
+# expert id space is hash-partitioned across `nodes` with the
+# documented `id % nodes.len()` scheme (see docs/distributed.md): ids
+# owned by `nodes[self_index]` stay on the local NVMe path, every
+# other id is routed to its owning peer. The batch scheduler's warm
+# pre-pass consults this placement so remote ids are fetched over the
+# gRPC shard transport (build with `--features grpc`) and surface
+# structured failures instead of redundant local SSD reads.
+[distributed]
+enabled = false
+# Every node in the mesh, in shard order ("host:port").
+nodes = []
+# This process's position in `nodes`.
+self_index = 0
+# Per-call deadline for remote expert fetches (milliseconds).
+remote_fetch_timeout_ms = 250

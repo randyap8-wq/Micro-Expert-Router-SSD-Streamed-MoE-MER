@@ -53,6 +53,7 @@
 
 use crate::block_pool::{BlockManager, BlockPool, PressureLevel};
 use crate::backend::Backend;
+use crate::distributed::{LocalShardRouter, ShardRouter};
 use crate::engine::Engine;
 use crate::model::RealModel;
 use crate::router::SpeculationController;
@@ -372,16 +373,49 @@ pub struct BatchScheduler {
     /// reclaimed at least one block. Snapshot via
     /// [`Self::idle_evictions_total`]; useful for stress-test assertions.
     idle_evictions: Arc<AtomicU64>,
+    /// Expert-placement layer the warm pre-pass consults before
+    /// issuing `Engine::warm_with`. [`LocalShardRouter`] (every id
+    /// local) unless the scheduler was built via
+    /// [`Self::spawn_with_shard_router`].
+    shard_router: Arc<dyn ShardRouter>,
+    /// Cumulative count of remote-shard fetches the warm pre-pass has
+    /// initiated (successful round-trips only).
+    remote_fetches: Arc<AtomicU64>,
+    /// Cumulative count of remote-shard fetches that surfaced a
+    /// structured [`crate::distributed::ShardRouterError`].
+    remote_fetch_failures: Arc<AtomicU64>,
 }
 
 impl BatchScheduler {
     /// Spawn the background batching task and return a handle to it.
     /// The task owns clones of `model` and `engine` and runs until the
     /// returned [`BatchScheduler`] (and all its clones) are dropped.
+    ///
+    /// Every expert id is treated as local ([`LocalShardRouter`]) —
+    /// the single-node default. Multi-node deployments use
+    /// [`Self::spawn_with_shard_router`].
     pub fn spawn(
         model: Arc<RealModel>,
         engine: Arc<Engine>,
         cfg: BatchConfig,
+    ) -> Self {
+        Self::spawn_with_shard_router(model, engine, cfg, Arc::new(LocalShardRouter))
+    }
+
+    /// [`Self::spawn`] with an explicit expert-placement layer. The
+    /// scheduler's warm pre-pass consults `shard_router` for every
+    /// peeked expert id: `Local` ids flow into the batched
+    /// `Engine::warm_with` exactly as before, while `Remote` ids are
+    /// fetched through [`ShardRouter::fetch_remote`] (concurrently,
+    /// best-effort) and surface structured
+    /// [`crate::distributed::InferenceError::RemoteShardFetchFailed`]
+    /// log lines + counters on failure instead of panicking or
+    /// issuing pointless local SSD reads.
+    pub fn spawn_with_shard_router(
+        model: Arc<RealModel>,
+        engine: Arc<Engine>,
+        cfg: BatchConfig,
+        shard_router: Arc<dyn ShardRouter>,
     ) -> Self {
         // A reasonable channel depth: each in-flight request can have
         // at most one outstanding StepRequest at a time, so
@@ -406,6 +440,8 @@ impl BatchScheduler {
             None
         };
         let idle_evictions = Arc::new(AtomicU64::new(0));
+        let remote_fetches = Arc::new(AtomicU64::new(0));
+        let remote_fetch_failures = Arc::new(AtomicU64::new(0));
         tokio::spawn(scheduler_loop(
             model,
             engine.clone(),
@@ -418,6 +454,9 @@ impl BatchScheduler {
             started_at,
             speculation.clone(),
             idle_evictions.clone(),
+            shard_router.clone(),
+            remote_fetches.clone(),
+            remote_fetch_failures.clone(),
         ));
         Self {
             tx_interactive,
@@ -431,7 +470,28 @@ impl BatchScheduler {
             overflow_requests: Arc::new(AtomicUsize::new(0)),
             overflow_warned: Arc::new(AtomicBool::new(false)),
             idle_evictions,
+            shard_router,
+            remote_fetches,
+            remote_fetch_failures,
         }
+    }
+
+    /// Name of the expert-placement layer the warm pre-pass consults
+    /// (`"local"` for the single-node default). Logged at startup.
+    pub fn shard_router_name(&self) -> &'static str {
+        self.shard_router.name()
+    }
+
+    /// Cumulative number of remote-shard fetches the warm pre-pass has
+    /// completed successfully since the scheduler started.
+    pub fn remote_fetches_total(&self) -> u64 {
+        self.remote_fetches.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative number of remote-shard fetches that surfaced a
+    /// structured error since the scheduler started.
+    pub fn remote_fetch_failures_total(&self) -> u64 {
+        self.remote_fetch_failures.load(Ordering::Relaxed)
     }
 
     /// Configuration the scheduler was built with.
@@ -852,6 +912,9 @@ async fn scheduler_loop(
     started_at: Instant,
     speculation: Arc<SpeculationController>,
     idle_evictions: Arc<AtomicU64>,
+    shard_router: Arc<dyn ShardRouter>,
+    remote_fetches: Arc<AtomicU64>,
+    remote_fetch_failures: Arc<AtomicU64>,
 ) {
     let now_us = || started_at.elapsed().as_micros() as u64;
     // Per-class WRR weights, captured once. These are `const fn`s so
@@ -1045,9 +1108,51 @@ async fn scheduler_loop(
             }
         }
         if !unique.is_empty() {
-            let ids: Vec<u32> = unique.into_iter().collect();
-            if let Err(e) = engine.warm_with(&ids).await {
-                tracing::debug!(error = %e, "scheduler pre-pass warm_with failed; falling through to inline fetches");
+            // ------------------------------------------------------
+            // Expert namespace partitioning: consult the placement
+            // layer for every peeked id. `Local` ids flow into the
+            // batched NVMe warm read exactly as before; `Remote` ids
+            // are fetched from their owning shard concurrently
+            // (best-effort — a failure is logged with full transport
+            // context and counted, never panicked on; the per-request
+            // step path degrades the same way it does for any other
+            // missing expert).
+            // ------------------------------------------------------
+            let mut local_ids: Vec<u32> = Vec::with_capacity(unique.len());
+            let mut remote: Vec<crate::distributed::ShardInstruction> = Vec::new();
+            for id in unique {
+                let inst = shard_router.route_expert(id);
+                if inst.is_local() {
+                    local_ids.push(id);
+                } else {
+                    remote.push(inst);
+                }
+            }
+            if !remote.is_empty() {
+                let fetches = remote.iter().map(|inst| shard_router.fetch_remote(inst));
+                for (inst, res) in
+                    remote.iter().zip(futures::future::join_all(fetches).await)
+                {
+                    match res {
+                        Ok(()) => {
+                            remote_fetches.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            remote_fetch_failures.fetch_add(1, Ordering::Relaxed);
+                            let err = crate::distributed::InferenceError::from(e);
+                            tracing::warn!(
+                                expert = inst.expert(),
+                                error = %err,
+                                "scheduler pre-pass remote shard fetch failed"
+                            );
+                        }
+                    }
+                }
+            }
+            if !local_ids.is_empty() {
+                if let Err(e) = engine.warm_with(&local_ids).await {
+                    tracing::debug!(error = %e, "scheduler pre-pass warm_with failed; falling through to inline fetches");
+                }
             }
         }
 
@@ -1353,5 +1458,155 @@ mod tests {
             "expected batched ({:?}) ≤ 1.5 × sequential ({:?})",
             batched, sequential
         );
+    }
+
+    /// A `ShardRouter` test double that tags a configurable id set
+    /// remote and records every `fetch_remote` call. `fail` selects
+    /// whether remote fetches succeed or surface a structured timeout.
+    struct RecordingShardRouter {
+        remote_ids: std::collections::HashSet<u32>,
+        fetched: std::sync::Mutex<Vec<u32>>,
+        fail: bool,
+    }
+
+    impl crate::distributed::ShardRouter for RecordingShardRouter {
+        fn name(&self) -> &'static str { "recording" }
+        fn route_expert(&self, expert: u32) -> crate::distributed::ShardInstruction {
+            if self.remote_ids.contains(&expert) {
+                crate::distributed::ShardInstruction::Remote {
+                    expert,
+                    node: crate::distributed::NodeAddr("peer-1:50051".to_string()),
+                    timeout: Duration::from_millis(10),
+                }
+            } else {
+                crate::distributed::ShardInstruction::Local { expert }
+            }
+        }
+        fn fetch_remote<'a>(
+            &'a self,
+            instruction: &'a crate::distributed::ShardInstruction,
+        ) -> crate::distributed::ShardFetchFuture<'a> {
+            Box::pin(async move {
+                match instruction {
+                    crate::distributed::ShardInstruction::Local { .. } => Ok(()),
+                    crate::distributed::ShardInstruction::Remote { expert, node, .. } => {
+                        self.fetched.lock().unwrap().push(*expert);
+                        if self.fail {
+                            Err(crate::distributed::ShardRouterError::Timeout {
+                                expert: *expert,
+                                node: node.clone(),
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            })
+        }
+    }
+
+    /// The warm pre-pass must consult the shard router: ids the
+    /// placement layer tags remote get a `fetch_remote` call (and the
+    /// success counter ticks), while stepping still completes with the
+    /// exact same token as a single-node scheduler — remote routing is
+    /// a prefetch-placement concern, never a correctness change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shard_router_pre_pass_routes_remote_ids_and_preserves_tokens() {
+        let cfg = RealModelConfig {
+            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
+            head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
+            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
+        let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
+
+        let mut kv_a = model.fresh_kv_caches();
+        let direct = model
+            .step(&engine, 7, 0, &mut kv_a, &crate::sampling::SamplingParams::greedy())
+            .await;
+
+        // Tag every odd global expert id remote.
+        let total = (cfg.num_layers * cfg.num_experts) as u32;
+        let remote_ids: std::collections::HashSet<u32> = (0..total).filter(|id| id % 2 == 1).collect();
+        let router = Arc::new(RecordingShardRouter {
+            remote_ids: remote_ids.clone(),
+            fetched: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let sched = BatchScheduler::spawn_with_shard_router(
+            model.clone(),
+            engine.clone(),
+            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2), ..Default::default() },
+            router.clone(),
+        );
+        assert_eq!(sched.shard_router_name(), "recording");
+
+        let resp = sched
+            .step(7, 0, model.fresh_kv_caches(), crate::sampling::SamplingParams::greedy())
+            .await
+            .unwrap();
+        assert_eq!(direct, resp.next_token, "shard routing must not change tokens");
+
+        let fetched = router.fetched.lock().unwrap().clone();
+        // The pre-pass peeks this request's routing decision; any id it
+        // saw that is tagged remote must have gone through fetch_remote
+        // (and only remote-tagged ids may appear there).
+        assert!(fetched.iter().all(|id| remote_ids.contains(id)));
+        assert_eq!(sched.remote_fetches_total(), fetched.len() as u64);
+        assert_eq!(sched.remote_fetch_failures_total(), 0);
+    }
+
+    /// Remote fetch failures must surface as structured counters (and
+    /// warn logs) — never a panic — and the request still completes
+    /// through the engine's existing local fallback path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shard_router_remote_failures_are_structured_and_non_fatal() {
+        let cfg = RealModelConfig {
+            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
+            head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
+            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
+        let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
+        let total = (cfg.num_layers * cfg.num_experts) as u32;
+        let router = Arc::new(RecordingShardRouter {
+            remote_ids: (0..total).collect(), // every id remote
+            fetched: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let sched = BatchScheduler::spawn_with_shard_router(
+            model.clone(),
+            engine.clone(),
+            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2), ..Default::default() },
+            router.clone(),
+        );
+        let resp = sched
+            .step(9, 0, model.fresh_kv_caches(), crate::sampling::SamplingParams::greedy())
+            .await
+            .expect("remote fetch failures must not fail the step");
+        assert!(resp.next_token < cfg.vocab_size as u32);
+        let attempted = router.fetched.lock().unwrap().len() as u64;
+        assert!(attempted > 0, "pre-pass must have attempted remote fetches");
+        assert_eq!(sched.remote_fetch_failures_total(), attempted);
+        assert_eq!(sched.remote_fetches_total(), 0);
+    }
+
+    /// The default `spawn` keeps the single-node `LocalShardRouter`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_spawn_uses_local_shard_router() {
+        let cfg = RealModelConfig {
+            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
+            head_dim: 4, num_layers: 1, num_experts: 4, top_k: 2,
+            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
+        let (engine, model, _tmp) = build_engine_and_model(cfg);
+        let sched = BatchScheduler::spawn(model, engine, BatchConfig::default());
+        assert_eq!(sched.shard_router_name(), "local");
+        assert_eq!(sched.remote_fetches_total(), 0);
+        assert_eq!(sched.remote_fetch_failures_total(), 0);
     }
 }

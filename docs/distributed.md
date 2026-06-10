@@ -51,9 +51,34 @@ single-process `combine_moe_outputs` does today. Top-K is small
 
 ## Status
 
-The sharded `RouteExperts` RPC is **implemented**. The dependency-free
-routing/wire layer is always in tree; the `tonic`/`prost` gRPC
-transport compiles in behind `--features grpc`.
+The sharded `RouteExperts` RPC is **implemented**, and the expert
+namespace partitioning is **wired into the serving path**: the batch
+scheduler's warm pre-pass consults a `ShardRouter` for every peeked
+expert id, keeping locally-owned ids on the NVMe path and fetching
+remote ids from their owning shard (best-effort, with structured
+failure counters). The dependency-free routing/wire layer is always in
+tree; the `tonic`/`prost` gRPC transport compiles in behind
+`--features grpc`.
+
+Enable partitioning with the `[distributed]` config section:
+
+```toml
+[distributed]
+enabled = true
+# Every node in the mesh, in shard order (expert id % nodes.len()).
+nodes = ["node-a:50051", "node-b:50051", "node-c:50051"]
+# This process's position in `nodes` (its experts stay local).
+self_index = 0
+# Per-call deadline for remote fetches (milliseconds).
+remote_fetch_timeout_ms = 250
+```
+
+At startup `serve` builds an `RpcShardRouter` over the documented
+`id % num_nodes` placement (`RpcShardRouter::from_modulo_placement`)
+spanning the layer-qualified global expert namespace
+(`num_layers × num_experts`); with the section absent (the default)
+the scheduler keeps the single-node `LocalShardRouter` and behaves
+identically to before.
 
 Always available (no feature flag, no extra dependencies):
 

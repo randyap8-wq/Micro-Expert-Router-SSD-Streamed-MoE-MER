@@ -42,7 +42,9 @@
 //! MLA), which keeps the per-request, per-layer cache plumbing in
 //! `RealModel` unchanged.
 
-use crate::transformer::{apply_rope_inplace, matmul_row_major, KvCache, RmsNorm};
+use crate::transformer::{
+    apply_rope_maybe_scaled, matmul_row_major, yarn_get_mscale, KvCache, RmsNorm, YarnRope,
+};
 
 /// Per-token softmax over `scores` in place (numerically stable).
 fn softmax_inplace(scores: &mut [f32]) {
@@ -83,6 +85,10 @@ pub struct MultiHeadLatentAttention {
     /// Attention logit scale. Defaults to `1/sqrt(qk_nope+qk_rope)`; a
     /// YaRN-scaled checkpoint folds its `mscale` correction in here.
     pub softmax_scale: f32,
+    /// Optional YaRN long-context RoPE scaling applied to the
+    /// `qk_rope_head_dim` rotary portion of Q and the shared `k_pe`.
+    /// `None` keeps the standard `1/base^(2i/d)` rotation.
+    pub rope_yarn: Option<YarnRope>,
 
     /// `[q_lora_rank, d_model]` — present only when `q_lora_rank > 0`.
     pub q_a_proj: Vec<f32>,
@@ -125,6 +131,30 @@ impl MultiHeadLatentAttention {
         1.0 / d.sqrt()
     }
 
+    /// YaRN-corrected softmax scale: the default `1/sqrt(d)` multiplied
+    /// by `mscale^2` where `mscale = yarn_get_mscale(factor,
+    /// mscale_all_dim)`. Mirrors the DeepSeek-V3 reference attention
+    /// (`softmax_scale *= mscale * mscale` when `mscale_all_dim` is
+    /// set); falls back to the default scale for non-YaRN configs.
+    pub fn yarn_softmax_scale(
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        scaling: Option<&crate::architecture::RopeScaling>,
+    ) -> f32 {
+        let base = Self::default_softmax_scale(qk_nope_head_dim, qk_rope_head_dim);
+        match scaling {
+            Some(s)
+                if s.rope_type.eq_ignore_ascii_case("yarn")
+                    && s.factor > 1.0
+                    && s.mscale_all_dim != 0.0 =>
+            {
+                let m = yarn_get_mscale(s.factor, s.mscale_all_dim);
+                base * m * m
+            }
+            _ => base,
+        }
+    }
+
     /// Project the query into per-head `[q_nope | q_pe]` rows and apply
     /// RoPE to the `q_pe` portion of each head. Returns the full
     /// `num_heads * qk_head_dim` vector.
@@ -144,7 +174,12 @@ impl MultiHeadLatentAttention {
         // `qk_rope_head_dim` slots).
         for h in 0..self.num_heads {
             let base = h * qk + self.qk_nope_head_dim;
-            apply_rope_inplace(&mut q[base..base + self.qk_rope_head_dim], pos, self.rope_base);
+            apply_rope_maybe_scaled(
+                &mut q[base..base + self.qk_rope_head_dim],
+                pos,
+                self.rope_base,
+                self.rope_yarn.as_ref(),
+            );
         }
         q
     }
@@ -167,7 +202,7 @@ impl MultiHeadLatentAttention {
         // k_pe (post-RoPE), shared across heads.
         {
             let mut k_pe = kv_a[self.kv_lora_rank..].to_vec();
-            apply_rope_inplace(&mut k_pe, pos, self.rope_base);
+            apply_rope_maybe_scaled(&mut k_pe, pos, self.rope_base, self.rope_yarn.as_ref());
             latent[self.kv_lora_rank..].copy_from_slice(&k_pe);
         }
         // The value slot is unused by MLA; store the latent in both to
@@ -375,6 +410,7 @@ mod tests {
             qk_rope_head_dim,
             v_head_dim,
             rope_base: 10000.0,
+            rope_yarn: None,
             softmax_scale: MultiHeadLatentAttention::default_softmax_scale(
                 qk_nope_head_dim,
                 qk_rope_head_dim,
@@ -476,5 +512,67 @@ mod tests {
     fn fp8_blockwise_dequant_rejects_bad_shapes() {
         assert!(dequant_fp8_e4m3_blockwise(&[0u8; 3], &[1.0], 2, 2, 1).is_empty());
         assert!(dequant_fp8_e4m3_blockwise(&[0u8; 4], &[1.0], 2, 2, 1).is_empty());
+    }
+
+    fn yarn_scaling(factor: f32, mscale: f32, mscale_all_dim: f32) -> crate::architecture::RopeScaling {
+        crate::architecture::RopeScaling {
+            rope_type: "yarn".to_string(),
+            factor,
+            original_max_position_embeddings: 4096,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            mscale,
+            mscale_all_dim,
+        }
+    }
+
+    #[test]
+    fn yarn_softmax_scale_applies_mscale_squared() {
+        // DeepSeek-V3 config: factor=40, mscale=1.0, mscale_all_dim=1.0.
+        let s = yarn_scaling(40.0, 1.0, 1.0);
+        let base = MultiHeadLatentAttention::default_softmax_scale(128, 64);
+        let scaled = MultiHeadLatentAttention::yarn_softmax_scale(128, 64, Some(&s));
+        let m = yarn_get_mscale(40.0, 1.0);
+        assert!((scaled - base * m * m).abs() < 1e-7, "got {scaled}");
+        // mscale_all_dim == 0 keeps the default scale (reference impl
+        // only corrects when mscale_all_dim is set).
+        let s0 = yarn_scaling(40.0, 1.0, 0.0);
+        assert_eq!(MultiHeadLatentAttention::yarn_softmax_scale(128, 64, Some(&s0)), base);
+        // No scaling config at all keeps the default.
+        assert_eq!(MultiHeadLatentAttention::yarn_softmax_scale(128, 64, None), base);
+    }
+
+    #[test]
+    fn mla_forward_with_yarn_stays_finite_and_differs_from_unscaled() {
+        // Larger-magnitude, position-varying inputs so attention scores
+        // are far from uniform — the YaRN mscale^2 softmax correction
+        // then visibly reweights the mixture.
+        let x_at = |d_model: usize, pos: usize| -> Vec<f32> {
+            (0..d_model).map(|i| 0.5 * (i as f32 + 1.0) + pos as f32).collect()
+        };
+        let mut mla = tiny_mla(6);
+        let mut kv_plain = KvCache::new(mla.latent_dim());
+        let plain: Vec<Vec<f32>> = (0..4)
+            .map(|pos| mla.forward(&x_at(mla.d_model, pos), pos, &mut kv_plain))
+            .collect();
+
+        let s = yarn_scaling(40.0, 1.0, 1.0);
+        mla.rope_yarn = YarnRope::from_scaling(mla.qk_rope_head_dim, mla.rope_base, &s);
+        assert!(mla.rope_yarn.is_some());
+        mla.softmax_scale = MultiHeadLatentAttention::yarn_softmax_scale(
+            mla.qk_nope_head_dim,
+            mla.qk_rope_head_dim,
+            Some(&s),
+        );
+        let mut kv_yarn = KvCache::new(mla.latent_dim());
+        let mut any_diff = false;
+        for pos in 0..4 {
+            let y = mla.forward(&x_at(mla.d_model, pos), pos, &mut kv_yarn);
+            assert!(y.iter().all(|v| v.is_finite()), "non-finite at pos {pos}");
+            if y.iter().zip(plain[pos].iter()).any(|(a, b)| (a - b).abs() > 1e-6) {
+                any_diff = true;
+            }
+        }
+        assert!(any_diff, "YaRN must alter MLA attention outputs");
     }
 }

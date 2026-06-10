@@ -1262,10 +1262,33 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             .with_max_overflow_capacity(rt.max_overflow_capacity),
             ..Default::default()
         };
-        let scheduler = crate::batch_scheduler::BatchScheduler::spawn(
+        // Expert-placement layer: single-node default (every id
+        // local), or the `[distributed]` `id % num_nodes` hash
+        // partitioning over the configured mesh when enabled.
+        let shard_router: std::sync::Arc<dyn crate::distributed::ShardRouter> =
+            if cfg.distributed.enabled {
+                let router = crate::distributed::RpcShardRouter::from_modulo_placement(
+                    &cfg.distributed.nodes,
+                    cfg.distributed.self_index,
+                    total_experts,
+                    std::time::Duration::from_millis(cfg.distributed.remote_fetch_timeout_ms),
+                );
+                info!(
+                    nodes = cfg.distributed.nodes.len(),
+                    self_index = cfg.distributed.self_index,
+                    total_experts,
+                    remote_fetch_timeout_ms = cfg.distributed.remote_fetch_timeout_ms,
+                    "distributed expert partitioning enabled (id % num_nodes)"
+                );
+                std::sync::Arc::new(router)
+            } else {
+                std::sync::Arc::new(crate::distributed::LocalShardRouter)
+            };
+        let scheduler = crate::batch_scheduler::BatchScheduler::spawn_with_shard_router(
             model_arc.clone(),
             engine.clone(),
             batch_cfg,
+            shard_router,
         );
         info!(
             num_layers = cfg.model.num_layers,

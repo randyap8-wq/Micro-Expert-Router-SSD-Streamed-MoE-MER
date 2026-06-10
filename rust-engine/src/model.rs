@@ -40,7 +40,7 @@ use crate::architecture::{
 use crate::gating::{LinearGate, ScoringFunc};
 use crate::mla::MultiHeadLatentAttention;
 use crate::transformer::{
-    KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, SharedExpert, TransformerLayer,
+    KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, SharedExpert, TransformerLayer, YarnRope,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -338,6 +338,14 @@ impl RealModel {
             .map(|_| {
                 let (q_norm, k_norm) = seed_qk_norm();
                 let mla = seed_mla(&config, &mut rng, proj_scale);
+                // YaRN long-context RoPE scaling for the standard
+                // attention path (the MLA path carries its own copy
+                // built inside `seed_mla`).
+                let rope_yarn = config
+                    .advanced
+                    .rope_scaling
+                    .as_ref()
+                    .and_then(|s| YarnRope::from_scaling(config.head_dim, config.rope_base, s));
                 TransformerLayer {
                 rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 attn: MultiHeadSelfAttention {
@@ -353,6 +361,7 @@ impl RealModel {
                     window_size: config.window_size,
                     q_norm,
                     k_norm,
+                    rope_yarn,
                 },
                 mla,
                 rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
@@ -1303,7 +1312,7 @@ fn seed_mla(
     let qk_head = dims.qk_nope_head_dim + dims.qk_rope_head_dim;
     let q_total = n_h * qk_head;
     let kv_proj_dim = dims.kv_lora_rank + dims.qk_rope_head_dim;
-    let kv_b_out = n_h * (dims.qk_nope_head_dim + dims.v_head_dim)
+    let kv_b_out = n_h * (dims.qk_nope_head_dim + dims.v_head_dim);
 
     let (q_a_proj, q_a_layernorm, q_b_proj) = if dims.q_lora_rank > 0 {
         (
@@ -1328,9 +1337,16 @@ fn seed_mla(
         qk_rope_head_dim: dims.qk_rope_head_dim,
         v_head_dim: dims.v_head_dim,
         rope_base: config.rope_base,
-        softmax_scale: MultiHeadLatentAttention::default_softmax_scale(
+        // YaRN long-context scaling (DeepSeek-V3 ships `rope_scaling`
+        // of type "yarn"): blended inverse frequencies over the rotary
+        // portion plus the `mscale` attention-magnitude corrections.
+        rope_yarn: config.advanced.rope_scaling.as_ref().and_then(|s| {
+            YarnRope::from_scaling(dims.qk_rope_head_dim, config.rope_base, s)
+        }),
+        softmax_scale: MultiHeadLatentAttention::yarn_softmax_scale(
             dims.qk_nope_head_dim,
             dims.qk_rope_head_dim,
+            config.advanced.rope_scaling.as_ref(),
         ),
         q_a_proj,
         q_a_layernorm,
@@ -1840,6 +1856,58 @@ mod tests {
         // per-layer cache is sized correctly.
         let kv_dim = model.layers[0].kv_dim();
         assert_eq!(kv_dim, 16 + 4);
+    }
+
+    /// `rope_scaling` of type `yarn` must be wired into both attention
+    /// paths at model build time: the standard path's `rope_yarn` and
+    /// the MLA path's `rope_yarn` + mscale-corrected `softmax_scale`.
+    #[test]
+    fn seeded_model_wires_yarn_rope_scaling() {
+        use crate::architecture::RopeScaling;
+        let scaling = RopeScaling {
+            rope_type: "yarn".to_string(),
+            factor: 40.0,
+            original_max_position_embeddings: 4096,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            mscale: 1.0,
+            mscale_all_dim: 1.0,
+        };
+        let mut advanced = AdvancedConfig::default();
+        advanced.mla = Some(MlaDims {
+            q_lora_rank: 0,
+            kv_lora_rank: 16,
+            qk_nope_head_dim: 4,
+            qk_rope_head_dim: 4,
+            v_head_dim: 8,
+        });
+        advanced.rope_scaling = Some(scaling.clone());
+        let cfg = RealModelConfig {
+            architecture: Architecture::DeepSeekV3,
+            advanced,
+            num_layers: 2,
+            ..RealModelConfig::tiny()
+        };
+        let model = RealModel::new_seeded(cfg, 1);
+        for layer in &model.layers {
+            assert!(layer.attn.rope_yarn.is_some(), "standard path must carry YaRN");
+            let mla = layer.mla.as_ref().expect("MLA seeded");
+            assert!(mla.rope_yarn.is_some(), "MLA path must carry YaRN");
+            let expected = crate::mla::MultiHeadLatentAttention::yarn_softmax_scale(
+                4,
+                4,
+                Some(&scaling),
+            );
+            assert!((mla.softmax_scale - expected).abs() < 1e-7);
+            assert!(
+                mla.softmax_scale
+                    > crate::mla::MultiHeadLatentAttention::default_softmax_scale(4, 4),
+                "mscale^2 correction must raise the softmax scale"
+            );
+        }
+        // Without a rope_scaling block, nothing is wired.
+        let plain = RealModel::new_seeded(RealModelConfig::tiny(), 1);
+        assert!(plain.layers.iter().all(|l| l.attn.rope_yarn.is_none()));
     }
 
     /// `from_hf_config` maps a parsed Qwen3-MoE `config.json` (explicit

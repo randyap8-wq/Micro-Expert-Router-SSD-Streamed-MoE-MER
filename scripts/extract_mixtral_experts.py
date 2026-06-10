@@ -20,10 +20,11 @@ The script is architecture-aware (matching the Rust `Architecture` enum):
   gate `…mlp.gate.weight`. No shared expert.
 * **DeepSeek-V3 / V3.1** (`deepseek_v3`) — same `mlp.experts.{j}.…`
   expert naming plus an always-on shared expert
-  (`…mlp.shared_experts.{gate,up,down}_proj.weight`). **Refused** when
-  the checkpoint is FP8-quantised (the engine cannot run MLA + FP8 yet);
-  the tensor naming is still understood so a future de-quantised export
-  works.
+  (`…mlp.shared_experts.{gate,up,down}_proj.weight`). FP8
+  block-quantised checkpoints are de-quantised on the fly: every
+  `F8_E4M3` tensor is decoded and multiplied by its companion
+  `weight_scale_inv` per-128x128-block reciprocal scale, mirroring the
+  engine's `dequant_fp8_e4m3_blockwise` (`rust-engine/src/mla.rs`).
 
 Fully **dense** architectures (Qwen3 dense `qwen3`, Mistral Small 3
 `mistral3`, Phi-4 `phi3`) have no routed experts to stream and are
@@ -351,14 +352,205 @@ def resolve_moe_config(config, arch: str) -> dict:
 def detect_fp8(config) -> bool:
     """True if the checkpoint is FP8 block-quantised (DeepSeek-V3).
 
-    Such weights carry companion `weight_scale_inv` tensors and need FP8
-    de-quantisation that neither this script nor the engine implements.
+    Such weights carry companion `weight_scale_inv` tensors: a per-block
+    f32 reciprocal scale laid out over a 128x128 block grid. This script
+    de-quantises them on the fly (mirroring the Rust engine's
+    `dequant_fp8_e4m3_blockwise` in `rust-engine/src/mla.rs`) by reading
+    the raw `safetensors` shards directly instead of instantiating the
+    model through `transformers`.
     """
     qc = getattr(config, "quantization_config", None)
     if qc is None:
         return False
     method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
     return bool(method) and "fp8" in str(method).lower()
+
+
+# Default FP8 quantisation block edge (DeepSeek-V3 `weight_block_size`).
+FP8_BLOCK = 128
+
+# Largest finite magnitude in the OCP `e4m3fn` format (S.1110.111 =
+# 1.875 * 2^8). The S.1111.111 NaN pattern is clamped to this value so
+# downstream matmuls stay finite — bit-for-bit the behaviour of the Rust
+# engine's `f8_e4m3_to_f32` (`rust-engine/src/mla.rs`).
+F8_E4M3_MAX_FINITE = 448.0
+
+
+def f8_e4m3_lut():
+    """256-entry `uint8 -> f32` decode table for FP8 `e4m3fn`.
+
+    1 sign / 4 exponent / 3 mantissa, bias 7, no infinities; the
+    all-ones encoding (`0x7F`/`0xFF`) is NaN in the spec and clamped to
+    +-448 here, matching the Rust engine's decoder exactly.
+    """
+    import numpy as np
+
+    cached = getattr(f8_e4m3_lut, "_cached", None)
+    if cached is not None:
+        return cached
+
+    lut = np.empty(256, dtype=np.float32)
+    for b in range(256):
+        sign = -1.0 if (b & 0x80) else 1.0
+        exp = (b >> 3) & 0x0F
+        mant = b & 0x07
+        if exp == 0:
+            val = sign * (mant / 8.0) * 2.0 ** (1 - 7)
+        elif exp == 0x0F and mant == 0x07:
+            val = sign * F8_E4M3_MAX_FINITE
+        else:
+            val = sign * (1.0 + mant / 8.0) * 2.0 ** (exp - 7)
+        lut[b] = val
+
+    f8_e4m3_lut._cached = lut
+    return lut
+
+
+def dequant_fp8_e4m3_blockwise(q_u8, scale_inv, block: int = FP8_BLOCK):
+    """Block-wise de-quantise an FP8 `e4m3fn` matrix to f32.
+
+    * `q_u8`      — `[rows, cols]` uint8 array of raw e4m3 bytes.
+    * `scale_inv` — `[ceil(rows/block), ceil(cols/block)]` f32 per-block
+                    reciprocal scales (DeepSeek `weight_scale_inv`).
+    * `block`     — square block edge (DeepSeek uses 128).
+
+    Mirrors `dequant_fp8_e4m3_blockwise` in `rust-engine/src/mla.rs`:
+    `out[r, c] = decode_e4m3(q[r, c]) * scale_inv[r // block, c // block]`.
+    """
+    import numpy as np
+
+    q_u8 = np.asarray(q_u8, dtype=np.uint8)
+    scale_inv = np.asarray(scale_inv, dtype=np.float32)
+    if q_u8.ndim != 2 or scale_inv.ndim != 2:
+        raise ValueError("dequant_fp8_e4m3_blockwise expects 2-D weight and scale arrays")
+    rows, cols = q_u8.shape
+    # `-(-x // y)` is integer ceiling division (avoids float round-trips
+    # and a `math` import).
+    want = (-(-rows // block), -(-cols // block))
+    if scale_inv.shape != want:
+        raise ValueError(
+            f"weight_scale_inv shape {scale_inv.shape} does not match the "
+            f"{want} block grid of a {rows}x{cols} weight (block={block})"
+        )
+    out = f8_e4m3_lut()[q_u8]
+    for br in range(want[0]):
+        r0 = br * block
+        r1 = min(r0 + block, rows)
+        for bc in range(want[1]):
+            c0 = bc * block
+            c1 = min(c0 + block, cols)
+            out[r0:r1, c0:c1] *= scale_inv[br, bc]
+    return out
+
+
+def _np_from_raw(dtype: str, raw: bytes, shape):
+    """Decode a raw safetensors buffer (`F32`/`F16`/`BF16`) to f32."""
+    import numpy as np
+
+    if dtype == "F32":
+        arr = np.frombuffer(raw, dtype=np.float32)
+    elif dtype == "F16":
+        arr = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
+    elif dtype == "BF16":
+        # BF16 is the high 16 bits of an F32; shifting left by 16 over a
+        # zeroed low half reconstructs the exact float value.
+        u16 = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
+        arr = (u16 << 16).view(np.float32)
+    else:
+        raise ValueError(f"unsupported safetensors dtype {dtype!r}")
+    return arr.reshape(shape).copy()
+
+
+class Fp8StateDict:
+    """Lazy state-dict view over an FP8 `safetensors` checkpoint.
+
+    Instantiating an FP8 DeepSeek checkpoint through
+    `AutoModelForCausalLM` requires a working fp8 quantisation backend
+    (and usually a GPU). This view instead reads the raw shards
+    directly — the 8-byte header-length prefix + JSON header layout is
+    trivial — and de-quantises any `F8_E4M3` tensor with its companion
+    `<name>_scale_inv` per-block scales on access. Non-FP8 tensors
+    (`F32`/`F16`/`BF16`, e.g. layernorms and the router gate) decode
+    straight to f32. Returned tensors are `torch.Tensor`s so the rest
+    of the extraction pipeline is unchanged.
+    """
+
+    def __init__(self, ckpt_dir: Path):
+        self.dir = Path(ckpt_dir)
+        # name -> (shard_path, dtype, shape, start, end); offsets are
+        # relative to the shard's data section (after the JSON header).
+        self._index: dict[str, tuple[Path, str, list[int], int, int]] = {}
+        shards = sorted(self.dir.glob("*.safetensors"))
+        if not shards:
+            raise FileNotFoundError(f"no .safetensors shards in {self.dir}")
+        for shard in shards:
+            for name, entry in self._read_header(shard).items():
+                self._index[name] = entry
+
+    @staticmethod
+    def _read_header(shard: Path) -> dict:
+        import struct
+
+        out = {}
+        with open(shard, "rb") as f:
+            (hlen,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(hlen))
+        data_base = 8 + hlen
+        for name, meta in header.items():
+            if name == "__metadata__":
+                continue
+            start, end = meta["data_offsets"]
+            out[name] = (shard, meta["dtype"], meta["shape"], data_base + start, data_base + end)
+        return out
+
+    def keys(self):
+        return self._index.keys()
+
+    def _raw(self, name: str) -> tuple[str, list[int], bytes]:
+        shard, dtype, shape, start, end = self._index[name]
+        with open(shard, "rb") as f:
+            f.seek(start)
+            raw = f.read(end - start)
+        return dtype, shape, raw
+
+    def get(self, name: str):
+        import numpy as np
+        import torch
+
+        if name not in self._index:
+            return None
+        dtype, shape, raw = self._raw(name)
+        if dtype == "F8_E4M3":
+            q = np.frombuffer(raw, dtype=np.uint8).reshape(shape)
+            scale_name = f"{name}_scale_inv"
+            if scale_name not in self._index:
+                raise KeyError(
+                    f"FP8 tensor {name!r} has no companion {scale_name!r}; "
+                    "cannot de-quantise"
+                )
+            s_dtype, s_shape, s_raw = self._raw(scale_name)
+            scale = _np_from_raw(s_dtype, s_raw, s_shape)
+            arr = dequant_fp8_e4m3_blockwise(q, scale, FP8_BLOCK)
+        else:
+            arr = _np_from_raw(dtype, raw, shape)
+        return torch.from_numpy(np.ascontiguousarray(arr))
+
+
+def resolve_checkpoint_dir(model: str) -> Path:
+    """Local checkpoint directory for `model` (a path or an HF repo id).
+
+    HF repo ids are materialised via `huggingface_hub.snapshot_download`
+    restricted to the `safetensors` shards + JSON sidecars the FP8 path
+    reads.
+    """
+    p = Path(model)
+    if p.is_dir():
+        return p
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(model, allow_patterns=["*.safetensors", "*.json"])
+    )
 
 
 def write_f32_matrix(path: Path, arr) -> None:
@@ -447,20 +639,20 @@ def main() -> int:
         )
         return 2
 
-    # DeepSeek-V3 ships FP8 block-quantised weights (companion
-    # `weight_scale_inv` tensors) that require FP8 de-quantisation this
-    # script does not implement, and the engine refuses to run DeepSeek
-    # (MLA + FP8 unimplemented). Fail fast rather than emit garbage.
-    if detect_fp8(config):
+    # DeepSeek-V3 ships FP8 block-quantised weights with companion
+    # `weight_scale_inv` tensors. The engine de-quantises these at load
+    # (MLA + FP8 are implemented in `rust-engine/src/mla.rs` /
+    # `model.rs`); this script mirrors that de-quantisation by reading
+    # the raw safetensors shards directly — no fp8 runtime backend (or
+    # GPU) needed.
+    is_fp8 = detect_fp8(config)
+    if is_fp8:
         print(
-            f"error: {args.model!r} ({arch!r}) is FP8 block-quantised; FP8 "
-            "de-quantisation is not implemented (companion `weight_scale_inv` "
-            "tensors cannot be applied). The tensor naming is understood, but "
-            "the engine cannot run DeepSeek-V3 yet (MLA + FP8 unimplemented). "
-            "Re-export a de-quantised (bf16/f16) checkpoint to extract it.",
+            f"{args.model!r} ({arch!r}) is FP8 block-quantised; de-quantising "
+            "expert tensors via the companion `weight_scale_inv` per-block "
+            f"scales (block={FP8_BLOCK}) while extracting.",
             file=sys.stderr,
         )
-        return 2
 
     schema = MOE_SCHEMAS[arch]
 
@@ -520,20 +712,27 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    # Load weights in fp32 on CPU. Mixtral-8x7B's full FFN is large
-    # (~88 GiB at fp32 across all 32 layers); for a single layer it
-    # fits in modest RAM.
-    print("loading model weights to CPU (this can take a while)...", file=sys.stderr)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-    )
+    # Load weights on CPU. FP8 checkpoints are read straight from their
+    # safetensors shards (lazy, de-quantised per tensor on access — see
+    # `Fp8StateDict`); everything else goes through the standard
+    # `transformers` fp32 instantiation. Mixtral-8x7B's full FFN is
+    # large (~88 GiB at fp32 across all 32 layers); for a single layer
+    # it fits in modest RAM.
+    if is_fp8:
+        print("opening FP8 safetensors shards (lazy, no model instantiation)...", file=sys.stderr)
+        sd = Fp8StateDict(resolve_checkpoint_dir(args.model))
+    else:
+        print("loading model weights to CPU (this can take a while)...", file=sys.stderr)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
 
-    # Walk the state dict for the requested layer(s)' experts, using the
-    # architecture's tensor-name schema (Mixtral `block_sparse_moe.*` vs
-    # Qwen3-MoE / DeepSeek `mlp.experts.{j}.{gate,up,down}_proj`).
-    sd = model.state_dict()
+        # Walk the state dict for the requested layer(s)' experts, using the
+        # architecture's tensor-name schema (Mixtral `block_sparse_moe.*` vs
+        # Qwen3-MoE / DeepSeek `mlp.experts.{j}.{gate,up,down}_proj`).
+        sd = model.state_dict()
 
     # Discover MoE layers present in the state dict, then resolve the
     # `--layer` spec (or legacy `--all-layers`) against them. The expert

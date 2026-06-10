@@ -26,10 +26,15 @@
 //!     └──────────────────┘                       └─────────────────────────────┘
 //! ```
 //!
-//! Planned wiring (follow-up PR): the `BatchScheduler` will consult
+//! Wiring: the `BatchScheduler`'s warm pre-pass consults the
 //! [`ShardRouter`] before issuing `Engine::warm_with`, so ids tagged
-//! `Local` stay on the existing NVMe path while `Remote` ids can
-//! surface structured remote-fetch failures instead of panicking.
+//! `Local` stay on the existing NVMe path while `Remote` ids are
+//! fetched through [`ShardRouter::fetch_remote`] and surface
+//! structured remote-fetch failures instead of panicking (see
+//! `BatchScheduler::spawn_with_shard_router`). Single-node
+//! deployments default to [`LocalShardRouter`]; the `[distributed]`
+//! config section builds an [`RpcShardRouter`] over the documented
+//! `id % num_nodes` placement.
 //!
 //! ## Zero-copy invariant
 //!
@@ -53,9 +58,9 @@
 //! Kubernetes-aware variant — without touching the predictor's
 //! Markov / locality / speculator arithmetic.
 
-// Scaffolding for future multi-node support. Most items are exposed
-// only via the public trait surface today; wiring this into the
-// scheduler hot path lands in a follow-up PR.
+// Some trait-surface items (e.g. the default `fetch_remote` impl and
+// error helpers) are exercised only by alternative ShardRouter
+// implementations and tests.
 #![allow(dead_code)]
 
 use std::future::Future;
@@ -389,10 +394,9 @@ pub struct RpcShardRouter {
 }
 
 impl RpcShardRouter {
-    /// Construct a router from a static placement map. Used today
-    /// only by tests; the real implementation will accept a
-    /// configuration source (e.g. an etcd watch) and refresh the map
-    /// behind an `ArcSwap`.
+    /// Construct a router from a static placement map. The real
+    /// implementation will accept a configuration source (e.g. an etcd
+    /// watch) and refresh the map behind an `ArcSwap`.
     pub fn new(
         placement: std::collections::HashMap<u32, NodeAddr>,
         default_timeout: Duration,
@@ -401,6 +405,38 @@ impl RpcShardRouter {
             placement: std::sync::Arc::new(placement),
             default_timeout,
         }
+    }
+
+    /// Build the documented `id % num_nodes` hash placement
+    /// ([`crate::rpc::shard_for_expert`]) over a mesh of `nodes`
+    /// (in shard order). Expert ids owned by `nodes[self_index]` are
+    /// **omitted** from the map so [`Self::route_expert`] tags them
+    /// `Local` and they stay on this node's NVMe path; every other id
+    /// maps to its owning peer's address.
+    ///
+    /// This is the constructor the `[distributed]` config section uses
+    /// at server startup.
+    pub fn from_modulo_placement(
+        nodes: &[String],
+        self_index: usize,
+        num_experts: u32,
+        default_timeout: Duration,
+    ) -> Self {
+        assert!(
+            self_index < nodes.len(),
+            "self_index ({self_index}) must be < nodes.len() ({})",
+            nodes.len()
+        );
+        let num_nodes = nodes.len() as u32;
+        let mut placement = std::collections::HashMap::new();
+        for id in 0..num_experts {
+            let shard = crate::rpc::shard_for_expert(id, num_nodes)
+                .expect("nodes.len() >= 1 checked above") as usize;
+            if shard != self_index {
+                placement.insert(id, NodeAddr(nodes[shard].clone()));
+            }
+        }
+        Self::new(placement, default_timeout)
     }
 
     /// **Free-function form** of the `tonic::Status` → [`ShardRouterError`]
@@ -640,5 +676,41 @@ mod tests {
         let inst = r.route_expert(42);
         assert!(inst.is_local());
         r.fetch_remote(&inst).await.expect("local passthrough");
+    }
+
+    #[test]
+    fn modulo_placement_keeps_own_shard_local_and_maps_peers() {
+        let nodes = vec![
+            "node-a:50051".to_string(),
+            "node-b:50051".to_string(),
+            "node-c:50051".to_string(),
+        ];
+        let r = RpcShardRouter::from_modulo_placement(&nodes, 1, 12, Duration::from_millis(50));
+        for id in 0..12u32 {
+            let inst = r.route_expert(id);
+            assert_eq!(inst.expert(), id);
+            let shard = (id % 3) as usize;
+            if shard == 1 {
+                assert!(inst.is_local(), "id {id} belongs to self_index 1 — must be Local");
+            } else {
+                match inst {
+                    ShardInstruction::Remote { node, timeout, .. } => {
+                        assert_eq!(node.0, nodes[shard]);
+                        assert_eq!(timeout, Duration::from_millis(50));
+                    }
+                    other => panic!("id {id} must be Remote, got {other:?}"),
+                }
+            }
+        }
+        // Ids past the configured namespace fall back to Local — the
+        // map only covers 0..num_experts.
+        assert!(r.route_expert(999).is_local());
+    }
+
+    #[test]
+    #[should_panic(expected = "self_index")]
+    fn modulo_placement_rejects_out_of_range_self_index() {
+        let nodes = vec!["node-a:50051".to_string(), "node-b:50051".to_string()];
+        let _ = RpcShardRouter::from_modulo_placement(&nodes, 2, 8, Duration::from_millis(50));
     }
 }
