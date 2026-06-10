@@ -865,8 +865,13 @@ impl GpuBackend {
         });
         let avail = weight_bytes.len().min(need);
         if avail == padded_len {
-            self.queue.write_buffer(&weight_buf, 0, &weight_bytes[..need]);
+            // Fast path: the source covers the full (already 4-byte-
+            // aligned) buffer, so write it directly without a copy.
+            self.queue.write_buffer(&weight_buf, 0, &weight_bytes[..padded_len]);
         } else {
+            // Source is short of `padded_len` — either `need` itself
+            // isn't a 4-byte multiple, or the buffer is within the
+            // one-page shortfall tolerance. Zero-fill the tail.
             let mut padded = Vec::with_capacity(padded_len);
             padded.extend_from_slice(&weight_bytes[..avail]);
             padded.resize(padded_len, 0);
