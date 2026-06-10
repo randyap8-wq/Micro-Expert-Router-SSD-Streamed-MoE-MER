@@ -1,6 +1,5 @@
 //! Math-backend module connecting GPU execution via wgpu and providing a CPU fallback.
 
-use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use anyhow::{anyhow, Result};
@@ -216,7 +215,13 @@ pub struct GpuBackend {
     softmax_bind_group: wgpu::BindGroup,
     attention_bind_group: wgpu::BindGroup,
 
-    conversion_scratch: UnsafeCell<Vec<f32>>,
+    /// f16→f32 staging scratch for buffer uploads. A real `Mutex` (not
+    /// `UnsafeCell`) so concurrent callers — e.g. two Tokio tasks that
+    /// share the same `Arc<GpuBackend>` when the batch scheduler fuses
+    /// requests — serialize instead of aliasing `&mut` into the same
+    /// buffer. The lock only covers a host-side convert + `write_buffer`
+    /// (microseconds), so contention is negligible.
+    conversion_scratch: ParkingMutex<Vec<f32>>,
 
     num_heads: usize,
     num_kv_heads: usize,
@@ -232,11 +237,6 @@ pub struct GpuBackend {
     /// Serializes the expert FFN path, which reuses shared staging buffers.
     expert_execution_lock: ParkingMutex<()>,
 }
-
-// SAFETY: GpuBackend is Sync and Send because the inference pipeline accesses
-// the conversion scratch exclusively in a single-threaded, non-reentrant fashion.
-unsafe impl Sync for GpuBackend {}
-unsafe impl Send for GpuBackend {}
 
 impl GpuBackend {
     pub async fn try_new(
@@ -543,7 +543,7 @@ impl GpuBackend {
             ],
         });
 
-        let conversion_scratch = UnsafeCell::new(vec![0.0f32; MAX_ELEM]);
+        let conversion_scratch = ParkingMutex::new(vec![0.0f32; MAX_ELEM]);
 
         Ok(Self {
             device,
@@ -758,8 +758,7 @@ impl GpuBackend {
         debug_assert_eq!(out.data.len(), d_model);
 
         // ── Upload x to work_a ────────────────────────────────────────────────
-        // SAFETY: conversion_scratch single-writer non-reentrant invariant.
-        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        let mut scratch = self.conversion_scratch.lock();
         assert!(d_model <= scratch.len());
         for i in 0..d_model {
             scratch[i] = x.data[i].to_f32();
@@ -873,8 +872,7 @@ impl Backend for GpuBackend {
         let b_len = b.data.len();
         let out_len = out.rows * out.cols;
 
-        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
-        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        let mut scratch = self.conversion_scratch.lock();
         assert!(a_len <= scratch.len());
         assert!(b_len <= scratch.len());
         assert!(out_len <= scratch.len());
@@ -950,8 +948,7 @@ impl Backend for GpuBackend {
         assert_eq!(up.data.len(), len);
         assert_eq!(out_len, len);
 
-        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
-        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        let mut scratch = self.conversion_scratch.lock();
         assert!(len <= scratch.len());
 
         // Upload gate
@@ -1018,8 +1015,7 @@ impl Backend for GpuBackend {
     fn softmax(&self, x: &mut TensorViewMut) -> Result<()> {
         let len = x.data.len();
 
-        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
-        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        let mut scratch = self.conversion_scratch.lock();
         assert!(len <= scratch.len());
 
         // Upload x
@@ -1087,8 +1083,7 @@ impl Backend for GpuBackend {
         let k_len = k.data.len();
         let v_len = v.data.len();
 
-        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
-        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        let mut scratch = self.conversion_scratch.lock();
         assert!(k_len <= scratch.len());
         assert!(v_len <= scratch.len());
 
@@ -1127,8 +1122,7 @@ impl Backend for GpuBackend {
         let q_len = q.data.len();
         let out_len = out.rows * out.cols;
 
-        // SAFETY: conversion_scratch is accessed during single-threaded, non-reentrant forward pass.
-        let scratch = unsafe { &mut *self.conversion_scratch.get() };
+        let mut scratch = self.conversion_scratch.lock();
         assert!(q_len <= scratch.len());
         assert!(out_len <= scratch.len());
 

@@ -1876,7 +1876,18 @@ impl Engine {
 
     /// Process a single token: route, fetch missing experts, run inference,
     /// update predictor, and kick off prefetches. Returns one [`CycleStats`].
-    pub async fn generate(self: &Arc<Self>, token_idx: u64) -> CycleStats {
+    ///
+    /// Returns `Err(ExpertReadError)` when a routed expert cannot be
+    /// fetched even after retries (corrupt file, persistent I/O error,
+    /// or a starved buffer pool). This path has no per-expert "skip"
+    /// option (unlike [`Self::moe_step`], which drops a failed expert
+    /// from the top-K mixture), so the only safe degradation is to
+    /// surface the error to the caller — the HTTP serving path maps it
+    /// to a 500 instead of crashing the process.
+    pub async fn generate(
+        self: &Arc<Self>,
+        token_idx: u64,
+    ) -> Result<CycleStats, ExpertReadError> {
         let cycle_start = Instant::now();
         // Compute the residual-stream hidden state up front. The
         // production `Router::Linear` path needs it to compute the
@@ -1928,8 +1939,10 @@ impl Engine {
         let io_wait_start = Instant::now();
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
         let mut cache_hits_per_expert: Vec<bool> = vec![false; target.len()];
-        let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
-            Vec::new();
+        let mut miss_handles: Vec<(
+            usize,
+            tokio::task::JoinHandle<Result<Arc<ExpertResident>, ExpertReadError>>,
+        )> = Vec::new();
         // VRAM (GPU) tier — aggregate hits/misses across this routing
         // decision and record once, rather than incrementing Prometheus
         // counters per activation on the hot path.
@@ -2000,11 +2013,13 @@ impl Engine {
         }
         let had_misses = !miss_handles.is_empty();
         for (i, h) in miss_handles {
-            // `fetch` panics on a fatal read error (the engine cannot
-            // make progress without the requested expert); propagate by
-            // unwrapping the `JoinError` so the panic surfaces exactly
-            // as it did before this was made concurrent.
-            let r = h.await.expect("expert fetch task panicked");
+            // `fetch` reports a fatal read error as `Err` (the engine
+            // cannot make progress without the requested expert);
+            // propagate it to the caller instead of crashing the
+            // process. The outer `expect` only covers a *panicked*
+            // fetch task (a bug, not an I/O failure), preserving the
+            // pre-concurrency panic-propagation semantics for that case.
+            let r = h.await.expect("expert fetch task panicked")?;
             // We still account the per-call `stats.bytes_read` here
             // for the synthetic-benchmark accumulator (it tracks
             // logical bytes consumed, not bytes actually pulled
@@ -2041,9 +2056,15 @@ impl Engine {
                 m.record_ssd_stall(io_wait_us as f64 / 1_000_000.0);
             }
         }
+        // Benchmark-path-only invariant (`Engine::generate`; the real
+        // serving path is `moe_step`, which uses `try_fetch_with_skip`
+        // and never reaches this): every slot was populated above by
+        // either a cache hit or a successfully-joined miss fetch — a
+        // failed fetch already returned `Err` before this point, so an
+        // empty slot here is a control-flow bug, not an I/O failure.
         let residents: Vec<Arc<ExpertResident>> = residents
             .into_iter()
-            .map(|r| r.expect("internal invariant: every routed expert slot must be populated by either a hit or a completed miss fetch"))
+            .map(|r| r.expect("internal invariant (benchmark path): every routed expert slot must be populated by either a hit or a completed miss fetch"))
             .collect();
 
         // 2) Either run the real SwiGLU FFN, or — under `--io-only` —
@@ -2260,23 +2281,23 @@ impl Engine {
         self.metrics.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
         self.metrics.tokens_processed.fetch_add(1, Ordering::Relaxed);
 
-        stats
+        Ok(stats)
     }
 
-    async fn fetch(self: &Arc<Self>, id: u32) -> Arc<ExpertResident> {
+    async fn fetch(self: &Arc<Self>, id: u32) -> Result<Arc<ExpertResident>, ExpertReadError> {
         match self.fetch_with_retry(id).await {
-            Ok(r) => r,
+            Ok(r) => Ok(r),
             Err(e) => {
                 // Critical-path miss could not be satisfied even after
-                // retries. Surfacing the error as a panic preserves
-                // the engine's prior crash semantics for the synthetic
-                // benchmark path (`Engine::generate`), which has no
-                // upstream "skip this expert" option. The real-
-                // transformer path uses [`Self::moe_step`] which
+                // retries. Surface the error to the caller —
+                // `Engine::generate` propagates it as
+                // `Err(ExpertReadError)` so the HTTP serving path can
+                // return a 500 instead of crashing the process. The
+                // real-transformer path uses [`Self::moe_step`] which
                 // calls [`Self::try_fetch_with_skip`] instead, so a
-                // single corrupt expert no longer kills the process.
+                // single corrupt expert never kills the process either.
                 warn!(expert = id, error = %e, "fatal: expert fetch failed after retries");
-                panic!("failed to read expert {id}: {e}");
+                Err(e)
             }
         }
     }
@@ -3920,7 +3941,7 @@ mod tests {
         let mut total_misses = 0u64;
         let mut total_bytes = 0u64;
         for t in 0..tokens {
-            let s = engine.generate(t).await;
+            let s = engine.generate(t).await.expect("generate should succeed");
             total_hits += s.hits;
             total_misses += s.misses;
             total_bytes += s.bytes_read;
@@ -3999,7 +4020,7 @@ mod tests {
         assert!(engine.core.cache.contains(7));
 
         // Subsequent generate calls now have warmed slots to hit.
-        let _ = engine.generate(0).await;
+        let _ = engine.generate(0).await.expect("generate should succeed");
         // After at least one token, the per-token cycle histogram must
         // have recorded a sample.
         let r = engine.report();
@@ -4101,7 +4122,7 @@ mod tests {
         let engine = build_engine(&dir.path, num_experts, 16, 32, cache_slots, 2, 2, 7);
 
         for t in 0..50 {
-            let _ = engine.generate(t).await;
+            let _ = engine.generate(t).await.expect("generate should succeed");
             // Residency must NEVER exceed the configured cache capacity,
             // even mid-stream — this is the actual invariant the test
             // name promises. Asserting after every token catches a class
@@ -4181,7 +4202,7 @@ mod tests {
         // so after several tokens the locality monitor will see repeated
         // ids and start pinning them.
         for t in 0..32u64 {
-            let _ = engine.generate(t).await;
+            let _ = engine.generate(t).await.expect("generate should succeed");
         }
         let pinned = engine.core.cache.pinned_count();
         assert!(
@@ -4231,7 +4252,7 @@ mod tests {
             )
         };
         for t in 0..50u64 {
-            let _ = engine.generate(t).await;
+            let _ = engine.generate(t).await.expect("generate should succeed");
         }
         let tele = engine.predictive_telemetry();
         assert!(
@@ -4256,7 +4277,7 @@ mod tests {
             &dir.path, num_experts, d_model, d_ff, cache_slots, top_k, predict_fanout, 0xDEADBEEF,
         );
         for t in 0..16u64 {
-            let _ = engine.generate(t).await;
+            let _ = engine.generate(t).await.expect("generate should succeed");
         }
         let tele = engine.predictive_telemetry();
         // With a 2-slot cache and 8 experts at top-k=2, we expect to
@@ -4302,7 +4323,7 @@ mod tests {
         let mut total_fetches: u64 = 0;
         let mut total_prefetch: u64 = 0;
         for t in 0..N {
-            let s = engine.generate(t).await;
+            let s = engine.generate(t).await.expect("generate should succeed");
             let per_token = s.hits + s.misses;
             assert_eq!(
                 per_token, TOP_K as u64,

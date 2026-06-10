@@ -424,6 +424,10 @@ fn flatten_messages(messages: &[ChatMessage]) -> String {
 pub enum GenerateError {
     Tokenizer(String),
     InvalidRequest(String),
+    /// A routed expert could not be read from storage even after
+    /// retries (legacy benchmark path). Maps to a 500 — the request
+    /// fails, the process survives.
+    ExpertRead(String),
 }
 
 impl std::fmt::Display for GenerateError {
@@ -431,6 +435,7 @@ impl std::fmt::Display for GenerateError {
         match self {
             GenerateError::Tokenizer(m) => write!(f, "tokenizer error: {m}"),
             GenerateError::InvalidRequest(m) => write!(f, "invalid request: {m}"),
+            GenerateError::ExpertRead(m) => write!(f, "expert read error: {m}"),
         }
     }
 }
@@ -592,7 +597,11 @@ async fn generate(
             .unwrap_or(0)
             .wrapping_add(params.seed as u32) as u64;
         for i in 0..max_tokens {
-            let stats = state.engine.generate(base.wrapping_add(i as u64)).await;
+            let stats = state
+                .engine
+                .generate(base.wrapping_add(i as u64))
+                .await
+                .map_err(|e| GenerateError::ExpertRead(e.to_string()))?;
             hits_total += stats.hits;
             misses_total += stats.misses;
             // Map engine cycle stats to a deterministic next-token id.
@@ -1038,8 +1047,23 @@ async fn stream_tokens(
                 n
             }
             GenMode::Legacy { base, i } => {
-                let stats = st.state.engine.generate(base.wrapping_add(*i)).await;
-                let _ = stats;
+                match st.state.engine.generate(base.wrapping_add(*i)).await {
+                    Ok(stats) => {
+                        let _ = stats;
+                    }
+                    Err(e) => {
+                        // A routed expert could not be read even after
+                        // retries. Terminate the stream cleanly instead
+                        // of crashing the process: emit a final
+                        // `finished` chunk so the client sees EOS.
+                        tracing::warn!(error = %e, "legacy stream: expert read failed; ending stream");
+                        st.finished_emitted = true;
+                        return Some((
+                            StreamChunk { text: String::new(), finished: true, hits: 0, misses: 0 },
+                            st,
+                        ));
+                    }
+                }
                 let vocab = st.state.tokenizer.vocab_size().max(1) as u64;
                 let id = ((base.wrapping_add(*i).wrapping_mul(0x9E3779B97F4A7C15)) % vocab) as u32;
                 *i = i.wrapping_add(1);
@@ -1288,6 +1312,7 @@ fn error_response(e: GenerateError) -> Response {
     let (status, kind) = match &e {
         GenerateError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
         GenerateError::Tokenizer(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+        GenerateError::ExpertRead(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
     };
     (
         status,
