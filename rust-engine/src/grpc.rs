@@ -174,7 +174,9 @@ impl<B: ShardCompute> ExpertShard for ExpertShardService<B> {
                     row.len()
                 )));
             }
-            ffn_out_f16.extend_from_slice(&pack_f16_bytes(row));
+            for &v in row {
+                ffn_out_f16.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+            }
         }
 
         Ok(Response::new(PbRouteResponse {
