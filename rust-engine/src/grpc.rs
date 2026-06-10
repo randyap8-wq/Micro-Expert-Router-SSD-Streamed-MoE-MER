@@ -357,7 +357,7 @@ pub async fn probe_remote(
 mod tests {
     use super::*;
     use crate::rpc::{pack_hidden_state, unpack_hidden_state};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use tonic::transport::server::TcpIncoming;
 
     /// Deterministic backend: each expert scales the hidden state by
     /// `(expert_id + 1)`, so the test can assert per-expert routing and
@@ -385,28 +385,32 @@ mod tests {
     }
 
     /// Bind an ephemeral port and return both the chosen `SocketAddr`
-    /// and the listener-backed incoming stream, so the server and the
-    /// client agree on the port with no race.
-    async fn ephemeral_addr() -> SocketAddr {
+    /// and the bound listener, so the server adopts the exact socket the
+    /// client will dial. Holding the listener until tonic starts serving
+    /// it eliminates the drop-and-rebind race on the port.
+    async fn ephemeral_addr() -> (SocketAddr, tokio::net::TcpListener) {
         // Port 0 lets the OS choose a free port; we read it back.
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let _ = NEXT.fetch_add(1, Ordering::Relaxed);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
-        addr
+        (addr, listener)
     }
 
-    async fn spawn_server(addr: SocketAddr) -> tokio::sync::oneshot::Sender<()> {
+    async fn spawn_server(listener: tokio::net::TcpListener) -> tokio::sync::oneshot::Sender<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        // Adopt the already-bound listener so the port reservation is
+        // held continuously; queued connections succeed even before the
+        // server task starts polling `accept`, so no warm-up sleep is
+        // needed.
+        let incoming =
+            TcpIncoming::from_listener(listener, true, None).expect("listener -> incoming");
         tokio::spawn(async move {
-            let _ = serve_with_shutdown(addr, ScaleBackend, async move {
-                let _ = rx.await;
-            })
-            .await;
+            let _ = Server::builder()
+                .add_service(ExpertShardServer::new(ExpertShardService::new(ScaleBackend)))
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = rx.await;
+                })
+                .await;
         });
-        // Give the server a moment to bind.
-        tokio::time::sleep(Duration::from_millis(150)).await;
         tx
     }
 
@@ -429,8 +433,8 @@ mod tests {
 
     #[tokio::test]
     async fn route_experts_roundtrip_over_grpc() {
-        let addr = ephemeral_addr().await;
-        let shutdown = spawn_server(addr).await;
+        let (addr, listener) = ephemeral_addr().await;
+        let shutdown = spawn_server(listener).await;
 
         let node = NodeAddr(addr.to_string());
         let mut client = ShardClient::connect(&node).await.expect("connect");
@@ -460,8 +464,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_probe_succeeds_against_live_shard() {
-        let addr = ephemeral_addr().await;
-        let shutdown = spawn_server(addr).await;
+        let (addr, listener) = ephemeral_addr().await;
+        let shutdown = spawn_server(listener).await;
         let node = NodeAddr(addr.to_string());
 
         let mut client = ShardClient::connect(&node).await.expect("connect");
