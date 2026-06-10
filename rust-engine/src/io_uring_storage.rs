@@ -1101,7 +1101,7 @@ mod tests {
         assert_eq!(n, expert_size);
 
         // Cross-check against a raw `pread`: byte-identical content.
-        let path = tmp.join("expert_0000.bin");
+        let path = tmp.join("expert_0.bin");
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(&raw[..], buf.as_slice());
 

@@ -22,10 +22,13 @@
 //           there are no write conflicts in shared_out.
 //   Step 4: Thread 0 updates running (run_m, run_d).
 //
-// Push constants: {num_heads, head_dim, seq_len, layer_offset: u32}
-// KV layout: [layer][kv=0(K)/kv=1(V)][seq_pos][kv_dim] stored as f32.
-//   K base for position t: f32_off + t * kv_dim + h * head_dim
-//   V base for position t: f32_off + MAX_SEQ_LEN * kv_dim + t * kv_dim + h * head_dim
+// Push constants: {num_heads, num_kv_heads, head_dim, seq_len, layer_offset: u32}
+// layer_offset is in f32 *elements* (not bytes).
+// KV layout: [layer][kv=0(K)/kv=1(V)][seq_pos][kv_dim] stored as f32, where
+// kv_dim = num_kv_heads * head_dim (GQA: query head h reads kv head
+// kv_h = h * num_kv_heads / num_heads).
+//   K base for position t: f32_off + t * kv_dim + kv_h * head_dim
+//   V base for position t: f32_off + MAX_SEQ_LEN * kv_dim + t * kv_dim + kv_h * head_dim
 //
 // MAX_SEQ_LEN and MAX_HEAD_DIM are replaced by GpuBackend::try_new() before
 // shader compilation; the literals here are defaults that must not be used
@@ -33,6 +36,7 @@
 
 struct PushConstants {
     num_heads:    u32,
+    num_kv_heads: u32,
     head_dim:     u32,
     seq_len:      u32,
     layer_offset: u32,
@@ -92,8 +96,10 @@ fn attention_main(
     }
     workgroupBarrier();
 
-    let kv_dim    = pc.num_heads * pc.head_dim;
-    let f32_off   = pc.layer_offset / 4u;
+    let kv_dim    = pc.num_kv_heads * pc.head_dim;
+    // GQA mapping: query head h attends through kv head kv_h.
+    let kv_h      = h * pc.num_kv_heads / pc.num_heads;
+    let f32_off   = pc.layer_offset;
     let scale     = 1.0 / sqrt(f32(pc.head_dim));
     let num_tiles = (pc.seq_len + WG - 1u) / WG;
 
@@ -111,7 +117,7 @@ fn attention_main(
         var s = -3.402823e+38;
         if valid {
             s = 0.0;
-            let key_off = f32_off + t * kv_dim + h * pc.head_dim;
+            let key_off = f32_off + t * kv_dim + kv_h * pc.head_dim;
             for (var j = 0u; j < pc.head_dim; j++) {
                 s += Q[h * pc.head_dim + j] * KV[key_off + j];
             }
@@ -173,7 +179,7 @@ fn attention_main(
                 let v_off = f32_off
                           + MAX_SEQ_LEN * kv_dim    // jump past K slice
                           + t_abs * kv_dim           // seq position stride
-                          + h * pc.head_dim          // head offset
+                          + kv_h * pc.head_dim       // kv-head offset (GQA)
                           + j;                       // element index
                 v_acc += w * KV[v_off];
             }

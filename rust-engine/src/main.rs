@@ -717,6 +717,7 @@ fn install_run_gpu_backend() -> Option<Arc<crate::expert_cache::GpuExpertCache>>
         1, // num_layers
         1, // max_seq_len
         1, // num_heads
+        1, // num_kv_heads
         1, // head_dim
         gpu_expert_cache.clone(),
     );
@@ -886,6 +887,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let num_layers = cfg.model.num_layers;
         let max_seq_len = if cfg.real_transformer.window_size == 0 { 4096 } else { cfg.real_transformer.window_size };
         let num_heads = cfg.real_transformer.num_heads;
+        let num_kv_heads = if cfg.real_transformer.num_kv_heads == 0 {
+            num_heads
+        } else {
+            cfg.real_transformer.num_kv_heads
+        };
         let head_dim = if cfg.real_transformer.head_dim == 0 {
             if num_heads > 0 { cfg.model.d_model / num_heads } else { 64 }
         } else {
@@ -895,6 +901,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             num_layers,
             max_seq_len,
             num_heads,
+            num_kv_heads,
             head_dim,
             gpu_expert_cache.clone(),
         );

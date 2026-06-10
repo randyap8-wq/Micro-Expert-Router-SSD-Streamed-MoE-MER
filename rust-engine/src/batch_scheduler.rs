@@ -1051,9 +1051,10 @@ async fn scheduler_loop(
                     }
                 }
                 PressureLevel::High => {
-                    if speculation.is_suspended() {
-                        speculation.resume();
-                    }
+                    // Note: speculation stays suspended (if it was) until
+                    // pressure returns to Normal — resuming at >90%
+                    // utilisation would oscillate the pool straight back
+                    // into Critical.
                     let reclaimed = run_idle_eviction(
                         &sessions,
                         cfg.idle_eviction_threshold,

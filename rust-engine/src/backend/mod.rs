@@ -124,8 +124,12 @@ struct SoftmaxPushConstants {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct AttentionPushConstants {
     num_heads: u32,
+    num_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
+    /// Offset of this layer's K slice in the KV buffer, in **f32
+    /// elements** (not bytes — a byte offset would overflow u32 for
+    /// deep models with large KV slices).
     layer_offset: u32,
 }
 
@@ -215,6 +219,7 @@ pub struct GpuBackend {
     conversion_scratch: UnsafeCell<Vec<f32>>,
 
     num_heads: usize,
+    num_kv_heads: usize,
     head_dim: usize,
 
     /// VRAM buffers for hot experts. Keyed by expert_id. Populated lazily
@@ -238,9 +243,12 @@ impl GpuBackend {
         num_layers: usize,
         max_seq_len: usize,
         num_heads: usize,
+        num_kv_heads: usize,
         head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     ) -> Result<Self> {
+        // GQA models have num_kv_heads < num_heads; 0 means MHA.
+        let num_kv_heads = if num_kv_heads == 0 { num_heads } else { num_kv_heads };
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -386,7 +394,9 @@ impl GpuBackend {
             bind_group_layouts: &[&layout_3_buffers],
             push_constant_ranges: &[wgpu::PushConstantRange {
                 stages: wgpu::ShaderStages::COMPUTE,
-                range: 0..16,
+                // 5 × u32 = 20 bytes; padded to the 32-byte limit
+                // requested in `required_limits`.
+                range: 0..32,
             }],
         });
 
@@ -477,8 +487,9 @@ impl GpuBackend {
             mapped_at_creation: false,
         });
 
-        // KV cache
-        let kv_dim = num_heads * head_dim;
+        // KV cache — stride is the *KV* width (num_kv_heads × head_dim),
+        // which is narrower than the query width for GQA models.
+        let kv_dim = num_kv_heads * head_dim;
         let kv_cache_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_cache"),
             size: (num_layers * 2 * max_seq_len * kv_dim * 4) as u64,
@@ -556,6 +567,7 @@ impl GpuBackend {
             attention_bind_group,
             conversion_scratch,
             num_heads,
+            num_kv_heads,
             head_dim,
             vram_expert_bufs: ParkingMutex::new(std::collections::HashMap::new()),
             gpu_expert_cache,
@@ -1127,11 +1139,21 @@ impl Backend for GpuBackend {
         self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..q_len]));
 
         // Dispatch
+        // Pass the layer offset in f32 *elements*: a byte offset cast to
+        // u32 silently wraps past 4 GiB for deep models with large KV
+        // slices. Guard the (4× larger) element range explicitly.
+        let layer_off_elems = self.kv_cache.offset_bytes(layer, 0, 0) / 4;
+        if layer_off_elems > u32::MAX as u64 {
+            return Err(anyhow!(
+                "KV layer offset {layer_off_elems} elements exceeds u32 push-constant range"
+            ));
+        }
         let pcs = AttentionPushConstants {
             num_heads: self.num_heads as u32,
+            num_kv_heads: self.num_kv_heads as u32,
             head_dim: self.head_dim as u32,
             seq_len: seq_len as u32,
-            layer_offset: self.kv_cache.offset_bytes(layer, 0, 0) as u32,
+            layer_offset: layer_off_elems as u32,
         };
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1376,10 +1398,11 @@ impl BackendBox {
         num_layers: usize,
         max_seq_len: usize,
         num_heads: usize,
+        num_kv_heads: usize,
         head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     ) -> Self {
-        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, head_dim, gpu_expert_cache).await {
+        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, num_kv_heads, head_dim, gpu_expert_cache).await {
             Ok(gpu) => BackendBox::Gpu(gpu),
             Err(e) => {
                 tracing::warn!(reason = %e, "GPU init failed — activating CPU fallback");
@@ -1392,6 +1415,7 @@ impl BackendBox {
         num_layers: usize,
         max_seq_len: usize,
         num_heads: usize,
+        num_kv_heads: usize,
         head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     ) -> Self {
@@ -1399,6 +1423,7 @@ impl BackendBox {
             num_layers,
             max_seq_len,
             num_heads,
+            num_kv_heads,
             head_dim,
             gpu_expert_cache,
         ))

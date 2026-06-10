@@ -101,6 +101,41 @@ pub struct SessionStore {
 
 pub type SessionCheckoutToken = u64;
 
+/// RAII receipt for an in-flight session checkout returned by
+/// [`SessionStore::take`]. Holding it proves ownership of the
+/// session's `in_flight` marker; passing it back to
+/// [`SessionStore::put`] releases the marker and reinserts the state.
+///
+/// If the guard is **dropped without** `put` — e.g. the request task
+/// was cancelled because the HTTP client disconnected mid-generation —
+/// the `Drop` impl clears the in-flight marker so the session id does
+/// not stay locked forever (the checked-out KV state is lost with the
+/// cancelled task, but the id remains usable for fresh sessions).
+pub struct SessionCheckout {
+    in_flight: Arc<DashMap<String, u64>>,
+    id: String,
+    token: SessionCheckoutToken,
+    armed: bool,
+}
+
+impl SessionCheckout {
+    /// The raw token value (diagnostics only).
+    #[allow(dead_code)]
+    pub fn token(&self) -> SessionCheckoutToken {
+        self.token
+    }
+}
+
+impl Drop for SessionCheckout {
+    fn drop(&mut self) {
+        if self.armed {
+            // Only clear the marker if we still own it (a concurrent
+            // path may have already replaced or removed it).
+            self.in_flight.remove_if(&self.id, |_, v| *v == self.token);
+        }
+    }
+}
+
 impl SessionStore {
     /// `ttl == 0` disables time-based eviction (sessions live until
     /// `delete` is called explicitly).
@@ -125,9 +160,11 @@ impl SessionStore {
 
     /// Atomically remove and return the session state for `id`. The
     /// caller is expected to call [`Self::put`] with the returned
-    /// checkout token when finished so the session resumes on the next
-    /// request. Returns `None` when no session with that id exists.
-    pub fn take(&self, id: &str) -> Option<(SessionState, SessionCheckoutToken)> {
+    /// checkout guard when finished so the session resumes on the next
+    /// request. If the guard is dropped without `put` (request
+    /// cancelled), the in-flight marker is released automatically.
+    /// Returns `None` when no session with that id exists.
+    pub fn take(&self, id: &str) -> Option<(SessionState, SessionCheckout)> {
         // Reject takes for ids that have an outstanding tombstone:
         // a concurrent `delete` already decided this session is
         // gone, and serving its state to a new request would
@@ -146,45 +183,49 @@ impl SessionStore {
                 return None;
             }
         }
-        let removed = self.inner.remove(id).map(|(_, mut s)| {
-            s.last_used = Instant::now();
-            s
-        });
-        match removed {
-            Some(mut state) => {
+        // From here on the guard owns the marker: every early return
+        // drops it, which clears the in-flight entry.
+        let guard = SessionCheckout {
+            in_flight: self.in_flight.clone(),
+            id: key,
+            token,
+            armed: true,
+        };
+        match self.inner.remove(id) {
+            Some((_, mut state)) => {
                 if self.tombstones.contains_key(id) {
                     state.zeroize_in_place();
-                    if self.in_flight.get(id).map(|v| *v == token).unwrap_or(false) {
-                        self.in_flight.remove(id);
-                    }
                     return None;
                 }
-                Some((state, token))
+                Some((state, guard))
             }
-            None => {
-                if self.in_flight.get(id).map(|v| *v == token).unwrap_or(false) {
-                    self.in_flight.remove(id);
-                }
-                None
-            }
+            None => None,
         }
     }
 
     /// Reinsert a session — typically after a request has consumed
-    /// `take` and produced new tokens. `checkout` must be the token
+    /// `take` and produced new tokens. `checkout` must be the guard
     /// returned by `take` for this in-flight session; use `None` when
     /// storing a fresh session that was not checked out from the store.
     pub fn put(
         &self,
         id: String,
         mut state: SessionState,
-        checkout: Option<SessionCheckoutToken>,
+        checkout: Option<SessionCheckout>,
     ) {
         // Returning an in-flight checkout must prove ownership of the
         // current marker. Callers that did not successfully `take`
         // pass `None` and must not clear another request's marker.
-        if let Some(token) = checkout {
-            let owns_marker = self.in_flight.get(&id).map(|v| *v == token).unwrap_or(false);
+        let was_checked_out = checkout.is_some();
+        if let Some(mut guard) = checkout {
+            // `put` takes over marker management from here; disarm the
+            // guard so its `Drop` doesn't race with the logic below.
+            guard.armed = false;
+            let owns_marker = self
+                .in_flight
+                .get(&id)
+                .map(|v| *v == guard.token)
+                .unwrap_or(false);
             if !owns_marker {
                 state.zeroize_in_place();
                 return;
@@ -192,7 +233,7 @@ impl SessionStore {
             self.in_flight.remove(&id);
         }
         if self.tombstones.contains_key(&id) {
-            if checkout.is_some() {
+            if was_checked_out {
                 self.tombstones.remove(&id);
             }
             // A `delete` arrived while this id was in flight. Honour

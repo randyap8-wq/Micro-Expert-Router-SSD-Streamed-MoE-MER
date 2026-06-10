@@ -480,7 +480,7 @@ pub struct PredictiveConfig {
 fn default_locality_window() -> usize { 256 }
 fn default_locality_threshold() -> f32 { 0.10 }
 fn default_speculator_hidden() -> usize { 128 }
-fn default_affinity_neighbors_k() -> usize { 2 }
+fn default_affinity_neighbors_k() -> usize { 4 }
 fn default_affinity_decay_epoch() -> u64 { 100_000 }
 
 impl Default for PredictiveConfig {
@@ -738,6 +738,14 @@ impl Config {
         }
         // [distributed] validation — only meaningful when enabled.
         if self.distributed.enabled {
+            if !self.real_transformer.enabled {
+                return Err(ConfigError::Invalid(
+                    "distributed.enabled requires real_transformer.enabled = true \
+                     (expert sharding is wired through the batch scheduler, which \
+                     only runs with the real transformer)"
+                        .into(),
+                ));
+            }
             if self.distributed.nodes.len() < 2 {
                 return Err(ConfigError::Invalid(format!(
                     "distributed.nodes must list at least 2 nodes when enabled \

@@ -535,7 +535,7 @@ fn parse_http_base(url_base: &str) -> Result<(String, String, String), Box<dyn s
             format!("{host}:{port_str}"),
             authority.to_string(),
         ),
-        _ => (format!("{authority}:80"), authority.to_string()),
+        _ => (format!("{authority}:8080"), authority.to_string()),
     };
 
     let request_path = format!(

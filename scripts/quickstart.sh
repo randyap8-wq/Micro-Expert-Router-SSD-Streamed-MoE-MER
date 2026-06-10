@@ -19,7 +19,7 @@ D_FF="${D_FF:-2048}"
 
 mkdir -p "$DATA_DIR"
 
-if [ ! -f "$DATA_DIR/expert_0000.bin" ]; then
+if [ ! -f "$DATA_DIR/expert_0.bin" ]; then
   echo ">> Generating ${NUM_EXPERTS} synthetic experts in ${DATA_DIR}"
   ( cd "$ROOT/rust-engine" && cargo run --release -- gen-data \
       --data-dir "$DATA_DIR" \
