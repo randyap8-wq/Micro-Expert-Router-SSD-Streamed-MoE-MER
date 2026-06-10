@@ -836,13 +836,16 @@ impl GpuBackend {
             d_ff, MAX_EXPERT_D_FF
         );
 
-        let blocks_per_proj = d_ff
+        // `checked_mul` guards against `usize` overflow on user-configurable
+        // dims; the division is exact (block alignment is enforced above and
+        // `Q4_0_BLOCK_ELEMS` is a nonzero constant).
+        let proj_elems = d_ff
             .checked_mul(d_model)
-            .and_then(|elems| elems.checked_div(Q4_0_BLOCK_ELEMS))
             .ok_or_else(|| anyhow::anyhow!(
                 "Q4_0 expert shape overflow: d_ff={} d_model={}",
                 d_ff, d_model
             ))?;
+        let blocks_per_proj = proj_elems / Q4_0_BLOCK_ELEMS;
         let proj_bytes = blocks_per_proj
             .checked_mul(Q4_0_BLOCK_BYTES)
             .ok_or_else(|| anyhow::anyhow!(
