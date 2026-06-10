@@ -1456,11 +1456,11 @@ impl Engine {
     /// Whether the configured expert dtype is eligible for the GPU
     /// `Backend::expert_matmul` fast path. F32 always qualifies. Q4_0
     /// qualifies only when both `d_model` and `d_ff` are
-    /// Q4_0-block-aligned: the promotion-time dequant in
-    /// [`Engine::install_gpu_cache`] then produces a tight F32 weight
-    /// stream (`[gate || up || down]`) with no inter-tensor padding,
-    /// exactly what the GPU SwiGLU kernels expect. All other dtypes
-    /// stay on the CPU path.
+    /// Q4_0-block-aligned: the raw block stream then has every matrix
+    /// row starting on a 32-element block boundary, which is what the
+    /// inline-dequant GEMV shader (`matmul_q4_0.wgsl`) assumes when it
+    /// walks `k / 32` blocks per row. All other dtypes stay on the
+    /// CPU path.
     fn gpu_eligible_dtype(&self) -> bool {
         match self.core.options.dtype {
             WeightDtype::F32 => true,
@@ -1486,10 +1486,12 @@ impl Engine {
     /// the *next* dispatch of the same expert hits the GPU fast path
     /// instead.
     ///
-    /// The byte conversion mirrors the background task exactly: Q4_0
-    /// experts are dequantised to a tight F32 stream (the GPU SwiGLU
-    /// kernels operate on F32 weights) before landing in VRAM, while
-    /// F32 experts are promoted byte-for-byte. The synchronous path
+    /// The byte handling mirrors the background task exactly: both
+    /// F32 and Q4_0 experts are promoted byte-for-byte — Q4_0 bytes
+    /// stay in native GGUF blocks (~8× smaller than F32) and are
+    /// dequantised *inline on the GPU* by the `matmul_q4_0.wgsl`
+    /// pipeline; the resident is dtype-tagged so the backend picks
+    /// the right pipeline. The synchronous path
     /// uses [`GpuExpertCache::try_promote_lru_no_evict`] so it never
     /// evicts already-resident hot experts and never consumes Anchor
     /// Core slots — anchor promotion stays the exclusive job of the
@@ -1514,54 +1516,20 @@ impl Engine {
         if gpu.contains(id) {
             return;
         }
-        let promote_q4_0 = self.core.options.dtype == WeightDtype::Q4_0;
-        let bytes = Self::resident_bytes_for_gpu(
+        // Bytes are promoted verbatim and dtype-tagged: Q4_0 experts
+        // stay in native GGUF blocks (~8× fewer bytes across PCIe and
+        // in VRAM than a dequantised F32 stream) and are unpacked
+        // inline by the GPU's `matmul_q4_0.wgsl` pipeline.
+        let gpu_res = Arc::new(GpuResident::new_with_dtype(
             id,
-            resident.data(),
-            promote_q4_0,
-            self.core.shape.d_model,
-            self.core.shape.d_ff,
-        );
-        let gpu_res = Arc::new(GpuResident::new(id, bytes));
+            resident.data().to_vec(),
+            self.core.options.dtype,
+        ));
         if gpu.try_promote_lru_no_evict(gpu_res) {
             if let Some(p) = self.metrics.prom.as_ref() {
                 p.record_promotions(1);
                 p.set_vram_used_bytes(gpu.used_bytes() as u64);
             }
-        }
-    }
-
-    /// Convert a RAM resident's weight bytes into the form the GPU
-    /// SwiGLU kernels expect before they land in VRAM. Q4_0 experts
-    /// are dequantised to a tight F32 stream (`promote_q4_0 == true`);
-    /// every other (already GPU-eligible) dtype is copied verbatim.
-    /// On a dequant error the raw bytes are returned so
-    /// `build_expert_entry` can reject the entry and the engine drops
-    /// back to the CPU path, preserving correctness.
-    ///
-    /// Shared by the synchronous warm-up promotion path
-    /// ([`Engine::try_promote_resident_to_gpu`]) and the background
-    /// promotion task spawned in [`Engine::install_gpu_cache`].
-    fn resident_bytes_for_gpu(
-        id: u32,
-        data: &[u8],
-        promote_q4_0: bool,
-        d_model: usize,
-        d_ff: usize,
-    ) -> Vec<u8> {
-        if promote_q4_0 {
-            match crate::inference::OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(
-                data, d_model, d_ff,
-            ) {
-                Ok(f32_bytes) => f32_bytes,
-                Err(e) => {
-                    warn!(expert = id, error = %e,
-                        "Q4_0→F32 dequant for GPU promotion failed; promoting raw bytes");
-                    data.to_vec()
-                }
-            }
-        } else {
-            data.to_vec()
         }
     }
 
@@ -1581,18 +1549,13 @@ impl Engine {
             tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
         let gpu_for_task = gpu.clone();
         let prom_for_task = self.metrics.prom.clone();
-        // Snapshot the (immutable) expert dtype + shape so the
-        // promotion task can dequantise Q4_0 experts to F32 *before*
-        // the bytes land in VRAM. The GPU SwiGLU kernels operate on
-        // F32 weight buffers (see `backend::build_expert_entry`), so a
-        // Q4_0 expert that reaches VRAM as raw 4-bit blocks would be
-        // misinterpreted. Converting here keeps the GPU
-        // `expert_matmul` fast path correct for Q4_0 while leaving the
-        // F32 path byte-for-byte unchanged.
+        // Snapshot the (immutable) expert dtype so each promoted
+        // resident is dtype-tagged. Q4_0 experts land in VRAM as raw
+        // GGUF blocks (~8× fewer bytes than a dequantised F32 stream)
+        // and are unpacked inline by the GPU's `matmul_q4_0.wgsl`
+        // pipeline (see `backend::build_expert_entry_q4_0`); the F32
+        // path is byte-for-byte unchanged.
         let promote_dtype = self.core.options.dtype;
-        let promote_q4_0_for_gpu = promote_dtype == WeightDtype::Q4_0 && self.gpu_eligible_dtype();
-        let promote_d_model = self.core.shape.d_model;
-        let promote_d_ff = self.core.shape.d_ff;
         // Capacity is constant for the lifetime of the cache; publish
         // it once so `mer_vram_capacity_bytes` is available on the
         // very first `/metrics` scrape (dashboards compute
@@ -1605,17 +1568,14 @@ impl Engine {
                 // `promote_sync` copies the resident bytes into the
                 // anchor/LRU edge under the parking_lot mutex; safe to
                 // call from a Tokio worker because it never .awaits.
-                // Q4_0 experts are dequantised to a tight F32 stream so
-                // the GPU matmul sees F32 weights (shared with the
-                // synchronous warm-up promotion path).
-                let bytes = Self::resident_bytes_for_gpu(
+                // Bytes are promoted verbatim; the dtype tag tells the
+                // GPU backend which matmul pipeline to dispatch (shared
+                // with the synchronous warm-up promotion path).
+                let gpu_res = Arc::new(GpuResident::new_with_dtype(
                     id,
-                    resident.data(),
-                    promote_q4_0_for_gpu,
-                    promote_d_model,
-                    promote_d_ff,
-                );
-                let gpu_res = Arc::new(GpuResident::new(id, bytes));
+                    resident.data().to_vec(),
+                    promote_dtype,
+                ));
                 let promoted = gpu_for_task.promote_sync(gpu_res);
                 if promoted {
                     if let Some(p) = prom_for_task.as_ref() {
@@ -1876,7 +1836,18 @@ impl Engine {
 
     /// Process a single token: route, fetch missing experts, run inference,
     /// update predictor, and kick off prefetches. Returns one [`CycleStats`].
-    pub async fn generate(self: &Arc<Self>, token_idx: u64) -> CycleStats {
+    ///
+    /// Returns `Err(ExpertReadError)` when a routed expert cannot be
+    /// fetched even after retries (corrupt file, persistent I/O error,
+    /// or a starved buffer pool). This path has no per-expert "skip"
+    /// option (unlike [`Self::moe_step`], which drops a failed expert
+    /// from the top-K mixture), so the only safe degradation is to
+    /// surface the error to the caller — the HTTP serving path maps it
+    /// to a 500 instead of crashing the process.
+    pub async fn generate(
+        self: &Arc<Self>,
+        token_idx: u64,
+    ) -> Result<CycleStats, ExpertReadError> {
         let cycle_start = Instant::now();
         // Compute the residual-stream hidden state up front. The
         // production `Router::Linear` path needs it to compute the
@@ -1928,8 +1899,10 @@ impl Engine {
         let io_wait_start = Instant::now();
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
         let mut cache_hits_per_expert: Vec<bool> = vec![false; target.len()];
-        let mut miss_handles: Vec<(usize, tokio::task::JoinHandle<Arc<ExpertResident>>)> =
-            Vec::new();
+        let mut miss_handles: Vec<(
+            usize,
+            tokio::task::JoinHandle<Result<Arc<ExpertResident>, ExpertReadError>>,
+        )> = Vec::new();
         // VRAM (GPU) tier — aggregate hits/misses across this routing
         // decision and record once, rather than incrementing Prometheus
         // counters per activation on the hot path.
@@ -2000,11 +1973,13 @@ impl Engine {
         }
         let had_misses = !miss_handles.is_empty();
         for (i, h) in miss_handles {
-            // `fetch` panics on a fatal read error (the engine cannot
-            // make progress without the requested expert); propagate by
-            // unwrapping the `JoinError` so the panic surfaces exactly
-            // as it did before this was made concurrent.
-            let r = h.await.expect("expert fetch task panicked");
+            // `fetch` reports a fatal read error as `Err` (the engine
+            // cannot make progress without the requested expert);
+            // propagate it to the caller instead of crashing the
+            // process. The outer `expect` only covers a *panicked*
+            // fetch task (a bug, not an I/O failure), preserving the
+            // pre-concurrency panic-propagation semantics for that case.
+            let r = h.await.expect("expert fetch task panicked")?;
             // We still account the per-call `stats.bytes_read` here
             // for the synthetic-benchmark accumulator (it tracks
             // logical bytes consumed, not bytes actually pulled
@@ -2041,9 +2016,15 @@ impl Engine {
                 m.record_ssd_stall(io_wait_us as f64 / 1_000_000.0);
             }
         }
+        // Benchmark-path-only invariant (`Engine::generate`; the real
+        // serving path is `moe_step`, which uses `try_fetch_with_skip`
+        // and never reaches this): every slot was populated above by
+        // either a cache hit or a successfully-joined miss fetch — a
+        // failed fetch already returned `Err` before this point, so an
+        // empty slot here is a control-flow bug, not an I/O failure.
         let residents: Vec<Arc<ExpertResident>> = residents
             .into_iter()
-            .map(|r| r.expect("internal invariant: every routed expert slot must be populated by either a hit or a completed miss fetch"))
+            .map(|r| r.expect("internal invariant (benchmark path): every routed expert slot must be populated by either a hit or a completed miss fetch"))
             .collect();
 
         // 2) Either run the real SwiGLU FFN, or — under `--io-only` —
@@ -2260,23 +2241,23 @@ impl Engine {
         self.metrics.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
         self.metrics.tokens_processed.fetch_add(1, Ordering::Relaxed);
 
-        stats
+        Ok(stats)
     }
 
-    async fn fetch(self: &Arc<Self>, id: u32) -> Arc<ExpertResident> {
+    async fn fetch(self: &Arc<Self>, id: u32) -> Result<Arc<ExpertResident>, ExpertReadError> {
         match self.fetch_with_retry(id).await {
-            Ok(r) => r,
+            Ok(r) => Ok(r),
             Err(e) => {
                 // Critical-path miss could not be satisfied even after
-                // retries. Surfacing the error as a panic preserves
-                // the engine's prior crash semantics for the synthetic
-                // benchmark path (`Engine::generate`), which has no
-                // upstream "skip this expert" option. The real-
-                // transformer path uses [`Self::moe_step`] which
+                // retries. Surface the error to the caller —
+                // `Engine::generate` propagates it as
+                // `Err(ExpertReadError)` so the HTTP serving path can
+                // return a 500 instead of crashing the process. The
+                // real-transformer path uses [`Self::moe_step`] which
                 // calls [`Self::try_fetch_with_skip`] instead, so a
-                // single corrupt expert no longer kills the process.
+                // single corrupt expert never kills the process either.
                 warn!(expert = id, error = %e, "fatal: expert fetch failed after retries");
-                panic!("failed to read expert {id}: {e}");
+                Err(e)
             }
         }
     }
@@ -3920,7 +3901,7 @@ mod tests {
         let mut total_misses = 0u64;
         let mut total_bytes = 0u64;
         for t in 0..tokens {
-            let s = engine.generate(t).await;
+            let s = engine.generate(t).await.expect("generate should succeed");
             total_hits += s.hits;
             total_misses += s.misses;
             total_bytes += s.bytes_read;
@@ -3999,7 +3980,7 @@ mod tests {
         assert!(engine.core.cache.contains(7));
 
         // Subsequent generate calls now have warmed slots to hit.
-        let _ = engine.generate(0).await;
+        let _ = engine.generate(0).await.expect("generate should succeed");
         // After at least one token, the per-token cycle histogram must
         // have recorded a sample.
         let r = engine.report();
@@ -4101,7 +4082,7 @@ mod tests {
         let engine = build_engine(&dir.path, num_experts, 16, 32, cache_slots, 2, 2, 7);
 
         for t in 0..50 {
-            let _ = engine.generate(t).await;
+            let _ = engine.generate(t).await.expect("generate should succeed");
             // Residency must NEVER exceed the configured cache capacity,
             // even mid-stream — this is the actual invariant the test
             // name promises. Asserting after every token catches a class
@@ -4181,7 +4162,7 @@ mod tests {
         // so after several tokens the locality monitor will see repeated
         // ids and start pinning them.
         for t in 0..32u64 {
-            let _ = engine.generate(t).await;
+            let _ = engine.generate(t).await.expect("generate should succeed");
         }
         let pinned = engine.core.cache.pinned_count();
         assert!(
@@ -4231,7 +4212,7 @@ mod tests {
             )
         };
         for t in 0..50u64 {
-            let _ = engine.generate(t).await;
+            let _ = engine.generate(t).await.expect("generate should succeed");
         }
         let tele = engine.predictive_telemetry();
         assert!(
@@ -4256,7 +4237,7 @@ mod tests {
             &dir.path, num_experts, d_model, d_ff, cache_slots, top_k, predict_fanout, 0xDEADBEEF,
         );
         for t in 0..16u64 {
-            let _ = engine.generate(t).await;
+            let _ = engine.generate(t).await.expect("generate should succeed");
         }
         let tele = engine.predictive_telemetry();
         // With a 2-slot cache and 8 experts at top-k=2, we expect to
@@ -4302,7 +4283,7 @@ mod tests {
         let mut total_fetches: u64 = 0;
         let mut total_prefetch: u64 = 0;
         for t in 0..N {
-            let s = engine.generate(t).await;
+            let s = engine.generate(t).await.expect("generate should succeed");
             let per_token = s.hits + s.misses;
             assert_eq!(
                 per_token, TOP_K as u64,

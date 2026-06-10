@@ -2114,7 +2114,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 bytes_read: post.bytes_read.saturating_sub(pre_bytes),
             }
         } else {
-            engine.generate(t).await
+            engine.generate(t).await?
         };
         let elapsed = start.elapsed();
         let throughput = if elapsed.as_secs_f64() > 0.0 {

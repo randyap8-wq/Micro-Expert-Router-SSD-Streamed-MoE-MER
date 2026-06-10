@@ -89,6 +89,11 @@ matrixmultiply = { version = "0.3", optional = true }
 # bytes-per-parameter halves every SSD read, which is the single highest-
 # leverage energy reduction in this engine.
 half = { version = "2", features = ["bytemuck"] }
+# Deliberately pinned at 0.20: the 0.20 → 0.21+ migration includes breaking
+# changes to `BufferDescriptor` / `ComputePassDescriptor` (among others).
+# Moving to a newer wgpu — e.g. for Vulkan subgroup-operation support to
+# speed up the GPU matmul — will require a dedicated API migration pass
+# across `src/backend/mod.rs`; do not bump this casually.
 wgpu = { version = "0.20", features = ["wgsl"] }
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
