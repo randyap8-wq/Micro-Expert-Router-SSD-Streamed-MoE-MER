@@ -516,9 +516,10 @@ pub struct MlaDims {
 }
 
 /// RoPE scaling parameters (YaRN), needed by DeepSeek / long-context
-/// configs. Carried through from `config.json`'s `rope_scaling` block.
-/// Like [`MlaDims`], this is plumbing for the staged MLA/long-context
-/// workstream; the standard RoPE path ignores it.
+/// configs. Carried through from `config.json`'s `rope_scaling` block
+/// and applied at attention-compute time via
+/// [`crate::transformer::YarnRope`] (blended inverse frequencies +
+/// attention-magnitude correction) on both the standard and MLA paths.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RopeScaling {
     /// `rope_scaling.type` / `rope_type` — e.g. `"yarn"`.

@@ -103,6 +103,145 @@ pub fn apply_rope_inplace(v: &mut [f32], pos: usize, base: f32) {
     }
 }
 
+// ---------------------------------------------------------------------
+// YaRN RoPE scaling (long-context position interpolation).
+//
+// YaRN ("Yet another RoPE extensioN", arXiv:2309.00071) extends a
+// model's context window past `original_max_position_embeddings` by
+// blending two per-frequency strategies:
+//
+// * **extrapolation** — high-frequency pairs (many full rotations over
+//   the original context) keep the unscaled `1/base^(2i/d)` frequency;
+// * **interpolation** — low-frequency pairs are slowed down by the
+//   scaling `factor` (`1/(factor * base^(2i/d))`).
+//
+// A linear ramp between the `beta_fast` / `beta_slow` rotation counts
+// decides how much of each strategy a given pair receives. On top of
+// the frequency blend, attention magnitudes are corrected by an
+// `mscale` factor folded into the rotation (cos/sin are multiplied by
+// `attn_factor`, so Q and K each carry one factor and attention scores
+// carry its square) — this matches the HuggingFace / DeepSeek-V3
+// `YarnRotaryEmbedding` convention.
+// ---------------------------------------------------------------------
+
+/// YaRN magnitude-scaling helper: `0.1 * mscale * ln(scale) + 1.0` for
+/// `scale > 1`, identity otherwise. Mirrors `yarn_get_mscale` from the
+/// DeepSeek-V3 reference implementation.
+pub fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
+    if scale <= 1.0 {
+        return 1.0;
+    }
+    0.1 * mscale * scale.ln() + 1.0
+}
+
+/// Precomputed YaRN rotary-embedding parameters for one head shape.
+///
+/// Built once at model-construction time from the checkpoint's
+/// `rope_scaling` block ([`crate::architecture::RopeScaling`]) and the
+/// head dim the rotation applies to; [`apply_rope_scaled_inplace`]
+/// consumes it on the hot path with no per-token recomputation beyond
+/// the `sin_cos` the unscaled path already pays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YarnRope {
+    /// Per-pair blended inverse frequencies, length `head_dim / 2`.
+    pub inv_freq: Vec<f32>,
+    /// Multiplier applied to cos/sin (i.e. to both Q and K), carrying
+    /// the YaRN attention-magnitude correction. Attention scores see
+    /// `attn_factor^2`.
+    pub attn_factor: f32,
+}
+
+impl YarnRope {
+    /// Dimension index below which a frequency completes fewer than
+    /// `num_rotations` full turns over the original context (the YaRN
+    /// "correction dim").
+    fn correction_dim(num_rotations: f32, dim: usize, base: f32, max_pos: usize) -> f32 {
+        let d = dim as f32;
+        d * (max_pos as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * base.ln())
+    }
+
+    /// Build the blended inverse-frequency table + attention factor for
+    /// a rotation over `head_dim` dims (`head_dim/2` pairs) with the
+    /// given RoPE `base`. Returns `None` when `scaling` is not a YaRN
+    /// config or carries a non-expanding factor (<= 1), in which case
+    /// the caller should keep the standard unscaled path.
+    pub fn from_scaling(
+        head_dim: usize,
+        base: f32,
+        scaling: &crate::architecture::RopeScaling,
+    ) -> Option<Self> {
+        if !scaling.rope_type.eq_ignore_ascii_case("yarn") || scaling.factor <= 1.0 {
+            return None;
+        }
+        if head_dim == 0 || head_dim % 2 != 0 {
+            return None;
+        }
+        let orig_max = if scaling.original_max_position_embeddings > 0 {
+            scaling.original_max_position_embeddings
+        } else {
+            4096
+        };
+        let half = head_dim / 2;
+        let low = Self::correction_dim(scaling.beta_fast, head_dim, base, orig_max)
+            .floor()
+            .max(0.0);
+        let high = Self::correction_dim(scaling.beta_slow, head_dim, base, orig_max)
+            .ceil()
+            .min((half - 1) as f32)
+            .max(low);
+        let range = (high - low).max(1e-3);
+        let mut inv_freq = Vec::with_capacity(half);
+        for i in 0..half {
+            let freq_extra = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
+            let freq_inter = freq_extra / scaling.factor;
+            // Linear ramp: 0 below `low` (pure extrapolation), 1 above
+            // `high` (pure interpolation).
+            let ramp = ((i as f32 - low) / range).clamp(0.0, 1.0);
+            inv_freq.push(freq_extra * (1.0 - ramp) + freq_inter * ramp);
+        }
+        // HF / DeepSeek convention: cos/sin are multiplied by
+        // `get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)`.
+        // With the defaults (mscale=1, mscale_all_dim=0) this reduces to
+        // the canonical YaRN `0.1*ln(factor)+1`.
+        let attn_factor = yarn_get_mscale(scaling.factor, scaling.mscale)
+            / yarn_get_mscale(scaling.factor, scaling.mscale_all_dim);
+        Some(Self { inv_freq, attn_factor })
+    }
+}
+
+/// YaRN-scaled variant of [`apply_rope_inplace`]: rotates with the
+/// precomputed per-pair inverse frequencies and multiplies cos/sin by
+/// the attention factor. `yarn.inv_freq.len()` must equal
+/// `v.len() / 2`.
+pub fn apply_rope_scaled_inplace(v: &mut [f32], pos: usize, yarn: &YarnRope) {
+    let head_dim = v.len();
+    debug_assert!(head_dim % 2 == 0, "RoPE requires even head_dim");
+    let half = head_dim / 2;
+    debug_assert_eq!(yarn.inv_freq.len(), half, "YarnRope built for a different head_dim");
+    let pos_f = pos as f32;
+    let m = yarn.attn_factor;
+    for i in 0..half {
+        let theta = pos_f * yarn.inv_freq[i];
+        let (sin_t, cos_t) = theta.sin_cos();
+        let (sin_t, cos_t) = (sin_t * m, cos_t * m);
+        let a = v[i];
+        let b = v[i + half];
+        v[i] = a * cos_t - b * sin_t;
+        v[i + half] = a * sin_t + b * cos_t;
+    }
+}
+
+/// Dispatch helper used by the attention paths: YaRN-scaled rotation
+/// when `yarn` is configured, the standard unscaled rotation otherwise.
+#[inline]
+pub fn apply_rope_maybe_scaled(v: &mut [f32], pos: usize, base: f32, yarn: Option<&YarnRope>) {
+    match yarn {
+        Some(y) => apply_rope_scaled_inplace(v, pos, y),
+        None => apply_rope_inplace(v, pos, base),
+    }
+}
+
 /// One layer's **paged** KV cache (per-layer). Stores keys and values
 /// in fixed-size blocks of [`PAGED_BLOCK_TOKENS`] tokens × `kv_dim`
 /// floats each, indexed by a block table.
@@ -310,6 +449,12 @@ pub struct MultiHeadSelfAttention {
     /// Qwen3-MoE). Weight length `head_dim`, applied to each of the
     /// `num_kv_heads` key heads. `None` leaves K untouched.
     pub k_norm: Option<RmsNorm>,
+    /// Optional YaRN long-context RoPE scaling. When `Some`, Q/K
+    /// rotations use the precomputed blended inverse frequencies and
+    /// attention-magnitude correction instead of the plain
+    /// `1/base^(2i/d)` schedule. Built from the checkpoint's
+    /// `rope_scaling` block; `None` keeps the standard rotation.
+    pub rope_yarn: Option<YarnRope>,
 }
 
 impl MultiHeadSelfAttention {
@@ -412,11 +557,11 @@ impl MultiHeadSelfAttention {
             self.apply_k_norm(&mut k);
             for h in 0..self.num_heads {
                 let s = h * self.head_dim;
-                apply_rope_inplace(&mut q[s..s + self.head_dim], pos, self.rope_base);
+                apply_rope_maybe_scaled(&mut q[s..s + self.head_dim], pos, self.rope_base, self.rope_yarn.as_ref());
             }
             for h in 0..self.num_kv_heads {
                 let s = h * self.head_dim;
-                apply_rope_inplace(&mut k[s..s + self.head_dim], pos, self.rope_base);
+                apply_rope_maybe_scaled(&mut k[s..s + self.head_dim], pos, self.rope_base, self.rope_yarn.as_ref());
             }
             kv.append(&k, &v);
             let attn_out = cpu_attend(&q, kv);
@@ -478,11 +623,11 @@ impl MultiHeadSelfAttention {
 
         for h in 0..self.num_heads {
             let s = h * self.head_dim;
-            apply_rope_inplace(&mut q[s..s + self.head_dim], pos, self.rope_base);
+            apply_rope_maybe_scaled(&mut q[s..s + self.head_dim], pos, self.rope_base, self.rope_yarn.as_ref());
         }
         for h in 0..self.num_kv_heads {
             let s = h * self.head_dim;
-            apply_rope_inplace(&mut k[s..s + self.head_dim], pos, self.rope_base);
+            apply_rope_maybe_scaled(&mut k[s..s + self.head_dim], pos, self.rope_base, self.rope_yarn.as_ref());
         }
 
         // ── 3) KV insert + attention ──────────────────────────────────────────
@@ -1179,6 +1324,148 @@ mod tests {
         assert!((n_before - n_after).abs() < 1e-4);
     }
 
+    fn yarn_test_scaling(factor: f32) -> crate::architecture::RopeScaling {
+        crate::architecture::RopeScaling {
+            rope_type: "yarn".to_string(),
+            factor,
+            original_max_position_embeddings: 4096,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            mscale: 1.0,
+            mscale_all_dim: 0.0,
+        }
+    }
+
+    #[test]
+    fn yarn_rejects_non_yarn_and_non_expanding_configs() {
+        let mut s = yarn_test_scaling(40.0);
+        s.rope_type = "linear".to_string();
+        assert!(YarnRope::from_scaling(64, 10_000.0, &s).is_none());
+        let s = yarn_test_scaling(1.0);
+        assert!(YarnRope::from_scaling(64, 10_000.0, &s).is_none());
+        // Odd / zero head dims can't be rotated as complex pairs.
+        let s = yarn_test_scaling(4.0);
+        assert!(YarnRope::from_scaling(63, 10_000.0, &s).is_none());
+        assert!(YarnRope::from_scaling(0, 10_000.0, &s).is_none());
+    }
+
+    #[test]
+    fn yarn_inv_freq_blends_between_extrapolation_and_interpolation() {
+        let head_dim = 64;
+        let base = 10_000.0f32;
+        let s = yarn_test_scaling(40.0);
+        let yarn = YarnRope::from_scaling(head_dim, base, &s).expect("yarn config");
+        assert_eq!(yarn.inv_freq.len(), head_dim / 2);
+        for (i, &f) in yarn.inv_freq.iter().enumerate() {
+            let extra = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
+            let inter = extra / s.factor;
+            assert!(
+                f <= extra * 1.0001 && f >= inter * 0.9999,
+                "pair {i}: blended {f} outside [{inter}, {extra}]"
+            );
+        }
+        // Highest-frequency pair (i=0) completes far more than beta_fast
+        // rotations over the original context → pure extrapolation.
+        assert!((yarn.inv_freq[0] - 1.0).abs() < 1e-6);
+        // Lowest-frequency pair → pure interpolation (slowed by factor).
+        let last = head_dim / 2 - 1;
+        let extra_last = 1.0 / base.powf(2.0 * last as f32 / head_dim as f32);
+        assert!((yarn.inv_freq[last] - extra_last / s.factor).abs() < extra_last * 1e-4);
+        // Default attention factor: 0.1 * ln(factor) + 1.
+        let expected = 0.1 * 40.0f32.ln() + 1.0;
+        assert!((yarn.attn_factor - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn yarn_rope_scales_vector_norm_by_attn_factor() {
+        let s = yarn_test_scaling(8.0);
+        let yarn = YarnRope::from_scaling(16, 10_000.0, &s).expect("yarn config");
+        let mut v: Vec<f32> = (1..=16).map(|i| i as f32 * 0.1).collect();
+        let n_before: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        apply_rope_scaled_inplace(&mut v, 9, &yarn);
+        let n_after: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (n_after - n_before * yarn.attn_factor).abs() < 1e-4,
+            "norm {n_after} != {n_before} * {}",
+            yarn.attn_factor
+        );
+    }
+
+    #[test]
+    fn yarn_interpolated_pair_matches_unscaled_rope_at_compressed_position() {
+        // For a pair in the pure-interpolation regime, rotating at
+        // position `factor * p` with YaRN equals rotating at `p`
+        // unscaled (up to the attention factor).
+        let head_dim = 16;
+        let base = 10_000.0f32;
+        let factor = 4.0;
+        let mut s = yarn_test_scaling(factor);
+        s.mscale = 0.0; // attn_factor numerator → 1.0
+        s.mscale_all_dim = 0.0;
+        // mscale = 0 gives yarn_get_mscale(f, 0) = 1.0 on both halves →
+        // attn_factor exactly 1, isolating the frequency blend.
+        let yarn = YarnRope::from_scaling(head_dim, base, &s).expect("yarn config");
+        assert!((yarn.attn_factor - 1.0).abs() < 1e-6);
+        let last = head_dim / 2 - 1;
+        let extra_last = 1.0 / base.powf(2.0 * last as f32 / head_dim as f32);
+        assert!(
+            (yarn.inv_freq[last] - extra_last / factor).abs() < extra_last * 1e-4,
+            "test premise: last pair must be pure interpolation"
+        );
+        // Compare just the last pair's rotation.
+        let mut scaled = vec![0.0f32; head_dim];
+        scaled[last] = 0.3;
+        scaled[last + head_dim / 2] = -0.7;
+        let mut unscaled = scaled.clone();
+        apply_rope_scaled_inplace(&mut scaled, 4 * 11, &yarn);
+        apply_rope_inplace(&mut unscaled, 11, base);
+        assert!((scaled[last] - unscaled[last]).abs() < 1e-3);
+        assert!((scaled[last + head_dim / 2] - unscaled[last + head_dim / 2]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn yarn_get_mscale_matches_reference() {
+        assert_eq!(yarn_get_mscale(1.0, 1.0), 1.0);
+        assert_eq!(yarn_get_mscale(0.5, 1.0), 1.0);
+        let m = yarn_get_mscale(40.0, 1.0);
+        assert!((m - (0.1 * 40.0f32.ln() + 1.0)).abs() < 1e-6);
+        let m2 = yarn_get_mscale(40.0, 0.707);
+        assert!((m2 - (0.1 * 0.707 * 40.0f32.ln() + 1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn attention_with_yarn_stays_finite_and_differs_from_unscaled() {
+        let mut attn = make_window_attn(None);
+        let mut kv_a = KvCache::new(attn.kv_dim());
+        let mut kv_b = KvCache::new(attn.kv_dim());
+        let backend = cpu_backend();
+        // Position-varying inputs so V differs per cached token —
+        // otherwise attention output is invariant to the softmax
+        // weights and YaRN could never change it.
+        let x_at = |pos: usize| -> Vec<f32> {
+            (0..attn.d_model)
+                .map(|i| ((i + 1) as f32 * 0.3 + pos as f32 * 0.7).sin())
+                .collect()
+        };
+        let unscaled: Vec<Vec<f32>> = (0..6)
+            .map(|pos| attn.forward(&x_at(pos), pos, 0, &mut kv_a, &backend))
+            .collect();
+        let s = yarn_test_scaling(16.0);
+        attn.rope_yarn = YarnRope::from_scaling(attn.head_dim, attn.rope_base, &s);
+        assert!(attn.rope_yarn.is_some());
+        let scaled: Vec<Vec<f32>> = (0..6)
+            .map(|pos| attn.forward(&x_at(pos), pos, 0, &mut kv_b, &backend))
+            .collect();
+        let mut any_diff = false;
+        for (u, sc) in unscaled.iter().zip(scaled.iter()) {
+            assert!(sc.iter().all(|v| v.is_finite()));
+            if u.iter().zip(sc.iter()).any(|(a, b)| (a - b).abs() > 1e-6) {
+                any_diff = true;
+            }
+        }
+        assert!(any_diff, "YaRN scaling must change attention outputs at pos > 0");
+    }
+
     #[test]
     fn softmax_sums_to_one() {
         let mut v = vec![1.0, 2.0, 3.0, -1.0];
@@ -1221,6 +1508,7 @@ mod tests {
             window_size: None,
             q_norm: None,
             k_norm: None,
+            rope_yarn: None,
         };
         let mut kv = KvCache::new(kv_dim);
         let x: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32).collect();
@@ -1261,6 +1549,7 @@ mod tests {
             window_size: None,
             q_norm: None,
             k_norm: None,
+            rope_yarn: None,
         };
         let mut normed = base.clone();
         // Non-unit per-head norm weights so the effect is visible.
@@ -1354,6 +1643,7 @@ mod tests {
                 window_size: None,
                 q_norm: None,
                 k_norm: None,
+                rope_yarn: None,
             },
             mla: None,
             rms_moe: RmsNorm::new(vec![1.0; d_model], 1e-6),
@@ -1441,6 +1731,7 @@ mod tests {
             window_size: window,
             q_norm: None,
             k_norm: None,
+            rope_yarn: None,
         }
     }
 
@@ -1570,6 +1861,7 @@ mod tests {
             window_size: None,
             q_norm: None,
             k_norm: None,
+            rope_yarn: None,
         };
         let mut kv = KvCache::new(kv_dim);
         // Walk past the first block boundary to exercise multi-block
