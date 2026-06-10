@@ -385,6 +385,10 @@ def f8_e4m3_lut():
     """
     import numpy as np
 
+    cached = getattr(f8_e4m3_lut, "_cached", None)
+    if cached is not None:
+        return cached
+
     lut = np.empty(256, dtype=np.float32)
     for b in range(256):
         sign = -1.0 if (b & 0x80) else 1.0
@@ -397,6 +401,8 @@ def f8_e4m3_lut():
         else:
             val = sign * (1.0 + mant / 8.0) * 2.0 ** (exp - 7)
         lut[b] = val
+
+    f8_e4m3_lut._cached = lut
     return lut
 
 
