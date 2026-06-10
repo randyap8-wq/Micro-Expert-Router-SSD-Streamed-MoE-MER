@@ -1293,11 +1293,17 @@ fn seed_mla(
     proj_scale: f32,
 ) -> Option<MultiHeadLatentAttention> {
     let dims = config.advanced.mla?;
+    assert!(dims.kv_lora_rank > 0, "MLA kv_lora_rank must be > 0");
+    assert!(dims.v_head_dim > 0, "MLA v_head_dim must be > 0");
+    assert!(
+        dims.qk_rope_head_dim % 2 == 0,
+        "MLA qk_rope_head_dim must be even for RoPE"
+    );
     let n_h = config.num_heads;
     let qk_head = dims.qk_nope_head_dim + dims.qk_rope_head_dim;
     let q_total = n_h * qk_head;
     let kv_proj_dim = dims.kv_lora_rank + dims.qk_rope_head_dim;
-    let kv_b_out = n_h * (dims.qk_nope_head_dim + dims.v_head_dim);
+    let kv_b_out = n_h * (dims.qk_nope_head_dim + dims.v_head_dim)
 
     let (q_a_proj, q_a_layernorm, q_b_proj) = if dims.q_lora_rank > 0 {
         (
