@@ -538,12 +538,13 @@ impl PredictiveLoader {
     /// * Markov contribution: probability from
     ///   [`Self::predict_next2`] (or [`Self::predict_next`] when
     ///   `prev_prev` is `None`), weighted **W_MARKOV**.
-    /// * Locality contribution: a flat **W_LOCALITY** for every expert
-    ///   in `monitor.get_hot_experts(threshold_pct)` — these are
+    /// * Locality contribution: **W_LOCALITY** (rank-decayed, see
+    ///   [`RANK_TIEBREAK_DECAY`]) for every expert in
+    ///   `monitor.get_hot_experts(threshold_pct)` — these are
     ///   temporally stable hot experts and we want them in the
     ///   prefetch set even when the Markov chain is uncertain.
-    /// * Speculator contribution: a flat **W_SPECULATOR** for every
-    ///   expert in `speculator.predict_topk(hidden, speculator_k)` —
+    /// * Speculator contribution: **W_SPECULATOR** (rank-decayed) for
+    ///   every expert in `speculator.predict_topk(hidden, speculator_k)` —
     ///   semantic intent is the strongest single signal in the design.
     ///
     /// The three constants sum to **1.0**, so an expert hit by all
@@ -629,13 +630,21 @@ impl PredictiveLoader {
         for &(id, p) in markov {
             *combined.entry(id).or_insert(0.0) += W_MARKOV * (p as f32);
         }
-        // 2) Locality contribution (flat weight per hot expert).
-        for &id in locality_ids {
-            *combined.entry(id).or_insert(0.0) += W_LOCALITY;
+        // 2) Locality contribution. The hot set arrives heat-sorted;
+        //    apply the tiny per-rank decay so the heat ordering
+        //    survives the fuse instead of collapsing into an all-ties
+        //    ascending-id sort (see [`RANK_TIEBREAK_DECAY`]). Clamped
+        //    at half weight so a pathologically long list can never
+        //    invert cross-arm ordering.
+        for (rank, &id) in locality_ids.iter().enumerate() {
+            let f = (1.0 - RANK_TIEBREAK_DECAY * rank as f32).max(0.5);
+            *combined.entry(id).or_insert(0.0) += W_LOCALITY * f;
         }
-        // 3) Speculator contribution (flat weight per top-K id).
-        for &id in speculator_ids {
-            *combined.entry(id).or_insert(0.0) += W_SPECULATOR;
+        // 3) Speculator contribution (logit-ranked top-K; same
+        //    rank-decay rationale as the locality arm).
+        for (rank, &id) in speculator_ids.iter().enumerate() {
+            let f = (1.0 - RANK_TIEBREAK_DECAY * rank as f32).max(0.5);
+            *combined.entry(id).or_insert(0.0) += W_SPECULATOR * f;
         }
 
         let mut out: Vec<(u32, f32)> = combined
@@ -1692,6 +1701,19 @@ pub const W_LOCALITY: f32 = 0.25;
 pub const W_AFFINITY: f32 = 0.10;
 pub const W_SPATIAL: f32 = 0.05;
 
+/// Per-rank decay applied to the flat locality / speculator
+/// contributions in [`PredictiveLoader::combine_unified_arms`]. Both
+/// arms hand the combiner a *ranked* list (locality is heat-sorted,
+/// the speculator logit-sorted), but a flat weight discards that
+/// ordering: every id ties at exactly `W_LOCALITY` / `W_SPECULATOR`
+/// and the deterministic ascending-id tie-break then systematically
+/// favours low (low-layer) ids when the candidate list is truncated
+/// to the shadow budget. Scaling the contribution by
+/// `1 − RANK_TIEBREAK_DECAY × rank` preserves each arm's internal
+/// ranking while staying small enough (1e-4) that cross-arm ordering
+/// is unaffected for any realistic list length.
+pub const RANK_TIEBREAK_DECAY: f32 = 1e-4;
+
 /// Default cap on the speculation window after a latency bump. The
 /// controller never grows the window beyond `base_depth +
 /// MAX_LATENCY_BUMP` tokens, even under sustained SSD stall.
@@ -2676,17 +2698,41 @@ mod tests {
         let speculator = vec![3u32, 1u32];
         let out = p.combine_unified_arms(&markov, &locality, &speculator);
         let score = |id: u32| out.iter().find(|(i, _)| *i == id).map(|(_, s)| *s);
-        // id=1: W_MARKOV*1.0 + W_SPECULATOR = 0.33 + 0.42 = 0.75
-        assert!((score(1).unwrap() - (W_MARKOV + W_SPECULATOR)).abs() < 1e-6);
-        // id=3: W_SPECULATOR = 0.42
+        // id=1: W_MARKOV*1.0 + W_SPECULATOR at rank 1 (rank-decayed).
+        let spec_rank1 = W_SPECULATOR * (1.0 - RANK_TIEBREAK_DECAY);
+        assert!((score(1).unwrap() - (W_MARKOV + spec_rank1)).abs() < 1e-6);
+        // id=3: W_SPECULATOR at rank 0 (full weight).
         assert!((score(3).unwrap() - W_SPECULATOR).abs() < 1e-6);
-        // id=2: W_LOCALITY = 0.25
+        // id=2: W_LOCALITY at rank 0 (full weight).
         assert!((score(2).unwrap() - W_LOCALITY).abs() < 1e-6);
         // Ranking: multi-arm id=1 first, then speculator id=3, then
         // locality id=2.
         assert_eq!(out.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 3, 2]);
         // Result is not truncated to fanout (caller's responsibility).
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn combine_unified_arms_preserves_arm_internal_ranking() {
+        // The locality hot set arrives heat-sorted and the speculator
+        // top-K logit-sorted. A flat per-arm weight used to collapse
+        // each arm into an all-ties group whose deterministic
+        // ascending-id tie-break systematically favoured low (low-
+        // layer) ids under budget truncation. The per-rank decay must
+        // keep each arm's ids in their *given* order — here
+        // deliberately descending-id so an ascending-id tie-break
+        // would invert it.
+        let p = PredictiveLoader::new(16, 16, 0.0, 7);
+        let locality = vec![9u32, 5, 2];
+        let speculator = vec![14u32, 11, 3];
+        let out = p.combine_unified_arms(&[], &locality, &speculator);
+        let ids: Vec<u32> = out.iter().map(|(i, _)| *i).collect();
+        // Speculator arm (0.42) outranks locality (0.25) throughout,
+        // and within each arm the caller-supplied order survives.
+        assert_eq!(ids, vec![14, 11, 3, 9, 5, 2]);
+        // Decay is tiny: rank-2 locality keeps >99.9% of its weight.
+        let score_2 = out.iter().find(|(i, _)| *i == 2).unwrap().1;
+        assert!(score_2 > W_LOCALITY * 0.999 && score_2 < W_LOCALITY);
     }
 
     #[test]
