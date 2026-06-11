@@ -2814,7 +2814,8 @@ impl Engine {
         // `hot_set` is sorted hottest-first, so the cap keeps the
         // most valuable ids.
         let ranked = monitor.hot_set(threshold);
-        let mut pins_per_layer: HashMap<usize, usize> = HashMap::new();
+        let mut pins_per_layer: HashMap<usize, usize> =
+            HashMap::with_capacity(self.core.cache.num_layers());
         let mut new_hot: HashSet<u32> = HashSet::with_capacity(ranked.len());
         for id in ranked {
             let layer = self.core.cache.layer_of(id);
