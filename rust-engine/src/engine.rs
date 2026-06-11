@@ -2230,7 +2230,7 @@ impl Engine {
             // hidden state computed at the top of `generate` (when
             // the speculator's d_model matches; otherwise this is
             // a no-op — see `speculator_predict_and_train`).
-            let m_speculator = self.speculator_predict_and_train(&hidden, &target);
+            let m_speculator = self.speculator_predict_and_train(&hidden, &target, None);
             // Synthetic single-layer benchmark path: no layer-qualified
             // id geometry, so the affinity fold is not applicable.
             self.union_prefetch(&s_markov, &m_speculator, &HashSet::new(), None);
@@ -2665,6 +2665,29 @@ impl Engine {
     // bit-for-bit.
     // -----------------------------------------------------------------
 
+    /// Effective locality heat threshold for the current id geometry.
+    ///
+    /// The configured `locality_threshold_pct` ("hot once it appears in
+    /// X% of the window") was designed for a *flat* expert namespace.
+    /// With layer-qualified global ids the window interleaves every
+    /// layer's activations, so a single expert's achievable share of the
+    /// window is diluted by the layer count: at 32 layers × top-2 even a
+    /// *always-chosen* expert caps out at ~3% of the window and a 10%
+    /// threshold is mathematically unreachable — the hot set stays empty
+    /// forever (the `hit_rate=0.04%` symptom). Dividing the threshold by
+    /// the number of layers restores the intended per-layer semantics:
+    /// "hot once it appears in X% of the tokens its layer routed".
+    fn effective_locality_threshold(&self) -> f32 {
+        let pct = self.speculation.locality_threshold_pct;
+        if let Some(per_layer) = self.core.storage.config().num_experts_per_layer {
+            if per_layer > 0 {
+                let layers = (self.core.router.num_experts() / per_layer).max(1);
+                return pct / layers as f32;
+            }
+        }
+        pct
+    }
+
     /// Observe the chosen expert ids in the locality monitor and
     /// reconcile pinning with the expert cache: ids that just entered
     /// the hot set are pinned (LRU-eviction-protected), ids that just
@@ -2680,10 +2703,11 @@ impl Engine {
             return 0;
         };
         // Snapshot pre-observation hit/miss against the *current* hot set.
+        let threshold = self.effective_locality_threshold();
         let mut hits: u64 = 0;
         let mut misses: u64 = 0;
         for &id in target {
-            if monitor.is_hot(id, self.speculation.locality_threshold_pct) {
+            if monitor.is_hot(id, threshold) {
                 hits += 1;
             } else {
                 misses += 1;
@@ -2704,7 +2728,7 @@ impl Engine {
 
         // Reconcile pin set against the post-observation hot set.
         let new_hot: HashSet<u32> = monitor
-            .hot_set(self.speculation.locality_threshold_pct)
+            .hot_set(threshold)
             .into_iter()
             .collect();
         let mut prev = self.speculation.locality_pinned.lock();
@@ -2728,7 +2752,22 @@ impl Engine {
     /// online SGD step against the actual decision. Returns the
     /// speculator's prediction so the caller can union it into the
     /// prefetch set.
-    fn speculator_predict_and_train(&self, x: &[f32], target: &[u32]) -> Vec<u32> {
+    ///
+    /// `layer` is the current MoE layer when known (the `moe_step`
+    /// path). With a layer-qualified id geometry the gate's decision is
+    /// confined to that layer's slice of the global namespace, so the
+    /// prediction is taken from [`NeuralSpeculator::predict_topk_for_layer`]
+    /// over the *same slice* — a global arg-max would spread the top-K
+    /// across every layer's logits and almost never land in the current
+    /// layer (the `accuracy=0.82%` symptom), while also feeding
+    /// wrong-layer ids into the union prefetch where they waste shadow
+    /// slots. Pass `None` on the layer-less `generate` path.
+    fn speculator_predict_and_train(
+        &self,
+        x: &[f32],
+        target: &[u32],
+        layer: Option<u32>,
+    ) -> Vec<u32> {
         let Some(spec) = self.speculation.speculator.as_ref() else {
             return Vec::new();
         };
@@ -2739,7 +2778,12 @@ impl Engine {
             // benchmark where d_model can disagree with the real model.
             return Vec::new();
         }
-        let preds = spec.predict_topk(x, self.speculation.speculator_topk);
+        let preds = match (layer, self.core.storage.config().num_experts_per_layer) {
+            (Some(l), Some(per_layer)) if per_layer > 0 => {
+                spec.predict_topk_for_layer(x, l, per_layer, self.speculation.speculator_topk)
+            }
+            _ => spec.predict_topk(x, self.speculation.speculator_topk),
+        };
         let target_set: HashSet<u32> = target.iter().copied().collect();
         let mut hits: u64 = 0;
         for &p in &preds {
@@ -2891,7 +2935,7 @@ impl Engine {
             .speculation
             .locality
             .as_ref()
-            .map(|m| m.hot_set(self.speculation.locality_threshold_pct))
+            .map(|m| m.hot_set(self.effective_locality_threshold()))
             .unwrap_or_default();
 
         // If expert aliasing is enabled, canonicalize ids *before* scoring so
@@ -3129,7 +3173,7 @@ impl Engine {
         // Speculator: predict against the *real* hidden state (this is
         // the path where d_model matches by construction) and train
         // online against the gate's actual top-K decision.
-        let m_speculator = self.speculator_predict_and_train(x, &target);
+        let m_speculator = self.speculator_predict_and_train(x, &target, Some(layer));
 
         // Frequency-based pinning: same logic as `generate`.
         if self.core.options.pin_after_observations > 0 {
@@ -4602,6 +4646,75 @@ mod tests {
         assert_eq!(affinity.affinity(1, 0, 1), 3, "co-fired three times");
         // No leakage into layer 0's matrix.
         assert!(affinity.neighbors(0, 0, 2).is_empty(), "layer 0 must be untouched");
+    }
+
+    /// **Layer-scoped speculator accuracy.** On the `moe_step` path the
+    /// gate's decision is confined to the current layer's slice of the
+    /// layer-qualified global namespace, so
+    /// `speculator_predict_and_train` must draw its prediction from
+    /// that same slice. A global arg-max spreads the top-K across every
+    /// layer's logits and almost never lands in the current layer —
+    /// the production `accuracy=0.82%` symptom.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn speculator_prediction_is_scoped_to_current_layer() {
+        let dir = TempDir::new("spec-layer-scope");
+        let per_layer: u32 = 4;
+        let num_layers: usize = 4;
+        let total_experts: u32 = per_layer * num_layers as u32;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed: u64 = 0xBEEF_CAFE_u64;
+
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, total_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: Some(per_layer),
+            })
+            .expect("storage init"),
+        );
+        storage.warmup_fds(0..total_experts).expect("pre-open fds");
+
+        let pool = BufferPool::new(total_experts as usize + 2, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(total_experts as usize));
+        let router = Router::Markov(Arc::new(TopKRouter::new(total_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(total_experts, 2, 0.05, seed));
+        let spec = Arc::new(NeuralSpeculator::new(d_model, 8, total_experts, seed));
+
+        let engine = Arc::new(
+            Engine::new(
+                cache,
+                pool,
+                storage,
+                router,
+                predictor,
+                ModelShape { d_model, d_ff, hidden_seed: seed },
+            )
+            .with_speculator(spec, /*top_k=*/ 2),
+        );
+
+        let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
+        for layer in 0..num_layers as u32 {
+            let base = layer * per_layer;
+            let target = [base, base + 1];
+            let preds = engine.speculator_predict_and_train(&hidden, &target, Some(layer));
+            assert!(!preds.is_empty(), "speculator must predict for layer {layer}");
+            for &p in &preds {
+                assert!(
+                    p >= base && p < base + per_layer,
+                    "layer {layer}: predicted id {p} is outside slice {base}..{}",
+                    base + per_layer
+                );
+            }
+        }
     }
 
     /// **Windowed depth-N look-ahead (`speculate_layer_ahead`).** With a

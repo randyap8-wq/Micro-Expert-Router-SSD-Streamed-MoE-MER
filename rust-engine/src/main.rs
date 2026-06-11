@@ -296,6 +296,13 @@ enum Cmd {
         /// with a warning if GPU init fails.
         #[arg(long)]
         gpu: bool,
+        /// VRAM budget, in MiB, for the run-mode GPU expert cache
+        /// (only with `--gpu`). Hot experts promote into this cache and
+        /// are served from device memory. The 4 GiB default fits ~40
+        /// Mixtral-8x7B Q4 experts (~99 MiB each — 512 MiB would hold
+        /// barely 5); lower it on cards with less free VRAM.
+        #[arg(long, default_value_t = 4096)]
+        gpu_cache_mb: usize,
         /// Enable the **neural speculator** (arm `M`): a 2-layer MLP
         /// trained online against the gate's actual top-K. Predicts
         /// from the residual stream — the same feature the gate sees —
@@ -518,8 +525,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--gpu` it must initialise the GPU compute backend *before* the
     // default CPU backend claims the `OnceLock` (gist Fix 2), mirroring
     // `cmd_serve`. A failed GPU init falls back to `install_default`.
-    let run_gpu_cache = if matches!(cli.cmd, Cmd::Run { gpu: true, .. }) {
-        install_run_gpu_backend()
+    let run_gpu_cache = if let Cmd::Run { gpu: true, gpu_cache_mb, .. } = &cli.cmd {
+        install_run_gpu_backend(*gpu_cache_mb)
     } else if !matches!(cli.cmd, Cmd::Serve { .. }) {
         crate::backend::install_default();
         let b = crate::backend::current();
@@ -574,6 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gate_weights,
                     trace_out,
                     gpu,
+                    gpu_cache_mb: _,
                     pipeline_depth,
                     speculator,
                     speculator_hidden_dim,
@@ -700,16 +708,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `set_backend` race — it falls back to
 /// [`install_default`](crate::backend::install_default) with a
 /// warning so the benchmark still runs on CPU.
-fn install_run_gpu_backend() -> Option<Arc<crate::expert_cache::GpuExpertCache>> {
+fn install_run_gpu_backend(
+    gpu_cache_mb: usize,
+) -> Option<Arc<crate::expert_cache::GpuExpertCache>> {
     // The KV-cache geometry below only sizes the dense-backbone cache,
     // which the synthetic `run` benchmark does not exercise — it routes
     // everything through `expert_matmul`.
     //
     // Give run-mode GPU promotion a bounded (but non-zero) budget so
-    // repeated experts can become true GPU hits.
-    const RUN_GPU_CACHE_CAPACITY_MB: usize = 512;
+    // repeated experts can become true GPU hits. Sized by
+    // `--gpu-cache-mb` (default 4 GiB — a single Mixtral-8x7B Q4
+    // expert is ~99 MiB, so anything much smaller thrashes).
     let gpu_expert_cache = std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(
-        RUN_GPU_CACHE_CAPACITY_MB * 1024 * 1024,
+        gpu_cache_mb.saturating_mul(1024 * 1024),
         0.5,
         16,
     ));
@@ -739,7 +750,7 @@ fn install_run_gpu_backend() -> Option<Arc<crate::expert_cache::GpuExpertCache>>
     } else {
         info!(
             device = device_name,
-            vram_capacity_mb = RUN_GPU_CACHE_CAPACITY_MB,
+            vram_capacity_mb = gpu_cache_mb,
             "GpuBackend installed for run benchmark"
         );
         Some(gpu_expert_cache)
