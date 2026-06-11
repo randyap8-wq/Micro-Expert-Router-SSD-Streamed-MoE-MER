@@ -95,6 +95,17 @@ impl ExpertResident {
         self.hits.load(Ordering::Relaxed)
     }
 
+    /// Whether this resident's bytes live in a **shadow** (Buffer B)
+    /// pool buffer — i.e. it entered the cache via a speculative
+    /// prefetch (`Engine::spawn_prefetch`) rather than a foreground
+    /// miss. Used by [`ExpertCache::evict_lru_shadow_backed`] to
+    /// recycle Buffer B capacity when every shadow slot is parked
+    /// inside long-lived residents.
+    #[inline]
+    pub fn is_shadow_backed(&self) -> bool {
+        self.buffer.is_shadow()
+    }
+
     /// Bare weight bytes — i.e. the buffer with any leading Unified
     /// Tensor Header stripped. The vast majority of callers want this.
     ///
@@ -271,6 +282,36 @@ impl ExpertCache {
         // Collect ids in reverse-recency order. `LruCache::iter` yields
         // most-recently-used first, so the *last* item is the LRU.
         let id_order: Vec<u32> = guard.iter().map(|(k, _)| *k).collect();
+        for &id in id_order.iter().rev() {
+            if !pinned.contains(&id) {
+                if let Some(v) = guard.pop(&id) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    /// Pop the least-recently-used entry that is **shadow-backed**
+    /// (see [`ExpertResident::is_shadow_backed`]) and not pinned.
+    /// Returns `None` when no such resident exists.
+    ///
+    /// Used by the engine when the shadow (Buffer B) free list is
+    /// empty: prefetched residents keep their shadow tag for the life
+    /// of their residency, so once `shadow_slots` of them accumulate
+    /// in the LRU every further speculative prefetch would be dropped
+    /// ("shadow pool busy") until ordinary eviction happens to recycle
+    /// one. Evicting the LRU shadow-backed resident hands its buffer
+    /// back to Buffer B so the look-ahead pipeline keeps running.
+    pub fn evict_lru_shadow_backed(&self) -> Option<Arc<ExpertResident>> {
+        let pinned = self.pinned.lock();
+        let mut guard = self.inner.lock();
+        // `LruCache::iter` yields most-recently-used first, so walk the
+        // collected order in reverse to test the LRU end first.
+        let id_order: Vec<u32> = guard
+            .iter()
+            .filter_map(|(k, v)| if v.is_shadow_backed() { Some(*k) } else { None })
+            .collect();
         for &id in id_order.iter().rev() {
             if !pinned.contains(&id) {
                 if let Some(v) = guard.pop(&id) {

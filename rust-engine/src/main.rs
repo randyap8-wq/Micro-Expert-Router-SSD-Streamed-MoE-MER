@@ -1173,10 +1173,20 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // expert namespace (see `total_experts` above) so multi-layer
     // models don't silently drop layer-≥1 ids on the floor.
     if cfg.predictive.locality_enabled {
-        let monitor = Arc::new(LocalityMonitor::new(
-            total_experts,
-            cfg.predictive.locality_window,
-        ));
+        // Scale the sliding window by the layer count: with a
+        // layer-qualified namespace every token contributes
+        // `num_layers × top_k` activations, so a flat 256-deep window
+        // only holds ~8 activations *per layer* — far too few for the
+        // per-layer heat threshold (`effective_locality_threshold`,
+        // which divides by the layer count) to discriminate anything.
+        // Multiplying the window by the layer count keeps the
+        // *per-layer* history depth equal to what the operator
+        // configured for a flat namespace.
+        let window = cfg
+            .predictive
+            .locality_window
+            .saturating_mul(cfg.model.num_layers.max(1));
+        let monitor = Arc::new(LocalityMonitor::new(total_experts, window));
         engine_builder = engine_builder
             .with_locality_monitor(monitor, cfg.predictive.locality_threshold_pct);
     }
@@ -1989,9 +1999,18 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         // All off by default so the legacy benchmark is bit-for-bit; turn
         // them on to measure whether they move the hit rate / I/O share.
         if args.locality {
+            // Mirror `cmd_serve`: when the run uses a layer-qualified
+            // namespace, scale the window by the layer count so the
+            // per-layer history depth matches the configured value
+            // (see `effective_locality_threshold` in engine.rs).
+            let num_layers = args
+                .num_experts_per_layer
+                .filter(|&p| p > 0)
+                .map(|p| args.num_experts.div_ceil(p).max(1) as usize)
+                .unwrap_or(1);
             let monitor = Arc::new(LocalityMonitor::new(
                 args.num_experts,
-                args.locality_window,
+                args.locality_window.saturating_mul(num_layers),
             ));
             base = base.with_locality_monitor(monitor, args.locality_threshold_pct);
         }

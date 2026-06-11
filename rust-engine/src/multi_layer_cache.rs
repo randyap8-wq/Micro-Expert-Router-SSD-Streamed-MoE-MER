@@ -114,6 +114,21 @@ impl MultiLayerExpertCache {
         layer.min(self.caches.len().saturating_sub(1))
     }
 
+    /// Public counterpart of [`Self::layer_idx`]: the per-layer cache
+    /// index that owns the global expert id `id` (clamped to the last
+    /// layer for out-of-range ids). Used by the engine's locality
+    /// pinning to budget pins against each layer's own capacity.
+    pub fn layer_of(&self, id: u32) -> usize {
+        self.layer_idx(id)
+    }
+
+    /// Residency capacity of one per-layer cache. Returns 0 for an
+    /// out-of-range layer index so callers can treat "unknown layer"
+    /// as "no budget".
+    pub fn capacity_of_layer(&self, layer: usize) -> usize {
+        self.caches.get(layer).map(|c| c.capacity()).unwrap_or(0)
+    }
+
     /// Borrow the [`ExpertCache`] for one layer (so existing engine code
     /// that takes an `Arc<ExpertCache>` keeps working). Panics if
     /// `layer` is out of range — call sites that may receive an
@@ -195,6 +210,22 @@ impl MultiLayerExpertCache {
         self.caches.iter().map(|c| c.len()).sum()
     }
 
+    /// Pop a least-recently-used, non-pinned, **shadow-backed** entry
+    /// (see [`ExpertCache::evict_lru_shadow_backed`]). Walks layers
+    /// heaviest-first so Buffer B recycling relieves the most-pressured
+    /// layer's LRU first. Returns `None` when no unpinned shadow-backed
+    /// resident exists anywhere.
+    pub fn evict_lru_shadow_backed(&self) -> Option<Arc<ExpertResident>> {
+        let mut order: Vec<usize> = (0..self.caches.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.caches[i].len()));
+        for idx in order {
+            if let Some(r) = self.caches[idx].evict_lru_shadow_backed() {
+                return Some(r);
+            }
+        }
+        None
+    }
+
     pub fn capacity(&self) -> usize {
         self.caches.iter().map(|c| c.capacity()).sum()
     }
@@ -248,6 +279,51 @@ mod tests {
         let a = mlc.cache_for_layer(0);
         let b = mlc.cache_for_layer(0);
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn layer_of_and_capacity_of_layer_decode_global_ids() {
+        let mlc = MultiLayerExpertCache::with_capacities(vec![3, 2], 8);
+        assert_eq!(mlc.layer_of(0), 0);
+        assert_eq!(mlc.layer_of(7), 0);
+        assert_eq!(mlc.layer_of(8), 1);
+        // Out-of-range ids clamp to the last layer (mirrors layer_idx).
+        assert_eq!(mlc.layer_of(99), 1);
+        assert_eq!(mlc.capacity_of_layer(0), 3);
+        assert_eq!(mlc.capacity_of_layer(1), 2);
+        assert_eq!(mlc.capacity_of_layer(5), 0);
+    }
+
+    #[test]
+    fn evict_lru_shadow_backed_skips_primary_and_pinned() {
+        // 2 primary + 2 shadow buffers; experts_per_layer=8, 1 layer.
+        let pool = BufferPool::new_with_shadow(2, 2, 4096, 4096);
+        let mlc = MultiLayerExpertCache::single_layer(4);
+
+        // id 0: primary-backed; ids 1, 2: shadow-backed (1 is LRU).
+        let _ = mlc.insert(Arc::new(ExpertResident::new(0, pool.try_acquire().unwrap())));
+        let _ = mlc.insert(Arc::new(ExpertResident::new(
+            1,
+            pool.try_acquire_shadow().unwrap(),
+        )));
+        let _ = mlc.insert(Arc::new(ExpertResident::new(
+            2,
+            pool.try_acquire_shadow().unwrap(),
+        )));
+
+        // Pin the LRU shadow-backed resident: eviction must skip it and
+        // take the *next* shadow-backed one (id 2), never primary id 0.
+        mlc.pin(1);
+        let evicted = mlc.evict_lru_shadow_backed().expect("one candidate left");
+        assert_eq!(evicted.id, 2);
+        assert!(evicted.is_shadow_backed());
+        drop(evicted);
+        // Its buffer must return to the SHADOW free list.
+        assert!(pool.try_acquire_shadow().is_some());
+        // No unpinned shadow-backed residents remain.
+        assert!(mlc.evict_lru_shadow_backed().is_none());
+        assert!(mlc.contains(0), "primary-backed resident untouched");
+        assert!(mlc.contains(1), "pinned shadow-backed resident untouched");
     }
 
     #[test]

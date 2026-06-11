@@ -1025,6 +1025,21 @@ pub(crate) struct EngineCore {
 /// Each arm is independently optional — a fresh `Engine::new(...)`
 /// disables all three, which preserves the legacy benchmark path
 /// bit-for-bit.
+/// One step of Markov routing history: the expert set the gate chose,
+/// tagged with the MoE layer it was chosen for (`None` on the
+/// layer-less `generate` benchmark path). The layer tag lets
+/// `moe_step` verify that consecutive history entries actually came
+/// from consecutive layers of the *same* token stream before learning
+/// or predicting from them — concurrent batched requests interleave
+/// their `moe_step` calls in this engine-global ring, and an
+/// uncontiguous pair is cross-stream noise the predictor must not
+/// train on (Finding 5).
+#[derive(Default, Clone)]
+pub(crate) struct MarkovHistory {
+    pub(crate) ids: Vec<u32>,
+    pub(crate) layer: Option<u32>,
+}
+
 pub(crate) struct EngineSpeculation {
     /// Optional alias map: when present, any routed/predicted expert id
     /// is remapped to its canonical id before the cache is consulted.
@@ -1040,11 +1055,11 @@ pub(crate) struct EngineSpeculation {
     /// `options.pin_after_observations`, the engine asks the cache to
     /// pin it.
     pub(super) route_observations: RwLock<HashMap<u32, u64>>,
-    pub(super) last_experts: parking_lot::Mutex<Vec<u32>>,
+    pub(super) last_experts: parking_lot::Mutex<MarkovHistory>,
     /// Set of experts active two tokens ago — fed to the predictor's
     /// 2nd-order rows so prefetch decisions condition on the
     /// `(prev_prev, prev)` pair when one is available.
-    pub(super) last_last_experts: parking_lot::Mutex<Vec<u32>>,
+    pub(super) last_last_experts: parking_lot::Mutex<MarkovHistory>,
     /// Locality monitor — sliding-window heat map over recently-routed
     /// experts. When configured, the engine reconciles its hot set
     /// against the expert cache after every token: ids in the hot set
@@ -1246,8 +1261,8 @@ impl EngineSpeculation {
             alias_map: None,
             alias_redirects: AtomicU64::new(0),
             route_observations: RwLock::new(HashMap::new()),
-            last_experts: parking_lot::Mutex::new(Vec::new()),
-            last_last_experts: parking_lot::Mutex::new(Vec::new()),
+            last_experts: parking_lot::Mutex::new(MarkovHistory::default()),
+            last_last_experts: parking_lot::Mutex::new(MarkovHistory::default()),
             locality: None,
             locality_pinned: parking_lot::Mutex::new(HashSet::new()),
             locality_threshold_pct: LocalityMonitor::DEFAULT_THRESHOLD_PCT,
@@ -2205,11 +2220,13 @@ impl Engine {
         {
             let mut last = self.speculation.last_experts.lock();
             let mut last_last = self.speculation.last_last_experts.lock();
-            if !last.is_empty() {
-                self.core.predictor.observe_step2(&last_last, &last, &target);
+            if !last.ids.is_empty() {
+                self.core
+                    .predictor
+                    .observe_step2(&last_last.ids, &last.ids, &target);
             }
             *last_last = last.clone();
-            *last = target.clone();
+            *last = MarkovHistory { ids: target.clone(), layer: None };
         }
 
         // 4) Kick off speculative prefetches for the most-recent expert,
@@ -2221,7 +2238,7 @@ impl Engine {
         //    into the prefetch set — see [`Engine::union_prefetch`].
         if let Some(&seed) = target.last() {
             let last_last = self.speculation.last_last_experts.lock();
-            let s_markov = match last_last.last() {
+            let s_markov = match last_last.ids.last() {
                 Some(&pp) => self.core.predictor.predict_next2(pp, seed),
                 None => self.core.predictor.predict_next(seed),
             };
@@ -2572,8 +2589,35 @@ impl Engine {
                     }
                 }
                 None => {
-                    debug!(expert = id, "skipping prefetch: shadow pool busy");
-                    return;
+                    // **Shadow recycling (Finding 3).** Buffer B is
+                    // starved — but its capacity may be parked inside
+                    // long-lived shadow-backed residents rather than
+                    // genuinely in flight. Evict the LRU unpinned
+                    // shadow-backed resident; dropping its (typically
+                    // sole) `Arc` returns the buffer to the shadow
+                    // free-list, so the retry below usually succeeds.
+                    // If a clone of the resident is still referenced
+                    // elsewhere the buffer comes back later — drop
+                    // this speculative load, exactly like before.
+                    match me
+                        .core
+                        .cache
+                        .evict_lru_shadow_backed()
+                        .and_then(|victim| {
+                            debug!(
+                                expert = id,
+                                recycled = victim.id,
+                                "shadow pool starved: recycled LRU shadow-backed resident"
+                            );
+                            drop(victim);
+                            me.core.pool.try_acquire_shadow()
+                        }) {
+                        Some(b) => b,
+                        None => {
+                            debug!(expert = id, "skipping prefetch: shadow pool busy");
+                            return;
+                        }
+                    }
                 }
             };
             let started = Instant::now();
@@ -2688,6 +2732,37 @@ impl Engine {
         pct
     }
 
+    /// Whether a Markov-history entry recorded for layer `prev` is a
+    /// valid predecessor of the current step at layer `cur` (Finding 5).
+    ///
+    /// The history ring (`last_experts` / `last_last_experts`) is
+    /// engine-global, but `moe_step` may be driven by several
+    /// concurrently-batched token streams. On the layer-qualified
+    /// geometry consecutive steps of one stream always advance the
+    /// layer by exactly one (wrapping from the last layer back to 0 at
+    /// the token boundary), so any entry that *doesn't* satisfy that
+    /// contiguity came from a different stream — training on it would
+    /// teach the predictor cross-stream noise, and predicting from it
+    /// keys the 2nd-order lookup on a junk pair. Layer-less callers
+    /// (`cur == None`, the `generate` path) and flat namespaces skip
+    /// the check entirely, preserving legacy behaviour bit-for-bit.
+    fn markov_layers_contiguous(&self, prev: Option<u32>, cur: Option<u32>) -> bool {
+        let Some(per_layer) = self.core.storage.config().num_experts_per_layer else {
+            return true;
+        };
+        if per_layer == 0 {
+            return true;
+        }
+        let Some(cur) = cur else {
+            return true;
+        };
+        let Some(prev) = prev else {
+            return false;
+        };
+        let layers = self.core.router.num_experts().div_ceil(per_layer).max(1);
+        cur == prev.wrapping_add(1) || (prev == layers.saturating_sub(1) && cur == 0)
+    }
+
     /// Observe the chosen expert ids in the locality monitor and
     /// reconcile pinning with the expert cache: ids that just entered
     /// the hot set are pinned (LRU-eviction-protected), ids that just
@@ -2727,10 +2802,30 @@ impl Engine {
         monitor.observe(target);
 
         // Reconcile pin set against the post-observation hot set.
-        let new_hot: HashSet<u32> = monitor
-            .hot_set(threshold)
-            .into_iter()
-            .collect();
+        //
+        // **Pin budget (Finding 1).** Pinning every hot id is unsafe:
+        // with a low effective threshold the hot set can cover the
+        // entire recent working set, and pinning it all saturates the
+        // cache — `insert` then rejects every new resident ("every
+        // slot pinned"), `evict_lru` returns `None`, and foreground
+        // misses serialize on the single reserved pool buffer (the
+        // multi-second SSD-stall spikes). Cap pins so every per-layer
+        // cache always keeps at least one evictable slot.
+        // `hot_set` is sorted hottest-first, so the cap keeps the
+        // most valuable ids.
+        let ranked = monitor.hot_set(threshold);
+        let mut pins_per_layer: HashMap<usize, usize> =
+            HashMap::with_capacity(self.core.cache.num_layers());
+        let mut new_hot: HashSet<u32> = HashSet::with_capacity(ranked.len());
+        for id in ranked {
+            let layer = self.core.cache.layer_of(id);
+            let budget = self.core.cache.capacity_of_layer(layer).saturating_sub(1);
+            let used = pins_per_layer.entry(layer).or_insert(0);
+            if *used < budget {
+                *used += 1;
+                new_hot.insert(id);
+            }
+        }
         let mut prev = self.speculation.locality_pinned.lock();
         for &id in new_hot.iter() {
             if !prev.contains(&id) {
@@ -2931,7 +3026,7 @@ impl Engine {
         layer: Option<u32>,
     ) {
         // Locality (L) arm — the monitor's current hot set, or empty.
-        let mut locality_ids: Vec<u32> = self
+        let locality_ids: Vec<u32> = self
             .speculation
             .locality
             .as_ref()
@@ -2942,17 +3037,24 @@ impl Engine {
         // evidence isn't split across aliases and neighbour folds operate on
         // the same ids the cache ultimately uses.
         let mut scored = if self.speculation.alias_map.is_some() {
-            // Canonicalize + dedupe flat-weight arms after alias resolution.
-            for id in locality_ids.iter_mut() {
-                *id = self.resolve_alias(*id);
-            }
-            locality_ids.sort_unstable();
-            locality_ids.dedup();
+            // Canonicalize + dedupe flat-weight arms after alias
+            // resolution, **preserving each arm's ranking** (heat order
+            // for locality, logit order for the speculator) — the
+            // combiner's per-rank tie-break decay depends on it. On an
+            // alias collision the first (higher-ranked) id wins.
+            let mut seen_loc: HashSet<u32> = HashSet::with_capacity(locality_ids.len());
+            let locality_ids: Vec<u32> = locality_ids
+                .iter()
+                .map(|&id| self.resolve_alias(id))
+                .filter(|&id| seen_loc.insert(id))
+                .collect();
 
-            let mut speculator_ids: Vec<u32> =
-                m_speculator.iter().map(|&id| self.resolve_alias(id)).collect();
-            speculator_ids.sort_unstable();
-            speculator_ids.dedup();
+            let mut seen_spec: HashSet<u32> = HashSet::with_capacity(m_speculator.len());
+            let speculator_ids: Vec<u32> = m_speculator
+                .iter()
+                .map(|&id| self.resolve_alias(id))
+                .filter(|&id| seen_spec.insert(id))
+                .collect();
 
             // Canonicalize Markov ids, keeping the max probability when multiple ids
             // map to the same canonical expert.
@@ -3212,12 +3314,25 @@ impl Engine {
         // *after* shifting the ring buffer).
         if let Some(&seed) = target.last() {
             let last = self.speculation.last_experts.lock();
-            let s_markov = match last.last() {
-                Some(&pp) => self.core.predictor.predict_next2(pp, seed),
-                None => self.core.predictor.predict_next(seed),
+            // 2nd-order lookup only when the history entry really is
+            // the previous layer of this stream (see
+            // `markov_layers_contiguous`); otherwise fall back to the
+            // 1st-order row keyed on the current seed alone.
+            let contiguous = self.markov_layers_contiguous(last.layer, Some(layer));
+            let s_markov = match last.ids.last() {
+                Some(&pp) if contiguous => self.core.predictor.predict_next2(pp, seed),
+                _ => self.core.predictor.predict_next(seed),
             };
             drop(last);
-            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new(), Some(layer));
+            // The gate's own targets are *not* speculative: the miss
+            // loop below fetches them into primary (Buffer A) buffers
+            // microseconds from now. Passing them as
+            // `already_in_flight` keeps the (heavily overlapping,
+            // layer-scoped) speculator arm from re-fetching them into
+            // scarce shadow slots — and from winning the singleflight
+            // slot so the foreground miss lands in a shadow buffer.
+            let in_flight: HashSet<u32> = target.iter().copied().collect();
+            self.union_prefetch(&s_markov, &m_speculator, &in_flight, Some(layer));
         }
 
         // **Layer-ahead look-ahead (Part 1).** Independently of the
@@ -3455,15 +3570,32 @@ impl Engine {
         // Update predictor history (mirrors `generate`). The actual
         // union prefetch was already fired above, before the
         // target-miss await — this block only carries forward the
-        // 2nd-order ring buffer for the *next* token's prefetch.
+        // 2nd-order ring buffer for the *next* step's prefetch.
+        //
+        // **Layer-continuity guard (Finding 5).** The ring is
+        // engine-global, so with concurrently-batched streams the
+        // previous entry may belong to a different request. Only train
+        // on `(last -> target)` when `last` really is this stream's
+        // previous layer, and only feed the 2nd-order triple when
+        // `last_last -> last` is contiguous too; otherwise skip the
+        // observation rather than teach the predictor cross-stream
+        // transitions. Single-stream behaviour is unchanged.
         if !target.is_empty() {
             let mut last = self.speculation.last_experts.lock();
             let mut last_last = self.speculation.last_last_experts.lock();
-            if !last.is_empty() {
-                self.core.predictor.observe_step2(&last_last, &last, &target);
+            if !last.ids.is_empty()
+                && self.markov_layers_contiguous(last.layer, Some(layer))
+            {
+                let pp: &[u32] =
+                    if self.markov_layers_contiguous(last_last.layer, last.layer) {
+                        &last_last.ids
+                    } else {
+                        &[]
+                    };
+                self.core.predictor.observe_step2(pp, &last.ids, &target);
             }
             *last_last = last.clone();
-            *last = target.clone();
+            *last = MarkovHistory { ids: target.clone(), layer: Some(layer) };
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
@@ -4715,6 +4847,209 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Locality pin budget (Finding 1).** Pinning the entire hot set
+    /// can saturate the cache (every slot pinned ⇒ `insert` rejects all
+    /// new residents and `evict_lru` returns `None`, serializing every
+    /// foreground miss on the one reserved pool buffer). The reconcile
+    /// step must cap pins so at least one slot per layer cache stays
+    /// evictable, keeping the hottest ids (hot_set is heat-sorted).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn locality_pinning_leaves_an_evictable_slot() {
+        let dir = TempDir::new("locality-pin-cap");
+        let num_experts: u32 = 8;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let cache_slots = 3usize;
+        let seed = 0x71D_CAFEu64;
+
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, num_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .expect("storage init"),
+        );
+        storage.warmup_fds(0..num_experts).expect("pre-open fds");
+        let pool = BufferPool::new(cache_slots + 2, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(cache_slots));
+        let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(num_experts, 2, 0.05, seed));
+        // Threshold 0.0 + tiny window ⇒ *every* observed id is hot, so
+        // without the cap the whole working set would be pinned.
+        let monitor = Arc::new(LocalityMonitor::new(num_experts, 64));
+        let engine = Arc::new(
+            Engine::new(
+                cache,
+                pool,
+                storage,
+                router,
+                predictor,
+                ModelShape { d_model, d_ff, hidden_seed: seed },
+            )
+            .with_locality_monitor(monitor, 0.0),
+        );
+
+        // Observe every expert repeatedly: all 8 ids meet the 0.0
+        // threshold, but pins must stay below the cache capacity.
+        for round in 0..16u32 {
+            for id in 0..num_experts {
+                engine.locality_observe_and_reconcile(&[id, (id + round) % num_experts]);
+            }
+        }
+        let pinned = engine.core.cache.pinned_count();
+        assert!(
+            pinned <= cache_slots - 1,
+            "locality pinning must leave >=1 evictable slot: pinned={pinned}, cap={cache_slots}"
+        );
+        assert!(pinned > 0, "the hottest ids should still be pinned");
+    }
+
+    /// **Markov layer-continuity guard (Finding 5).** The engine-global
+    /// history ring may interleave concurrently-batched streams; an
+    /// entry is a valid 2nd-order predecessor only if its layer is
+    /// exactly one before the current step's (wrapping at the token
+    /// boundary). Layer-less callers and flat namespaces bypass the
+    /// check (legacy behaviour).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn markov_history_requires_layer_contiguity() {
+        let dir = TempDir::new("markov-contiguity");
+        let per_layer: u32 = 4;
+        let num_layers: u32 = 4;
+        let total = per_layer * num_layers;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed = 0x5EEDu64;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, total, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: Some(per_layer),
+            })
+            .expect("storage init"),
+        );
+        let pool = BufferPool::new(4, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(2));
+        let router = Router::Markov(Arc::new(TopKRouter::new(total, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(total, 2, 0.05, seed));
+        let engine = Arc::new(Engine::new(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape { d_model, d_ff, hidden_seed: seed },
+        ));
+
+        // Contiguous: L -> L+1, and last-layer -> 0 (token boundary).
+        assert!(engine.markov_layers_contiguous(Some(0), Some(1)));
+        assert!(engine.markov_layers_contiguous(Some(2), Some(3)));
+        assert!(engine.markov_layers_contiguous(Some(num_layers - 1), Some(0)));
+        // Non-contiguous: skips, repeats, backwards, unknown prev.
+        assert!(!engine.markov_layers_contiguous(Some(0), Some(2)));
+        assert!(!engine.markov_layers_contiguous(Some(1), Some(1)));
+        assert!(!engine.markov_layers_contiguous(Some(3), Some(2)));
+        assert!(!engine.markov_layers_contiguous(None, Some(1)));
+        // Layer-less current step (generate path) bypasses the check.
+        assert!(engine.markov_layers_contiguous(Some(3), None));
+        assert!(engine.markov_layers_contiguous(None, None));
+    }
+
+    /// **Shadow-pool recycling (Finding 3).** Prefetched residents keep
+    /// their shadow (Buffer B) buffer for the life of their residency,
+    /// so once `shadow_slots` of them accumulate every further
+    /// speculative prefetch used to be dropped ("shadow pool busy")
+    /// until an unrelated eviction happened to recycle one. The fix:
+    /// when Buffer B is starved, `spawn_prefetch` evicts the LRU
+    /// unpinned shadow-backed resident and retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_prefetch_recycles_shadow_backed_residents_when_starved() {
+        let dir = TempDir::new("shadow-recycle");
+        let num_experts: u32 = 8;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed = 0xB0FFu64;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, num_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .expect("storage init"),
+        );
+        storage.warmup_fds(0..num_experts).expect("pre-open fds");
+        // ONE shadow slot: the first prefetched resident parks it.
+        let pool = BufferPool::new_with_shadow(4, 1, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(3));
+        let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(num_experts, 2, 0.05, seed));
+        let engine = Arc::new(Engine::new(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape { d_model, d_ff, hidden_seed: seed },
+        ));
+
+        // Helper: spawn a prefetch and wait until the id is resident.
+        async fn prefetch_and_wait(engine: &Arc<Engine>, id: u32) {
+            engine.spawn_prefetch(id, 0.5);
+            for _ in 0..200 {
+                if engine.core.cache.contains(id) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("prefetch of expert {id} never landed");
+        }
+
+        // First prefetch parks the only shadow buffer inside resident 0.
+        prefetch_and_wait(&engine, 0).await;
+        assert!(engine.core.cache.get(0).unwrap().is_shadow_backed());
+
+        // Second prefetch finds Buffer B starved; it must recycle the
+        // LRU shadow-backed resident (id 0) and still complete.
+        prefetch_and_wait(&engine, 1).await;
+        assert!(
+            engine.core.cache.contains(1),
+            "starved prefetch must complete by recycling a shadow-backed resident"
+        );
+        assert!(
+            !engine.core.cache.contains(0),
+            "the parked shadow-backed resident must have been evicted to free Buffer B"
+        );
+        // A *pinned* shadow-backed resident must never be recycled.
+        engine.core.cache.pin(1);
+        engine.spawn_prefetch(2, 0.5);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            engine.core.cache.contains(1),
+            "pinned shadow-backed resident must survive shadow starvation"
+        );
     }
 
     /// **Windowed depth-N look-ahead (`speculate_layer_ahead`).** With a
