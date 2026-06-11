@@ -2681,7 +2681,7 @@ impl Engine {
         let pct = self.speculation.locality_threshold_pct;
         if let Some(per_layer) = self.core.storage.config().num_experts_per_layer {
             if per_layer > 0 {
-                let layers = (self.core.router.num_experts() / per_layer).max(1);
+                let layers = self.core.router.num_experts().div_ceil(per_layer).max(1);
                 return pct / layers as f32;
             }
         }
