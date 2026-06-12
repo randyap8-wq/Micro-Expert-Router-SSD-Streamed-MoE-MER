@@ -176,31 +176,27 @@ enum VramWeightLayout {
     Q4_0,
 }
 
-/// A fully-initialized VRAM expert: weight buffer + pre-built bind groups
-/// for the four FFN dispatch passes. Created once per expert on first
-/// promotion; reused on every subsequent token.
+/// A fully-initialized VRAM expert: weight buffer + shape/layout
+/// metadata for the four FFN dispatch passes (the dispatch-time bind
+/// groups are built per call against the checked-out
+/// [`ExpertWorkspace`]). Created once per expert on first promotion;
+/// reused on every subsequent token.
 struct VramExpertEntry {
     /// Raw weight buffer in VRAM. Layout: [gate_proj | up_proj | down_proj],
     /// either dense f32 LE or packed Q4_0 blocks — see [`VramWeightLayout`].
     /// gate_proj: [d_ff, d_model], up_proj: [d_ff, d_model], down_proj: [d_model, d_ff].
     weight_buf: wgpu::Buffer,
-    /// Bind group for Pass 1: gate matmul.
-    /// Bindings: [weight_buf@gate_slice (read), work_a/x (read), work_mid_1 (write)]
-    gate_bg:   wgpu::BindGroup,
-    /// Bind group for Pass 2: up matmul.
-    /// Bindings: [weight_buf@up_slice (read), work_a/x (read), work_mid_2 (write)]
-    up_bg:     wgpu::BindGroup,
-    /// Bind group for Pass 3: SwiGLU.
-    /// Bindings: [work_mid_1/gate (read), work_mid_2/up (read), work_out/swiglu_out (write)]
-    swiglu_bg: wgpu::BindGroup,
-    /// Bind group for Pass 4: down matmul.
-    /// Bindings: [weight_buf@down_slice (read), work_out/swiglu_out (read), work_mid_1/final_out (write)]
-    down_bg:   wgpu::BindGroup,
     /// Cached shape parameters.
     d_model:   usize,
     d_ff:      usize,
     /// Weight encoding → which matmul pipeline the passes dispatch.
     layout:    VramWeightLayout,
+    /// Bytes per projection matrix (F32 layout only; selects the
+    /// gate/up/down sub-range of `weight_buf` when the per-dispatch
+    /// bind groups are built — gate at 0, up at `proj_bytes`, down at
+    /// `2 * proj_bytes`). Unused (0) for Q4_0, whose projection base
+    /// travels in the `w_block_off` push constant instead.
+    proj_bytes: u64,
     /// First-block index of the up projection (Q4_0 layout only; 0 for F32).
     up_block_off:   u32,
     /// First-block index of the down projection (Q4_0 layout only; 0 for F32).
@@ -214,6 +210,46 @@ impl GpuStorage for VramExpertEntry {
     fn as_wgpu_buffer(&self) -> Option<&wgpu::Buffer> {
         Some(&self.weight_buf)
     }
+}
+
+/// Number of per-dispatch expert FFN workspaces pre-allocated at
+/// backend init. Each VRAM expert dispatch checks one out for its
+/// lifetime, so up to this many expert FFNs can be in flight on the
+/// queue **concurrently** — the per-dispatch wait below only blocks
+/// on its own submission index, never on the whole queue. Sized at
+/// 5 × ~64 KiB buffers per workspace (≈ 1.3 MiB total for the pool):
+/// negligible VRAM for a 4-way overlap window.
+const EXPERT_WORKSPACE_POOL: usize = 4;
+
+/// Private buffer set for one in-flight expert FFN dispatch.
+///
+/// The legacy path funnelled every expert through the backend-global
+/// `work_a` / `work_mid_*` / `staging_dn` buffers, which forced the
+/// whole FFN (upload → 4 passes → readback) under one
+/// `expert_execution_lock` — and the per-op `Maintain::Wait` then
+/// stalled the *entire* device queue per dispatch. Giving each
+/// dispatch its own buffers removes both: no shared-buffer lock, and
+/// each dispatch waits only for its own `SubmissionIndex`.
+///
+/// All buffers are sized for the worst-case expert shape
+/// (`MAX_EXPERT_D_FF` f32 elements — `d_model ≤ MAX_EXPERT_D_FF` was
+/// already implied by the legacy path, which wrote the [d_model] down
+/// output into the `MAX_EXPERT_D_FF`-sized `work_mid_1`).
+struct ExpertWorkspace {
+    /// Hidden-state upload target ([d_model] f32).
+    x_buf:   wgpu::Buffer,
+    /// Gate projection output, then reused for the final down output ([d_ff] / [d_model] f32).
+    mid_1:   wgpu::Buffer,
+    /// Up projection output ([d_ff] f32).
+    mid_2:   wgpu::Buffer,
+    /// SwiGLU output ([d_ff] f32).
+    ffn_out: wgpu::Buffer,
+    /// Readback staging for the down output ([d_model] f32, MAP_READ).
+    staging: wgpu::Buffer,
+    /// Host-side f16→f32 conversion scratch for the `x` upload —
+    /// per-workspace, so expert dispatches never contend on the
+    /// backend-global `conversion_scratch` either.
+    scratch: Vec<f32>,
 }
 
 pub struct GpuBackend {
@@ -232,10 +268,6 @@ pub struct GpuBackend {
     work_a: wgpu::Buffer,
     work_b: wgpu::Buffer,
     work_out: wgpu::Buffer,
-    /// Pre-allocated intermediate [d_ff] buffer for the expert gate projection output.
-    work_mid_1: wgpu::Buffer,
-    /// Pre-allocated intermediate [d_ff] buffer for the expert up projection output.
-    work_mid_2: wgpu::Buffer,
 
     _staging_up: wgpu::Buffer,
     staging_dn: wgpu::Buffer,
@@ -270,8 +302,13 @@ pub struct GpuBackend {
     /// Reference to the VRAM expert cache. Used to check whether an expert
     /// is GPU-resident before falling back to the NVMe → CPU path.
     gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
-    /// Serializes the expert FFN path, which reuses shared staging buffers.
-    expert_execution_lock: ParkingMutex<()>,
+    /// Checked-out-on-dispatch workspaces for the expert FFN path —
+    /// see [`ExpertWorkspace`]. Replaces the `expert_execution_lock`
+    /// that used to serialize all expert dispatches behind one set of
+    /// shared staging buffers.
+    expert_workspaces: ParkingMutex<Vec<ExpertWorkspace>>,
+    /// Wakes dispatchers parked on an empty workspace pool.
+    expert_workspace_cv: parking_lot::Condvar,
 }
 
 impl GpuBackend {
@@ -508,22 +545,46 @@ impl GpuBackend {
             mapped_at_creation: false,
         });
 
-        let work_mid_1 = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("work_mid_1"),
-            size:               (MAX_EXPERT_D_FF * 4) as u64,
-            usage:              wgpu::BufferUsages::STORAGE
-                              | wgpu::BufferUsages::COPY_DST
-                              | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let work_mid_2 = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("work_mid_2"),
-            size:               (MAX_EXPERT_D_FF * 4) as u64,
-            usage:              wgpu::BufferUsages::STORAGE
-                              | wgpu::BufferUsages::COPY_DST
-                              | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // Per-dispatch expert FFN workspaces — see [`ExpertWorkspace`].
+        let workspace_bytes = (MAX_EXPERT_D_FF * 4) as u64;
+        let storage_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+        let expert_workspaces: Vec<ExpertWorkspace> = (0..EXPERT_WORKSPACE_POOL)
+            .map(|i| ExpertWorkspace {
+                x_buf: device.create_buffer(&wgpu::BufferDescriptor {
+                    label:              Some(&format!("expert_ws{i}_x")),
+                    size:               workspace_bytes,
+                    usage:              storage_usage,
+                    mapped_at_creation: false,
+                }),
+                mid_1: device.create_buffer(&wgpu::BufferDescriptor {
+                    label:              Some(&format!("expert_ws{i}_mid_1")),
+                    size:               workspace_bytes,
+                    usage:              storage_usage,
+                    mapped_at_creation: false,
+                }),
+                mid_2: device.create_buffer(&wgpu::BufferDescriptor {
+                    label:              Some(&format!("expert_ws{i}_mid_2")),
+                    size:               workspace_bytes,
+                    usage:              storage_usage,
+                    mapped_at_creation: false,
+                }),
+                ffn_out: device.create_buffer(&wgpu::BufferDescriptor {
+                    label:              Some(&format!("expert_ws{i}_ffn_out")),
+                    size:               workspace_bytes,
+                    usage:              storage_usage,
+                    mapped_at_creation: false,
+                }),
+                staging: device.create_buffer(&wgpu::BufferDescriptor {
+                    label:              Some(&format!("expert_ws{i}_staging")),
+                    size:               workspace_bytes,
+                    usage:              wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                scratch: vec![0.0f32; MAX_EXPERT_D_FF],
+            })
+            .collect();
 
         let staging_up = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging_up"),
@@ -609,8 +670,6 @@ impl GpuBackend {
             work_a,
             work_b,
             work_out,
-            work_mid_1,
-            work_mid_2,
             _staging_up: staging_up,
             staging_dn,
             kv_cache,
@@ -624,12 +683,13 @@ impl GpuBackend {
             head_dim,
             vram_expert_bufs: ParkingMutex::new(std::collections::HashMap::new()),
             gpu_expert_cache,
-            expert_execution_lock: ParkingMutex::new(()),
+            expert_workspaces: ParkingMutex::new(expert_workspaces),
+            expert_workspace_cv: parking_lot::Condvar::new(),
         })
     }
 
-    /// Upload expert weight bytes to VRAM and pre-build the four bind groups
-    /// needed for expert FFN dispatch.
+    /// Upload expert weight bytes to VRAM and validate the projection
+    /// sub-range offsets for the per-dispatch bind groups.
     ///
     /// Weight layout (verify against `dispatch_expert_forward` before shipping):
     ///   gate_proj bytes: [0,                   d_ff * d_model * 4)
@@ -642,7 +702,6 @@ impl GpuBackend {
         d_model:      usize,
         d_ff:         usize,
     ) -> anyhow::Result<VramExpertEntry> {
-        use std::num::NonZeroU64;
 
         let proj_bytes = d_ff * d_model * 4;  // bytes per projection matrix
         anyhow::ensure!(
@@ -672,7 +731,10 @@ impl GpuBackend {
         self.queue.write_buffer(&weight_buf, 0, weight_bytes);
 
         // ── Sub-range offsets ─────────────────────────────────────────────────
-        let gate_offset  = 0u64;
+        // The per-dispatch bind groups (built in `expert_matmul_from_vram`
+        // against the checked-out workspace) bind gate/up/down as offset
+        // sub-ranges of this buffer, so the offsets must honour the
+        // device's storage-offset alignment.
         let up_offset    = proj_bytes as u64;
         let down_offset  = 2 * proj_bytes as u64;
         let min_align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
@@ -688,123 +750,21 @@ impl GpuBackend {
             down_offset,
             min_align
         );
-        let slice_size   = NonZeroU64::new(proj_bytes as u64).unwrap();
-
-        // ── Bind group layout (3 buffers: read, read, read-write) ─────────────
-        // Reuse the pipeline's auto-layout by pulling it from the existing pipeline.
-        let matmul_bgl  = self.matmul_pipeline.get_bind_group_layout(0);
-        let swiglu_bgl  = self.swiglu_pipeline.get_bind_group_layout(0);
-
-        // ── Pass 1: gate matmul — weight_buf[gate] × x → work_mid_1 ─────────
-        let gate_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("expert_gate_bg"),
-            layout:  &matmul_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding:  0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &weight_buf,
-                        offset: gate_offset,
-                        size:   Some(slice_size),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  1,
-                    resource: self.work_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  2,
-                    resource: self.work_mid_1.as_entire_binding(),
-                },
-            ],
-        });
-
-        // ── Pass 2: up matmul — weight_buf[up] × x → work_mid_2 ─────────────
-        let up_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("expert_up_bg"),
-            layout:  &matmul_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding:  0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &weight_buf,
-                        offset: up_offset,
-                        size:   Some(slice_size),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  1,
-                    resource: self.work_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  2,
-                    resource: self.work_mid_2.as_entire_binding(),
-                },
-            ],
-        });
-
-        // ── Pass 3: SwiGLU — work_mid_1, work_mid_2 → work_out ──────────────
-        let swiglu_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("expert_swiglu_bg"),
-            layout:  &swiglu_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding:  0,
-                    resource: self.work_mid_1.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  1,
-                    resource: self.work_mid_2.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  2,
-                    resource: self.work_out.as_entire_binding(),
-                },
-            ],
-        });
-
-        // ── Pass 4: down matmul — weight_buf[down] × work_out → work_mid_1 ──
-        let down_slice_size = NonZeroU64::new(proj_bytes as u64).unwrap(); // same shape
-        let down_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("expert_down_bg"),
-            layout:  &matmul_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding:  0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &weight_buf,
-                        offset: down_offset,
-                        size:   Some(down_slice_size),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  1,
-                    resource: self.work_out.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  2,
-                    resource: self.work_mid_1.as_entire_binding(),
-                },
-            ],
-        });
 
         Ok(VramExpertEntry {
             weight_buf,
-            gate_bg,
-            up_bg,
-            swiglu_bg,
-            down_bg,
             d_model,
             d_ff,
             layout: VramWeightLayout::F32,
+            proj_bytes: proj_bytes as u64,
             up_block_off: 0,
             down_block_off: 0,
         })
     }
 
-    /// Upload a **native Q4_0** expert weight buffer to VRAM and pre-build
-    /// the four FFN bind groups against the inline-dequant pipeline
-    /// (`matmul_q4_0.wgsl`). Unlike [`Self::build_expert_entry`] the bytes
+    /// Upload a **native Q4_0** expert weight buffer to VRAM for the
+    /// inline-dequant pipeline (`matmul_q4_0.wgsl`). Unlike
+    /// [`Self::build_expert_entry`] the bytes
     /// are *not* dequantised first: the GGUF Q4_0 blocks (18 bytes per 32
     /// weights) cross PCIe and live in VRAM as-is — ~8× fewer bytes than
     /// the dense F32 stream — and each compute pass unpacks blocks inline.
@@ -903,52 +863,43 @@ impl GpuBackend {
 
         // The projection base is selected via the `w_block_off` push
         // constant (Q4_0 blocks are 18 bytes and cannot honour
-        // min_storage_buffer_offset_alignment), so every matmul pass
-        // binds the entire weight buffer.
-        let matmul_bgl = self.matmul_q4_0_pipeline.get_bind_group_layout(0);
-        let swiglu_bgl = self.swiglu_pipeline.get_bind_group_layout(0);
-
-        let make_matmul_bg = |label: &str, x_buf: &wgpu::Buffer, out_buf: &wgpu::Buffer| {
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label:   Some(label),
-                layout:  &matmul_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: weight_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
-                ],
-            })
-        };
-
-        // Pass 1: gate GEMV — W[gate blocks] × x → work_mid_1.
-        let gate_bg = make_matmul_bg("expert_gate_bg_q4_0", &self.work_a, &self.work_mid_1);
-        // Pass 2: up GEMV — W[up blocks] × x → work_mid_2.
-        let up_bg = make_matmul_bg("expert_up_bg_q4_0", &self.work_a, &self.work_mid_2);
-        // Pass 3: SwiGLU — work_mid_1, work_mid_2 → work_out (dense, unchanged).
-        let swiglu_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("expert_swiglu_bg_q4_0"),
-            layout:  &swiglu_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.work_mid_1.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.work_mid_2.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.work_out.as_entire_binding() },
-            ],
-        });
-        // Pass 4: down GEMV — W[down blocks] × work_out → work_mid_1.
-        let down_bg = make_matmul_bg("expert_down_bg_q4_0", &self.work_out, &self.work_mid_1);
-
+        // min_storage_buffer_offset_alignment), so the per-dispatch
+        // matmul bind groups bind the entire weight buffer.
         Ok(VramExpertEntry {
             weight_buf,
-            gate_bg,
-            up_bg,
-            swiglu_bg,
-            down_bg,
             d_model,
             d_ff,
             layout: VramWeightLayout::Q4_0,
+            proj_bytes: 0,
             up_block_off: blocks_per_proj as u32,
             down_block_off: (2 * blocks_per_proj) as u32,
         })
+    }
+
+    /// Check an [`ExpertWorkspace`] out of the pool, parking on the
+    /// condvar until one frees up when all are in flight. With
+    /// [`EXPERT_WORKSPACE_POOL`] workspaces, up to that many expert
+    /// FFN dispatches proceed concurrently; the (rare) wait here
+    /// replaces the old whole-path `expert_execution_lock`.
+    ///
+    /// Fairness: `parking_lot::Condvar` wakes waiters FIFO-ish but
+    /// makes no strict guarantee; with a pool of
+    /// [`EXPERT_WORKSPACE_POOL`] = 4 against a typical MoE top-K of
+    /// 2–4 concurrent dispatches, contention (let alone starvation)
+    /// is not expected in practice.
+    fn acquire_expert_workspace(&self) -> ExpertWorkspace {
+        let mut pool = self.expert_workspaces.lock();
+        loop {
+            if let Some(ws) = pool.pop() {
+                return ws;
+            }
+            self.expert_workspace_cv.wait(&mut pool);
+        }
+    }
+
+    fn release_expert_workspace(&self, ws: ExpertWorkspace) {
+        self.expert_workspaces.lock().push(ws);
+        self.expert_workspace_cv.notify_one();
     }
 
     /// Dispatch a SwiGLU expert FFN where the weight buffer is already
@@ -957,31 +908,105 @@ impl GpuBackend {
     ///
     /// The weight layout assumed is `[gate_proj || up_proj || down_proj]`
     /// matching `ExpertWeights::from_bytes` / the SwiGLU forward convention.
+    ///
+    /// **Concurrency / async pipeline.** Each call checks a private
+    /// [`ExpertWorkspace`] out of the pool, encodes against that
+    /// workspace's buffers, and waits only for **its own** submission
+    /// (`Maintain::wait_for(submission_index)`) — not for the whole
+    /// device queue (`Maintain::Wait`) the way the legacy path did.
+    /// Concurrent expert dispatches therefore overlap on the queue:
+    /// while one dispatch is in its readback, another can upload,
+    /// encode and submit.
     fn expert_matmul_from_vram(
         &self,
         entry: &VramExpertEntry,
         x:     TensorView<'_>,
         out:   &mut TensorViewMut<'_>,
     ) -> Result<()> {
-        let _exec_guard = self.expert_execution_lock.lock();
+        let mut ws = self.acquire_expert_workspace();
+        let result = self.expert_ffn_dispatch(entry, x, out, &mut ws);
+        // Always return the workspace — including on error paths — or
+        // the pool would leak a slot per failed dispatch.
+        self.release_expert_workspace(ws);
+        result
+    }
+
+    fn expert_ffn_dispatch(
+        &self,
+        entry: &VramExpertEntry,
+        x:     TensorView<'_>,
+        out:   &mut TensorViewMut<'_>,
+        ws:    &mut ExpertWorkspace,
+    ) -> Result<()> {
+        use std::num::NonZeroU64;
+
         let d_model = entry.d_model;
         let d_ff    = entry.d_ff;
 
         debug_assert_eq!(x.data.len(),   d_model);
         debug_assert_eq!(out.data.len(), d_model);
 
-        // ── Upload x to work_a ────────────────────────────────────────────────
-        // Scope the scratch lock to the host-side f16→f32 conversion + upload
-        // only; releasing it before encoding/submitting GPU work avoids
-        // serializing concurrent callers across the blocking readback below.
-        {
-            let mut scratch = self.conversion_scratch.lock();
-            assert!(d_model <= scratch.len());
-            for i in 0..d_model {
-                scratch[i] = x.data[i].to_f32();
-            }
-            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..d_model]));
+        // ── Upload x to the workspace's private x_buf ─────────────────────────
+        // Per-workspace scratch: no contention with other dispatches or
+        // with the dense ops' backend-global conversion scratch.
+        assert!(d_model <= ws.scratch.len());
+        for i in 0..d_model {
+            ws.scratch[i] = x.data[i].to_f32();
         }
+        self.queue.write_buffer(&ws.x_buf, 0, bytemuck::cast_slice(&ws.scratch[..d_model]));
+
+        // ── Per-dispatch bind groups against the workspace buffers ────────────
+        // Bind group creation is microseconds against a millisecond-scale
+        // submit+readback; paying it per dispatch is what frees the expert
+        // path from the shared `work_*` buffers (and the execution lock
+        // that serialized them).
+        let matmul_bgl = match entry.layout {
+            VramWeightLayout::F32  => self.matmul_pipeline.get_bind_group_layout(0),
+            VramWeightLayout::Q4_0 => self.matmul_q4_0_pipeline.get_bind_group_layout(0),
+        };
+        let swiglu_bgl = self.swiglu_pipeline.get_bind_group_layout(0);
+
+        // Weight binding for a projection pass. F32 binds the projection's
+        // sub-range (offsets validated in `build_expert_entry`); Q4_0 binds
+        // the whole buffer and selects the base via `w_block_off`.
+        let weight_binding = |proj: u32| -> wgpu::BindingResource<'_> {
+            match entry.layout {
+                VramWeightLayout::F32 => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &entry.weight_buf,
+                    offset: proj as u64 * entry.proj_bytes,
+                    size:   NonZeroU64::new(entry.proj_bytes),
+                }),
+                VramWeightLayout::Q4_0 => entry.weight_buf.as_entire_binding(),
+            }
+        };
+        let make_matmul_bg = |label: &str, proj: u32, x_buf: &wgpu::Buffer, out_buf: &wgpu::Buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label:   Some(label),
+                layout:  &matmul_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: weight_binding(proj) },
+                    wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+                ],
+            })
+        };
+
+        // Pass 1: gate matmul — weight[gate] × x → mid_1.
+        let gate_bg = make_matmul_bg("expert_gate_bg", 0, &ws.x_buf, &ws.mid_1);
+        // Pass 2: up matmul — weight[up] × x → mid_2.
+        let up_bg = make_matmul_bg("expert_up_bg", 1, &ws.x_buf, &ws.mid_2);
+        // Pass 3: SwiGLU — mid_1, mid_2 → ffn_out.
+        let swiglu_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("expert_swiglu_bg"),
+            layout:  &swiglu_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ws.mid_1.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: ws.mid_2.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: ws.ffn_out.as_entire_binding() },
+            ],
+        });
+        // Pass 4: down matmul — weight[down] × ffn_out → mid_1.
+        let down_bg = make_matmul_bg("expert_down_bg", 2, &ws.ffn_out, &ws.mid_1);
 
         // ── Single command buffer: 4 sequential compute passes ───────────────
         // The GPU executes these in order; no host-side synchronization needed
@@ -990,7 +1015,7 @@ impl GpuBackend {
             label: Some("expert_ffn_encoder"),
         });
 
-        // Pass 1: gate_proj × x → work_mid_1   (M=d_ff, K=d_model, N=1)
+        // Pass 1: gate_proj × x → mid_1   (M=d_ff, K=d_model, N=1)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label:            Some("expert_gate_pass"),
@@ -999,7 +1024,7 @@ impl GpuBackend {
             match entry.layout {
                 VramWeightLayout::F32 => {
                     cpass.set_pipeline(&self.matmul_pipeline);
-                    cpass.set_bind_group(0, &entry.gate_bg, &[]);
+                    cpass.set_bind_group(0, &gate_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_ff as u32, n: 1, k: d_model as u32, w_block_off: 0,
                     }));
@@ -1007,7 +1032,7 @@ impl GpuBackend {
                 }
                 VramWeightLayout::Q4_0 => {
                     cpass.set_pipeline(&self.matmul_q4_0_pipeline);
-                    cpass.set_bind_group(0, &entry.gate_bg, &[]);
+                    cpass.set_bind_group(0, &gate_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_ff as u32, n: 1, k: d_model as u32, w_block_off: 0,
                     }));
@@ -1016,7 +1041,7 @@ impl GpuBackend {
             }
         }
 
-        // Pass 2: up_proj × x → work_mid_2   (M=d_ff, K=d_model, N=1)
+        // Pass 2: up_proj × x → mid_2   (M=d_ff, K=d_model, N=1)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label:            Some("expert_up_pass"),
@@ -1025,7 +1050,7 @@ impl GpuBackend {
             match entry.layout {
                 VramWeightLayout::F32 => {
                     cpass.set_pipeline(&self.matmul_pipeline);
-                    cpass.set_bind_group(0, &entry.up_bg, &[]);
+                    cpass.set_bind_group(0, &up_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_ff as u32, n: 1, k: d_model as u32, w_block_off: 0,
                     }));
@@ -1033,7 +1058,7 @@ impl GpuBackend {
                 }
                 VramWeightLayout::Q4_0 => {
                     cpass.set_pipeline(&self.matmul_q4_0_pipeline);
-                    cpass.set_bind_group(0, &entry.up_bg, &[]);
+                    cpass.set_bind_group(0, &up_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_ff as u32, n: 1, k: d_model as u32,
                         w_block_off: entry.up_block_off,
@@ -1043,14 +1068,14 @@ impl GpuBackend {
             }
         }
 
-        // Pass 3: SwiGLU(work_mid_1, work_mid_2) → work_out   (n_elements=d_ff)
+        // Pass 3: SwiGLU(mid_1, mid_2) → ffn_out   (n_elements=d_ff)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label:            Some("expert_swiglu_pass"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.swiglu_pipeline);
-            cpass.set_bind_group(0, &entry.swiglu_bg, &[]);
+            cpass.set_bind_group(0, &swiglu_bg, &[]);
             cpass.set_push_constants(0, bytemuck::bytes_of(&SwigluPushConstants {
                 n_elements: d_ff as u32, _pad0: 0, _pad1: 0, _pad2: 0,
             }));
@@ -1058,7 +1083,7 @@ impl GpuBackend {
             cpass.dispatch_workgroups(wg_x, 1, 1);
         }
 
-        // Pass 4: down_proj × work_out → work_mid_1   (M=d_model, K=d_ff, N=1)
+        // Pass 4: down_proj × ffn_out → mid_1   (M=d_model, K=d_ff, N=1)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label:            Some("expert_down_pass"),
@@ -1067,7 +1092,7 @@ impl GpuBackend {
             match entry.layout {
                 VramWeightLayout::F32 => {
                     cpass.set_pipeline(&self.matmul_pipeline);
-                    cpass.set_bind_group(0, &entry.down_bg, &[]);
+                    cpass.set_bind_group(0, &down_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_model as u32, n: 1, k: d_ff as u32, w_block_off: 0,
                     }));
@@ -1075,7 +1100,7 @@ impl GpuBackend {
                 }
                 VramWeightLayout::Q4_0 => {
                     cpass.set_pipeline(&self.matmul_q4_0_pipeline);
-                    cpass.set_bind_group(0, &entry.down_bg, &[]);
+                    cpass.set_bind_group(0, &down_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_model as u32, n: 1, k: d_ff as u32,
                         w_block_off: entry.down_block_off,
@@ -1085,15 +1110,17 @@ impl GpuBackend {
             }
         }
 
-        // ── Readback work_mid_1 → out ─────────────────────────────────────────
+        // ── Readback mid_1 → out ──────────────────────────────────────────────
         let out_bytes = (d_model * 4) as u64;
-        encoder.copy_buffer_to_buffer(&self.work_mid_1, 0, &self.staging_dn, 0, out_bytes);
-        self.queue.submit(Some(encoder.finish()));
+        encoder.copy_buffer_to_buffer(&ws.mid_1, 0, &ws.staging, 0, out_bytes);
+        // Wait only for *this* submission — other in-flight expert
+        // dispatches (and dense ops) keep making progress on the queue.
+        let submission = self.queue.submit(Some(encoder.finish()));
 
-        let slice = self.staging_dn.slice(0..out_bytes);
+        let slice = ws.staging.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| { let _ = tx.send(res); });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::Maintain::wait_for(submission));
 
         rx.recv()
             .map_err(|e| anyhow::anyhow!("channel error on expert readback: {e:?}"))?
@@ -1106,7 +1133,7 @@ impl GpuBackend {
                 out.data[i] = half::f16::from_f32(floats[i]);
             }
         }
-        self.staging_dn.unmap();
+        ws.staging.unmap();
         Ok(())
     }
 }
@@ -1176,14 +1203,15 @@ impl Backend for GpuBackend {
         // Readback
         let out_bytes = (out_len * 4) as u64;
         encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
-        self.queue.submit(Some(encoder.finish()));
+        // Wait only for this submission, not the whole device queue.
+        let submission = self.queue.submit(Some(encoder.finish()));
 
         let slice = self.staging_dn.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::Maintain::wait_for(submission));
 
         rx.recv()
             .map_err(|e| anyhow!("Channel error on GPU readback: {:?}", e))?
@@ -1250,14 +1278,15 @@ impl Backend for GpuBackend {
         // Readback
         let out_bytes = (len * 4) as u64;
         encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
-        self.queue.submit(Some(encoder.finish()));
+        // Wait only for this submission, not the whole device queue.
+        let submission = self.queue.submit(Some(encoder.finish()));
 
         let slice = self.staging_dn.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::Maintain::wait_for(submission));
 
         rx.recv()
             .map_err(|e| anyhow!("Channel error on GPU readback: {:?}", e))?
@@ -1315,14 +1344,15 @@ impl Backend for GpuBackend {
         // Readback from work_a (in-place)
         let out_bytes = (len * 4) as u64;
         encoder.copy_buffer_to_buffer(&self.work_a, 0, &self.staging_dn, 0, out_bytes);
-        self.queue.submit(Some(encoder.finish()));
+        // Wait only for this submission, not the whole device queue.
+        let submission = self.queue.submit(Some(encoder.finish()));
 
         let slice = self.staging_dn.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::Maintain::wait_for(submission));
 
         rx.recv()
             .map_err(|e| anyhow!("Channel error on GPU readback: {:?}", e))?
@@ -1437,14 +1467,15 @@ impl Backend for GpuBackend {
         // Readback
         let out_bytes = (out_len * 4) as u64;
         encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
-        self.queue.submit(Some(encoder.finish()));
+        // Wait only for this submission, not the whole device queue.
+        let submission = self.queue.submit(Some(encoder.finish()));
 
         let slice = self.staging_dn.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::Maintain::wait_for(submission));
 
         rx.recv()
             .map_err(|e| anyhow!("Channel error on GPU readback: {:?}", e))?
@@ -1473,9 +1504,9 @@ impl Backend for GpuBackend {
         use crate::expert_cache::GpuLookup;
         let _ = layer_idx;
 
-        // ── Fast path: expert already in VRAM with pre-built bind groups ──────
+        // ── Fast path: expert weights already VRAM-resident ──────────────────
         // Clone the Arc handle and release the map lock *before* the
-        // blocking GPU dispatch so concurrent callers can probe / install
+        // GPU dispatch so concurrent callers can probe / install
         // other experts while this one executes.
         let cached_entry = self.vram_expert_bufs.lock().get(&expert_id).cloned();
         if let Some(entry) = cached_entry {

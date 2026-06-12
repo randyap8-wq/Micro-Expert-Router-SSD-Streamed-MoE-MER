@@ -27,8 +27,13 @@
 //!
 //! This is a real implementation backed by the [`io_uring`] crate. It
 //! supports `READ_FIXED` against pre-registered pool buffers and a
-//! batched-submit entry point that pushes K SQEs and `submit_and_wait(K)`
-//! once. The default engine factory still selects the portable `pread`
+//! batched-submit entry point that pushes K SQEs with one syscall. The
+//! reactor thread is **multi-request concurrent**: several callers'
+//! macro-batches share the ring's queue depth simultaneously (slot-
+//! tagged `user_data`, per-batch completion accounting), so a
+//! speculative prefetch batch no longer waits for a foreground batch
+//! to fully drain before its SQEs reach the kernel. The default engine
+//! factory still selects the portable `pread`
 //! backend; a deployment can opt in to this one by constructing
 //! [`IoUringStorage`] directly (see the integration sketch in the
 //! `Engine` docs and `cmd_run`'s `--io-uring` branch).
@@ -728,23 +733,351 @@ mod linux_impl {
         }
     }
 
-    /// Reactor body. Exclusively owns the `IoUring`. Pulls one
-    /// `ReactorRequest` at a time (mpsc semantics), pushes its SQEs
-    /// in chunks of `queue_depth`, issues a single
-    /// `submit_and_wait(N)`, drains the N CQEs, replies via the
-    /// request's oneshot. Loops until the channel closes.
+    /// Reactor body. Exclusively owns the `IoUring`.
+    ///
+    /// **Multi-request concurrency** (the follow-up flagged in PR
+    /// #101): instead of dequeuing one `ReactorRequest` at a time and
+    /// blocking in `submit_and_wait` until its entire macro-batch
+    /// completes, the reactor keeps up to [`MAX_INFLIGHT_REQUESTS`]
+    /// macro-batches in flight on the ring **simultaneously**, as long
+    /// as their combined SQE count fits the configured queue depth.
+    /// Concurrent callers (foreground miss fetches + speculative
+    /// prefetch batches) therefore share the NVMe queue instead of the
+    /// prefetch batch queueing *behind* the foreground batch at the
+    /// reactor boundary.
+    ///
+    /// Mechanics:
+    /// * Each admitted request is assigned a **slot id**; every one of
+    ///   its SQEs carries `user_data = slot << 32 | expert_id`, so a
+    ///   CQE can always be attributed to its owning request.
+    /// * Completions are drained as they arrive (`submit_and_wait(1)` +
+    ///   drain-all-available), decrementing the owning request's
+    ///   remaining-op count; the reply oneshot fires the moment *that
+    ///   request's* ops are all done — independent of any other
+    ///   in-flight batch.
+    /// * Oversized macro-batches (more SQEs than the ring depth) still
+    ///   take the legacy exclusive chunked path ([`process_one`]),
+    ///   which needs sole ownership of the completion queue; they are
+    ///   parked until the ring drains.
+    /// * A request that does not currently fit (`pending_ops + K >
+    ///   queue_depth`) is parked — never dropped — and re-admitted as
+    ///   soon as completions free up SQE budget. Channel FIFO order is
+    ///   preserved (a parked request blocks later admissions).
+    ///
+    /// Loops until the channel closes *and* every in-flight batch has
+    /// been drained.
     fn reactor_loop(mut ring: IoUring, mut rx: ReactorRx, queue_depth: usize) {
+        use tokio::sync::mpsc::error::TryRecvError;
         let cap = queue_depth.max(1);
-        // Use the current-thread runtime's `blocking_recv`-equivalent:
-        // we are on a dedicated std::thread, so we can call
-        // `Receiver::blocking_recv` directly.
-        while let Some(req) = rx.blocking_recv() {
+        let mut inflight: HashMap<u32, InflightBatch> = HashMap::new();
+        let mut pending_ops: usize = 0;
+        let mut next_slot: u32 = 0;
+        let mut parked: Option<ReactorRequest> = None;
+        let mut closed = false;
+        // Buffer owners for batches failed administratively (a
+        // `submit_and_wait` error) while the kernel may still hold
+        // their SQEs: dropping them could let the kernel DMA into
+        // freed memory, so they are deliberately kept alive for the
+        // reactor's lifetime instead (never safe to drop earlier).
+        // Only ever populated on a broken-ring path.
+        let mut leaked_keep_alives: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+
+        loop {
+            // ── Admission ────────────────────────────────────────────
+            // A parked request has FIFO priority over the channel.
+            if let Some(req) = parked.take() {
+                if let Admit::Parked(req) = admit_request(
+                    &mut ring, &mut inflight, &mut next_slot, &mut pending_ops, cap, req,
+                ) {
+                    parked = Some(req);
+                }
+            }
+            if parked.is_none() && !closed {
+                if inflight.is_empty() {
+                    // Fully idle: block until work (or close) arrives.
+                    match rx.blocking_recv() {
+                        Some(req) => {
+                            if let Admit::Parked(req) = admit_request(
+                                &mut ring, &mut inflight, &mut next_slot, &mut pending_ops,
+                                cap, req,
+                            ) {
+                                parked = Some(req);
+                            }
+                        }
+                        None => closed = true,
+                    }
+                }
+                // Opportunistic top-up: admit whatever else is already
+                // queued, without blocking, until the ring budget or
+                // request cap stops us.
+                while parked.is_none() && !closed {
+                    match rx.try_recv() {
+                        Ok(req) => {
+                            if let Admit::Parked(req) = admit_request(
+                                &mut ring, &mut inflight, &mut next_slot, &mut pending_ops,
+                                cap, req,
+                            ) {
+                                parked = Some(req);
+                            }
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => closed = true,
+                    }
+                }
+            }
+            if closed && inflight.is_empty() && parked.is_none() {
+                break;
+            }
+
+            // ── Completion wait + drain ──────────────────────────────
+            if pending_ops > 0 {
+                if let Err(e) = ring.submit_and_wait(1) {
+                    tracing::warn!(
+                        error = %e,
+                        in_flight = inflight.len(),
+                        "io_uring: submit_and_wait failed — failing all in-flight batches"
+                    );
+                    for (_, batch) in inflight.drain() {
+                        let _ = batch.reply.send(Err(io::Error::new(
+                            e.kind(),
+                            format!("io_uring submit_and_wait failed: {e}"),
+                        )));
+                        // The kernel may still own these SQEs; never
+                        // free the underlying buffers from here.
+                        leaked_keep_alives.push(batch._keep_alive);
+                    }
+                    pending_ops = 0;
+                    continue;
+                }
+                // Drain everything that is ready (≥ 1 by the wait above).
+                loop {
+                    let next = { ring.completion().next() };
+                    let Some(cqe) = next else { break };
+                    handle_cqe(&cqe, &mut inflight, &mut pending_ops);
+                }
+            }
+        }
+    }
+
+    /// Maximum number of macro-batches the reactor keeps in flight on
+    /// the ring at once. Bounds the slot table and keeps per-CQE
+    /// attribution lookups cheap; the SQE budget (`queue_depth`) is
+    /// the real limiter for total queue depth.
+    const MAX_INFLIGHT_REQUESTS: usize = 8;
+
+    /// Book-keeping for one admitted macro-batch whose SQEs are on the
+    /// ring. Mirrors the accumulation `process_one` did on the stack,
+    /// lifted into a slot table so several batches can accumulate
+    /// concurrently.
+    struct InflightBatch {
+        /// SQEs pushed for this batch that have not yet completed.
+        remaining: usize,
+        /// Expected read length per op (short-read validation).
+        len: usize,
+        /// Sum of full-length completions so far.
+        total_bytes: usize,
+        /// First per-op failure (OS error or short read) — reported to
+        /// the caller once the whole batch drains, exactly like the
+        /// serial path's first-error semantics.
+        first_err: Option<io::Error>,
+        reply: tokio::sync::oneshot::Sender<io::Result<usize>>,
+        /// Owner of the fds + buffers the kernel is reading into; must
+        /// outlive the last CQE of this batch.
+        _keep_alive: Box<dyn std::any::Any + Send>,
+    }
+
+    enum Admit {
+        /// Request consumed: SQEs are on the ring (or it was answered
+        /// inline — empty, push-failed, or legacy oversized path).
+        Admitted,
+        /// Request does not fit right now; caller must retry after
+        /// completions free SQE budget.
+        Parked(ReactorRequest),
+    }
+
+    /// Try to put `req`'s SQEs on the ring under the shared-queue
+    /// budget. See [`reactor_loop`] for the admission rules.
+    fn admit_request(
+        ring: &mut IoUring,
+        inflight: &mut HashMap<u32, InflightBatch>,
+        next_slot: &mut u32,
+        pending_ops: &mut usize,
+        cap: usize,
+        req: ReactorRequest,
+    ) -> Admit {
+        let total = req.prepared.len();
+        if total == 0 {
+            let _ = req.reply.send(Ok(0));
+            return Admit::Admitted;
+        }
+        if total > cap {
+            // Oversized macro-batch: needs the legacy chunked
+            // submit/drain windows, which assume exclusive ownership
+            // of the completion queue. Run it only when nothing else
+            // is in flight.
+            if !inflight.is_empty() {
+                return Admit::Parked(req);
+            }
             let ReactorRequest { prepared, len, reply, _keep_alive } = req;
-            let result = process_one(&mut ring, &prepared, len, cap);
-            // Send the reply; if the requester dropped its receiver
-            // (cancelled future) just drop the result.
+            let result = process_one(ring, &prepared, len, cap);
             let _ = reply.send(result);
             drop(_keep_alive);
+            return Admit::Admitted;
+        }
+        if *pending_ops + total > cap || inflight.len() >= MAX_INFLIGHT_REQUESTS {
+            return Admit::Parked(req);
+        }
+        // Allocate an unused slot id for CQE attribution.
+        let slot = loop {
+            let s = *next_slot;
+            *next_slot = next_slot.wrapping_add(1);
+            if !inflight.contains_key(&s) {
+                break s;
+            }
+        };
+        let ReactorRequest { prepared, len, reply, _keep_alive } = req;
+        let mut pushed = 0usize;
+        let mut push_err: Option<io::Error> = None;
+        'push: for &(fd, ptr, buf_idx, expert_id) in &prepared {
+            let sqe = opcode::ReadFixed::new(types::Fd(fd), ptr, len as u32, buf_idx)
+                .offset(0)
+                .build()
+                .user_data(((slot as u64) << 32) | expert_id as u64);
+            // SAFETY / retry semantics identical to the serial path:
+            // `ptr`/`fd` are kept alive by `_keep_alive` and the ring's
+            // pool clone; only `PushError::Full` is transient.
+            const MAX_PUSH_RETRIES: usize = 16;
+            let mut attempts = 0usize;
+            loop {
+                // SAFETY: the reactor thread is the single owner of
+                // `ring`; the SQE is a value type.
+                if unsafe { ring.submission().push(&sqe) }.is_ok() {
+                    pushed += 1;
+                    break;
+                }
+                attempts += 1;
+                if attempts > MAX_PUSH_RETRIES {
+                    push_err = Some(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "io_uring: submission queue refused {MAX_PUSH_RETRIES} push retries — kernel not draining SQ"
+                        ),
+                    ));
+                    break 'push;
+                }
+                // SQ full — non-blocking flush to make room, then retry.
+                if let Err(e) = ring.submit() {
+                    push_err = Some(e);
+                    break 'push;
+                }
+            }
+        }
+        if pushed == 0 {
+            // Nothing reached the ring: fail the request inline.
+            let e = push_err.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "io_uring: no SQEs pushed")
+            });
+            let _ = reply.send(Err(e));
+            drop(_keep_alive);
+            return Admit::Admitted;
+        }
+        // Hand the pushed window to the kernel now (non-blocking) so
+        // the device starts servicing it while we admit more requests.
+        // A failure here is recorded as the batch's first error; the
+        // SQEs stay queued and the next `submit_and_wait` retries the
+        // kernel handoff.
+        if let Err(e) = ring.submit() {
+            if push_err.is_none() {
+                push_err = Some(e);
+            }
+        }
+        *pending_ops += pushed;
+        inflight.insert(
+            slot,
+            InflightBatch {
+                remaining: pushed,
+                len,
+                total_bytes: 0,
+                first_err: push_err.map(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("io_uring batch partially submitted: {e}"),
+                    )
+                }),
+                reply,
+                _keep_alive,
+            },
+        );
+        Admit::Admitted
+    }
+
+    /// Attribute one CQE to its owning in-flight batch, apply the same
+    /// per-op validation as the serial path (negative result → OS
+    /// error, short read → `UnexpectedEof`), and fire the batch's
+    /// reply when its last op drains.
+    fn handle_cqe(
+        cqe: &io_uring::cqueue::Entry,
+        inflight: &mut HashMap<u32, InflightBatch>,
+        pending_ops: &mut usize,
+    ) {
+        let user_data = cqe.user_data();
+        let slot = (user_data >> 32) as u32;
+        let expert_id = user_data as u32;
+        let Some(batch) = inflight.get_mut(&slot) else {
+            // CQE for a slot we no longer track — possible only after
+            // an administrative failure cleared the table. Drop it.
+            tracing::warn!(slot, expert_id, "io_uring: CQE for unknown request slot");
+            *pending_ops = pending_ops.saturating_sub(1);
+            return;
+        };
+        *pending_ops = pending_ops.saturating_sub(1);
+        let result = cqe.result();
+        if result < 0 {
+            let e = io::Error::from_raw_os_error(-result);
+            tracing::warn!(
+                expert_id,
+                error = %e,
+                "io_uring CQE reported error"
+            );
+            if batch.first_err.is_none() {
+                batch.first_err = Some(io::Error::new(
+                    e.kind(),
+                    format!("io_uring read on expert {expert_id} failed: {e}"),
+                ));
+            }
+        } else {
+            let n = result as usize;
+            if n != batch.len {
+                tracing::warn!(
+                    expert_id,
+                    got = n,
+                    expected = batch.len,
+                    "io_uring CQE reported short read"
+                );
+                if batch.first_err.is_none() {
+                    batch.first_err = Some(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "io_uring short read on expert {expert_id}: got {n} bytes, expected {}",
+                            batch.len
+                        ),
+                    ));
+                }
+            } else {
+                batch.total_bytes += n;
+            }
+        }
+        batch.remaining -= 1;
+        if batch.remaining == 0 {
+            let batch = inflight
+                .remove(&slot)
+                .expect("slot present: we just mutated it");
+            let result = match batch.first_err {
+                Some(e) => Err(e),
+                None => Ok(batch.total_bytes),
+            };
+            let _ = batch.reply.send(result);
+            drop(batch._keep_alive);
         }
     }
 

@@ -33,7 +33,7 @@ use crate::router::{
 };
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1059,6 +1059,23 @@ pub(crate) struct MarkovHistory {
     pub(crate) layer: Option<u32>,
 }
 
+/// The two-deep Markov history ring (`prev` + `prev_prev`) behind a
+/// **single** mutex. The legacy layout used one mutex per entry, which
+/// forced every history update to take two locks back-to-back (a
+/// nested-acquisition pattern that both doubles the lock traffic on
+/// the per-token hot path and bakes in an implicit lock-ordering
+/// invariant). Collapsing the ring into one critical section makes the
+/// shift (`last → last_last`, `target → last`) atomic by construction:
+/// no interleaving can ever observe a half-shifted ring.
+#[derive(Default)]
+pub(crate) struct MarkovRing {
+    /// Expert set the gate chose on the previous step.
+    pub(crate) last: MarkovHistory,
+    /// Expert set active two steps ago — feeds the predictor's
+    /// 2nd-order rows.
+    pub(crate) last_last: MarkovHistory,
+}
+
 pub(crate) struct EngineSpeculation {
     /// Optional alias map: when present, any routed/predicted expert id
     /// is remapped to its canonical id before the cache is consulted.
@@ -1072,13 +1089,14 @@ pub(crate) struct EngineSpeculation {
     /// Per-expert routing-observation counts used by frequency-based
     /// pinning. Once an expert's count crosses
     /// `options.pin_after_observations`, the engine asks the cache to
-    /// pin it.
-    pub(super) route_observations: RwLock<HashMap<u32, u64>>,
-    pub(super) last_experts: parking_lot::Mutex<MarkovHistory>,
-    /// Set of experts active two tokens ago — fed to the predictor's
-    /// 2nd-order rows so prefetch decisions condition on the
-    /// `(prev_prev, prev)` pair when one is available.
-    pub(super) last_last_experts: parking_lot::Mutex<MarkovHistory>,
+    /// pin it. Sharded `DashMap` of atomics instead of a global
+    /// `RwLock<HashMap>`: the per-token bump is a shard *read* lock +
+    /// `fetch_add` in steady state, so concurrent `moe_step` calls
+    /// from batched requests no longer serialize on one writer lock.
+    pub(super) route_observations: DashMap<u32, AtomicU64>,
+    /// Two-deep Markov history (`last` + `last_last`) behind a single
+    /// mutex — see [`MarkovRing`] for why the entries share one lock.
+    pub(super) markov_ring: parking_lot::Mutex<MarkovRing>,
     /// Locality monitor — sliding-window heat map over recently-routed
     /// experts. When configured, the engine reconciles its hot set
     /// against the expert cache after every token: ids in the hot set
@@ -1279,9 +1297,8 @@ impl EngineSpeculation {
         Self {
             alias_map: None,
             alias_redirects: AtomicU64::new(0),
-            route_observations: RwLock::new(HashMap::new()),
-            last_experts: parking_lot::Mutex::new(MarkovHistory::default()),
-            last_last_experts: parking_lot::Mutex::new(MarkovHistory::default()),
+            route_observations: DashMap::new(),
+            markov_ring: parking_lot::Mutex::new(MarkovRing::default()),
             locality: None,
             locality_pinned: parking_lot::Mutex::new(HashSet::new()),
             locality_threshold_pct: LocalityMonitor::DEFAULT_THRESHOLD_PCT,
@@ -1937,16 +1954,7 @@ impl Engine {
         // Frequency-based pinning: bump observation counts and ask the
         // cache to pin any id that crossed the threshold this token.
         if self.core.options.pin_after_observations > 0 {
-            let mut obs = self.speculation.route_observations.write();
-            let threshold = self.core.options.pin_after_observations;
-            for &id in &target {
-                let entry = obs.entry(id).or_insert(0);
-                *entry += 1;
-                if *entry == threshold {
-                    debug!(expert = id, count = *entry, "pinning hot expert");
-                    self.core.cache.pin(id);
-                }
-            }
+            self.bump_route_observations(&target);
         }
 
         // 1) Make sure every required expert is resident.
@@ -2047,15 +2055,14 @@ impl Engine {
         //    `(prev_prev -> prev -> next)` triples in addition to the
         //    `(prev -> next)` baseline.
         {
-            let mut last = self.speculation.last_experts.lock();
-            let mut last_last = self.speculation.last_last_experts.lock();
-            if !last.ids.is_empty() {
+            let mut ring = self.speculation.markov_ring.lock();
+            if !ring.last.ids.is_empty() {
                 self.core
                     .predictor
-                    .observe_step2(&last_last.ids, &last.ids, &target);
+                    .observe_step2(&ring.last_last.ids, &ring.last.ids, &target);
             }
-            *last_last = last.clone();
-            *last = MarkovHistory { ids: target.clone(), layer: None };
+            ring.last_last = ring.last.clone();
+            ring.last = MarkovHistory { ids: target.clone(), layer: None };
         }
         // Kick off speculative prefetches for the most-recent expert,
         // using the 2nd-order predictor when a prev_prev is available
@@ -2065,12 +2072,12 @@ impl Engine {
         // arm) and the locality monitor's hot set (the **L** arm)
         // into the prefetch set — see [`Engine::union_prefetch`].
         if let Some(&seed) = target.last() {
-            let last_last = self.speculation.last_last_experts.lock();
-            let s_markov = match last_last.ids.last() {
+            let ring = self.speculation.markov_ring.lock();
+            let s_markov = match ring.last_last.ids.last() {
                 Some(&pp) => self.core.predictor.predict_next2(pp, seed),
                 None => self.core.predictor.predict_next(seed),
             };
-            drop(last_last);
+            drop(ring);
             // Speculator: predict + train on the residual-stream
             // hidden state computed at the top of `generate` (when
             // the speculator's d_model matches; otherwise this is
@@ -2850,7 +2857,7 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
     /// Whether a Markov-history entry recorded for layer `prev` is a
     /// valid predecessor of the current step at layer `cur` (Finding 5).
     ///
-    /// The history ring (`last_experts` / `last_last_experts`) is
+    /// The history ring ([`MarkovRing`], `last` / `last_last`) is
     /// engine-global, but `moe_step` may be driven by several
     /// concurrently-batched token streams. On the layer-qualified
     /// geometry consecutive steps of one stream always advance the
@@ -2876,6 +2883,40 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         };
         let layers = self.core.router.num_experts().div_ceil(per_layer).max(1);
         cur == prev.wrapping_add(1) || (prev == layers.saturating_sub(1) && cur == 0)
+    }
+
+    /// Frequency-based pinning: bump per-expert routing-observation
+    /// counts and pin any id that crosses
+    /// `options.pin_after_observations` exactly once.
+    ///
+    /// Lock structure (this is the `route_observations` restructuring
+    /// flagged as follow-up in PR #101): the counts live in a sharded
+    /// `DashMap<u32, AtomicU64>`, so the steady-state bump for an
+    /// already-seen expert takes only a shard **read** lock plus a
+    /// relaxed `fetch_add` — concurrent `generate`/`moe_step` calls
+    /// from batched requests touch disjoint shards instead of
+    /// serializing on one `RwLock<HashMap>` writer guard. The shard
+    /// write lock is only taken on the first observation of a given
+    /// expert id (entry insertion). `fetch_add`'s returned
+    /// previous value makes the threshold crossing exact: precisely
+    /// one caller observes `prev + 1 == threshold` and issues the pin.
+    fn bump_route_observations(&self, target: &[u32]) {
+        let threshold = self.core.options.pin_after_observations;
+        for &id in target {
+            let prev = if let Some(counter) = self.speculation.route_observations.get(&id) {
+                counter.fetch_add(1, Ordering::Relaxed)
+            } else {
+                self.speculation
+                    .route_observations
+                    .entry(id)
+                    .or_insert_with(|| AtomicU64::new(0))
+                    .fetch_add(1, Ordering::Relaxed)
+            };
+            if prev + 1 == threshold {
+                debug!(expert = id, count = threshold, "pinning hot expert");
+                self.core.cache.pin(id);
+            }
+        }
     }
 
     /// Observe the chosen expert ids in the locality monitor and
@@ -3415,16 +3456,7 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
 
         // Frequency-based pinning: same logic as `generate`.
         if self.core.options.pin_after_observations > 0 {
-            let mut obs = self.speculation.route_observations.write();
-            let threshold = self.core.options.pin_after_observations;
-            for &id in &target {
-                let entry = obs.entry(id).or_insert(0);
-                *entry += 1;
-                if *entry == threshold {
-                    debug!(expert = id, count = *entry, "pinning hot expert");
-                    self.core.cache.pin(id);
-                }
-            }
+            self.bump_route_observations(&target);
         }
 
         // **Speculative I/O union-fetch (S ∪ L ∪ M), issued
@@ -3449,17 +3481,17 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // (and matching `generate`, which performs the same lookup
         // *after* shifting the ring buffer).
         if let Some(&seed) = target.last() {
-            let last = self.speculation.last_experts.lock();
+            let ring = self.speculation.markov_ring.lock();
             // 2nd-order lookup only when the history entry really is
             // the previous layer of this stream (see
             // `markov_layers_contiguous`); otherwise fall back to the
             // 1st-order row keyed on the current seed alone.
-            let contiguous = self.markov_layers_contiguous(last.layer, Some(layer));
-            let s_markov = match last.ids.last() {
+            let contiguous = self.markov_layers_contiguous(ring.last.layer, Some(layer));
+            let s_markov = match ring.last.ids.last() {
                 Some(&pp) if contiguous => self.core.predictor.predict_next2(pp, seed),
                 _ => self.core.predictor.predict_next(seed),
             };
-            drop(last);
+            drop(ring);
             // The gate's own targets are *not* speculative: the miss
             // loop below fetches them into primary (Buffer A) buffers
             // microseconds from now. Passing them as
@@ -3747,21 +3779,20 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // observation rather than teach the predictor cross-stream
         // transitions. Single-stream behaviour is unchanged.
         if !target.is_empty() {
-            let mut last = self.speculation.last_experts.lock();
-            let mut last_last = self.speculation.last_last_experts.lock();
-            if !last.ids.is_empty()
-                && self.markov_layers_contiguous(last.layer, Some(layer))
+            let mut ring = self.speculation.markov_ring.lock();
+            if !ring.last.ids.is_empty()
+                && self.markov_layers_contiguous(ring.last.layer, Some(layer))
             {
                 let pp: &[u32] =
-                    if self.markov_layers_contiguous(last_last.layer, last.layer) {
-                        &last_last.ids
+                    if self.markov_layers_contiguous(ring.last_last.layer, ring.last.layer) {
+                        &ring.last_last.ids
                     } else {
                         &[]
                     };
-                self.core.predictor.observe_step2(pp, &last.ids, &target);
+                self.core.predictor.observe_step2(pp, &ring.last.ids, &target);
             }
-            *last_last = last.clone();
-            *last = MarkovHistory { ids: target.clone(), layer: Some(layer) };
+            ring.last_last = ring.last.clone();
+            ring.last = MarkovHistory { ids: target.clone(), layer: Some(layer) };
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;

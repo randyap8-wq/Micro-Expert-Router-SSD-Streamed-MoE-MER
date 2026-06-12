@@ -61,6 +61,14 @@ use crate::io_provider::NvmeStorage;
 /// intended bottleneck, not the channel.
 pub const DEFAULT_REACTOR_QUEUE: usize = 256;
 
+/// Default number of reads the reactor keeps in flight concurrently
+/// (see [`IoReactor::spawn_with_concurrency`]). Matches the NVMe
+/// queue depth `read_experts_batch` targets for a steady-state MoE
+/// top-K burst: deep enough that a foreground miss never queues
+/// behind a speculative prefetch inside the reactor, shallow enough
+/// that the bounded mpsc queue stays the admission-control point.
+pub const DEFAULT_REACTOR_CONCURRENCY: usize = 8;
+
 /// One in-flight request from a worker to the reactor.
 struct ReactorRequest {
     expert_id: u32,
@@ -127,50 +135,93 @@ impl IoReactorHandle {
     }
 }
 
-/// The single-owner actor task. Wraps an [`NvmeStorage`] and serialises
-/// every read through one task — this is a **high-efficiency bounded
-/// serial actor loop**, not a concurrent dispatcher: requests are
-/// dequeued one at a time and the read is `await`-ed inline before the
-/// next request is pulled. The bounded mpsc queue therefore also
-/// bounds active I/O concurrency (no `tokio::spawn` per request, no
-/// fan-out), which is exactly the back-pressure shape the engine
-/// wants when the storage layer is the rate-limiting stage.
+/// The single-owner actor task. Wraps an [`NvmeStorage`] and routes
+/// every read through one task that owns all reactor state. The actor
+/// is a **bounded concurrent dispatcher** (the multi-request follow-up
+/// flagged in PR #101): up to `max_concurrent` reads are driven
+/// simultaneously against the storage layer, so a foreground miss
+/// admitted behind a slow speculative read no longer waits for it to
+/// finish — the two preads overlap on the NVMe queue. The combination
+/// of the bounded mpsc queue (admission) and the in-flight cap
+/// (active I/O concurrency) is still the back-pressure shape the
+/// engine wants when the storage layer is the rate-limiting stage:
+/// concurrency is bounded by construction, never by accident.
 pub struct IoReactor;
 
 impl IoReactor {
     /// Spawn the reactor and return a [`IoReactorHandle`] callers
     /// clone freely. The reactor task runs on the caller's tokio
     /// runtime; dropping every handle closes the channel and the
-    /// task exits.
+    /// task exits once in-flight reads drain.
     ///
     /// `queue` sizes the bounded mpsc buffer; use
     /// [`DEFAULT_REACTOR_QUEUE`] unless profiling says otherwise.
+    /// I/O concurrency defaults to [`DEFAULT_REACTOR_CONCURRENCY`];
+    /// use [`Self::spawn_with_concurrency`] to tune it.
     pub fn spawn(storage: Arc<NvmeStorage>, queue: usize) -> IoReactorHandle {
+        Self::spawn_with_concurrency(storage, queue, DEFAULT_REACTOR_CONCURRENCY)
+    }
+
+    /// Spawn the reactor with an explicit cap on concurrently
+    /// in-flight reads. `max_concurrent = 1` reproduces the legacy
+    /// strictly-serial actor loop.
+    pub fn spawn_with_concurrency(
+        storage: Arc<NvmeStorage>,
+        queue: usize,
+        max_concurrent: usize,
+    ) -> IoReactorHandle {
         assert!(queue > 0, "IoReactor queue must be > 0");
+        assert!(max_concurrent > 0, "IoReactor max_concurrent must be > 0");
         let (tx, mut rx) = mpsc::channel::<ReactorRequest>(queue);
         tokio::spawn(async move {
-            // Keep the actual read inside the actor so the bounded
-            // mpsc queue also bounds active I/O concurrency. If we
-            // spawned a child task per dequeued request, a burst
-            // could drain the queue immediately and recreate
-            // unbounded concurrent `read_expert` calls against the
-            // storage layer.
-            //
-            // Follow-up integrations will fold in-flight
-            // deduplication and the breaker-probe scheduler here so
-            // the engine's existing `DashMap<u32, Notify>` shard
-            // table can retire.
-            while let Some(req) = rx.recv().await {
-                let ReactorRequest { expert_id, mut buf, reply } = req;
-                let result = storage.read_expert(expert_id, &mut buf).await;
-                // `send` only fails if the caller dropped the
-                // oneshot before the reply arrived — that's
-                // legal (cancellation); swallow it and let the
-                // buffer drop release its arena slot.
-                let _ = reply.send(ReactorReply { buf, result });
+            // The actor still single-owns all reactor state; the only
+            // thing that fans out is the storage read itself, into a
+            // JoinSet capped at `max_concurrent`. New requests are
+            // admitted only while the set has room, so a burst can
+            // never recreate unbounded concurrent `read_expert` calls
+            // against the storage layer — the failure mode the old
+            // serial loop was guarding against.
+            let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    req = rx.recv(), if inflight.len() < max_concurrent => {
+                        match req {
+                            Some(ReactorRequest { expert_id, mut buf, reply }) => {
+                                let storage = storage.clone();
+                                inflight.spawn(async move {
+                                    let result = storage.read_expert(expert_id, &mut buf).await;
+                                    // `send` only fails if the caller
+                                    // dropped the oneshot before the
+                                    // reply arrived — that's legal
+                                    // (cancellation); swallow it and
+                                    // let the buffer drop release its
+                                    // arena slot.
+                                    let _ = reply.send(ReactorReply { buf, result });
+                                });
+                            }
+                            // Channel closed: every handle was
+                            // dropped. Fall through to drain what's
+                            // still in flight, then exit.
+                            None => break,
+                        }
+                    }
+                    Some(joined) = inflight.join_next(), if !inflight.is_empty() => {
+                        if let Err(e) = joined {
+                            // A read task panicking drops its oneshot,
+                            // which the caller observes as BrokenPipe;
+                            // log so the panic isn't silent.
+                            tracing::warn!(error = %e, "io_reactor: in-flight read task failed");
+                        }
+                    }
+                }
             }
-            // Channel closed: every handle was dropped. Exit
-            // cleanly — no shutdown signal needed.
+            // Drain the tail so already-admitted requests still get
+            // their replies after the last handle drops.
+            while let Some(joined) = inflight.join_next().await {
+                if let Err(e) = joined {
+                    tracing::warn!(error = %e, "io_reactor: in-flight read task failed during drain");
+                }
+            }
         });
         IoReactorHandle { tx }
     }
@@ -288,5 +339,49 @@ mod tests {
         // The actor task is now draining; without any sender, it
         // exits. A fresh handle would need a new `spawn` call.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The explicit-concurrency constructor must serve correct bytes at
+    /// both extremes: `max_concurrent = 1` (the legacy strictly-serial
+    /// loop) and a deep in-flight window. Every read goes through the
+    /// same shared actor, so this also exercises admission gating
+    /// (requests beyond the in-flight cap wait in the mpsc queue).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reactor_concurrency_extremes_serve_correct_bytes() {
+        for max_concurrent in [1usize, 8] {
+            let tag = format!("conc{max_concurrent}");
+            let (dir, storage, pool, expert_size) = setup(&tag, 4);
+
+            // Reference bytes via the direct path.
+            let mut reference: Vec<Vec<u8>> = Vec::new();
+            for id in 0..4u32 {
+                let mut b = pool.acquire().await;
+                storage.read_expert(id, &mut b).await.expect("direct read");
+                reference.push(b.as_slice().to_vec());
+            }
+
+            let handle = IoReactor::spawn_with_concurrency(storage.clone(), 16, max_concurrent);
+            let mut tasks = Vec::new();
+            for i in 0..24u32 {
+                let h = handle.clone();
+                let p = pool.clone();
+                tasks.push(tokio::spawn(async move {
+                    let buf = p.acquire().await;
+                    let id = i % 4;
+                    let reply = h.read_expert(id, buf).await.expect("reactor read");
+                    let n = reply.result.expect("inner io");
+                    assert_eq!(n, expert_size);
+                    (id, reply.buf.as_slice().to_vec())
+                }));
+            }
+            for t in tasks {
+                let (id, bytes) = t.await.expect("worker task panicked");
+                assert_eq!(
+                    bytes, reference[id as usize],
+                    "byte mismatch for expert {id} at max_concurrent={max_concurrent}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
