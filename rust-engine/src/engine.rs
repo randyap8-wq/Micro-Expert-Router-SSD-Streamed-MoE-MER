@@ -824,6 +824,25 @@ pub(crate) struct Counters {
     /// semaphore was exhausted (gist Phase 3 — bounded prefetch).
     /// Surfaced via `EngineReport::prefetch_dropped_concurrency`.
     prefetch_dropped_concurrency: AtomicU64,
+    /// Speculative prefetches dropped because no buffer could be
+    /// acquired — the shadow (Buffer B) half was starved even after
+    /// recycling the LRU shadow-backed resident, or (legacy
+    /// single-pool configs) the primary pool was busy. Previously this
+    /// was only a `debug!`, making shadow-pool starvation invisible in
+    /// production; surfaced via
+    /// `EngineReport::prefetch_dropped_pool_starved` and
+    /// `mer_prefetch_dropped_pool_starved_total`.
+    prefetch_dropped_pool_starved: AtomicU64,
+    /// Tokens for which the neural speculator (M arm) was silently
+    /// disabled because the hidden-state width didn't match the
+    /// speculator's `d_model`. A persistent non-zero rate means the
+    /// predictive arm is misconfigured and contributing nothing.
+    speculator_dmodel_mismatch: AtomicU64,
+    /// Expert activations that fell back from the GPU fast path to the
+    /// CPU path because the VRAM dispatch errored (typically a VRAM
+    /// miss). Invisible mixed GPU/CPU execution is a major source of
+    /// inconsistent token latency, so make it countable.
+    gpu_cpu_fallbacks: AtomicU64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -1319,6 +1338,33 @@ pub struct Engine {
     pub(crate) core: EngineCore,
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
+}
+
+/// Run a CPU/GPU-blocking expert compute closure while *donating* the
+/// current tokio worker thread to it.
+///
+/// The per-expert FFN forward (and the synchronous wgpu dispatch +
+/// readback behind `Backend::expert_matmul`) takes ~10ms+ per layer.
+/// Running it inline on a tokio worker pins that worker for the whole
+/// slice, and with a fused decode batch every worker can be pinned at
+/// once — starving the `tokio::spawn`-ed speculative prefetch tasks
+/// exactly when they need to run to bury the next layer's SSD reads
+/// under compute. `block_in_place` flags the worker as blocked so the
+/// scheduler migrates other ready tasks (the prefetches) to sibling
+/// workers, the same discipline `io_provider` already applies to its
+/// `pread(2)` calls.
+///
+/// `block_in_place` panics on a `current_thread` runtime (used by
+/// plain `#[tokio::test]`), so fall back to running inline there —
+/// a single-threaded runtime has no sibling workers to protect anyway.
+fn run_compute_donated<R>(f: impl FnOnce() -> R) -> R {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// Dispatch a single per-expert SwiGLU forward pass according to
@@ -1986,6 +2032,61 @@ impl Engine {
             let predicted = self.trace_prediction(&hidden);
             tw.write_record(token_idx, 0, &target, &cache_hits_per_expert, &predicted);
         }
+
+        // 2) Update the predictor with the observed transition and fire
+        //    the speculative union prefetch (S ∪ L ∪ M) *now* — before
+        //    awaiting the miss fetches and before the FFN compute — so
+        //    the speculative reads overlap both the foreground SSD
+        //    stall and this token's compute instead of running
+        //    sequentially after them (this mirrors `moe_step`, which
+        //    has always issued its union prefetch ahead of the
+        //    miss-await).
+        //
+        //    Use the 2nd-order helper when we have a `prev_prev` set
+        //    (anything from token_idx >= 2), so the predictor learns
+        //    `(prev_prev -> prev -> next)` triples in addition to the
+        //    `(prev -> next)` baseline.
+        {
+            let mut last = self.speculation.last_experts.lock();
+            let mut last_last = self.speculation.last_last_experts.lock();
+            if !last.ids.is_empty() {
+                self.core
+                    .predictor
+                    .observe_step2(&last_last.ids, &last.ids, &target);
+            }
+            *last_last = last.clone();
+            *last = MarkovHistory { ids: target.clone(), layer: None };
+        }
+        // Kick off speculative prefetches for the most-recent expert,
+        // using the 2nd-order predictor when a prev_prev is available
+        // (which gives sharper distributions than 1st-order alone and
+        // therefore wastes less prefetch bandwidth). When a neural
+        // speculator is configured, also union its top-K (the **M**
+        // arm) and the locality monitor's hot set (the **L** arm)
+        // into the prefetch set — see [`Engine::union_prefetch`].
+        if let Some(&seed) = target.last() {
+            let last_last = self.speculation.last_last_experts.lock();
+            let s_markov = match last_last.ids.last() {
+                Some(&pp) => self.core.predictor.predict_next2(pp, seed),
+                None => self.core.predictor.predict_next(seed),
+            };
+            drop(last_last);
+            // Speculator: predict + train on the residual-stream
+            // hidden state computed at the top of `generate` (when
+            // the speculator's d_model matches; otherwise this is
+            // a no-op — see `speculator_predict_and_train`).
+            let m_speculator = self.speculator_predict_and_train(&hidden, &target, None);
+            // The gate's own targets are being fetched into primary
+            // (Buffer A) buffers by the miss tasks spawned above —
+            // pass them as `already_in_flight` so the union prefetch
+            // doesn't re-fetch them into scarce shadow slots or steal
+            // their singleflight leadership (same rationale as
+            // `moe_step`). Synthetic single-layer benchmark path: no
+            // layer-qualified id geometry, so no affinity fold.
+            let in_flight: HashSet<u32> = target.iter().copied().collect();
+            self.union_prefetch(&s_markov, &m_speculator, &in_flight, None);
+        }
+
         let had_misses = !miss_handles.is_empty();
         for (i, h) in miss_handles {
             // `fetch` reports a fatal read error as `Err` (the engine
@@ -2042,12 +2143,16 @@ impl Engine {
             .map(|r| r.expect("internal invariant (benchmark path): every routed expert slot must be populated by either a hit or a completed miss fetch"))
             .collect();
 
-        // 2) Either run the real SwiGLU FFN, or — under `--io-only` —
+        // 3) Either run the real SwiGLU FFN, or — under `--io-only` —
         //    just touch every byte of the resident buffer with a cheap
         //    XOR checksum so the kernel actually delivers the page data
         //    and we can isolate the SSD-streaming cost from FFN compute.
+        //    Either way this is a multi-millisecond blocking slice, so
+        //    donate the worker thread (`block_in_place`) for its
+        //    duration — otherwise the speculative prefetch tasks fired
+        //    above can't get a worker to overlap this compute.
         let compute_start = Instant::now();
-        let compute_us = if self.core.options.io_only {
+        let compute_us = run_compute_donated(|| if self.core.options.io_only {
             let mut digest: u64 = 0;
             let mut total_bytes: u64 = 0;
             for r in &residents {
@@ -2207,51 +2312,10 @@ impl Engine {
                 "FFN forward complete"
             );
             us
-        };
+        });
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
         self.metrics.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
         self.metrics.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
-
-        // 3) Update predictor with the observed transition.
-        //    Use the 2nd-order helper when we have a `prev_prev` set
-        //    (anything from token_idx >= 2), so the predictor learns
-        //    `(prev_prev -> prev -> next)` triples in addition to the
-        //    `(prev -> next)` baseline.
-        {
-            let mut last = self.speculation.last_experts.lock();
-            let mut last_last = self.speculation.last_last_experts.lock();
-            if !last.ids.is_empty() {
-                self.core
-                    .predictor
-                    .observe_step2(&last_last.ids, &last.ids, &target);
-            }
-            *last_last = last.clone();
-            *last = MarkovHistory { ids: target.clone(), layer: None };
-        }
-
-        // 4) Kick off speculative prefetches for the most-recent expert,
-        //    using the 2nd-order predictor when a prev_prev is available
-        //    (which gives sharper distributions than 1st-order alone and
-        //    therefore wastes less prefetch bandwidth). When a neural
-        //    speculator is configured, also union its top-K (the **M**
-        //    arm) and the locality monitor's hot set (the **L** arm)
-        //    into the prefetch set — see [`Engine::union_prefetch`].
-        if let Some(&seed) = target.last() {
-            let last_last = self.speculation.last_last_experts.lock();
-            let s_markov = match last_last.ids.last() {
-                Some(&pp) => self.core.predictor.predict_next2(pp, seed),
-                None => self.core.predictor.predict_next(seed),
-            };
-            drop(last_last);
-            // Speculator: predict + train on the residual-stream
-            // hidden state computed at the top of `generate` (when
-            // the speculator's d_model matches; otherwise this is
-            // a no-op — see `speculator_predict_and_train`).
-            let m_speculator = self.speculator_predict_and_train(&hidden, &target, None);
-            // Synthetic single-layer benchmark path: no layer-qualified
-            // id geometry, so the affinity fold is not applicable.
-            self.union_prefetch(&s_markov, &m_speculator, &HashSet::new(), None);
-        }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
         let _ = self.metrics.cycle_hist.lock().record(cycle_us.max(1));
@@ -2505,6 +2569,18 @@ impl Engine {
     }
 
     fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
+        // **Dedup before spending a permit.** `union_prefetch` and
+        // `speculate_layer_ahead` can both nominate the same id for one
+        // token; without this pre-check each duplicate consumed a
+        // semaphore permit (and a spawned task) before the singleflight
+        // map rejected it — under a tight `max_concurrent_prefetches`
+        // budget, two predictions of the same expert could crowd out a
+        // genuinely new one. Racing with a concurrent insert/landing is
+        // fine: the post-spawn `contains` re-check and the singleflight
+        // entry below stay authoritative.
+        if self.core.cache.contains(id) || self.core.in_flight.contains_key(&id) {
+            return;
+        }
         // Speculative prefetches are *bounded*: each spawn must hold
         // an owned permit from `prefetch_semaphore` for the duration
         // of the I/O. When the configured ceiling
@@ -2583,7 +2659,7 @@ impl Engine {
                     match me.core.pool.try_acquire() {
                         Some(b) => b,
                         None => {
-                            debug!(expert = id, "skipping prefetch: pool busy");
+                            me.note_prefetch_dropped_pool_starved(id);
                             return;
                         }
                     }
@@ -2614,7 +2690,7 @@ impl Engine {
                         }) {
                         Some(b) => b,
                         None => {
-                            debug!(expert = id, "skipping prefetch: shadow pool busy");
+                            me.note_prefetch_dropped_pool_starved(id);
                             return;
                         }
                     }
@@ -2647,13 +2723,28 @@ impl Engine {
                     // the insert (every slot pinned), the resident drops
                     // here and its buffer returns to the shadow pool —
                     // exactly the right behaviour for a speculative load.
-                    if let Err(_rejected) = me.core.cache.insert(resident) {
+                    if let Err(_rejected) = me.core.cache.insert(resident.clone()) {
                         debug!(
                             expert = id,
                             "prefetch dropped: cache full of pinned entries"
                         );
                         return;
                     }
+                    // **Eager VRAM promotion.** A speculative prefetch is
+                    // a strong "about to be routed" signal, so try to
+                    // stage the bytes into the GPU LRU Edge *now* instead
+                    // of waiting for `promote_after_hits` RAM hits — the
+                    // lazy path can leave a predicted expert on the CPU
+                    // fallback for its first N activations (one CPU
+// Only attempt eager VRAM promotion when the cache definitely has room;
+// otherwise we would copy ~expert_size bytes into a Vec only to have the
+// non-evicting promotion path immediately reject it.
+if let Some(gpu) = me.core.gpu_cache.as_ref() {
+    let bytes = resident.data().len();
+    if (gpu.used_bytes() as usize).saturating_add(bytes) <= gpu.capacity_bytes() {
+        me.try_promote_resident_to_gpu(&resident);
+    }
+}
                     debug!(
                         expert = id,
                         prob = p,
@@ -2672,6 +2763,30 @@ impl Engine {
     /// Account for the fact that an expert was a hit *because* we prefetched it.
     pub fn note_prefetch_hit(&self) {
         self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A speculative prefetch was dropped because no pool buffer could
+    /// be acquired (shadow starved even after recycling, or legacy
+    /// primary pool busy). Counts it, mirrors to Prometheus, and warns
+    /// on the first occurrence so starvation is never silent.
+    fn note_prefetch_dropped_pool_starved(&self, id: u32) {
+        let prev = self
+            .metrics
+            .counters
+            .prefetch_dropped_pool_starved
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = self.metrics.prom.as_ref() {
+            p.record_prefetch_dropped_pool_starved(1);
+        }
+        if prev == 0 {
+            warn!(
+                expert = id,
+                "prefetch dropped: buffer pool starved (further drops counted in \
+                 mer_prefetch_dropped_pool_starved_total, logged at debug)"
+            );
+        } else {
+            debug!(expert = id, "skipping prefetch: pool starved");
+        }
     }
 
     /// The predictive controller's expert guess for the current token,
@@ -2868,9 +2983,30 @@ impl Engine {
         };
         if x.len() != spec.d_model() {
             // Hidden state shape mismatch — nothing useful we can
-            // predict against, so silently disable for this token.
-            // This makes the speculator graceful in the synthetic
-            // benchmark where d_model can disagree with the real model.
+            // predict against, so disable the M arm for this token.
+            // This keeps the speculator graceful in the synthetic
+            // benchmark where d_model can disagree with the real
+            // model, but the disablement must not be invisible: a
+            // persistently mismatched speculator silently zeroes the
+            // M arm (and, through the unified score ceiling, the
+            // affinity/spatial fold too). Warn once and count every
+            // occurrence so operators can see it in /metrics.
+            let prev = self
+                .metrics
+                .counters
+                .speculator_dmodel_mismatch
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = self.metrics.prom.as_ref() {
+                p.record_speculator_disabled(1);
+            }
+            if prev == 0 {
+                warn!(
+                    hidden_len = x.len(),
+                    speculator_d_model = spec.d_model(),
+                    "speculator disabled: hidden-state width != speculator d_model \
+                     (M arm contributes nothing; counted in mer_speculator_disabled_total)"
+                );
+            }
             return Vec::new();
         }
         let preds = match (layer, self.core.storage.config().num_experts_per_layer) {
@@ -3470,92 +3606,122 @@ impl Engine {
         let residents: Vec<Option<Arc<ExpertResident>>> = residents;
 
         // Run the SwiGLU FFN per expert against the hidden state.
+        // Donate this worker thread for the duration: per-expert FFN
+        // compute (CPU QMatMul or the synchronous wgpu dispatch +
+        // readback) is a multi-millisecond blocking slice, and running
+        // it inline would starve the speculative prefetch tasks spawned
+        // above of a worker right when they must overlap this compute.
         let compute_start = Instant::now();
-        let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
-        for r_opt in &residents {
-            let r = match r_opt {
-                Some(r) => r,
-                None => {
-                    // Failed fetch: push a zero vector so the caller's
-                    // weights[] alignment stays valid (combining with
-                    // weight `w_i * 0 = 0` is equivalent to dropping
-                    // this expert from the mixture).
-                    per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
-                    continue;
-                }
-            };
-            // ── Phase 3: GPU fast path ────────────────────────────────────
-            // If the backend is GPU and the expert is VRAM-resident, dispatch
-            // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
-            // unconditionally, so we always guard behind is_gpu(). A VRAM
-            // miss returns Err and we fall through to the CPU path below.
-            // Both F32 and (block-aligned) Q4_0 experts are eligible —
-            // see `Engine::gpu_eligible_dtype`.
-            let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
-            {
-                let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
-                let x_f16: Vec<half::f16> =
-                    x.iter().map(|&f| half::f16::from_f32(f)).collect();
-                let x_view = crate::backend::TensorView {
-                    data: &x_f16,
-                    rows: 1,
-                    cols: self.core.shape.d_model,
+        let per_expert_y: Vec<HiddenState> = run_compute_donated(|| {
+            let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
+            for r_opt in &residents {
+                let r = match r_opt {
+                    Some(r) => r,
+                    None => {
+                        // Failed fetch: push a zero vector so the caller's
+                        // weights[] alignment stays valid (combining with
+                        // weight `w_i * 0 = 0` is equivalent to dropping
+                        // this expert from the mixture).
+                        per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
+                        continue;
+                    }
                 };
-                let mut out_view = crate::backend::TensorViewMut {
-                    data: &mut out_f16,
-                    rows: 1,
-                    cols: self.core.shape.d_model,
-                };
-                let matmul_res = self.core.backend.expert_matmul(
-                    layer as usize,
-                    r.id,
-                    x_view,
-                    self.core.shape.d_model,
-                    self.core.shape.d_ff,
-                    &mut out_view,
-                );
-                match matmul_res {
-                    Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
-                    Err(_) => None, // VRAM miss — fall through to CPU
-                }
-            } else {
-                None
-            };
-
-            let res = if let Some(gpu_out) = gpu_result {
-                // Synthesize an InferenceOutput so downstream logging stays
-                // shape-compatible with the CPU path.
-                Ok((
-                    summarise_output_like_cpu(token_idx, r.id, &gpu_out),
-                    gpu_out,
-                ))
-            } else {
-                dispatch_expert_forward(
-                    self.core.options.dtype,
-                    self.core.options.use_qmm_for_q4,
-                    token_idx,
-                    r,
-                    x,
-                    self.core.shape.d_model,
-                    self.core.shape.d_ff,
-                )
-            };
-            match res {
-                Ok((_out, y)) => per_expert_y.push(y),
-                Err(e) => {
-                    warn!(
-                        token = token_idx,
-                        expert = r.id,
-                        error = %e,
-                        "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                // ── Phase 3: GPU fast path ────────────────────────────────────
+                // If the backend is GPU and the expert is VRAM-resident, dispatch
+                // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
+                // unconditionally, so we always guard behind is_gpu(). A VRAM
+                // miss returns Err and we fall through to the CPU path below.
+                // Both F32 and (block-aligned) Q4_0 experts are eligible —
+                // see `Engine::gpu_eligible_dtype`.
+                let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
+                {
+                    let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
+                    let x_f16: Vec<half::f16> =
+                        x.iter().map(|&f| half::f16::from_f32(f)).collect();
+                    let x_view = crate::backend::TensorView {
+                        data: &x_f16,
+                        rows: 1,
+                        cols: self.core.shape.d_model,
+                    };
+                    let mut out_view = crate::backend::TensorViewMut {
+                        data: &mut out_f16,
+                        rows: 1,
+                        cols: self.core.shape.d_model,
+                    };
+                    let matmul_res = self.core.backend.expert_matmul(
+                        layer as usize,
+                        r.id,
+                        x_view,
+                        self.core.shape.d_model,
+                        self.core.shape.d_ff,
+                        &mut out_view,
                     );
-                    // Push a zero vector so the caller's weights[] alignment
-                    // stays valid; combining with weight `w_i * 0 = 0` is
-                    // the same as if this expert were never picked.
-                    per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
+                    match matmul_res {
+                        Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
+                        Err(e) => {
+                            // VRAM miss — fall through to CPU. Count it:
+                            // invisible mixed GPU/CPU execution (one CPU
+                            // expert dominating an otherwise-GPU token)
+                            // is a major source of inconsistent TPS.
+                            let prev = self
+                                .metrics
+                                .counters
+                                .gpu_cpu_fallbacks
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Some(p) = self.metrics.prom.as_ref() {
+                                p.record_gpu_cpu_fallback(1);
+                            }
+                            if prev == 0 {
+                                warn!(
+                                    expert = r.id,
+                                    error = %e,
+                                    "GPU expert dispatch fell back to CPU \
+                                     (further fallbacks counted in mer_gpu_cpu_fallbacks_total)"
+                                );
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let res = if let Some(gpu_out) = gpu_result {
+                    // Synthesize an InferenceOutput so downstream logging stays
+                    // shape-compatible with the CPU path.
+                    Ok((
+                        summarise_output_like_cpu(token_idx, r.id, &gpu_out),
+                        gpu_out,
+                    ))
+                } else {
+                    dispatch_expert_forward(
+                        self.core.options.dtype,
+                        self.core.options.use_qmm_for_q4,
+                        token_idx,
+                        r,
+                        x,
+                        self.core.shape.d_model,
+                        self.core.shape.d_ff,
+                    )
+                };
+                match res {
+                    Ok((_out, y)) => per_expert_y.push(y),
+                    Err(e) => {
+                        warn!(
+                            token = token_idx,
+                            expert = r.id,
+                            error = %e,
+                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                        );
+                        // Push a zero vector so the caller's weights[] alignment
+                        // stays valid; combining with weight `w_i * 0 = 0` is
+                        // the same as if this expert were never picked.
+                        per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
+                    }
                 }
             }
-        }
+            per_expert_y
+        });
         let compute_us = compute_start.elapsed().as_micros() as u64;
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
         self.metrics.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
@@ -3730,6 +3896,17 @@ impl Engine {
                 .counters
                 .prefetch_dropped_concurrency
                 .load(Ordering::Relaxed),
+            prefetch_dropped_pool_starved: self
+                .metrics
+                .counters
+                .prefetch_dropped_pool_starved
+                .load(Ordering::Relaxed),
+            speculator_dmodel_mismatch: self
+                .metrics
+                .counters
+                .speculator_dmodel_mismatch
+                .load(Ordering::Relaxed),
+            gpu_cpu_fallbacks: self.metrics.counters.gpu_cpu_fallbacks.load(Ordering::Relaxed),
             gpu_cache_enabled: self.core.gpu_cache.is_some(),
             vram_used_bytes: self
                 .core
@@ -3929,6 +4106,21 @@ pub struct EngineReport {
     /// Speculative prefetches dropped because
     /// `EngineOptions::max_concurrent_prefetches` was already saturated.
     pub prefetch_dropped_concurrency: u64,
+    /// Speculative prefetches dropped because no pool buffer could be
+    /// acquired (shadow half starved even after recycling an LRU
+    /// shadow-backed resident, or legacy primary pool busy). A high
+    /// rate means look-ahead is being silently disabled by buffer
+    /// starvation — grow the shadow half or reduce prefetch fanout.
+    pub prefetch_dropped_pool_starved: u64,
+    /// Tokens for which the neural speculator was disabled by a
+    /// hidden-state / `d_model` mismatch. Persistent non-zero values
+    /// mean the M predictive arm is misconfigured and contributing
+    /// nothing.
+    pub speculator_dmodel_mismatch: u64,
+    /// Expert activations that fell back from the GPU fast path to the
+    /// CPU path because the VRAM dispatch errored (typically a VRAM
+    /// miss). Non-zero rates explain mixed GPU/CPU token latency.
+    pub gpu_cpu_fallbacks: u64,
     /// Phase 2 / 3-tier hierarchy: whether the engine has a VRAM (GPU)
     /// expert cache attached. `false` keeps the historical 2-tier
     /// behaviour bit-for-bit; `true` adds the SSD → RAM → VRAM tier.

@@ -77,6 +77,17 @@ struct MetricsInner {
     /// `gpu_cache.promote_after_hits` and being copied into the
     /// Anchor Core (or the LRU Edge as a fallback). Phase 1.
     pub promotions_total: Counter,
+    /// Speculative prefetches dropped because no pool buffer could be
+    /// acquired (shadow half starved even after recycling, or legacy
+    /// primary pool busy). Makes shadow-pool starvation visible in
+    /// `/metrics` instead of a `debug!` only.
+    pub prefetch_dropped_pool_starved_total: Counter,
+    /// Tokens for which the neural speculator (M arm) was disabled by
+    /// a hidden-state / `d_model` mismatch.
+    pub speculator_disabled_total: Counter,
+    /// Expert activations that fell back from the GPU fast path to the
+    /// CPU path because the VRAM dispatch errored.
+    pub gpu_cpu_fallbacks_total: Counter,
 }
 
 impl Default for Metrics {
@@ -201,6 +212,24 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_promotions_total");
+        let prefetch_dropped_pool_starved_total = register_counter_with_registry!(
+            "mer_prefetch_dropped_pool_starved_total",
+            "Speculative prefetches dropped because no pool buffer (shadow or legacy primary) could be acquired.",
+            registry
+        )
+        .expect("metric registration: mer_prefetch_dropped_pool_starved_total");
+        let speculator_disabled_total = register_counter_with_registry!(
+            "mer_speculator_disabled_total",
+            "Tokens for which the neural speculator was disabled by a hidden-state/d_model mismatch.",
+            registry
+        )
+        .expect("metric registration: mer_speculator_disabled_total");
+        let gpu_cpu_fallbacks_total = register_counter_with_registry!(
+            "mer_gpu_cpu_fallbacks_total",
+            "Expert activations that fell back from the GPU fast path to the CPU path.",
+            registry
+        )
+        .expect("metric registration: mer_gpu_cpu_fallbacks_total");
         Self {
             inner: Arc::new(MetricsInner {
                 registry,
@@ -221,6 +250,9 @@ impl Metrics {
                 vram_used_bytes,
                 vram_capacity_bytes,
                 promotions_total,
+                prefetch_dropped_pool_starved_total,
+                speculator_disabled_total,
+                gpu_cpu_fallbacks_total,
             }),
         }
     }
@@ -318,6 +350,27 @@ impl Metrics {
         }
     }
 
+    /// Record `n` speculative prefetches dropped to pool starvation.
+    pub fn record_prefetch_dropped_pool_starved(&self, n: u64) {
+        if n > 0 {
+            self.inner.prefetch_dropped_pool_starved_total.inc_by(n as f64);
+        }
+    }
+
+    /// Record `n` tokens with the speculator disabled by d_model mismatch.
+    pub fn record_speculator_disabled(&self, n: u64) {
+        if n > 0 {
+            self.inner.speculator_disabled_total.inc_by(n as f64);
+        }
+    }
+
+    /// Record `n` GPU → CPU expert dispatch fallbacks.
+    pub fn record_gpu_cpu_fallback(&self, n: u64) {
+        if n > 0 {
+            self.inner.gpu_cpu_fallbacks_total.inc_by(n as f64);
+        }
+    }
+
     /// Render the registry to a Prometheus text-format payload (the body
     /// of `GET /metrics`).
     pub fn render(&self) -> Result<Vec<u8>, prometheus::Error> {
@@ -347,6 +400,9 @@ mod tests {
         m.set_vram_used_bytes(1_048_576);
         m.set_vram_capacity_bytes(8_388_608);
         m.record_promotions(3);
+        m.record_prefetch_dropped_pool_starved(1);
+        m.record_speculator_disabled(1);
+        m.record_gpu_cpu_fallback(1);
         let body = String::from_utf8(m.render().unwrap()).unwrap();
         for name in [
             "mer_requests_total",
@@ -366,6 +422,9 @@ mod tests {
             "mer_vram_used_bytes",
             "mer_vram_capacity_bytes",
             "mer_promotions_total",
+            "mer_prefetch_dropped_pool_starved_total",
+            "mer_speculator_disabled_total",
+            "mer_gpu_cpu_fallbacks_total",
         ] {
             assert!(body.contains(name), "metric {name} missing from /metrics body:\n{body}");
         }

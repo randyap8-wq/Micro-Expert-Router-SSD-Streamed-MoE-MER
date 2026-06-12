@@ -1058,11 +1058,11 @@ impl NvmeStorage {
     /// path runs each `pread(2)` inside its own
     /// [`tokio::task::block_in_place`] call, which means the runtime has
     /// to round-trip between scheduler decisions for every expert. This
-    /// helper hoists all `K` syscalls into one `block_in_place` block:
-    /// the underlying [`std::os::unix::fs::FileExt::read_at`] calls are
-    /// issued back-to-back to the kernel so the NVMe queue depth ramps
-    /// up immediately, which is the same property an `io_uring`
-    /// `submit_and_wait(K)` provides on the high-throughput path.
+    /// helper hoists all `K` reads into one `block_in_place` block and
+    /// issues them **concurrently** on scoped OS threads, so the NVMe
+    /// genuinely sees parallel queue depth `K` — the same property an
+    /// `io_uring` `submit_and_wait(K)` provides on the high-throughput
+    /// path.
     ///
     /// On Linux with the `io_uring` cargo feature this method also has
     /// a sibling, `crate::io_uring_storage::IoUringStorage::read_experts_batch_fixed`,
@@ -1092,21 +1092,63 @@ impl NvmeStorage {
             debug_assert_eq!(buf.len(), expert_size);
         }
 
-        // Single donation: all K reads dispatched without yielding to the
-        // runtime between syscalls. On Linux this hands the NVMe queue
-        // K consecutive submissions, matching the io_uring path's
-        // submit-once semantics. Each read still passes through the
-        // per-expert fault-tolerant path so a single bad drive can't
-        // wedge the whole batch — it surfaces as a `HardwareFailure`
-        // for that expert id and the engine's higher-level cache code
-        // routes around it.
+        // Single donation: all K reads dispatched **concurrently** via
+        // scoped threads, so the NVMe actually sees queue depth K
+        // instead of an effective queue depth of 1 (sequential preads
+        // never let the device overlap commands — prefetch reads then
+        // queue behind foreground reads). Spawning K-1 short-lived
+        // threads costs tens of microseconds; a serialized NVMe read
+        // costs hundreds, so the break-even is immediate for K > 1.
+        // Each read still passes through the per-expert
+        // fault-tolerant path so a single bad drive can't wedge the
+        // whole batch — it surfaces as a `HardwareFailure` for that
+        // expert id and the engine's higher-level cache code routes
+        // around it. The first error (by slot order) is returned.
         let id_vec: Vec<u32> = ids.to_vec();
         let total = tokio::task::block_in_place(|| -> io::Result<usize> {
+            if id_vec.len() == 1 {
+                // Fast path: no thread spawn for the common single-miss case.
+                let buf = &mut *bufs[0];
+                return self.read_at_with_retries(
+                    &files[0],
+                    id_vec[0],
+                    0,
+                    &mut buf.as_mut_slice()[..expert_size],
+                );
+            }
+            let results: Vec<io::Result<usize>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = files
+                    .iter()
+                    .zip(bufs.iter_mut())
+                    .zip(id_vec.iter())
+                    .map(|((file, buf), &id)| {
+                        let buf: &mut PooledBuffer = &mut *buf;
+                        scope.spawn(move || {
+                            debug_assert_eq!(buf.len(), expert_size);
+                            self.read_at_with_retries(
+                                file,
+                                id,
+                                0,
+                                &mut buf.as_mut_slice()[..expert_size],
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .zip(id_vec.iter())
+                    .map(|(h, &id)| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(io::Error::other(format!(
+                                "read_experts_batch worker panicked reading expert {id}"
+                            )))
+                        })
+                    })
+                    .collect()
+            });
             let mut total = 0usize;
-            for ((file, buf), &id) in files.iter().zip(bufs.iter_mut()).zip(id_vec.iter()) {
-                debug_assert_eq!(buf.len(), expert_size);
-                let n = self.read_at_with_retries(file, id, 0, &mut buf.as_mut_slice()[..expert_size])?;
-                total += n;
+            for r in results {
+                total += r?;
             }
             Ok(total)
         })?;
