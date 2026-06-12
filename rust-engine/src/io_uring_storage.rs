@@ -554,13 +554,19 @@ mod linux_impl {
             // `expert_<id:04>.bin` name for deployments that still
             // use it.
             let primary = self.cfg_base.join(format!("expert_{id}.bin"));
-            let path = if primary.exists() {
-                primary
-            } else {
-                let padded = self.cfg_base.join(format!("expert_{id:04}.bin"));
-                if padded.exists() { padded } else { primary }
+            let f = match File::open(&primary) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let padded = self.cfg_base.join(format!("expert_{id:04}.bin"));
+                    match File::open(&padded) {
+                        Ok(f) => f,
+                        Err(e2) if e2.kind() == io::ErrorKind::NotFound => return Err(e),
+                        Err(e2) => return Err(e2),
+                    }
+                }
+                Err(e) => return Err(e),
             };
-            let f = std::sync::Arc::new(File::open(path)?);
+            let f = std::sync::Arc::new(f);
             self.fds.write().insert(id, f.clone());
             Ok(f)
         }
