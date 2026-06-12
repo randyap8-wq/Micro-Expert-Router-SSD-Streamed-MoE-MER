@@ -217,8 +217,8 @@ impl GpuStorage for VramExpertEntry {
 /// lifetime, so up to this many expert FFNs can be in flight on the
 /// queue **concurrently** — the per-dispatch wait below only blocks
 /// on its own submission index, never on the whole queue. Sized at
-/// queue. Sized at 5 × ~64 KiB buffers per workspace (≈ 1.3 MiB
-/// total for the pool): negligible VRAM for a 4-way overlap window.
+/// 5 × ~64 KiB buffers per workspace (≈ 1.3 MiB total for the pool):
+/// negligible VRAM for a 4-way overlap window.
 const EXPERT_WORKSPACE_POOL: usize = 4;
 
 /// Private buffer set for one in-flight expert FFN dispatch.
