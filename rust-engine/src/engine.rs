@@ -2736,11 +2736,15 @@ impl Engine {
                     // of waiting for `promote_after_hits` RAM hits — the
                     // lazy path can leave a predicted expert on the CPU
                     // fallback for its first N activations (one CPU
-                    // expert in an otherwise-GPU mixture dominates token
-                    // latency). Strictly non-evicting and a cheap no-op
-                    // when no GPU cache is installed or the budget is
-                    // full, so the CPU-only path is unchanged.
-                    me.try_promote_resident_to_gpu(&resident);
+// Only attempt eager VRAM promotion when the cache definitely has room;
+// otherwise we would copy ~expert_size bytes into a Vec only to have the
+// non-evicting promotion path immediately reject it.
+if let Some(gpu) = me.core.gpu_cache.as_ref() {
+    let bytes = resident.data().len();
+    if (gpu.used_bytes() as usize).saturating_add(bytes) <= gpu.capacity_bytes() {
+        me.try_promote_resident_to_gpu(&resident);
+    }
+}
                     debug!(
                         expert = id,
                         prob = p,
