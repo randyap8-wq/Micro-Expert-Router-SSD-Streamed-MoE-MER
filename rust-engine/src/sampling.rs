@@ -126,11 +126,11 @@ pub fn sample(logits: &[f32], params: &SamplingParams, position: u64) -> u32 {
     // 2) Build a sorted-descending index permutation. `vocab` ≤ 256k in
     // practice; `O(N log N)` is fine for one token.
     let mut order: Vec<usize> = (0..probs.len()).collect();
-    order.sort_unstable_by(|&a, &b| {
-        probs[b]
-            .partial_cmp(&probs[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // `total_cmp` provides the total order `sort_unstable_by` requires
+    // (Rust 1.81+ panics on comparators that violate it, which the old
+    // `partial_cmp().unwrap_or(Equal)` did when NaNs were present).
+    // Comparing `b` against `a` keeps the sort descending.
+    order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
 
     // 3) Top-K: discard everything past index K.
     let k_cut = if params.top_k == 0 { order.len() } else { params.top_k.min(order.len()) };
