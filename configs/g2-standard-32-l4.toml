@@ -1,0 +1,144 @@
+# Baseline `serve` configuration tuned for a GCP **g2-standard-32**
+# (32 vCPUs, 128 GB RAM) with a single **NVIDIA L4 (24 GB VRAM)**,
+# running **Mixtral 8x7B quantised to Q4_0** streamed from local NVMe.
+#
+# Run:
+#   cargo run --release -p micro-expert-router -- serve --config configs/g2-standard-32-l4.toml
+#
+# Sizing rationale (adjust if your geometry differs):
+#   * Q4_0 expert file: 3 × 4096 × 14336 weights × 0.5625 B = 99_090_432 B
+#     (~94.5 MiB, already a multiple of the 4096 B O_DIRECT alignment).
+#   * RAM buffer pool = (cache_slots + 1) primary + (predict_fanout ×
+#     pipeline_depth) shadow slots = 145 slots × 94.5 MiB ≈ 13.4 GiB —
+#     comfortably under the engine's 1/4-of-RAM advisory (32 GiB),
+#     leaving room for the OS, paged KV pool, and batching.
+#   * cache_slots = 128 ⇒ 4 of 8 experts resident per layer (the serve
+#     path splits the aggregate budget evenly across the 32 layers).
+#   * Shadow pool 16 = predict_fanout 4 × pipeline_depth 4; the prefetch
+#     semaphore is auto-clamped to this, so max_concurrent_prefetches
+#     only needs to be ≥ 16.
+#   * L4 24 GB: 16 GiB VRAM expert cache (~173 Q4_0 experts) leaves
+#     ~8 GB headroom for the dense body, activations, and KV cache.
+
+[server]
+bind = "0.0.0.0:8080"
+max_tokens = 1024
+# Stateless by default; raise (e.g. 600) for multi-turn KV reuse.
+session_ttl_secs = 0
+# 32 vCPUs handle batched decode well, but admission control keeps the
+# engine from queueing unboundedly under load spikes.
+max_concurrent_requests = 16
+admission_min_free_blocks = 0
+
+[sampling]
+# Greedy for reproducible TPS benchmarking; override per request.
+temperature = 0.0
+top_p = 1.0
+top_k = 0
+seed = 0
+
+[model]
+# Directory containing expert_<id>.bin files extracted at Q4_0
+# (scripts/extract_mixtral_experts.py --dtype q4_0). Point at your
+# local-NVMe mount for real streaming numbers.
+data_dir = "./data"
+# Mixtral 8x7B geometry: 8 experts/layer, top-2 routing, 32 layers.
+num_experts = 8
+top_k = 2
+d_model = 4096
+d_ff = 14336
+# Q4_0: 3 × 4096 × 14336 × 0.5625 B = 99_090_432 (multiple of 4096).
+expert_size = 99090432
+num_layers = 32
+dtype = "q4_0"
+
+[storage]
+# Aggregate LRU slots across all 32 layers (4 experts resident per
+# layer = half the per-layer pool). ~12 GiB of RAM at Q4_0.
+cache_slots = 128
+block_align = 4096
+# Local NVMe on GCE supports O_DIRECT; keep it on so the OS page cache
+# doesn't compete with the engine's own RAM cache (a major source of
+# read-latency variance). Set true only on tmpfs/overlayfs/CI.
+no_direct = false
+# 4 speculative candidates per token per look-ahead layer.
+predict_fanout = 4
+# A Q4_0 expert read (~95 MiB) off GCE local NVMe is ~30–45 ms while
+# per-layer compute is ~10–15 ms, so a depth-4 window is needed to
+# bury a cold read under compute. Also sizes the shadow pool (4×4=16).
+pipeline_depth = 4
+# <= 0 auto-scales to 2 / num_experts. A fixed 0.05 can silently
+# disable the Markov arm on cold rows in a layer-qualified namespace
+# (256 global ids), so prefer the auto-scaled threshold here.
+predict_min_prob = 0.0
+partial_load_fraction = 1.0
+# Leave frequency pinning off: with only 8 experts/layer permanent
+# pins quickly wedge the per-layer LRU and serialize foreground
+# misses on the single reserved headroom buffer.
+pin_after_observations = 0
+
+[tokenizer]
+# Mixtral tokenizer (build with `--features tokenizer`); falls back to
+# the deterministic byte tokenizer when omitted.
+# path = "./data/tokenizer.json"
+
+[real_transformer]
+enabled = true
+# Dense weights extracted next to the experts; architecture and
+# hyperparameters are auto-detected from its config.json when present.
+# weights_dir = "./data/dense"
+# architecture = "mixtral"
+vocab_size = 32000
+num_heads = 32
+num_kv_heads = 8           # Mixtral GQA: 8 KV heads
+head_dim = 0               # auto: d_model / num_heads = 128
+rope_base = 1000000.0      # Mixtral 8x7B rope_theta
+rms_eps = 1e-5
+seed = 12648430
+# 32 vCPUs sustain a fused batch of 8 decode streams; the 5 ms join
+# window trades negligible latency for much better TPS under load.
+max_batch_size = 8
+batch_timeout_ms = 5
+speculation_base_depth = 1
+# Hybrid offload: dense body + VRAM-resident Q4_0 experts run on the
+# L4 via wgpu; non-resident experts fall back to the CPU QMatMul path.
+compute_offload = "gpu"
+# Headroom above the shadow-pool clamp (semaphore = min(this, 16)).
+max_concurrent_prefetches = 32
+max_fetch_yields = 128
+
+[predictive]
+# All three arms on: the speculative union-fetch (S ∪ L ∪ M) is what
+# keeps prefetching consistent across layers.
+locality_enabled = true
+# Scaled internally by num_layers on the serve path; 256 ≈ a few dozen
+# tokens of history at top-2 × 32 layers.
+locality_window = 256
+locality_threshold_pct = 0.10
+speculator_enabled = true
+speculator_hidden_dim = 128
+speculator_top_k = 0       # inherit model.top_k (2)
+affinity_enabled = true
+affinity_neighbors_k = 2
+affinity_decay_epoch = 4096
+
+[gpu_cache]
+enabled = true
+# 16 GiB of the L4's 24 GB for the expert tier (~173 Q4_0 experts ≈
+# 2/3 of the model VRAM-resident at steady state); the remaining ~8 GB
+# covers the dense body, activations, staging, and the paged KV cache.
+vram_capacity_mb = 16384
+# Promote after 2 RAM hits: with only 8 experts/layer the routing
+# distribution is heavy-tailed, and a low threshold gets hot experts
+# onto the L4 within the first few tokens instead of after 16.
+promote_after_hits = 2
+vram_anchor_ratio = 0.5
+# Keep experts in VRAM as raw Q4_0 blocks (dequantised in-shader) —
+# ~4× more experts per GB than f16.
+dtype = "q4_0"
+
+[distributed]
+enabled = false
+nodes = []
+self_index = 0
+remote_fetch_timeout_ms = 250
