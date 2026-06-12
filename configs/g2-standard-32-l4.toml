@@ -67,9 +67,10 @@ predict_fanout = 4
 # per-layer compute is ~10–15 ms, so a depth-4 window is needed to
 # bury a cold read under compute. Also sizes the shadow pool (4×4=16).
 pipeline_depth = 4
-# <= 0 auto-scales to 2 / num_experts. A fixed 0.05 can silently
-# disable the Markov arm on cold rows in a layer-qualified namespace
-# (256 global ids), so prefer the auto-scaled threshold here.
+# Set to 0.0 so the engine auto-scales the threshold to
+# 2 / num_experts. Pinning it to the legacy fixed 0.05 instead can
+# silently disable the Markov arm on cold rows in a layer-qualified
+# namespace (256 global ids), so prefer the auto-scaled threshold.
 predict_min_prob = 0.0
 partial_load_fraction = 1.0
 # Leave frequency pinning off: with only 8 experts/layer permanent
