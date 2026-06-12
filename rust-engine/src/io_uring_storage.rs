@@ -774,12 +774,13 @@ mod linux_impl {
         let mut next_slot: u32 = 0;
         let mut parked: Option<ReactorRequest> = None;
         let mut closed = false;
-        // Keep-alive graveyard for batches failed administratively (a
+        // Buffer owners for batches failed administratively (a
         // `submit_and_wait` error) while the kernel may still hold
-        // their SQEs: dropping the buffers there could let the kernel
-        // DMA into freed memory, so park the owners for the reactor's
-        // lifetime instead. Only ever populated on a broken-ring path.
-        let mut graveyard: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+        // their SQEs: dropping them could let the kernel DMA into
+        // freed memory, so they are deliberately kept alive for the
+        // reactor's lifetime instead (never safe to drop earlier).
+        // Only ever populated on a broken-ring path.
+        let mut leaked_keep_alives: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
 
         loop {
             // ── Admission ────────────────────────────────────────────
@@ -843,7 +844,7 @@ mod linux_impl {
                         )));
                         // The kernel may still own these SQEs; never
                         // free the underlying buffers from here.
-                        graveyard.push(batch._keep_alive);
+                        leaked_keep_alives.push(batch._keep_alive);
                     }
                     pending_ops = 0;
                     continue;
@@ -856,7 +857,6 @@ mod linux_impl {
                 }
             }
         }
-        drop(graveyard);
     }
 
     /// Maximum number of macro-batches the reactor keeps in flight on

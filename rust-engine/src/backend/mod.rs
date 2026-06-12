@@ -217,8 +217,8 @@ impl GpuStorage for VramExpertEntry {
 /// lifetime, so up to this many expert FFNs can be in flight on the
 /// queue **concurrently** — the per-dispatch wait below only blocks
 /// on its own submission index, never on the whole queue. Sized at
-/// 5 × ~64 KiB buffers each (≈ 1.5 MiB total): negligible VRAM for a
-/// 4-way overlap window.
+/// queue. Sized at 5 × ~64 KiB buffers per workspace (≈ 1.3 MiB
+/// total for the pool): negligible VRAM for a 4-way overlap window.
 const EXPERT_WORKSPACE_POOL: usize = 4;
 
 /// Private buffer set for one in-flight expert FFN dispatch.
@@ -881,6 +881,12 @@ impl GpuBackend {
     /// [`EXPERT_WORKSPACE_POOL`] workspaces, up to that many expert
     /// FFN dispatches proceed concurrently; the (rare) wait here
     /// replaces the old whole-path `expert_execution_lock`.
+    ///
+    /// Fairness: `parking_lot::Condvar` wakes waiters FIFO-ish but
+    /// makes no strict guarantee; with a pool of
+    /// [`EXPERT_WORKSPACE_POOL`] = 4 against a typical MoE top-K of
+    /// 2–4 concurrent dispatches, contention (let alone starvation)
+    /// is not expected in practice.
     fn acquire_expert_workspace(&self) -> ExpertWorkspace {
         let mut pool = self.expert_workspaces.lock();
         loop {
