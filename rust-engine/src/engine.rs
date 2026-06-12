@@ -2128,7 +2128,6 @@ impl Engine {
         //    just touch every byte of the resident buffer with a cheap
         //    XOR checksum so the kernel actually delivers the page data
         //    and we can isolate the SSD-streaming cost from FFN compute.
-        //    and we can isolate the SSD-streaming cost from FFN compute.
         //    Either way this is a multi-millisecond blocking slice, so
         //    donate the worker thread (`block_in_place`) for its
         //    duration — otherwise the speculative prefetch tasks fired
