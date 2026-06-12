@@ -824,6 +824,25 @@ pub(crate) struct Counters {
     /// semaphore was exhausted (gist Phase 3 — bounded prefetch).
     /// Surfaced via `EngineReport::prefetch_dropped_concurrency`.
     prefetch_dropped_concurrency: AtomicU64,
+    /// Speculative prefetches dropped because no buffer could be
+    /// acquired — the shadow (Buffer B) half was starved even after
+    /// recycling the LRU shadow-backed resident, or (legacy
+    /// single-pool configs) the primary pool was busy. Previously this
+    /// was only a `debug!`, making shadow-pool starvation invisible in
+    /// production; surfaced via
+    /// `EngineReport::prefetch_dropped_pool_starved` and
+    /// `mer_prefetch_dropped_pool_starved_total`.
+    prefetch_dropped_pool_starved: AtomicU64,
+    /// Tokens for which the neural speculator (M arm) was silently
+    /// disabled because the hidden-state width didn't match the
+    /// speculator's `d_model`. A persistent non-zero rate means the
+    /// predictive arm is misconfigured and contributing nothing.
+    speculator_dmodel_mismatch: AtomicU64,
+    /// Expert activations that fell back from the GPU fast path to the
+    /// CPU path because the VRAM dispatch errored (typically a VRAM
+    /// miss). Invisible mixed GPU/CPU execution is a major source of
+    /// inconsistent token latency, so make it countable.
+    gpu_cpu_fallbacks: AtomicU64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -2550,6 +2569,18 @@ impl Engine {
     }
 
     fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
+        // **Dedup before spending a permit.** `union_prefetch` and
+        // `speculate_layer_ahead` can both nominate the same id for one
+        // token; without this pre-check each duplicate consumed a
+        // semaphore permit (and a spawned task) before the singleflight
+        // map rejected it — under a tight `max_concurrent_prefetches`
+        // budget, two predictions of the same expert could crowd out a
+        // genuinely new one. Racing with a concurrent insert/landing is
+        // fine: the post-spawn `contains` re-check and the singleflight
+        // entry below stay authoritative.
+        if self.core.cache.contains(id) || self.core.in_flight.contains_key(&id) {
+            return;
+        }
         // Speculative prefetches are *bounded*: each spawn must hold
         // an owned permit from `prefetch_semaphore` for the duration
         // of the I/O. When the configured ceiling
@@ -2628,7 +2659,7 @@ impl Engine {
                     match me.core.pool.try_acquire() {
                         Some(b) => b,
                         None => {
-                            debug!(expert = id, "skipping prefetch: pool busy");
+                            me.note_prefetch_dropped_pool_starved(id);
                             return;
                         }
                     }
@@ -2659,7 +2690,7 @@ impl Engine {
                         }) {
                         Some(b) => b,
                         None => {
-                            debug!(expert = id, "skipping prefetch: shadow pool busy");
+                            me.note_prefetch_dropped_pool_starved(id);
                             return;
                         }
                     }
@@ -2692,13 +2723,24 @@ impl Engine {
                     // the insert (every slot pinned), the resident drops
                     // here and its buffer returns to the shadow pool —
                     // exactly the right behaviour for a speculative load.
-                    if let Err(_rejected) = me.core.cache.insert(resident) {
+                    if let Err(_rejected) = me.core.cache.insert(resident.clone()) {
                         debug!(
                             expert = id,
                             "prefetch dropped: cache full of pinned entries"
                         );
                         return;
                     }
+                    // **Eager VRAM promotion.** A speculative prefetch is
+                    // a strong "about to be routed" signal, so try to
+                    // stage the bytes into the GPU LRU Edge *now* instead
+                    // of waiting for `promote_after_hits` RAM hits — the
+                    // lazy path can leave a predicted expert on the CPU
+                    // fallback for its first N activations (one CPU
+                    // expert in an otherwise-GPU mixture dominates token
+                    // latency). Strictly non-evicting and a cheap no-op
+                    // when no GPU cache is installed or the budget is
+                    // full, so the CPU-only path is unchanged.
+                    me.try_promote_resident_to_gpu(&resident);
                     debug!(
                         expert = id,
                         prob = p,
@@ -2717,6 +2759,30 @@ impl Engine {
     /// Account for the fact that an expert was a hit *because* we prefetched it.
     pub fn note_prefetch_hit(&self) {
         self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A speculative prefetch was dropped because no pool buffer could
+    /// be acquired (shadow starved even after recycling, or legacy
+    /// primary pool busy). Counts it, mirrors to Prometheus, and warns
+    /// on the first occurrence so starvation is never silent.
+    fn note_prefetch_dropped_pool_starved(&self, id: u32) {
+        let prev = self
+            .metrics
+            .counters
+            .prefetch_dropped_pool_starved
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = self.metrics.prom.as_ref() {
+            p.record_prefetch_dropped_pool_starved(1);
+        }
+        if prev == 0 {
+            warn!(
+                expert = id,
+                "prefetch dropped: buffer pool starved (further drops counted in \
+                 mer_prefetch_dropped_pool_starved_total, logged at debug)"
+            );
+        } else {
+            debug!(expert = id, "skipping prefetch: pool starved");
+        }
     }
 
     /// The predictive controller's expert guess for the current token,
@@ -2913,9 +2979,30 @@ impl Engine {
         };
         if x.len() != spec.d_model() {
             // Hidden state shape mismatch — nothing useful we can
-            // predict against, so silently disable for this token.
-            // This makes the speculator graceful in the synthetic
-            // benchmark where d_model can disagree with the real model.
+            // predict against, so disable the M arm for this token.
+            // This keeps the speculator graceful in the synthetic
+            // benchmark where d_model can disagree with the real
+            // model, but the disablement must not be invisible: a
+            // persistently mismatched speculator silently zeroes the
+            // M arm (and, through the unified score ceiling, the
+            // affinity/spatial fold too). Warn once and count every
+            // occurrence so operators can see it in /metrics.
+            let prev = self
+                .metrics
+                .counters
+                .speculator_dmodel_mismatch
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = self.metrics.prom.as_ref() {
+                p.record_speculator_disabled(1);
+            }
+            if prev == 0 {
+                warn!(
+                    hidden_len = x.len(),
+                    speculator_d_model = spec.d_model(),
+                    "speculator disabled: hidden-state width != speculator d_model \
+                     (M arm contributes nothing; counted in mer_speculator_disabled_total)"
+                );
+            }
             return Vec::new();
         }
         let preds = match (layer, self.core.storage.config().num_experts_per_layer) {
@@ -3567,7 +3654,29 @@ impl Engine {
                     );
                     match matmul_res {
                         Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
-                        Err(_) => None, // VRAM miss — fall through to CPU
+                        Err(e) => {
+                            // VRAM miss — fall through to CPU. Count it:
+                            // invisible mixed GPU/CPU execution (one CPU
+                            // expert dominating an otherwise-GPU token)
+                            // is a major source of inconsistent TPS.
+                            let prev = self
+                                .metrics
+                                .counters
+                                .gpu_cpu_fallbacks
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Some(p) = self.metrics.prom.as_ref() {
+                                p.record_gpu_cpu_fallback(1);
+                            }
+                            if prev == 0 {
+                                warn!(
+                                    expert = r.id,
+                                    error = %e,
+                                    "GPU expert dispatch fell back to CPU \
+                                     (further fallbacks counted in mer_gpu_cpu_fallbacks_total)"
+                                );
+                            }
+                            None
+                        }
                     }
                 } else {
                     None
@@ -3783,6 +3892,17 @@ impl Engine {
                 .counters
                 .prefetch_dropped_concurrency
                 .load(Ordering::Relaxed),
+            prefetch_dropped_pool_starved: self
+                .metrics
+                .counters
+                .prefetch_dropped_pool_starved
+                .load(Ordering::Relaxed),
+            speculator_dmodel_mismatch: self
+                .metrics
+                .counters
+                .speculator_dmodel_mismatch
+                .load(Ordering::Relaxed),
+            gpu_cpu_fallbacks: self.metrics.counters.gpu_cpu_fallbacks.load(Ordering::Relaxed),
             gpu_cache_enabled: self.core.gpu_cache.is_some(),
             vram_used_bytes: self
                 .core
@@ -3982,6 +4102,21 @@ pub struct EngineReport {
     /// Speculative prefetches dropped because
     /// `EngineOptions::max_concurrent_prefetches` was already saturated.
     pub prefetch_dropped_concurrency: u64,
+    /// Speculative prefetches dropped because no pool buffer could be
+    /// acquired (shadow half starved even after recycling an LRU
+    /// shadow-backed resident, or legacy primary pool busy). A high
+    /// rate means look-ahead is being silently disabled by buffer
+    /// starvation — grow the shadow half or reduce prefetch fanout.
+    pub prefetch_dropped_pool_starved: u64,
+    /// Tokens for which the neural speculator was disabled by a
+    /// hidden-state / `d_model` mismatch. Persistent non-zero values
+    /// mean the M predictive arm is misconfigured and contributing
+    /// nothing.
+    pub speculator_dmodel_mismatch: u64,
+    /// Expert activations that fell back from the GPU fast path to the
+    /// CPU path because the VRAM dispatch errored (typically a VRAM
+    /// miss). Non-zero rates explain mixed GPU/CPU token latency.
+    pub gpu_cpu_fallbacks: u64,
     /// Phase 2 / 3-tier hierarchy: whether the engine has a VRAM (GPU)
     /// expert cache attached. `false` keeps the historical 2-tier
     /// behaviour bit-for-bit; `true` adds the SSD → RAM → VRAM tier.

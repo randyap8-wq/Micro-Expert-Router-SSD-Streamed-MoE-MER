@@ -260,8 +260,12 @@ pub struct GpuBackend {
     head_dim: usize,
 
     /// VRAM buffers for hot experts. Keyed by expert_id. Populated lazily
-    /// on first access after GpuExpertCache promotes an expert.
-    vram_expert_bufs: ParkingMutex<std::collections::HashMap<u32, VramExpertEntry>>,
+    /// on first access after GpuExpertCache promotes an expert. Entries
+    /// are `Arc`-wrapped so the fast path can clone a handle and release
+    /// this lock *before* the (blocking) GPU dispatch — holding the map
+    /// lock across `expert_matmul_from_vram` would serialize all expert
+    /// lookups behind a multi-millisecond submit + readback.
+    vram_expert_bufs: ParkingMutex<std::collections::HashMap<u32, Arc<VramExpertEntry>>>,
 
     /// Reference to the VRAM expert cache. Used to check whether an expert
     /// is GPU-resident before falling back to the NVMe → CPU path.
@@ -1470,11 +1474,12 @@ impl Backend for GpuBackend {
         let _ = layer_idx;
 
         // ── Fast path: expert already in VRAM with pre-built bind groups ──────
-        {
-            let bufs = self.vram_expert_bufs.lock();
-            if let Some(entry) = bufs.get(&expert_id) {
-                return self.expert_matmul_from_vram(entry, x, out);
-            }
+        // Clone the Arc handle and release the map lock *before* the
+        // blocking GPU dispatch so concurrent callers can probe / install
+        // other experts while this one executes.
+        let cached_entry = self.vram_expert_bufs.lock().get(&expert_id).cloned();
+        if let Some(entry) = cached_entry {
+            return self.expert_matmul_from_vram(&entry, x, out);
         }
 
         // Slow path: evict stale entries whose GpuExpertCache slot was reclaimed.
@@ -1487,15 +1492,14 @@ impl Backend for GpuBackend {
             GpuLookup::AnchorHit(r) | GpuLookup::LruHit(r) => {
                 // Native Q4_0 residents go through the inline-dequant
                 // pipeline; everything else is the dense F32 layout.
-                let entry = match r.dtype() {
+                let entry = Arc::new(match r.dtype() {
                     crate::inference::WeightDtype::Q4_0 => {
                         self.build_expert_entry_q4_0(r.data(), d_model, d_ff)?
                     }
                     _ => self.build_expert_entry(r.data(), d_model, d_ff)?,
-                };
-                let result = self.expert_matmul_from_vram(&entry, x, out);
-                self.vram_expert_bufs.lock().insert(expert_id, entry);
-                result
+                });
+                self.vram_expert_bufs.lock().insert(expert_id, entry.clone());
+                self.expert_matmul_from_vram(&entry, x, out)
             }
             GpuLookup::Miss => {
                 anyhow::bail!(
