@@ -1136,9 +1136,12 @@ impl NvmeStorage {
                     .collect();
                 handles
                     .into_iter()
-                    .map(|h| {
+                    .zip(id_vec.iter())
+                    .map(|(h, &id)| {
                         h.join().unwrap_or_else(|_| {
-                            Err(io::Error::other("read_experts_batch worker panicked"))
+                            Err(io::Error::other(format!(
+                                "read_experts_batch worker panicked reading expert {id}"
+                            )))
                         })
                     })
                     .collect()
