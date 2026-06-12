@@ -548,7 +548,18 @@ mod linux_impl {
             if let Some(f) = self.fds.read().get(&id) {
                 return Ok(f.clone());
             }
-            let path = self.cfg_base.join(format!("expert_{id:04}.bin"));
+            // Same on-disk convention as `NvmeStorage::expert_path` /
+            // `generate_synthetic_experts`: `expert_<id>.bin` without
+            // zero padding. Fall back to the legacy zero-padded
+            // `expert_<id:04>.bin` name for deployments that still
+            // use it.
+            let primary = self.cfg_base.join(format!("expert_{id}.bin"));
+            let path = if primary.exists() {
+                primary
+            } else {
+                let padded = self.cfg_base.join(format!("expert_{id:04}.bin"));
+                if padded.exists() { padded } else { primary }
+            };
             let f = std::sync::Arc::new(File::open(path)?);
             self.fds.write().insert(id, f.clone());
             Ok(f)
@@ -771,6 +782,15 @@ mod linux_impl {
         let cap = queue_depth.max(1);
         let mut inflight: HashMap<u32, InflightBatch> = HashMap::new();
         let mut pending_ops: usize = 0;
+        // Ops belonging to batches that were failed administratively
+        // (their slots removed from `inflight`) but whose SQEs the
+        // kernel may still complete. Tracked separately from
+        // `pending_ops` so a late orphan CQE can never steal budget
+        // accounting from a *live* batch — if it did, `pending_ops`
+        // could hit zero while a live batch still had ops in the
+        // kernel, the loop would stop waiting for completions, and
+        // that batch's caller would hang on its oneshot forever.
+        let mut orphaned_ops: usize = 0;
         let mut next_slot: u32 = 0;
         let mut parked: Option<ReactorRequest> = None;
         let mut closed = false;
@@ -787,19 +807,22 @@ mod linux_impl {
             // A parked request has FIFO priority over the channel.
             if let Some(req) = parked.take() {
                 if let Admit::Parked(req) = admit_request(
-                    &mut ring, &mut inflight, &mut next_slot, &mut pending_ops, cap, req,
+                    &mut ring, &mut inflight, &mut next_slot, &mut pending_ops,
+                    orphaned_ops, cap, req,
                 ) {
                     parked = Some(req);
                 }
             }
             if parked.is_none() && !closed {
                 if inflight.is_empty() {
-                    // Fully idle: block until work (or close) arrives.
+                    // Fully idle (orphaned CQEs, if any, need no active
+                    // wait — no caller is waiting on them): block until
+                    // work (or close) arrives.
                     match rx.blocking_recv() {
                         Some(req) => {
                             if let Admit::Parked(req) = admit_request(
                                 &mut ring, &mut inflight, &mut next_slot, &mut pending_ops,
-                                cap, req,
+                                orphaned_ops, cap, req,
                             ) {
                                 parked = Some(req);
                             }
@@ -815,7 +838,7 @@ mod linux_impl {
                         Ok(req) => {
                             if let Admit::Parked(req) = admit_request(
                                 &mut ring, &mut inflight, &mut next_slot, &mut pending_ops,
-                                cap, req,
+                                orphaned_ops, cap, req,
                             ) {
                                 parked = Some(req);
                             }
@@ -830,11 +853,15 @@ mod linux_impl {
             }
 
             // ── Completion wait + drain ──────────────────────────────
-            if pending_ops > 0 {
+            // Wait when live ops are outstanding, or when a parked
+            // request can only make progress once orphaned CQEs drain
+            // (an oversized batch needs exclusive CQ ownership).
+            if pending_ops > 0 || (orphaned_ops > 0 && parked.is_some()) {
                 if let Err(e) = ring.submit_and_wait(1) {
                     tracing::warn!(
                         error = %e,
                         in_flight = inflight.len(),
+                        orphaned_ops,
                         "io_uring: submit_and_wait failed — failing all in-flight batches"
                     );
                     for (_, batch) in inflight.drain() {
@@ -846,14 +873,30 @@ mod linux_impl {
                         // free the underlying buffers from here.
                         leaked_keep_alives.push(batch._keep_alive);
                     }
+                    // The failed batches' ops become orphans: their
+                    // CQEs may still surface later and must not be
+                    // attributed to (or steal accounting from) batches
+                    // admitted after this point.
+                    orphaned_ops += pending_ops;
                     pending_ops = 0;
+                    if orphaned_ops > 0 && parked.is_some() && inflight.is_empty() {
+                        // We were waiting purely to drain orphans for a
+                        // parked oversized batch, and the ring cannot
+                        // even wait any more. Abandon the orphan drain
+                        // so the parked request is not stuck forever.
+                        tracing::warn!(
+                            orphaned_ops,
+                            "io_uring: abandoning orphaned-CQE drain on broken ring"
+                        );
+                        orphaned_ops = 0;
+                    }
                     continue;
                 }
                 // Drain everything that is ready (≥ 1 by the wait above).
                 loop {
                     let next = { ring.completion().next() };
                     let Some(cqe) = next else { break };
-                    handle_cqe(&cqe, &mut inflight, &mut pending_ops);
+                    handle_cqe(&cqe, &mut inflight, &mut pending_ops, &mut orphaned_ops);
                 }
             }
         }
@@ -902,6 +945,7 @@ mod linux_impl {
         inflight: &mut HashMap<u32, InflightBatch>,
         next_slot: &mut u32,
         pending_ops: &mut usize,
+        orphaned_ops: usize,
         cap: usize,
         req: ReactorRequest,
     ) -> Admit {
@@ -914,8 +958,10 @@ mod linux_impl {
             // Oversized macro-batch: needs the legacy chunked
             // submit/drain windows, which assume exclusive ownership
             // of the completion queue. Run it only when nothing else
-            // is in flight.
-            if !inflight.is_empty() {
+            // is in flight — including orphaned CQEs from
+            // administratively-failed batches, which `process_one`
+            // would otherwise mis-attribute to its own ops.
+            if !inflight.is_empty() || orphaned_ops > 0 {
                 return Admit::Parked(req);
             }
             let ReactorRequest { prepared, len, reply, _keep_alive } = req;
@@ -1019,15 +1065,19 @@ mod linux_impl {
         cqe: &io_uring::cqueue::Entry,
         inflight: &mut HashMap<u32, InflightBatch>,
         pending_ops: &mut usize,
+        orphaned_ops: &mut usize,
     ) {
         let user_data = cqe.user_data();
         let slot = (user_data >> 32) as u32;
         let expert_id = user_data as u32;
         let Some(batch) = inflight.get_mut(&slot) else {
-            // CQE for a slot we no longer track — possible only after
-            // an administrative failure cleared the table. Drop it.
+            // CQE for a slot we no longer track — an orphan from a
+            // batch failed administratively (`submit_and_wait` error).
+            // Account it against the orphan budget, never against
+            // `pending_ops`: live batches' accounting must not be
+            // disturbed by stale completions.
             tracing::warn!(slot, expert_id, "io_uring: CQE for unknown request slot");
-            *pending_ops = pending_ops.saturating_sub(1);
+            *orphaned_ops = orphaned_ops.saturating_sub(1);
             return;
         };
         *pending_ops = pending_ops.saturating_sub(1);
@@ -1509,7 +1559,7 @@ mod tests {
                 "buffer {i} should have been promoted to primary"
             );
             // Byte-identical to a raw pread of the same expert file.
-            let raw = std::fs::read(tmp.join(format!("expert_{i:04}.bin"))).unwrap();
+            let raw = std::fs::read(tmp.join(format!("expert_{i}.bin"))).unwrap();
             assert_eq!(&raw[..], buf.as_slice());
         }
 
@@ -1521,6 +1571,117 @@ mod tests {
         // Primary picked up the two now-free buffers.
         let _p0 = pool.try_acquire().expect("primary slot 0");
         let _p1 = pool.try_acquire().expect("primary slot 1");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The multi-request reactor must serve byte-correct replies when
+    /// several macro-batches share the ring concurrently — including
+    /// batches that exceed `MAX_INFLIGHT_REQUESTS` (parking), exhaust
+    /// the SQE budget (admission gating), and an **oversized** batch
+    /// (more SQEs than the queue depth) that takes the exclusive
+    /// legacy `process_one` path interleaved with fitting batches.
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_batches_share_ring_and_round_trip() {
+        use crate::io_provider::generate_synthetic_experts;
+
+        let mut tmp = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        tmp.push(format!("mer-iouring-conc-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let num_experts = 8u32;
+        let d_model = 8usize;
+        let d_ff = 16usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block = 4096usize;
+        let expert_size = ((weight_bytes + block - 1) / block) * block;
+        generate_synthetic_experts(&tmp, num_experts, expert_size, d_model, d_ff).unwrap();
+
+        // Small queue depth (4) so concurrent 2-element batches exceed
+        // the SQE budget (forcing parking + re-admission) and a
+        // 6-element batch is oversized (legacy exclusive path).
+        let pool = BufferPool::new(24, expert_size, block);
+        let storage = match IoUringStorage::new(
+            IoUringConfig {
+                base_path: tmp.clone(),
+                expert_size,
+                block_align: block,
+                queue_depth: 4,
+                numa_node: None,
+            },
+            &pool,
+        ) {
+            Ok(s) => std::sync::Arc::new(s),
+            Err(e) => {
+                eprintln!("io_uring not available, skipping: {e}");
+                let _ = std::fs::remove_dir_all(&tmp);
+                return;
+            }
+        };
+
+        // Reference bytes via std reads.
+        let reference: Vec<Vec<u8>> = (0..num_experts)
+            .map(|i| std::fs::read(tmp.join(format!("expert_{i}.bin"))).unwrap())
+            .collect();
+
+        let mut tasks = Vec::new();
+        // 8 concurrent 2-element batches (16 SQEs total >> depth 4).
+        // The batch futures are not `Send` (raw buffer pointers held
+        // across the await), so concurrency is driven by `join_all`
+        // on this task: every future sends its `ReactorRequest`
+        // before any reply resolves, so the reactor sees them all
+        // in flight together.
+        for t in 0..8u32 {
+            let storage = storage.clone();
+            let pool = pool.clone();
+            let reference = &reference;
+            tasks.push(async move {
+                let ids = vec![t % num_experts, (t + 3) % num_experts];
+                let mut b0 = pool.acquire().await;
+                let mut b1 = pool.acquire().await;
+                {
+                    let mut bufs = [&mut b0, &mut b1];
+                    let n = storage
+                        .read_experts_batch_fixed(&ids, &mut bufs)
+                        .await
+                        .expect("concurrent batch read");
+                    assert_eq!(n, ids.len() * expert_size);
+                }
+                assert_eq!(b0.as_slice(), &reference[ids[0] as usize][..]);
+                assert_eq!(b1.as_slice(), &reference[ids[1] as usize][..]);
+            });
+        }
+        // One oversized batch (6 SQEs > depth 4) racing the others:
+        // exercises parking-until-exclusive + the legacy chunked path.
+        let oversized = {
+            let storage = storage.clone();
+            let pool = pool.clone();
+            let reference = &reference;
+            async move {
+                let ids: Vec<u32> = (0..6u32).collect();
+                let mut bufs: Vec<PooledBuffer> = Vec::new();
+                for _ in 0..ids.len() {
+                    bufs.push(pool.acquire().await);
+                }
+                {
+                    let mut refs: Vec<&mut PooledBuffer> = bufs.iter_mut().collect();
+                    let n = storage
+                        .read_experts_batch_fixed(&ids, &mut refs)
+                        .await
+                        .expect("oversized batch read");
+                    assert_eq!(n, ids.len() * expert_size);
+                }
+                for (i, b) in bufs.iter().enumerate() {
+                    assert_eq!(b.as_slice(), &reference[i][..], "oversized expert {i}");
+                }
+            }
+        };
+        futures::future::join(futures::future::join_all(tasks), oversized).await;
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
