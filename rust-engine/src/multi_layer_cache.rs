@@ -216,8 +216,16 @@ impl MultiLayerExpertCache {
     /// layer's LRU first. Returns `None` when no unpinned shadow-backed
     /// resident exists anywhere.
     pub fn evict_lru_shadow_backed(&self) -> Option<Arc<ExpertResident>> {
+        // Snapshot each layer's length *once* before sorting. `len()`
+        // takes a lock and reads live state, so calling it from inside
+        // the comparator (as `sort_by_key` does, repeatedly per element)
+        // lets a concurrent mutation change a key mid-sort. That makes
+        // the ordering non-total and trips the `sort` total-order
+        // assertion under load. Sorting over a stable snapshot keeps the
+        // key fixed for the duration of the sort.
+        let lens: Vec<usize> = self.caches.iter().map(|c| c.len()).collect();
         let mut order: Vec<usize> = (0..self.caches.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(self.caches[i].len()));
+        order.sort_by_key(|&i| std::cmp::Reverse(lens[i]));
         for idx in order {
             if let Some(r) = self.caches[idx].evict_lru_shadow_backed() {
                 return Some(r);
