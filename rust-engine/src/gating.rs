@@ -208,7 +208,7 @@ impl LinearGate {
                 (g, sum)
             })
             .collect();
-        group_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        group_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
         let mut mask = vec![false; self.num_experts];
         for &(g, _) in group_scores.iter().take(self.topk_group) {
             for e in g * group_size..(g + 1) * group_size {
@@ -251,9 +251,7 @@ impl LinearGate {
         // by the SSD read.
         let mut idx: Vec<u32> = (0..self.num_experts as u32).collect();
         idx.sort_by(|&a, &b| {
-            selection[b as usize]
-                .partial_cmp(&selection[a as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
+            selection[b as usize].total_cmp(&selection[a as usize])
         });
         idx.retain(|&i| selection[i as usize].is_finite());
         idx.truncate(self.top_k);
