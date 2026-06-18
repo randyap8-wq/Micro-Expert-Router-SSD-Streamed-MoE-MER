@@ -247,13 +247,15 @@ impl Architecture {
             // ratio of 0 (e.g. an explicit `sliding_window_pattern = 1`)
             // degenerates to "every layer global" via the formula below,
             // honouring an explicit request to disable the sliding window.
-            (Some(w), Some(r)) => {
-                if (layer_idx + 1) % (r + 1) == 0 {
-                    AttentionMode::Global
-                } else {
-                    AttentionMode::SlidingWindow { window: w }
-                }
-            }
+(Some(w), Some(r)) => {
+    let denom = r.saturating_add(1);
+    let idx1 = layer_idx.saturating_add(1);
+    if idx1 % denom == 0 {
+        AttentionMode::Global
+    } else {
+        AttentionMode::SlidingWindow { window: w }
+    }
+}
             // Uniform sliding window (Mixtral) — every layer is SWA.
             (Some(w), None) => AttentionMode::SlidingWindow { window: w },
             // No window configured — full causal attention everywhere.
