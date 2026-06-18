@@ -393,10 +393,11 @@ impl KvCache {
     /// No-op for `pos == 0` and for global-attention layers (which never
     /// call this), preserving the original full-history behaviour.
     pub fn evict_before(&mut self, pos: usize) {
-        // Logical block `b` covers absolute positions
-        // `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully below `pos` iff
-        // `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`. So the number
-        // of logical blocks entirely below `pos` is `pos / BLOCK`.
+        // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
+        // absolute positions `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully
+        // below `pos` iff `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`.
+        // So the number of logical blocks entirely below `pos` is
+        // `pos / BLOCK`.
         let target_evicted = pos / PAGED_BLOCK_TOKENS;
         if target_evicted <= self.evicted_blocks {
             return;
