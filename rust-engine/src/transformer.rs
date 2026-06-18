@@ -392,16 +392,17 @@ impl KvCache {
     ///
     /// No-op for `pos == 0` and for global-attention layers (which never
     /// call this), preserving the original full-history behaviour.
-    pub fn evict_before(&mut self, pos: usize) {
-        // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
-        // absolute positions `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully
-        // below `pos` iff `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`.
-        // So the number of logical blocks entirely below `pos` is
-        // `pos / BLOCK`.
-        let target_evicted = pos / PAGED_BLOCK_TOKENS;
-        if target_evicted <= self.evicted_blocks {
-            return;
-        }
+pub fn evict_before(&mut self, pos: usize) {
+    let pos = pos.min(self.seq_len);
+    // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
+    // absolute positions `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully
+    // below `pos` iff `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`.
+    // So the number of logical blocks entirely below `pos` is
+    // `pos / BLOCK`.
+    let target_evicted = pos / PAGED_BLOCK_TOKENS;
+    if target_evicted <= self.evicted_blocks {
+        return;
+    }
         let drop = target_evicted - self.evicted_blocks;
         // Never drop more than what is physically resident (defensive;
         // `drop` is bounded by the resident block count in practice).
