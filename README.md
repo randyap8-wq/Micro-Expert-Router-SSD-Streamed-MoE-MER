@@ -419,7 +419,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API and the extended `predict_unified_with_spatial(…)` that folds in **expert-affinity** + **UTH-spatial** neighbours when a seed scores ≥ 0.80), `LocalityMonitor` (sliding-window heat map, the **L** arm), `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm), `ExpertAffinity` (lock-free `N×N` `AtomicU32` co-occurrence matrix tracking which experts fire together in the same MoE layer) plus the new `LayeredExpertAffinity` wrapper that **keeps one matrix per layer** (gist Part 2 fix #2) so layer-0 co-firings cannot leak into other layers' neighbour signal, and a background **exponential-decay worker** (gist Part 2 fix #7) that right-shifts the counter matrix per `epoch_threshold` cumulative observations to prevent atomic saturation, and `SpeculationController` (latency-aware speculation window, grows under rising `ssd_stall_us`, clamps to 0 under critical pool pressure; `update_from_stall` swaps the high-water-mark with one relaxed atomic, no `compare_exchange`). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
 | `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q8_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For the GGUF block-quantised dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm` / `run_inference_q8_0_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels, no F32 dequantise of the weights. The legacy `run_inference_q4_0` / `run_inference_q4k` / `run_inference_q8_0` dequant kernels are kept as a graceful fallback when `cols % block_size != 0`. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
-| `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab), `LMHead`, and the `matmul_row_major` dispatch. `matmul_row_major` auto-escalates: scalar → runtime row-parallel (always compiled) → `matrixmultiply` SGEMV under `--features blas`. |
+| `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention, resolved **per layer** so hybrid SWA/global families like MiMo-V2 and GPT-OSS mix modes within one model), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab; `evict_before` drops leading blocks to bound sliding-window caches), `LMHead`, and the `matmul_row_major` dispatch. `matmul_row_major` auto-escalates: scalar → runtime row-parallel (always compiled) → `matrixmultiply` SGEMV under `--features blas`. |
 | `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. Also exposes `peek_experts` (cheap, side-effect-free routing pre-pass) and `step_speculative` (verify K draft tokens with a unified expert prefetch, gist Phase 2; the preview KV growth for positions `k ≥ 1` is now seeded from a layer-0 draft-token embedding + RoPE projection rather than zero vectors so the verifier's lookahead is not routed on garbage activations, gist Part 2 fix #3). |
 | `draft` | Speculative-decoding "draft" model (gist Phase 2). `DraftLike` trait + `DraftEngine` (a small, deterministic, RAM-resident dense head tied to the main model's embedding). `predict_next` runs through `kernels::dot_f32` over a 64-byte-aligned hidden-state scratch (gist Part 2 fix #1) so the draft path auto-escalates AVX-512 → AVX2 → scalar exactly like the main matmul; the K-token loop reuses one allocation. Generates K candidate tokens with no SSD I/O so `RealModel::step_speculative` can verify them in a single batched-prefetch wave. |
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
@@ -1172,10 +1172,13 @@ enabled = true
 # Optional. Missing tensors fall back to a deterministic seeded init.
 # weights_dir = "./data/dense"
 # Optional model-family override (exact Hugging Face `model_type`):
-# "mixtral" | "qwen3" | "qwen3_moe" | "deepseek_v3" | "mistral3" | "phi3".
+# "mixtral" | "qwen3" | "qwen3_moe" | "deepseek_v3" | "mistral3" | "phi3"
+# | "mimo_v2" | "gpt_oss".
 # When omitted, the family + all hyperparameters are auto-detected from a
 # `config.json` in `weights_dir`. An unrecognised value is a hard error.
 # architecture = "qwen3_moe"
+# swa_global_ratio = 5    # Optional. Hybrid SWA:global layer ratio (see below).
+#                         # Auto-detected for mimo_v2 (5) and gpt_oss (1).
 vocab_size = 256          # match the tokenizer (256 for the byte fallback)
 num_heads = 8
 num_kv_heads = 2          # 0 = MHA (auto-set to num_heads); GQA otherwise
@@ -1805,11 +1808,31 @@ error — the engine never silently mislabels a checkpoint.
 | Mistral Small 3 | `mistral3` | ✅ Full (dense) | Multimodal checkpoint: LM tensors carry a `language_model.` prefix (stripped automatically) and the vision tower is ignored. The dense SwiGLU FFN is executed; dense models do **not** exercise SSD expert streaming. |
 | Phi-4 | `phi3` | ✅ Full (dense) | Fused `qkv_proj` is split into separate Q/K/V at load; the fused `gate_up_proj` dense FFN is split and executed. Dense models do **not** exercise SSD expert streaming. |
 | DeepSeek-V3 / V3.1 | `deepseek_v3` | ✅ Loadable (MLA + FP8) | Tensor names (incl. `weight_scale_inv` FP8 scales) are mapped, and the dense-vs-MoE split honours `first_k_dense_replace`. Sigmoid + bias-corrected grouped top-K routing is implemented. **MLA latent-KV attention** runs through [`crate::mla`] (q/kv LoRA projections, decoupled RoPE, latent KV cache) and **FP8 `e4m3` block-wise weights are dequantised at load time** via their companion `weight_scale_inv` tensors, so the model is built and executed instead of refused. Expert FFNs still stream as `expert_<id>.bin`; YaRN long-context is a later stage. |
+| Xiaomi MiMo-V2 / V2.5 | `mimo_v2` | ✅ Loadable (hybrid SWA) | Qwen3-MoE-style tensor names (`mlp.{gate,experts.{i}.{gate,up,down}_proj}`) with **per-layer hybrid attention**: a 5:1 sliding-window-to-global ratio (global attention every 6th layer — indices 5, 11, 17, …), 128-token window on the SWA layers. The Multi-Token-Prediction (MTP) head tensors are detected and **skipped** at load (the engine generates one token at a time). |
+| OpenAI GPT-OSS 20B / 120B | `gpt_oss` | ✅ Loadable (hybrid SWA) | Router gate at `mlp.router.weight`, softmax top-4 routing, 32 (20B) / 128 (120B) experts. **Per-layer hybrid attention** alternates 1:1 (global on odd layer indices, 128-token sliding window on even). |
 
 Because Mistral Small 3 and Phi-4 are fully **dense**, they bypass the
 per-token expert-streaming substrate entirely — the feature the engine
 exists to demonstrate. They are supported for tensor-name correctness,
 not as showcases of the SSD-streamed MoE pipeline.
+
+###### Per-layer hybrid attention (MiMo-V2, GPT-OSS)
+
+MiMo-V2 and GPT-OSS interleave **sliding-window** and **global** attention
+on a fixed per-layer cadence instead of applying one window uniformly. The
+engine resolves the mode for each decoder layer from the family's intrinsic
+`swa_global_ratio` (overridable via `[real_transformer] swa_global_ratio`):
+a layer is **global** when `(layer_idx + 1) % (ratio + 1) == 0` and a
+128-token **sliding window** otherwise. MiMo-V2 uses a 5:1 ratio (global at
+layers 5, 11, 17, …); GPT-OSS alternates 1:1. Each `MultiHeadSelfAttention`
+stores its resolved `window_size` (`None` = global, `Some(w)` = SWA), so the
+existing sliding-window attention path runs unchanged per layer.
+
+To keep the KV footprint bounded on the sliding-window layers, the decode
+loop calls `KvCache::evict_before(pos − window)` after each step, dropping
+whole leading 16-token blocks that can no longer be attended to. Global
+layers (and all legacy families) never evict, so their outputs are
+byte-identical to before.
 
 ##### How to run each model family
 
