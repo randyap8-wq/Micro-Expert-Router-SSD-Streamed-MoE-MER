@@ -1821,7 +1821,7 @@ not as showcases of the SSD-streamed MoE pipeline.
 MiMo-V2 and GPT-OSS interleave **sliding-window** and **global** attention
 on a fixed per-layer cadence instead of applying one window uniformly. The
 engine resolves the mode for each decoder layer from the family's intrinsic
-`swa_global_ratio` (overridable via `[real_transformer] swa_global_ratio`):
+`swa_global_ratio` (from `config.json`, or the architecture's intrinsic default when absent):
 a layer is **global** when `(layer_idx + 1) % (ratio + 1) == 0` and a
 128-token **sliding window** otherwise. MiMo-V2 uses a 5:1 ratio (global at
 layers 5, 11, 17, …); GPT-OSS alternates 1:1. Each `MultiHeadSelfAttention`
