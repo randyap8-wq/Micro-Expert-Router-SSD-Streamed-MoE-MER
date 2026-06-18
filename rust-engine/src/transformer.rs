@@ -419,8 +419,20 @@ impl KvCache {
     }
 
     /// Get the i-th cached key as a slice of length `kv_dim`.
+    ///
+    /// Caller invariant: `i` must not refer to a position that has already
+    /// been evicted by [`Self::evict_before`] — i.e. its block index must be
+    /// `>= self.evicted_blocks`. Standard attention upholds this because its
+    /// `t_start` never drops below `pos - window`, which is exactly the
+    /// floor `evict_before` preserves; MLA never evicts at all.
     fn key(&self, i: usize) -> &[f32] {
-        let block_idx = i / PAGED_BLOCK_TOKENS - self.evicted_blocks;
+        let abs_block = i / PAGED_BLOCK_TOKENS;
+        debug_assert!(
+            abs_block >= self.evicted_blocks,
+            "KvCache::key({i}) reads an evicted block ({abs_block} < {})",
+            self.evicted_blocks
+        );
+        let block_idx = abs_block - self.evicted_blocks;
         let in_block = i % PAGED_BLOCK_TOKENS;
         let start = in_block * self.kv_dim;
         &self.keys_blocks[block_idx][start..start + self.kv_dim]
@@ -439,7 +451,13 @@ impl KvCache {
     }
 
     fn value(&self, i: usize) -> &[f32] {
-        let block_idx = i / PAGED_BLOCK_TOKENS - self.evicted_blocks;
+        let abs_block = i / PAGED_BLOCK_TOKENS;
+        debug_assert!(
+            abs_block >= self.evicted_blocks,
+            "KvCache::value({i}) reads an evicted block ({abs_block} < {})",
+            self.evicted_blocks
+        );
+        let block_idx = abs_block - self.evicted_blocks;
         let in_block = i % PAGED_BLOCK_TOKENS;
         let start = in_block * self.kv_dim;
         &self.values_blocks[block_idx][start..start + self.kv_dim]
@@ -1974,6 +1992,10 @@ mod tests {
         let mut last_evict = vec![];
         let mut last_keep = vec![];
         for p in 0..total {
+            // Arbitrary but deterministic per-position input: the first
+            // element varies with the position (mod 5) so successive tokens
+            // differ, the rest are fixed; exact values are immaterial — the
+            // test only asserts evict and keep paths agree bit-for-bit.
             let x = vec![((p % 5) as f32) * 0.3, 0.1, -0.2, 0.05];
             last_evict = attn.forward(&x, p, 0, &mut kv_evict, &cpu_backend());
             kv_evict.evict_before(p.saturating_sub(window));

@@ -295,6 +295,9 @@ impl RealModelConfig {
             // Hybrid families (MiMo-V2, GPT-OSS) use a 128-token SWA window;
             // fall back to the architecture's default when the config omits
             // `sliding_window` so the per-layer pattern still has a window.
+            // `default_swa_window()` returns `None` for every non-hybrid
+            // family, so this fallback only ever activates for MiMo-V2 and
+            // GPT-OSS — legacy families keep their explicit window (or none).
             window_size: hf.sliding_window.or_else(|| hf.architecture.default_swa_window()),
             architecture: hf.architecture,
             first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
@@ -718,8 +721,20 @@ impl RealModel {
         if config.architecture == Architecture::MiMoV2 {
             let num_layers = config.num_layers;
             let is_mtp_tensor = |name: &str| -> bool {
-                let n = name.to_ascii_lowercase();
-                if n.contains("mtp") || n.contains("nextn") {
+                // Match `mtp` / `nextn` only as whole dot-delimited path
+                // segments (optionally with an `_…` suffix, e.g.
+                // `nextn_predict`), so unrelated names that merely contain
+                // the substring (e.g. `…attempts…` → `mtp`) are not flagged.
+                let is_marker_segment = |seg: &str| {
+                    let seg = seg.to_ascii_lowercase();
+                    for marker in ["mtp", "nextn"] {
+                        if seg == marker || seg.starts_with(&format!("{marker}_")) {
+                            return true;
+                        }
+                    }
+                    false
+                };
+                if name.split('.').any(is_marker_segment) {
                     return true;
                 }
                 // `model.layers.{idx}.…` with idx beyond the configured

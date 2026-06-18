@@ -243,8 +243,11 @@ impl Architecture {
         let window = window.filter(|&w| w > 0);
         let ratio = swa_global_ratio.or_else(|| self.swa_global_ratio());
         match (window, ratio) {
-            // Hybrid interleave: `ratio` SWA layers, then one global.
-            (Some(w), Some(r)) if r > 0 => {
+            // Hybrid interleave: `ratio` SWA layers, then one global. A
+            // ratio of 0 (e.g. an explicit `sliding_window_pattern = 1`)
+            // degenerates to "every layer global" via the formula below,
+            // honouring an explicit request to disable the sliding window.
+            (Some(w), Some(r)) => {
                 if (layer_idx + 1) % (r + 1) == 0 {
                     AttentionMode::Global
                 } else {
@@ -252,7 +255,7 @@ impl Architecture {
                 }
             }
             // Uniform sliding window (Mixtral) — every layer is SWA.
-            (Some(w), _) => AttentionMode::SlidingWindow { window: w },
+            (Some(w), None) => AttentionMode::SlidingWindow { window: w },
             // No window configured — full causal attention everywhere.
             (None, _) => AttentionMode::Global,
         }
@@ -850,7 +853,9 @@ impl HfConfig {
         //   * `swa_global_ratio` — direct value (number of SWA layers per
         //     global layer).
         //   * `sliding_window_pattern` — HF convention where every P-th
-        //     layer is global, i.e. `P - 1` SWA layers per global one.
+        //     layer is global, i.e. `P - 1` SWA layers per global one. A
+        //     pattern of 1 maps to ratio 0 (every layer global) and is
+        //     preserved; `checked_sub` drops only the nonsensical `P = 0`.
         // When absent, the architecture's intrinsic ratio is applied at
         // resolve time (see `Architecture::attention_mode`), so MiMo-V2 /
         // GPT-OSS still get the correct pattern from a config that only
@@ -861,7 +866,6 @@ impl HfConfig {
                 get("sliding_window_pattern")
                     .and_then(as_usize)
                     .and_then(|p| p.checked_sub(1))
-                    .filter(|&r| r > 0)
             });
 
         // Routed-expert count spelling differs per family.
