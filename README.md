@@ -1177,8 +1177,8 @@ enabled = true
 # When omitted, the family + all hyperparameters are auto-detected from a
 # `config.json` in `weights_dir`. An unrecognised value is a hard error.
 # architecture = "qwen3_moe"
-# swa_global_ratio = 5    # Optional. Hybrid SWA:global layer ratio (see below).
-#                         # Auto-detected for mimo_v2 (5) and gpt_oss (1).
+# Hybrid SWA/global cadence is read from the checkpoint's config.json for mimo_v2 / gpt_oss.
+# (No TOML override is currently supported.)
 vocab_size = 256          # match the tokenizer (256 for the byte fallback)
 num_heads = 8
 num_kv_heads = 2          # 0 = MHA (auto-set to num_heads); GQA otherwise
