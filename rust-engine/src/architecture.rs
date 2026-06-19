@@ -134,7 +134,7 @@ impl Architecture {
             "DeepseekV3ForCausalLM" => Some(Self::DeepSeekV3),
             "Mistral3ForConditionalGeneration" => Some(Self::MistralSmall3),
             "Phi3ForCausalLM" => Some(Self::Phi4),
-            "MiMoV2FlashForCausalLM" => Some(Self::MiMoV2),
+            "MiMoV2FlashForCausalLM" | "MiMoV2ForCausalLM" => Some(Self::MiMoV2),
             "GptOssForCausalLM" => Some(Self::GptOss),
             _ => None,
         }
