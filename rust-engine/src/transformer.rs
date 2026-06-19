@@ -404,23 +404,23 @@ pub fn evict_before(&mut self, pos: usize) {
     if target_evicted <= self.evicted_blocks {
         return;
     }
-        let drop = target_evicted - self.evicted_blocks;
+        let blocks_to_drop = target_evicted - self.evicted_blocks;
         // Never drop more than what is physically resident (defensive;
-        // `drop` is bounded by the resident block count in practice).
-        let drop = drop.min(self.keys_blocks.len());
-        if drop == 0 {
+        // `blocks_to_drop` is bounded by the resident block count in practice).
+        let blocks_to_drop = blocks_to_drop.min(self.keys_blocks.len());
+        if blocks_to_drop == 0 {
             return;
         }
         // Zeroize the dropped blocks before releasing them so a tenant's
         // attention state cannot survive in a freed heap region (mirrors
         // `zeroize`), then remove them from the front of the block table.
-        zeroize_blocks(self.keys_blocks.iter_mut().take(drop));
-        zeroize_blocks(self.values_blocks.iter_mut().take(drop));
-        for _ in 0..drop {
+        zeroize_blocks(self.keys_blocks.iter_mut().take(blocks_to_drop));
+        zeroize_blocks(self.values_blocks.iter_mut().take(blocks_to_drop));
+        for _ in 0..blocks_to_drop {
             self.keys_blocks.pop_front();
             self.values_blocks.pop_front();
         }
-        self.evicted_blocks += drop;
+        self.evicted_blocks += blocks_to_drop;
     }
 
     /// Get the i-th cached key as a slice of length `kv_dim`.
