@@ -118,7 +118,7 @@ impl Architecture {
             "phi3" => Some(Self::Phi4),
             // Best-known canonical `model_type` strings for the two new
             // families (unverifiable in the sandbox — see the variant docs).
-            "mimo_v2_flash" => Some(Self::MiMoV2),
+            "mimo_v2_flash" | "mimo_v2" => Some(Self::MiMoV2),
             "gpt_oss" => Some(Self::GptOss),
             _ => None,
         }
