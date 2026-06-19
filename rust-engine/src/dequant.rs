@@ -111,23 +111,22 @@ pub fn decode_e8m0_scale(e: u8) -> f32 {
 /// lengths that don't match the dimensions) so callers can fall back to
 /// seeded init rather than panic on a malformed checkpoint.
 pub fn dequant_mxfp4(packed: &[u8], scales: &[u8], rows: usize, cols: usize) -> Vec<f32> {
-    if cols % 2 != 0 {
-        return Vec::new();
-    }
     let blocks_per_row = cols.div_ceil(32);
-    let need_packed = rows.saturating_mul(cols) / 2;
+    let bytes_per_row = cols.div_ceil(2);
+    let need_packed = rows.saturating_mul(bytes_per_row);
     let need_scales = rows.saturating_mul(blocks_per_row);
     if packed.len() != need_packed || scales.len() != need_scales {
         return Vec::new();
     }
     let mut out = vec![0.0f32; rows.saturating_mul(cols)];
     for r in 0..rows {
+        let packed_row = r * bytes_per_row;
         let scale_row = r * blocks_per_row;
         for c in 0..cols {
-            let n = r * cols + c;
-            let byte = packed[n / 2];
-            let nibble = if n % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            let byte = packed[packed_row + c / 2];
+            let nibble = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
             let scale = decode_e8m0_scale(scales[scale_row + c / 32]);
+            let n = r * cols + c;
             out[n] = decode_mxfp4_nibble(nibble) * scale;
         }
     }
