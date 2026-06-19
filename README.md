@@ -1173,11 +1173,11 @@ enabled = true
 # weights_dir = "./data/dense"
 # Optional model-family override (exact Hugging Face `model_type`):
 # "mixtral" | "qwen3" | "qwen3_moe" | "deepseek_v3" | "mistral3" | "phi3"
-# | "mimo_v2" | "gpt_oss".
+# | "mimo_v2_flash" | "gpt_oss".
 # When omitted, the family + all hyperparameters are auto-detected from a
 # `config.json` in `weights_dir`. An unrecognised value is a hard error.
 # architecture = "qwen3_moe"
-# Hybrid SWA/global cadence is read from the checkpoint's config.json for mimo_v2 / gpt_oss.
+# Hybrid SWA/global cadence is read from the checkpoint's config.json for mimo_v2_flash / gpt_oss.
 # (No TOML override is currently supported.)
 vocab_size = 256          # match the tokenizer (256 for the byte fallback)
 num_heads = 8
@@ -1808,7 +1808,7 @@ error — the engine never silently mislabels a checkpoint.
 | Mistral Small 3 | `mistral3` | ✅ Full (dense) | Multimodal checkpoint: LM tensors carry a `language_model.` prefix (stripped automatically) and the vision tower is ignored. The dense SwiGLU FFN is executed; dense models do **not** exercise SSD expert streaming. |
 | Phi-4 | `phi3` | ✅ Full (dense) | Fused `qkv_proj` is split into separate Q/K/V at load; the fused `gate_up_proj` dense FFN is split and executed. Dense models do **not** exercise SSD expert streaming. |
 | DeepSeek-V3 / V3.1 | `deepseek_v3` | ✅ Loadable (MLA + FP8) | Tensor names (incl. `weight_scale_inv` FP8 scales) are mapped, and the dense-vs-MoE split honours `first_k_dense_replace`. Sigmoid + bias-corrected grouped top-K routing is implemented. **MLA latent-KV attention** runs through [`crate::mla`] (q/kv LoRA projections, decoupled RoPE, latent KV cache) and **FP8 `e4m3` block-wise weights are dequantised at load time** via their companion `weight_scale_inv` tensors, so the model is built and executed instead of refused. Expert FFNs still stream as `expert_<id>.bin`; YaRN long-context is a later stage. |
-| Xiaomi MiMo-V2 / V2.5 | `mimo_v2` | ✅ Loadable (hybrid SWA) | Qwen3-MoE-style tensor names (`mlp.{gate,experts.{i}.{gate,up,down}_proj}`) with **per-layer hybrid attention**: a 5:1 sliding-window-to-global ratio (global attention every 6th layer — indices 5, 11, 17, …), 128-token window on the SWA layers. The Multi-Token-Prediction (MTP) head tensors are detected and **skipped** at load (the engine generates one token at a time). |
+| Xiaomi MiMo-V2-Flash | `mimo_v2_flash` | ✅ Loadable (hybrid SWA) | Qwen3-MoE-style tensor names (`mlp.{gate,experts.{i}.{gate,up,down}_proj}`) with **per-layer hybrid attention** driven by the checkpoint's explicit `hybrid_layer_pattern` (`0 = global`, `1 = SWA`): **layer 0 is global**, then 5 SWA + 1 global repeats (global at indices 0, 6, 12, …), with a 128-token window on the SWA layers. RoPE uses a **per-layer base**: `rope_theta` (5M) on global layers and the smaller `swa_rope_theta` (10K) on SWA layers. FP8 `e4m3` weights are dequantised with the checkpoint's `weight_block_size` (128×128) tiles. The Multi-Token-Prediction (MTP) head tensors are detected and **skipped** at load (the engine generates one token at a time). |
 | OpenAI GPT-OSS 20B / 120B | `gpt_oss` | ✅ Loadable (hybrid SWA) | Router gate at `mlp.router.weight`, softmax top-4 routing, 32 (20B) / 128 (120B) experts. **Per-layer hybrid attention** alternates 1:1 (global on odd layer indices, 128-token sliding window on even). |
 
 Because Mistral Small 3 and Phi-4 are fully **dense**, they bypass the
@@ -1816,17 +1816,21 @@ per-token expert-streaming substrate entirely — the feature the engine
 exists to demonstrate. They are supported for tensor-name correctness,
 not as showcases of the SSD-streamed MoE pipeline.
 
-###### Per-layer hybrid attention (MiMo-V2, GPT-OSS)
+###### Per-layer hybrid attention (MiMo-V2-Flash, GPT-OSS)
 
-MiMo-V2 and GPT-OSS interleave **sliding-window** and **global** attention
-on a fixed per-layer cadence instead of applying one window uniformly. The
-engine resolves the mode for each decoder layer from the family's intrinsic
-`swa_global_ratio` (from `config.json`, or the architecture's intrinsic default when absent):
-a layer is **global** when `(layer_idx + 1) % (ratio + 1) == 0` and a
-128-token **sliding window** otherwise. MiMo-V2 uses a 5:1 ratio (global at
-layers 5, 11, 17, …); GPT-OSS alternates 1:1. Each `MultiHeadSelfAttention`
-stores its resolved `window_size` (`None` = global, `Some(w)` = SWA), so the
-existing sliding-window attention path runs unchanged per layer.
+MiMo-V2-Flash and GPT-OSS interleave **sliding-window** and **global** attention
+on a fixed per-layer cadence instead of applying one window uniformly. When
+the checkpoint ships an explicit `hybrid_layer_pattern` (MiMo-V2-Flash: `0 =
+global`, `1 = SWA`), the engine uses it as a direct per-layer lookup — so
+**layer 0 is global**, then 5 SWA + 1 global repeats (global at indices 0, 6,
+12, …). Otherwise the mode is resolved from the family's `swa_global_ratio`
+(from `config.json`, or the architecture's intrinsic default when absent): a
+layer is **global** when `(layer_idx + 1) % (ratio + 1) == 0` and a 128-token
+**sliding window** otherwise (GPT-OSS alternates 1:1). MiMo-V2-Flash also uses
+a **per-layer RoPE base** — `rope_theta` on global layers and the smaller
+`swa_rope_theta` on SWA layers. Each `MultiHeadSelfAttention` stores its
+resolved `window_size` (`None` = global, `Some(w)` = SWA) and `rope_base`, so
+the existing sliding-window attention path runs unchanged per layer.
 
 To keep the KV footprint bounded on the sliding-window layers, the decode
 loop calls `KvCache::evict_before(pos − window)` after each step, dropping

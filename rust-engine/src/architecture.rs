@@ -118,7 +118,7 @@ impl Architecture {
             "phi3" => Some(Self::Phi4),
             // Best-known canonical `model_type` strings for the two new
             // families (unverifiable in the sandbox — see the variant docs).
-            "mimo_v2" => Some(Self::MiMoV2),
+            "mimo_v2_flash" => Some(Self::MiMoV2),
             "gpt_oss" => Some(Self::GptOss),
             _ => None,
         }
@@ -134,7 +134,7 @@ impl Architecture {
             "DeepseekV3ForCausalLM" => Some(Self::DeepSeekV3),
             "Mistral3ForConditionalGeneration" => Some(Self::MistralSmall3),
             "Phi3ForCausalLM" => Some(Self::Phi4),
-            "MiMoV2ForCausalLM" => Some(Self::MiMoV2),
+            "MiMoV2FlashForCausalLM" => Some(Self::MiMoV2),
             "GptOssForCausalLM" => Some(Self::GptOss),
             _ => None,
         }
@@ -149,7 +149,7 @@ impl Architecture {
             Self::DeepSeekV3 => "deepseek_v3",
             Self::MistralSmall3 => "mistral3",
             Self::Phi4 => "phi3",
-            Self::MiMoV2 => "mimo_v2",
+            Self::MiMoV2 => "mimo_v2_flash",
             Self::GptOss => "gpt_oss",
         }
     }
@@ -227,6 +227,10 @@ impl Architecture {
     /// * `swa_global_ratio` is the explicit interleave ratio from the
     ///   config, if any; when `None` the architecture's intrinsic ratio
     ///   ([`Self::swa_global_ratio`]) is used.
+    /// * `hybrid_pattern` is the explicit per-layer pattern
+    ///   (`hybrid_layer_pattern`: `0 = global`, non-zero = SWA). When
+    ///   present it is used as a direct lookup and overrides the ratio
+    ///   formula; pass `None` for every non-MiMo-V2-Flash path.
     ///
     /// With a hybrid ratio `R` and a positive `window`, layer `l` is
     /// `Global` iff `(l + 1) % (R + 1) == 0`, otherwise
@@ -239,8 +243,21 @@ impl Architecture {
         layer_idx: usize,
         window: Option<usize>,
         swa_global_ratio: Option<usize>,
+        hybrid_pattern: Option<&[u8]>,
     ) -> AttentionMode {
         let window = window.filter(|&w| w > 0);
+        // Explicit per-layer pattern wins over everything (MiMo-V2-Flash
+        // `hybrid_layer_pattern`: `0 = global`, non-zero = SWA).
+        if let Some(pat) = hybrid_pattern {
+            return match (pat.get(layer_idx), window) {
+                (Some(0), _) => AttentionMode::Global,
+                (Some(_), Some(w)) => AttentionMode::SlidingWindow { window: w },
+                // SWA layer with no configured window, or out-of-bounds
+                // index → safe Global default.
+                (Some(_), None) => AttentionMode::Global,
+                (None, _) => AttentionMode::Global,
+            };
+        }
         let ratio = swa_global_ratio.or_else(|| self.swa_global_ratio());
         match (window, ratio) {
             // Hybrid interleave: `ratio` SWA layers, then one global. A
@@ -646,7 +663,7 @@ impl std::fmt::Display for ArchitectureError {
                 "unsupported model architecture (model_type={model_type:?}, \
                  architectures={architectures:?}); supported model_types are \
                  mixtral, qwen3, qwen3_moe, deepseek_v3, mistral3, phi3, \
-                 mimo_v2, gpt_oss"
+                 mimo_v2_flash, gpt_oss"
             ),
             Self::MissingField(name) => {
                 write!(f, "config.json is missing required field `{name}`")
@@ -753,6 +770,23 @@ pub struct HfConfig {
     pub v_head_dim: Option<usize>,
     // -- RoPE scaling (YaRN) --
     pub rope_scaling: Option<RopeScaling>,
+    /// Explicit per-layer hybrid-attention pattern (`hybrid_layer_pattern`),
+    /// where `0` marks a Global attention layer and any non-zero value
+    /// marks a Sliding-Window-Attention layer. MiMo-V2-Flash ships this
+    /// 48-element array (global at layers 0, 6, 12, …). When present it is
+    /// used as a direct per-layer lookup and wins over the
+    /// [`Self::swa_global_ratio`] formula; `None` keeps the ratio-based
+    /// fallback (see [`Architecture::attention_mode`]).
+    pub hybrid_layer_pattern: Option<Vec<u8>>,
+    /// Separate RoPE base frequency for Sliding-Window-Attention layers
+    /// (`swa_rope_theta`). MiMo-V2-Flash uses a much smaller theta (10K) on
+    /// SWA layers than on global layers (`rope_theta`, 5M). `None` ⇒ every
+    /// layer uses `rope_theta`.
+    pub swa_rope_theta: Option<f32>,
+    /// FP8 block-quantisation tile size (`quantization_config.weight_block_size`,
+    /// e.g. `[128, 128]`). Drives the block edge used by
+    /// [`crate::mla::dequant_fp8_e4m3_blockwise`]; `None` ⇒ the default 128.
+    pub fp8_block_size: Option<[usize; 2]>,
 }
 
 fn as_usize(v: &serde_json::Value) -> Option<usize> {
@@ -870,6 +904,32 @@ impl HfConfig {
                     .and_then(|p| p.checked_sub(1))
             });
 
+        // Explicit per-layer hybrid attention pattern (MiMo-V2-Flash):
+        // `0 = global, non-zero = SWA`. When present this wins over the
+        // ratio formula at resolve time (see `Architecture::attention_mode`).
+        let hybrid_layer_pattern = get("hybrid_layer_pattern")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_u64().map(|n| n as u8))
+                    .collect::<Vec<u8>>()
+            });
+
+        // Separate RoPE base for SWA layers (MiMo-V2-Flash `swa_rope_theta`).
+        let swa_rope_theta = get("swa_rope_theta").and_then(as_f32);
+
+        // FP8 block-quantisation tile size from `quantization_config`.
+        let fp8_block_size: Option<[usize; 2]> = get("quantization_config")
+            .and_then(|v| v.get("weight_block_size"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                if arr.len() == 2 {
+                    Some([as_usize(&arr[0])?, as_usize(&arr[1])?])
+                } else {
+                    None
+                }
+            });
+
         // Routed-expert count spelling differs per family.
         let num_routed_experts = get("num_local_experts")
             .and_then(as_usize)
@@ -911,6 +971,9 @@ impl HfConfig {
             qk_nope_head_dim: get("qk_nope_head_dim").and_then(as_usize),
             v_head_dim: get("v_head_dim").and_then(as_usize),
             rope_scaling: get("rope_scaling").and_then(parse_rope_scaling),
+            hybrid_layer_pattern,
+            swa_rope_theta,
+            fp8_block_size,
         })
     }
 
@@ -1223,13 +1286,13 @@ mod tests {
 
     #[test]
     fn mimo_v2_model_type_maps() {
-        assert_eq!(Architecture::from_model_type("mimo_v2"), Some(Architecture::MiMoV2));
+        assert_eq!(Architecture::from_model_type("mimo_v2_flash"), Some(Architecture::MiMoV2));
         assert_eq!(
-            Architecture::from_hf_architecture("MiMoV2ForCausalLM"),
+            Architecture::from_hf_architecture("MiMoV2FlashForCausalLM"),
             Some(Architecture::MiMoV2)
         );
         // Round-trip through the canonical string.
-        assert_eq!(Architecture::MiMoV2.model_type(), "mimo_v2");
+        assert_eq!(Architecture::MiMoV2.model_type(), "mimo_v2_flash");
         assert!(Architecture::MiMoV2.is_moe());
         // MiMo-V2 does not use QK-Norm.
         assert!(!Architecture::MiMoV2.uses_qk_norm());
@@ -1256,14 +1319,19 @@ mod tests {
     }
 
     #[test]
-    fn mimo_v2_attention_mode_pattern() {
-        // 36-layer MiMo-V2: 5:1 SWA:global. Global at 5, 11, 17, 23, 29, 35;
-        // every other layer is SWA with a 128-token window.
+    fn mimo_v2_flash_attention_mode_pattern() {
+        // MiMo-V2-Flash ships an explicit `hybrid_layer_pattern` where
+        // `0 = global, 1 = SWA`. Layer 0 is GLOBAL (stabilises early
+        // representations); then 5 SWA + 1 global repeats. Global layers:
+        // 0, 6, 12, 18, 24, 30, 36, 42.
         let arch = Architecture::MiMoV2;
         let window = Some(128);
-        for l in 0..36 {
-            let mode = arch.attention_mode(l, window, None);
-            if (l + 1) % 6 == 0 {
+        // The 48-layer pattern from the config: global (0) every 6th layer
+        // starting at index 0.
+        let pattern: Vec<u8> = (0..48).map(|l| if l % 6 == 0 { 0 } else { 1 }).collect();
+        for l in 0..48 {
+            let mode = arch.attention_mode(l, window, None, Some(&pattern));
+            if l % 6 == 0 {
                 assert_eq!(mode, AttentionMode::Global, "layer {l} should be global");
             } else {
                 assert_eq!(
@@ -1274,11 +1342,30 @@ mod tests {
             }
         }
         // Spot-check the boundaries the gist calls out.
-        assert_eq!(arch.attention_mode(0, window, None), AttentionMode::SlidingWindow { window: 128 });
-        assert_eq!(arch.attention_mode(4, window, None), AttentionMode::SlidingWindow { window: 128 });
-        assert_eq!(arch.attention_mode(5, window, None), AttentionMode::Global);
-        assert_eq!(arch.attention_mode(6, window, None), AttentionMode::SlidingWindow { window: 128 });
-        assert_eq!(arch.attention_mode(11, window, None), AttentionMode::Global);
+        assert_eq!(
+            arch.attention_mode(0, window, None, Some(&pattern)),
+            AttentionMode::Global
+        );
+        assert_eq!(
+            arch.attention_mode(1, window, None, Some(&pattern)),
+            AttentionMode::SlidingWindow { window: 128 }
+        );
+        assert_eq!(
+            arch.attention_mode(5, window, None, Some(&pattern)),
+            AttentionMode::SlidingWindow { window: 128 }
+        );
+        assert_eq!(
+            arch.attention_mode(6, window, None, Some(&pattern)),
+            AttentionMode::Global
+        );
+        assert_eq!(
+            arch.attention_mode(11, window, None, Some(&pattern)),
+            AttentionMode::SlidingWindow { window: 128 }
+        );
+        assert_eq!(
+            arch.attention_mode(12, window, None, Some(&pattern)),
+            AttentionMode::Global
+        );
     }
 
     #[test]
@@ -1288,7 +1375,7 @@ mod tests {
         let arch = Architecture::GptOss;
         let window = Some(128);
         for l in 0..24 {
-            let mode = arch.attention_mode(l, window, None);
+            let mode = arch.attention_mode(l, window, None, None);
             if l % 2 == 0 {
                 assert_eq!(
                     mode,
@@ -1308,22 +1395,22 @@ mod tests {
         let arch = Architecture::GptOss; // intrinsic ratio 1
         let window = Some(128);
         // Force a 2:1 pattern: global only at layers 2, 5, 8, …
-        assert_eq!(arch.attention_mode(0, window, Some(2)), AttentionMode::SlidingWindow { window: 128 });
-        assert_eq!(arch.attention_mode(1, window, Some(2)), AttentionMode::SlidingWindow { window: 128 });
-        assert_eq!(arch.attention_mode(2, window, Some(2)), AttentionMode::Global);
+        assert_eq!(arch.attention_mode(0, window, Some(2), None), AttentionMode::SlidingWindow { window: 128 });
+        assert_eq!(arch.attention_mode(1, window, Some(2), None), AttentionMode::SlidingWindow { window: 128 });
+        assert_eq!(arch.attention_mode(2, window, Some(2), None), AttentionMode::Global);
     }
 
     #[test]
     fn uniform_attention_modes_for_legacy_families() {
         // No window ⇒ every layer is Global (Qwen3-MoE, DeepSeek-V3, …).
         for l in 0..8 {
-            assert_eq!(Architecture::Qwen3Moe.attention_mode(l, None, None), AttentionMode::Global);
-            assert_eq!(Architecture::DeepSeekV3.attention_mode(l, None, None), AttentionMode::Global);
+            assert_eq!(Architecture::Qwen3Moe.attention_mode(l, None, None, None), AttentionMode::Global);
+            assert_eq!(Architecture::DeepSeekV3.attention_mode(l, None, None, None), AttentionMode::Global);
         }
         // Mixtral's uniform sliding window applies to every layer.
         for l in 0..8 {
             assert_eq!(
-                Architecture::Mixtral.attention_mode(l, Some(4096), None),
+                Architecture::Mixtral.attention_mode(l, Some(4096), None, None),
                 AttentionMode::SlidingWindow { window: 4096 }
             );
         }
@@ -1375,8 +1462,8 @@ mod tests {
         // A MiMo-V2 config that only carries `sliding_window` still yields
         // the 5:1 pattern via the architecture's intrinsic ratio.
         let json = r#"{
-            "architectures": ["MiMoV2ForCausalLM"],
-            "model_type": "mimo_v2",
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
             "hidden_size": 4096,
             "intermediate_size": 12288,
             "moe_intermediate_size": 1536,
@@ -1396,12 +1483,66 @@ mod tests {
         // No explicit ratio in the config ⇒ falls back to intrinsic 5.
         assert_eq!(cfg.swa_global_ratio, None);
         assert_eq!(
-            cfg.architecture.attention_mode(5, cfg.sliding_window, cfg.swa_global_ratio),
+            cfg.architecture.attention_mode(5, cfg.sliding_window, cfg.swa_global_ratio, cfg.hybrid_layer_pattern.as_deref()),
             AttentionMode::Global
         );
         assert_eq!(
-            cfg.architecture.attention_mode(0, cfg.sliding_window, cfg.swa_global_ratio),
+            cfg.architecture.attention_mode(0, cfg.sliding_window, cfg.swa_global_ratio, cfg.hybrid_layer_pattern.as_deref()),
             AttentionMode::SlidingWindow { window: 128 }
+        );
+    }
+
+    #[test]
+    fn read_mimo_v2_flash_config_parses_hybrid_pattern_and_per_layer_rope() {
+        // A full MiMo-V2-Flash config: explicit `hybrid_layer_pattern`
+        // (layer 0 global), per-layer `swa_rope_theta`, and an FP8
+        // `weight_block_size`. The pattern must override the ratio formula.
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "moe_intermediate_size": 1536,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 151936,
+            "rope_theta": 5000000.0,
+            "swa_rope_theta": 10000.0,
+            "sliding_window": 128,
+            "hybrid_layer_pattern": [0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1],
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128]
+            }
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.architecture, Architecture::MiMoV2);
+        assert_eq!(cfg.rope_theta, 5_000_000.0);
+        assert_eq!(cfg.swa_rope_theta, Some(10_000.0));
+        assert_eq!(cfg.fp8_block_size, Some([128, 128]));
+        let pat = cfg.hybrid_layer_pattern.clone().expect("hybrid pattern parsed");
+        assert_eq!(pat, vec![0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1]);
+        // Layer 0 is GLOBAL (the gist's core correction); 1..=5 are SWA;
+        // layer 6 is global again. The explicit pattern wins over the 5:1
+        // ratio formula (which would have made layer 5 global).
+        assert_eq!(
+            cfg.architecture.attention_mode(0, cfg.sliding_window, cfg.swa_global_ratio, Some(pat.as_slice())),
+            AttentionMode::Global
+        );
+        for l in 1..=5 {
+            assert_eq!(
+                cfg.architecture.attention_mode(l, cfg.sliding_window, cfg.swa_global_ratio, Some(pat.as_slice())),
+                AttentionMode::SlidingWindow { window: 128 },
+                "layer {l} should be SWA under the explicit pattern"
+            );
+        }
+        assert_eq!(
+            cfg.architecture.attention_mode(6, cfg.sliding_window, cfg.swa_global_ratio, Some(pat.as_slice())),
+            AttentionMode::Global
         );
     }
 }

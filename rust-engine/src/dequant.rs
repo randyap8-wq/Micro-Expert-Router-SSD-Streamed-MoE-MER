@@ -111,6 +111,12 @@ pub fn decode_e8m0_scale(e: u8) -> f32 {
 /// lengths that don't match the dimensions) so callers can fall back to
 /// seeded init rather than panic on a malformed checkpoint.
 pub fn dequant_mxfp4(packed: &[u8], scales: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    // `cols` must be even so every row begins on a byte boundary (two E2M1
+    // elements per packed byte). Reject odd `cols` per the documented
+    // contract rather than silently mis-packing the final nibble.
+    if cols % 2 != 0 {
+        return Vec::new();
+    }
     let blocks_per_row = cols.div_ceil(32);
     let bytes_per_row = cols.div_ceil(2);
     let need_packed = rows.saturating_mul(bytes_per_row);
