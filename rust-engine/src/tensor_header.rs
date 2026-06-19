@@ -73,6 +73,8 @@ pub enum UthDtypeId {
     Q4K = 3,
     Q4_0 = 4,
     Q8_0 = 5,
+    BF16 = 6,
+    MXFP4 = 7,
 }
 
 impl UthDtypeId {
@@ -84,6 +86,8 @@ impl UthDtypeId {
             WeightDtype::Q4K => UthDtypeId::Q4K,
             WeightDtype::Q4_0 => UthDtypeId::Q4_0,
             WeightDtype::Q8_0 => UthDtypeId::Q8_0,
+            WeightDtype::BF16 => UthDtypeId::BF16,
+            WeightDtype::MXFP4 => UthDtypeId::MXFP4,
         }
     }
 
@@ -95,6 +99,8 @@ impl UthDtypeId {
             UthDtypeId::Q4K => WeightDtype::Q4K,
             UthDtypeId::Q4_0 => WeightDtype::Q4_0,
             UthDtypeId::Q8_0 => WeightDtype::Q8_0,
+            UthDtypeId::BF16 => WeightDtype::BF16,
+            UthDtypeId::MXFP4 => WeightDtype::MXFP4,
         }
     }
 
@@ -106,6 +112,8 @@ impl UthDtypeId {
             3 => Some(UthDtypeId::Q4K),
             4 => Some(UthDtypeId::Q4_0),
             5 => Some(UthDtypeId::Q8_0),
+            6 => Some(UthDtypeId::BF16),
+            7 => Some(UthDtypeId::MXFP4),
             _ => None,
         }
     }
@@ -154,8 +162,16 @@ impl TensorHeader {
             // at offset `dtype.header_bytes()`.
             WeightDtype::Int8 => (0u32, 3u32),
             // No global scale region — `quant_scale_offset` is unused
-            // when `quant_scale_count == 0`.
-            WeightDtype::F32 | WeightDtype::F16 | WeightDtype::Q4K | WeightDtype::Q4_0 | WeightDtype::Q8_0 => (0, 0),
+            // when `quant_scale_count == 0`. (MXFP4 keeps its E8M0 block
+            // scales inline per projection, so like Q4_0/Q4K they cannot
+            // be addressed by a single offset.)
+            WeightDtype::F32
+            | WeightDtype::F16
+            | WeightDtype::Q4K
+            | WeightDtype::Q4_0
+            | WeightDtype::Q8_0
+            | WeightDtype::BF16
+            | WeightDtype::MXFP4 => (0, 0),
         };
         Self {
             version: UTH_VERSION,

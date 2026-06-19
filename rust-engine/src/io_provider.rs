@@ -1485,6 +1485,31 @@ pub fn generate_synthetic_experts_with_dtype(
             // floats_remaining was set assuming the per-weight format;
             // null it out so we don't double-write.
             floats_remaining = 0;
+        } else if matches!(dtype, WeightDtype::MXFP4) {
+            // MXFP4 writes three projections (gate, up, down) back to
+            // back. Each projection is its packed E2M1 weight bytes
+            // (`rows * ceil(cols/2)`, low-nibble first) immediately
+            // followed by its E8M0 block scales (`rows * ceil(cols/32)`).
+            // Synthetic weights use random nibbles and a fixed unit
+            // block scale (E8M0 byte 127 = 2^0), so dequant reproduces
+            // the canonical E2M1 magnitudes deterministically.
+            use crate::inference::MXFP4_SCALE_BLOCK;
+            for &(rows, cols) in &[(d_ff, d_model), (d_ff, d_model), (d_model, d_ff)] {
+                let wbytes = rows.saturating_mul(cols.div_ceil(2));
+                let mut buf = vec![0u8; wbytes];
+                for b in buf.iter_mut() {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *b = (state >> 40) as u8;
+                }
+                f.write_all(&buf)?;
+                let sbytes = rows.saturating_mul(cols.div_ceil(MXFP4_SCALE_BLOCK));
+                // E8M0 byte 127 => 2^0 = 1.0 (non-zero, unit scale).
+                let sbuf = vec![127u8; sbytes];
+                f.write_all(&sbuf)?;
+            }
+            floats_remaining = 0;
         } else {
             let bpw = dtype.bytes_per_weight();
             let mut buf = Vec::<u8>::with_capacity(chunk_floats * bpw);
@@ -1504,6 +1529,10 @@ pub fn generate_synthetic_experts_with_dtype(
                             let h = half::f16::from_f32(v);
                             buf.extend_from_slice(&h.to_bits().to_le_bytes());
                         }
+                        WeightDtype::BF16 => {
+                            let h = half::bf16::from_f32(v);
+                            buf.extend_from_slice(&h.to_bits().to_le_bytes());
+                        }
                         WeightDtype::Int8 => {
                             // Per-tensor symmetric quant. With the synthetic
                             // distribution and `q = scale/127.0`, `v / q`
@@ -1516,6 +1545,7 @@ pub fn generate_synthetic_experts_with_dtype(
                         WeightDtype::Q4K => unreachable!("Q4K handled above"),
                         WeightDtype::Q4_0 => unreachable!("Q4_0 handled above"),
                         WeightDtype::Q8_0 => unreachable!("Q8_0 handled above"),
+                        WeightDtype::MXFP4 => unreachable!("MXFP4 handled above"),
                     }
                 }
                 f.write_all(&buf)?;
