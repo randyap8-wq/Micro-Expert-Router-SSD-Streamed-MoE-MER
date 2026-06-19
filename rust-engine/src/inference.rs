@@ -1642,24 +1642,44 @@ impl OwnedExpertWeights {
 
         // Decode one [rows × cols] projection starting at `off`, returning
         // the dequantised f32 matrix and the new offset.
-        let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, usize), ExpertWeightsError> {
-            let weight_bytes = rows.saturating_mul(cols.div_ceil(2));
-            let scale_bytes = rows.saturating_mul(cols.div_ceil(MXFP4_SCALE_BLOCK));
-            let w_end = off + weight_bytes;
-            let s_end = w_end + scale_bytes;
-            let packed = &bytes[off..w_end];
-            let scales = &bytes[w_end..s_end];
-            let out = crate::dequant::dequant_mxfp4(packed, scales, rows, cols);
-            if out.len() != rows.saturating_mul(cols) {
-                return Err(ExpertWeightsError::BufferTooSmall {
-                    have: bytes.len(),
-                    need: need_bytes,
-                    d_model,
-                    d_ff,
-                });
-            }
-            Ok((out, s_end))
-        };
+let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, usize), ExpertWeightsError> {
+    let weight_bytes = rows.saturating_mul(cols.div_ceil(2));
+    let scale_bytes = rows.saturating_mul(cols.div_ceil(MXFP4_SCALE_BLOCK));
+    let w_end = off.checked_add(weight_bytes).ok_or(ExpertWeightsError::BufferTooSmall {
+        have: bytes.len(),
+        need: need_bytes,
+        d_model,
+        d_ff,
+    })?;
+    let s_end = w_end.checked_add(scale_bytes).ok_or(ExpertWeightsError::BufferTooSmall {
+        have: bytes.len(),
+        need: need_bytes,
+        d_model,
+        d_ff,
+    })?;
+    let packed = bytes.get(off..w_end).ok_or(ExpertWeightsError::BufferTooSmall {
+        have: bytes.len(),
+        need: need_bytes,
+        d_model,
+        d_ff,
+    })?;
+    let scales = bytes.get(w_end..s_end).ok_or(ExpertWeightsError::BufferTooSmall {
+        have: bytes.len(),
+        need: need_bytes,
+        d_model,
+        d_ff,
+    })?;
+    let out = crate::dequant::dequant_mxfp4(packed, scales, rows, cols);
+    if out.len() != rows.saturating_mul(cols) {
+        return Err(ExpertWeightsError::BufferTooSmall {
+            have: bytes.len(),
+            need: need_bytes,
+            d_model,
+            d_ff,
+        });
+    }
+    Ok((out, s_end))
+};
 
         let (gate, off) = decode_proj(0, d_ff, d_model)?;
         let (up, off) = decode_proj(off, d_ff, d_model)?;
