@@ -91,8 +91,8 @@ pub fn decode_e8m0_scale(e: u8) -> f32 {
     if e == 0 {
         0.0
     } else {
-        // 2^(e - 127); for e in 1..=254 this stays within f32 range.
-        2f32.powi(e as i32 - 127)
+        // For f32, exponent bits directly encode powers of two: 2^(e-127).
+        f32::from_bits((e as u32) << 23)
     }
 }
 
