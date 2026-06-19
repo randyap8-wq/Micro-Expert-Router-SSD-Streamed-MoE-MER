@@ -733,19 +733,26 @@ impl RealModel {
             .collect::<Result<_, _>>()?;
 
         // FP8 block-quantisation tile edge. MiMo-V2-Flash and DeepSeek-V3
-        // both use 128×128 tiles; drive the edge from the checkpoint's
+        // both use square 128×128 tiles; drive the edge from the checkpoint's
         // `weight_block_size` (`config.advanced.fp8_block_size`) when present
         // so a checkpoint with a different tile size dequantises with the
         // matching scale grid, falling back to the historical `FP8_BLOCK`.
-        // `weight_block_size` is `[block_rows, block_cols]`; the dequantiser
-        // takes a single square edge, so we use the first dimension (square
-        // tiles in every shipping config).
-        let fp8_block = config
-            .advanced
-            .fp8_block_size
-            .map(|[r, _c]| r)
-            .filter(|&b| b > 0)
-            .unwrap_or(FP8_BLOCK);
+        // The dequantiser only models *square* tiles, so a non-square
+        // `weight_block_size` (`block_rows != block_cols`) is rejected (warn +
+        // fall back) rather than silently using one dimension for both.
+        let fp8_block = match config.advanced.fp8_block_size {
+            Some([r, c]) if r > 0 && r == c => r,
+            Some([r, c]) => {
+                warn!(
+                    block_rows = r,
+                    block_cols = c,
+                    "non-square FP8 weight_block_size is unsupported; \
+                     using default {FP8_BLOCK}x{FP8_BLOCK} tiles"
+                );
+                FP8_BLOCK
+            }
+            None => FP8_BLOCK,
+        };
 
         // -- Multi-Token-Prediction (MTP) tensor skipping (MiMo-V2) --------
         //
