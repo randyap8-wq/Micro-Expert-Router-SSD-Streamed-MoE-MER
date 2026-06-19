@@ -76,6 +76,19 @@ pub struct AdvancedConfig {
     /// intrinsic ratio ([`Architecture::swa_global_ratio`]) to resolve each
     /// layer's [`crate::architecture::AttentionMode`] at construction time.
     pub swa_global_ratio: Option<usize>,
+    /// Explicit per-layer hybrid-attention pattern (MiMo-V2-Flash
+    /// `hybrid_layer_pattern`: `0 = global`, non-zero = SWA). When present
+    /// it is used as a direct per-layer lookup and overrides
+    /// `swa_global_ratio`. `None` ⇒ ratio-based resolution.
+    pub hybrid_layer_pattern: Option<Vec<u8>>,
+    /// Separate RoPE base for Sliding-Window-Attention layers
+    /// (`swa_rope_theta`). MiMo-V2-Flash uses a smaller theta on SWA layers
+    /// than on global layers (`rope_base`). `None` ⇒ every layer uses
+    /// `rope_base`.
+    pub swa_rope_theta: Option<f32>,
+    /// FP8 block-quantisation tile size (`weight_block_size`). Drives the
+    /// block edge used by the FP8 dequantiser; `None` ⇒ the default 128.
+    pub fp8_block_size: Option<[usize; 2]>,
 }
 
 impl Default for AdvancedConfig {
@@ -96,6 +109,9 @@ impl Default for AdvancedConfig {
             mla: None,
             rope_scaling: None,
             swa_global_ratio: None,
+            hybrid_layer_pattern: None,
+            swa_rope_theta: None,
+            fp8_block_size: None,
         }
     }
 }
@@ -275,6 +291,9 @@ impl RealModelConfig {
             mla,
             rope_scaling: hf.rope_scaling.clone(),
             swa_global_ratio: hf.swa_global_ratio,
+            hybrid_layer_pattern: hf.hybrid_layer_pattern.clone(),
+            swa_rope_theta: hf.swa_rope_theta,
+            fp8_block_size: hf.fp8_block_size,
         };
         Self {
             d_model: hf.hidden_size,
@@ -364,8 +383,17 @@ impl RealModel {
                         layer_idx,
                         config.window_size,
                         config.advanced.swa_global_ratio,
+                        config.advanced.hybrid_layer_pattern.as_deref(),
                     )
                     .window();
+                // Per-layer RoPE base. MiMo-V2-Flash uses a separate (much
+                // smaller) `swa_rope_theta` on SWA layers; global layers keep
+                // the model-level `rope_base`. When `swa_rope_theta` is unset
+                // every layer uses `rope_base` (legacy behaviour).
+                let layer_rope_base = match (layer_window, config.advanced.swa_rope_theta) {
+                    (Some(_), Some(swa_theta)) => swa_theta,
+                    _ => config.rope_base,
+                };
                 // YaRN long-context RoPE scaling for the standard
                 // attention path (the MLA path carries its own copy
                 // built inside `seed_mla`).
@@ -373,7 +401,7 @@ impl RealModel {
                     .advanced
                     .rope_scaling
                     .as_ref()
-                    .and_then(|s| YarnRope::from_scaling(config.head_dim, config.rope_base, s));
+                    .and_then(|s| YarnRope::from_scaling(config.head_dim, layer_rope_base, s));
                 TransformerLayer {
                 rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 attn: MultiHeadSelfAttention {
@@ -381,7 +409,7 @@ impl RealModel {
                     num_heads: config.num_heads,
                     num_kv_heads: config.num_kv_heads,
                     head_dim: config.head_dim,
-                    rope_base: config.rope_base,
+                    rope_base: layer_rope_base,
                     wq: sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
                     wk: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
                     wv: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
@@ -704,6 +732,28 @@ impl RealModel {
             })
             .collect::<Result<_, _>>()?;
 
+        // FP8 block-quantisation tile edge. MiMo-V2-Flash and DeepSeek-V3
+        // both use square 128×128 tiles; drive the edge from the checkpoint's
+        // `weight_block_size` (`config.advanced.fp8_block_size`) when present
+        // so a checkpoint with a different tile size dequantises with the
+        // matching scale grid, falling back to the historical `FP8_BLOCK`.
+        // The dequantiser only models *square* tiles, so a non-square
+        // `weight_block_size` (`block_rows != block_cols`) is rejected (warn +
+        // fall back) rather than silently using one dimension for both.
+        let fp8_block = match config.advanced.fp8_block_size {
+            Some([r, c]) if r > 0 && r == c => r,
+            Some([r, c]) => {
+                warn!(
+                    block_rows = r,
+                    block_cols = c,
+                    "non-square FP8 weight_block_size is unsupported; \
+                     using default {FP8_BLOCK}x{FP8_BLOCK} tiles"
+                );
+                FP8_BLOCK
+            }
+            None => FP8_BLOCK,
+        };
+
         // -- Multi-Token-Prediction (MTP) tensor skipping (MiMo-V2) --------
         //
         // MiMo-V2 ships `num_nextn_predict_layers` extra "next-token
@@ -755,7 +805,7 @@ impl RealModel {
                 .count();
             if mtp_skipped > 0 {
                 debug!(
-                    arch = "mimo_v2",
+                    arch = "mimo_v2_flash",
                     mtp_tensors_skipped = mtp_skipped,
                     "skipping MiMo-V2 Multi-Token-Prediction tensors (single-token decode)"
                 );
@@ -817,7 +867,7 @@ impl RealModel {
                             &scale_inv,
                             rows,
                             cols,
-                            FP8_BLOCK,
+                            fp8_block,
                         );
                         if out.is_empty() {
                             return None;
@@ -847,19 +897,13 @@ impl RealModel {
                         // metadata tensor (e.g. attention-sink scales)
                         // that happens to share a name prefix.
                         Dtype::U8 => {
-if shape.len() == 2
-    && shape[0] != 0
-    && expected % shape[0] == 0
-    && shape[1] == (expected / shape[0]).div_ceil(2)
-{
-    let rows = shape[0];
-    let cols = expected / rows;
-                                    warn!(
-                                        tensor = name,
-                                        "MXFP4 packed shape inconsistent with expected; falling back"
-                                    );
-                                    return None;
-                                }
+                            if shape.len() == 2
+                                && shape[0] != 0
+                                && expected % shape[0] == 0
+                                && shape[1] == (expected / shape[0]).div_ceil(2)
+                            {
+                                let rows = shape[0];
+                                let cols = expected / rows;
                                 let Some(scales) = find_mxfp4_scales(&parsed, name, rows, cols)
                                 else {
                                     warn!(
@@ -985,7 +1029,7 @@ if let Ok(sv) = s.tensor(&scale_name) {
                                 &scale_inv,
                                 rows,
                                 cols,
-                                FP8_BLOCK,
+                                fp8_block,
                             );
                             if out.is_empty() {
                                 warn!(
@@ -1686,11 +1730,12 @@ fn decode_safetensor_to_f32(view: &safetensors::tensor::TensorView<'_>, name: &s
 
 /// Locate the OCP MXFP4 block-scale tensor that accompanies a packed
 /// `*_blocks` weight and return its raw E8M0 bytes (one byte per 32-wide
-/// block). GPT-OSS names the scales `<base>_scales` next to a
-/// `<base>_blocks` weight, but we also probe the generic `<name>_scale`,
-/// `<name>_scales`, and `<name>.scale` spellings. The companion is only
-/// accepted when its element count equals `rows * ceil(cols / 32)`, the
-/// E8M0 grid implied by the weight shape.
+/// block). GPT-OSS names the scales `<base>.scales` next to a
+/// `<base>.blocks` weight (dot-separated, per `openai/gpt-oss`
+/// weights.py); we probe that first, then the generic `<name>_scale`,
+/// `<name>_scales`, `<name>.scale`, and the underscore `<base>_scales`
+/// variant. The companion is only accepted when its element count equals
+/// `rows * ceil(cols / 32)`, the E8M0 grid implied by the weight shape.
 fn find_mxfp4_scales(
     parsed: &[safetensors::SafeTensors],
     name: &str,
@@ -1704,6 +1749,13 @@ fn find_mxfp4_scales(
         format!("{name}_scales"),
         format!("{name}.scale"),
     ];
+    // Primary GPT-OSS pattern: `<base>.blocks` packed weight is paired with
+    // a `<base>.scales` E8M0 scale tensor (dot-separated suffix, per
+    // `openai/gpt-oss` weights.py). Probe it first — it's the confirmed
+    // correct spelling for GPT-OSS MoE weights.
+    if let Some(base) = name.strip_suffix(".blocks") {
+        candidates.insert(0, format!("{base}.scales"));
+    }
     if let Some(base) = name.strip_suffix("_blocks") {
         candidates.push(format!("{base}_scales"));
         candidates.push(format!("{base}_scale"));
@@ -1723,6 +1775,49 @@ fn find_mxfp4_scales(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod mxfp4_scale_tests {
+    use super::find_mxfp4_scales;
+    use safetensors::tensor::{Dtype, TensorView};
+
+    /// GPT-OSS names the packed weight `<base>.blocks` and its companion
+    /// E8M0 scales `<base>.scales` (dot-separated, per `openai/gpt-oss`
+    /// weights.py). `find_mxfp4_scales` must resolve the companion from the
+    /// `.blocks` name even though none of the legacy underscore/dot-scale
+    /// spellings match.
+    #[test]
+    fn find_mxfp4_scales_dot_suffix() {
+        // rows = 2, cols = 64 ⇒ blocks_per_row = ceil(64 / 32) = 2,
+        // so the E8M0 scale grid is 2 × 2 = 4 bytes.
+        let rows = 2usize;
+        let cols = 64usize;
+        let name = "block.0.mlp.mlp1_weight.blocks";
+        let scale_name = "block.0.mlp.mlp1_weight.scales";
+
+        // Packed weight: two E2M1 nibbles per byte ⇒ rows * cols/2 bytes.
+        let weight_bytes = vec![0u8; rows * cols / 2];
+        // E8M0 scales: one byte per 32-wide block ⇒ 4 distinct values.
+        let scale_bytes: Vec<u8> = vec![1, 2, 3, 4];
+
+        let tensors = vec![
+            (
+                name.to_string(),
+                TensorView::new(Dtype::U8, vec![rows, cols / 2], &weight_bytes).unwrap(),
+            ),
+            (
+                scale_name.to_string(),
+                TensorView::new(Dtype::U8, vec![rows, 2], &scale_bytes).unwrap(),
+            ),
+        ];
+        let bytes = safetensors::serialize(tensors, &None).unwrap();
+        let parsed = vec![safetensors::SafeTensors::deserialize(&bytes).unwrap()];
+
+        let found = find_mxfp4_scales(&parsed, name, rows, cols)
+            .expect("`.blocks` weight should resolve its `.scales` companion");
+        assert_eq!(found, scale_bytes);
+    }
 }
 
 #[cfg(test)]
