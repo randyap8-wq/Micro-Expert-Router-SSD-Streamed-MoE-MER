@@ -39,6 +39,7 @@ use crate::expert_cache::ExpertResident;
 use crate::inference::{forward_candle_tensors, ExpertWeights, HiddenState};
 use candle_core::{Device, Tensor};
 use half::f16;
+use std::collections::VecDeque;
 
 /// RMSNorm: `y = x * rsqrt(mean(x^2) + eps) * weight`.
 ///
@@ -272,9 +273,9 @@ pub struct KvCache {
     /// worth of `kv_dim` floats laid out as `[token_in_block, kv_dim]`
     /// row-major. The last block may be partially filled (the unused
     /// tail is never read because `seq_len` bounds every iteration).
-    keys_blocks: Vec<Box<[f32]>>,
+    keys_blocks: VecDeque<Box<[f32]>>,
     /// Mirrors `keys_blocks` for the value half of the cache.
-    values_blocks: Vec<Box<[f32]>>,
+    values_blocks: VecDeque<Box<[f32]>>,
     /// Number of leading paged blocks that have been physically dropped by
     /// [`Self::evict_before`] (sliding-window KV eviction). Absolute
     /// positions keep counting from 0 via `seq_len`, but the block table is
@@ -298,8 +299,8 @@ pub const PAGED_BLOCK_TOKENS: usize = 16;
 impl KvCache {
     pub fn new(kv_dim: usize) -> Self {
         Self {
-            keys_blocks: Vec::new(),
-            values_blocks: Vec::new(),
+            keys_blocks: VecDeque::new(),
+            values_blocks: VecDeque::new(),
             evicted_blocks: 0,
             seq_len: 0,
             kv_dim,
@@ -322,9 +323,9 @@ impl KvCache {
             debug_assert_eq!(self.keys_blocks.len(), block_idx - self.evicted_blocks);
             let block_floats = PAGED_BLOCK_TOKENS * self.kv_dim;
             self.keys_blocks
-                .push(vec![0.0f32; block_floats].into_boxed_slice());
+                .push_back(vec![0.0f32; block_floats].into_boxed_slice());
             self.values_blocks
-                .push(vec![0.0f32; block_floats].into_boxed_slice());
+                .push_back(vec![0.0f32; block_floats].into_boxed_slice());
         }
         let start = in_block * self.kv_dim;
         let end = start + self.kv_dim;
@@ -332,11 +333,11 @@ impl KvCache {
         // write directly into its in-place slot.
         let kb = self
             .keys_blocks
-            .last_mut()
+            .back_mut()
             .expect("block must exist after append");
         let vb = self
             .values_blocks
-            .last_mut()
+            .back_mut()
             .expect("block must exist after append");
         kb[start..end].copy_from_slice(k);
         vb[start..end].copy_from_slice(v);
@@ -364,8 +365,8 @@ impl KvCache {
     /// is dropped immediately afterwards is, in principle, eligible
     /// for dead-store elimination.
     pub fn zeroize(&mut self) {
-        zeroize_blocks(&mut self.keys_blocks);
-        zeroize_blocks(&mut self.values_blocks);
+        zeroize_blocks(self.keys_blocks.iter_mut());
+        zeroize_blocks(self.values_blocks.iter_mut());
         self.reset();
     }
 
@@ -413,10 +414,12 @@ pub fn evict_before(&mut self, pos: usize) {
         // Zeroize the dropped blocks before releasing them so a tenant's
         // attention state cannot survive in a freed heap region (mirrors
         // `zeroize`), then remove them from the front of the block table.
-        zeroize_blocks(&mut self.keys_blocks[..drop]);
-        zeroize_blocks(&mut self.values_blocks[..drop]);
-        self.keys_blocks.drain(..drop);
-        self.values_blocks.drain(..drop);
+        zeroize_blocks(self.keys_blocks.iter_mut().take(drop));
+        zeroize_blocks(self.values_blocks.iter_mut().take(drop));
+        for _ in 0..drop {
+            self.keys_blocks.pop_front();
+            self.values_blocks.pop_front();
+        }
         self.evicted_blocks += drop;
     }
 
@@ -472,8 +475,11 @@ pub fn evict_before(&mut self, pos: usize) {
 /// `compiler_fence` prevents the writes from being reordered past
 /// the eventual deallocation of the backing buffers.
 #[inline(never)]
-fn zeroize_blocks(blocks: &mut [Box<[f32]>]) {
-    for block in blocks.iter_mut() {
+fn zeroize_blocks<'a, I>(blocks: I)
+where
+    I: IntoIterator<Item = &'a mut Box<[f32]>>,
+{
+    for block in blocks {
         let ptr = block.as_mut_ptr();
         let len = block.len();
         // Safety: `block` is a `Box<[f32]>` (boxed slice) of length
