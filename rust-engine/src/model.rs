@@ -44,7 +44,7 @@ use crate::transformer::{
 };
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Advanced routing / attention parameters that only some architectures
 /// use. Defaults reproduce Mixtral / Qwen3 behaviour exactly (softmax
@@ -70,6 +70,12 @@ pub struct AdvancedConfig {
     pub mla: Option<MlaDims>,
     /// RoPE scaling (YaRN) parameters; `None` when absent.
     pub rope_scaling: Option<RopeScaling>,
+    /// Hybrid-attention interleave ratio (number of consecutive
+    /// Sliding-Window-Attention layers per Global layer). `None` ⇒ uniform
+    /// attention (the legacy behaviour). Combined with the architecture's
+    /// intrinsic ratio ([`Architecture::swa_global_ratio`]) to resolve each
+    /// layer's [`crate::architecture::AttentionMode`] at construction time.
+    pub swa_global_ratio: Option<usize>,
 }
 
 impl Default for AdvancedConfig {
@@ -89,6 +95,7 @@ impl Default for AdvancedConfig {
             topk_method: None,
             mla: None,
             rope_scaling: None,
+            swa_global_ratio: None,
         }
     }
 }
@@ -267,6 +274,7 @@ impl RealModelConfig {
             topk_method: hf.topk_method.clone(),
             mla,
             rope_scaling: hf.rope_scaling.clone(),
+            swa_global_ratio: hf.swa_global_ratio,
         };
         Self {
             d_model: hf.hidden_size,
@@ -284,7 +292,13 @@ impl RealModelConfig {
             top_k,
             rope_base: hf.rope_theta,
             rms_eps: hf.rms_norm_eps,
-            window_size: hf.sliding_window,
+            // Hybrid families (MiMo-V2, GPT-OSS) use a 128-token SWA window;
+            // fall back to the architecture's default when the config omits
+            // `sliding_window` so the per-layer pattern still has a window.
+            // `default_swa_window()` returns `None` for every non-hybrid
+            // family, so this fallback only ever activates for MiMo-V2 and
+            // GPT-OSS — legacy families keep their explicit window (or none).
+            window_size: hf.sliding_window.or_else(|| hf.architecture.default_swa_window()),
             architecture: hf.architecture,
             first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
             advanced,
@@ -335,9 +349,23 @@ impl RealModel {
         };
 
         let layers: Vec<TransformerLayer> = (0..config.num_layers)
-            .map(|_| {
+            .map(|layer_idx| {
                 let (q_norm, k_norm) = seed_qk_norm();
                 let mla = seed_mla(&config, &mut rng, proj_scale);
+                // Per-layer attention mode (hybrid SWA:global for MiMo-V2 /
+                // GPT-OSS, uniform for everything else). Resolve the mode for
+                // this layer and store it as `window_size` so SWA and Global
+                // layers can coexist in a single model. Legacy uniform-window
+                // models (Mixtral) resolve to the same `Some(window)` on
+                // every layer; full-causal models resolve to `None`.
+                let layer_window = config
+                    .architecture
+                    .attention_mode(
+                        layer_idx,
+                        config.window_size,
+                        config.advanced.swa_global_ratio,
+                    )
+                    .window();
                 // YaRN long-context RoPE scaling for the standard
                 // attention path (the MLA path carries its own copy
                 // built inside `seed_mla`).
@@ -358,7 +386,7 @@ impl RealModel {
                     wk: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
                     wv: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
                     wo: sample_uniform_vec(&mut rng, config.d_model * q_dim, proj_scale),
-                    window_size: config.window_size,
+                    window_size: layer_window,
                     q_norm,
                     k_norm,
                     rope_yarn,
@@ -675,6 +703,64 @@ impl RealModel {
                 })
             })
             .collect::<Result<_, _>>()?;
+
+        // -- Multi-Token-Prediction (MTP) tensor skipping (MiMo-V2) --------
+        //
+        // MiMo-V2 ships `num_nextn_predict_layers` extra "next-token
+        // prediction" heads whose weights appear in the checkpoint as
+        // additional decoder layers (`model.layers.{idx}` with
+        // `idx >= num_hidden_layers`) and/or tensors carrying an `mtp` /
+        // `nextn` marker. MER does single-token decoding and never consults
+        // these heads, so they are intentionally not looked up by the
+        // name-driven loader below. The standard loader already ignores any
+        // tensor it does not explicitly request, so this pass does not
+        // change loading behaviour — it exists purely to make the skip
+        // *intentional and observable*: we count the MTP tensors and emit a
+        // single `debug!` line, rather than silently relying on the
+        // name-lookup miss. (Not an error: extra MTP tensors are expected.)
+        if config.architecture == Architecture::MiMoV2 {
+            let num_layers = config.num_layers;
+            let is_mtp_tensor = |name: &str| -> bool {
+                // Match `mtp` / `nextn` only as whole dot-delimited path
+                // segments (optionally with an `_…` suffix, e.g.
+                // `nextn_predict`), so unrelated names that merely contain
+                // the substring (e.g. `…attempts…` → `mtp`) are not flagged.
+                let is_marker_segment = |seg: &str| {
+                    let seg = seg.to_ascii_lowercase();
+                    for marker in ["mtp", "nextn"] {
+                        if seg == marker || seg.starts_with(&format!("{marker}_")) {
+                            return true;
+                        }
+                    }
+                    false
+                };
+                if name.split('.').any(is_marker_segment) {
+                    return true;
+                }
+                // `model.layers.{idx}.…` with idx beyond the configured
+                // decoder depth is an MTP predict layer.
+                if let Some(rest) = name.split("model.layers.").nth(1) {
+                    if let Some(idx_str) = rest.split('.').next() {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            return idx >= num_layers;
+                        }
+                    }
+                }
+                false
+            };
+            let mtp_skipped: usize = parsed
+                .iter()
+                .flat_map(|st| st.names().into_iter())
+                .filter(|name| is_mtp_tensor(name))
+                .count();
+            if mtp_skipped > 0 {
+                debug!(
+                    arch = "mimo_v2",
+                    mtp_tensors_skipped = mtp_skipped,
+                    "skipping MiMo-V2 Multi-Token-Prediction tensors (single-token decode)"
+                );
+            }
+        }
 
         // Closure: search every shard for `name` and decode as f32.
         // Returns `None` when the tensor isn't found in any shard or
@@ -1220,6 +1306,17 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
             x = layer.attn_block(&x, pos, layer_idx, &mut kv[layer_idx], &*backend);
+            // Sliding-Window-Attention layers (MiMo-V2 SWA layers, GPT-OSS
+            // banded layers, Mixtral's uniform window) only ever attend to
+            // the last `window` positions, so KV entries older than that are
+            // dead weight. Evict them to keep this layer's cache bounded at
+            // O(window) instead of O(seq_len). Global layers (`window_size
+            // == None`) keep their full history untouched.
+            if let crate::architecture::AttentionMode::SlidingWindow { window } =
+                layer.attn.attention_mode()
+            {
+                kv[layer_idx].evict_before(pos.saturating_sub(window));
+            }
             // Dense FFN layers (Mistral Small 3, Phi-4, DeepSeek dense
             // prefix) bypass the SSD-streamed expert path entirely: run the
             // resident SwiGLU FFN and skip routing.
@@ -1519,6 +1616,53 @@ mod tests {
         assert_eq!(m.lm_head.weights.len(), cfg.vocab_size * cfg.d_model);
         assert_eq!(m.final_rms.weight.len(), cfg.d_model);
         assert!(m.embedding.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn hybrid_attention_sets_per_layer_windows() {
+        use crate::architecture::Architecture;
+        // MiMo-V2: 12 layers, 5:1 SWA:global ⇒ global at layers 5 and 11,
+        // SWA (window 128) everywhere else.
+        let cfg = RealModelConfig {
+            num_layers: 12,
+            architecture: Architecture::MiMoV2,
+            window_size: Some(128),
+            ..RealModelConfig::tiny()
+        };
+        let m = RealModel::new_seeded(cfg, 3);
+        for (l, layer) in m.layers.iter().enumerate() {
+            if (l + 1) % 6 == 0 {
+                assert_eq!(layer.attn.window_size, None, "layer {l} should be global");
+            } else {
+                assert_eq!(layer.attn.window_size, Some(128), "layer {l} should be SWA");
+            }
+        }
+
+        // GPT-OSS: alternating 1:1 ⇒ even layers SWA, odd layers global.
+        let cfg = RealModelConfig {
+            num_layers: 6,
+            architecture: Architecture::GptOss,
+            window_size: Some(128),
+            ..RealModelConfig::tiny()
+        };
+        let m = RealModel::new_seeded(cfg, 3);
+        for (l, layer) in m.layers.iter().enumerate() {
+            if l % 2 == 0 {
+                assert_eq!(layer.attn.window_size, Some(128), "even layer {l} should be SWA");
+            } else {
+                assert_eq!(layer.attn.window_size, None, "odd layer {l} should be global");
+            }
+        }
+
+        // Legacy Mixtral: uniform window on every layer.
+        let cfg = RealModelConfig {
+            num_layers: 4,
+            architecture: Architecture::Mixtral,
+            window_size: Some(4096),
+            ..RealModelConfig::tiny()
+        };
+        let m = RealModel::new_seeded(cfg, 3);
+        assert!(m.layers.iter().all(|l| l.attn.window_size == Some(4096)));
     }
 
     #[test]

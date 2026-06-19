@@ -55,6 +55,32 @@ pub enum Architecture {
     /// Phi-4 (`phi3`). Dense decoder with **fused** `qkv_proj` and
     /// `gate_up_proj` projections.
     Phi4,
+    /// MiMo-V2 / MiMo-V2.5 (Xiaomi, `mimo_v2`). Sparse MoE (309B total /
+    /// 15B active) with a **hybrid per-layer attention** pattern: a 5:1
+    /// ratio of Sliding-Window-Attention (SWA, 128-token window) layers to
+    /// Global-attention layers — every 6th layer (0-indexed 5, 11, 17, …)
+    /// is global. Carries Multi-Token-Prediction (`num_nextn_predict_layers`)
+    /// heads that MER ignores (their weight tensors are skipped at load
+    /// time; see [`crate::model::RealModel::from_safetensors`]). Tensor
+    /// naming follows the Qwen3-MoE / DeepSeek convention
+    /// (`model.layers.{l}.mlp.experts.{j}.{gate,up,down}_proj`,
+    /// `model.layers.{l}.mlp.gate`).
+    ///
+    /// NOTE: the exact `model_type` / `architectures` strings and the MTP
+    /// tensor prefix could not be confirmed against the live HuggingFace
+    /// repo (`XiaomiMiMo/MiMo-V2-Flash`) because the sandbox has no network
+    /// access to huggingface.co. The values below are the best-known
+    /// canonical spellings and should be re-verified against the published
+    /// `config.json` / weight index.
+    MiMoV2,
+    /// GPT-OSS 20B / 120B (OpenAI, `gpt_oss`). Sparse MoE (32 experts for
+    /// 20B, 128 for 120B), top-4 softmax routing, **no shared expert**, and
+    /// an alternating **1:1 per-layer attention** pattern: even layers use
+    /// a 128-token banded sliding window, odd layers use full causal
+    /// attention. The router lives at `model.layers.{l}.mlp.router` (not
+    /// `mlp.gate`); attention carries a learnable per-layer sink bias
+    /// (`self_attn.sinks`) that MER does not yet apply.
+    GptOss,
 }
 
 impl Default for Architecture {
@@ -90,6 +116,10 @@ impl Architecture {
             "deepseek_v3" => Some(Self::DeepSeekV3),
             "mistral3" => Some(Self::MistralSmall3),
             "phi3" => Some(Self::Phi4),
+            // Best-known canonical `model_type` strings for the two new
+            // families (unverifiable in the sandbox — see the variant docs).
+            "mimo_v2" => Some(Self::MiMoV2),
+            "gpt_oss" => Some(Self::GptOss),
             _ => None,
         }
     }
@@ -104,6 +134,8 @@ impl Architecture {
             "DeepseekV3ForCausalLM" => Some(Self::DeepSeekV3),
             "Mistral3ForConditionalGeneration" => Some(Self::MistralSmall3),
             "Phi3ForCausalLM" => Some(Self::Phi4),
+            "MiMoV2ForCausalLM" => Some(Self::MiMoV2),
+            "GptOssForCausalLM" => Some(Self::GptOss),
             _ => None,
         }
     }
@@ -117,13 +149,18 @@ impl Architecture {
             Self::DeepSeekV3 => "deepseek_v3",
             Self::MistralSmall3 => "mistral3",
             Self::Phi4 => "phi3",
+            Self::MiMoV2 => "mimo_v2",
+            Self::GptOss => "gpt_oss",
         }
     }
 
     /// `true` if the architecture has sparse MoE FFN layers (some layers
     /// may still be dense, e.g. DeepSeek's `first_k_dense_replace`).
     pub fn is_moe(&self) -> bool {
-        matches!(self, Self::Mixtral | Self::Qwen3Moe | Self::DeepSeekV3)
+        matches!(
+            self,
+            Self::Mixtral | Self::Qwen3Moe | Self::DeepSeekV3 | Self::MiMoV2 | Self::GptOss
+        )
     }
 
     /// `true` if the architecture applies per-head QK-Norm (a `head_dim`
@@ -141,6 +178,131 @@ impl Architecture {
     /// model can be both mapped and executed.
     pub fn compute_support(&self) -> ComputeSupport {
         ComputeSupport::Supported
+    }
+
+    // ===================================================================
+    // Per-layer hybrid attention (MiMo-V2 5:1 SWA:global, GPT-OSS 1:1).
+    //
+    // Older families apply a *uniform* attention mode to every layer:
+    // full causal (most) or a single sliding window (Mixtral's 4096).
+    // MiMo-V2 and GPT-OSS interleave Sliding-Window-Attention (SWA) and
+    // Global layers. The interleave is expressed as a single integer
+    // "SWA:global ratio" `R` — `R` consecutive SWA layers followed by one
+    // global layer — so layer `l` is **global** iff `(l + 1) % (R + 1) == 0`
+    // and **SWA** otherwise. MiMo-V2 uses `R = 5` (global at 5, 11, 17, …),
+    // GPT-OSS uses `R = 1` (global on every odd layer, SWA on every even
+    // layer). `None` means "no hybrid pattern": the uniform window applies.
+    // ===================================================================
+
+    /// The architecture's intrinsic SWA:global interleave ratio, or `None`
+    /// for families with uniform attention. `Some(5)` for MiMo-V2 (5 SWA
+    /// layers per global layer), `Some(1)` for GPT-OSS (alternating).
+    ///
+    /// This is the *fallback* used when `config.json` does not carry an
+    /// explicit ratio field; an explicit config value always wins (see
+    /// [`Self::attention_mode`]).
+    pub fn swa_global_ratio(&self) -> Option<usize> {
+        match self {
+            Self::MiMoV2 => Some(5),
+            Self::GptOss => Some(1),
+            _ => None,
+        }
+    }
+
+    /// The architecture's intrinsic sliding-window span for its SWA layers
+    /// when `config.json` omits `sliding_window`. Both MiMo-V2 and GPT-OSS
+    /// use a 128-token banded window. `None` for families whose window (if
+    /// any) is always specified in the config (e.g. Mixtral's 4096).
+    pub fn default_swa_window(&self) -> Option<usize> {
+        match self {
+            Self::MiMoV2 | Self::GptOss => Some(128),
+            _ => None,
+        }
+    }
+
+    /// Resolve the [`AttentionMode`] for decoder layer `layer_idx`.
+    ///
+    /// * `window` is the sliding-window span from `config.json`
+    ///   (`sliding_window`); `None`/`Some(0)` disables SWA.
+    /// * `swa_global_ratio` is the explicit interleave ratio from the
+    ///   config, if any; when `None` the architecture's intrinsic ratio
+    ///   ([`Self::swa_global_ratio`]) is used.
+    ///
+    /// With a hybrid ratio `R` and a positive `window`, layer `l` is
+    /// `Global` iff `(l + 1) % (R + 1) == 0`, otherwise
+    /// `SlidingWindow { window }`. Without a hybrid ratio the result is
+    /// uniform: `SlidingWindow { window }` when a window is set (Mixtral),
+    /// else `Global` (Qwen3-MoE, DeepSeek-V3, …) — exactly the legacy
+    /// behaviour.
+    pub fn attention_mode(
+        &self,
+        layer_idx: usize,
+        window: Option<usize>,
+        swa_global_ratio: Option<usize>,
+    ) -> AttentionMode {
+        let window = window.filter(|&w| w > 0);
+        let ratio = swa_global_ratio.or_else(|| self.swa_global_ratio());
+        match (window, ratio) {
+            // Hybrid interleave: `ratio` SWA layers, then one global. A
+            // ratio of 0 (e.g. an explicit `sliding_window_pattern = 1`)
+            // degenerates to "every layer global" via the formula below,
+            // honouring an explicit request to disable the sliding window.
+(Some(w), Some(r)) => {
+    let denom = r.saturating_add(1);
+    let idx1 = layer_idx.saturating_add(1);
+    if idx1 % denom == 0 {
+        AttentionMode::Global
+    } else {
+        AttentionMode::SlidingWindow { window: w }
+    }
+}
+            // Uniform sliding window (Mixtral) — every layer is SWA.
+            (Some(w), None) => AttentionMode::SlidingWindow { window: w },
+            // No window configured — full causal attention everywhere.
+            (None, _) => AttentionMode::Global,
+        }
+    }
+}
+
+/// Per-layer attention mode. Replaces the older "uniform window or
+/// nothing" assumption so hybrid models (MiMo-V2, GPT-OSS) can mix
+/// Sliding-Window-Attention (SWA) and Global layers within one model.
+///
+/// Resolved per layer by [`Architecture::attention_mode`] and stored on
+/// each [`crate::transformer::MultiHeadSelfAttention`] as its
+/// `window_size` (`None` ⇔ [`AttentionMode::Global`], `Some(w)` ⇔
+/// [`AttentionMode::SlidingWindow`]). The forward pass branches on this
+/// to bound the attention sum (and the decode loop uses it to evict
+/// out-of-window KV entries).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionMode {
+    /// Full causal attention over all past positions.
+    Global,
+    /// Sliding window: attend only to the last `window` positions.
+    SlidingWindow { window: usize },
+}
+
+impl AttentionMode {
+    /// The window span for an SWA layer, or `None` for a global layer.
+    /// This is the `Option<usize>` the attention block stores as
+    /// `window_size`, so a model can be built directly from a resolved
+    /// mode without a second match.
+    pub fn window(&self) -> Option<usize> {
+        match self {
+            AttentionMode::Global => None,
+            AttentionMode::SlidingWindow { window } => Some(*window),
+        }
+    }
+
+    /// Build an [`AttentionMode`] from a stored `window_size` field:
+    /// `None` ⇒ [`AttentionMode::Global`], `Some(w)` ⇒
+    /// [`AttentionMode::SlidingWindow`]. `Some(0)` is treated as Global
+    /// (a zero-width window is meaningless).
+    pub fn from_window(window: Option<usize>) -> Self {
+        match window {
+            Some(w) if w > 0 => AttentionMode::SlidingWindow { window: w },
+            _ => AttentionMode::Global,
+        }
     }
 }
 
@@ -339,6 +501,12 @@ impl TensorNaming {
             Architecture::Mixtral => {
                 format!("{}model.layers.{l}.block_sparse_moe.gate.weight", self.prefix)
             }
+            // GPT-OSS names its router `mlp.router` rather than `mlp.gate`.
+            Architecture::GptOss => {
+                format!("{}model.layers.{l}.mlp.router.weight", self.prefix)
+            }
+            // Qwen3-MoE, DeepSeek-V3 and MiMo-V2 all place the router at
+            // `mlp.gate`.
             _ => format!("{}model.layers.{l}.mlp.gate.weight", self.prefix),
         }
     }
@@ -477,7 +645,8 @@ impl std::fmt::Display for ArchitectureError {
                 f,
                 "unsupported model architecture (model_type={model_type:?}, \
                  architectures={architectures:?}); supported model_types are \
-                 mixtral, qwen3, qwen3_moe, deepseek_v3, mistral3, phi3"
+                 mixtral, qwen3, qwen3_moe, deepseek_v3, mistral3, phi3, \
+                 mimo_v2, gpt_oss"
             ),
             Self::MissingField(name) => {
                 write!(f, "config.json is missing required field `{name}`")
@@ -554,6 +723,14 @@ pub struct HfConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub sliding_window: Option<usize>,
+    /// Hybrid-attention interleave ratio: number of consecutive
+    /// Sliding-Window-Attention layers between each Global layer (e.g. `5`
+    /// for MiMo-V2's 5:1 SWA:global pattern, `1` for GPT-OSS's alternating
+    /// pattern). `None` ⇒ uniform attention (all Global, or all SWA when
+    /// `sliding_window` is set, as for Mixtral). Parsed from the config
+    /// when present; otherwise the architecture's intrinsic ratio
+    /// ([`Architecture::swa_global_ratio`]) is used at resolve time.
+    pub swa_global_ratio: Option<usize>,
     // -- MoE --
     /// Number of routed experts (`num_local_experts` / `num_experts` /
     /// `n_routed_experts` depending on family).
@@ -673,6 +850,26 @@ impl HfConfig {
         let head_dim = get("head_dim").and_then(as_usize);
         let sliding_window = get("sliding_window").and_then(as_usize);
 
+        // Hybrid-attention interleave ratio. Spellings vary by family, so
+        // we accept a few:
+        //   * `swa_global_ratio` — direct value (number of SWA layers per
+        //     global layer).
+        //   * `sliding_window_pattern` — HF convention where every P-th
+        //     layer is global, i.e. `P - 1` SWA layers per global one. A
+        //     pattern of 1 maps to ratio 0 (every layer global) and is
+        //     preserved; `checked_sub` drops only the nonsensical `P = 0`.
+        // When absent, the architecture's intrinsic ratio is applied at
+        // resolve time (see `Architecture::attention_mode`), so MiMo-V2 /
+        // GPT-OSS still get the correct pattern from a config that only
+        // carries `sliding_window`.
+        let swa_global_ratio = get("swa_global_ratio")
+            .and_then(as_usize)
+            .or_else(|| {
+                get("sliding_window_pattern")
+                    .and_then(as_usize)
+                    .and_then(|p| p.checked_sub(1))
+            });
+
         // Routed-expert count spelling differs per family.
         let num_routed_experts = get("num_local_experts")
             .and_then(as_usize)
@@ -697,6 +894,7 @@ impl HfConfig {
             rms_norm_eps,
             rope_theta,
             sliding_window,
+            swa_global_ratio,
             num_routed_experts,
             num_experts_per_tok: get("num_experts_per_tok").and_then(as_usize),
             num_shared_experts: get("n_shared_experts").and_then(as_usize),
@@ -1019,5 +1217,191 @@ mod tests {
         }"#;
         let err = HfConfig::from_json_str(json).unwrap_err();
         assert!(matches!(err, ArchitectureError::UnknownArchitecture { .. }));
+    }
+
+    // -- MiMo-V2 / GPT-OSS registration + hybrid attention ----------------
+
+    #[test]
+    fn mimo_v2_model_type_maps() {
+        assert_eq!(Architecture::from_model_type("mimo_v2"), Some(Architecture::MiMoV2));
+        assert_eq!(
+            Architecture::from_hf_architecture("MiMoV2ForCausalLM"),
+            Some(Architecture::MiMoV2)
+        );
+        // Round-trip through the canonical string.
+        assert_eq!(Architecture::MiMoV2.model_type(), "mimo_v2");
+        assert!(Architecture::MiMoV2.is_moe());
+        // MiMo-V2 does not use QK-Norm.
+        assert!(!Architecture::MiMoV2.uses_qk_norm());
+        assert_eq!(Architecture::MiMoV2.compute_support(), ComputeSupport::Supported);
+        // Tensor naming follows the Qwen3-MoE / DeepSeek convention.
+        let n = TensorNaming::new(Architecture::MiMoV2, 0);
+        assert_eq!(n.moe_gate(2), "model.layers.2.mlp.gate.weight");
+        assert_eq!(n.expert_gate(5, 9), "model.layers.5.mlp.experts.9.gate_proj.weight");
+    }
+
+    #[test]
+    fn gpt_oss_model_type_maps() {
+        assert_eq!(Architecture::from_model_type("gpt_oss"), Some(Architecture::GptOss));
+        assert_eq!(
+            Architecture::from_hf_architecture("GptOssForCausalLM"),
+            Some(Architecture::GptOss)
+        );
+        assert_eq!(Architecture::GptOss.model_type(), "gpt_oss");
+        assert!(Architecture::GptOss.is_moe());
+        assert_eq!(Architecture::GptOss.compute_support(), ComputeSupport::Supported);
+        // GPT-OSS routes through `mlp.router`, not `mlp.gate`.
+        let n = TensorNaming::new(Architecture::GptOss, 0);
+        assert_eq!(n.moe_gate(3), "model.layers.3.mlp.router.weight");
+    }
+
+    #[test]
+    fn mimo_v2_attention_mode_pattern() {
+        // 36-layer MiMo-V2: 5:1 SWA:global. Global at 5, 11, 17, 23, 29, 35;
+        // every other layer is SWA with a 128-token window.
+        let arch = Architecture::MiMoV2;
+        let window = Some(128);
+        for l in 0..36 {
+            let mode = arch.attention_mode(l, window, None);
+            if (l + 1) % 6 == 0 {
+                assert_eq!(mode, AttentionMode::Global, "layer {l} should be global");
+            } else {
+                assert_eq!(
+                    mode,
+                    AttentionMode::SlidingWindow { window: 128 },
+                    "layer {l} should be SWA"
+                );
+            }
+        }
+        // Spot-check the boundaries the gist calls out.
+        assert_eq!(arch.attention_mode(0, window, None), AttentionMode::SlidingWindow { window: 128 });
+        assert_eq!(arch.attention_mode(4, window, None), AttentionMode::SlidingWindow { window: 128 });
+        assert_eq!(arch.attention_mode(5, window, None), AttentionMode::Global);
+        assert_eq!(arch.attention_mode(6, window, None), AttentionMode::SlidingWindow { window: 128 });
+        assert_eq!(arch.attention_mode(11, window, None), AttentionMode::Global);
+    }
+
+    #[test]
+    fn gpt_oss_attention_mode_alternating() {
+        // GPT-OSS alternates 1:1 — even layers SWA (banded 128), odd layers
+        // global.
+        let arch = Architecture::GptOss;
+        let window = Some(128);
+        for l in 0..24 {
+            let mode = arch.attention_mode(l, window, None);
+            if l % 2 == 0 {
+                assert_eq!(
+                    mode,
+                    AttentionMode::SlidingWindow { window: 128 },
+                    "even layer {l} should be SWA"
+                );
+            } else {
+                assert_eq!(mode, AttentionMode::Global, "odd layer {l} should be global");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_config_ratio_overrides_intrinsic() {
+        // An explicit `swa_global_ratio` from config.json wins over the
+        // architecture's intrinsic ratio.
+        let arch = Architecture::GptOss; // intrinsic ratio 1
+        let window = Some(128);
+        // Force a 2:1 pattern: global only at layers 2, 5, 8, …
+        assert_eq!(arch.attention_mode(0, window, Some(2)), AttentionMode::SlidingWindow { window: 128 });
+        assert_eq!(arch.attention_mode(1, window, Some(2)), AttentionMode::SlidingWindow { window: 128 });
+        assert_eq!(arch.attention_mode(2, window, Some(2)), AttentionMode::Global);
+    }
+
+    #[test]
+    fn uniform_attention_modes_for_legacy_families() {
+        // No window ⇒ every layer is Global (Qwen3-MoE, DeepSeek-V3, …).
+        for l in 0..8 {
+            assert_eq!(Architecture::Qwen3Moe.attention_mode(l, None, None), AttentionMode::Global);
+            assert_eq!(Architecture::DeepSeekV3.attention_mode(l, None, None), AttentionMode::Global);
+        }
+        // Mixtral's uniform sliding window applies to every layer.
+        for l in 0..8 {
+            assert_eq!(
+                Architecture::Mixtral.attention_mode(l, Some(4096), None),
+                AttentionMode::SlidingWindow { window: 4096 }
+            );
+        }
+    }
+
+    #[test]
+    fn attention_mode_window_roundtrip() {
+        assert_eq!(AttentionMode::Global.window(), None);
+        assert_eq!(AttentionMode::SlidingWindow { window: 128 }.window(), Some(128));
+        assert_eq!(AttentionMode::from_window(None), AttentionMode::Global);
+        assert_eq!(AttentionMode::from_window(Some(0)), AttentionMode::Global);
+        assert_eq!(
+            AttentionMode::from_window(Some(64)),
+            AttentionMode::SlidingWindow { window: 64 }
+        );
+    }
+
+    #[test]
+    fn read_gpt_oss_config_parses_window_and_ratio() {
+        // Minimal GPT-OSS-style config: `sliding_window_pattern: 2` means
+        // every 2nd layer is global ⇒ ratio 1 (alternating).
+        let json = r#"{
+            "architectures": ["GptOssForCausalLM"],
+            "model_type": "gpt_oss",
+            "hidden_size": 2880,
+            "intermediate_size": 2880,
+            "moe_intermediate_size": 2880,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "head_dim": 64,
+            "vocab_size": 201088,
+            "rope_theta": 150000.0,
+            "sliding_window": 128,
+            "sliding_window_pattern": 2,
+            "num_local_experts": 32,
+            "num_experts_per_tok": 4
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.architecture, Architecture::GptOss);
+        assert_eq!(cfg.sliding_window, Some(128));
+        assert_eq!(cfg.swa_global_ratio, Some(1));
+        assert_eq!(cfg.num_routed_experts, Some(32));
+        assert_eq!(cfg.num_experts_per_tok, Some(4));
+    }
+
+    #[test]
+    fn read_mimo_v2_config_uses_intrinsic_ratio() {
+        // A MiMo-V2 config that only carries `sliding_window` still yields
+        // the 5:1 pattern via the architecture's intrinsic ratio.
+        let json = r#"{
+            "architectures": ["MiMoV2ForCausalLM"],
+            "model_type": "mimo_v2",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "moe_intermediate_size": 1536,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 151936,
+            "rope_theta": 1000000.0,
+            "sliding_window": 128,
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "num_nextn_predict_layers": 1
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.architecture, Architecture::MiMoV2);
+        assert_eq!(cfg.sliding_window, Some(128));
+        // No explicit ratio in the config ⇒ falls back to intrinsic 5.
+        assert_eq!(cfg.swa_global_ratio, None);
+        assert_eq!(
+            cfg.architecture.attention_mode(5, cfg.sliding_window, cfg.swa_global_ratio),
+            AttentionMode::Global
+        );
+        assert_eq!(
+            cfg.architecture.attention_mode(0, cfg.sliding_window, cfg.swa_global_ratio),
+            AttentionMode::SlidingWindow { window: 128 }
+        );
     }
 }

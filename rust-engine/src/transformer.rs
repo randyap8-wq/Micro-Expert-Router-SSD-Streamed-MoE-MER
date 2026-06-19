@@ -39,6 +39,7 @@ use crate::expert_cache::ExpertResident;
 use crate::inference::{forward_candle_tensors, ExpertWeights, HiddenState};
 use candle_core::{Device, Tensor};
 use half::f16;
+use std::collections::VecDeque;
 
 /// RMSNorm: `y = x * rsqrt(mean(x^2) + eps) * weight`.
 ///
@@ -272,9 +273,17 @@ pub struct KvCache {
     /// worth of `kv_dim` floats laid out as `[token_in_block, kv_dim]`
     /// row-major. The last block may be partially filled (the unused
     /// tail is never read because `seq_len` bounds every iteration).
-    keys_blocks: Vec<Box<[f32]>>,
+    keys_blocks: VecDeque<Box<[f32]>>,
     /// Mirrors `keys_blocks` for the value half of the cache.
-    values_blocks: Vec<Box<[f32]>>,
+    values_blocks: VecDeque<Box<[f32]>>,
+    /// Number of leading paged blocks that have been physically dropped by
+    /// [`Self::evict_before`] (sliding-window KV eviction). Absolute
+    /// positions keep counting from 0 via `seq_len`, but the block table is
+    /// indexed *relative* to this offset: logical block `b` lives at
+    /// physical index `b - evicted_blocks`. `0` for caches that are never
+    /// evicted (every non-SWA layer), preserving the original byte-for-byte
+    /// indexing.
+    evicted_blocks: usize,
     pub seq_len: usize,
     pub kv_dim: usize,
 }
@@ -290,8 +299,9 @@ pub const PAGED_BLOCK_TOKENS: usize = 16;
 impl KvCache {
     pub fn new(kv_dim: usize) -> Self {
         Self {
-            keys_blocks: Vec::new(),
-            values_blocks: Vec::new(),
+            keys_blocks: VecDeque::new(),
+            values_blocks: VecDeque::new(),
+            evicted_blocks: 0,
             seq_len: 0,
             kv_dim,
         }
@@ -305,14 +315,17 @@ impl KvCache {
         let in_block = pos % PAGED_BLOCK_TOKENS;
         // Allocate a fresh block when crossing a block boundary. This
         // is the *only* allocation point in the per-token path — the
-        // existing block bytes are written in place.
+        // existing block bytes are written in place. The block table is
+        // indexed relative to `evicted_blocks` (leading blocks dropped by
+        // SWA eviction), so the freshly-pushed block lands at physical
+        // index `block_idx - evicted_blocks`.
         if in_block == 0 {
-            debug_assert_eq!(self.keys_blocks.len(), block_idx);
+            debug_assert_eq!(self.keys_blocks.len(), block_idx - self.evicted_blocks);
             let block_floats = PAGED_BLOCK_TOKENS * self.kv_dim;
             self.keys_blocks
-                .push(vec![0.0f32; block_floats].into_boxed_slice());
+                .push_back(vec![0.0f32; block_floats].into_boxed_slice());
             self.values_blocks
-                .push(vec![0.0f32; block_floats].into_boxed_slice());
+                .push_back(vec![0.0f32; block_floats].into_boxed_slice());
         }
         let start = in_block * self.kv_dim;
         let end = start + self.kv_dim;
@@ -320,11 +333,11 @@ impl KvCache {
         // write directly into its in-place slot.
         let kb = self
             .keys_blocks
-            .last_mut()
+            .back_mut()
             .expect("block must exist after append");
         let vb = self
             .values_blocks
-            .last_mut()
+            .back_mut()
             .expect("block must exist after append");
         kb[start..end].copy_from_slice(k);
         vb[start..end].copy_from_slice(v);
@@ -334,6 +347,7 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.keys_blocks.clear();
         self.values_blocks.clear();
+        self.evicted_blocks = 0;
         self.seq_len = 0;
     }
 
@@ -351,20 +365,79 @@ impl KvCache {
     /// is dropped immediately afterwards is, in principle, eligible
     /// for dead-store elimination.
     pub fn zeroize(&mut self) {
-        zeroize_blocks(&mut self.keys_blocks);
-        zeroize_blocks(&mut self.values_blocks);
+        zeroize_blocks(self.keys_blocks.iter_mut());
+        zeroize_blocks(self.values_blocks.iter_mut());
         self.reset();
     }
 
     /// Number of allocated blocks. Useful for telemetry — matches
-    /// the vLLM `block_tables` length.
+    /// the vLLM `block_tables` length. After SWA eviction this reflects
+    /// only the *resident* blocks (it shrinks as old blocks are dropped),
+    /// which is exactly what makes a sliding-window cache bounded.
     pub fn num_blocks(&self) -> usize {
         self.keys_blocks.len()
     }
 
+    /// Evict KV entries for absolute positions strictly older than `pos`.
+    ///
+    /// Only whole leading paged blocks that lie *entirely* below `pos` are
+    /// dropped (a partially-in-window block is retained), so the surviving
+    /// absolute positions keep their exact K/V bytes and the attention math
+    /// is unchanged for any position the model can still attend to. This is
+    /// the memory-efficiency half of sliding-window attention: for a layer
+    /// in [`crate::architecture::AttentionMode::SlidingWindow`], positions
+    /// outside the window are never read again, so retaining them is dead
+    /// weight. The decode loop calls
+    /// `kv.evict_before(pos.saturating_sub(window))` after each step on SWA
+    /// layers, keeping the cache at `O(window)` instead of `O(seq_len)`.
+    ///
+    /// No-op for `pos == 0` and for global-attention layers (which never
+    /// call this), preserving the original full-history behaviour.
+pub fn evict_before(&mut self, pos: usize) {
+    let pos = pos.min(self.seq_len);
+    // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
+    // absolute positions `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully
+    // below `pos` iff `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`.
+    // So the number of logical blocks entirely below `pos` is
+    // `pos / BLOCK`.
+    let target_evicted = pos / PAGED_BLOCK_TOKENS;
+    if target_evicted <= self.evicted_blocks {
+        return;
+    }
+        let blocks_to_drop = target_evicted - self.evicted_blocks;
+        // Never drop more than what is physically resident (defensive;
+        // `blocks_to_drop` is bounded by the resident block count in practice).
+        let blocks_to_drop = blocks_to_drop.min(self.keys_blocks.len());
+        if blocks_to_drop == 0 {
+            return;
+        }
+        // Zeroize the dropped blocks before releasing them so a tenant's
+        // attention state cannot survive in a freed heap region (mirrors
+        // `zeroize`), then remove them from the front of the block table.
+        zeroize_blocks(self.keys_blocks.iter_mut().take(blocks_to_drop));
+        zeroize_blocks(self.values_blocks.iter_mut().take(blocks_to_drop));
+        for _ in 0..blocks_to_drop {
+            self.keys_blocks.pop_front();
+            self.values_blocks.pop_front();
+        }
+        self.evicted_blocks += blocks_to_drop;
+    }
+
     /// Get the i-th cached key as a slice of length `kv_dim`.
+    ///
+    /// Caller invariant: `i` must not refer to a position that has already
+    /// been evicted by [`Self::evict_before`] — i.e. its block index must be
+    /// `>= self.evicted_blocks`. Standard attention upholds this because its
+    /// `t_start` never drops below `pos - window`, which is exactly the
+    /// floor `evict_before` preserves; MLA never evicts at all.
     fn key(&self, i: usize) -> &[f32] {
-        let block_idx = i / PAGED_BLOCK_TOKENS;
+        let abs_block = i / PAGED_BLOCK_TOKENS;
+        debug_assert!(
+            abs_block >= self.evicted_blocks,
+            "KvCache::key({i}) reads an evicted block ({abs_block} < {})",
+            self.evicted_blocks
+        );
+        let block_idx = abs_block - self.evicted_blocks;
         let in_block = i % PAGED_BLOCK_TOKENS;
         let start = in_block * self.kv_dim;
         &self.keys_blocks[block_idx][start..start + self.kv_dim]
@@ -383,7 +456,13 @@ impl KvCache {
     }
 
     fn value(&self, i: usize) -> &[f32] {
-        let block_idx = i / PAGED_BLOCK_TOKENS;
+        let abs_block = i / PAGED_BLOCK_TOKENS;
+        debug_assert!(
+            abs_block >= self.evicted_blocks,
+            "KvCache::value({i}) reads an evicted block ({abs_block} < {})",
+            self.evicted_blocks
+        );
+        let block_idx = abs_block - self.evicted_blocks;
         let in_block = i % PAGED_BLOCK_TOKENS;
         let start = in_block * self.kv_dim;
         &self.values_blocks[block_idx][start..start + self.kv_dim]
@@ -396,8 +475,11 @@ impl KvCache {
 /// `compiler_fence` prevents the writes from being reordered past
 /// the eventual deallocation of the backing buffers.
 #[inline(never)]
-fn zeroize_blocks(blocks: &mut [Box<[f32]>]) {
-    for block in blocks.iter_mut() {
+fn zeroize_blocks<'a, I>(blocks: I)
+where
+    I: IntoIterator<Item = &'a mut Box<[f32]>>,
+{
+    for block in blocks {
         let ptr = block.as_mut_ptr();
         let len = block.len();
         // Safety: `block` is a `Box<[f32]>` (boxed slice) of length
@@ -436,13 +518,20 @@ pub struct MultiHeadSelfAttention {
     pub wk: Vec<f32>,
     pub wv: Vec<f32>,
     pub wo: Vec<f32>,
-    /// Sliding-window attention span (Mixtral default = 4096). When
-    /// `Some(w)`, each query position `pos` only attends to KV positions
-    /// in `[pos.saturating_sub(w - 1) ..= pos]`. The KV cache itself
-    /// still stores all positions (that's required for correctness as
-    /// the window slides forward); only the attention sum is restricted.
-    /// `None` recovers full causal attention (backward compatible
+    /// Sliding-window attention span. When `Some(w)`, each query position
+    /// `pos` only attends to KV positions in `[pos.saturating_sub(w - 1) ..=
+    /// pos]`; `None` recovers full causal attention (the backward-compatible
     /// default used by every existing test).
+    ///
+    /// This is the storage form of the per-layer
+    /// [`crate::architecture::AttentionMode`]: `None` ⇔ `Global`, `Some(w)`
+    /// ⇔ `SlidingWindow { window: w }` (see [`Self::attention_mode`]).
+    /// Hybrid models (MiMo-V2 5:1, GPT-OSS 1:1) set this **per layer** at
+    /// construction time so SWA and Global layers coexist in one model;
+    /// uniform-SWA models (Mixtral) set the same `Some(4096)` on every
+    /// layer. The KV cache still stores all appended positions, but the
+    /// decode loop additionally evicts out-of-window entries on SWA layers
+    /// (see [`KvCache::evict_before`]) to keep memory `O(window)`.
     pub window_size: Option<usize>,
     /// Optional per-head RMSNorm applied to **Q** before RoPE (Qwen3 /
     /// Qwen3-MoE "QK-Norm"). The weight vector has length `head_dim` and
@@ -468,6 +557,14 @@ impl MultiHeadSelfAttention {
 
     pub fn kv_dim(&self) -> usize {
         self.num_kv_heads * self.head_dim
+    }
+
+    /// This layer's per-layer [`AttentionMode`], derived from
+    /// `window_size`. `None` ⇒ [`AttentionMode::Global`], `Some(w)` ⇒
+    /// [`AttentionMode::SlidingWindow`]. Used by the decode loop to decide
+    /// whether to evict out-of-window KV entries.
+    pub fn attention_mode(&self) -> crate::architecture::AttentionMode {
+        crate::architecture::AttentionMode::from_window(self.window_size)
     }
 
     /// Apply the optional per-head Q RMSNorm (QK-Norm) in place. No-op when
@@ -522,9 +619,18 @@ impl MultiHeadSelfAttention {
             let mut attn_out = vec![0.0f32; q_dim];
             let scale   = 1.0 / (self.head_dim as f32).sqrt();
             let t_max   = kv.seq_len;
-            let t_start = match self.window_size {
-                Some(w) if w > 0 => t_max.saturating_sub(w),
-                _ => 0,
+            // Per-layer attention mode: Global attends to all past
+            // positions; SlidingWindow restricts the sum to the last
+            // `window` positions. Equivalent to the previous match on
+            // `window_size`, now expressed via `AttentionMode` so hybrid
+            // models (MiMo-V2, GPT-OSS) share one code path with the
+            // uniform-window (Mixtral) and full-causal (everything else)
+            // cases.
+            let t_start = match self.attention_mode() {
+                crate::architecture::AttentionMode::SlidingWindow { window } => {
+                    t_max.saturating_sub(window)
+                }
+                crate::architecture::AttentionMode::Global => 0,
             };
 
             for h in 0..self.num_heads {
@@ -1830,6 +1936,84 @@ mod tests {
         kv.reset();
         assert_eq!(kv.seq_len, 0);
         assert_eq!(kv.num_blocks(), 0);
+    }
+
+    #[test]
+    fn swa_kv_eviction_bounds() {
+        // evict_before drops whole leading blocks below the window, keeping
+        // a sliding-window cache bounded at O(window) instead of O(seq_len)
+        // while leaving every still-attendable position byte-for-byte intact.
+        let kv_dim = 4;
+        let window = 2 * PAGED_BLOCK_TOKENS; // 32-token window
+        let mut kv = KvCache::new(kv_dim);
+        // Distinct K/V per position so we can verify survivors exactly.
+        let tok = |p: usize| (vec![p as f32; kv_dim], vec![(p as f32) + 0.5; kv_dim]);
+        let total = 10 * PAGED_BLOCK_TOKENS; // 160 tokens, far past the window
+        for p in 0..total {
+            let (k, v) = tok(p);
+            kv.append(&k, &v);
+            // Mirror the decode loop: evict positions older than the window.
+            kv.evict_before(p.saturating_sub(window));
+        }
+        assert_eq!(kv.seq_len, total);
+        // Bounded: never more than window/BLOCK + a small constant of slack.
+        let max_blocks = window / PAGED_BLOCK_TOKENS + 2;
+        assert!(
+            kv.num_blocks() <= max_blocks,
+            "cache not bounded: {} blocks (max {})",
+            kv.num_blocks(),
+            max_blocks
+        );
+        // The most recent `window` positions must still round-trip exactly.
+        for p in (total - window)..total {
+            let (k, v) = tok(p);
+            assert_eq!(kv.key(p), &k[..], "evicted a still-windowed key at {p}");
+            assert_eq!(kv.value(p), &v[..], "evicted a still-windowed value at {p}");
+        }
+    }
+
+    #[test]
+    fn evict_before_is_noop_at_zero_and_for_small_pos() {
+        // No eviction can happen until at least one whole block is below
+        // `pos`, so small `pos` (and pos == 0) leave the cache untouched.
+        let mut kv = KvCache::new(4);
+        for p in 0..(PAGED_BLOCK_TOKENS + 5) {
+            kv.append(&[p as f32; 4], &[p as f32; 4]);
+        }
+        let before = kv.num_blocks();
+        kv.evict_before(0);
+        kv.evict_before(PAGED_BLOCK_TOKENS - 1); // still within block 0
+        assert_eq!(kv.num_blocks(), before);
+        assert_eq!(kv.key(0), &[0.0; 4][..]);
+    }
+
+    #[test]
+    fn swa_attention_correct_after_eviction() {
+        // End-to-end: a windowed attention block fed through eviction must
+        // produce the same output as one that retained the full history,
+        // because eviction only drops positions outside the window.
+        let window = PAGED_BLOCK_TOKENS + 3;
+        let attn = make_window_attn(Some(window));
+        let mut kv_evict = KvCache::new(attn.kv_dim());
+        let mut kv_keep = KvCache::new(attn.kv_dim());
+        let total = 3 * PAGED_BLOCK_TOKENS;
+        let mut last_evict = vec![];
+        let mut last_keep = vec![];
+        for p in 0..total {
+            // Arbitrary but deterministic per-position input: the first
+            // element varies with the position (mod 5) so successive tokens
+            // differ, the rest are fixed; exact values are immaterial — the
+            // test only asserts evict and keep paths agree bit-for-bit.
+            let x = vec![((p % 5) as f32) * 0.3, 0.1, -0.2, 0.05];
+            last_evict = attn.forward(&x, p, 0, &mut kv_evict, &cpu_backend());
+            kv_evict.evict_before(p.saturating_sub(window));
+            last_keep = attn.forward(&x, p, 0, &mut kv_keep, &cpu_backend());
+        }
+        for (a, b) in last_evict.iter().zip(last_keep.iter()) {
+            assert!((a - b).abs() < 1e-5, "eviction changed output: {a} vs {b}");
+        }
+        // The evicting cache stayed bounded; the keeping one grew unbounded.
+        assert!(kv_evict.num_blocks() < kv_keep.num_blocks());
     }
 
     #[test]
