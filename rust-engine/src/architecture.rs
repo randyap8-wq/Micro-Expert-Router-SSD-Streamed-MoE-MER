@@ -909,10 +909,16 @@ impl HfConfig {
         // ratio formula at resolve time (see `Architecture::attention_mode`).
         let hybrid_layer_pattern = get("hybrid_layer_pattern")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|e| e.as_u64().map(|n| n as u8))
-                    .collect::<Vec<u8>>()
+            .and_then(|arr| {
+                let mut out = Vec::with_capacity(arr.len());
+                for e in arr {
+                    let n = e.as_u64()?;
+                    if n > u8::MAX as u64 {
+                        return None;
+                    }
+                    out.push(n as u8);
+                }
+                Some(out)
             });
 
         // Separate RoPE base for SWA layers (MiMo-V2-Flash `swa_rope_theta`).
