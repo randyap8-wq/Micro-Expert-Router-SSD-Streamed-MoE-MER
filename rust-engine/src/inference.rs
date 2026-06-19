@@ -785,15 +785,6 @@ pub const fn expert_weight_bytes_f16(d_model: usize, d_ff: usize) -> usize {
     expert_weight_count(d_model, d_ff).saturating_mul(2)
 }
 
-/// Number of bytes an expert with these dimensions occupies on disk
-/// for the given dtype, **including** any per-expert header (e.g. the
-/// 12-byte INT8 scale header).
-///
-/// For [`WeightDtype::Q4K`] the weight count is rounded **up** to a
-/// multiple of [`Q4K_BLOCK_ELEMS`] (256) — Q4K only quantises whole
-/// super-blocks, so a tail of < 256 weights still pays for one full
-/// 144-byte block on disk. This matches the behaviour of every
-/// production GGUF quantiser.
 /// Number of on-disk bytes for one MXFP4 projection of shape
 /// `[rows, cols]`: the packed E2M1 weight bytes (`rows * ceil(cols/2)`,
 /// each row begins on a byte boundary) immediately followed by the E8M0
@@ -805,6 +796,15 @@ pub const fn mxfp4_projection_bytes(rows: usize, cols: usize) -> usize {
     weight_bytes.saturating_add(scale_bytes)
 }
 
+/// Number of bytes an expert with these dimensions occupies on disk
+/// for the given dtype, **including** any per-expert header (e.g. the
+/// 12-byte INT8 scale header).
+///
+/// For [`WeightDtype::Q4K`] the weight count is rounded **up** to a
+/// multiple of [`Q4K_BLOCK_ELEMS`] (256) — Q4K only quantises whole
+/// super-blocks, so a tail of < 256 weights still pays for one full
+/// 144-byte block on disk. This matches the behaviour of every
+/// production GGUF quantiser.
 #[inline]
 pub const fn expert_weight_bytes_for(d_model: usize, d_ff: usize, dtype: WeightDtype) -> usize {
     match dtype {
@@ -1674,7 +1674,6 @@ impl OwnedExpertWeights {
             col_indices: None,
         })
     }
-
 
     /// Build an owned weight set by dequantising a per-tensor symmetric
     /// **INT8** byte buffer into a fresh `Vec<f32>`. The buffer layout
@@ -2947,7 +2946,6 @@ mod tests {
         assert_eq!(WeightDtype::BF16.bytes_per_weight(), 2);
         assert_eq!(WeightDtype::MXFP4.bytes_per_weight(), 1);
     }
-
 
     #[test]
     fn f16_bytes_helper_is_half_of_f32() {
