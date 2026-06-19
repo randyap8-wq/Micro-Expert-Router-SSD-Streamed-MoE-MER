@@ -778,7 +778,7 @@ impl RealModel {
                         );
                         return None;
                     }
-                    return Some(decode_safetensor_to_f32(&view));
+                    return Some(decode_safetensor_to_f32(&view, name));
                 }
             }
             None
@@ -796,7 +796,7 @@ impl RealModel {
                 for st in &parsed {
                     if let Ok(view) = st.tensor(name) {
                         if view.dtype() != Dtype::F8_E4M3 {
-                            return Some(decode_safetensor_to_f32(&view));
+                            return Some(decode_safetensor_to_f32(&view, name));
                         }
                         let shape = view.shape();
                         if shape.len() != 2 {
@@ -807,7 +807,7 @@ impl RealModel {
                         let mut scale_inv = None;
                         for s in &parsed {
                             if let Ok(sv) = s.tensor(&scale_name) {
-                                scale_inv = Some(decode_safetensor_to_f32(&sv));
+                                scale_inv = Some(decode_safetensor_to_f32(&sv, &scale_name));
                                 break;
                             }
                         }
@@ -840,61 +840,175 @@ impl RealModel {
                 if let Ok(view) = st.tensor(name) {
                     let shape = view.shape();
                     let n_elem: usize = shape.iter().product();
-                    if n_elem != expected {
-                        warn!(
-                            tensor = name,
-                            have = n_elem,
-                            need = expected,
-                            "safetensors shape mismatch; falling back to seeded init"
-                        );
-                        return None;
-                    }
-                    if view.dtype() != Dtype::F8_E4M3 {
-                        return Some(decode_safetensor_to_f32(&view));
-                    }
-                    // FP8 block-wise quantised 2D weight. DeepSeek stores a
-                    // companion `<name>_scale_inv` of reciprocal block
-                    // scales ([ceil(rows/128), ceil(cols/128)] f32).
-                    if shape.len() != 2 {
-                        warn!(
-                            tensor = name,
-                            "FP8 weight is not 2D; cannot block-dequantise"
-                        );
-                        return None;
-                    }
-                    let (rows, cols) = (shape[0], shape[1]);
-                    let scale_name = format!("{name}_scale_inv");
-                    let scale_inv = (|| {
-                        for s in &parsed {
-                            if let Ok(sv) = s.tensor(&scale_name) {
-                                return Some(decode_safetensor_to_f32(&sv));
+                    match view.dtype() {
+                        // U8 carries either OCP MXFP4 packed weights
+                        // (GPT-OSS `*_blocks`: two E2M1 nibbles per byte,
+                        // so `n_elem == expected / 2`) or some unrelated
+                        // metadata tensor (e.g. attention-sink scales)
+                        // that happens to share a name prefix.
+                        Dtype::U8 => {
+if shape.len() == 2
+    && shape[0] != 0
+    && expected % shape[0] == 0
+    && shape[1] == (expected / shape[0]).div_ceil(2)
+{
+    let rows = shape[0];
+    let cols = expected / rows;
+                                    warn!(
+                                        tensor = name,
+                                        "MXFP4 packed shape inconsistent with expected; falling back"
+                                    );
+                                    return None;
+                                }
+                                let Some(scales) = find_mxfp4_scales(&parsed, name, rows, cols)
+                                else {
+                                    warn!(
+                                        tensor = name,
+                                        "MXFP4 weight missing companion block scales; falling back to seeded init"
+                                    );
+                                    return None;
+                                };
+                                let out = crate::dequant::dequant_mxfp4(
+                                    view.data(),
+                                    &scales,
+                                    rows,
+                                    cols,
+                                );
+                                if out.is_empty() {
+                                    warn!(
+                                        tensor = name,
+                                        "MXFP4 dequant failed (shape mismatch); falling back to seeded init"
+                                    );
+                                    return None;
+                                }
+                                return Some(out);
                             }
+                            // Same element count as a real weight but raw
+                            // U8: not a format we model. Skip quietly so it
+                            // falls back to seeded init without log spam.
+                            debug!(
+                                tensor = name,
+                                n_elem,
+                                "skipping non-weight U8 safetensors tensor"
+                            );
+                            return None;
                         }
-                        None
-                    })();
-                    let Some(scale_inv) = scale_inv else {
-                        warn!(
-                            tensor = name,
-                            scale = %scale_name,
-                            "FP8 weight missing companion scale_inv; falling back to seeded init"
-                        );
-                        return None;
-                    };
-                    let out = crate::mla::dequant_fp8_e4m3_blockwise(
-                        view.data(),
-                        &scale_inv,
-                        rows,
-                        cols,
-                        FP8_BLOCK,
-                    );
-                    if out.is_empty() {
-                        warn!(
-                            tensor = name,
-                            "FP8 block-dequant failed (shape mismatch); falling back to seeded init"
-                        );
-                        return None;
+                        // Per-tensor INT8: decode (cast) then apply the
+                        // optional companion `<name>_scale` scalar.
+                        Dtype::I8 => {
+                            if n_elem != expected {
+                                warn!(
+                                    tensor = name,
+                                    have = n_elem,
+                                    need = expected,
+                                    "safetensors shape mismatch; falling back to seeded init"
+                                );
+                                return None;
+                            }
+                            let mut out = decode_safetensor_to_f32(&view, name);
+                            let scale_name = format!("{name}_scale");
+                            let scale = (|| {
+                                for s in &parsed {
+if let Ok(sv) = s.tensor(&scale_name) {
+    let v = decode_safetensor_to_f32(&sv, &scale_name);
+    if v.len() == 1 {
+        return Some(v[0]);
+    }
+    warn!(
+        tensor = name,
+        scale = %scale_name,
+        len = v.len(),
+        "INT8 companion scale tensor is not a scalar; ignoring"
+    );
+    return None;
+}
+                                }
+                                None
+                            })();
+                            match scale {
+                                Some(s) if s != 1.0 => {
+                                    for x in out.iter_mut() {
+                                        *x *= s;
+                                    }
+                                }
+                                None => {
+                                    warn!(
+                                        tensor = name,
+                                        scale = %scale_name,
+                                        "INT8 weight missing companion scale; using unit scale"
+                                    );
+                                }
+                                _ => {}
+                            }
+                            return Some(out);
+                        }
+                        Dtype::F8_E4M3 => {
+                            if n_elem != expected {
+                                warn!(
+                                    tensor = name,
+                                    have = n_elem,
+                                    need = expected,
+                                    "safetensors shape mismatch; falling back to seeded init"
+                                );
+                                return None;
+                            }
+                            // FP8 block-wise quantised 2D weight. DeepSeek
+                            // stores a companion `<name>_scale_inv` of
+                            // reciprocal block scales.
+                            if shape.len() != 2 {
+                                warn!(
+                                    tensor = name,
+                                    "FP8 weight is not 2D; cannot block-dequantise"
+                                );
+                                return None;
+                            }
+                            let (rows, cols) = (shape[0], shape[1]);
+                            let scale_name = format!("{name}_scale_inv");
+                            let scale_inv = (|| {
+                                for s in &parsed {
+                                    if let Ok(sv) = s.tensor(&scale_name) {
+                                        return Some(decode_safetensor_to_f32(&sv, &scale_name));
+                                    }
+                                }
+                                None
+                            })();
+                            let Some(scale_inv) = scale_inv else {
+                                warn!(
+                                    tensor = name,
+                                    scale = %scale_name,
+                                    "FP8 weight missing companion scale_inv; falling back to seeded init"
+                                );
+                                return None;
+                            };
+                            let out = crate::mla::dequant_fp8_e4m3_blockwise(
+                                view.data(),
+                                &scale_inv,
+                                rows,
+                                cols,
+                                FP8_BLOCK,
+                            );
+                            if out.is_empty() {
+                                warn!(
+                                    tensor = name,
+                                    "FP8 block-dequant failed (shape mismatch); falling back to seeded init"
+                                );
+                                return None;
+                            }
+                            return Some(out);
+                        }
+                        _ => {
+                            if n_elem != expected {
+                                warn!(
+                                    tensor = name,
+                                    have = n_elem,
+                                    need = expected,
+                                    "safetensors shape mismatch; falling back to seeded init"
+                                );
+                                return None;
+                            }
+                            return Some(decode_safetensor_to_f32(&view, name));
+                        }
                     }
-                    return Some(out);
                 }
             }
             None
@@ -1533,7 +1647,7 @@ fn load_mla_layer<F>(
 /// right place to apply. Unknown dtypes fall back to seeded init via
 /// the empty `Vec` — the caller's `expected` length check will reject
 /// it cleanly.
-fn decode_safetensor_to_f32(view: &safetensors::tensor::TensorView<'_>) -> Vec<f32> {
+fn decode_safetensor_to_f32(view: &safetensors::tensor::TensorView<'_>, name: &str) -> Vec<f32> {
     use safetensors::tensor::Dtype;
     let raw = view.data();
     match view.dtype() {
@@ -1549,14 +1663,66 @@ fn decode_safetensor_to_f32(view: &safetensors::tensor::TensorView<'_>) -> Vec<f
             .chunks_exact(2)
             .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
+        // Per-tensor INT8 (AWQ-style / older Mixtral quants). The
+        // safetensors tensor carries no scale, so we cast `i8 -> f32`
+        // here; any companion `<name>_scale` is applied by the caller
+        // (`find_f32_dequant`), mirroring the FP8 `_scale_inv` scan.
+        Dtype::I8 => raw.iter().map(|&b| b as i8 as f32).collect(),
+        // FP8 E5M2 (1-5-2, bias 15). Activation-oriented and carries no
+        // companion block scale in current models, so decode each byte
+        // standalone. (E4M3 weights still route through the block-wise
+        // path in `find_f32_dequant` / `find_f32_any`.)
+        Dtype::F8_E5M2 => crate::dequant::dequant_fp8_e5m2(raw),
         other => {
             warn!(
+                tensor = name,
                 dtype = ?other,
                 "unsupported safetensors dtype; falling back to seeded init"
             );
             Vec::new()
         }
     }
+}
+
+/// Locate the OCP MXFP4 block-scale tensor that accompanies a packed
+/// `*_blocks` weight and return its raw E8M0 bytes (one byte per 32-wide
+/// block). GPT-OSS names the scales `<base>_scales` next to a
+/// `<base>_blocks` weight, but we also probe the generic `<name>_scale`,
+/// `<name>_scales`, and `<name>.scale` spellings. The companion is only
+/// accepted when its element count equals `rows * ceil(cols / 32)`, the
+/// E8M0 grid implied by the weight shape.
+fn find_mxfp4_scales(
+    parsed: &[safetensors::SafeTensors],
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Option<Vec<u8>> {
+    let blocks_per_row = cols.div_ceil(crate::inference::MXFP4_SCALE_BLOCK);
+    let want = rows.saturating_mul(blocks_per_row);
+    let mut candidates = vec![
+        format!("{name}_scale"),
+        format!("{name}_scales"),
+        format!("{name}.scale"),
+    ];
+    if let Some(base) = name.strip_suffix("_blocks") {
+        candidates.push(format!("{base}_scales"));
+        candidates.push(format!("{base}_scale"));
+    }
+    for cand in &candidates {
+        for st in parsed {
+            if let Ok(view) = st.tensor(cand) {
+                let n_elem: usize = view.shape().iter().product();
+                let raw = view.data();
+                // E8M0 scales are one byte each. Accept a tensor whose
+                // byte length matches the implied block grid regardless
+                // of whether the loader reports it as U8.
+                if n_elem == want && raw.len() == want {
+                    return Some(raw.to_vec());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

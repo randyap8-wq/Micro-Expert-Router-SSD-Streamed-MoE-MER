@@ -20,7 +20,8 @@ use crate::expert_cache::{ExpertResident, GpuExpertCache, GpuResident};
 use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::gating::Router;
 use crate::inference::{
-    combine_outputs, run_inference_f16, run_inference_int8, run_inference_q4_0,
+    combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8, run_inference_mxfp4,
+    run_inference_q4_0,
     run_inference_q4_0_qmm, run_inference_q4k, run_inference_q4k_qmm,
     run_inference_q8_0, run_inference_q8_0_qmm, synth_hidden_state,
     uniform_scores, ExpertWeightsError, HiddenState,
@@ -1474,6 +1475,8 @@ fn dispatch_expert_forward(
             }
         }
         WeightDtype::Q8_0 => run_inference_q8_0(token_idx, r, x, d_model, d_ff),
+        WeightDtype::BF16 => run_inference_bf16(token_idx, r, x, d_model, d_ff),
+        WeightDtype::MXFP4 => run_inference_mxfp4(token_idx, r, x, d_model, d_ff),
     }
 }
 

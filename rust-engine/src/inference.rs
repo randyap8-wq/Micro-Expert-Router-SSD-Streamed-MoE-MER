@@ -139,6 +139,27 @@ pub enum WeightDtype {
     /// kernel.
     #[serde(alias = "Q8_0", alias = "q80", alias = "q8_0_gguf")]
     Q8_0,
+    /// Little-endian IEEE-754 `bfloat16` (`half::bf16`), 2 bytes per
+    /// weight, no header. Decodes to f32 exactly like [`Self::F16`] but
+    /// via `half::bf16::from_le_bytes`. BF16 is the native dense-body
+    /// dtype of most current open-weight checkpoints (GPT-OSS,
+    /// MiMo-V2-Flash, …); this variant lets MER also store expert `.bin`
+    /// blobs in BF16 rather than promoting them to F32 at load time.
+    #[serde(alias = "BF16", alias = "bf16", alias = "bfloat16")]
+    BF16,
+    /// **OCP Microscaling FP4 (MXFP4).** Each weight is a 4-bit E2M1
+    /// float packed two-per-byte (low nibble first), and every 32
+    /// consecutive elements share one E8M0 (power-of-two) block scale.
+    /// Effective density is 4.25 bits/weight — on par with `Q4_0` /
+    /// `Q4K`. This is the weight format of `openai/gpt-oss-20b` /
+    /// `gpt-oss-120b`. An expert `.bin` stores three projections
+    /// (gate || up || down) back to back; each projection is its packed
+    /// U8 weight bytes immediately followed by its U8 E8M0 scale bytes,
+    /// with no header and no padding. Exact sizing goes through
+    /// [`expert_weight_bytes_for`]; the dequant kernel is
+    /// [`crate::dequant::dequant_mxfp4`].
+    #[serde(alias = "MXFP4", alias = "mxfp4", alias = "mx_fp4")]
+    MXFP4,
 }
 
 impl WeightDtype {
@@ -163,6 +184,11 @@ impl WeightDtype {
             WeightDtype::Q4_0 => 1,
             // 34 / 32 rounded up = 2; not used for sizing — see docs.
             WeightDtype::Q8_0 => 2,
+            WeightDtype::BF16 => 2,
+            // ~4.25 bits/weight; sizing is done exactly via
+            // [`expert_weight_bytes_for`] — this rounded value is only a
+            // placeholder for callers that ignore the block layout.
+            WeightDtype::MXFP4 => 1,
         }
     }
 
@@ -179,7 +205,9 @@ impl WeightDtype {
             | WeightDtype::F16
             | WeightDtype::Q4K
             | WeightDtype::Q4_0
-            | WeightDtype::Q8_0 => 0,
+            | WeightDtype::Q8_0
+            | WeightDtype::BF16
+            | WeightDtype::MXFP4 => 0,
             WeightDtype::Int8 => INT8_HEADER_BYTES,
         }
     }
@@ -193,6 +221,8 @@ impl WeightDtype {
             "q4k" | "q4_k" | "q4_k_m" | "q4km" => Some(WeightDtype::Q4K),
             "q4_0" | "q40" | "q4" => Some(WeightDtype::Q4_0),
             "q8_0" | "q80" => Some(WeightDtype::Q8_0),
+            "bf16" | "bfloat16" => Some(WeightDtype::BF16),
+            "mxfp4" | "mx_fp4" => Some(WeightDtype::MXFP4),
             _ => None,
         }
     }
@@ -206,6 +236,8 @@ impl WeightDtype {
             WeightDtype::Q4K => "q4k",
             WeightDtype::Q4_0 => "q4_0",
             WeightDtype::Q8_0 => "q8_0",
+            WeightDtype::BF16 => "bf16",
+            WeightDtype::MXFP4 => "mxfp4",
         }
     }
 }
@@ -448,7 +480,9 @@ pub fn dequantize_q4k_to_f32(src: &[u8], n_weights: usize, dst: &mut Vec<f32>) {
 /// `QK4_0` / `ggml_tensor.block_size`. The design spec asks for
 /// "every 32 weights share an f16 scale", which is exactly Q4_0.
 pub const Q4_0_BLOCK_ELEMS: usize = 32;
-
+/// Number of MXFP4 (E2M1) weight elements that share one E8M0 block
+/// scale. Matches the OCP Microscaling spec used by GPT-OSS.
+pub const MXFP4_SCALE_BLOCK: usize = 32;
 /// Bytes per Q4_0 block on disk.
 ///
 /// Layout:
@@ -751,6 +785,17 @@ pub const fn expert_weight_bytes_f16(d_model: usize, d_ff: usize) -> usize {
     expert_weight_count(d_model, d_ff).saturating_mul(2)
 }
 
+/// Number of on-disk bytes for one MXFP4 projection of shape
+/// `[rows, cols]`: the packed E2M1 weight bytes (`rows * ceil(cols/2)`,
+/// each row begins on a byte boundary) immediately followed by the E8M0
+/// block scales (`rows * ceil(cols/32)`).
+#[inline]
+pub const fn mxfp4_projection_bytes(rows: usize, cols: usize) -> usize {
+    let weight_bytes = rows.saturating_mul(cols.div_ceil(2));
+    let scale_bytes = rows.saturating_mul(cols.div_ceil(MXFP4_SCALE_BLOCK));
+    weight_bytes.saturating_add(scale_bytes)
+}
+
 /// Number of bytes an expert with these dimensions occupies on disk
 /// for the given dtype, **including** any per-expert header (e.g. the
 /// 12-byte INT8 scale header).
@@ -786,6 +831,18 @@ pub const fn expert_weight_bytes_for(d_model: usize, d_ff: usize, dtype: WeightD
             let one_blocks = one.div_ceil(Q8_0_BLOCK_ELEMS);
             let total_blocks = one_blocks.saturating_mul(3);
             total_blocks.saturating_mul(Q8_0_BLOCK_BYTES)
+        }
+        WeightDtype::MXFP4 => {
+            // Three projections (gate, up, down) stored back to back.
+            // Each projection is its packed U8 weight bytes (two E2M1
+            // elements per byte, one byte holds cols-parity-aligned
+            // nibbles so each row is `ceil(cols/2)` bytes) immediately
+            // followed by its U8 E8M0 block scales (`ceil(cols/32)` per
+            // row). No header, no padding between projections.
+            let gate = mxfp4_projection_bytes(d_ff, d_model);
+            let up = mxfp4_projection_bytes(d_ff, d_model);
+            let down = mxfp4_projection_bytes(d_model, d_ff);
+            gate.saturating_add(up).saturating_add(down)
         }
         _ => {
             let payload = expert_weight_count(d_model, d_ff)
@@ -1524,6 +1581,120 @@ impl OwnedExpertWeights {
         })
     }
 
+    /// Build an owned weight set by dequantising a little-endian `bf16`
+    /// byte buffer into a fresh `Vec<f32>`. Identical in layout to
+    /// [`Self::from_bytes_f16`] (2 bytes/weight, no header) but decodes
+    /// each pair through `half::bf16::from_le_bytes`.
+    pub fn from_bytes_bf16(
+        bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        let need_floats = expert_weight_count(d_model, d_ff);
+        let need_bytes = need_floats.saturating_mul(2);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
+        let floats: Vec<f32> = bytes[..need_bytes]
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        let view = ExpertWeights::from_floats(&floats, d_model, d_ff)?;
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate: view.gate.to_vec(),
+            up: view.up.to_vec(),
+            down: view.down.to_vec(),
+            col_indices: None,
+        })
+    }
+
+    /// Build an owned weight set by dequantising an **MXFP4** expert
+    /// blob into a fresh `Vec<f32>`. The blob holds three projections
+    /// (gate, up, down) back to back; each projection is its packed U8
+    /// E2M1 weight bytes immediately followed by its U8 E8M0 block
+    /// scales, with no header and no padding (see
+    /// [`expert_weight_bytes_for`] for the exact byte accounting and
+    /// [`crate::dequant::dequant_mxfp4`] for the kernel).
+    ///
+    /// Projection shapes mirror the f32 layout: `gate`/`up` are
+    /// `[d_ff × d_model]` and `down` is `[d_model × d_ff]`.
+    pub fn from_bytes_mxfp4(
+        bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        let need_bytes = expert_weight_bytes_for(d_model, d_ff, WeightDtype::MXFP4);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
+
+        // Decode one [rows × cols] projection starting at `off`, returning
+        // the dequantised f32 matrix and the new offset.
+let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, usize), ExpertWeightsError> {
+    let weight_bytes = rows.saturating_mul(cols.div_ceil(2));
+    let scale_bytes = rows.saturating_mul(cols.div_ceil(MXFP4_SCALE_BLOCK));
+    let w_end = off.checked_add(weight_bytes).ok_or(ExpertWeightsError::BufferTooSmall {
+        have: bytes.len(),
+        need: need_bytes,
+        d_model,
+        d_ff,
+    })?;
+    let s_end = w_end.checked_add(scale_bytes).ok_or(ExpertWeightsError::BufferTooSmall {
+        have: bytes.len(),
+        need: need_bytes,
+        d_model,
+        d_ff,
+    })?;
+    let packed = bytes.get(off..w_end).ok_or(ExpertWeightsError::BufferTooSmall {
+        have: bytes.len(),
+        need: need_bytes,
+        d_model,
+        d_ff,
+    })?;
+    let scales = bytes.get(w_end..s_end).ok_or(ExpertWeightsError::BufferTooSmall {
+        have: bytes.len(),
+        need: need_bytes,
+        d_model,
+        d_ff,
+    })?;
+    let out = crate::dequant::dequant_mxfp4(packed, scales, rows, cols);
+    if out.len() != rows.saturating_mul(cols) {
+        return Err(ExpertWeightsError::BufferTooSmall {
+            have: bytes.len(),
+            need: need_bytes,
+            d_model,
+            d_ff,
+        });
+    }
+    Ok((out, s_end))
+};
+
+        let (gate, off) = decode_proj(0, d_ff, d_model)?;
+        let (up, off) = decode_proj(off, d_ff, d_model)?;
+        let (down, _off) = decode_proj(off, d_model, d_ff)?;
+
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate,
+            up,
+            down,
+            col_indices: None,
+        })
+    }
+
     /// Build an owned weight set by dequantising a per-tensor symmetric
     /// **INT8** byte buffer into a fresh `Vec<f32>`. The buffer layout
     /// is: 12-byte [`Int8ExpertMeta`] header (`[gate, up, down]: [f32; 3]`
@@ -1663,8 +1834,16 @@ impl OwnedExpertWeights {
                 dequantize_f16_to_f32(&bytes[..packed_floats * 2], &mut v);
                 v
             }
-            WeightDtype::Int8 | WeightDtype::Q4K | WeightDtype::Q4_0 | WeightDtype::Q8_0 => {
-                // Partial-load + INT8 / Q4K / Q4_0 / Q8_0 isn't
+            WeightDtype::BF16 => bytes[..packed_floats * 2]
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            WeightDtype::Int8
+            | WeightDtype::Q4K
+            | WeightDtype::Q4_0
+            | WeightDtype::Q8_0
+            | WeightDtype::MXFP4 => {
+                // Partial-load + INT8 / Q4K / Q4_0 / Q8_0 / MXFP4 isn't
                 // supported (the partial-load packing is column-major
                 // and the block / per-tensor scales are not
                 // per-column, so the dequant rounding would shift).
@@ -1991,6 +2170,42 @@ pub fn run_inference_q8_0(
     d_ff: usize,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     let weights = OwnedExpertWeights::from_bytes_q8_0(resident.data(), d_model, d_ff)?;
+    let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+/// BF16 counterpart of [`run_inference`]: dequantises the resident
+/// `bf16` bytes into an owned `Vec<f32>` (via
+/// [`OwnedExpertWeights::from_bytes_bf16`]) and runs the same SwiGLU
+/// forward pass. Used when the on-disk dtype is [`WeightDtype::BF16`].
+pub fn run_inference_bf16(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = OwnedExpertWeights::from_bytes_bf16(resident.data(), d_model, d_ff)?;
+    let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+/// MXFP4 counterpart of [`run_inference`]: dequantises the resident
+/// MXFP4 expert blob (packed E2M1 weights + E8M0 block scales, three
+/// projections back to back) into an owned `Vec<f32>` (via
+/// [`OwnedExpertWeights::from_bytes_mxfp4`]) and runs the same SwiGLU
+/// forward pass. Used when the on-disk dtype is [`WeightDtype::MXFP4`]
+/// — the GPT-OSS native 4.25-bit weight format.
+pub fn run_inference_mxfp4(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = OwnedExpertWeights::from_bytes_mxfp4(resident.data(), d_model, d_ff)?;
     let y = weights.forward(x);
     let out = summarise_output(token_idx, resident.id, &y);
     Ok((out, y))
@@ -2647,6 +2862,109 @@ mod tests {
                 "f16 forward diverged from f32: {a} vs {b}"
             );
         }
+    }
+
+    #[test]
+    fn from_bytes_bf16_round_trips() {
+        // bf16 path must produce a finite output of the right shape and
+        // agree with the f32 forward on the same fill value to within
+        // bf16 quantisation noise (bf16 keeps the f32 exponent but only
+        // 7 mantissa bits, so tolerance is looser than f16).
+        let d_model = 16;
+        let d_ff = 32;
+        let fill = 0.05_f32;
+
+        let n = expert_weight_count(d_model, d_ff);
+        let bf = half::bf16::from_f32(fill);
+        let mut bf16_bytes = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            bf16_bytes.extend_from_slice(&bf.to_bits().to_le_bytes());
+        }
+        let weights = OwnedExpertWeights::from_bytes_bf16(&bf16_bytes, d_model, d_ff).unwrap();
+        let x = synth_hidden_state(7, d_model, 1234);
+        let y = weights.forward(&x);
+        assert_eq!(y.len(), d_model);
+        assert!(y.iter().all(|v| v.is_finite()));
+
+        let f32_buf = make_weights_buffer(d_model, d_ff, fill);
+        let w32 = ExpertWeights::from_bytes(f32_buf.as_slice(), d_model, d_ff).unwrap();
+        let y32 = w32.forward(&x);
+        for (a, b) in y.iter().zip(y32.iter()) {
+            assert!(
+                (a - b).abs() < 5e-2,
+                "bf16 forward diverged from f32: {a} vs {b}"
+            );
+        }
+
+        // Too-small buffers are rejected, not silently truncated.
+        assert!(OwnedExpertWeights::from_bytes_bf16(&bf16_bytes[..2], d_model, d_ff).is_err());
+    }
+
+    #[test]
+    fn from_bytes_mxfp4_round_trips() {
+        // Build a synthetic MXFP4 expert blob (three projections, each
+        // packed E2M1 weights + E8M0 unit scales) and confirm it
+        // dequantises to exactly the canonical E2M1 magnitudes.
+        let d_model = 16;
+        let d_ff = 32;
+        let total = expert_weight_bytes_for(d_model, d_ff, WeightDtype::MXFP4);
+        let mut blob = vec![0u8; total];
+
+        // Fill weight regions with a repeating nibble pattern and scale
+        // regions with E8M0 byte 127 (== 2^0). Walk the three
+        // projections in order: gate/up [d_ff x d_model], down
+        // [d_model x d_ff].
+        let mut off = 0usize;
+        for &(rows, cols) in &[(d_ff, d_model), (d_ff, d_model), (d_model, d_ff)] {
+            let wbytes = rows * cols.div_ceil(2);
+            for (i, b) in blob[off..off + wbytes].iter_mut().enumerate() {
+                // low nibble = i%8, high nibble = (i+1)%8 -> non-negative
+                // E2M1 magnitudes, so the forward stays finite.
+                let lo = (i % 8) as u8;
+                let hi = ((i + 1) % 8) as u8;
+                *b = lo | (hi << 4);
+            }
+            off += wbytes;
+            let sbytes = rows * cols.div_ceil(MXFP4_SCALE_BLOCK);
+            for b in blob[off..off + sbytes].iter_mut() {
+                *b = 127; // 2^0
+            }
+            off += sbytes;
+        }
+        assert_eq!(off, total);
+
+        let weights = OwnedExpertWeights::from_bytes_mxfp4(&blob, d_model, d_ff).unwrap();
+        assert_eq!(weights.gate.len(), d_ff * d_model);
+        assert_eq!(weights.up.len(), d_ff * d_model);
+        assert_eq!(weights.down.len(), d_model * d_ff);
+
+        // Unit scale => every decoded weight is a canonical E2M1 value.
+        let table = crate::dequant::MXFP4_E2M1_TABLE;
+        for (i, &w) in weights.gate.iter().enumerate() {
+            let j = i / 2;
+            let nib = if i % 2 == 0 { j % 8 } else { (j + 1) % 8 };
+            assert_eq!(w, table[nib], "gate[{i}]");
+        }
+
+        let x = synth_hidden_state(3, d_model, 99);
+        let y = weights.forward(&x);
+        assert_eq!(y.len(), d_model);
+        assert!(y.iter().all(|v| v.is_finite()));
+
+        // Short buffers must error rather than panic.
+        assert!(OwnedExpertWeights::from_bytes_mxfp4(&blob[..total - 1], d_model, d_ff).is_err());
+    }
+
+    #[test]
+    fn bf16_mxfp4_dtypes_round_trip_through_str() {
+        assert_eq!(WeightDtype::from_str_opt("bf16"), Some(WeightDtype::BF16));
+        assert_eq!(WeightDtype::from_str_opt("BFloat16"), Some(WeightDtype::BF16));
+        assert_eq!(WeightDtype::from_str_opt("mxfp4"), Some(WeightDtype::MXFP4));
+        assert_eq!(WeightDtype::from_str_opt("MX_FP4"), Some(WeightDtype::MXFP4));
+        assert_eq!(WeightDtype::BF16.as_str(), "bf16");
+        assert_eq!(WeightDtype::MXFP4.as_str(), "mxfp4");
+        assert_eq!(WeightDtype::BF16.bytes_per_weight(), 2);
+        assert_eq!(WeightDtype::MXFP4.bytes_per_weight(), 1);
     }
 
     #[test]

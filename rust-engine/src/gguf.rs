@@ -74,6 +74,8 @@ pub mod ggml_dtype {
     pub const Q5_K: u32 = 13;
     pub const Q6_K: u32 = 14;
     pub const Q8_K: u32 = 15;
+    /// GGML BF16 dtype code (added in later llama.cpp releases).
+    pub const BF16: u32 = 32;
 }
 
 /// A metadata value. Arrays are flattened into typed `Vec`s for the
@@ -292,6 +294,7 @@ pub fn ggml_to_weight_dtype(code: u32) -> Option<WeightDtype> {
     match code {
         ggml_dtype::F32 => Some(WeightDtype::F32),
         ggml_dtype::F16 => Some(WeightDtype::F16),
+        ggml_dtype::BF16 => Some(WeightDtype::BF16),
         ggml_dtype::Q4_0 => Some(WeightDtype::Q4_0),
         ggml_dtype::Q4_K => Some(WeightDtype::Q4K),
         ggml_dtype::Q8_0 => Some(WeightDtype::Q8_0),
@@ -307,6 +310,7 @@ fn ggml_tensor_bytes(code: u32, shape: &[u64]) -> Option<u64> {
     let bytes = match code {
         ggml_dtype::F32 => elems.checked_mul(4)?,
         ggml_dtype::F16 => elems.checked_mul(2)?,
+        ggml_dtype::BF16 => elems.checked_mul(2)?,
         ggml_dtype::Q4_0 => {
             // 32-element blocks of 18 bytes each.
             let blocks = elems.div_ceil(Q4_0_BLOCK_ELEMS as u64);
