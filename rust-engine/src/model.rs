@@ -847,10 +847,13 @@ impl RealModel {
                         // metadata tensor (e.g. attention-sink scales)
                         // that happens to share a name prefix.
                         Dtype::U8 => {
-                            if shape.len() == 2 && expected % 2 == 0 && n_elem == expected / 2 {
-                                let rows = shape[0];
-                                let cols = shape[1] * 2;
-                                if rows.saturating_mul(cols) != expected {
+if shape.len() == 2
+    && shape[0] != 0
+    && expected % shape[0] == 0
+    && shape[1] == (expected / shape[0]).div_ceil(2)
+{
+    let rows = shape[0];
+    let cols = expected / rows;
                                     warn!(
                                         tensor = name,
                                         "MXFP4 packed shape inconsistent with expected; falling back"
