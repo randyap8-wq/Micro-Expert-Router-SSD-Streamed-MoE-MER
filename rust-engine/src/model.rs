@@ -909,10 +909,19 @@ if shape.len() == 2
                             let scale_name = format!("{name}_scale");
                             let scale = (|| {
                                 for s in &parsed {
-                                    if let Ok(sv) = s.tensor(&scale_name) {
-                                        let v = decode_safetensor_to_f32(&sv, &scale_name);
-                                        return v.first().copied();
-                                    }
+if let Ok(sv) = s.tensor(&scale_name) {
+    let v = decode_safetensor_to_f32(&sv, &scale_name);
+    if v.len() == 1 {
+        return Some(v[0]);
+    }
+    warn!(
+        tensor = name,
+        scale = %scale_name,
+        len = v.len(),
+        "INT8 companion scale tensor is not a scalar; ignoring"
+    );
+    return None;
+}
                                 }
                                 None
                             })();
