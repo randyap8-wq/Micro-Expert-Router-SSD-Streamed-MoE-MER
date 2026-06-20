@@ -939,8 +939,22 @@ impl RealModel {
             for name in names {
                 for st in &parsed {
                     if let Ok(view) = st.tensor(name) {
-                        if view.dtype() != Dtype::F8_E4M3 || is_fp8_ignored(name) {
+                        if view.dtype() != Dtype::F8_E4M3 {
                             return Some(decode_safetensor_to_f32(&view, name));
+                        }
+                        if is_fp8_ignored(name) {
+                            let raw = view.data();
+                            // `ignored_layers` are stored as BF16. Some checkpoints still tag
+                            // them as FP8 in metadata; detect BF16 payload by byte width.
+                            if raw.len() % 2 == 0 {
+                                return Some(
+                                    raw.chunks_exact(2)
+                                        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                                        .collect(),
+                                );
+                            }
+                            warn!(tensor = name, "FP8-ignored tensor did not look like BF16 payload");
+                            return None;
                         }
                         let shape = view.shape();
                         if shape.len() != 2 {
