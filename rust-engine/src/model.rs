@@ -287,6 +287,22 @@ impl RealModelConfig {
                 adv.routed_scaling_factor
             ));
         }
+        if let Some(f) = adv.partial_rotary_factor {
+            if !f.is_finite() || f <= 0.0 || f > 1.0 {
+                return Err(format!(
+                    "partial_rotary_factor ({}) must be a finite number in (0, 1]",
+                    f
+                ));
+            }
+        }
+        if let Some(v) = adv.v_head_dim {
+            if v == 0 || v > self.head_dim {
+                return Err(format!(
+                    "v_head_dim ({}) must be in 1..=head_dim ({})",
+                    v, self.head_dim
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -462,7 +478,7 @@ impl RealModel {
                     .advanced
                     .rope_scaling
                     .as_ref()
-                    .and_then(|s| YarnRope::from_scaling(config.head_dim, layer_rope_base, s));
+                    .and_then(|s| YarnRope::from_scaling(rope_dim, layer_rope_base, s));
                 TransformerLayer {
                 rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 attn: MultiHeadSelfAttention {

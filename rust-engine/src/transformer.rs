@@ -702,6 +702,7 @@ impl MultiHeadSelfAttention {
 
         debug_assert_eq!(x.len(), self.d_model);
         debug_assert_eq!(kv.kv_dim, self.kv_dim());
+        debug_assert_eq!(kv.v_dim, self.v_proj_dim());
 
         let q_dim  = self.q_dim();
         let kv_dim = self.kv_dim();
