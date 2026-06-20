@@ -501,6 +501,32 @@ pub fn swiglu_f32_into(
     }
 }
 
+/// SwiGLU dispatcher with an optional gate clamp (GPT-OSS `swiglu_limit`).
+///
+/// When `swiglu_limit` is `None` this is byte-for-byte
+/// [`swiglu_f32_into`] (AVX-512 → scalar). When `Some(limit)` — the
+/// GPT-OSS clamp path — it routes to the scalar
+/// [`scalar::swiglu_f32_clamped`] reference, which applies
+/// `g.clamp(-limit, limit)` before the sigmoid. The clamp path is only
+/// taken by GPT-OSS checkpoints, so correctness is favoured over the
+/// AVX-512 fast path there; every other architecture keeps the unclamped
+/// auto-escalating kernel.
+#[inline]
+pub fn swiglu_f32_into_clamped(
+    gate_w: &[f32],
+    up_w: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    y: &mut [f32],
+    swiglu_limit: Option<f32>,
+) {
+    match swiglu_limit {
+        None => swiglu_f32_into(gate_w, up_w, x, rows, cols, y),
+        Some(_) => scalar::swiglu_f32_clamped(gate_w, up_w, x, rows, cols, y, swiglu_limit),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

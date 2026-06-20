@@ -89,6 +89,13 @@ pub struct AdvancedConfig {
     /// FP8 block-quantisation tile size (`weight_block_size`). Drives the
     /// block edge used by the FP8 dequantiser; `None` ⇒ the default 128.
     pub fp8_block_size: Option<[usize; 2]>,
+    /// GPT-OSS gate activation clamp (`swiglu_limit`). When `Some(limit)`,
+    /// the SwiGLU gate is clamped to `[-limit, limit]` before the sigmoid.
+    /// `None` (every other architecture) means no clamping.
+    pub swiglu_limit: Option<f32>,
+    /// Whether the attention Q/K/V/O projections carry additive biases
+    /// (`attention_bias`, GPT-OSS). `false` for every other architecture.
+    pub attention_bias: bool,
 }
 
 impl Default for AdvancedConfig {
@@ -112,6 +119,8 @@ impl Default for AdvancedConfig {
             hybrid_layer_pattern: None,
             swa_rope_theta: None,
             fp8_block_size: None,
+            swiglu_limit: None,
+            attention_bias: false,
         }
     }
 }
@@ -294,6 +303,8 @@ impl RealModelConfig {
             hybrid_layer_pattern: hf.hybrid_layer_pattern.clone(),
             swa_rope_theta: hf.swa_rope_theta,
             fp8_block_size: hf.fp8_block_size,
+            swiglu_limit: hf.swiglu_limit,
+            attention_bias: hf.attention_bias,
         };
         Self {
             d_model: hf.hidden_size,
@@ -418,6 +429,13 @@ impl RealModel {
                     q_norm,
                     k_norm,
                     rope_yarn,
+                    // Attention projection biases (GPT-OSS `attention_bias`)
+                    // are seeded absent; the on-disk loader populates them
+                    // when the checkpoint sets `attention_bias = true`.
+                    bq: None,
+                    bk: None,
+                    bv: None,
+                    bo: None,
                 },
                 mla,
                 rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
@@ -1149,6 +1167,28 @@ if let Ok(sv) = s.tensor(&scale_name) {
                 });
                 maybe!(&naming.attn_k_norm(l), config.head_dim, |v| {
                     model.layers[l].attn.k_norm = Some(RmsNorm::new(v, config.rms_eps));
+                });
+            }
+
+            // Attention projection biases (GPT-OSS `attention_bias = true`):
+            // learnable additive terms on Q/K/V/O. Only loaded when the
+            // checkpoint declares them; every other family leaves these
+            // `None` (seeded in `new_seeded`). Missing tensors are tolerated
+            // via `maybe!`, so a config that sets `attention_bias` but ships
+            // no bias tensors degrades to the bias-free path rather than
+            // failing the whole load.
+            if config.advanced.attention_bias {
+                maybe!(&naming.q_proj_bias(l), q_dim, |v| {
+                    model.layers[l].attn.bq = Some(v);
+                });
+                maybe!(&naming.k_proj_bias(l), kv_dim, |v| {
+                    model.layers[l].attn.bk = Some(v);
+                });
+                maybe!(&naming.v_proj_bias(l), kv_dim, |v| {
+                    model.layers[l].attn.bv = Some(v);
+                });
+                maybe!(&naming.o_proj_bias(l), d_model, |v| {
+                    model.layers[l].attn.bo = Some(v);
                 });
             }
 

@@ -461,6 +461,30 @@ impl TensorNaming {
         format!("{}model.layers.{l}.self_attn.k_norm.weight", self.prefix)
     }
 
+    // -- Attention projection biases (GPT-OSS `attention_bias = true`) ----
+    // Only emitted/loaded when the config sets `attention_bias`; every
+    // other family leaves the Q/K/V/O projections bias-free.
+
+    /// Q-projection bias, length `num_heads * head_dim`.
+    pub fn q_proj_bias(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.q_proj.bias", self.prefix)
+    }
+
+    /// K-projection bias, length `num_kv_heads * head_dim`.
+    pub fn k_proj_bias(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.k_proj.bias", self.prefix)
+    }
+
+    /// V-projection bias, length `num_kv_heads * head_dim`.
+    pub fn v_proj_bias(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.v_proj.bias", self.prefix)
+    }
+
+    /// Output-projection bias, length `d_model`.
+    pub fn o_proj_bias(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.o_proj.bias", self.prefix)
+    }
+
     // -- MLA projections (DeepSeek-V3 latent attention) ------------------
     //
     // DeepSeek-V3 replaces the dense q/k/v/o projections with a
@@ -787,6 +811,16 @@ pub struct HfConfig {
     /// e.g. `[128, 128]`). Drives the block edge used by
     /// [`crate::mla::dequant_fp8_e4m3_blockwise`]; `None` ⇒ the default 128.
     pub fp8_block_size: Option<[usize; 2]>,
+    /// GPT-OSS gate activation clamp (`swiglu_limit`, e.g. `7.0`). When
+    /// `Some(limit)`, the SwiGLU gate value `g` is clamped to
+    /// `[-limit, limit]` before the sigmoid (`silu(g.clamp(±limit)) * u`),
+    /// matching the official GPT-OSS reference. `None` (every other
+    /// architecture) means no clamping.
+    pub swiglu_limit: Option<f32>,
+    /// Whether the attention Q/K/V/O projections carry additive bias terms
+    /// (`attention_bias`, GPT-OSS sets `true`). `false` (every other
+    /// architecture) means the biases are absent and never loaded.
+    pub attention_bias: bool,
 }
 
 fn as_usize(v: &serde_json::Value) -> Option<usize> {
@@ -919,10 +953,34 @@ impl HfConfig {
                     out.push(n as u8);
                 }
                 Some(out)
+            })
+            // GPT-OSS encodes the same per-layer pattern as a `layer_types`
+            // string array (`"full_attention"` = global, `"sliding_attention"`
+            // = SWA) instead of the MiMo-V2 integer `hybrid_layer_pattern`.
+            // Parse it into the identical `0 = global, non-zero = SWA` u8
+            // encoding so both families feed the one downstream lookup. Only
+            // consulted when the integer pattern is absent.
+            .or_else(|| {
+                get("layer_types")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| {
+                        let out: Option<Vec<u8>> = arr
+                            .iter()
+                            .map(|e| e.as_str().map(|s| if s == "full_attention" { 0u8 } else { 1u8 }))
+                            .collect();
+                        out.filter(|v| v.len() == num_hidden_layers)
+                    })
             });
 
         // Separate RoPE base for SWA layers (MiMo-V2-Flash `swa_rope_theta`).
         let swa_rope_theta = get("swa_rope_theta").and_then(as_f32);
+
+        // GPT-OSS gate activation clamp (`swiglu_limit`); `None` elsewhere.
+        let swiglu_limit = get("swiglu_limit").and_then(as_f32);
+
+        // GPT-OSS learnable Q/K/V/O projection biases (`attention_bias`).
+        let attention_bias =
+            get("attention_bias").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // FP8 block-quantisation tile size from `quantization_config`.
         let fp8_block_size: Option<[usize; 2]> = get("quantization_config")
@@ -980,6 +1038,8 @@ impl HfConfig {
             hybrid_layer_pattern,
             swa_rope_theta,
             fp8_block_size,
+            swiglu_limit,
+            attention_bias,
         })
     }
 
@@ -1550,5 +1610,108 @@ mod tests {
             cfg.architecture.attention_mode(6, cfg.sliding_window, cfg.swa_global_ratio, Some(pat.as_slice())),
             AttentionMode::Global
         );
+    }
+
+    #[test]
+    fn gpt_oss_layer_types_parsed_as_hybrid_pattern() {
+        let json = r#"{
+            "architectures": ["GptOssForCausalLM"],
+            "model_type": "gpt_oss",
+            "hidden_size": 2880, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "vocab_size": 201088,
+            "layer_types": ["sliding_attention","full_attention",
+                             "sliding_attention","full_attention"],
+            "sliding_window": 128
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        // layer_types → pattern [1, 0, 1, 0]
+        let pat = cfg.hybrid_layer_pattern.as_deref().unwrap();
+        assert_eq!(pat, &[1u8, 0, 1, 0]);
+        // Verify attention_mode resolves correctly from the pattern.
+        let w = cfg.sliding_window;
+        assert_eq!(
+            cfg.architecture.attention_mode(0, w, cfg.swa_global_ratio, Some(pat)),
+            AttentionMode::SlidingWindow { window: 128 }
+        );
+        assert_eq!(
+            cfg.architecture.attention_mode(1, w, cfg.swa_global_ratio, Some(pat)),
+            AttentionMode::Global
+        );
+    }
+
+    #[test]
+    fn gpt_oss_explicit_integer_pattern_wins_over_layer_types() {
+        // When both an integer `hybrid_layer_pattern` and a string
+        // `layer_types` are present, the integer pattern is authoritative.
+        let json = r#"{
+            "architectures": ["GptOssForCausalLM"],
+            "model_type": "gpt_oss",
+            "hidden_size": 2880, "num_hidden_layers": 2,
+            "num_attention_heads": 64, "vocab_size": 201088,
+            "hybrid_layer_pattern": [0, 0],
+            "layer_types": ["sliding_attention", "sliding_attention"]
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.hybrid_layer_pattern.as_deref(), Some(&[0u8, 0][..]));
+    }
+
+    #[test]
+    fn gpt_oss_swiglu_limit_parsed() {
+        let json = r#"{
+            "architectures": ["GptOssForCausalLM"],
+            "model_type": "gpt_oss",
+            "hidden_size": 2880, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "vocab_size": 201088,
+            "swiglu_limit": 7.0
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.swiglu_limit, Some(7.0));
+    }
+
+    #[test]
+    fn swiglu_limit_none_by_default() {
+        let json = r#"{
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
+            "hidden_size": 4096, "num_hidden_layers": 32,
+            "num_attention_heads": 32, "vocab_size": 32000
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.swiglu_limit, None);
+    }
+
+    #[test]
+    fn attention_bias_parsed_from_config() {
+        let json = r#"{
+            "architectures": ["GptOssForCausalLM"],
+            "model_type": "gpt_oss",
+            "hidden_size": 2880, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "vocab_size": 201088,
+            "attention_bias": true
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert!(cfg.attention_bias);
+    }
+
+    #[test]
+    fn attention_bias_false_by_default() {
+        // All existing architectures should have attention_bias = false.
+        let json = r#"{
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
+            "hidden_size": 4096, "num_hidden_layers": 32,
+            "num_attention_heads": 32, "vocab_size": 32000
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert!(!cfg.attention_bias);
+    }
+
+    #[test]
+    fn attention_bias_tensor_names_match_safetensors_convention() {
+        let naming = TensorNaming::new(Architecture::Mixtral, 0);
+        assert_eq!(naming.q_proj_bias(3), "model.layers.3.self_attn.q_proj.bias");
+        assert_eq!(naming.k_proj_bias(3), "model.layers.3.self_attn.k_proj.bias");
+        assert_eq!(naming.v_proj_bias(3), "model.layers.3.self_attn.v_proj.bias");
+        assert_eq!(naming.o_proj_bias(3), "model.layers.3.self_attn.o_proj.bias");
     }
 }
