@@ -909,11 +909,23 @@ impl RealModel {
         // `quantization_config.ignored_layers` (all `self_attn.o_proj`) are
         // stored as BF16, not FP8. The block-dequant closures below must
         // decode them via the standard path rather than misinterpreting the
-        // bytes as E4M3. `contains` (not exact match) tolerates shard
-        // prefixes in the safetensors tensor names.
+        // bytes as E4M3. Each entry is a module path (e.g.
+        // `model.layers.0.self_attn.o_proj`); the safetensors tensor names
+        // append a suffix (`.weight`, `.bias`, `_scale_inv`) and may carry a
+        // shard prefix. We therefore match the entry as a substring but
+        // require a separator (`.`/`_`) or end-of-string boundary after it,
+        // so a path like `...o_proj` never matches `...o_projection`.
         let fp8_ignored = config.advanced.fp8_ignored_layers.clone();
         let is_fp8_ignored = move |name: &str| -> bool {
-            fp8_ignored.iter().any(|ignored| name.contains(ignored.as_str()))
+            fp8_ignored.iter().any(|ignored| {
+                let ignored = ignored.as_str();
+                name.match_indices(ignored).any(|(idx, _)| {
+                    let after = &name[idx + ignored.len()..];
+                    after.is_empty()
+                        || after.starts_with('.')
+                        || after.starts_with('_')
+                })
+            })
         };
 
         // Closure: search every shard for the first matching `name` and
