@@ -1085,7 +1085,16 @@ if let Ok(sv) = s.tensor(&scale_name) {
                             // stored as BF16 even though tagged here; decode
                             // via the standard path, never block-dequant.
                             if is_fp8_ignored(name) {
-                                return Some(decode_safetensor_to_f32(&view, name));
+                                let raw = view.data();
+                                if raw.len() % 2 == 0 {
+                                    return Some(
+                                        raw.chunks_exact(2)
+                                            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                                            .collect(),
+                                    );
+                                }
+                                warn!(tensor = name, "FP8-ignored tensor did not look like BF16 payload; falling back to seeded init");
+                                return None;
                             }
                             if n_elem != expected {
                                 warn!(
