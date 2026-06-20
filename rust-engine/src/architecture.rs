@@ -485,6 +485,19 @@ impl TensorNaming {
         format!("{}model.layers.{l}.self_attn.o_proj.bias", self.prefix)
     }
 
+    /// Per-head attention sink bias (MiMo-V2-Flash
+    /// `add_swa_attention_sink_bias`), length `num_attention_heads`. Added to
+    /// the logit of position 0 (the sink token) before softmax on SWA layers.
+    ///
+    /// TODO: verify the exact tensor name against the
+    /// `XiaomiMiMo/MiMo-V2-Flash` `model.safetensors.index.json` — the sandbox
+    /// has no network access to confirm it. The application path (CPU softmax)
+    /// is fully implemented and activates as soon as a tensor with this name
+    /// is present in the checkpoint.
+    pub fn attn_sink_bias(&self, l: usize) -> String {
+        format!("{}model.layers.{l}.self_attn.attention_sink_bias", self.prefix)
+    }
+
     // -- MLA projections (DeepSeek-V3 latent attention) ------------------
     //
     // DeepSeek-V3 replaces the dense q/k/v/o projections with a
@@ -757,6 +770,12 @@ pub struct HfConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    /// Separate KV-head count for Sliding-Window-Attention layers
+    /// (`swa_num_key_value_heads`). MiMo-V2-Flash uses 8 KV heads on SWA
+    /// layers but 4 on global layers (`num_key_value_heads`), while keeping
+    /// the same `num_attention_heads` (64) for both. `None` (every other
+    /// architecture) ⇒ every layer uses `num_key_value_heads`.
+    pub swa_num_key_value_heads: Option<usize>,
     /// Explicit per-head dim (`head_dim`), if the config specifies one
     /// (Qwen3 does; it need not equal `hidden_size / num_heads`).
     pub head_dim: Option<usize>,
@@ -837,6 +856,16 @@ pub struct HfConfig {
     /// so the loader must not run E4M3 dequant on them. Empty for every
     /// architecture without an FP8 `ignored_layers` list.
     pub fp8_ignored_layers: Vec<String>,
+    /// Whether SWA layers add a learnable per-head attention sink bias to the
+    /// logit of the first (sink) token before softmax
+    /// (`add_swa_attention_sink_bias`, MiMo-V2-Flash sets `true`). `false`
+    /// (every other architecture) ⇒ no sink bias is loaded or applied.
+    pub add_swa_attention_sink_bias: bool,
+    /// Whether global (full-attention) layers add the same per-head sink bias
+    /// (`add_full_attention_sink_bias`). MiMo-V2-Flash sets `false`; parsed
+    /// for completeness so the flag round-trips even though only the SWA
+    /// variant is currently applied.
+    pub add_full_attention_sink_bias: bool,
 }
 
 fn as_usize(v: &serde_json::Value) -> Option<usize> {
@@ -1009,6 +1038,20 @@ impl HfConfig {
         // MiMo-V2-Flash post-attention output scale (`attention_value_scale`).
         let attention_value_scale = get("attention_value_scale").and_then(as_f32);
 
+        // MiMo-V2-Flash separate KV-head count for SWA layers
+        // (`swa_num_key_value_heads`, 8 vs the global `num_key_value_heads` 4).
+        let swa_num_key_value_heads = get("swa_num_key_value_heads").and_then(as_usize);
+
+        // MiMo-V2-Flash learnable per-head attention sink bias flags. Only the
+        // SWA variant is applied; the full-attention flag is parsed so it
+        // round-trips. Default `false` for every other architecture.
+        let add_swa_attention_sink_bias = get("add_swa_attention_sink_bias")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let add_full_attention_sink_bias = get("add_full_attention_sink_bias")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // FP8 `ignored_layers` (`quantization_config.ignored_layers`):
         // tensors stored as BF16 even though the rest of the checkpoint is
         // FP8. MiMo-V2-Flash lists all `self_attn.o_proj` tensors here.
@@ -1049,6 +1092,7 @@ impl HfConfig {
             num_hidden_layers,
             num_attention_heads,
             num_key_value_heads,
+            swa_num_key_value_heads,
             head_dim,
             partial_rotary_factor,
             vocab_size,
@@ -1089,6 +1133,8 @@ impl HfConfig {
             attention_bias,
             attention_value_scale,
             fp8_ignored_layers,
+            add_swa_attention_sink_bias,
+            add_full_attention_sink_bias,
         })
     }
 
@@ -1436,17 +1482,33 @@ mod tests {
     #[test]
     fn mimo_v2_flash_attention_mode_pattern() {
         // MiMo-V2-Flash ships an explicit `hybrid_layer_pattern` where
-        // `0 = global, 1 = SWA`. Layer 0 is GLOBAL (stabilises early
-        // representations); then 5 SWA + 1 global repeats. Global layers:
-        // 0, 6, 12, 18, 24, 30, 36, 42.
+        // `0 = global, 1 = SWA`. Layer 0 is GLOBAL, then the first group has
+        // 4 SWA layers; every subsequent group has 5 SWA layers before the
+        // next global. Global layers fall at 0, 5, 11, 17, 23, 29, 35, 41, 47
+        // — NOT the naïve `l % 6 == 0` (0, 6, 12, …) the test used to assume.
         let arch = Architecture::MiMoV2;
-        let window = Some(128);
-        // The 48-layer pattern from the config: global (0) every 6th layer
-        // starting at index 0.
-        let pattern: Vec<u8> = (0..48).map(|l| if l % 6 == 0 { 0 } else { 1 }).collect();
+        let window = Some(128usize);
+
+        // The exact 48-layer pattern from XiaomiMiMo/MiMo-V2-Flash/config.json.
+        // 0 = global, 1 = SWA.
+        let pattern: Vec<u8> = vec![
+            0, 1, 1, 1, 1, // layers  0–4:  global, then 4 SWA
+            0, 1, 1, 1, 1, 1, // layers  5–10: global, then 5 SWA
+            0, 1, 1, 1, 1, 1, // layers 11–16
+            0, 1, 1, 1, 1, 1, // layers 17–22
+            0, 1, 1, 1, 1, 1, // layers 23–28
+            0, 1, 1, 1, 1, 1, // layers 29–34
+            0, 1, 1, 1, 1, 1, // layers 35–40
+            0, 1, 1, 1, 1, 1, // layers 41–46
+            0, // layer  47: global
+        ];
+        assert_eq!(pattern.len(), 48);
+
+        // Global layers must be at the exact positions the config encodes.
+        let expected_globals: Vec<usize> = vec![0, 5, 11, 17, 23, 29, 35, 41, 47];
         for l in 0..48 {
             let mode = arch.attention_mode(l, window, None, Some(&pattern));
-            if l % 6 == 0 {
+            if expected_globals.contains(&l) {
                 assert_eq!(mode, AttentionMode::Global, "layer {l} should be global");
             } else {
                 assert_eq!(
@@ -1456,7 +1518,8 @@ mod tests {
                 );
             }
         }
-        // Spot-check the boundaries the gist calls out.
+
+        // Spot-check the first group boundary explicitly.
         assert_eq!(
             arch.attention_mode(0, window, None, Some(&pattern)),
             AttentionMode::Global
@@ -1466,19 +1529,27 @@ mod tests {
             AttentionMode::SlidingWindow { window: 128 }
         );
         assert_eq!(
-            arch.attention_mode(5, window, None, Some(&pattern)),
+            arch.attention_mode(4, window, None, Some(&pattern)),
             AttentionMode::SlidingWindow { window: 128 }
         );
         assert_eq!(
-            arch.attention_mode(6, window, None, Some(&pattern)),
+            arch.attention_mode(5, window, None, Some(&pattern)),
             AttentionMode::Global
         );
         assert_eq!(
-            arch.attention_mode(11, window, None, Some(&pattern)),
+            arch.attention_mode(6, window, None, Some(&pattern)),
             AttentionMode::SlidingWindow { window: 128 }
         );
         assert_eq!(
-            arch.attention_mode(12, window, None, Some(&pattern)),
+            arch.attention_mode(10, window, None, Some(&pattern)),
+            AttentionMode::SlidingWindow { window: 128 }
+        );
+        assert_eq!(
+            arch.attention_mode(11, window, None, Some(&pattern)),
+            AttentionMode::Global
+        );
+        assert_eq!(
+            arch.attention_mode(47, window, None, Some(&pattern)),
             AttentionMode::Global
         );
     }
@@ -1820,6 +1891,68 @@ mod tests {
         }"#;
         let cfg = HfConfig::from_json_str(json).unwrap();
         assert!((cfg.attention_value_scale.unwrap() - 0.707f32).abs() < 1e-5);
+    }
+
+    #[test]
+    fn swa_num_key_value_heads_parsed() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 6,
+            "num_attention_heads": 64, "num_key_value_heads": 4,
+            "head_dim": 192, "v_head_dim": 128, "vocab_size": 152576,
+            "sliding_window": 128,
+            "hybrid_layer_pattern": [0, 1, 1, 1, 1, 0],
+            "swa_num_key_value_heads": 8
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.swa_num_key_value_heads, Some(8));
+        // Global layers keep the standard KV-head count.
+        assert_eq!(cfg.num_key_value_heads, 4);
+    }
+
+    #[test]
+    fn swa_num_key_value_heads_absent_defaults_none() {
+        // Every non-MiMo family omits the key; it must parse to `None` so
+        // every layer keeps `num_key_value_heads`.
+        let json = r#"{
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 32, "num_key_value_heads": 8,
+            "vocab_size": 32000
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.swa_num_key_value_heads, None);
+    }
+
+    #[test]
+    fn add_swa_attention_sink_bias_parsed() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "vocab_size": 152576,
+            "add_swa_attention_sink_bias": true,
+            "add_full_attention_sink_bias": false
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert!(cfg.add_swa_attention_sink_bias);
+        assert!(!cfg.add_full_attention_sink_bias);
+    }
+
+    #[test]
+    fn attention_sink_bias_flags_default_false() {
+        let json = r#"{
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 32, "num_key_value_heads": 8,
+            "vocab_size": 32000
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert!(!cfg.add_swa_attention_sink_bias);
+        assert!(!cfg.add_full_attention_sink_bias);
     }
 
     #[test]

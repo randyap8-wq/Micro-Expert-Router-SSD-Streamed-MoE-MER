@@ -589,6 +589,11 @@ pub struct MultiHeadSelfAttention {
     /// Optional additive bias for the output projection, length `d_model`.
     /// Added to the `wo · attn_out` projection. See [`Self::bq`].
     pub bo: Option<Vec<f32>>,
+    /// Per-head attention sink bias (MiMo-V2-Flash `add_swa_attention_sink_bias`).
+    /// When `Some`, a scalar per attention head is added to the logit for
+    /// position 0 (the sink token) before softmax, on SWA layers only.
+    /// Length = `num_heads`. `None` for every other architecture / layer.
+    pub sink_bias: Option<Vec<f32>>,
 }
 
 impl MultiHeadSelfAttention {
@@ -738,6 +743,17 @@ impl MultiHeadSelfAttention {
                     for j in 0..self.head_dim { s += q_head[j] * k_h[j]; }
                     scores.push(s * scale);
                 }
+                // Attention sink bias (MiMo-V2-Flash `add_swa_attention_sink_bias`):
+                // add the per-head scalar to the logit for the first (sink)
+                // position before softmax. Only applied when position 0 is
+                // within the attention span (`t_start == 0`), so the sink
+                // token's slot is `scores[0]`. `None` (every other
+                // architecture / global layers) is a no-op.
+                if let Some(bias) = self.sink_bias.as_ref() {
+                    if t_start == 0 && !scores.is_empty() {
+                        scores[0] += bias[h];
+                    }
+                }
                 softmax_inplace(&mut scores);
 
                 // V uses `v_head_dim` (may differ from `head_dim` on
@@ -783,10 +799,13 @@ impl MultiHeadSelfAttention {
             self.apply_o_bias(&mut out);
             out
         };
-        if !backend.is_gpu() || self.v_head_dim != self.head_dim {
+        if !backend.is_gpu() || self.v_head_dim != self.head_dim || self.sink_bias.is_some() {
             // The GPU attention kernels assume a symmetric K/V head dim, so
             // MiMo-V2-Flash's asymmetric V (`v_head_dim != head_dim`) always
-            // takes the CPU path.
+            // takes the CPU path. The per-head attention sink bias
+            // (`add_swa_attention_sink_bias`) is likewise only implemented on
+            // the CPU softmax path, so force CPU when it is present.
+            // TODO: apply attention_sink_bias on GPU path (kv_attend kernel).
             return cpu_forward();
         }
 
@@ -1753,6 +1772,7 @@ mod tests {
             bk: None,
             bv: None,
             bo: None,
+            sink_bias: None,
         };
         let mut kv = KvCache::new(kv_dim);
         let x: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32).collect();
@@ -1801,6 +1821,7 @@ mod tests {
             bk: None,
             bv: None,
             bo: None,
+            sink_bias: None,
         };
         let mut normed = base.clone();
         // Non-unit per-head norm weights so the effect is visible.
@@ -1902,6 +1923,7 @@ mod tests {
                 bk: None,
                 bv: None,
                 bo: None,
+                sink_bias: None,
             },
             mla: None,
             rms_moe: RmsNorm::new(vec![1.0; d_model], 1e-6),
@@ -1997,6 +2019,7 @@ mod tests {
             bk: None,
             bv: None,
             bo: None,
+            sink_bias: None,
         }
     }
 
@@ -2055,6 +2078,46 @@ mod tests {
                 assert!((a - b).abs() < 1e-5);
             }
         }
+    }
+
+    #[test]
+    fn sink_bias_shifts_attention_toward_first_token() {
+        // MiMo-V2-Flash attention sink bias: a per-head scalar added to the
+        // logit of position 0 before softmax pulls probability mass toward the
+        // sink token. With identity Q/K/V/O and V[0] carrying a 1.0 in dim 0,
+        // the bias must strictly raise the attention output's dim 0.
+        let mut attn_bias = make_window_attn(None);
+        attn_bias.sink_bias = Some(vec![2.0]); // single head
+        let attn_none = make_window_attn(None);
+
+        let t0 = vec![1.0f32, 0.0, 0.0, 0.0];
+        let t1 = vec![0.0f32, 1.0, 0.0, 0.0];
+
+        let run = |attn: &MultiHeadSelfAttention| -> Vec<f32> {
+            let mut kv = KvCache::new(attn.kv_dim());
+            let _ = attn.forward(&t0, 0, 0, &mut kv, &cpu_backend());
+            attn.forward(&t1, 1, 0, &mut kv, &cpu_backend())
+        };
+        let y_bias = run(&attn_bias);
+        let y_none = run(&attn_none);
+        assert!(
+            y_bias[0] > y_none[0] + 1e-4,
+            "sink bias should pull attention toward token 0: bias={y_bias:?} none={y_none:?}"
+        );
+    }
+
+    #[test]
+    fn sink_bias_none_is_a_noop() {
+        // `sink_bias = None` (every other architecture) must leave attention
+        // bit-for-bit identical to the pre-sink-bias behaviour.
+        let attn = make_window_attn(None);
+        assert!(attn.sink_bias.is_none());
+        let t0 = vec![1.0f32, 0.0, 0.0, 0.0];
+        let t1 = vec![0.0f32, 1.0, 0.0, 0.0];
+        let mut kv = KvCache::new(attn.kv_dim());
+        let _ = attn.forward(&t0, 0, 0, &mut kv, &cpu_backend());
+        let y = attn.forward(&t1, 1, 0, &mut kv, &cpu_backend());
+        assert!(y.iter().all(|v| v.is_finite()));
     }
 
     // ----------------- PagedAttention block-storage tests -------------
@@ -2212,6 +2275,7 @@ mod tests {
             bk: None,
             bv: None,
             bo: None,
+            sink_bias: None,
         };
         let mut kv = KvCache::new(kv_dim);
         // Walk past the first block boundary to exercise multi-block

@@ -110,6 +110,15 @@ pub struct AdvancedConfig {
     /// (`quantization_config.ignored_layers`); loaded as BF16 instead of
     /// E4M3. Empty for every architecture without an FP8 ignore list.
     pub fp8_ignored_layers: Vec<String>,
+    /// Separate KV-head count for Sliding-Window-Attention layers
+    /// (`swa_num_key_value_heads`). MiMo-V2-Flash uses 8 KV heads on SWA
+    /// layers and 4 (`num_kv_heads`) on global layers. `None` (every other
+    /// architecture) ⇒ every layer uses `num_kv_heads`.
+    pub swa_num_key_value_heads: Option<usize>,
+    /// Whether SWA layers add a learnable per-head attention sink bias to the
+    /// logit of the first (sink) token before softmax
+    /// (`add_swa_attention_sink_bias`). `false` for every other architecture.
+    pub add_swa_attention_sink_bias: bool,
 }
 
 impl Default for AdvancedConfig {
@@ -139,6 +148,8 @@ impl Default for AdvancedConfig {
             partial_rotary_factor: None,
             attention_value_scale: None,
             fp8_ignored_layers: Vec::new(),
+            swa_num_key_value_heads: None,
+            add_swa_attention_sink_bias: false,
         }
     }
 }
@@ -303,6 +314,16 @@ impl RealModelConfig {
                 ));
             }
         }
+        // MiMo-V2-Flash SWA layers use a separate KV-head count; it must also
+        // evenly divide `num_heads`. `None` leaves every layer on `num_kv_heads`.
+        if let Some(swa_kv) = adv.swa_num_key_value_heads {
+            if swa_kv == 0 || self.num_heads % swa_kv != 0 {
+                return Err(format!(
+                    "num_heads ({}) must be a positive multiple of swa_num_key_value_heads ({})",
+                    self.num_heads, swa_kv
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -365,6 +386,14 @@ impl RealModelConfig {
             partial_rotary_factor: hf.partial_rotary_factor,
             attention_value_scale: hf.attention_value_scale,
             fp8_ignored_layers: hf.fp8_ignored_layers.clone(),
+            // MiMo-V2-Flash SWA layers carry a different KV-head count and a
+            // per-head attention sink bias. MLA (DeepSeek) ignores both.
+            swa_num_key_value_heads: if mla.is_some() {
+                None
+            } else {
+                hf.swa_num_key_value_heads
+            },
+            add_swa_attention_sink_bias: hf.add_swa_attention_sink_bias,
         };
         Self {
             d_model: hf.hidden_size,
@@ -418,11 +447,11 @@ impl RealModel {
         let embedding = sample_uniform_vec(&mut rng, config.vocab_size * config.d_model, 0.04);
 
         let q_dim = config.num_heads * config.head_dim;
-        let kv_dim = config.num_kv_heads * config.head_dim;
         // V projection / output-projection widths use `v_head_dim`, which
         // equals `head_dim` for every architecture except MiMo-V2-Flash.
+        // Per-layer K/V projection widths are resolved inside the layer loop
+        // (MiMo-V2-Flash SWA layers use a different KV-head count).
         let v_head_dim = config.v_head_dim();
-        let v_proj_dim = config.num_kv_heads * v_head_dim;
         let attn_out_dim = config.num_heads * v_head_dim;
         let rope_dim = config.rope_dim();
         // Slightly smaller scale for the projections so the residual
@@ -471,6 +500,20 @@ impl RealModel {
                     (Some(_), Some(swa_theta)) => swa_theta,
                     _ => config.rope_base,
                 };
+                // Per-layer KV-head count. MiMo-V2-Flash SWA layers use
+                // `swa_num_key_value_heads` (8) while global layers use
+                // `num_kv_heads` (4); `num_heads` is the same for both. All
+                // other architectures leave `swa_num_key_value_heads = None`,
+                // so every layer uses `num_kv_heads` (zero behaviour change).
+                let layer_num_kv_heads = match (
+                    layer_window,
+                    config.advanced.swa_num_key_value_heads,
+                ) {
+                    (Some(_), Some(swa_kv)) => swa_kv, // SWA layer
+                    _ => config.num_kv_heads,          // global layer / no override
+                };
+                let layer_kv_dim = layer_num_kv_heads * config.head_dim;
+                let layer_v_proj_dim = layer_num_kv_heads * v_head_dim;
                 // YaRN long-context RoPE scaling for the standard
                 // attention path (the MLA path carries its own copy
                 // built inside `seed_mla`).
@@ -484,15 +527,15 @@ impl RealModel {
                 attn: MultiHeadSelfAttention {
                     d_model: config.d_model,
                     num_heads: config.num_heads,
-                    num_kv_heads: config.num_kv_heads,
+                    num_kv_heads: layer_num_kv_heads,
                     head_dim: config.head_dim,
                     rope_dim,
                     v_head_dim,
                     attention_value_scale: config.advanced.attention_value_scale,
                     rope_base: layer_rope_base,
                     wq: sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
-                    wk: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
-                    wv: sample_uniform_vec(&mut rng, v_proj_dim * config.d_model, proj_scale),
+                    wk: sample_uniform_vec(&mut rng, layer_kv_dim * config.d_model, proj_scale),
+                    wv: sample_uniform_vec(&mut rng, layer_v_proj_dim * config.d_model, proj_scale),
                     wo: sample_uniform_vec(&mut rng, config.d_model * attn_out_dim, proj_scale),
                     window_size: layer_window,
                     q_norm,
@@ -505,6 +548,10 @@ impl RealModel {
                     bk: None,
                     bv: None,
                     bo: None,
+                    // Attention sink bias (MiMo-V2-Flash) is seeded absent;
+                    // the on-disk loader populates it on SWA layers when the
+                    // checkpoint sets `add_swa_attention_sink_bias = true`.
+                    sink_bias: None,
                 },
                 mla,
                 rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
@@ -604,7 +651,6 @@ impl RealModel {
 
         let d_model = config.d_model;
         let q_dim = config.num_heads * config.head_dim;
-        let kv_dim = config.num_kv_heads * config.head_dim;
 
         maybe!("embed.bin", config.vocab_size * d_model, |v| model.embedding = v);
         maybe!("final_rms.bin", d_model, |v| {
@@ -614,6 +660,12 @@ impl RealModel {
             model.lm_head = LMHead::new(v, config.vocab_size, d_model);
         });
         for l in 0..config.num_layers {
+            // Per-layer K/V projection widths. MiMo-V2-Flash SWA layers use a
+            // different KV-head count than global layers; `new_seeded` already
+            // set `num_kv_heads`/`v_head_dim` per layer, so derive the loaded
+            // tensor lengths from the seeded attention struct.
+            let kv_dim = model.layers[l].attn.kv_dim();
+            let v_proj_dim = model.layers[l].attn.v_proj_dim();
             maybe!(&format!("rms_attn_{l}.bin"), d_model, |v| {
                 model.layers[l].rms_attn = RmsNorm::new(v, config.rms_eps);
             });
@@ -626,7 +678,7 @@ impl RealModel {
             maybe!(&format!("attn_{l}_k.bin"), kv_dim * d_model, |v| {
                 model.layers[l].attn.wk = v;
             });
-            maybe!(&format!("attn_{l}_v.bin"), kv_dim * d_model, |v| {
+            maybe!(&format!("attn_{l}_v.bin"), v_proj_dim * d_model, |v| {
                 model.layers[l].attn.wv = v;
             });
             maybe!(&format!("attn_{l}_o.bin"), d_model * q_dim, |v| {
@@ -1213,11 +1265,11 @@ if let Ok(sv) = s.tensor(&scale_name) {
 
         let d_model = config.d_model;
         let q_dim = config.num_heads * config.head_dim;
-        let kv_dim = config.num_kv_heads * config.head_dim;
         // V projection / output-projection widths use `v_head_dim`
         // (MiMo-V2-Flash asymmetric V); equal to `kv_dim` / `q_dim` for
-        // every other architecture.
-        let v_proj_dim = config.num_kv_heads * config.v_head_dim();
+        // every other architecture. Per-layer K/V widths are resolved inside
+        // the layer loop (MiMo-V2-Flash SWA layers use a different KV-head
+        // count); the output width is `num_heads * v_head_dim` for all layers.
         let attn_out_dim = config.num_heads * config.v_head_dim();
 
         maybe!(&naming.embed(), config.vocab_size * d_model, |v| {
@@ -1230,6 +1282,12 @@ if let Ok(sv) = s.tensor(&scale_name) {
             model.lm_head = LMHead::new(v, config.vocab_size, d_model);
         });
         for l in 0..config.num_layers {
+            // Per-layer K/V projection widths. MiMo-V2-Flash SWA layers use a
+            // different KV-head count than global layers; `new_seeded` already
+            // resolved `num_kv_heads`/`v_head_dim` per layer, so derive the
+            // expected tensor lengths from the seeded attention struct.
+            let kv_dim = model.layers[l].attn.kv_dim();
+            let v_proj_dim = model.layers[l].attn.v_proj_dim();
             maybe!(&naming.input_layernorm(l), d_model, |v| {
                 model.layers[l].rms_attn = RmsNorm::new(v, config.rms_eps);
             });
@@ -1315,6 +1373,20 @@ if let Ok(sv) = s.tensor(&scale_name) {
                 });
                 maybe!(&naming.o_proj_bias(l), d_model, |v| {
                     model.layers[l].attn.bo = Some(v);
+                });
+            }
+
+            // Attention sink bias (MiMo-V2-Flash `add_swa_attention_sink_bias`):
+            // a learnable per-head scalar (length `num_heads`) added to the
+            // logit of position 0 before softmax. Only loaded on SWA layers
+            // (`window_size.is_some()`) and only when the config sets the flag;
+            // every other family leaves `sink_bias = None` (seeded in
+            // `new_seeded`). A missing tensor is tolerated via `maybe!`.
+            if config.advanced.add_swa_attention_sink_bias
+                && model.layers[l].attn.window_size.is_some()
+            {
+                maybe!(&naming.attn_sink_bias(l), config.num_heads, |v| {
+                    model.layers[l].attn.sink_bias = Some(v);
                 });
             }
 
@@ -2090,6 +2162,100 @@ mod tests {
         assert_eq!(out.len(), cfg.d_model);
         assert!(out.iter().all(|v| v.is_finite()));
         assert_eq!(kv.seq_len, 1);
+    }
+
+    #[test]
+    fn per_layer_swa_kv_heads_resolved() {
+        use crate::architecture::Architecture;
+        // MiMo-V2-Flash: SWA layers use `swa_num_key_value_heads`, global
+        // layers use `num_kv_heads`; `num_heads` is the same for both. With
+        // MiMoV2's 5:1 pattern over 12 layers, globals fall at layers 5 and 11.
+        let mut adv = AdvancedConfig::default();
+        adv.swa_num_key_value_heads = Some(2);
+        let cfg = RealModelConfig {
+            num_layers: 12,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 8,
+            architecture: Architecture::MiMoV2,
+            window_size: Some(128),
+            advanced: adv,
+            ..RealModelConfig::tiny()
+        };
+        let m = RealModel::new_seeded(cfg.clone(), 5);
+        for (l, layer) in m.layers.iter().enumerate() {
+            let is_global = (l + 1) % 6 == 0;
+            let expect_kv = if is_global { 4 } else { 2 };
+            assert_eq!(layer.attn.num_kv_heads, expect_kv, "num_kv_heads layer {l}");
+            assert_eq!(
+                layer.attn.wk.len(),
+                expect_kv * cfg.head_dim * cfg.d_model,
+                "wk len layer {l}"
+            );
+            assert_eq!(
+                layer.attn.wv.len(),
+                expect_kv * cfg.head_dim * cfg.d_model,
+                "wv len layer {l}"
+            );
+        }
+        // KV caches follow the per-layer head count: layer 0 is SWA (2 heads),
+        // layer 5 is global (4 heads).
+        let caches = m.fresh_kv_caches();
+        assert_eq!(caches[0].kv_dim, 2 * cfg.head_dim);
+        assert_eq!(caches[5].kv_dim, 4 * cfg.head_dim);
+    }
+
+    #[test]
+    fn swa_kv_heads_none_keeps_uniform_kv_heads() {
+        use crate::architecture::Architecture;
+        // No `swa_num_key_value_heads` ⇒ every layer (SWA or global) keeps
+        // `num_kv_heads` — zero behaviour change for non-MiMo families.
+        let cfg = RealModelConfig {
+            num_layers: 12,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 8,
+            architecture: Architecture::MiMoV2,
+            window_size: Some(128),
+            ..RealModelConfig::tiny()
+        };
+        assert_eq!(cfg.advanced.swa_num_key_value_heads, None);
+        let m = RealModel::new_seeded(cfg.clone(), 5);
+        assert!(m.layers.iter().all(|l| l.attn.num_kv_heads == 4));
+    }
+
+    #[test]
+    fn swa_kv_heads_not_dividing_num_heads_fails_validate() {
+        let mut adv = AdvancedConfig::default();
+        adv.swa_num_key_value_heads = Some(3); // 4 % 3 != 0
+        let cfg = RealModelConfig {
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 8,
+            advanced: adv,
+            ..RealModelConfig::tiny()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn mimo_v2_flash_advanced_threads_swa_kv_and_sink_bias() {
+        use crate::architecture::HfConfig;
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 32, "num_hidden_layers": 6,
+            "num_attention_heads": 4, "num_key_value_heads": 4,
+            "head_dim": 8, "vocab_size": 256,
+            "sliding_window": 128,
+            "hybrid_layer_pattern": [0, 1, 1, 1, 1, 0],
+            "swa_num_key_value_heads": 2,
+            "add_swa_attention_sink_bias": true
+        }"#;
+        let hf = HfConfig::from_json_str(json).unwrap();
+        let cfg = RealModelConfig::from_hf_config(&hf);
+        assert_eq!(cfg.advanced.swa_num_key_value_heads, Some(2));
+        assert!(cfg.advanced.add_swa_attention_sink_bias);
     }
 
     #[test]
