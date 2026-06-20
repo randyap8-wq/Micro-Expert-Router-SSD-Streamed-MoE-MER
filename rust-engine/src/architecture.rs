@@ -760,6 +760,12 @@ pub struct HfConfig {
     /// Explicit per-head dim (`head_dim`), if the config specifies one
     /// (Qwen3 does; it need not equal `hidden_size / num_heads`).
     pub head_dim: Option<usize>,
+    /// Fraction of each head's dimensions that receive RoPE rotation
+    /// (`partial_rotary_factor`). MiMo-V2-Flash sets `0.334`, so only the
+    /// first `floor(head_dim * factor)` dims (rounded down to even) of
+    /// every Q/K head are rotated; the rest pass through unchanged. `None`
+    /// (every other architecture) ⇒ full-head rotation.
+    pub partial_rotary_factor: Option<f32>,
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
@@ -821,6 +827,16 @@ pub struct HfConfig {
     /// (`attention_bias`, GPT-OSS sets `true`). `false` (every other
     /// architecture) means the biases are absent and never loaded.
     pub attention_bias: bool,
+    /// Post-attention output scaling applied to the weighted V sum before
+    /// the output projection (`attention_value_scale`). MiMo-V2-Flash uses
+    /// `0.707` (~1/√2). `None` (every other architecture) ⇒ no scaling.
+    pub attention_value_scale: Option<f32>,
+    /// Tensor names excluded from FP8 quantisation
+    /// (`quantization_config.ignored_layers`). MiMo-V2-Flash lists every
+    /// `self_attn.o_proj` here — those weights are stored as BF16, not FP8,
+    /// so the loader must not run E4M3 dequant on them. Empty for every
+    /// architecture without an FP8 `ignored_layers` list.
+    pub fp8_ignored_layers: Vec<String>,
 }
 
 fn as_usize(v: &serde_json::Value) -> Option<usize> {
@@ -913,9 +929,17 @@ impl HfConfig {
         let vocab_size = req_usize("vocab_size")?;
         let intermediate_size = get("intermediate_size").and_then(as_usize).unwrap_or(0);
 
-        let rms_norm_eps = get("rms_norm_eps").and_then(as_f32).unwrap_or(1e-6);
+        // MiMo-V2-Flash spells the RMSNorm epsilon `layernorm_epsilon`
+        // (1e-5) and ships no `rms_norm_eps`; fall back to it so those
+        // layers don't silently use the 1e-6 default (a 10x difference).
+        let rms_norm_eps = get("rms_norm_eps")
+            .or_else(|| get("layernorm_epsilon"))
+            .and_then(as_f32)
+            .unwrap_or(1e-6);
         let rope_theta = get("rope_theta").and_then(as_f32).unwrap_or(10_000.0);
         let head_dim = get("head_dim").and_then(as_usize);
+        // MiMo-V2-Flash partial RoPE fraction (`partial_rotary_factor`).
+        let partial_rotary_factor = get("partial_rotary_factor").and_then(as_f32);
         let sliding_window = get("sliding_window").and_then(as_usize);
 
         // Hybrid-attention interleave ratio. Spellings vary by family, so
@@ -982,6 +1006,18 @@ impl HfConfig {
         let attention_bias =
             get("attention_bias").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        // MiMo-V2-Flash post-attention output scale (`attention_value_scale`).
+        let attention_value_scale = get("attention_value_scale").and_then(as_f32);
+
+        // FP8 `ignored_layers` (`quantization_config.ignored_layers`):
+        // tensors stored as BF16 even though the rest of the checkpoint is
+        // FP8. MiMo-V2-Flash lists all `self_attn.o_proj` tensors here.
+        let fp8_ignored_layers: Vec<String> = get("quantization_config")
+            .and_then(|v| v.get("ignored_layers"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
         // FP8 block-quantisation tile size from `quantization_config`.
         let fp8_block_size: Option<[usize; 2]> = get("quantization_config")
             .and_then(|v| v.get("weight_block_size"))
@@ -1014,6 +1050,7 @@ impl HfConfig {
             num_attention_heads,
             num_key_value_heads,
             head_dim,
+            partial_rotary_factor,
             vocab_size,
             rms_norm_eps,
             rope_theta,
@@ -1022,7 +1059,17 @@ impl HfConfig {
             num_routed_experts,
             num_experts_per_tok: get("num_experts_per_tok").and_then(as_usize),
             num_shared_experts: get("n_shared_experts").and_then(as_usize),
-            first_k_dense_replace: get("first_k_dense_replace").and_then(as_usize),
+            first_k_dense_replace: get("first_k_dense_replace")
+                .and_then(as_usize)
+                // MiMo-V2-Flash has no `first_k_dense_replace`; it marks
+                // dense vs MoE layers via `moe_layer_freq` (0 = dense FFN,
+                // 1 = MoE). Layer 0 is dense, so the number of leading dense
+                // layers is the count of leading zeros in that array.
+                .or_else(|| {
+                    get("moe_layer_freq").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter().take_while(|e| e.as_u64() == Some(0)).count()
+                    })
+                }),
             scoring_func: get("scoring_func").and_then(|v| v.as_str().map(String::from)),
             topk_method: get("topk_method").and_then(|v| v.as_str().map(String::from)),
             n_group: get("n_group").and_then(as_usize),
@@ -1040,6 +1087,8 @@ impl HfConfig {
             fp8_block_size,
             swiglu_limit,
             attention_bias,
+            attention_value_scale,
+            fp8_ignored_layers,
         })
     }
 
@@ -1713,5 +1762,112 @@ mod tests {
         assert_eq!(naming.k_proj_bias(3), "model.layers.3.self_attn.k_proj.bias");
         assert_eq!(naming.v_proj_bias(3), "model.layers.3.self_attn.v_proj.bias");
         assert_eq!(naming.o_proj_bias(3), "model.layers.3.self_attn.o_proj.bias");
+    }
+
+    // ── MiMo-V2-Flash pre-run config parsing (6 bugs) ───────────────────────
+
+    #[test]
+    fn mimo_v2_flash_layernorm_epsilon_parsed() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "vocab_size": 152576,
+            "layernorm_epsilon": 1e-05
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert!((cfg.rms_norm_eps - 1e-5f32).abs() < 1e-10);
+    }
+
+    #[test]
+    fn partial_rotary_factor_parsed_and_rope_dim_computed() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "num_key_value_heads": 4,
+            "head_dim": 192, "vocab_size": 152576,
+            "partial_rotary_factor": 0.334
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.partial_rotary_factor, Some(0.334f32));
+        // floor(192 * 0.334) = floor(64.128) = 64, rounded to even = 64
+        let rope_dim = ((192f32 * 0.334).floor() as usize) & !1;
+        assert_eq!(rope_dim, 64);
+    }
+
+    #[test]
+    fn v_head_dim_parsed_for_mimo_v2_flash() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "num_key_value_heads": 4,
+            "head_dim": 192, "v_head_dim": 128, "vocab_size": 152576
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.v_head_dim, Some(128));
+    }
+
+    #[test]
+    fn attention_value_scale_parsed() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "vocab_size": 152576,
+            "attention_value_scale": 0.707
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert!((cfg.attention_value_scale.unwrap() - 0.707f32).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fp8_ignored_layers_parsed() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 2,
+            "num_attention_heads": 64, "vocab_size": 152576,
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+                "ignored_layers": [
+                    "model.layers.0.self_attn.o_proj",
+                    "model.layers.1.self_attn.o_proj"
+                ]
+            }
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.fp8_ignored_layers.len(), 2);
+        assert!(cfg.fp8_ignored_layers[0].contains("o_proj"));
+    }
+
+    #[test]
+    fn moe_layer_freq_maps_to_first_k_dense_replace() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "vocab_size": 152576,
+            "moe_layer_freq": [0, 1, 1, 1]
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        // One leading zero → first_k_dense_replace = 1
+        assert_eq!(cfg.first_k_dense_replace, Some(1));
+    }
+
+    #[test]
+    fn moe_layer_freq_all_moe_gives_zero() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 4,
+            "num_attention_heads": 64, "vocab_size": 152576,
+            "moe_layer_freq": [1, 1, 1, 1]
+        }"#;
+        let cfg = HfConfig::from_json_str(json).unwrap();
+        assert_eq!(cfg.first_k_dense_replace, Some(0));
     }
 }
