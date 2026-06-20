@@ -286,6 +286,10 @@ pub struct KvCache {
     evicted_blocks: usize,
     pub seq_len: usize,
     pub kv_dim: usize,
+    /// Value-half row width. Equals [`Self::kv_dim`] for every architecture
+    /// except MiMo-V2-Flash, whose V head dim (`v_head_dim`) is smaller than
+    /// its K head dim. Defaults to `kv_dim` via [`Self::new`].
+    pub v_dim: usize,
 }
 
 /// Number of tokens per PagedAttention block. Matches the spec value
@@ -298,18 +302,28 @@ pub const PAGED_BLOCK_TOKENS: usize = 16;
 
 impl KvCache {
     pub fn new(kv_dim: usize) -> Self {
+        Self::new_kv(kv_dim, kv_dim)
+    }
+
+    /// Construct a cache whose key and value halves have independent row
+    /// widths. `k_dim` is the K width (`num_kv_heads * head_dim`) and
+    /// `v_dim` the V width (`num_kv_heads * v_head_dim`). They differ only
+    /// for MiMo-V2-Flash; [`Self::new`] passes `v_dim == k_dim` for every
+    /// other architecture.
+    pub fn new_kv(k_dim: usize, v_dim: usize) -> Self {
         Self {
             keys_blocks: VecDeque::new(),
             values_blocks: VecDeque::new(),
             evicted_blocks: 0,
             seq_len: 0,
-            kv_dim,
+            kv_dim: k_dim,
+            v_dim,
         }
     }
 
     pub fn append(&mut self, k: &[f32], v: &[f32]) {
         debug_assert_eq!(k.len(), self.kv_dim);
-        debug_assert_eq!(v.len(), self.kv_dim);
+        debug_assert_eq!(v.len(), self.v_dim);
         let pos = self.seq_len;
         let block_idx = pos / PAGED_BLOCK_TOKENS;
         let in_block = pos % PAGED_BLOCK_TOKENS;
@@ -321,26 +335,23 @@ impl KvCache {
         // index `block_idx - evicted_blocks`.
         if in_block == 0 {
             debug_assert_eq!(self.keys_blocks.len(), block_idx - self.evicted_blocks);
-            let block_floats = PAGED_BLOCK_TOKENS * self.kv_dim;
             self.keys_blocks
-                .push_back(vec![0.0f32; block_floats].into_boxed_slice());
+                .push_back(vec![0.0f32; PAGED_BLOCK_TOKENS * self.kv_dim].into_boxed_slice());
             self.values_blocks
-                .push_back(vec![0.0f32; block_floats].into_boxed_slice());
+                .push_back(vec![0.0f32; PAGED_BLOCK_TOKENS * self.v_dim].into_boxed_slice());
         }
-        let start = in_block * self.kv_dim;
-        let end = start + self.kv_dim;
         // Borrow the freshly-allocated (or current) trailing block and
         // write directly into its in-place slot.
         let kb = self
             .keys_blocks
             .back_mut()
             .expect("block must exist after append");
+        kb[in_block * self.kv_dim..in_block * self.kv_dim + self.kv_dim].copy_from_slice(k);
         let vb = self
             .values_blocks
             .back_mut()
             .expect("block must exist after append");
-        kb[start..end].copy_from_slice(k);
-        vb[start..end].copy_from_slice(v);
+        vb[in_block * self.v_dim..in_block * self.v_dim + self.v_dim].copy_from_slice(v);
         self.seq_len += 1;
     }
 
@@ -464,8 +475,8 @@ pub fn evict_before(&mut self, pos: usize) {
         );
         let block_idx = abs_block - self.evicted_blocks;
         let in_block = i % PAGED_BLOCK_TOKENS;
-        let start = in_block * self.kv_dim;
-        &self.values_blocks[block_idx][start..start + self.kv_dim]
+        let start = in_block * self.v_dim;
+        &self.values_blocks[block_idx][start..start + self.v_dim]
     }
 }
 
@@ -513,6 +524,21 @@ pub struct MultiHeadSelfAttention {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    /// Number of head dimensions that receive RoPE rotation. Equals
+    /// `head_dim` for full rotation (every architecture except
+    /// MiMo-V2-Flash, which sets `partial_rotary_factor = 0.334` giving
+    /// `rope_dim = 64` of `head_dim = 192`). Dimensions `[rope_dim..head_dim]`
+    /// pass through unrotated. Always even.
+    pub rope_dim: usize,
+    /// V head dimension. Equals `head_dim` for every standard architecture;
+    /// MiMo-V2-Flash uses `128` for V while Q/K use `192`. Drives the V
+    /// projection (`wv`) row count, the per-head V slice width, and the
+    /// attention-output / `wo` input width.
+    pub v_head_dim: usize,
+    /// Post-attention output scaling applied to the weighted V sum before
+    /// the output projection (MiMo-V2-Flash `attention_value_scale = 0.707`).
+    /// `None` (every other architecture) means no scaling (factor 1.0).
+    pub attention_value_scale: Option<f32>,
     pub rope_base: f32,
     pub wq: Vec<f32>,
     pub wk: Vec<f32>,
@@ -572,6 +598,30 @@ impl MultiHeadSelfAttention {
 
     pub fn kv_dim(&self) -> usize {
         self.num_kv_heads * self.head_dim
+    }
+
+    /// V projection (`wv`) output width: `num_kv_heads * v_head_dim`. Equals
+    /// [`Self::kv_dim`] for every architecture except MiMo-V2-Flash, where
+    /// V uses a smaller per-head dim than K.
+    pub fn v_proj_dim(&self) -> usize {
+        self.num_kv_heads * self.v_head_dim
+    }
+
+    /// Attention-output width = `wo` input width: `num_heads * v_head_dim`.
+    /// Equals [`Self::q_dim`] when `v_head_dim == head_dim`.
+    pub fn attn_out_dim(&self) -> usize {
+        self.num_heads * self.v_head_dim
+    }
+
+    /// Apply the optional post-attention output scale (MiMo-V2-Flash
+    /// `attention_value_scale`) in place. No-op when `None`, so every other
+    /// architecture pays nothing.
+    fn apply_value_scale(&self, out: &mut [f32]) {
+        if let Some(scale) = self.attention_value_scale {
+            for x in out.iter_mut() {
+                *x *= scale;
+            }
+        }
     }
 
     /// This layer's per-layer [`AttentionMode`], derived from
@@ -652,11 +702,13 @@ impl MultiHeadSelfAttention {
 
         debug_assert_eq!(x.len(), self.d_model);
         debug_assert_eq!(kv.kv_dim, self.kv_dim());
+        debug_assert_eq!(kv.v_dim, self.v_proj_dim());
 
         let q_dim  = self.q_dim();
         let kv_dim = self.kv_dim();
+        let v_head_dim = self.v_head_dim;
         let cpu_attend = |q: &[f32], kv: &KvCache| -> Vec<f32> {
-            let mut attn_out = vec![0.0f32; q_dim];
+            let mut attn_out = vec![0.0f32; self.attn_out_dim()];
             let scale   = 1.0 / (self.head_dim as f32).sqrt();
             let t_max   = kv.seq_len;
             // Per-layer attention mode: Global attends to all past
@@ -688,12 +740,14 @@ impl MultiHeadSelfAttention {
                 }
                 softmax_inplace(&mut scores);
 
-                let out_h = &mut attn_out[h * self.head_dim..(h + 1) * self.head_dim];
+                // V uses `v_head_dim` (may differ from `head_dim` on
+                // MiMo-V2-Flash); the attention output head is the same width.
+                let out_h = &mut attn_out[h * v_head_dim..(h + 1) * v_head_dim];
                 for (idx, score) in scores.iter().enumerate() {
                     let t   = t_start + idx;
                     let v_t = kv.value(t);
-                    let v_h = &v_t[kv_head * self.head_dim..(kv_head + 1) * self.head_dim];
-                    for j in 0..self.head_dim { out_h[j] += score * v_h[j]; }
+                    let v_h = &v_t[kv_head * v_head_dim..(kv_head + 1) * v_head_dim];
+                    for j in 0..v_head_dim { out_h[j] += score * v_h[j]; }
                 }
             }
             attn_out
@@ -701,28 +755,38 @@ impl MultiHeadSelfAttention {
         let mut cpu_forward = || {
             let mut q = matmul_row_major(&self.wq, x, q_dim, self.d_model);
             let mut k = matmul_row_major(&self.wk, x, kv_dim, self.d_model);
-            let mut v = matmul_row_major(&self.wv, x, kv_dim, self.d_model);
+            // V projection width is `num_kv_heads * v_head_dim`.
+            let mut v = matmul_row_major(&self.wv, x, self.v_proj_dim(), self.d_model);
             // QKV projection biases (GPT-OSS `attention_bias = true`),
             // added to the raw projections before QK-Norm / RoPE.
             self.apply_qkv_bias(&mut q, &mut k, &mut v);
             // QK-Norm (Qwen3): per-head RMSNorm on Q and K *before* RoPE.
             self.apply_q_norm(&mut q);
             self.apply_k_norm(&mut k);
+            // RoPE rotates only the first `rope_dim` dims of each head
+            // (partial rotary on MiMo-V2-Flash; `rope_dim == head_dim`
+            // elsewhere ⇒ full rotation).
             for h in 0..self.num_heads {
                 let s = h * self.head_dim;
-                apply_rope_maybe_scaled(&mut q[s..s + self.head_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+                apply_rope_maybe_scaled(&mut q[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
             }
             for h in 0..self.num_kv_heads {
                 let s = h * self.head_dim;
-                apply_rope_maybe_scaled(&mut k[s..s + self.head_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+                apply_rope_maybe_scaled(&mut k[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
             }
             kv.append(&k, &v);
-            let attn_out = cpu_attend(&q, kv);
-            let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
+            let mut attn_out = cpu_attend(&q, kv);
+            // Post-attention output scale (MiMo-V2-Flash 0.707), applied
+            // before the output projection.
+            self.apply_value_scale(&mut attn_out);
+            let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, self.attn_out_dim());
             self.apply_o_bias(&mut out);
             out
         };
-        if !backend.is_gpu() {
+        if !backend.is_gpu() || self.v_head_dim != self.head_dim {
+            // The GPU attention kernels assume a symmetric K/V head dim, so
+            // MiMo-V2-Flash's asymmetric V (`v_head_dim != head_dim`) always
+            // takes the CPU path.
             return cpu_forward();
         }
 
@@ -784,11 +848,11 @@ impl MultiHeadSelfAttention {
 
         for h in 0..self.num_heads {
             let s = h * self.head_dim;
-            apply_rope_maybe_scaled(&mut q[s..s + self.head_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+            apply_rope_maybe_scaled(&mut q[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
         }
         for h in 0..self.num_kv_heads {
             let s = h * self.head_dim;
-            apply_rope_maybe_scaled(&mut k[s..s + self.head_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+            apply_rope_maybe_scaled(&mut k[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
         }
 
         // ── 3) KV insert + attention ──────────────────────────────────────────
@@ -810,7 +874,8 @@ impl MultiHeadSelfAttention {
             TensorView { data: &k_f16_rope, rows: 1, cols: kv_dim },
             TensorView { data: &v_f16_rope, rows: 1, cols: kv_dim },
         ).is_err() {
-            let attn_out = cpu_attend(&q, kv);
+            let mut attn_out = cpu_attend(&q, kv);
+            self.apply_value_scale(&mut attn_out);
             let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
             self.apply_o_bias(&mut out);
             return out;
@@ -828,6 +893,11 @@ impl MultiHeadSelfAttention {
         } else {
             cpu_attend(&q, kv)
         };
+
+        // Post-attention output scale (MiMo-V2-Flash 0.707), applied before
+        // the output projection. No-op for every other architecture.
+        let mut attn_out = attn_out;
+        self.apply_value_scale(&mut attn_out);
 
         // ── 4) Output projection via backend ──────────────────────────────────
         let wo_f16      = to_f16(&self.wo);
@@ -1667,6 +1737,9 @@ mod tests {
             num_heads,
             num_kv_heads,
             head_dim,
+            rope_dim: head_dim,
+            v_head_dim: head_dim,
+            attention_value_scale: None,
             rope_base: 10000.0,
             wq: mk(q_dim, d_model),
             wk: mk(kv_dim, d_model),
@@ -1712,6 +1785,9 @@ mod tests {
             num_heads,
             num_kv_heads,
             head_dim,
+            rope_dim: head_dim,
+            v_head_dim: head_dim,
+            attention_value_scale: None,
             rope_base: 10000.0,
             wq: mk(q_dim, d_model),
             wk: mk(kv_dim, d_model),
@@ -1810,6 +1886,9 @@ mod tests {
                 num_heads,
                 num_kv_heads,
                 head_dim,
+                rope_dim: head_dim,
+                v_head_dim: head_dim,
+                attention_value_scale: None,
                 rope_base: 10000.0,
                 wq: mk(q_dim, d_model, 0.05),
                 wk: mk(kv_dim, d_model, 0.05),
@@ -1902,6 +1981,9 @@ mod tests {
             num_heads,
             num_kv_heads,
             head_dim,
+            rope_dim: head_dim,
+            v_head_dim: head_dim,
+            attention_value_scale: None,
             rope_base: 10000.0,
             wq: identity(d_model),
             wk: identity(d_model),
@@ -2114,6 +2196,9 @@ mod tests {
             num_heads,
             num_kv_heads,
             head_dim,
+            rope_dim: head_dim,
+            v_head_dim: head_dim,
+            attention_value_scale: None,
             rope_base: 10000.0,
             wq: mk(q_dim, d_model),
             wk: mk(kv_dim, d_model),

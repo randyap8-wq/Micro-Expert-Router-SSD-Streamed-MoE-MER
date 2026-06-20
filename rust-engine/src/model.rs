@@ -96,6 +96,20 @@ pub struct AdvancedConfig {
     /// Whether the attention Q/K/V/O projections carry additive biases
     /// (`attention_bias`, GPT-OSS). `false` for every other architecture.
     pub attention_bias: bool,
+    /// V head dimension override (`v_head_dim`) for standard (non-MLA)
+    /// attention. `Some(128)` for MiMo-V2-Flash (Q/K use `head_dim = 192`);
+    /// `None` ⇒ V uses `head_dim` (every other architecture).
+    pub v_head_dim: Option<usize>,
+    /// Fraction of each head's dims that receive RoPE (`partial_rotary_factor`).
+    /// `Some(0.334)` for MiMo-V2-Flash; `None` ⇒ full-head rotation.
+    pub partial_rotary_factor: Option<f32>,
+    /// Post-attention output scale (`attention_value_scale`). `Some(0.707)`
+    /// for MiMo-V2-Flash; `None` ⇒ no scaling.
+    pub attention_value_scale: Option<f32>,
+    /// Tensor names excluded from FP8 quantisation
+    /// (`quantization_config.ignored_layers`); loaded as BF16 instead of
+    /// E4M3. Empty for every architecture without an FP8 ignore list.
+    pub fp8_ignored_layers: Vec<String>,
 }
 
 impl Default for AdvancedConfig {
@@ -121,6 +135,10 @@ impl Default for AdvancedConfig {
             fp8_block_size: None,
             swiglu_limit: None,
             attention_bias: false,
+            v_head_dim: None,
+            partial_rotary_factor: None,
+            attention_value_scale: None,
+            fp8_ignored_layers: Vec::new(),
         }
     }
 }
@@ -181,6 +199,24 @@ impl RealModelConfig {
             first_k_dense_replace: 0,
             advanced: AdvancedConfig::default(),
         }
+    }
+
+    /// V head dimension for the standard attention path. Equals
+    /// [`Self::head_dim`] for every architecture except MiMo-V2-Flash, which
+    /// sets `v_head_dim = 128` while Q/K use `head_dim = 192`.
+    pub fn v_head_dim(&self) -> usize {
+        self.advanced.v_head_dim.unwrap_or(self.head_dim)
+    }
+
+    /// Number of head dims that receive RoPE rotation. Equals
+    /// [`Self::head_dim`] (full rotation) unless `partial_rotary_factor` is
+    /// set (MiMo-V2-Flash), in which case it is
+    /// `floor(head_dim * factor)` rounded down to even.
+    pub fn rope_dim(&self) -> usize {
+        self.advanced
+            .partial_rotary_factor
+            .map(|f| ((self.head_dim as f32 * f).floor() as usize) & !1)
+            .unwrap_or(self.head_dim)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -251,6 +287,22 @@ impl RealModelConfig {
                 adv.routed_scaling_factor
             ));
         }
+        if let Some(f) = adv.partial_rotary_factor {
+            if !f.is_finite() || f <= 0.0 || f > 1.0 {
+                return Err(format!(
+                    "partial_rotary_factor ({}) must be a finite number in (0, 1]",
+                    f
+                ));
+            }
+        }
+        if let Some(v) = adv.v_head_dim {
+            if v == 0 || v > self.head_dim {
+                return Err(format!(
+                    "v_head_dim ({}) must be in 1..=head_dim ({})",
+                    v, self.head_dim
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -305,6 +357,14 @@ impl RealModelConfig {
             fp8_block_size: hf.fp8_block_size,
             swiglu_limit: hf.swiglu_limit,
             attention_bias: hf.attention_bias,
+            // V head dim override only applies to the standard attention
+            // path. DeepSeek-style MLA carries its own `v_head_dim` inside
+            // `MlaDims`, so when MLA is active the standard attention struct
+            // stays symmetric (`v_head_dim == head_dim`) and unused.
+            v_head_dim: if mla.is_some() { None } else { hf.v_head_dim },
+            partial_rotary_factor: hf.partial_rotary_factor,
+            attention_value_scale: hf.attention_value_scale,
+            fp8_ignored_layers: hf.fp8_ignored_layers.clone(),
         };
         Self {
             d_model: hf.hidden_size,
@@ -359,6 +419,12 @@ impl RealModel {
 
         let q_dim = config.num_heads * config.head_dim;
         let kv_dim = config.num_kv_heads * config.head_dim;
+        // V projection / output-projection widths use `v_head_dim`, which
+        // equals `head_dim` for every architecture except MiMo-V2-Flash.
+        let v_head_dim = config.v_head_dim();
+        let v_proj_dim = config.num_kv_heads * v_head_dim;
+        let attn_out_dim = config.num_heads * v_head_dim;
+        let rope_dim = config.rope_dim();
         // Slightly smaller scale for the projections so the residual
         // stream doesn't blow up across many layers.
         let proj_scale = (1.0 / (config.d_model as f32).sqrt()).min(0.05);
@@ -412,7 +478,7 @@ impl RealModel {
                     .advanced
                     .rope_scaling
                     .as_ref()
-                    .and_then(|s| YarnRope::from_scaling(config.head_dim, layer_rope_base, s));
+                    .and_then(|s| YarnRope::from_scaling(rope_dim, layer_rope_base, s));
                 TransformerLayer {
                 rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                 attn: MultiHeadSelfAttention {
@@ -420,11 +486,14 @@ impl RealModel {
                     num_heads: config.num_heads,
                     num_kv_heads: config.num_kv_heads,
                     head_dim: config.head_dim,
+                    rope_dim,
+                    v_head_dim,
+                    attention_value_scale: config.advanced.attention_value_scale,
                     rope_base: layer_rope_base,
                     wq: sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
                     wk: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
-                    wv: sample_uniform_vec(&mut rng, kv_dim * config.d_model, proj_scale),
-                    wo: sample_uniform_vec(&mut rng, config.d_model * q_dim, proj_scale),
+                    wv: sample_uniform_vec(&mut rng, v_proj_dim * config.d_model, proj_scale),
+                    wo: sample_uniform_vec(&mut rng, config.d_model * attn_out_dim, proj_scale),
                     window_size: layer_window,
                     q_norm,
                     k_norm,
@@ -852,6 +921,29 @@ impl RealModel {
             None
         };
 
+        // FP8 `ignored_layers` (MiMo-V2-Flash): tensors listed in
+        // `quantization_config.ignored_layers` (all `self_attn.o_proj`) are
+        // stored as BF16, not FP8. The block-dequant closures below must
+        // decode them via the standard path rather than misinterpreting the
+        // bytes as E4M3. Each entry is a module path (e.g.
+        // `model.layers.0.self_attn.o_proj`); the safetensors tensor names
+        // append a suffix (`.weight`, `.bias`, `_scale_inv`) and may carry a
+        // shard prefix. We therefore match the entry as a substring but
+        // require a separator (`.`/`_`) or end-of-string boundary after it,
+        // so a path like `...o_proj` never matches `...o_projection`.
+        let fp8_ignored = config.advanced.fp8_ignored_layers.clone();
+        let is_fp8_ignored = move |name: &str| -> bool {
+            fp8_ignored.iter().any(|ignored| {
+                let ignored = ignored.as_str();
+                name.match_indices(ignored).any(|(idx, _)| {
+                    let after = &name[idx + ignored.len()..];
+                    after.is_empty()
+                        || after.starts_with('.')
+                        || after.starts_with('_')
+                })
+            })
+        };
+
         // Closure: search every shard for the first matching `name` and
         // return its decoded f32 data regardless of length. Used by the
         // shared-expert loader, which infers the shared intermediate size
@@ -865,6 +957,20 @@ impl RealModel {
                     if let Ok(view) = st.tensor(name) {
                         if view.dtype() != Dtype::F8_E4M3 {
                             return Some(decode_safetensor_to_f32(&view, name));
+                        }
+                        if is_fp8_ignored(name) {
+                            let raw = view.data();
+                            // `ignored_layers` are stored as BF16. Some checkpoints still tag
+                            // them as FP8 in metadata; detect BF16 payload by byte width.
+                            if raw.len() % 2 == 0 {
+                                return Some(
+                                    raw.chunks_exact(2)
+                                        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                                        .collect(),
+                                );
+                            }
+                            warn!(tensor = name, "FP8-ignored tensor did not look like BF16 payload");
+                            return None;
                         }
                         let shape = view.shape();
                         if shape.len() != 2 {
@@ -1005,6 +1111,21 @@ if let Ok(sv) = s.tensor(&scale_name) {
                             return Some(out);
                         }
                         Dtype::F8_E4M3 => {
+                            // FP8 `ignored_layers` (MiMo-V2-Flash o_proj):
+                            // stored as BF16 even though tagged here; decode
+                            // via the standard path, never block-dequant.
+                            if is_fp8_ignored(name) {
+                                let raw = view.data();
+                                if raw.len() % 2 == 0 {
+                                    return Some(
+                                        raw.chunks_exact(2)
+                                            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                                            .collect(),
+                                    );
+                                }
+                                warn!(tensor = name, "FP8-ignored tensor did not look like BF16 payload; falling back to seeded init");
+                                return None;
+                            }
                             if n_elem != expected {
                                 warn!(
                                     tensor = name,
@@ -1093,6 +1214,11 @@ if let Ok(sv) = s.tensor(&scale_name) {
         let d_model = config.d_model;
         let q_dim = config.num_heads * config.head_dim;
         let kv_dim = config.num_kv_heads * config.head_dim;
+        // V projection / output-projection widths use `v_head_dim`
+        // (MiMo-V2-Flash asymmetric V); equal to `kv_dim` / `q_dim` for
+        // every other architecture.
+        let v_proj_dim = config.num_kv_heads * config.v_head_dim();
+        let attn_out_dim = config.num_heads * config.v_head_dim();
 
         maybe!(&naming.embed(), config.vocab_size * d_model, |v| {
             model.embedding = v;
@@ -1149,10 +1275,10 @@ if let Ok(sv) = s.tensor(&scale_name) {
                 maybe!(&naming.attn_k(l), kv_dim * d_model, |v| {
                     model.layers[l].attn.wk = v;
                 });
-                maybe!(&naming.attn_v(l), kv_dim * d_model, |v| {
+                maybe!(&naming.attn_v(l), v_proj_dim * d_model, |v| {
                     model.layers[l].attn.wv = v;
                 });
-                maybe!(&naming.attn_o(l), d_model * q_dim, |v| {
+                maybe!(&naming.attn_o(l), d_model * attn_out_dim, |v| {
                     model.layers[l].attn.wo = v;
                 });
             }
@@ -1376,7 +1502,7 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     pub fn fresh_kv_caches(&self) -> Vec<KvCache> {
         self.layers
             .iter()
-            .map(|l| KvCache::new(l.kv_dim()))
+            .map(|l| KvCache::new_kv(l.attn.kv_dim(), l.attn.v_proj_dim()))
             .collect()
     }
 
@@ -1917,6 +2043,53 @@ mod tests {
         assert_eq!(m.lm_head.weights.len(), cfg.vocab_size * cfg.d_model);
         assert_eq!(m.final_rms.weight.len(), cfg.d_model);
         assert!(m.embedding.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn mimo_asymmetric_v_head_dim_shapes_and_forward() {
+        use crate::transformer::KvCache;
+        // MiMo-V2-Flash-style asymmetric attention: Q/K use head_dim=8,
+        // V uses v_head_dim=4; partial RoPE over 4 of 8 dims; value scale.
+        let mut adv = AdvancedConfig::default();
+        adv.v_head_dim = Some(4);
+        adv.partial_rotary_factor = Some(0.5); // floor(8*0.5)=4, even
+        adv.attention_value_scale = Some(0.707);
+        let cfg = RealModelConfig {
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 8,
+            num_layers: 2,
+            advanced: adv,
+            ..RealModelConfig::tiny()
+        };
+        assert_eq!(cfg.v_head_dim(), 4);
+        assert_eq!(cfg.rope_dim(), 4);
+
+        let m = RealModel::new_seeded(cfg.clone(), 7);
+        let attn = &m.layers[0].attn;
+        assert_eq!(attn.v_head_dim, 4);
+        assert_eq!(attn.rope_dim, 4);
+        assert_eq!(attn.attention_value_scale, Some(0.707));
+        // wv rows = num_kv_heads * v_head_dim; wo cols = num_heads * v_head_dim.
+        assert_eq!(attn.wv.len(), cfg.num_kv_heads * 4 * cfg.d_model);
+        assert_eq!(attn.wo.len(), cfg.d_model * cfg.num_heads * 4);
+        assert_eq!(attn.v_proj_dim(), cfg.num_kv_heads * 4);
+        assert_eq!(attn.attn_out_dim(), cfg.num_heads * 4);
+
+        // Fresh KV caches carry the asymmetric key/value widths.
+        let caches = m.fresh_kv_caches();
+        assert_eq!(caches[0].kv_dim, cfg.num_kv_heads * cfg.head_dim);
+        assert_eq!(caches[0].v_dim, cfg.num_kv_heads * 4);
+
+        // The attention forward runs end-to-end on the CPU path and yields
+        // a finite, correctly-sized hidden state.
+        let backend = crate::backend::current();
+        let mut kv = KvCache::new_kv(attn.kv_dim(), attn.v_proj_dim());
+        let x = vec![0.1f32; cfg.d_model];
+        let out = attn.forward(&x, 0, 0, &mut kv, &*backend);
+        assert_eq!(out.len(), cfg.d_model);
+        assert!(out.iter().all(|v| v.is_finite()));
+        assert_eq!(kv.seq_len, 1);
     }
 
     #[test]
