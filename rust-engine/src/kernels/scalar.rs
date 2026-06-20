@@ -147,15 +147,21 @@ mod tests {
     }
 
     #[test]
-    fn swiglu_f32_no_limit_unchanged() {
-        // Without a limit, behaviour is identical to the existing implementation.
+    fn swiglu_f32_no_limit_matches_reference() {
         let gate_w = [2.0f32];
         let up_w = [3.0f32];
         let x = [1.0f32];
-        let mut y_limited = [0.0f32];
-        let mut y_unlimited = [0.0f32];
-        swiglu_f32_clamped(&gate_w, &up_w, &x, 1, 1, &mut y_limited, None);
-        swiglu_f32(&gate_w, &up_w, &x, 1, 1, &mut y_unlimited);
-        assert!((y_limited[0] - y_unlimited[0]).abs() < 1e-7);
+        let g = gate_w[0] * x[0];
+        let u = up_w[0] * x[0];
+        let silu_g = g / (1.0 + (-g).exp());
+        let expected = silu_g * u;
+
+        let mut y1 = [0.0f32];
+        swiglu_f32_clamped(&gate_w, &up_w, &x, 1, 1, &mut y1, None);
+        assert!((y1[0] - expected).abs() < 1e-7);
+
+        let mut y2 = [0.0f32];
+        swiglu_f32(&gate_w, &up_w, &x, 1, 1, &mut y2);
+        assert!((y2[0] - expected).abs() < 1e-7);
     }
 }
