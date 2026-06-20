@@ -793,7 +793,10 @@ impl MultiHeadSelfAttention {
 
         // ── 3) KV insert + attention ──────────────────────────────────────────
         let k_f16_rope = to_f16(&k);
-        let v_f16_rope = to_f16(&v); // V is not RoPE'd (but carries its bias)
+        // V is not RoPE'd. When there is no V-bias, `v` is an exact f32 copy of
+        // the already-correct `v_f16` projection, so reuse it directly and skip
+        // the redundant per-token f32→f16 round-trip.
+        let v_f16_rope = if self.bv.is_some() { to_f16(&v) } else { v_f16 };
 
         // Generation must advance strictly one token at a time: before we append
         // the new KV for `pos`, the cache length should equal that position.
