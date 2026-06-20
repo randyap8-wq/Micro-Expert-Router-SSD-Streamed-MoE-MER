@@ -1668,8 +1668,8 @@ mod tests {
     #[test]
     fn swiglu_limit_none_by_default() {
         let json = r#"{
-            "architectures": ["MistralForCausalLM"],
-            "model_type": "mistral",
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
             "hidden_size": 4096, "num_hidden_layers": 32,
             "num_attention_heads": 32, "vocab_size": 32000
         }"#;
@@ -1694,8 +1694,8 @@ mod tests {
     fn attention_bias_false_by_default() {
         // All existing architectures should have attention_bias = false.
         let json = r#"{
-            "architectures": ["MistralForCausalLM"],
-            "model_type": "mistral",
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
             "hidden_size": 4096, "num_hidden_layers": 32,
             "num_attention_heads": 32, "vocab_size": 32000
         }"#;
