@@ -2086,10 +2086,9 @@ mod tests {
         // logit of position 0 before softmax pulls probability mass toward the
         // sink token. With identity Q/K/V/O and V[0] carrying a 1.0 in dim 0,
         // the bias must strictly raise the attention output's dim 0.
-        let mut attn_bias = make_window_attn(None);
+        let mut attn_bias = make_window_attn(Some(10));
         attn_bias.sink_bias = Some(vec![2.0]); // single head
-        let attn_none = make_window_attn(None);
-
+        let attn_none = make_window_attn(Some(10));
         let t0 = vec![1.0f32, 0.0, 0.0, 0.0];
         let t1 = vec![0.0f32, 1.0, 0.0, 0.0];
 
