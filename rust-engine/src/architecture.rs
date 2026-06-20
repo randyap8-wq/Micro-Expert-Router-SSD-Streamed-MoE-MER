@@ -961,12 +961,15 @@ impl HfConfig {
             // encoding so both families feed the one downstream lookup. Only
             // consulted when the integer pattern is absent.
             .or_else(|| {
-                get("layer_types").and_then(|v| v.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| e.as_str())
-                        .map(|s| if s == "full_attention" { 0u8 } else { 1u8 })
-                        .collect::<Vec<u8>>()
-                })
+                get("layer_types")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| {
+                        let out: Option<Vec<u8>> = arr
+                            .iter()
+                            .map(|e| e.as_str().map(|s| if s == "full_attention" { 0u8 } else { 1u8 }))
+                            .collect();
+                        out.filter(|v| v.len() == num_hidden_layers)
+                    })
             });
 
         // Separate RoPE base for SWA layers (MiMo-V2-Flash `swa_rope_theta`).
