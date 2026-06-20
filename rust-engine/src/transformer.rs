@@ -749,10 +749,13 @@ impl MultiHeadSelfAttention {
                 // within the attention span (`t_start == 0`), so the sink
                 // token's slot is `scores[0]`. `None` (every other
                 // architecture / global layers) is a no-op.
-                if let Some(bias) = self.sink_bias.as_ref() {
-                    if t_start == 0 && !scores.is_empty() {
-                        scores[0] += bias[h];
-                    }
+if let Some(bias) = self.sink_bias.as_ref() {
+    if t_start == 0 && !scores.is_empty() {
+        if let Some(b) = bias.get(h) {
+            scores[0] += *b;
+        }
+    }
+}
                 }
                 softmax_inplace(&mut scores);
 
