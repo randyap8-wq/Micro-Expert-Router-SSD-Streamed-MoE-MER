@@ -2108,8 +2108,8 @@ mod tests {
 
     #[test]
     fn sink_bias_none_is_a_noop() {
-        // `sink_bias = None` (every other architecture) must leave attention
-        // bit-for-bit identical to the pre-sink-bias behaviour.
+        // `sink_bias = None` (every other architecture) should behave exactly
+        // like a regular attention block; this is a smoke test that it runs and produces finite output.
         let attn = make_window_attn(None);
         assert!(attn.sink_bias.is_none());
         let t0 = vec![1.0f32, 0.0, 0.0, 0.0];
