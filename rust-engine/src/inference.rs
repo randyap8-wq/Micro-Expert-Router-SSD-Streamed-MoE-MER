@@ -72,6 +72,54 @@ use std::fmt;
 // would defeat the project's "single-binary CPU/NVMe runtime" thesis.
 use candle_core::{Device, Tensor};
 
+/// Process-global GPT-OSS SwiGLU gate clamp (`swiglu_limit`).
+///
+/// Stored as the raw `f32` bits, with `u32::MAX` (a NaN bit pattern that
+/// no valid positive-finite limit can produce) as the "unset / `None`"
+/// sentinel. Set once at startup from the checkpoint's `config.json`
+/// (`config.advanced.swiglu_limit`); read on the expert-FFN hot path so
+/// the clamp can be applied without threading the limit through every
+/// `run_inference_*` signature and the streaming engine's `ModelShape`.
+/// Defaults to `None`, so every non-GPT-OSS run is unaffected.
+static SWIGLU_LIMIT_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(SWIGLU_LIMIT_NONE);
+const SWIGLU_LIMIT_NONE: u32 = u32::MAX;
+
+/// Install the global GPT-OSS SwiGLU gate clamp. `Some(limit)` activates
+/// the clamp for every subsequent expert FFN; `None` (or a non-positive /
+/// non-finite limit) disables it. Idempotent and cheap; call once at
+/// model construction.
+pub fn set_swiglu_limit(limit: Option<f32>) {
+    let bits = match limit {
+        Some(l) if l.is_finite() && l > 0.0 => l.to_bits(),
+        _ => SWIGLU_LIMIT_NONE,
+    };
+    SWIGLU_LIMIT_BITS.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The currently-installed GPT-OSS SwiGLU gate clamp, or `None` when no
+/// clamp is active (the default for every architecture except GPT-OSS).
+#[inline]
+pub fn swiglu_limit() -> Option<f32> {
+    let bits = SWIGLU_LIMIT_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == SWIGLU_LIMIT_NONE {
+        None
+    } else {
+        Some(f32::from_bits(bits))
+    }
+}
+
+/// Apply the global SwiGLU gate clamp to a candle gate tensor `g` before
+/// the sigmoid. No-op (returns `g` unchanged) when no limit is active, so
+/// non-GPT-OSS experts pay only a single relaxed atomic load.
+#[inline]
+fn clamp_swiglu_gate(g: Tensor) -> Result<Tensor, candle_core::Error> {
+    match swiglu_limit() {
+        Some(limit) => g.clamp(-limit, limit),
+        None => Ok(g),
+    }
+}
+
 /// Bit-width with which expert weights are stored on disk.
 ///
 /// `F32` is the legacy (and default) format: each weight is 4 bytes,
@@ -1111,7 +1159,9 @@ pub fn forward_candle_tensors(
     let g = gate_t.matmul(&x_t).map_err(map_err)?;
     let u = up_t.matmul(&x_t).map_err(map_err)?;
 
-    // SwiGLU: silu(g) ⊙ u
+    // SwiGLU: silu(clamp(g)) ⊙ u. The clamp is the GPT-OSS `swiglu_limit`
+    // (no-op for every other architecture; see `clamp_swiglu_gate`).
+    let g = clamp_swiglu_gate(g).map_err(map_err)?;
     let gated = candle_core::Tensor::silu(&g)
         .map_err(map_err)?
         .mul(&u)
@@ -1908,6 +1958,7 @@ let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, us
         debug_assert_eq!(self.up.len(), self.d_ff * m);
 
         // 1) gate / up projections, each summed only over the loaded columns.
+        let swiglu_limit = swiglu_limit();
         let mut gated = vec![0.0f32; self.d_ff];
         for i in 0..self.d_ff {
             let row_off = i * m;
@@ -1918,6 +1969,10 @@ let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, us
             for (j, &orig_col) in cols.iter().enumerate() {
                 g += g_row[j] * x[orig_col];
                 u += u_row[j] * x[orig_col];
+            }
+            // GPT-OSS `swiglu_limit` clamp before silu (no-op otherwise).
+            if let Some(limit) = swiglu_limit {
+                g = g.clamp(-limit, limit);
             }
             gated[i] = silu(g) * u;
         }
@@ -2052,6 +2107,8 @@ pub fn run_inference_gpu(
         let x_t = Tensor::from_slice(x, (d_model, 1), dev).map_err(map_err)?;
         let g = gate_t.matmul(&x_t).map_err(map_err)?;
         let u = up_t.matmul(&x_t).map_err(map_err)?;
+        // GPT-OSS `swiglu_limit` clamp before silu (no-op otherwise).
+        let g = clamp_swiglu_gate(g).map_err(map_err)?;
         let gated = Tensor::silu(&g).map_err(map_err)?.mul(&u).map_err(map_err)?;
         let y_t = down_t.matmul(&gated).map_err(map_err)?;
         let y_t = y_t.squeeze(1).map_err(map_err)?;
@@ -2341,6 +2398,8 @@ fn forward_qmm(
 
     let g = gate.forward(&x_t).map_err(map_err)?;        // [1, d_ff]
     let u = up.forward(&x_t).map_err(map_err)?;          // [1, d_ff]
+    // GPT-OSS `swiglu_limit` clamp before silu (no-op otherwise).
+    let g = clamp_swiglu_gate(g).map_err(map_err)?;
     let gated = candle_core::Tensor::silu(&g)
         .map_err(map_err)?
         .mul(&u)

@@ -823,6 +823,10 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                     // `norm_topk_prob`) so they reach the per-layer gate.
                     resolved_advanced =
                         crate::model::RealModelConfig::from_hf_config(&hf).advanced;
+                    // GPT-OSS SwiGLU gate clamp: install the process-global
+                    // limit so the expert-FFN hot path applies it (no-op for
+                    // every architecture that leaves `swiglu_limit` unset).
+                    crate::inference::set_swiglu_limit(resolved_advanced.swiglu_limit);
                     // Engine-visible dims (cache + expert namespace + router).
                     cfg.model.d_model = hf.hidden_size;
                     cfg.model.d_ff = hf.resolved_d_ff();

@@ -548,6 +548,21 @@ pub struct MultiHeadSelfAttention {
     /// `1/base^(2i/d)` schedule. Built from the checkpoint's
     /// `rope_scaling` block; `None` keeps the standard rotation.
     pub rope_yarn: Option<YarnRope>,
+    /// Optional additive bias for the Q projection (`attention_bias = true`
+    /// in config, e.g. GPT-OSS), length `num_heads * head_dim`. Added to the
+    /// raw `wq · x` projection before QK-Norm and RoPE. `None` for every
+    /// other architecture (the bias-free default used by every existing
+    /// test).
+    pub bq: Option<Vec<f32>>,
+    /// Optional additive bias for the K projection, length
+    /// `num_kv_heads * head_dim`. See [`Self::bq`].
+    pub bk: Option<Vec<f32>>,
+    /// Optional additive bias for the V projection, length
+    /// `num_kv_heads * head_dim`. See [`Self::bq`].
+    pub bv: Option<Vec<f32>>,
+    /// Optional additive bias for the output projection, length `d_model`.
+    /// Added to the `wo · attn_out` projection. See [`Self::bq`].
+    pub bo: Option<Vec<f32>>,
 }
 
 impl MultiHeadSelfAttention {
@@ -588,6 +603,31 @@ impl MultiHeadSelfAttention {
                 let s = h * self.head_dim;
                 norm.forward_inplace(&mut k[s..s + self.head_dim]);
             }
+        }
+    }
+
+    /// Add the optional Q/K/V projection biases in place (GPT-OSS
+    /// `attention_bias = true`). No-op when the biases are `None`, so every
+    /// bias-free architecture pays nothing. Applied to the raw projection
+    /// outputs *before* QK-Norm and RoPE, matching the HF reference where
+    /// the bias is part of the linear layer.
+    fn apply_qkv_bias(&self, q: &mut [f32], k: &mut [f32], v: &mut [f32]) {
+        if let Some(bq) = self.bq.as_ref() {
+            for (qi, bi) in q.iter_mut().zip(bq.iter()) { *qi += bi; }
+        }
+        if let Some(bk) = self.bk.as_ref() {
+            for (ki, bi) in k.iter_mut().zip(bk.iter()) { *ki += bi; }
+        }
+        if let Some(bv) = self.bv.as_ref() {
+            for (vi, bi) in v.iter_mut().zip(bv.iter()) { *vi += bi; }
+        }
+    }
+
+    /// Add the optional output-projection bias in place (GPT-OSS). No-op
+    /// when `bo` is `None`.
+    fn apply_o_bias(&self, out: &mut [f32]) {
+        if let Some(bo) = self.bo.as_ref() {
+            for (oi, bi) in out.iter_mut().zip(bo.iter()) { *oi += bi; }
         }
     }
 
@@ -661,7 +701,10 @@ impl MultiHeadSelfAttention {
         let mut cpu_forward = || {
             let mut q = matmul_row_major(&self.wq, x, q_dim, self.d_model);
             let mut k = matmul_row_major(&self.wk, x, kv_dim, self.d_model);
-            let v = matmul_row_major(&self.wv, x, kv_dim, self.d_model);
+            let mut v = matmul_row_major(&self.wv, x, kv_dim, self.d_model);
+            // QKV projection biases (GPT-OSS `attention_bias = true`),
+            // added to the raw projections before QK-Norm / RoPE.
+            self.apply_qkv_bias(&mut q, &mut k, &mut v);
             // QK-Norm (Qwen3): per-head RMSNorm on Q and K *before* RoPE.
             self.apply_q_norm(&mut q);
             self.apply_k_norm(&mut k);
@@ -675,7 +718,9 @@ impl MultiHeadSelfAttention {
             }
             kv.append(&k, &v);
             let attn_out = cpu_attend(&q, kv);
-            matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim)
+            let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
+            self.apply_o_bias(&mut out);
+            out
         };
         if !backend.is_gpu() {
             return cpu_forward();
@@ -725,6 +770,12 @@ impl MultiHeadSelfAttention {
         // ── 2) Apply RoPE in f32 (cheap; stays on CPU regardless of backend) ─
         let mut q = to_f32(&q_f16);
         let mut k = to_f32(&k_f16);
+        let mut v = to_f32(&v_f16);
+
+        // QKV projection biases (GPT-OSS `attention_bias = true`), mirror of
+        // the CPU path so GPU and CPU attention agree numerically. Applied to
+        // the raw projections before QK-Norm / RoPE.
+        self.apply_qkv_bias(&mut q, &mut k, &mut v);
 
         // QK-Norm (Qwen3): per-head RMSNorm on Q and K *before* RoPE, mirror
         // of the CPU path so the GPU and CPU attention agree numerically.
@@ -742,13 +793,12 @@ impl MultiHeadSelfAttention {
 
         // ── 3) KV insert + attention ──────────────────────────────────────────
         let k_f16_rope = to_f16(&k);
-        let v_f16_rope = v_f16; // V is not RoPE'd
+        let v_f16_rope = to_f16(&v); // V is not RoPE'd (but carries its bias)
 
         // Generation must advance strictly one token at a time: before we append
         // the new KV for `pos`, the cache length should equal that position.
         debug_assert_eq!(pos, kv.seq_len);
-        let v_for_cpu = to_f32(&v_f16_rope);
-        kv.append(&k, &v_for_cpu);
+        kv.append(&k, &v);
         let seq_len = kv.seq_len;
 
         if backend.kv_cache_insert(
@@ -758,7 +808,9 @@ impl MultiHeadSelfAttention {
             TensorView { data: &v_f16_rope, rows: 1, cols: kv_dim },
         ).is_err() {
             let attn_out = cpu_attend(&q, kv);
-            return matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
+            let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
+            self.apply_o_bias(&mut out);
+            return out;
         }
 
         let q_f16_rope = to_f16(&q);
@@ -779,7 +831,7 @@ impl MultiHeadSelfAttention {
         let attn_f16    = to_f16(&attn_out);
         let mut out_f16 = vec![f16::ZERO; self.d_model];
 
-        if backend.matmul_into(
+        let mut out = if backend.matmul_into(
             TensorView { data: &wo_f16,   rows: self.d_model, cols: q_dim },
             TensorView { data: &attn_f16, rows: q_dim,        cols: 1 },
             &mut TensorViewMut { data: &mut out_f16, rows: self.d_model, cols: 1 },
@@ -787,7 +839,9 @@ impl MultiHeadSelfAttention {
             to_f32(&out_f16)
         } else {
             matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim)
-        }
+        };
+        self.apply_o_bias(&mut out);
+        out
     }
 }
 
@@ -1619,6 +1673,10 @@ mod tests {
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            bq: None,
+            bk: None,
+            bv: None,
+            bo: None,
         };
         let mut kv = KvCache::new(kv_dim);
         let x: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32).collect();
@@ -1660,6 +1718,10 @@ mod tests {
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            bq: None,
+            bk: None,
+            bv: None,
+            bo: None,
         };
         let mut normed = base.clone();
         // Non-unit per-head norm weights so the effect is visible.
@@ -1754,6 +1816,10 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 rope_yarn: None,
+                bq: None,
+                bk: None,
+                bv: None,
+                bo: None,
             },
             mla: None,
             rms_moe: RmsNorm::new(vec![1.0; d_model], 1e-6),
@@ -1842,6 +1908,10 @@ mod tests {
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            bq: None,
+            bk: None,
+            bv: None,
+            bo: None,
         }
     }
 
@@ -2050,6 +2120,10 @@ mod tests {
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            bq: None,
+            bk: None,
+            bv: None,
+            bo: None,
         };
         let mut kv = KvCache::new(kv_dim);
         // Walk past the first block boundary to exercise multi-block

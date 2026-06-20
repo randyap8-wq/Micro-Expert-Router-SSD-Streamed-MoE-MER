@@ -67,16 +67,50 @@ pub fn swiglu_f32(
     cols: usize,
     y: &mut [f32],
 ) {
+    swiglu_f32_clamped(gate_w, up_w, x, rows, cols, y, None)
+}
+
+/// SwiGLU FFN inner stage with an optional gate clamp:
+/// `y[i] = silu(clamp(gate_w[i]·x)) * (up_w[i]·x)`.
+///
+/// When `swiglu_limit` is `Some(limit)` the gate value `g` is clamped to
+/// `[-limit, limit]` before the sigmoid — this is the GPT-OSS
+/// `swiglu_limit` (e.g. `7.0`) behaviour. `None` reproduces the plain
+/// SwiGLU used by every other architecture, with no per-element branch in
+/// the unclamped loop. Writes into the caller-provided `y` (no allocation).
+#[inline]
+pub fn swiglu_f32_clamped(
+    gate_w: &[f32],
+    up_w: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    y: &mut [f32],
+    swiglu_limit: Option<f32>,
+) {
     debug_assert_eq!(gate_w.len(), rows * cols);
     debug_assert_eq!(up_w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
     debug_assert_eq!(y.len(), rows);
-    for row in 0..rows {
-        let off = row * cols;
-        let g = dot_f32(&gate_w[off..off + cols], x);
-        let u = dot_f32(&up_w[off..off + cols], x);
-        let silu_g = g / (1.0 + (-g).exp());
-        y[row] = silu_g * u;
+    match swiglu_limit {
+        Some(limit) => {
+            for row in 0..rows {
+                let off = row * cols;
+                let g = dot_f32(&gate_w[off..off + cols], x).clamp(-limit, limit);
+                let u = dot_f32(&up_w[off..off + cols], x);
+                let silu_g = g / (1.0 + (-g).exp());
+                y[row] = silu_g * u;
+            }
+        }
+        None => {
+            for row in 0..rows {
+                let off = row * cols;
+                let g = dot_f32(&gate_w[off..off + cols], x);
+                let u = dot_f32(&up_w[off..off + cols], x);
+                let silu_g = g / (1.0 + (-g).exp());
+                y[row] = silu_g * u;
+            }
+        }
     }
 }
 
@@ -96,5 +130,32 @@ mod tests {
         let q = [1i8, -2, 3];
         let x = [1.0f32, 1.0, 1.0];
         assert!((dequant_int8_dot(0.5, &q, &x) - (1.0 - 2.0 + 3.0) * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn swiglu_f32_applies_limit() {
+        // gate value of 100.0 should be clamped to 7.0 before silu
+        let gate_w = [1.0f32]; // dot with x=[100.0] → g=100.0
+        let up_w = [1.0f32]; // u = 100.0
+        let x = [100.0f32];
+        let mut y = [0.0f32];
+        swiglu_f32_clamped(&gate_w, &up_w, &x, 1, 1, &mut y, Some(7.0));
+        let g_clamped = 7.0f32;
+        let silu_7 = g_clamped / (1.0 + (-g_clamped).exp());
+        let expected = silu_7 * 100.0;
+        assert!((y[0] - expected).abs() < 1e-5, "got {}, expected {}", y[0], expected);
+    }
+
+    #[test]
+    fn swiglu_f32_no_limit_unchanged() {
+        // Without a limit, behaviour is identical to the existing implementation.
+        let gate_w = [2.0f32];
+        let up_w = [3.0f32];
+        let x = [1.0f32];
+        let mut y_limited = [0.0f32];
+        let mut y_unlimited = [0.0f32];
+        swiglu_f32_clamped(&gate_w, &up_w, &x, 1, 1, &mut y_limited, None);
+        swiglu_f32(&gate_w, &up_w, &x, 1, 1, &mut y_unlimited);
+        assert!((y_limited[0] - y_unlimited[0]).abs() < 1e-7);
     }
 }

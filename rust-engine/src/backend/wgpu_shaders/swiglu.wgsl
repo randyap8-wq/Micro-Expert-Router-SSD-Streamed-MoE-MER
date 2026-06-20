@@ -16,6 +16,11 @@ fn swiglu_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (idx < pc.n_elements) {
         let g = gate[idx];
         let u = up[idx];
+        // TODO: apply swiglu_limit (GPT-OSS) in WGSL. The CPU path clamps
+        // `g` to [-limit, limit] before the sigmoid; replicating it here
+        // needs the limit threaded in as a push constant / uniform, which
+        // would require a pipeline rebuild. The GPU compute path is not used
+        // in production yet, so the clamp is applied on the CPU path only.
         let silu_g = g / (1.0 + exp(-g));
         out[idx] = silu_g * u;
     }
