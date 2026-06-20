@@ -110,7 +110,9 @@ struct MatmulPushConstants {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct SwigluPushConstants {
     n_elements: u32,
-    _pad0: u32,
+    /// GPT-OSS SwiGLU gate clamp threshold. `+inf` disables the clamp
+    /// (`clamp(g, -inf, inf)` is a bit-exact no-op), matching the CPU path.
+    swiglu_limit: f32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -1077,7 +1079,9 @@ impl GpuBackend {
             cpass.set_pipeline(&self.swiglu_pipeline);
             cpass.set_bind_group(0, &swiglu_bg, &[]);
             cpass.set_push_constants(0, bytemuck::bytes_of(&SwigluPushConstants {
-                n_elements: d_ff as u32, _pad0: 0, _pad1: 0, _pad2: 0,
+                n_elements: d_ff as u32,
+                swiglu_limit: crate::inference::swiglu_limit().unwrap_or(f32::INFINITY),
+                _pad1: 0, _pad2: 0,
             }));
             let wg_x = (d_ff as u32 + 255) / 256;
             cpass.dispatch_workgroups(wg_x, 1, 1);
@@ -1256,7 +1260,7 @@ impl Backend for GpuBackend {
         // Dispatch
         let pcs = SwigluPushConstants {
             n_elements: len as u32,
-            _pad0: 0,
+            swiglu_limit: crate::inference::swiglu_limit().unwrap_or(f32::INFINITY),
             _pad1: 0,
             _pad2: 0,
         };
@@ -1611,8 +1615,15 @@ impl Backend for CandleBackend {
         assert_eq!(up.data.len(), len);
         assert_eq!(out.data.len(), len);
 
+        // Apply the GPT-OSS gate clamp when active so this backend matches
+        // both the GPU `swiglu.wgsl` path and the production CPU FFN kernel
+        // (`kernels::scalar::swiglu_f32_clamped`). `None` is a no-op.
+        let limit = crate::inference::swiglu_limit();
         for i in 0..len {
-            let g = gate.data[i].to_f32();
+            let mut g = gate.data[i].to_f32();
+            if let Some(l) = limit {
+                g = g.clamp(-l, l);
+            }
             let u = up.data[i].to_f32();
             let silu_g = g / (1.0 + (-g).exp());
             out.data[i] = half::f16::from_f32(silu_g * u);
