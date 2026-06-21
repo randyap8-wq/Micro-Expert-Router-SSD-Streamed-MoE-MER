@@ -688,7 +688,7 @@ impl MultiHeadSelfAttention {
 
     /// Project a single token embedding `x` into this layer's
     /// cache-ready **K** and **V** vectors at absolute position `pos`:
-    /// `wk`/`wv` matmul, optional QKV bias, optional K QK-Norm, and
+    /// `wk`/`wv` matmul, optional K/V bias, optional K QK-Norm, and
     /// RoPE on K over the partial `rope_dim` with optional YaRN scaling
     /// — exactly the steps [`Self::forward`] performs before
     /// `kv.append`. V is returned at its full `v_proj_dim()` width

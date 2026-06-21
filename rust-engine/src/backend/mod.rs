@@ -1416,41 +1416,20 @@ impl Backend for GpuBackend {
 
     fn kv_cache_insert(
         &self,
-        layer: usize,
-        position: usize,
-        k: TensorView,
-        v: TensorView,
+        _layer: usize,
+        _position: usize,
+        _k: TensorView,
+        _v: TensorView,
     ) -> Result<()> {
-        let k_len = k.data.len();
-        let v_len = v.data.len();
-
-        let mut scratch = self.conversion_scratch.lock();
-        assert!(k_len <= scratch.len());
-        assert!(v_len <= scratch.len());
-
-        // Upload K
-        for i in 0..k_len {
-            scratch[i] = k.data[i].to_f32();
-        }
-        let offset_k = self.kv_cache.offset_bytes(layer, 0, position);
-        self.queue.write_buffer(
-            &self.kv_cache.buffer,
-            offset_k,
-            bytemuck::cast_slice(&scratch[..k_len]),
-        );
-
-        // Upload V
-        for i in 0..v_len {
-            scratch[i] = v.data[i].to_f32();
-        }
-        let offset_v = self.kv_cache.offset_bytes(layer, 1, position);
-        self.queue.write_buffer(
-            &self.kv_cache.buffer,
-            offset_v,
-            bytemuck::cast_slice(&scratch[..v_len]),
-        );
-
-        Ok(())
+        // The VRAM KV cache is process-wide and addressed only by
+        // `(layer, position)`. BatchScheduler can run multiple requests at
+        // the same position concurrently against this backend, so using the
+        // GPU KV path would let those requests overwrite each other's slots.
+        // Fail safely and let transformer.rs use its per-request CPU KvCache
+        // until the GPU cache grows a request/session namespace.
+        anyhow::bail!(
+            "GPU KV cache is disabled because it is not request-isolated under concurrent batching"
+        )
     }
 
     fn kv_attend(

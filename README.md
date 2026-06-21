@@ -26,7 +26,7 @@ substrate that makes that trade-off observable and measurable.
 
 The engine lives under [`rust-engine/`](./rust-engine).
 
-### Supported model families
+## Supported model families
 
 The loader is **architecture-aware**: point it at a HuggingFace
 `.safetensors` checkpoint and the engine auto-detects the family from its
