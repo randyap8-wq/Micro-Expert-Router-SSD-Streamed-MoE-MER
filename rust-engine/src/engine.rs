@@ -52,13 +52,6 @@ use tracing::{debug, info, warn};
 /// snapshot path without re-allocating into a new aligned region.
 pub const KV_CACHE_BLOCK_ALIGN: usize = 4096;
 
-/// Default rolling-window capacity (in tokens) for [`AlignedKvCache`].
-/// Once `seq_len` reaches this value an `append` evicts the oldest
-/// token and shifts the tail down — the standard sliding-window
-/// transformer attention pattern. Zero means "unbounded": the cache
-/// will keep growing until the host runs out of memory.
-pub const KV_CACHE_DEFAULT_WINDOW_TOKENS: usize = 4096;
-
 /// Decompose a **global** expert id into its `(layer, layer-local)`
 /// pair given a layer-qualified geometry of `per_layer` experts each
 /// (`global = layer * per_layer + local`). The inverse of
@@ -168,21 +161,6 @@ impl AlignedKvCache {
     #[inline]
     pub fn window_tokens(&self) -> usize {
         self.window_tokens
-    }
-
-    /// Hidden dimension per row.
-    #[inline]
-    pub fn kv_dim(&self) -> usize {
-        self.kv_dim
-    }
-
-    /// Dtype hint describing the model's hidden-layer K/V layout.
-    /// The cache stores rows as `f32`; callers in the attention path
-    /// use this to confirm no cast is required (and panic / log when
-    /// the hint disagrees with the model config).
-    #[inline]
-    pub fn kv_dtype(&self) -> WeightDtype {
-        self.kv_dtype
     }
 
     /// Page-aligned base address of the key buffer (for `O_DIRECT`
@@ -409,9 +387,8 @@ impl Drop for SingleflightLeaderGuard {
     }
 }
 
-/// Boot-time engine error. Returned by helpers like
-/// [`Engine::verify_manifest_dtype`] that run startup-only invariant
-/// checks the synchronous `Engine::new` constructor doesn't perform.
+/// Boot-time engine error reserved for startup-only invariant checks
+/// the synchronous `Engine::new` constructor doesn't perform.
 #[derive(Debug)]
 pub enum EngineError {
     /// The cold-start manifest observed at least two experts whose
@@ -422,8 +399,7 @@ pub enum EngineError {
     /// per-token math kernel.
     IncompatibleExpertTypes(crate::io_provider::IncompatibleExpertTypes),
     /// The manifest indexed experts whose unique on-disk dtype does
-    /// not match the engine's configured `WeightDtype`. Surfaced by
-    /// [`Engine::verify_manifest_dtype`].
+    /// not match the engine's configured `WeightDtype`.
     ManifestDtypeMismatch {
         expected: WeightDtype,
         found: WeightDtype,
@@ -999,14 +975,6 @@ pub(crate) struct EngineCore {
     /// fire-and-forget.
     pub(super) gpu_promotion_tx:
         Option<tokio::sync::mpsc::UnboundedSender<(u32, Arc<ExpertResident>)>>,
-    /// Optional persistent, page-aligned KV cache attached at
-    /// construction time via [`Engine::with_kv_cache`]. Lives on
-    /// `EngineCore` (gist feedback #2.4 — complete the I/O-runtime
-    /// split) alongside the other I/O-runtime fields the synthetic
-    /// `generate` path doesn't append to (no real attention runs at
-    /// this layer in the benchmark configuration), but the
-    /// real-transformer / server path does — see `server.rs`.
-    pub(super) kv_cache: Option<Arc<Mutex<AlignedKvCache>>>,
     /// In-flight read singleflight (gist Phase 1 — SSD Read
     /// De-Duplication). Lives on `EngineCore` (gist feedback #2.4)
     /// because it is part of the I/O-runtime infrastructure that
@@ -1280,7 +1248,6 @@ impl EngineCore {
             options,
             gpu_cache: None,
             gpu_promotion_tx: None,
-            kv_cache: None,
             in_flight: Arc::new(DashMap::new()),
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
             // Default to the CPU backend; `install_gpu_cache` swaps in a
@@ -1525,15 +1492,6 @@ impl Engine {
         }
     }
 
-    /// Attach a persistent, page-aligned KV cache (one per session
-    /// when called from a session-aware server path). The cache is
-    /// owned by the engine and its window / kv_dim are immutable.
-    /// Returns `self` for builder-style chaining.
-    pub fn with_kv_cache(mut self, cache: AlignedKvCache) -> Self {
-        self.core.kv_cache = Some(Arc::new(Mutex::new(cache)));
-        self
-    }
-
     /// Whether the configured expert dtype is eligible for the GPU
     /// `Backend::expert_matmul` fast path. F32 always qualifies. Q4_0
     /// qualifies only when both `d_model` and `d_ff` are
@@ -1672,8 +1630,7 @@ impl Engine {
         // Phase 3: try to bring up a real `GpuBackend` now that a
         // `GpuExpertCache` is available. The `num_layers`/`max_seq_len`/
         // `num_heads`/`head_dim` parameters drive `GpuKvCache` sizing,
-        // which is **not** on the expert-FFN dispatch path; the engine
-        // already owns its own KV cache (see `EngineCore::kv_cache`).
+        // which is **not** on the expert-FFN dispatch path.
         // `BackendBox::init_blocking` returns `BackendBox::Cpu`
         // automatically when no adapter is present, so this never
         // panics.
@@ -1686,11 +1643,6 @@ impl Engine {
             gpu,
         );
         self.core.backend = Arc::new(backend);
-    }
-
-    /// Borrow the engine's VRAM (GPU) expert cache, if any.
-    pub fn gpu_cache(&self) -> Option<Arc<GpuExpertCache>> {
-        self.core.gpu_cache.clone()
     }
 
     /// **Test-only** wiring of the GPU promotion channel without
@@ -1715,75 +1667,6 @@ impl Engine {
         self.core.gpu_cache = Some(gpu);
         self.core.gpu_promotion_tx = Some(tx);
         rx
-    }
-
-    /// Borrow the engine's KV cache, if any. Callers acquire the
-    /// inner `parking_lot::Mutex` to read or append.
-    pub fn kv_cache(&self) -> Option<Arc<Mutex<AlignedKvCache>>> {
-        self.core.kv_cache.clone()
-    }
-
-    /// Append `(k, v)` to the persistent KV cache. No-op (returns
-    /// `Ok(false)`) when no cache is attached. The boolean return
-    /// value mirrors [`AlignedKvCache::append`]: `true` ⇔ the
-    /// rolling window evicted its oldest token to make room.
-    pub fn kv_cache_append(&self, k: &[f32], v: &[f32]) -> bool {
-        match &self.core.kv_cache {
-            Some(c) => c.lock().append(k, v),
-            None => false,
-        }
-    }
-
-    /// Reset the persistent KV cache (drop every resident token but
-    /// keep the page-aligned allocation). No-op when no cache is
-    /// attached. Called by the session-delete path before the engine
-    /// state is swapped for a new tenant.
-    pub fn reset_kv_cache(&self) {
-        if let Some(c) = &self.core.kv_cache {
-            c.lock().zeroize();
-        }
-    }
-
-    /// Number of tokens currently resident in the persistent KV
-    /// cache, or `0` when no cache is attached.
-    pub fn kv_cache_seq_len(&self) -> usize {
-        self.core.kv_cache
-            .as_ref()
-            .map(|c| c.lock().seq_len())
-            .unwrap_or(0)
-    }
-
-    /// Cross-check a cold-start manifest against the engine's
-    /// configured dtype. Returns:
-    ///
-    /// * `Ok(Some(dtype))` if every indexed expert agrees on a
-    ///   single on-disk dtype, **and** that dtype matches the
-    ///   engine's configured `WeightDtype`. The returned dtype is
-    ///   guaranteed to be the one the dispatch table will use.
-    /// * `Ok(None)` if the manifest is empty or holds only legacy
-    ///   bare-payload files (no UTH dtype to verify against).
-    /// * `Err(EngineError::IncompatibleExpertTypes)` if the
-    ///   manifest indexed at least two experts whose dtypes
-    ///   disagree, **or** if the unique dtype in the manifest
-    ///   doesn't match `expected_dtype`. The engine refuses to
-    ///   serve traffic in either case.
-    ///
-    /// This is the runtime hook that backs the gist's "verify the
-    /// manifest invariant on engine startup" requirement; it's a
-    /// constant-time iteration over the already-resident manifest
-    /// (no I/O).
-    pub fn verify_manifest_dtype(
-        manifest: &crate::io_provider::Manifest,
-        expected_dtype: WeightDtype,
-    ) -> Result<Option<WeightDtype>, EngineError> {
-        match manifest.verify_uniform_dtype()? {
-            None => Ok(None),
-            Some(d) if d == expected_dtype => Ok(Some(d)),
-            Some(d) => Err(EngineError::ManifestDtypeMismatch {
-                expected: expected_dtype,
-                found: d,
-            }),
-        }
     }
 
     /// Install a JSONL routing trace sink. Every subsequent
@@ -1901,10 +1784,6 @@ impl Engine {
             }
         }
         id
-    }
-
-    pub fn shape(&self) -> ModelShape {
-        self.core.shape
     }
 
     /// Total number of distinct experts the engine's router can
@@ -2768,11 +2647,6 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 Err(e) => warn!(expert = id, error = %e, "prefetch failed"),
             }
         });
-    }
-
-    /// Account for the fact that an expert was a hit *because* we prefetched it.
-    pub fn note_prefetch_hit(&self) {
-        self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A speculative prefetch was dropped because no pool buffer could

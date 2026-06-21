@@ -461,21 +461,11 @@ impl BlockPool {
         self.utilization() >= self.thresholds.high
     }
 
-    /// Currently configured back-pressure thresholds.
-    pub fn thresholds(&self) -> PressureThresholds {
-        self.thresholds
-    }
-
     /// Total physical capacity of the **primary** slab, in blocks
     /// (constant for the pool's lifetime). The overflow slab is
     /// reported separately by [`Self::overflow_in_use`].
     pub fn capacity(&self) -> usize {
         self.capacity
-    }
-
-    /// Per-block embedding width (one of K or V; the other is identical).
-    pub fn kv_dim(&self) -> usize {
-        self.kv_dim
     }
 
     /// Write the `(k, v)` pair for one token into block `id` at

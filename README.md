@@ -5,9 +5,9 @@ router resident in RAM and **hot-swaps individual experts on demand** from a
 PCIe-attached NVMe drive into a pool of pre-allocated, page-aligned RAM
 buffers using **`O_DIRECT`** positional reads (`pread(2)` via
 `tokio::task::block_in_place`, kernel-page-cache bypass). Each routed
-expert then **executes a real Mixtral / Llama-style
-SwiGLU FFN forward pass** directly over the bytes that just arrived from the
-drive.
+expert then **executes a real SwiGLU FFN forward pass** — the Mixtral /
+Llama expert shape shared by every supported family — directly over the
+bytes that just arrived from the drive.
 
 The premise is straightforward: a **modern PCIe-4 / 5 NVMe SSD sustains
 6-14 GB/s** of sequential read; a single Mixtral-8x7B expert is
@@ -18,12 +18,32 @@ therefore costs a small fraction of a second of I/O per MoE layer, and
 is 10-100× DRAM. Quantisation is what makes the trade-off practical
 on real models: 4-bit weights cut SSD bytes per token by ~3.5× vs bf16
 and let a single PCIe-4 NVMe sustain interactive token rates on
-Mixtral-class checkpoints. So you can run much larger models on much
+modern MoE checkpoints (Mixtral, Qwen3-MoE, DeepSeek-V3, MiMo-V2-Flash,
+GPT-OSS, …). So you can run much larger models on much
 more modest hardware by treating the SSD as the main weight store and
 DRAM as a small cache of *active* experts. This engine is the
 substrate that makes that trade-off observable and measurable.
 
 The engine lives under [`rust-engine/`](./rust-engine).
+
+### Supported model families
+
+The loader is **architecture-aware**: point it at a HuggingFace
+`.safetensors` checkpoint and the engine auto-detects the family from its
+`config.json`, remaps every tensor name and hyperparameter, and runs the
+unified dense + SSD-streamed-MoE forward path — no hand-edited config
+required. Supported families:
+
+* **Mixtral 8x7B / 8x22B** (`mixtral`) — the original, fully-streamed MoE path.
+* **Qwen3-MoE** (`qwen3_moe`) + **Qwen3 dense** (`qwen3`) — `mlp.experts.*` names, QK-Norm attention.
+* **DeepSeek-V3 / V3.1** (`deepseek_v3`) — MLA latent-KV attention, FP8 `e4m3` weights, shared expert, sigmoid grouped-top-K routing, `first_k_dense_replace` dense prefix.
+* **Xiaomi MiMo-V2-Flash** (`mimo_v2_flash`) + **OpenAI GPT-OSS 20B / 120B** (`gpt_oss`) — per-layer **hybrid** sliding-window / global attention.
+* **Mistral Small 3** (`mistral3`) + **Phi-4** (`phi3`) — dense decoders (fused QKV / gate-up split at load).
+
+Mixtral remains the canonical streamed example (and the model behind the
+benchmark below), but it is no longer the only target. See
+[Supported model architectures](#supported-model-architectures) for the
+per-family tensor schemas, routing and attention details.
 
 ---
 
@@ -67,6 +87,7 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
 
 ## Table of Contents
 
+- [Supported model families](#supported-model-families)
 - [Benchmark Results](#-benchmark-results-endurance-scaling)
 - [What it actually does](#what-it-actually-does)
   - [End-to-end pipeline](#end-to-end-pipeline)
@@ -96,7 +117,7 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
   - [Sample output](#sample-output)
     - [Enabling the predictive prefetcher (and A/B testing it)](#enabling-the-predictive-prefetcher-and-ab-testing-it)
   - [CLI reference](#cli-reference)
-  - [Running on real Mixtral weights](#running-on-real-mixtral-weights)
+  - [Running on real MoE weights](#running-on-real-moe-weights)
   - [Routing model, Markov chain, transition matrix, or LinearGate](#routing-model-markov-chain-transition-matrix-or-lineargate)
   - [macOS](#macos)
 - [What can it actually run today?](#what-can-it-actually-run-today)
@@ -108,7 +129,7 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
   - [GPU promotion regression test](#gpu-promotion-regression-test)
 - [Energy Efficiency Features](#energy-efficiency-features)
   - [1. On-disk quantization (`--dtype`)](#1-on-disk-quantization---dtype)
-  - [Persistent, page-aligned KV cache](#persistent-page-aligned-kv-cache)
+  - [Page-aligned KV cache buffer](#page-aligned-kv-cache-buffer)
   - [Cold-start manifest](#cold-start-manifest)
   - [2. 2nd-order Markov + gate-lookahead prefetching](#2-2nd-order-markov--gate-lookahead-prefetching)
   - [3. Partial weight loading (`--partial-load-fraction`)](#3-partial-weight-loading---partial-load-fraction)
@@ -125,7 +146,7 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
 
 ## What it actually does
 
-A standard Mixtral-style transformer activates only `K` of `N` experts per
+A sparse Mixture-of-Experts (MoE) transformer activates only `K` of `N` experts per
 token (e.g. `K=2`, `N=64`). For inference on hardware whose DRAM cannot hold
 all `N` experts you have two options:
 
@@ -409,7 +430,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 
 | Module | Responsibility |
 |---|---|
-| `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. Reused by [`AlignedKvCache`](#persistent-page-aligned-kv-cache) so the session-scoped K/V state can be snapshotted to NVMe with no extra copy. |
+| `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. Reused by [`AlignedKvCache`](#page-aligned-kv-cache-buffer) so the session-scoped K/V state can be snapshotted to NVMe with no extra copy. |
 | `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s, optionally split into **primary** + **shadow** halves sharing one `Notify`. Hands out `PooledBuffer` RAII guards; `try_acquire`/`try_acquire_shadow` route to the corresponding free list; dropping a guard returns the buffer to its originating list and wakes waiters. `promote_shadow` does the zero-copy slot-tag swap when a speculative prefetch is confirmed. The literal "pre-allocated RAM buffer" the spec asks for. |
 | `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. **Now wired into the engine hot path** (gist Part 1 fix #2): `EngineCore::cache` is an `Arc<MultiLayerExpertCache>` and `run`/`serve` distribute `--cache-slots` across `num_layers` (uniform per-layer caps via `MultiLayerExpertCache::with_capacities`, with any remainder going to the lowest-indexed layers). Single-layer / `--io-only` mode collapses to `MultiLayerExpertCache::single_layer(cap)` so existing benchmark paths are byte-identical. |
@@ -425,8 +446,8 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
 | `tokenizer` | HuggingFace `tokenizers` crate when the `tokenizer` cargo feature is enabled and a `tokenizer.json` is configured; deterministic byte-level fallback otherwise. |
 | `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. TTL-driven `evict_expired` now zeroizes each expired session's KV buffers **before** the `Arc<SessionState>` is dropped (gist Part 1 fix #1) so residual user context cannot survive in freed heap pages; `delete` does the same on explicit removal. |
-| `batch_scheduler` | **Continuous batching + multi-tenant fair-share.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. Each batched step starts with a **peek/warm pre-pass** that calls `RealModel::peek_experts` for every request, unions the predicted expert ids, and fires one `engine.warm_with(&ids)` so the NVMe sees one read per unique expert across the entire batch (gist Phase 1). Registered sessions carry a **`SessionClass`** (`Interactive` weight 4, `Audit` weight 1) consumed by the **Weighted Round-Robin admission policy** so an Audit flood cannot starve Interactive callers, plus a monotonic `last_activity_us` timestamp used by **`evict_idle_blocks`** to reclaim KV blocks from sessions idle ≥ `idle_eviction_threshold` (default 5 s) when the pool crosses its soft-cap. Under `PressureLevel::Critical` the scheduler suspends the shared `SpeculationController` so prefetch depth is clamped to zero. |
-| `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. Also home to [`AlignedKvCache`](#persistent-page-aligned-kv-cache), a session-scoped, page-aligned, rolling-window K/V buffer attached via `Engine::with_kv_cache`. `spawn_prefetch` is **bounded** by a `tokio::sync::Semaphore` sized from `EngineOptions::max_concurrent_prefetches` (default 64, configurable via `[real_transformer].max_concurrent_prefetches`, gist Part 1 fix #3): an owned permit is acquired *before* `tokio::spawn`, so the bound is enforced before any task work happens; refusals bump `Counters::prefetch_dropped_concurrency` (also surfaced on `EngineReport`). `Engine::fetch_once` likewise bounds its `tokio::task::yield_now()` spin loop at `EngineOptions::max_fetch_yields` (default 128, configurable via `[real_transformer].max_fetch_yields`, gist feedback #1.3): when the cache is full of pinned residents and no `PooledBuffer` frees within the budget, `fetch_once` returns `FetchOnceError::PoolStarved` instead of yielding indefinitely. |
+| `batch_scheduler` | **Continuous batching + multi-tenant fair-share.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. Each batched step starts with a **peek/warm pre-pass** that calls `RealModel::peek_experts` for every request, unions the predicted expert ids, and fires one `engine.warm_with(&ids)` so the NVMe sees one read per unique expert across the entire batch (gist Phase 1). Registered sessions carry a **`SessionClass`** (`Interactive` weight 4, `Audit` weight 1) consumed by the **Weighted Round-Robin admission policy** so an Audit flood cannot starve Interactive callers, plus a monotonic `last_activity_us` timestamp the scheduler loop uses to **reclaim KV blocks** from sessions idle ≥ `idle_eviction_threshold` (default 5 s) when the pool crosses its soft-cap. Under `PressureLevel::Critical` the scheduler suspends the shared `SpeculationController` so prefetch depth is clamped to zero. |
+| `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. `spawn_prefetch` is **bounded** by a `tokio::sync::Semaphore` sized from `EngineOptions::max_concurrent_prefetches` (default 64, configurable via `[real_transformer].max_concurrent_prefetches`, gist Part 1 fix #3): an owned permit is acquired *before* `tokio::spawn`, so the bound is enforced before any task work happens; refusals bump `Counters::prefetch_dropped_concurrency` (also surfaced on `EngineReport`). `Engine::fetch_once` likewise bounds its `tokio::task::yield_now()` spin loop at `EngineOptions::max_fetch_yields` (default 128, configurable via `[real_transformer].max_fetch_yields`, gist feedback #1.3): when the cache is full of pinned residents and no `PooledBuffer` frees within the budget, `fetch_once` returns `FetchOnceError::PoolStarved` instead of yielding indefinitely. |
 | `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`, `Q8_0`. Two readers ship side-by-side: `GgufFile::open` (eager, slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming, keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Both implement the `GgufSource` trait so the loader is reader-agnostic. |
 | `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q8_0` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files for the 4-bit dtypes, ~4× smaller for `Q8_0`; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
 | `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
@@ -1056,7 +1077,7 @@ compute overlap. The knobs live under `[real_transformer]`:
 ```toml
 max_batch_size            = 8     # max concurrent requests fused per step (1 disables batching)
 batch_timeout_ms          = 5     # how long to wait for more requests to join a partial batch
-idle_eviction_threshold_ms = 5000 # idle-cutoff for evict_idle_blocks under pool pressure (default 5 s)
+idle_eviction_threshold_ms = 5000 # idle-cutoff for the scheduler's idle-eviction pass under pool pressure (default 5 s)
 speculation_base_depth     = 1    # baseline prefetch depth in tokens-ahead (grows to base+2 under SSD stall)
 max_concurrent_prefetches  = 64   # gist Part 1 fix #3, semaphore ceiling for engine.spawn_prefetch (refusals bump `prefetch_dropped_concurrency`)
 max_fetch_yields           = 128  # gist feedback #1.3, bound on `tokio::yield_now` spins in `Engine::fetch_once` before returning `FetchOnceError::PoolStarved`
@@ -1074,7 +1095,7 @@ one Interactive + N Audit sessions still leaves Interactive with
 regardless of how many Audit streams are running.
 
 The scheduler additionally tracks each session's monotonic
-`last_activity_us` and runs **`evict_idle_blocks(idle_threshold)`**
+`last_activity_us` and runs an **idle-eviction pass**
 whenever the `BlockPool` crosses its soft-cap (90 % primary
 utilisation). Sessions idle for ≥ `idle_eviction_threshold_ms` have
 their attached `BlockManager` dropped, returning every block to the
@@ -1083,7 +1104,7 @@ chat sessions retain their KV memory under pressure.
 
 Under `BlockPool::PressureLevel::Critical` (≥ 98 % primary
 utilisation) the scheduler **suspends the shared
-`SpeculationController`**, clamping `current_speculation_depth()` to
+`SpeculationController`**, clamping the **speculation depth** to
 0. The controller stays suspended through `High` (≥ 90 %) and only
 resumes when the pool reverts to `Normal` — resuming at `High` would
 oscillate the pool straight back into `Critical`. Once resumed,
@@ -1699,10 +1720,11 @@ micro-expert-router monitor          # requires `--features tui` (on by default)
   --refresh-ms <MS>          Dashboard refresh interval (default 500).
 ```
 
-### Running on real Mixtral weights
+### Running on real MoE weights
 
-There are **three** ways to feed real Mixtral / Llama-MoE weights into
-the engine, depending on what format you have them in:
+There are **three** ways to feed real MoE weights (Mixtral / Llama-MoE,
+Qwen3-MoE, DeepSeek-V3, …) into the engine, depending on what format you
+have them in:
 
 **1. From a Hugging Face checkpoint (per-expert `.bin` files).**
 `scripts/extract_mixtral_experts.py` dumps a transformer layer's expert
@@ -1799,6 +1821,14 @@ auto-detection from a `config.json` in `weights_dir` (which also remaps
 all hyperparameters, so a real checkpoint loads without hand-editing the
 TOML `[model]` section). An **unrecognised** architecture is a hard
 error — the engine never silently mislabels a checkpoint.
+
+Every family below **executes** through the unified forward path:
+`Architecture::compute_support()` returns `Supported` for all of them, so
+none are refused at compute time. *Full* marks the original, battle-tested
+streamed path; *Loadable* marks families that load and run but are newer
+and have had less end-to-end validation against published checkpoints;
+*(dense)* marks models with no MoE layers (they run but do not exercise
+SSD expert streaming).
 
 | Family | `model_type` | Status | Notes |
 |---|---|---|---|
@@ -1984,8 +2014,9 @@ for clean numbers.
 
 ## What can it actually run today?
 
-**Today, in this repository: a real Mixtral / Llama-style transformer
-forward pass with weights streamed from NVMe.** When
+**Today, in this repository: a real, architecture-aware MoE transformer
+forward pass with experts streamed from NVMe** — Mixtral, Qwen3-MoE,
+DeepSeek-V3 (MLA), MiMo-V2-Flash and GPT-OSS all run the same path. When
 `[real_transformer].enabled = true` the server runs the full decoder
 
 ```
@@ -2020,7 +2051,7 @@ What is **still synthetic by default**:
   matrix via `--router-matrix`). When `[real_transformer]` is enabled
   routing instead goes through the per-layer learned `LinearGate`
   driven by the actual hidden state, the same `softmax`-over-gate-
-  logits a real Mixtral implementation uses. The Markov path stays
+  logits a real MoE implementation uses. The Markov path stays
   available for benchmarks where you want a fixed, reproducible
   routing distribution independent of the model weights.
 - **Combining** uses the gate's softmax probabilities as weights on
@@ -2042,11 +2073,12 @@ while the matmul + `silu` activation use Candle's built-in kernels.
 Swapping in a different backend (e.g. a GPU-enabled Candle build, or
 `tch` / `cudarc`) is a localised change inside `inference.rs`.
 
-Real Mixtral expert weights can already be fed to the engine end-to-end
-via [`scripts/extract_mixtral_experts.py`](./scripts/extract_mixtral_experts.py),
-which dumps a single layer's experts into the on-disk format the
-engine expects (plus a `metadata.json` that `run` auto-loads). See
-[Running on real Mixtral weights](#running-on-real-mixtral-weights).
+Real MoE expert weights can already be fed to the engine end-to-end
+via [`scripts/extract_mixtral_experts.py`](./scripts/extract_mixtral_experts.py)
+(architecture-aware despite the name — Mixtral, Qwen3-MoE and DeepSeek
+schemas are auto-detected), which dumps a layer's experts into the
+on-disk format the engine expects (plus a `metadata.json` that `run`
+auto-loads). See [Running on real MoE weights](#running-on-real-moe-weights).
 
 That said, the architecture (per-expert files, fixed expert size,
 top-K activation, LRU + prefetch) is shaped specifically for **sparse
@@ -2353,34 +2385,28 @@ additionally avoids the `O(d_model · d_ff)` dequantise write per
 forward pass, which is the largest L1/L2 win on the hot per-token
 critical path.
 
-### Persistent, page-aligned KV cache
+### Page-aligned KV cache buffer
 
-Multi-call chat / completion sessions need to retain attention
-context across `Engine::generate` calls so the prefix isn't
-recomputed on every token. `engine::AlignedKvCache` is a
-session-scoped K/V buffer backed by [`AlignedBuffer`](#architecture)
-(4096-byte page-aligned) so the K/V bytes are cheap to spill to an
-`O_DIRECT` snapshot file or share with `io_uring`'s registered
-fixed buffers without any rebuffering.
+`engine::AlignedKvCache` is a rolling-window, page-aligned K/V buffer
+backed by [`AlignedBuffer`](#architecture) (4096-byte aligned) so the K/V
+bytes are cheap to spill to an `O_DIRECT` snapshot file or share with
+`io_uring`'s registered fixed buffers without any rebuffering.
 
 Key properties:
 
-* **Rolling window.** Once `seq_len` reaches `window_tokens` (default
-  `KV_CACHE_DEFAULT_WINDOW_TOKENS = 4096`), `append` evicts the oldest
-  K/V row and writes the new one at the tail. Memory is bounded at
-  `2 · window_tokens · kv_dim · 4` bytes per session.
+* **Rolling window.** Once `seq_len` reaches its `window_tokens` bound,
+  `append` evicts the oldest K/V row and writes the new one at the tail.
+  Memory is bounded at `2 · window_tokens · kv_dim · 4` bytes.
 * **Page-aligned base.** `keys_ptr() % 4096 == 0` is an invariant
   enforced by [`AlignedBuffer`].
-* **Zero-on-reset.** `reset_kv_cache()` calls `zeroize()` so a
-  subsequent allocation that lands in the same heap region cannot
-  observe the previous tenant's state.
-* **Mounted on `Engine`** via the builder method `Engine::with_kv_cache`.
-  Accessors are `Engine::kv_cache()`, `Engine::kv_cache_append(k, v)`,
-  `Engine::kv_cache_seq_len()`, and `Engine::reset_kv_cache()`.
+* **Zero-on-reset.** `reset` calls `zeroize()` so a subsequent allocation
+  that lands in the same heap region cannot observe the previous tenant's
+  state.
 
-This complements the per-layer paged KV cache in `transformer.rs`
-(used inside one model forward pass) with a session-scoped,
-contiguous version that survives across token cycles.
+Cross-call session KV persistence in the HTTP server is handled by the
+[Session API](#session-api) — each session owns its `Vec<KvCache>` — so
+this contiguous, page-aligned buffer is the substrate for snapshotting /
+fixed-buffer sharing rather than the live session store.
 
 ### Cold-start manifest
 

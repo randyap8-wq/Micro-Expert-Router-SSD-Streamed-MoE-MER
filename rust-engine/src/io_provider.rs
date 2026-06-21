@@ -733,13 +733,6 @@ impl NvmeStorage {
             .load(Ordering::Acquire)
     }
 
-    /// Borrow the per-drive breaker for a given drive index. Mostly
-    /// useful in tests; callers in production should rely on the
-    /// transparent short-circuit in [`Self::read_at_with_retries`].
-    pub fn drive_breaker(&self, drive_index: usize) -> Option<Arc<DriveBreakerState>> {
-        self.drive_breakers.get(drive_index).cloned()
-    }
-
     /// Record one failed read. Returns `(just_tripped, count)`:
     /// `just_tripped` is `true` only on the call that flips the
     /// breaker from closed to open (so callers can log once);
@@ -1252,44 +1245,6 @@ impl NvmeStorage {
         Ok(pos)
     }
 
-    #[cfg(target_os = "linux")]
-    async fn read_into(&self, file: &File, buf: &mut PooledBuffer) -> io::Result<usize> {
-        // Run the synchronous `pread(2)` on the current Tokio worker via
-        // `block_in_place`. Other ready tasks are migrated to sibling
-        // workers, so we don't stall the runtime; we also avoid the
-        // `'static` requirement of `spawn_blocking`, which lets us keep
-        // the borrow on `buf`.
-        //
-        // We *must* return the byte count `read_at` reports, not
-        // `buf.len()`: a truncated expert file (or any short read on a
-        // network-mounted FS) would otherwise look like a full read and
-        // the caller's "got `n` bytes, expected …" check would never
-        // fire. See `read_expert` / `read_experts_batch` for the
-        // surface-level validation that depends on this.
-        tokio::task::block_in_place(|| {
-            // `read_at` is a positional read (`pread`) that does not touch
-            // the file offset, so concurrent reads against the same fd
-            // from multiple workers are safe.
-            file.read_at(buf.as_mut_slice(), 0)
-        })
-    }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
-    async fn read_into(&self, file: &File, buf: &mut PooledBuffer) -> io::Result<usize> {
-        // Same logic on macOS for development. `O_DIRECT` is unavailable;
-        // the user is expected to pass `--no-direct` on those hosts.
-        // As on Linux, return the actual count from `read_at` so short
-        // reads are surfaced — see the Linux branch's note.
-        tokio::task::block_in_place(|| file.read_at(buf.as_mut_slice(), 0))
-    }
-
-    #[cfg(not(unix))]
-    async fn read_into(&self, _file: &File, _buf: &mut PooledBuffer) -> io::Result<usize> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "this engine targets Unix; non-Unix platforms are not supported",
-        ))
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1858,24 +1813,6 @@ impl Manifest {
     #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    /// Whether the manifest indexed any experts.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Block alignment the manifest was scanned with. Every
-    /// `payload_offset` is a multiple of this value.
-    #[inline]
-    pub fn block_align(&self) -> usize {
-        self.block_align
-    }
-
-    /// Iterate over `(id, entry)` pairs in arbitrary order.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, &ManifestEntry)> + '_ {
-        self.entries.iter().map(|(k, v)| (*k, v))
     }
 
     /// Convenience: zero-latency lookup of the byte offset where the

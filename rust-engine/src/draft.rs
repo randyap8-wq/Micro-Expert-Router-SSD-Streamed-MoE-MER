@@ -408,28 +408,33 @@ impl RealModel {
     /// gist flagged: the previous "append zeros" loop polluted the
     /// peek pre-pass for $i > 0$.
     fn advance_preview_kv(&self, kv0: &mut KvCache, draft_tok: u32, abs_pos: usize) {
-        use crate::transformer::{apply_rope_inplace, matmul_row_major};
         let x = self.embed(draft_tok);
-        let attn = &self.layers[0].attn;
-        debug_assert_eq!(kv0.kv_dim, attn.kv_dim());
-        // Project K/V from the draft-token embedding. This is the
-        // same projection the verifier's `attn_block` would do —
-        // *modulo* attention output residuals, which `peek_experts`
-        // does not re-read. Skipping Q/wo + attention sum keeps the
-        // helper "lightweight" (the gist's term): one matmul each
-        // for K and V, no softmax, no scaled-dot, no weighted sum.
-        let mut k = matmul_row_major(&attn.wk, &x, attn.kv_dim(), attn.d_model);
-        let v = matmul_row_major(&attn.wv, &x, attn.kv_dim(), attn.d_model);
-        // RoPE must be applied at the absolute position the verifier
-        // *would* attend at, otherwise the rotational phase of K
-        // drifts and the peek's attention becomes meaningless. The
-        // verifier appends to position `abs_pos + 1` next, so the
-        // K/V we synthesise here represents position `abs_pos + 1`.
-        let rope_pos = abs_pos + 1;
-        for h in 0..attn.num_kv_heads {
-            let s = h * attn.head_dim;
-            apply_rope_inplace(&mut k[s..s + attn.head_dim], rope_pos, attn.rope_base);
+        let layer = &self.layers[0];
+        // Mirror the verifier's `attn_block` dispatch: MLA layers cache a
+        // single latent vector (k == v == latent), the standard path caches
+        // projected K/V. Using the matching projection keeps the peek
+        // pre-pass faithful and, critically, matches the cache width
+        // `fresh_kv_caches` allocated for this layer (MLA → `latent_dim`),
+        // so the `append` below cannot hit a `copy_from_slice` mismatch.
+        if let Some(mla) = layer.mla.as_ref() {
+            debug_assert_eq!(kv0.kv_dim, mla.latent_dim());
+            debug_assert_eq!(kv0.v_dim, mla.latent_dim());
+            mla.project_and_cache_kv(&x, abs_pos, kv0);
+            return;
         }
+        let attn = &layer.attn;
+        debug_assert_eq!(kv0.kv_dim, attn.kv_dim());
+        debug_assert_eq!(kv0.v_dim, attn.v_proj_dim());
+        // Project K/V exactly as the verifier's `attn_block` does — the
+        // shared `project_kv` applies QKV bias, QK-Norm and partial/scaled
+        // RoPE at the same absolute position the verifier will consume
+        // this token at (`abs_pos`, i.e. `pos + i`). Using the shared
+        // helper keeps the peek pre-pass faithful and prevents the V-width
+        // (`v_proj_dim`, not `kv_dim`) and RoPE-position drift the previous
+        // hand-rolled copy introduced. Skipping Q/wo + the attention sum
+        // keeps the helper lightweight; `peek_experts` only re-reads
+        // layer 0's K/V slots.
+        let (k, v) = attn.project_kv(&x, abs_pos);
         kv0.append(&k, &v);
     }
 }

@@ -859,12 +859,6 @@ struct LocalityInner {
 }
 
 impl LocalityMonitor {
-    /// Default sliding-window length when no explicit value is configured.
-    /// 512 tokens matches the value called out in the design spec — long
-    /// enough to smooth out per-token noise, short enough to track topic
-    /// shifts that warrant repinning.
-    pub const DEFAULT_WINDOW: usize = 512;
-
     /// Default heat threshold (10% of the window) for declaring an
     /// expert "hot". Mirrors the spec's example.
     pub const DEFAULT_THRESHOLD_PCT: f32 = 0.10;
@@ -897,9 +891,8 @@ impl LocalityMonitor {
                 }
             }
         }
-        // `total` is the cumulative observation counter (saturating
-        // semantics promised by [`Self::total_observations`]); count
-        // every observation, not just the ones that grew the window.
+        // `total` is the cumulative observation counter; count every
+        // observation, not just the ones that grew the window.
         inner.total = inner.total.saturating_add(1);
         inner.window.push_back(id);
         inner.counts[id as usize] = inner.counts[id as usize].saturating_add(1);
@@ -910,11 +903,6 @@ impl LocalityMonitor {
         for &id in ids {
             self.observe_one(id);
         }
-    }
-
-    /// Window capacity (the maximum number of observations kept).
-    pub fn capacity(&self) -> usize {
-        self.capacity
     }
 
     /// Number of observations currently in the window.
@@ -983,11 +971,6 @@ impl LocalityMonitor {
             return 0;
         }
         self.inner.read().counts[id as usize]
-    }
-
-    /// Aggregate observation count since construction (saturating).
-    pub fn total_observations(&self) -> u64 {
-        self.inner.read().total
     }
 
     /// Reset the monitor back to its empty state. Useful for tests and
@@ -1111,9 +1094,6 @@ struct SpeculatorWeights {
 }
 
 impl NeuralSpeculator {
-    /// Default hidden size called out in the design spec.
-    pub const DEFAULT_HIDDEN: usize = 128;
-
     /// Default learning rate for the online SGD step. Small by design:
     /// the speculator is trained continuously over every token and a
     /// large lr would let occasional outlier routings dominate.
@@ -1189,14 +1169,6 @@ impl NeuralSpeculator {
 
     pub fn d_model(&self) -> usize {
         self.d_model
-    }
-
-    pub fn hidden(&self) -> usize {
-        self.hidden
-    }
-
-    pub fn num_experts(&self) -> u32 {
-        self.num_experts
     }
 
     /// Forward pass returning the full logit vector of length `num_experts`.
@@ -1764,11 +1736,6 @@ impl ExpertAffinity {
         }
     }
 
-    /// Number of experts the matrix was sized for.
-    pub fn num_experts(&self) -> u32 {
-        self.num_experts
-    }
-
     /// Total `observe_layer` calls recorded since construction.
     pub fn total_observations(&self) -> u64 {
         self.observations.load(Ordering::Relaxed)
@@ -1933,16 +1900,6 @@ impl LayeredExpertAffinity {
         }
     }
 
-    /// Number of layers the matrix was sized for.
-    pub fn num_layers(&self) -> usize {
-        self.layers.len()
-    }
-
-    /// Number of experts each layer's matrix was sized for.
-    pub fn num_experts(&self) -> u32 {
-        self.num_experts
-    }
-
     /// Record that every pair `(i, j)` in `experts` was activated
     /// together by the same MoE step inside `layer_idx`. Hot-path
     /// safe — delegates to the single-layer
@@ -2065,27 +2022,15 @@ impl LayeredExpertAffinity {
 /// carry a `#[must_use]` attribute — letting the value bind to `_` or
 /// fall out of scope at the end of an engine's lifetime is exactly
 /// the intended shutdown path. Callers that want to retire the worker
-/// earlier can call [`Self::shutdown`] (cooperative) or
-/// [`Self::abort`] (synonym, kept for ergonomic symmetry with
-/// `tokio::JoinHandle::abort`).
+/// earlier can call [`Self::shutdown`] cooperatively.
 pub struct DecayWorkerHandle {
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// `None` after the handle has been joined explicitly via
-    /// [`Self::shutdown`] / [`Self::abort`]; the `Drop` impl then has
-    /// nothing to do.
+    /// [`Self::shutdown`]; the `Drop` impl then has nothing to do.
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DecayWorkerHandle {
-    /// Direct accessor for the shutdown flag — exposed for the
-    /// integration test that needs to flip the flag while the
-    /// `Drop` impl is still in scope (i.e. it cannot move `self`).
-    /// In production the engine never calls this directly; it just
-    /// drops the handle on shutdown.
-    pub fn shutdown_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        self.shutdown.clone()
-    }
-
     /// Cooperative shutdown: clear the flag and join the worker.
     /// Subsequent calls / `Drop` are no-ops.
     pub fn shutdown(mut self) {
@@ -2095,11 +2040,6 @@ impl DecayWorkerHandle {
         }
     }
 
-    /// Alias for [`Self::shutdown`] — provided so callers used to
-    /// `tokio::task::JoinHandle::abort` can use the same name.
-    pub fn abort(self) {
-        self.shutdown();
-    }
 }
 
 impl Drop for DecayWorkerHandle {
@@ -2198,11 +2138,6 @@ impl SpeculationController {
             last_stall_us: AtomicU64::new(0),
             calm_streak: AtomicU64::new(0),
         }
-    }
-
-    /// Baseline depth this controller was built with.
-    pub fn base_depth(&self) -> usize {
-        self.base_depth
     }
 
     /// Currently active speculation depth, in tokens. Returns `0`

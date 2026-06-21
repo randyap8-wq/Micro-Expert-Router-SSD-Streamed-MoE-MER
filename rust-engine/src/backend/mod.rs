@@ -289,6 +289,19 @@ pub struct GpuBackend {
     /// (microseconds), so contention is negligible.
     conversion_scratch: ParkingMutex<Vec<f32>>,
 
+    /// Serializes the *whole* dense-op execution (`matmul_into`,
+    /// `swiglu_into`, `softmax`, `kv_attend`) against the backend-global
+    /// `work_a`/`work_b`/`work_out`/`staging_dn` buffers and their
+    /// pre-built bind groups. The `conversion_scratch` lock above only
+    /// guards the host upload; without this lock two concurrent callers
+    /// (the documented "two Tokio tasks share one `Arc<GpuBackend>`"
+    /// case) could overwrite each other's `work_*` inputs between upload
+    /// and dispatch, or double-`map_async` the single `staging_dn`
+    /// readback buffer. The expert FFN path is unaffected: it runs on
+    /// per-workspace buffers (`ExpertWorkspace`) and never takes this
+    /// lock, so expert dispatches still overlap freely.
+    dense_exec_lock: ParkingMutex<()>,
+
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -680,6 +693,7 @@ impl GpuBackend {
             softmax_bind_group,
             attention_bind_group,
             conversion_scratch,
+            dense_exec_lock: ParkingMutex::new(()),
             num_heads,
             num_kv_heads,
             head_dim,
@@ -721,6 +735,16 @@ impl GpuBackend {
             d_ff <= MAX_EXPERT_D_FF,
             "d_ff={} exceeds MAX_EXPERT_D_FF={}; increase the constant",
             d_ff, MAX_EXPERT_D_FF
+        );
+        // `d_model` flows through the same `MAX_EXPERT_D_FF`-sized workspace
+        // buffers (`x_buf`, and `mid_1` reused for the [d_model] down output)
+        // and host scratch, so bound it here too — otherwise an oversized
+        // `d_model` only trips a late `assert!` mid-dispatch instead of
+        // failing cleanly at load time.
+        anyhow::ensure!(
+            d_model <= MAX_EXPERT_D_FF,
+            "d_model={} exceeds MAX_EXPERT_D_FF={}; increase the constant",
+            d_model, MAX_EXPERT_D_FF
         );
 
         // ── Upload weights to VRAM ────────────────────────────────────────────
@@ -800,6 +824,13 @@ impl GpuBackend {
             d_ff <= MAX_EXPERT_D_FF,
             "d_ff={} exceeds MAX_EXPERT_D_FF={}; increase the constant",
             d_ff, MAX_EXPERT_D_FF
+        );
+        // Same `MAX_EXPERT_D_FF` workspace bound applies to `d_model`
+        // (the down projection writes [d_model] into a workspace buffer).
+        anyhow::ensure!(
+            d_model <= MAX_EXPERT_D_FF,
+            "d_model={} exceeds MAX_EXPERT_D_FF={}; increase the constant",
+            d_model, MAX_EXPERT_D_FF
         );
 
         // `checked_mul` guards against `usize` overflow on user-configurable
@@ -1131,11 +1162,14 @@ impl GpuBackend {
             .map_err(|e| anyhow::anyhow!("buffer map error on expert readback: {e:?}"))?;
 
         {
+            use half::slice::HalfFloatSliceExt;
             let view   = slice.get_mapped_range();
             let floats: &[f32] = bytemuck::cast_slice(&view);
-            for i in 0..d_model {
-                out.data[i] = half::f16::from_f32(floats[i]);
-            }
+            // Vectorized f32 → f16 downcast. `half`'s slice conversion does
+            // runtime CPU-feature detection (F16C/AVX2/AVX-512), so this picks
+            // up hardware float-to-half on capable hosts without compile-time
+            // target-feature gating, and falls back to scalar elsewhere.
+            out.data[..d_model].convert_from_f32_slice(&floats[..d_model]);
         }
         ws.staging.unmap();
         Ok(())
@@ -1152,13 +1186,16 @@ impl Backend for GpuBackend {
     }
 
     fn matmul_into(&self, a: TensorView, b: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        // Serialize the whole op: the shared `work_*`/`staging_dn` buffers
+        // and bind groups can't be safely shared across concurrent callers
+        // (see `dense_exec_lock`). Held until readback completes.
+        let _exec = self.dense_exec_lock.lock();
         let a_len = a.data.len();
         let b_len = b.data.len();
         let out_len = out.rows * out.cols;
 
-        // Scope the scratch lock to the host-side conversions + uploads only,
-        // releasing it before encoding/submitting GPU work so the blocking
-        // readback below doesn't serialize concurrent callers.
+        // Host-side conversions + uploads. The `dense_exec_lock` already
+        // serializes callers, so `conversion_scratch` is uncontended here.
         {
             let mut scratch = self.conversion_scratch.lock();
             assert!(a_len <= scratch.len());
@@ -1233,13 +1270,15 @@ impl Backend for GpuBackend {
     }
 
     fn swiglu_into(&self, gate: TensorView, up: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        // Serialize the whole op against the shared `work_*`/`staging_dn`
+        // buffers (see `dense_exec_lock`).
+        let _exec = self.dense_exec_lock.lock();
         let len = gate.data.len();
         let out_len = out.rows * out.cols;
         assert_eq!(up.data.len(), len);
         assert_eq!(out_len, len);
 
-        // Scope the scratch lock to the host-side conversions + uploads only,
-        // releasing it before the dispatch + blocking readback below.
+        // Host-side conversions + uploads (serialized by `dense_exec_lock`).
         {
             let mut scratch = self.conversion_scratch.lock();
             assert!(len <= scratch.len());
@@ -1308,10 +1347,12 @@ impl Backend for GpuBackend {
     }
 
     fn softmax(&self, x: &mut TensorViewMut) -> Result<()> {
+        // Serialize the whole op against the shared `work_a`/`staging_dn`
+        // buffers (see `dense_exec_lock`).
+        let _exec = self.dense_exec_lock.lock();
         let len = x.data.len();
 
-        // Scope the scratch lock to the upload only, releasing it before the
-        // softmax dispatch + blocking readback below.
+        // Host-side upload (serialized by `dense_exec_lock`).
         {
             let mut scratch = self.conversion_scratch.lock();
             assert!(len <= scratch.len());
@@ -1419,11 +1460,13 @@ impl Backend for GpuBackend {
         seq_len: usize,
         out: &mut TensorViewMut,
     ) -> Result<()> {
+        // Serialize the whole op against the shared `work_*`/`staging_dn`
+        // buffers (see `dense_exec_lock`).
+        let _exec = self.dense_exec_lock.lock();
         let q_len = q.data.len();
         let out_len = out.rows * out.cols;
 
-        // Scope the scratch lock to the Q upload only, releasing it before the
-        // attention dispatch + blocking readback below.
+        // Host-side Q upload (serialized by `dense_exec_lock`).
         {
             let mut scratch = self.conversion_scratch.lock();
             assert!(q_len <= scratch.len());

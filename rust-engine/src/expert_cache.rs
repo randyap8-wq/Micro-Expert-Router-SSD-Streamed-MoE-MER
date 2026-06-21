@@ -86,15 +86,6 @@ impl ExpertResident {
         self.hits.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Current value of the per-resident hit counter. Snapshot only —
-    /// the underlying counter may have been bumped by a concurrent
-    /// caller by the time this returns. Used by diagnostics and the
-    /// VRAM promotion controller.
-    #[inline]
-    pub fn hits(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
-    }
-
     /// Whether this resident's bytes live in a **shadow** (Buffer B)
     /// pool buffer — i.e. it entered the cache via a speculative
     /// prefetch (`Engine::spawn_prefetch`) rather than a foreground
@@ -174,12 +165,6 @@ pub struct ExpertCache {
     /// (see [`crate::engine::Engine`] / `pin_after_observations`).
     pinned: Mutex<HashSet<u32>>,
     capacity: usize,
-}
-
-#[derive(Default, Debug, Clone, Copy)]
-pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
 }
 
 impl ExpertCache {
@@ -449,14 +434,6 @@ pub enum GpuLookup {
 }
 
 impl GpuLookup {
-    /// Convenience: pull the resident out of any hit variant.
-    pub fn into_resident(self) -> Option<Arc<GpuResident>> {
-        match self {
-            GpuLookup::AnchorHit(r) | GpuLookup::LruHit(r) => Some(r),
-            GpuLookup::Miss => None,
-        }
-    }
-
     pub fn is_hit(&self) -> bool {
         !matches!(self, GpuLookup::Miss)
     }
@@ -559,18 +536,6 @@ impl GpuExpertCache {
         self.anchor_capacity_bytes + self.lru_capacity_bytes
     }
 
-    /// Capacity of the Anchor Core region in bytes.
-    #[inline]
-    pub fn anchor_capacity_bytes(&self) -> usize {
-        self.anchor_capacity_bytes
-    }
-
-    /// Capacity of the LRU Edge region in bytes.
-    #[inline]
-    pub fn lru_capacity_bytes(&self) -> usize {
-        self.lru_capacity_bytes
-    }
-
     /// Currently-resident VRAM bytes (anchor + LRU).
     #[inline]
     pub fn used_bytes(&self) -> u64 {
@@ -593,12 +558,6 @@ impl GpuExpertCache {
     #[inline]
     pub fn misses(&self) -> u64 {
         self.misses.load(Ordering::Relaxed)
-    }
-
-    /// Promotion threshold (`gpu_cache.promote_after_hits`).
-    #[inline]
-    pub fn promote_after_hits(&self) -> u64 {
-        self.promote_after_hits
     }
 
     /// Look up an expert in VRAM. Returns the [`GpuLookup`] discriminator
@@ -750,16 +709,7 @@ impl GpuExpertCache {
         true
     }
 
-    /// Snapshot of VRAM-resident expert ids (anchor first, then LRU
-    /// in most-recently-used order). Used by the admin health
-    /// endpoint and the TUI dashboard.
-    pub fn resident_ids(&self) -> Vec<u32> {
-        let g = self.inner.lock();
-        let mut v: Vec<u32> = g.anchor.keys().copied().collect();
-        v.sort_unstable();
-        v.extend(g.lru.iter().map(|(k, _)| *k));
-        v
-    }
+
 
     /// Number of Anchor Core entries.
     pub fn anchor_len(&self) -> usize {

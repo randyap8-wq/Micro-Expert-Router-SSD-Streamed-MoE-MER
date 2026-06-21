@@ -1574,7 +1574,7 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     pub fn fresh_kv_caches(&self) -> Vec<KvCache> {
         self.layers
             .iter()
-            .map(|l| KvCache::new_kv(l.attn.kv_dim(), l.attn.v_proj_dim()))
+            .map(|l| KvCache::new_kv(l.kv_dim(), l.v_dim()))
             .collect()
     }
 
@@ -2378,6 +2378,51 @@ mod tests {
         let r = engine.report();
         assert!(r.misses > 0, "first step should miss the cache");
         assert!(r.bytes_read > 0, "engine should have read expert bytes from disk");
+    }
+
+    /// Regression test for MLA KV-cache sizing. `fresh_kv_caches` must
+    /// allocate the *latent* width (`kv_lora_rank + qk_rope_head_dim`,
+    /// 20 here) for MLA layers, not the unused standard `num_kv_heads *
+    /// head_dim` (32 here). Before the fix the per-layer cache was sized
+    /// with `attn.kv_dim()`, so the very first `step` panicked inside
+    /// `KvCache::append` (`copy_from_slice` / debug-assert width
+    /// mismatch) the moment `mla.forward` appended its latent vector.
+    /// Stepping twice also exercises multi-position latent append.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mla_model_steps_through_fresh_kv_caches() {
+        let dir = TempDir::new("mla-step");
+        let mut advanced = AdvancedConfig::default();
+        advanced.mla = Some(MlaDims {
+            q_lora_rank: 0,
+            kv_lora_rank: 16,
+            qk_nope_head_dim: 4,
+            qk_rope_head_dim: 4,
+            v_head_dim: 8,
+        });
+        let cfg = RealModelConfig {
+            architecture: Architecture::DeepSeekV3,
+            advanced,
+            num_layers: 2,
+            ..RealModelConfig::tiny()
+        };
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let model = RealModel::new_seeded(cfg.clone(), 0x5EED);
+        assert!(model.layers.iter().all(|l| l.mla.is_some()), "all layers MLA");
+
+        let mut kv = model.fresh_kv_caches();
+        let latent = 16 + 4; // kv_lora_rank + qk_rope_head_dim
+        for c in &kv {
+            assert_eq!(c.kv_dim, latent, "MLA K cache must be latent-width");
+            assert_eq!(c.v_dim, latent, "MLA V cache must be latent-width");
+        }
+
+        let t1 = model.step(&engine, 7, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+        let t2 = model.step(&engine, t1, 1, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+        assert!((t1 as usize) < cfg.vocab_size);
+        assert!((t2 as usize) < cfg.vocab_size);
+        for c in &kv {
+            assert_eq!(c.seq_len, 2, "each MLA layer cached two positions");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

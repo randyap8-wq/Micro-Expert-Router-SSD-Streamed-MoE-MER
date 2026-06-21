@@ -116,11 +116,6 @@ impl BufferPool {
         self.inner.buffer_size
     }
 
-    /// Required alignment of each buffer (matches `O_DIRECT` requirements).
-    pub fn align(&self) -> usize {
-        self.inner.align
-    }
-
     /// Snapshot the raw `(ptr, len)` of every currently-free buffer
     /// (primary **and** shadow, in that order).
     ///

@@ -116,13 +116,12 @@ impl Default for SessionClass {
 struct SessionMeta {
     class: SessionClass,
     /// Monotonic microseconds since scheduler start. Updated on every
-    /// `step_registered` call so [`BatchScheduler::evict_idle_blocks`]
-    /// can identify sessions that have stopped producing tokens.
+    /// `step_registered` call so the scheduler can identify sessions
+    /// that have stopped producing tokens.
     last_activity_us: AtomicU64,
-    /// Optional [`BlockManager`] handle. Populated by
-    /// [`BatchScheduler::bind_block_manager`] when the HTTP request
-    /// owns paged-KV blocks; the scheduler tears it down on idle
-    /// eviction, dropping every block back into the pool's free list.
+    /// Optional [`BlockManager`] handle owned by a paged-KV request; the
+    /// scheduler tears it down on idle eviction, dropping every block
+    /// back into the pool's free list.
     block_manager: parking_lot::Mutex<Option<BlockManager>>,
 }
 
@@ -275,9 +274,9 @@ pub struct BatchConfig {
     /// request touches it.
     pub block_pool_capacity: usize,
     pub block_pool_kv_dim: usize,
-    /// Cutoff after which a session's KV blocks become candidates
-    /// for [`BatchScheduler::evict_idle_blocks`] when the pool is
-    /// above its soft-cap. Default: 5 seconds, matching the gist.
+    /// Cutoff after which a session's KV blocks become candidates for
+    /// idle eviction when the pool is above its soft-cap. Default:
+    /// 5 seconds, matching the gist.
     pub idle_eviction_threshold: Duration,
     /// Baseline speculation depth (tokens-ahead) for the predictor's
     /// prefetch. The scheduler's [`SpeculationController`] grows this
@@ -356,22 +355,17 @@ pub struct BatchScheduler {
     /// adjustments.
     started_at: Instant,
     /// Latency-aware speculation window controller. Shared with the
-    /// scheduler loop (which calls `update_from_stall` on every batch
-    /// using the engine's cumulative SSD-stall telemetry) and exposed
-    /// to HTTP / prefetch callers via
-    /// [`Self::current_speculation_depth`] so they know how far ahead
-    /// to prefetch.
+    /// scheduler loop, which calls `update_from_stall` on every batch
+    /// using the engine's cumulative SSD-stall telemetry.
     speculation: Arc<SpeculationController>,
     /// Number of requests that have spilled into the block pool's
     /// overflow slab since startup (cumulative; never decremented).
-    /// Snapshot via [`Self::overflow_requests_total`].
     overflow_requests: Arc<AtomicUsize>,
     /// Latches `true` on the first overflow occurrence so the
     /// warning log is emitted exactly once per scheduler instance.
     overflow_warned: Arc<AtomicBool>,
-    /// Cumulative count of idle-eviction passes that actually
-    /// reclaimed at least one block. Snapshot via
-    /// [`Self::idle_evictions_total`]; useful for stress-test assertions.
+    /// Cumulative count of idle-eviction passes that actually reclaimed
+    /// at least one block; useful for stress-test assertions.
     idle_evictions: Arc<AtomicU64>,
     /// Expert-placement layer the warm pre-pass consults before
     /// issuing `Engine::warm_with`. [`LocalShardRouter`] (every id
@@ -494,40 +488,11 @@ impl BatchScheduler {
         self.remote_fetch_failures.load(Ordering::Relaxed)
     }
 
-    /// Configuration the scheduler was built with.
-    pub fn config(&self) -> BatchConfig { self.cfg }
-
     /// Shared physical block pool, if one is configured. Returns
     /// `None` when the scheduler was built without a paged-cache
     /// budget (the default).
     pub fn block_pool(&self) -> Option<Arc<BlockPool>> {
         self.block_pool.clone()
-    }
-
-    /// Convenience: allocate a per-request [`BlockManager`] backed by
-    /// the scheduler's shared pool. Returns `None` when the scheduler
-    /// was built without a paged-cache budget. The caller owns the
-    /// returned manager; on `Drop` it will release every block back
-    /// to the pool.
-    pub fn new_block_manager(&self) -> Option<BlockManager> {
-        self.block_pool.clone().map(BlockManager::new)
-    }
-
-    /// Number of block-pool overflow blocks currently in use across
-    /// all requests, or `0` when no pool is configured. `> 0`
-    /// indicates the primary slab was exhausted and the pool is
-    /// servicing requests out of its heap-backed fallback; operators
-    /// should size [`BatchConfig::block_pool_capacity`] up if this is
-    /// non-zero in steady state.
-    pub fn overflow_in_use(&self) -> usize {
-        self.block_pool.as_ref().map(|p| p.overflow_in_use()).unwrap_or(0)
-    }
-
-    /// Cumulative number of requests observed to be running with at
-    /// least one overflow block since the scheduler started. Useful
-    /// for monitoring (this counter never decrements).
-    pub fn overflow_requests_total(&self) -> usize {
-        self.overflow_requests.load(Ordering::Relaxed)
     }
 
     /// Number of currently registered requests. Mostly diagnostic.
@@ -550,8 +515,7 @@ impl BatchScheduler {
 
     /// Register a request with an explicit service class. The class
     /// drives the WRR admission policy and the order in which sessions
-    /// become candidates for [`Self::evict_idle_blocks`] under
-    /// pressure.
+    /// become idle-eviction candidates under pressure.
     pub fn register_with_class(&self, kv: Vec<KvCache>, class: SessionClass) -> RequestId {
         let id = self.registry.register(kv);
         let now_us = self.now_us();
@@ -560,29 +524,12 @@ impl BatchScheduler {
         id
     }
 
-    /// Attach a [`BlockManager`] handle to a registered request. When
-    /// the scheduler later evicts the session for being idle, it
-    /// takes the manager and drops it, returning every block the
-    /// session owned to the shared pool's free list. No-op if the
-    /// request id is not registered.
-    pub fn bind_block_manager(&self, id: RequestId, manager: BlockManager) {
-        if let Some(meta) = self.sessions.get(&id.0) {
-            *meta.block_manager.lock() = Some(manager);
-        }
-    }
-
-    /// Look up the service class for a registered request, or `None`
-    /// if the id has been released.
-    pub fn session_class(&self, id: RequestId) -> Option<SessionClass> {
-        self.sessions.get(&id.0).map(|m| m.class)
-    }
-
     /// Tear down a registered request, returning its (now-mutated)
     /// KV cache. Returns `None` if the id was already released. The
     /// scheduler also probes the block pool's overflow state at
-    /// release time so the cumulative `overflow_requests_total`
-    /// counter stays accurate even when the request never
-    /// re-touched the scheduler after a burst.
+    /// release time so the cumulative overflow counter stays accurate
+    /// even when the request never re-touched the scheduler after a
+    /// burst.
     pub fn release(&self, id: RequestId) -> Option<Vec<KvCache>> {
         let kv = self.registry.release(id);
         // Removing the session meta drops the held `BlockManager`
@@ -593,73 +540,6 @@ impl BatchScheduler {
         // point to surface whether the pool was ever stressed.
         self.maybe_warn_overflow();
         kv
-    }
-
-    /// Memory-pressure classification of the underlying block pool.
-    /// Returns [`PressureLevel::Normal`] when no pool is configured.
-    pub fn pressure_level(&self) -> PressureLevel {
-        self.block_pool
-            .as_ref()
-            .map(|p| p.pressure_level())
-            .unwrap_or(PressureLevel::Normal)
-    }
-
-    /// Currently-active speculation depth, in tokens-ahead. The
-    /// predictor reads this on every batch and clamps its prefetch
-    /// fanout accordingly: `0` under
-    /// [`PressureLevel::Critical`], `base_depth` under normal
-    /// conditions, up to `base_depth + MAX_LATENCY_BUMP` under
-    /// rising SSD stall.
-    pub fn current_speculation_depth(&self) -> usize {
-        self.speculation.current_depth()
-    }
-
-    /// Shared [`SpeculationController`]. Useful for tests and for
-    /// instrumentation code that wants to read more than just the
-    /// current depth (e.g. whether the controller is suspended).
-    pub fn speculation_controller(&self) -> Arc<SpeculationController> {
-        self.speculation.clone()
-    }
-
-    /// Walk the session map and release every block owned by a
-    /// session that hasn't produced a token in `idle_threshold` (or
-    /// the configured default when `None`). Returns the number of
-    /// sessions whose blocks were reclaimed. Idempotent — sessions
-    /// that don't own a `BlockManager` are skipped.
-    ///
-    /// Audit-class sessions are evicted **first** (sorted ahead of
-    /// Interactive) so a flurry of low-priority bulk jobs cannot
-    /// starve a latency-sensitive chat session of KV memory. The
-    /// scheduler loop also calls this method itself whenever
-    /// [`PressureLevel::High`] is reached, but operators can invoke
-    /// it manually for an off-cycle reclamation pass.
-    pub fn evict_idle_blocks(&self, idle_threshold: Option<Duration>) -> usize {
-        let threshold = idle_threshold.unwrap_or(self.cfg.idle_eviction_threshold);
-        let reclaimed = run_idle_eviction(&self.sessions, threshold, self.now_us());
-        if reclaimed > 0 {
-            self.idle_evictions.fetch_add(1, Ordering::Relaxed);
-        }
-        reclaimed
-    }
-
-    /// Total number of `evict_idle_blocks` passes that reclaimed at
-    /// least one session. Snapshot via [`Self::idle_evictions_total`].
-    pub fn idle_evictions_total(&self) -> u64 {
-        self.idle_evictions.load(Ordering::Relaxed)
-    }
-
-    /// Number of registered sessions, partitioned by class.
-    /// Useful for diagnostics and for stress-test assertions.
-    pub fn session_counts_by_class(&self) -> (usize, usize) {
-        let mut interactive = 0;
-        let mut audit = 0;
-        for kv in self.sessions.iter() {
-            match kv.value().class {
-                SessionClass::Interactive => interactive += 1,
-                SessionClass::Audit => audit += 1,
-            }
-        }
-        (interactive, audit)
     }
 
     fn now_us(&self) -> u64 {
