@@ -189,7 +189,7 @@ impl MultiHeadLatentAttention {
     /// (post-RoPE) for symmetry with the cached entries; the caller does
     /// not need them (it re-reads from the cache), but exposing them
     /// keeps the function testable.
-    fn project_and_cache_kv(&self, x: &[f32], pos: usize, kv: &mut KvCache) {
+    pub fn project_and_cache_kv(&self, x: &[f32], pos: usize, kv: &mut KvCache) {
         let proj_dim = self.kv_lora_rank + self.qk_rope_head_dim;
         let kv_a = matmul_row_major(&self.kv_a_proj_with_mqa, x, proj_dim, self.d_model);
         let mut latent = vec![0.0f32; self.latent_dim()];
@@ -306,12 +306,6 @@ impl MultiHeadLatentAttention {
 /// are NaN) to f32. Matches the OCP `e4m3` / DeepSeek `float8_e4m3fn`
 /// definition: the all-exponent-ones encoding is *not* infinity, the max
 /// finite magnitude is 448.
-/// Largest finite magnitude representable in the FP8 `e4m3fn` format
-/// (`S.1110.111` = `1.875 * 2^8`). The `S.1111.111` bit pattern is
-/// reserved for NaN and is decoded to `0.0` so it contributes nothing
-/// to downstream matmuls.
-pub const F8_E4M3_MAX_FINITE: f32 = 448.0;
-
 pub fn f8_e4m3_to_f32(b: u8) -> f32 {
     let sign = if (b & 0x80) != 0 { -1.0f32 } else { 1.0f32 };
     let exp = ((b >> 3) & 0x0F) as i32;

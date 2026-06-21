@@ -686,6 +686,32 @@ impl MultiHeadSelfAttention {
         }
     }
 
+    /// Project a single token embedding `x` into this layer's
+    /// cache-ready **K** and **V** vectors at absolute position `pos`:
+    /// `wk`/`wv` matmul, optional K/V bias, optional K QK-Norm, and
+    /// RoPE on K over the partial `rope_dim` with optional YaRN scaling
+    /// — exactly the steps [`Self::forward`] performs before
+    /// `kv.append`. V is returned at its full `v_proj_dim()` width
+    /// (which differs from `kv_dim()` on MiMo-V2-Flash). Shared by the
+    /// verifier forward and the speculative KV preview so the two can
+    /// never drift out of sync.
+    pub fn project_kv(&self, x: &[f32], pos: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut k = matmul_row_major(&self.wk, x, self.kv_dim(), self.d_model);
+        let mut v = matmul_row_major(&self.wv, x, self.v_proj_dim(), self.d_model);
+        if let Some(bk) = self.bk.as_ref() {
+            for (ki, bi) in k.iter_mut().zip(bk.iter()) { *ki += bi; }
+        }
+        if let Some(bv) = self.bv.as_ref() {
+            for (vi, bi) in v.iter_mut().zip(bv.iter()) { *vi += bi; }
+        }
+        self.apply_k_norm(&mut k);
+        for h in 0..self.num_kv_heads {
+            let s = h * self.head_dim;
+            apply_rope_maybe_scaled(&mut k[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+        }
+        (k, v)
+    }
+
     /// Forward one token at absolute position `pos`. Updates `kv` with
     /// the new K/V for this position. Returns a new hidden state of
     /// length `d_model`.
@@ -749,13 +775,12 @@ impl MultiHeadSelfAttention {
                 // within the attention span (`t_start == 0`), so the sink
                 // token's slot is `scores[0]`. `None` (every other
                 // architecture / global layers) is a no-op.
-if let Some(bias) = self.sink_bias.as_ref() {
-    if t_start == 0 && !scores.is_empty() {
-        if let Some(b) = bias.get(h) {
-            scores[0] += *b;
-        }
-    }
-}
+                if let Some(bias) = self.sink_bias.as_ref() {
+                    if t_start == 0 && !scores.is_empty() {
+                        if let Some(b) = bias.get(h) {
+                            scores[0] += *b;
+                        }
+                    }
                 }
                 softmax_inplace(&mut scores);
 
@@ -773,15 +798,13 @@ if let Some(bias) = self.sink_bias.as_ref() {
         };
         let mut cpu_forward = || {
             let mut q = matmul_row_major(&self.wq, x, q_dim, self.d_model);
-            let mut k = matmul_row_major(&self.wk, x, kv_dim, self.d_model);
-            // V projection width is `num_kv_heads * v_head_dim`.
-            let mut v = matmul_row_major(&self.wv, x, self.v_proj_dim(), self.d_model);
-            // QKV projection biases (GPT-OSS `attention_bias = true`),
-            // added to the raw projections before QK-Norm / RoPE.
-            self.apply_qkv_bias(&mut q, &mut k, &mut v);
-            // QK-Norm (Qwen3): per-head RMSNorm on Q and K *before* RoPE.
+            // Q bias (GPT-OSS `attention_bias`) before QK-Norm / RoPE; K and
+            // V biases are applied inside `project_kv`.
+            if let Some(bq) = self.bq.as_ref() {
+                for (qi, bi) in q.iter_mut().zip(bq.iter()) { *qi += bi; }
+            }
+            // QK-Norm (Qwen3): per-head RMSNorm on Q *before* RoPE.
             self.apply_q_norm(&mut q);
-            self.apply_k_norm(&mut k);
             // RoPE rotates only the first `rope_dim` dims of each head
             // (partial rotary on MiMo-V2-Flash; `rope_dim == head_dim`
             // elsewhere ⇒ full rotation).
@@ -789,10 +812,9 @@ if let Some(bias) = self.sink_bias.as_ref() {
                 let s = h * self.head_dim;
                 apply_rope_maybe_scaled(&mut q[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
             }
-            for h in 0..self.num_kv_heads {
-                let s = h * self.head_dim;
-                apply_rope_maybe_scaled(&mut k[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
-            }
+            // K/V projection (+ bias, QK-Norm, RoPE) is shared with the
+            // speculative KV preview via `project_kv`.
+            let (k, v) = self.project_kv(x, pos);
             kv.append(&k, &v);
             let mut attn_out = cpu_attend(&q, kv);
             // Post-attention output scale (MiMo-V2-Flash 0.707), applied
@@ -1373,6 +1395,16 @@ impl TransformerLayer {
         match self.mla.as_ref() {
             Some(mla) => mla.latent_dim(),
             None => self.attn.kv_dim(),
+        }
+    }
+
+    /// V-cache width this layer needs. MLA stores its latent vector in the
+    /// value slot too (`KvCache::append(&latent, &latent)`), so the V width
+    /// is the latent dim; the standard path uses `num_kv_heads * v_head_dim`.
+    pub fn v_dim(&self) -> usize {
+        match self.mla.as_ref() {
+            Some(mla) => mla.latent_dim(),
+            None => self.attn.v_proj_dim(),
         }
     }
 

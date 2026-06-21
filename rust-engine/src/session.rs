@@ -154,10 +154,6 @@ impl SessionStore {
         self.inner.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
     /// Atomically remove and return the session state for `id`. The
     /// caller is expected to call [`Self::put`] with the returned
     /// checkout guard when finished so the session resumes on the next

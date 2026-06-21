@@ -101,10 +101,6 @@ impl MultiLayerExpertCache {
         self.caches.len()
     }
 
-    pub fn experts_per_layer(&self) -> u32 {
-        self.experts_per_layer
-    }
-
     /// Decode a global expert id into the index of its per-layer
     /// cache. Clamps to the last layer when `id` is out of range so
     /// downstream callers never panic on a malformed router output —
@@ -393,10 +389,4 @@ impl MultiLayerExpertCache {
             .unwrap_or(false)
     }
 
-    /// `(layer, local)` lookup using the same global-id encoding the
-    /// rest of the engine emits.
-    pub fn get_at(&self, key: ExpertKey) -> Option<Arc<ExpertResident>> {
-        let cache = self.caches.get(key.layer as usize)?;
-        cache.get(self.global_id(key))
-    }
 }

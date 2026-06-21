@@ -271,11 +271,6 @@ impl TensorHeader {
         })
     }
 
-    /// Returns true if `bytes` starts with the U.T.H. magic.
-    pub fn has_magic(bytes: &[u8]) -> bool {
-        bytes.len() >= 4 && bytes[0..4] == UTH_MAGIC
-    }
-
     /// If `bytes` starts with a valid U.T.H., return the *payload*
     /// (post-header, post-padding) slice paired with the parsed header.
     /// Otherwise return `(None, bytes)` so the caller can treat the
@@ -457,7 +452,7 @@ mod tests {
         // 16 K iterations × up to 256 B input ≈ 4 MiB of work, well
         // under the test budget even in debug mode.
         for trial in 0..16384u64 {
-            let len = ((trial * 0x9E37_79B9_7F4A_7C15) % (4 * UTH_BYTES as u64 + 1)) as usize;
+            let len = ((trial.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % (4 * UTH_BYTES as u64 + 1)) as usize;
             let mut buf = vec![0u8; len];
             fill_random(&mut buf, trial.wrapping_mul(0x1234_5678) ^ 0xDEAD_BEEF);
             // Property: probe must return either `None` or a fully-
@@ -496,7 +491,7 @@ mod tests {
         // a panic here would crash the engine on a malformed
         // expert_<id>.bin.
         for trial in 0..4096u64 {
-            let len = ((trial * 0x517C_C1B7_2722_0A95) % (3 * UTH_BYTES as u64 + 1)) as usize;
+            let len = ((trial.wrapping_mul(0x517C_C1B7_2722_0A95)) % (3 * UTH_BYTES as u64 + 1)) as usize;
             let mut buf = vec![0u8; len];
             fill_random(&mut buf, trial.wrapping_add(0x0123_4567_89AB_CDEF));
             for block in [16usize, 64, 512, 4096] {

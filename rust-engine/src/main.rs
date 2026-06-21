@@ -1147,6 +1147,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         )))
     };
 
+    let metrics = Metrics::new();
     let mut engine_builder = Engine::with_options(
         cache,
         pool,
@@ -1247,7 +1248,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         );
         engine_builder.install_gpu_cache(gpu_expert_cache.clone());
     }
-    let engine = Arc::new(engine_builder);
+    let engine = Arc::new(engine_builder.with_metrics(metrics.clone()));
 
     let tokenizer = match cfg.tokenizer.path.as_ref() {
         Some(p) => match Tokenizer::from_file(p) {
@@ -1416,7 +1417,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     let state = AppState {
         engine,
         tokenizer,
-        metrics: Metrics::new(),
+        metrics,
         real_model,
         batch_scheduler,
         draft_engine,
