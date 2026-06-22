@@ -2016,6 +2016,7 @@ dependencies = [
  "prost",
  "rand 0.8.6",
  "ratatui",
+ "rayon",
  "safetensors 0.4.5",
  "serde",
  "serde_json",

@@ -2330,6 +2330,28 @@ impl Engine {
                 armed: true,
             };
 
+            // Re-check the cache now that we hold leadership. The
+            // line-`2264` fast-path miss happened *before* we won the
+            // `in_flight` election; in the window between the two, a
+            // prior leader may have finished its read, inserted the
+            // resident, and dropped its guard — and that guard's
+            // `in_flight.remove` is exactly what freed the slot we
+            // just won. Because `fetch_once` inserts into the cache
+            // *before* the guard removes the `in_flight` slot, and our
+            // winning `entry()` observed that removal, the insert is
+            // guaranteed visible to this `get()`. Without this check
+            // two callers that miss the fast path in quick succession
+            // each become a leader and issue a redundant disk read,
+            // breaking the SSD-dedup invariant asserted by
+            // `fetch_with_retry_deduplicates_concurrent_reads`. The
+            // guard still runs on this early return, freeing the slot
+            // we installed and waking any followers parked on us.
+            if let Some(r) = self.core.cache.get(id) {
+                self.metrics.counters.singleflight_followers
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(r);
+            }
+
             const MAX_ATTEMPTS: usize = 3;
             let mut last_err: Option<String> = None;
             for attempt in 0..MAX_ATTEMPTS {

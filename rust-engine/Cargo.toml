@@ -41,6 +41,20 @@ prometheus = { version = "0.13", default-features = false }
 # which is exactly what we want around a short critical section.
 parking_lot = "0.12"
 
+# Persistent, work-stealing thread pool for the architecture-agnostic
+# dense-compute kernels (`matmul_row_major`, per-expert `gate_up_swiglu`
+# / `down_proj`). These run on every token of every supported family
+# (Mixtral, Qwen3-MoE, DeepSeek-V3/MLA, GPT-OSS, MiMo, dense Mistral /
+# Phi). The previous implementation fanned each call out across cores
+# with `std::thread::scope`, which *spawns and joins fresh OS threads on
+# every matmul* — hundreds of times per token — and, under continuous
+# batching, oversubscribed the machine by `concurrent_requests × cores`
+# threads. `rayon`'s process-wide pool is created once and shared, so the
+# per-call cost collapses to a fork-join on resident workers and
+# concurrent requests share one bounded pool instead of each spawning
+# their own. See `crate::parallel`.
+rayon = "1"
+
 # Lock-free, RCU-style atomic Arc swap. Used for the live-reloadable
 # runtime configuration so Tokio worker threads can read sampling
 # parameters / max-tokens caps on the hot token-evaluation path with
