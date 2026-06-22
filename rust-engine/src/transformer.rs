@@ -1049,74 +1049,43 @@ pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f
                 1,
             );
         }
-        return y;
+        y
     }
     // Runtime row-parallel path. Always compiled (no `#[cfg(feature =
     // "simd")]` gate) so a single binary auto-escalates on any host
-    // with enough cores.
+    // with enough cores. The serial-vs-parallel decision now lives in
+    // `par_row_chunks` (it runs small matmuls inline), so we delegate
+    // unconditionally instead of duplicating a threshold here.
     #[cfg(not(feature = "blas"))]
     {
-        if rows * cols >= 8 * 1024 {
-            return matmul_row_major_parallel(w, x, rows, cols);
-        }
+        matmul_row_major_parallel(w, x, rows, cols)
     }
-    let mut y = vec![0.0f32; rows];
-    for i in 0..rows {
-        let row = &w[i * cols..(i + 1) * cols];
-        let mut acc = 0.0f32;
-        for j in 0..cols {
-            acc += row[j] * x[j];
-        }
-        y[i] = acc;
-    }
-    y
 }
 
-/// Row-parallel matmul using `std::thread::scope`. Each worker computes a
+/// Row-parallel matmul on the shared `rayon` pool. Each worker computes a
 /// contiguous block of output rows; no synchronisation is required because
 /// the output rows are disjoint. Always compiled — gist Task 1's
 /// "auto-escalation" requirement means we can't hide this behind a
 /// cargo feature any more.
+///
+/// Unlike the previous `std::thread::scope` implementation this does
+/// **not** spawn OS threads per call: [`crate::parallel::par_row_chunks`]
+/// dispatches onto the process-wide pool, so the per-call cost is a
+/// fork-join over resident workers and concurrent requests (continuous
+/// batching) share one bounded pool instead of each oversubscribing the
+/// machine. The arithmetic — one `f32` dot product per output row — is
+/// unchanged, so the result is identical to the scalar path.
 #[cfg(not(feature = "blas"))]
 fn matmul_row_major_parallel(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let nthreads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(rows.max(1));
-    if nthreads <= 1 {
-        // Fall back to scalar for tiny outputs.
-        let mut y = vec![0.0f32; rows];
-        for i in 0..rows {
-            let row = &w[i * cols..(i + 1) * cols];
+    let mut y = vec![0.0f32; rows];
+    crate::parallel::par_row_chunks(&mut y, cols, |row_start, out| {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let row = &w[(row_start + i) * cols..(row_start + i + 1) * cols];
             let mut acc = 0.0f32;
             for j in 0..cols {
                 acc += row[j] * x[j];
             }
-            y[i] = acc;
-        }
-        return y;
-    }
-    let mut y = vec![0.0f32; rows];
-    let chunk = rows.div_ceil(nthreads);
-    std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(nthreads);
-        for (chunk_idx, out_chunk) in y.chunks_mut(chunk).enumerate() {
-            let row_start = chunk_idx * chunk;
-            let w_slice = &w[row_start * cols..(row_start + out_chunk.len()) * cols];
-            let x_ref = x;
-            handles.push(s.spawn(move || {
-                for (i, slot) in out_chunk.iter_mut().enumerate() {
-                    let row = &w_slice[i * cols..(i + 1) * cols];
-                    let mut acc = 0.0f32;
-                    for j in 0..cols {
-                        acc += row[j] * x_ref[j];
-                    }
-                    *slot = acc;
-                }
-            }));
-        }
-        for h in handles {
-            let _ = h.join();
+            *slot = acc;
         }
     });
     y

@@ -43,6 +43,7 @@ mod mla;
 mod model;
 mod multi_layer_cache;
 mod numa;
+mod parallel;
 mod router;
 mod rpc;
 mod sampling;

@@ -1237,55 +1237,26 @@ fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_mode
                 *g = silu(*g) * u;
             }
         });
-        return;
     }
 
     #[cfg(not(feature = "blas"))]
     {
-        let d_ff = gated.len();
-        if d_ff * d_model >= 8 * 1024 {
-            let nthreads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(d_ff.max(1));
-            if nthreads > 1 {
-                let chunk = d_ff.div_ceil(nthreads);
-                std::thread::scope(|s| {
-                    let mut handles = Vec::with_capacity(nthreads);
-                    for (chunk_idx, out_chunk) in gated.chunks_mut(chunk).enumerate() {
-                        let row_start = chunk_idx * chunk;
-                        let g_slice = &gate[row_start * d_model
-                            ..(row_start + out_chunk.len()) * d_model];
-                        let u_slice = &up[row_start * d_model
-                            ..(row_start + out_chunk.len()) * d_model];
-                        let x_ref = x;
-                        handles.push(s.spawn(move || {
-                            for (i, slot) in out_chunk.iter_mut().enumerate() {
-                                let g_row = &g_slice[i * d_model..(i + 1) * d_model];
-                                let u_row = &u_slice[i * d_model..(i + 1) * d_model];
-                                let g = crate::kernels::dot_f32(g_row, x_ref);
-                                let u = crate::kernels::dot_f32(u_row, x_ref);
-                                *slot = silu(g) * u;
-                            }
-                        }));
-                    }
-                    for h in handles {
-                        // Propagate worker panics — a silent failure here
-                        // would leave `gated` partially written.
-                        h.join().expect("expert gate/up matmul worker panicked");
-                    }
-                });
-                return;
+        // Each output row is an independent `silu(gate·x) * (up·x)`, so
+        // the rows fan out cleanly onto the shared `rayon` pool via
+        // `par_row_chunks` (no per-call OS-thread spawn, and concurrent
+        // requests under continuous batching share one bounded pool
+        // instead of each oversubscribing the machine). The arithmetic
+        // is identical to the equivalent serial loop.
+        crate::parallel::par_row_chunks(gated, d_model, |row_start, out| {
+            for (i, slot) in out.iter_mut().enumerate() {
+                let r = row_start + i;
+                let g_row = &gate[r * d_model..(r + 1) * d_model];
+                let u_row = &up[r * d_model..(r + 1) * d_model];
+                let g = crate::kernels::dot_f32(g_row, x);
+                let u = crate::kernels::dot_f32(u_row, x);
+                *slot = silu(g) * u;
             }
-        }
-    }
-    let d_ff = gated.len();
-    for i in 0..d_ff {
-        let row = i * d_model;
-        let g_row = &gate[row..row + d_model];
-        let u_row = &up[row..row + d_model];
-        gated[i] = silu(crate::kernels::dot_f32(g_row, x))
-                 * crate::kernels::dot_f32(u_row, x);
+        });
     }
 }
 
@@ -1308,46 +1279,24 @@ fn down_proj(down: &[f32], gated: &[f32], y: &mut [f32], d_ff: usize) {
                 0.0, y.as_mut_ptr(), 1, 1,
             );
         }
-        return;
     }
 
     #[cfg(not(feature = "blas"))]
     {
-        let d_model = y.len();
-        if d_model * d_ff >= 8 * 1024 {
-            let nthreads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(d_model.max(1));
-            if nthreads > 1 {
-                let chunk = d_model.div_ceil(nthreads);
-                std::thread::scope(|s| {
-                    let mut handles = Vec::with_capacity(nthreads);
-                    for (chunk_idx, out_chunk) in y.chunks_mut(chunk).enumerate() {
-                        let row_start = chunk_idx * chunk;
-                        let d_slice = &down[row_start * d_ff
-                            ..(row_start + out_chunk.len()) * d_ff];
-                        let g_ref = gated;
-                        handles.push(s.spawn(move || {
-                            for (i, slot) in out_chunk.iter_mut().enumerate() {
-                                *slot = crate::kernels::dot_f32(&d_slice[i * d_ff..(i + 1) * d_ff], g_ref);
-                            }
-                        }));
-                    }
-                    for h in handles {
-                        // Propagate worker panics — a silent failure here
-                        // would leave `y` partially written.
-                        h.join().expect("expert down-proj matmul worker panicked");
-                    }
-                });
-                return;
+        // `y[i] = down[i] · gated` for each of the `d_model` output
+        // rows. The rows are independent, so they fan out onto the
+        // shared `rayon` pool via `par_row_chunks` — no per-call
+        // OS-thread spawn, and continuous-batching requests share one
+        // bounded pool instead of each oversubscribing the machine.
+        // `par_row_chunks` runs small projections inline, so this also
+        // subsumes the old serial fallback. Arithmetic is identical to
+        // the serial reference.
+        crate::parallel::par_row_chunks(y, d_ff, |row_start, out| {
+            for (i, slot) in out.iter_mut().enumerate() {
+                let r = row_start + i;
+                *slot = crate::kernels::dot_f32(&down[r * d_ff..(r + 1) * d_ff], gated);
             }
-        }
-    }
-    let d_model = y.len();
-    for i in 0..d_model {
-        let row = i * d_ff;
-        y[i] = crate::kernels::dot_f32(&down[row..row + d_ff], gated);
+        });
     }
 }
 
