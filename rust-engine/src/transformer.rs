@@ -996,17 +996,21 @@ pub fn run_expert_forward(
 /// Row-major matrix-vector multiply: `y = W · x` where `W` is
 /// `[rows, cols]` row-major. Returns a fresh `Vec<f32>` of length `rows`.
 ///
-/// **Auto-escalation (gist Task 1).** Three layers of dispatch, in
-/// order:
+/// **Auto-escalation (gist Task 1).** Dispatch, in order:
 ///
 /// 1. `--features blas` → BLAS-shaped `matrixmultiply` SGEMV
 ///    microkernel (the `ndarray`-style tuned path).
-/// 2. Otherwise, **runtime row-parallel** when the matrix is large
-///    enough to amortise thread-spawn overhead (`rows*cols ≥ 8 KiB`).
+/// 2. Otherwise, always delegate to `matmul_row_major_parallel`, which
+///    uses `parallel::par_row_chunks` to fork-join disjoint output-row
+///    chunks on the shared, process-wide `rayon` pool (resident workers,
+///    not per-call OS-thread spawning). Its inline fast path runs on the
+///    caller for a single row, a single-threaded pool, or `rows*cols <
+///    parallel::MIN_TOTAL_FOR_PARALLEL`; otherwise fan-out is bounded by
+///    `parallel::MIN_ELEMS_PER_TASK`. This folds the scalar fallback into
+///    the same helper and preserves per-row, bit-identical dot products.
 ///    This path is now always compiled — the `--features simd` flag is
 ///    no longer required and is retained only for backwards
 ///    compatibility (it is a no-op).
-/// 3. Scalar fallback otherwise.
 pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
