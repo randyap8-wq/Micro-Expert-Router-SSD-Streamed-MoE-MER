@@ -41,6 +41,21 @@
 //! and the task count is capped so each task carries at least
 //! [`MIN_ELEMS_PER_TASK`] elements of work — preventing a large matmul
 //! from being shredded into more tasks than there is work to justify.
+//!
+//! ## Pool sizing — leave headroom for the async runtime
+//!
+//! Left to its own devices `rayon` sizes the global pool to *every*
+//! logical core. Under continuous batching that is actively harmful: a
+//! saturated compute fan-out pins all cores and delays the tokio workers
+//! that drive the scheduler (mpsc wakeups), the gRPC server, and io_uring
+//! SSD completions, inflating per-token tail latency exactly when
+//! throughput matters most. [`init_global_pool`] therefore builds the pool
+//! once at startup with [`default_compute_threads`] — logical cores minus
+//! a small, bounded reservation — so the engine keeps a couple of cores
+//! free for async work by default. An explicit `RAYON_NUM_THREADS` is
+//! treated as an operator override and wins.
+
+use tracing::{info, warn};
 
 /// Below this many multiply-accumulates (`rows * cols`) a matmul runs
 /// inline on the calling thread. The fork-join handshake costs more than
@@ -62,6 +77,112 @@ pub const MIN_ELEMS_PER_TASK: usize = 1 << 16; // 65_536
 #[inline]
 pub fn num_threads() -> usize {
     rayon::current_num_threads().max(1)
+}
+
+/// Number of logical cores held back from the compute pool for the async
+/// runtime, as a function of the host's logical core count.
+///
+/// The pool would otherwise span *every* core; see the module docs for why
+/// that starves tokio under continuous batching. We leave a small, bounded
+/// slice free instead:
+///
+/// | logical cores | reserved | compute |
+/// |---------------|----------|---------|
+/// | `1..=4`       | 0        | all     |
+/// | `5..=8`       | 1        | `n-1`   |
+/// | `9..=31`      | 2        | `n-2`   |
+/// | `32, 48, 64…` | `n/16`   | `n-n/16`|
+///
+/// Tiny hosts keep every core — compute is the scarce resource there and a
+/// reservation would hurt more than async contention. From nine cores up
+/// we hold back two, growing by one per additional sixteen cores so large
+/// hosts keep proportionate headroom (e.g. 32 -> 30, 64 -> 60, 128 -> 120).
+/// The result is monotonic in `logical` and always at least one.
+pub fn default_compute_threads(logical: usize) -> usize {
+    let reserved = match logical {
+        0..=4 => 0,
+        5..=8 => 1,
+        _ => (logical / 16).max(2),
+    };
+    logical.saturating_sub(reserved).max(1)
+}
+
+/// A valid, positive `RAYON_NUM_THREADS` is an explicit operator override.
+/// Zero or unparseable values are ignored so the smart default applies
+/// (rayon itself treats `RAYON_NUM_THREADS=0` as "use the default").
+fn env_thread_override() -> Option<usize> {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Initialise the shared compute pool once, reserving headroom for the
+/// async runtime (see [`default_compute_threads`]). Returns the resolved
+/// worker count.
+///
+/// Call exactly once at process start — *after* any NUMA/affinity pinning
+/// so the workers inherit the startup affinity mask, and *before* the first
+/// [`par_row_chunks`] touches the pool. The global pool is built eagerly
+/// here in *both* cases: a valid `RAYON_NUM_THREADS` sets the worker count
+/// as an explicit operator override, otherwise the reserved
+/// [`default_compute_threads`] count is used. Building now — rather than
+/// letting rayon lazily initialise on first use — is what guarantees the
+/// workers are spawned at this point and inherit the startup affinity mask.
+/// Deferring (e.g. returning early on the override path) would spawn them at
+/// the first matmul, inheriting whatever affinity the triggering thread
+/// happens to carry by then (such as a later io_uring repin onto ≤8 cores).
+pub fn init_global_pool() -> usize {
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    // Resolve the worker count: an explicit, valid `RAYON_NUM_THREADS` wins,
+    // otherwise fall back to the reserved async-runtime-headroom default.
+    let threads = match env_thread_override() {
+        Some(n) => {
+            info!(
+                threads = n,
+                logical,
+                source = "RAYON_NUM_THREADS",
+                "compute pool: honoring explicit thread-count override"
+            );
+            n
+        }
+        None => {
+            let t = default_compute_threads(logical);
+            info!(
+                logical,
+                threads = t,
+                reserved = logical - t,
+                source = "auto",
+                "compute pool: sizing with reserved async-runtime headroom"
+            );
+            t
+        }
+    };
+
+    // Build the global pool *now* — after startup affinity pinning and before
+    // the first matmul — for BOTH the override and auto paths, so the workers
+    // are spawned here and inherit the startup affinity mask. Returning early
+    // on the override path (deferring to rayon's lazy init) would instead
+    // spawn them at first use, inheriting whatever affinity the triggering
+    // thread carries by then (e.g. a later io_uring repin onto ≤8 cores).
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("mer-compute-{i}"))
+        .build_global()
+    {
+        // `build_global` only errors if the global pool was already built
+        // (a prior call, or a rayon use before init). Keep what exists.
+        warn!(
+            error = %e,
+            current_threads = rayon::current_num_threads().max(1),
+            "compute pool already initialised; keeping existing configuration"
+        );
+    }
+
+    num_threads()
 }
 
 /// Fill `out` in parallel by computing disjoint row-chunks on the shared
@@ -188,5 +309,38 @@ mod tests {
         });
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(out[0], 42);
+    }
+
+    #[test]
+    fn default_threads_reserve_async_headroom() {
+        // Tiny hosts keep every core — compute is already scarce.
+        assert_eq!(default_compute_threads(1), 1);
+        assert_eq!(default_compute_threads(2), 2);
+        assert_eq!(default_compute_threads(4), 4);
+        // Small hosts hold back a single core.
+        assert_eq!(default_compute_threads(5), 4);
+        assert_eq!(default_compute_threads(8), 7);
+        // From nine cores up we reserve two...
+        assert_eq!(default_compute_threads(9), 7);
+        assert_eq!(default_compute_threads(16), 14);
+        assert_eq!(default_compute_threads(32), 30); // the 32-vCPU reference box
+        // ...growing by one per additional sixteen cores.
+        assert_eq!(default_compute_threads(48), 45);
+        assert_eq!(default_compute_threads(64), 60);
+        assert_eq!(default_compute_threads(128), 120);
+    }
+
+    #[test]
+    fn default_threads_are_positive_and_monotonic() {
+        // The pool must never collapse to zero workers, never exceed the
+        // logical core count, and never *shrink* as cores are added.
+        let mut prev = 0;
+        for n in 1..=256 {
+            let t = default_compute_threads(n);
+            assert!(t >= 1, "n={n}: pool must keep at least one worker");
+            assert!(t <= n, "n={n}: cannot use more than {n} logical cores (got {t})");
+            assert!(t >= prev, "n={n}: compute threads went backwards {prev}->{t}");
+            prev = t;
+        }
     }
 }
