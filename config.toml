@@ -141,6 +141,17 @@ partial_load_fraction = 1.0
 # permanently in the LRU cache so it is never evicted by cold experts.
 # 0 (default) disables frequency-based pinning.
 pin_after_observations = 0
+# --- Tier 2: packed expert storage (opt-in) -------------------------------
+# Read every expert from one packed blob (built by the `repack` subcommand)
+# instead of one file per expert. The engine then uses a single shared fd
+# and coalesces physically-adjacent experts into one vectored `preadv`,
+# raising effective queue depth and cutting per-miss open()/syscall cost.
+# Leave both unset (default) for the original one-file-per-expert layout.
+# Build the blob with, e.g.:
+#   micro-expert-router repack --data-dir ./data --out-blob ./experts.blob \
+#       --num-experts 256 --expert-size 99090432 --profile hot.json
+# packed_blob = "./experts.blob"
+# packed_manifest = "./experts.blob.manifest.json"
 
 [tokenizer]
 # Path to a HuggingFace `tokenizer.json` (e.g. the one shipped with

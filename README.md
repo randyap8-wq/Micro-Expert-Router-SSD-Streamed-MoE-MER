@@ -138,6 +138,14 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
   - [6. Expert deduplication via alias map (`--alias-map`)](#6-expert-deduplication-via-alias-map---alias-map)
   - [7. Predictive architecture (`S ∪ L ∪ M` speculative I/O)](#7-predictive-architecture-s--l--m-speculative-io)
   - [How to combine them](#how-to-combine-them)
+- [Defeating the cache-fraction wall (streaming Tiers 1–4)](#defeating-the-cache-fraction-wall-streaming-tiers-14)
+  - [The wall](#the-wall)
+  - [Benchmark workload harness (`--workload`)](#benchmark-workload-harness---workload)
+  - [Tier 1 — skew-aware static residency](#tier-1--skew-aware-static-residency)
+  - [Tier 2 — packed expert storage + coalesced vectored reads](#tier-2--packed-expert-storage--coalesced-vectored-reads)
+  - [Tier 3 — per-layer pre-gate (cross-layer prefetch)](#tier-3--per-layer-pre-gate-cross-layer-prefetch)
+  - [Tier 4 — adaptive prefetch governor + cost-aware eviction](#tier-4--adaptive-prefetch-governor--cost-aware-eviction)
+  - [Putting it together](#putting-it-together)
 - [3-tier heterogeneous memory cache (SSD → RAM → VRAM)](#3-tier-heterogeneous-memory-cache-ssd--ram--vram)
   - [`monitor` subcommand](#monitor-subcommand)
 - [Limitations / next steps](#limitations--next-steps)
@@ -1158,6 +1166,29 @@ speculator_top_k       = 0      # 0 ⇒ inherit `model.top_k`
 affinity_enabled       = false  # turn on per-layer expert-affinity + UTH-spatial folds
 affinity_neighbors_k   = 4      # co-fired neighbours to fold in per seed
 affinity_decay_epoch   = 100000 # cumulative observations before a decay right-shift
+
+# Streaming Tiers 1/3/4 (off by default; defaults stream as before).
+# See "Defeating the cache-fraction wall" for the full story.
+prefetch_governor              = false  # Tier 4: throttle low-value speculation
+prefetch_precision_floor       = 0.05   # governor precision floor / EWMA seed, [0,1]
+prefetch_contention_weight     = 1.0    # governor backoff per in-flight foreground read
+cost_aware_eviction            = false  # Tier 4: evict coldest heat score, not strict LRU
+pregate_enabled                = false  # Tier 3: layer-L→L+1 next-layer prefetch
+static_residency_fraction      = 0.0    # Tier 1: pin hottest fraction of the namespace
+static_residency_warmup_tokens = 0      # tokens observed before deriving the online hot set
+# static_residency_profile     = "hot.json"  # seed the hot set from a --profile-out dump
+```
+
+The packed-storage knobs (Tier 2) live under `[storage]`:
+
+```toml
+[storage]
+# Read every expert from one packed blob (built by the `repack`
+# subcommand) instead of one file per expert; adjacent experts coalesce
+# into a single vectored preadv. Both must be set together, or both unset
+# (default, one-file-per-expert layout).
+# packed_blob     = "./experts.blob"
+# packed_manifest = "./experts.blob.manifest.json"
 ```
 
 The defaults (everything off) reproduce the legacy Markov-only
@@ -1166,7 +1197,8 @@ the prefetch union and lights up the corresponding Prometheus
 counters on `/metrics`. The schema is validated at startup
 (`config.rs`) and rejects nonsensical settings, `locality_window
 == 0`, `locality_threshold_pct` outside `(0, 1]`, `speculator_top_k >
-num_experts`, etc.
+num_experts`, `static_residency_fraction` outside `[0, 1]`, a
+`packed_blob` without its `packed_manifest`, etc.
 
 #### Real-transformer pipeline
 
@@ -1595,6 +1627,22 @@ micro-expert-router gen-data
   --block-align <BYTES>      O_DIRECT alignment (default 4096)
   --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 | q8_0 (default f32)
 
+micro-expert-router repack    # Tier 2: build a packed expert blob + manifest
+  --data-dir <PATH>          Source dir of expert_<id>.bin (default ./data)
+  --out-blob <PATH>          Output blob (all expert payloads concatenated)
+  --out-manifest <PATH>      Output manifest (default <out-blob>.manifest.json)
+  --num-experts <N>          Experts to pack, ids 0..N (default 64)
+  --expert-size <BYTES>      Bytes per expert; must match the source files
+  --block-align <BYTES>      O_DIRECT alignment, must match gen-data (default 4096)
+  --no-direct                Disable O_DIRECT while reading sources (tmpfs/macOS/CI)
+  --num-experts-per-layer <N>  Layer-qualified source naming, if used
+  --profile <PATH>           Routing-frequency profile (from run --profile-out)
+                              to order experts hottest-first; unobserved
+                              experts appended numerically.
+  --order <PATH>             Explicit physical layout: a file of expert ids
+                              (one per line or a JSON array). Overrides
+                              --profile; only the listed experts are packed.
+
 micro-expert-router run
   --data-dir <PATH>          Directory with expert_<id>.bin files
                               (auto-loads metadata.json if present).
@@ -1702,6 +1750,56 @@ micro-expert-router run
                               layer+1..=layer+pipeline_depth ahead (hides
                               SSD latency behind compute). Unset = flat
                               single-namespace benchmark (no look-ahead).
+
+  # Streaming Tiers 1-4 (all off by default; defaults stream as before).
+  # See "Defeating the cache-fraction wall" below for the full story.
+  --static-residency-fraction <F>  Tier 1. Pin the hottest F of the expert
+                              namespace permanently in RAM so a skewed
+                              workload can exceed the bare cache-fraction
+                              hit ceiling. 0.0 (default) disables it.
+  --static-residency-warmup-tokens <N>  Tokens to observe before deriving
+                              the online hot set (ignored when a profile
+                              is supplied). Default 0.
+  --static-residency-profile <PATH>  JSON popularity profile ({"<id>":count},
+                              e.g. from --profile-out) to pin the hot set
+                              from token 0 with no warmup.
+  --profile-out <PATH>       Write the observed expert id->count routing
+                              profile at shutdown (feed back into
+                              --static-residency-profile or `repack`).
+  --pregate                  Tier 3. Train an online layer-L->L+1 conditional
+                              map and drive high-precision next-layer
+                              prefetch (multi-layer / replay path).
+  --prefetch-governor        Tier 4. Throttle speculative prefetches by
+                              measured precision (consumed/completed) and
+                              foreground-read contention, so low-value
+                              speculation can't crowd out foreground misses.
+  --prefetch-precision-floor <F>  Precision floor / optimistic EWMA seed for
+                              the governor, in [0,1] (default 0.05).
+  --prefetch-contention-weight <F>  Per-outstanding-foreground-read multiplier
+                              on the governor's admission threshold
+                              (default 1.0; higher = backs off harder).
+  --cost-aware-eviction      Tier 4. Evict the coldest resident by decaying
+                              heat score instead of strict LRU.
+  --packed-blob <PATH>       Tier 2. Read every expert from this single
+                              packed blob (built by `repack`) instead of
+                              one file per expert. Requires --packed-manifest.
+                              Physically-adjacent experts coalesce into one
+                              vectored preadv. Falls back to the per-file
+                              path when unset.
+  --packed-manifest <PATH>   JSON manifest (id->offset,len) for --packed-blob.
+
+  # Benchmark workload selector (so the tiers above are falsifiable).
+  --workload <KIND>          synthetic (default; uniform-i.i.d., hit rate
+                              pinned to the cache fraction) | skewed (Zipf
+                              popularity + Markov correlation) | replay
+                              (stream experts from a JSONL routing trace).
+  --zipf-s <F>               Zipf exponent for --workload skewed (default
+                              1.0; larger = more skew).
+  --workload-correlation <F>  Markov stay-probability for --workload skewed,
+                              in [0,1] (default 0.0; temporal correlation
+                              the predictors can exploit).
+  --replay-trace <PATH>      JSONL routing trace to replay with
+                              --workload replay (the --trace-out format).
 
   # Multi-drive striping:
   --data-dir <DIR1,DIR2...> Comma-separated list of mountpoints shards
@@ -2742,7 +2840,207 @@ you can verify the energy-saving paths actually engaged.
 
 ---
 
-## 3-tier heterogeneous memory cache (SSD → RAM → VRAM)
+## Defeating the cache-fraction wall (streaming Tiers 1–4)
+
+### The wall
+
+On a real SSD-streaming run the headline number is the **hit rate**: the
+fraction of routed experts already resident in the RAM cache. The whole
+point of the project is to push that number *above* the cache fraction so
+the SSD tier buys you more than the RAM you paid for. The failure mode the
+engine kept hitting is that the hit rate tracks the cache fraction almost
+exactly — 50 % of experts cached ⇒ ~50 % hit rate — and the predictive
+prefetcher (`S ∪ L ∪ M`) does nothing to lift it.
+
+**This is not a prefetcher bug. It is information-theoretic.** The legacy
+benchmark feeds `synth_hidden_state(t)` = `splitmix64(t, seed)`: every
+token is an **independent, uniform** random vector, so the routed experts
+are i.i.d. uniform over the pool. Under a uniform-i.i.d. access stream the
+optimal hit rate of *any* cache of capacity `c` over `N` experts is exactly
+`c / N`, and **no predictor can beat it** — there is no temporal locality,
+no correlation, and no signal in the hidden state to exploit. Worse, a
+speculator firing at chance accuracy (`top_k / N`) pours junk prefetches
+into a saturated disk queue, inflating the foreground-miss latency (in the
+Mixtral run, p50 read climbed from 120 ms to 405 ms — a 3.4× self-inflicted
+penalty). The "wall" is the diagonal `hit ≈ cache_fraction`, and on a
+memoryless workload the diagonal is the ceiling.
+
+Real MoE traces are **not** memoryless — they are Zipf-skewed (a few
+experts carry most of the routing mass) and Markov-correlated (the active
+expert set drifts slowly within a topic). The four tiers below exploit
+exactly those two properties, and a new **workload harness** makes them
+falsifiable on synthetic data without a GPU or real weights.
+
+Every tier is **opt-in**; with all the new knobs at their defaults the
+engine streams bit-for-bit as before.
+
+### Benchmark workload harness (`--workload`)
+
+So the streaming tiers can be measured (and so the wall can be *seen*), the
+`run` loop grows a workload selector:
+
+```bash
+# Legacy memoryless benchmark — hit rate pinned to the cache fraction.
+micro-expert-router run --data-dir ./data --workload synthetic ...
+
+# Zipf-skewed + Markov-correlated stream (the realistic case).
+micro-expert-router run --data-dir ./data \
+    --workload skewed --zipf-s 1.2 --workload-correlation 0.6 ...
+
+# Replay a captured routing trace (the `--trace-out` JSONL format).
+micro-expert-router run --data-dir ./data \
+    --workload replay --replay-trace ./trace.jsonl ...
+```
+
+* `--workload synthetic` (default) is the original uniform-i.i.d. stream —
+  unchanged, so existing numbers reproduce exactly.
+* `--workload skewed` draws each token's experts from a **Zipf** popularity
+  law (`--zipf-s`, larger ⇒ more skew) and then, with probability
+  `--workload-correlation`, re-uses experts from the previous token (a
+  first-order Markov stay), modelling topical drift.
+* `--workload replay` streams the experts from a JSONL routing trace, so a
+  capture from a real model can drive the cache simulator directly.
+
+On a skewed stream at 50 % cache, the engine clears ~90 % hit rate versus
+the ~50 % wall on the memoryless stream — the headroom the tiers below are
+designed to capture.
+
+### Tier 1 — skew-aware static residency
+
+Zipf skew means a small hot set is responsible for most routing. Tier 1
+pins that hot set in RAM permanently, so the popular experts are read **at
+most once** instead of being churned by the LRU under cold-expert pressure.
+
+```bash
+# Derive the hot set ONLINE: observe `warmup_tokens`, then pin the top
+# `fraction` of the namespace by observed routing frequency.
+micro-expert-router run ... \
+    --static-residency-fraction 0.10 \
+    --static-residency-warmup-tokens 512
+
+# …or seed it from a profile captured on a previous run:
+micro-expert-router run ... --profile-out hot.json          # capture
+micro-expert-router run ... --static-residency-profile hot.json  # reuse
+```
+
+The pin set is applied once (CAS-latched) and reuses the existing
+`ExpertCache` pin machinery, so a pinned expert is simply never chosen as an
+eviction victim. `--profile-out` writes the observed `id → count` map at
+shutdown; feeding it back via `--static-residency-profile` pins the hot set
+from token 0 with no warmup. Config equivalents live under `[predictive]`
+(`static_residency_fraction`, `static_residency_warmup_tokens`,
+`static_residency_profile`).
+
+### Tier 2 — packed expert storage + coalesced vectored reads
+
+The default storage layout is **one file per expert** (`expert_<id>.bin`).
+On a low-hit-rate stream that means a cascade of `open(2)`s and fd-cache
+thrash, and a token that misses on `K` experts issues `K` independent
+`pread`s the NVMe can only partially overlap. Tier 2 repacks every expert
+into a single **blob** (one block-aligned `expert_size` slot each) with a
+JSON manifest (`id → offset,len`), and the read path coalesces
+**physically-adjacent** experts into one vectored `preadv(2)` that scatters
+straight into the per-expert buffers — one syscall, one seek, full device
+queue depth.
+
+```bash
+# Build the blob + manifest. Order experts hottest-first from a profile so
+# the popular set is contiguous (and so co-fetched experts coalesce):
+micro-expert-router repack \
+    --data-dir ./data --out-blob ./experts.blob \
+    --num-experts 256 --expert-size 99090432 \
+    --profile hot.json            # or --order ids.txt, or numeric default
+
+# Point the engine at it (or set [storage] packed_blob / packed_manifest):
+micro-expert-router run ... \
+    --packed-blob ./experts.blob \
+    --packed-manifest ./experts.blob.manifest.json
+```
+
+The coalesced path keeps the full fault-tolerance contract: a singleton
+run, an oversized iovec batch, or any short/failed `preadv` falls back to
+the per-expert retry + circuit-breaker path, so byte-for-byte results are
+identical to the one-file layout (an integration test asserts exactly this).
+With neither knob set the engine uses the per-file path unchanged.
+
+### Tier 3 — per-layer pre-gate (cross-layer prefetch)
+
+Within one forward pass the MoE layers route **in order**, and the set of
+experts a layer picks is correlated with the next layer's pick. Tier 3
+learns that conditional online — a `layer L routed set → layer L+1 experts`
+map — and issues a **high-precision** prefetch for the next layer's likely
+experts the moment layer `L` routes, hiding the `L+1` miss behind the `L`
+compute. It runs on the multi-layer `moe_step` path (`--num-layers > 1` or
+the real-transformer/replay path), not the flat single-namespace benchmark.
+
+```bash
+micro-expert-router run ... --pregate          # [predictive] pregate_enabled
+```
+
+The run summary gains a `pregate:` line reporting the predictor's running
+accuracy (intersection of prediction with the actual next-layer routed set).
+
+### Tier 4 — adaptive prefetch governor + cost-aware eviction
+
+Tier 4 is the antidote to the self-inflicted latency the wall section
+describes. Two mechanisms:
+
+* **Adaptive prefetch governor** (`--prefetch-governor`). Tracks an EWMA of
+  prefetch **precision** (speculative reads later consumed by a hit ÷ reads
+  completed) and the disk's saturation, and **throttles speculative
+  admission** when precision is low or the queue is hot — so junk prefetches
+  stop crowding out foreground misses. Tunable via
+  `--prefetch-precision-floor` and `--prefetch-contention-weight`
+  (`[predictive] prefetch_precision_floor`, `prefetch_contention_weight`).
+* **Cost-aware eviction** (`--cost-aware-eviction`). Replaces plain LRU with
+  a decaying per-expert heat score, so the victim is the expert least likely
+  to be needed soon rather than merely the least-recently-used
+  (`[predictive] cost_aware_eviction`).
+
+The run summary gains a `governor:` line reporting precision, prefetch
+admit/throttle counts, and used/completed. On the memoryless wall workload
+the governor correctly throttles ~all speculation (it has no value to add);
+on a skewed workload it admits the prefetches that actually land.
+
+### Putting it together
+
+A realistic streaming preset on a skewed/real workload:
+
+```bash
+# 1. Capture a hot-set profile on a warmup run.
+micro-expert-router run --data-dir ./data --workload skewed \
+    --zipf-s 1.2 --workload-correlation 0.6 --tokens 2000 --profile-out hot.json
+
+# 2. Repack hottest-first so the popular set is contiguous.
+micro-expert-router repack --data-dir ./data --out-blob ./experts.blob \
+    --num-experts 256 --expert-size 99090432 --profile hot.json
+
+# 3. Stream with every tier engaged.
+micro-expert-router run --data-dir ./data \
+    --workload skewed --zipf-s 1.2 --workload-correlation 0.6 \
+    --packed-blob ./experts.blob --packed-manifest ./experts.blob.manifest.json \
+    --static-residency-profile hot.json \
+    --pregate --prefetch-governor --cost-aware-eviction
+```
+
+…and the `serve`-time equivalent in `config.toml`:
+
+```toml
+[storage]
+packed_blob     = "./experts.blob"
+packed_manifest = "./experts.blob.manifest.json"
+
+[predictive]
+static_residency_fraction      = 0.10
+static_residency_warmup_tokens = 512
+pregate_enabled                = true
+prefetch_governor              = true
+cost_aware_eviction            = true
+```
+
+---
+
+
 
 The legacy 2-tier `SSD → RAM` substrate is bit-for-bit unchanged when
 `[gpu_cache] enabled = false` (the default). With `enabled = true`,
@@ -2816,8 +3114,21 @@ The streaming GGUF reader, the Unified Tensor Header (U.T.H.) format,
 and the primary/shadow `BufferPool` (with the batched
 `IoUringStorage::read_experts_batch_fixed_promote` fast path) are all
 shipped and on by default, see the *Energy Efficiency Features*
-section above for the user-facing details. The genuinely open items
-are:
+section above for the user-facing details. The streaming **Tiers 1–4**
+(skew-aware static residency, packed storage + coalesced `preadv`,
+per-layer pre-gate, and the prefetch governor + cost-aware eviction)
+plus the `--workload` harness are likewise shipped, all opt-in, see
+[Defeating the cache-fraction wall](#defeating-the-cache-fraction-wall-streaming-tiers-14).
+The genuinely open items are:
+
+- **Tier 3 pre-gate is exercised only on the multi-layer path.** The
+  per-layer pre-gate learns a layer-L→L+1 conditional, so it only
+  contributes on the real-transformer / trace-replay path (or
+  `--num-layers > 1`); the flat single-namespace benchmark has no
+  next-layer to predict, and the module is currently covered by unit
+  tests rather than an end-to-end run. The skewed-workload hit-rate
+  figures quoted above are cache-simulator results, not full-model
+  inference numbers.
 
 - **GPU / alternative math backend.** The per-expert SwiGLU FFN runs
   through **`candle-core`**. The default build is CPU-only (no
