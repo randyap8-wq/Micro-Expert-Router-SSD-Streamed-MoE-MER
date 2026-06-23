@@ -54,6 +54,7 @@ mod session;
 mod tensor_header;
 mod tokenizer;
 mod transformer;
+mod workload;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -400,6 +401,27 @@ enum Cmd {
         /// `--static-residency-profile` on a later run).
         #[arg(long)]
         profile_out: Option<String>,
+        /// **Benchmark workload.** `synthetic` (default) keeps the legacy
+        /// uniform-i.i.d. stream (the engine/gate routes its own hidden
+        /// state); `skewed` drives `moe_step` from a Zipf-popular,
+        /// Markov-correlated expert generator (so static residency and
+        /// the predictors are exercisable); `replay` replays a recorded
+        /// JSONL routing trace via `--replay-trace`.
+        #[arg(long, default_value = "synthetic")]
+        workload: String,
+        /// Zipf exponent for `--workload skewed` (larger ⇒ more skew;
+        /// `1.0` ≈ classic Zipf, `0.0` ≈ uniform).
+        #[arg(long, default_value_t = 1.1)]
+        zipf_s: f64,
+        /// Markov stay-probability for `--workload skewed`, in `[0, 1]`:
+        /// the chance a token reuses the previous token's expert set
+        /// (temporal correlation the predictors can exploit).
+        #[arg(long, default_value_t = 0.0)]
+        workload_correlation: f64,
+        /// JSONL routing trace to replay with `--workload replay` (the
+        /// `--trace-out` format).
+        #[arg(long)]
+        replay_trace: Option<String>,
         /// Number of transformer layers, used to size the affinity
         /// matrix. `1` (default) is the single-namespace synthetic
         /// benchmark.
@@ -662,6 +684,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     static_residency_warmup_tokens,
                     static_residency_profile,
                     profile_out,
+                    workload,
+                    zipf_s,
+                    workload_correlation,
+                    replay_trace,
                     num_layers,
                     num_experts_per_layer,
                 } = cli.cmd
@@ -718,6 +744,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         static_residency_warmup_tokens,
                         static_residency_profile,
                         profile_out,
+                        workload,
+                        zipf_s,
+                        workload_correlation,
+                        replay_trace,
                         num_layers,
                         num_experts_per_layer,
                         },
@@ -1755,6 +1785,10 @@ struct RunArgs {
     static_residency_warmup_tokens: u64,
     static_residency_profile: Option<String>,
     profile_out: Option<String>,
+    workload: String,
+    zipf_s: f64,
+    workload_correlation: f64,
+    replay_trace: Option<String>,
     num_layers: u32,
     num_experts_per_layer: Option<u32>,
 }
@@ -2274,28 +2308,96 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         None => None,
     };
 
+    // Benchmark workload selection (Tier 1/3 falsifiability). `synthetic`
+    // keeps the legacy uniform-i.i.d. stream; `skewed`/`replay` drive
+    // `moe_step` with an explicit, structured expert set so the
+    // skew-aware and correlation-aware machinery is exercisable.
+    let workload = crate::workload::Workload::from_str_opt(&args.workload).ok_or_else(|| {
+        format!(
+            "--workload: unknown value {:?} (use 'synthetic', 'skewed', or 'replay')",
+            args.workload
+        )
+    })?;
+    let mut skewed_stream = if workload == crate::workload::Workload::Skewed {
+        info!(
+            zipf_s = args.zipf_s,
+            correlation = args.workload_correlation,
+            top_k = args.top_k,
+            "workload: skewed (Zipf popularity + Markov correlation)"
+        );
+        Some(crate::workload::SkewedStream::new(
+            args.num_experts,
+            args.top_k,
+            args.zipf_s,
+            args.workload_correlation,
+            args.seed,
+        ))
+    } else {
+        None
+    };
+    let mut replay_stream = if workload == crate::workload::Workload::Replay {
+        let path = args
+            .replay_trace
+            .as_ref()
+            .ok_or("--workload replay requires --replay-trace <path>")?;
+        let stream = crate::workload::ReplayStream::load(std::path::Path::new(path))?;
+        if stream.is_empty() {
+            return Err(format!("--replay-trace {path}: no usable routing records").into());
+        }
+        info!(path = %path, records = stream.len(), "workload: replay JSONL routing trace");
+        Some(stream)
+    } else {
+        None
+    };
+
     for t in 0..args.tokens {
         let start = Instant::now();
-        let stats = if let Some(gate) = gate.as_ref() {
-            // Real gating-network path. Hidden state is the same
-            // synthetic activation `Engine::generate` would have used,
-            // so the only difference relative to the legacy path is
-            // *which* experts are selected.
-            let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
-            let dec = gate.route(&hidden);
-            let pre_hits = engine.report().hits;
-            let pre_misses = engine.report().misses;
-            let pre_bytes = engine.report().bytes_read;
-            let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
-            let post = engine.report();
-            crate::engine::CycleStats {
-                hits: post.hits.saturating_sub(pre_hits),
-                misses: post.misses.saturating_sub(pre_misses),
-                prefetch_hits: 0,
-                bytes_read: post.bytes_read.saturating_sub(pre_bytes),
+        let stats = match workload {
+            // Structured workloads: drive `moe_step` with the harness's
+            // explicit expert set and measure the engine-counter delta.
+            crate::workload::Workload::Skewed | crate::workload::Workload::Replay => {
+                let experts: Vec<u32> = match workload {
+                    crate::workload::Workload::Skewed => {
+                        skewed_stream.as_mut().expect("skewed stream").next_experts()
+                    }
+                    _ => replay_stream
+                        .as_mut()
+                        .expect("replay stream")
+                        .next_experts()
+                        .expect("replay stream non-empty"),
+                };
+                let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
+                let pre = engine.report();
+                let _ = engine.moe_step(t, 0, &hidden, &experts).await;
+                let post = engine.report();
+                crate::engine::CycleStats {
+                    hits: post.hits.saturating_sub(pre.hits),
+                    misses: post.misses.saturating_sub(pre.misses),
+                    prefetch_hits: 0,
+                    bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
+                }
             }
-        } else {
-            engine.generate(t).await?
+            crate::workload::Workload::Synthetic => {
+                if let Some(gate) = gate.as_ref() {
+                    // Real gating-network path. Hidden state is the same
+                    // synthetic activation `Engine::generate` would have
+                    // used, so the only difference relative to the legacy
+                    // path is *which* experts are selected.
+                    let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
+                    let dec = gate.route(&hidden);
+                    let pre = engine.report();
+                    let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
+                    let post = engine.report();
+                    crate::engine::CycleStats {
+                        hits: post.hits.saturating_sub(pre.hits),
+                        misses: post.misses.saturating_sub(pre.misses),
+                        prefetch_hits: 0,
+                        bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
+                    }
+                } else {
+                    engine.generate(t).await?
+                }
+            }
         };
         let elapsed = start.elapsed();
         let throughput = if elapsed.as_secs_f64() > 0.0 {
