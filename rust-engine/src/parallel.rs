@@ -123,51 +123,67 @@ fn env_thread_override() -> Option<usize> {
 ///
 /// Call exactly once at process start — *after* any NUMA/affinity pinning
 /// so the workers inherit the startup affinity mask, and *before* the first
-/// [`par_row_chunks`] touches the pool. A valid `RAYON_NUM_THREADS` is left
-/// untouched for rayon to apply on first use; otherwise the global pool is
-/// built explicitly with the reserved worker count.
+/// [`par_row_chunks`] touches the pool. The global pool is built eagerly
+/// here in *both* cases: a valid `RAYON_NUM_THREADS` sets the worker count
+/// as an explicit operator override, otherwise the reserved
+/// [`default_compute_threads`] count is used. Building now — rather than
+/// letting rayon lazily initialise on first use — is what guarantees the
+/// workers are spawned at this point and inherit the startup affinity mask.
+/// Deferring (e.g. returning early on the override path) would spawn them at
+/// the first matmul, inheriting whatever affinity the triggering thread
+/// happens to carry by then (such as a later io_uring repin onto ≤8 cores).
 pub fn init_global_pool() -> usize {
-    if let Some(n) = env_thread_override() {
-        info!(
-            threads = n,
-            source = "RAYON_NUM_THREADS",
-            "compute pool: honoring explicit thread-count override"
-        );
-        return n;
-    }
-
     let logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let threads = default_compute_threads(logical);
 
-    let build_result = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|i| format!("mer-compute-{i}"))
-        .build_global();
-
-    match build_result {
-        Ok(()) => {
+    // Resolve the worker count: an explicit, valid `RAYON_NUM_THREADS` wins,
+    // otherwise fall back to the reserved async-runtime-headroom default.
+    let threads = match env_thread_override() {
+        Some(n) => {
+            info!(
+                threads = n,
+                logical,
+                source = "RAYON_NUM_THREADS",
+                "compute pool: honoring explicit thread-count override"
+            );
+            n
+        }
+        None => {
+            let t = default_compute_threads(logical);
             info!(
                 logical,
-                threads,
-                reserved = logical - threads,
-                "compute pool: sized with reserved async-runtime headroom"
+                threads = t,
+                reserved = logical - t,
+                source = "auto",
+                "compute pool: sizing with reserved async-runtime headroom"
             );
-            threads
+            t
         }
+    };
+
+    // Build the global pool *now* — after startup affinity pinning and before
+    // the first matmul — for BOTH the override and auto paths, so the workers
+    // are spawned here and inherit the startup affinity mask. Returning early
+    // on the override path (deferring to rayon's lazy init) would instead
+    // spawn them at first use, inheriting whatever affinity the triggering
+    // thread carries by then (e.g. a later io_uring repin onto ≤8 cores).
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("mer-compute-{i}"))
+        .build_global()
+    {
         // `build_global` only errors if the global pool was already built
         // (a prior call, or a rayon use before init). Keep what exists.
-        Err(e) => {
-            let current = rayon::current_num_threads().max(1);
-            warn!(
-                error = %e,
-                current_threads = current,
-                "compute pool already initialised; keeping existing configuration"
-            );
-            current
-        }
+        warn!(
+            error = %e,
+            current_threads = rayon::current_num_threads().max(1),
+            "compute pool already initialised; keeping existing configuration"
+        );
     }
+
+    num_threads()
+}
 
 /// Fill `out` in parallel by computing disjoint row-chunks on the shared
 /// `rayon` pool.
