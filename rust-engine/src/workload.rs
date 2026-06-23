@@ -210,7 +210,18 @@ impl ReplayStream {
             if let Some(arr) = value.get("experts").and_then(|e| e.as_array()) {
                 let experts: Vec<u32> = arr
                     .iter()
-                    .filter_map(|x| x.as_u64().map(|n| n as u32))
+                    .filter_map(|x| x.as_u64())
+                    .filter_map(|n| {
+                        if n > u32::MAX as u64 {
+                            tracing::warn!(
+                                expert_id = n,
+                                "replay trace expert id exceeds u32::MAX; skipping"
+                            );
+                            None
+                        } else {
+                            Some(n as u32)
+                        }
+                    })
                     .collect();
                 if !experts.is_empty() {
                     records.push(ReplayRecord {
@@ -358,6 +369,19 @@ mod tests {
         assert_eq!(third.experts, vec![5]);
         // Cycles back to the start.
         assert_eq!(r.next_experts(), Some(vec![3, 7]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_skips_expert_ids_exceeding_u32() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("replay_overflow_{}.jsonl", std::process::id()));
+        // 4294967296 == u32::MAX + 1; a silent `as u32` cast would truncate
+        // it to 0, so the guard must drop it instead.
+        std::fs::write(&path, "{\"experts\":[5,4294967296,7]}\n").unwrap();
+        let mut r = ReplayStream::load(&path).unwrap();
+        let rec = r.next_record().unwrap();
+        assert_eq!(rec.experts, vec![5, 7]);
         let _ = std::fs::remove_file(&path);
     }
 }

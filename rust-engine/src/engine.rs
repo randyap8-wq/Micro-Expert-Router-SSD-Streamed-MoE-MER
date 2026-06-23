@@ -1123,6 +1123,11 @@ pub(crate) struct EngineSpeculation {
     /// `fetch_add` in steady state, so concurrent `moe_step` calls
     /// from batched requests no longer serialize on one writer lock.
     pub(super) route_observations: DashMap<u32, AtomicU64>,
+    /// Engine-owned monotonic token counter for route-observation bumps.
+    /// Online static-residency warmup gates on this instead of the
+    /// caller-supplied `token_idx`, which can be per-stream or reused on
+    /// `moe_step`.
+    pub(super) route_observation_tokens: AtomicU64,
     /// Two-deep Markov history (`last` + `last_last`) behind a single
     /// mutex — see [`MarkovRing`] for why the entries share one lock.
     pub(super) markov_ring: parking_lot::Mutex<MarkovRing>,
@@ -1137,6 +1142,9 @@ pub(crate) struct EngineSpeculation {
     /// reconciliation. Diff'd against the current hot set so we only
     /// `pin`/`unpin` ids that actually changed status.
     pub(super) locality_pinned: parking_lot::Mutex<HashSet<u32>>,
+    /// Expert ids pinned by static residency. Locality reconciliation must
+    /// not unpin these ids when they leave the sliding-window hot set.
+    pub(super) static_pinned: parking_lot::Mutex<HashSet<u32>>,
     /// Heat threshold for [`Self::locality`]. Mirrors
     /// [`LocalityMonitor::DEFAULT_THRESHOLD_PCT`] when not overridden.
     pub(super) locality_threshold_pct: f32,
@@ -1351,9 +1359,11 @@ impl EngineSpeculation {
             alias_map: None,
             alias_redirects: AtomicU64::new(0),
             route_observations: DashMap::new(),
+            route_observation_tokens: AtomicU64::new(0),
             markov_ring: parking_lot::Mutex::new(MarkovRing::default()),
             locality: None,
             locality_pinned: parking_lot::Mutex::new(HashSet::new()),
+            static_pinned: parking_lot::Mutex::new(HashSet::new()),
             locality_threshold_pct: LocalityMonitor::DEFAULT_THRESHOLD_PCT,
             locality_hits: AtomicU64::new(0),
             locality_misses: AtomicU64::new(0),
@@ -1920,11 +1930,12 @@ impl Engine {
 
     /// Apply the static-residency hot set exactly once, when ready. For
     /// a profile-seeded controller this fires on the first token; for an
-    /// online controller it waits until `token_idx >= warmup_tokens` and
-    /// then derives the hot set from the accumulated route observations.
+    /// online controller it waits until the engine has bumped route
+    /// observations for `warmup_tokens` tokens, then derives the hot set
+    /// from the accumulated route observations.
     /// The pin is latched behind a compare-and-swap so concurrent
     /// per-token calls apply it a single time.
-    fn maybe_apply_static_residency(&self, token_idx: u64) {
+    fn maybe_apply_static_residency(&self) {
         let Some(sr) = self.speculation.static_residency.as_ref() else {
             return;
         };
@@ -1934,7 +1945,12 @@ impl Engine {
         let hot = if let Some(profile) = sr.profile.as_ref() {
             profile.hot_set(sr.fraction, sr.namespace)
         } else {
-            if token_idx < sr.warmup_tokens {
+            if self
+                .speculation
+                .route_observation_tokens
+                .load(Ordering::Acquire)
+                < sr.warmup_tokens
+            {
                 return;
             }
             self.snapshot_route_profile()
@@ -1953,6 +1969,10 @@ impl Engine {
         }
         for id in &hot {
             self.core.cache.pin(*id);
+        }
+        {
+            let mut static_pinned = self.speculation.static_pinned.lock();
+            static_pinned.extend(hot.iter().copied());
         }
         info!(
             pinned = hot.len(),
@@ -1984,6 +2004,14 @@ impl Engine {
             }
         }
         id
+    }
+
+    #[inline]
+    fn credit_prefetch_use(&self, resident: &Arc<ExpertResident>, new_hits: u64) {
+        if new_hits == 1 && resident.is_shadow_backed() {
+            self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
+            self.core.governor.record_used();
+        }
     }
 
     /// Total number of distinct experts the engine's router can
@@ -2050,7 +2078,7 @@ impl Engine {
         }
         // Tier 1: pin the static-residency hot set once it is ready
         // (immediately for a profile seed, post-warmup for online).
-        self.maybe_apply_static_residency(token_idx);
+        self.maybe_apply_static_residency();
 
         // 1) Make sure every required expert is resident.
         //
@@ -2101,10 +2129,7 @@ impl Engine {
                 // governor so its precision EWMA tracks reality, and bump
                 // the (previously dead) `prefetch_used` counter so the
                 // run summary can report end-to-end prefetch precision.
-                if new_hits == 1 && r.is_shadow_backed() {
-                    self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
-                    self.core.governor.record_used();
-                }
+                self.credit_prefetch_use(&r, new_hits);
                 if let (Some(gpu), Some(tx)) = (
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
@@ -2208,6 +2233,8 @@ impl Engine {
             // fetch task (a bug, not an I/O failure), preserving the
             // pre-concurrency panic-propagation semantics for that case.
             let r = h.await.expect("expert fetch task panicked")?;
+            let new_hits = r.record_hit();
+            self.credit_prefetch_use(&r, new_hits);
             // We still account the per-call `stats.bytes_read` here
             // for the synthetic-benchmark accumulator (it tracks
             // logical bytes consumed, not bytes actually pulled
@@ -2662,9 +2689,8 @@ impl Engine {
         // duration of the device I/O so the governor throttles
         // speculation that would otherwise queue ahead of it. No-op when
         // the governor is disabled.
-        self.core.governor.begin_foreground();
+        let _fg = self.core.governor.foreground_guard();
         let read_result = self.core.storage.read_expert(id, &mut buf).await;
-        self.core.governor.end_foreground();
         match read_result {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
@@ -3051,6 +3077,9 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
     /// previous value makes the threshold crossing exact: precisely
     /// one caller observes `prev + 1 == threshold` and issues the pin.
     fn bump_route_observations(&self, target: &[u32]) {
+        self.speculation
+            .route_observation_tokens
+            .fetch_add(1, Ordering::Release);
         let threshold = self.core.options.pin_after_observations;
         for &id in target {
             let prev = if let Some(counter) = self.speculation.route_observations.get(&id) {
@@ -3140,7 +3169,10 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         }
         for &id in prev.iter() {
             if !new_hot.contains(&id) {
-                self.core.cache.unpin(id);
+                let is_static_pinned = self.speculation.static_pinned.lock().contains(&id);
+                if !is_static_pinned {
+                    self.core.cache.unpin(id);
+                }
             }
         }
         let len = new_hot.len();
@@ -3635,7 +3667,7 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             self.bump_route_observations(&target);
         }
         // Tier 1: pin the static-residency hot set once it is ready.
-        self.maybe_apply_static_residency(token_idx);
+        self.maybe_apply_static_residency();
 
         // **Speculative I/O union-fetch (S ∪ L ∪ M), issued
         // concurrently with the target-miss fetches.** Fire the
@@ -3723,10 +3755,7 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 // Tier 4 precision feedback (mirrors `generate`): a
                 // first hit on a shadow-backed resident is a prefetch
                 // that paid off. No-op when the governor is disabled.
-                if new_hits == 1 && r.is_shadow_backed() {
-                    self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
-                    self.core.governor.record_used();
-                }
+                self.credit_prefetch_use(&r, new_hits);
                 if let (Some(gpu), Some(tx)) = (
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
@@ -3792,6 +3821,8 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             // re-raise so the supervising scheduler can restart us.
             match h.await.expect("expert fetch task panicked") {
                 Ok(r) => {
+                    let new_hits = r.record_hit();
+                    self.credit_prefetch_use(&r, new_hits);
                     // `bytes_read` is already bumped inside
                     // `fetch_once` on the actual leader path, so we
                     // don't double-count here. Followers that
@@ -5336,14 +5367,109 @@ mod tests {
         let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
         // Skewed stream: experts {2,5} fire every token; a rotating cold
         // expert fires once each so {2,5} are unambiguously hottest.
-        for t in 0..8u64 {
+        // Reuse token_idx=0 on every call to prove online warmup is driven
+        // by the engine-owned observation counter, not the caller seed.
+        for t in 0..3u64 {
             let cold = 6 + (t % 2) as u32; // 6 or 7, never as hot as {2,5}
-            let _ = engine.moe_step(t, /*layer=*/ 0, &hidden, &[2, 5, cold]).await;
+            let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[2, 5, cold]).await;
+        }
+        assert_eq!(cache.pinned_count(), 0, "warmup should not fire before 4 bumps");
+        for t in 3..8u64 {
+            let cold = 6 + (t % 2) as u32;
+            let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[2, 5, cold]).await;
         }
 
         // After warmup the hot set must be pinned exactly once.
         assert_eq!(cache.pinned_count(), 2, "ceil(0.25*8)=2 experts pinned");
         assert_eq!(cache.pinned_ids(), vec![2, 5], "the two hottest experts");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_residency_pin_survives_locality_unpin() {
+        let dir = TempDir::new("static-locality-pin");
+        let total_experts: u32 = 4;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed: u64 = 0x51A7_1C_u64;
+        let engine = build_engine(
+            &dir.path,
+            total_experts,
+            d_model,
+            d_ff,
+            /*cache_slots=*/ 4,
+            /*top_k=*/ 1,
+            /*predict_fanout=*/ 1,
+            seed,
+        );
+        let profile = crate::residency::ResidencyProfile::from_counts(HashMap::from([
+            (0, 10),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+        ]));
+        let engine = {
+            let cache = engine.core.cache.clone();
+            let pool = engine.core.pool.clone();
+            let storage = engine.core.storage.clone();
+            let router = engine.core.router.clone();
+            let predictor = engine.core.predictor.clone();
+            let shape = engine.core.shape;
+            let monitor = Arc::new(LocalityMonitor::new(total_experts, /*window=*/ 2));
+            Arc::new(
+                Engine::new(cache, pool, storage, router, predictor, shape)
+                    .with_static_residency(0.25, /*warmup_tokens=*/ 100, Some(profile))
+                    .with_locality_monitor(monitor, 0.5),
+            )
+        };
+
+        engine.maybe_apply_static_residency();
+        assert!(
+            engine.core.cache.pinned_ids().contains(&0),
+            "static residency pins expert 0"
+        );
+
+        engine.locality_observe_and_reconcile(&[0]);
+        assert!(
+            engine.core.cache.pinned_ids().contains(&0),
+            "locality also sees expert 0 hot"
+        );
+        engine.locality_observe_and_reconcile(&[1]);
+        engine.locality_observe_and_reconcile(&[1]);
+
+        assert!(
+            engine.core.cache.pinned_ids().contains(&0),
+            "locality must not unpin an expert pinned by static residency"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credit_prefetch_use_counts_shadow_resident_once() {
+        let dir = TempDir::new("prefetch-use-credit");
+        let engine = build_engine(
+            &dir.path,
+            /*num_experts=*/ 2,
+            /*d_model=*/ 16,
+            /*d_ff=*/ 32,
+            /*cache_slots=*/ 2,
+            /*top_k=*/ 1,
+            /*predict_fanout=*/ 1,
+            0xC0FF_EE_u64,
+        );
+        let shadow_pool = BufferPool::new_with_shadow(1, 1, 4096, 4096);
+        let buf = shadow_pool.try_acquire_shadow().expect("shadow buffer");
+        let resident = Arc::new(ExpertResident::new(0, buf));
+        assert!(resident.is_shadow_backed());
+
+        let first = resident.record_hit();
+        engine.credit_prefetch_use(&resident, first);
+        let second = resident.record_hit();
+        engine.credit_prefetch_use(&resident, second);
+
+        assert_eq!(
+            engine.metrics.counters.prefetch_used.load(Ordering::Relaxed),
+            1,
+            "only the first consumption of a shadow-backed resident is credited"
+        );
     }
 
     /// **Tier 1 — profile-seeded static residency.** With an offline

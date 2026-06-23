@@ -831,6 +831,18 @@ impl Config {
                 self.predictive.static_residency_fraction
             )));
         }
+        if !(0.0..=1.0).contains(&self.predictive.prefetch_precision_floor) {
+            return Err(ConfigError::Invalid(format!(
+                "predictive.prefetch_precision_floor ({}) must be in [0.0, 1.0]",
+                self.predictive.prefetch_precision_floor
+            )));
+        }
+        if self.predictive.prefetch_contention_weight < 0.0 {
+            return Err(ConfigError::Invalid(format!(
+                "predictive.prefetch_contention_weight ({}) must be >= 0.0",
+                self.predictive.prefetch_contention_weight
+            )));
+        }
         // [gpu_cache] validation — only meaningful when enabled.
         if self.gpu_cache.enabled {
             if !(0.0..=1.0).contains(&self.gpu_cache.vram_anchor_ratio) {
@@ -1358,6 +1370,20 @@ mod tests {
         let mut c = minimal_cfg();
         c.predictive.speculator_enabled = true;
         c.predictive.speculator_top_k = 9999;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn predictive_rejects_out_of_range_precision_floor() {
+        let mut c = minimal_cfg();
+        c.predictive.prefetch_precision_floor = 1.5;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn predictive_rejects_negative_contention_weight() {
+        let mut c = minimal_cfg();
+        c.predictive.prefetch_contention_weight = -0.1;
         assert!(c.validate().is_err());
     }
 }

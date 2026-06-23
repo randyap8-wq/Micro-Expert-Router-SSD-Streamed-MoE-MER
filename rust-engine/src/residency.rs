@@ -110,7 +110,18 @@ impl ResidencyProfile {
         if budget == 0 {
             return Vec::new();
         }
-        let mut ranked: Vec<(u32, u64)> = self.counts.iter().map(|(k, v)| (*k, *v)).collect();
+        // Exclude ids outside the active namespace: a stale/offline profile
+        // from a different model can reference ids >= namespace that would
+        // otherwise waste hot-set slots on experts the router can't address.
+        let mut ranked: Vec<(u32, u64)> = self
+            .counts
+            .iter()
+            .filter(|(id, _)| (**id as usize) < namespace)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        if ranked.is_empty() {
+            return Vec::new();
+        }
         // Sort by count desc, then id asc. Experts never observed are not
         // in the map and are correctly excluded.
         ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -195,6 +206,24 @@ mod tests {
         }
         // ceil(0.1 * 3) = 1.
         assert_eq!(p.hot_set(0.1, 3).len(), 1);
+    }
+
+    #[test]
+    fn hot_set_excludes_ids_outside_namespace() {
+        let mut p = ResidencyProfile::new();
+        // A stale id from a larger model dominates the counts but must not
+        // be pinned: it is outside the active 8-expert namespace.
+        for _ in 0..100 {
+            p.observe(99);
+        }
+        for _ in 0..5 {
+            p.observe(2);
+        }
+        for _ in 0..3 {
+            p.observe(5);
+        }
+        // namespace = 8, budget = ceil(0.25 * 8) = 2.
+        assert_eq!(p.hot_set(0.25, 8), vec![2, 5]);
     }
 
     #[test]

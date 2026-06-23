@@ -185,11 +185,15 @@ impl PackedBlob {
     pub fn open(blob_path: &Path, manifest_path: &Path, use_direct_io: bool) -> io::Result<Self> {
         let manifest = PackedManifest::load_from(manifest_path)?;
         let file = open_expert_file(blob_path, use_direct_io)?;
-        Ok(Self {
+        let blob = Self {
             file: Arc::new(file),
             manifest,
             blob_path: blob_path.to_path_buf(),
-        })
+        };
+        // Reject malformed/stale manifests at open time so direct callers
+        // (not just the attach path) never drive wrong offsets into reads.
+        blob.validate()?;
+        Ok(blob)
     }
 
     /// The shared blob file descriptor.
@@ -418,5 +422,22 @@ mod tests {
     #[test]
     fn coalesce_empty_is_empty() {
         assert!(coalesce_runs(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn open_rejects_truncated_blob() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let blob_path = dir.join(format!("trunc_{pid}.blob"));
+        let manifest_path = dir.join(format!("trunc_{pid}.manifest.json"));
+        // Manifest declares two 4096-byte slots (blob_len = 8192) but the
+        // blob file holds only one slot's worth of bytes.
+        let m = PackedManifest::uniform(vec![0, 1], 4096, 4096);
+        m.write_to(&manifest_path).unwrap();
+        std::fs::write(&blob_path, vec![0u8; 4096]).unwrap();
+        let err = PackedBlob::open(&blob_path, &manifest_path, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&blob_path);
+        let _ = std::fs::remove_file(&manifest_path);
     }
 }

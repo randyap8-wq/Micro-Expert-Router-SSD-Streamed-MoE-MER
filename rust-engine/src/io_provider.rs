@@ -1505,7 +1505,16 @@ pub async fn pack_experts(
         .truncate(true)
         .open(blob_path)?;
     let mut writer = std::io::BufWriter::with_capacity(8 * 1024 * 1024, blob);
+    // Reject duplicate ids: the manifest collapses entries by key while the
+    // blob writes every slot, so a repeated id yields a malformed layout.
+    let mut seen = std::collections::HashSet::with_capacity(order.len());
     for &id in order {
+        if !seen.insert(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate expert id {id} in packed order"),
+            ));
+        }
         let mut buf = pool.acquire().await;
         debug_assert_eq!(buf.len(), expert_size);
         source.read_expert(id, &mut buf).await?;
@@ -2915,5 +2924,37 @@ mod tests {
             HardwareFailure::ExpertUnavailable { expert_id, .. } => assert_eq!(expert_id, 7),
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// `pack_experts` rejects a duplicate id in the requested order rather
+    /// than writing a malformed blob whose manifest collapses by key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pack_experts_rejects_duplicate_order() {
+        let dir = tempdir("packed-dup");
+        let num_experts = 3u32;
+        let d_model = 8usize;
+        let d_ff = 16usize;
+        let block = 4096usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let expert_size = weight_bytes.div_ceil(block) * block;
+        generate_synthetic_experts(&dir, num_experts, expert_size, d_model, d_ff).unwrap();
+
+        let cfg = StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        };
+        let source = NvmeStorage::new(cfg).unwrap();
+        let pool = BufferPool::new(num_experts as usize * 2 + 4, expert_size, block);
+        let blob_path = dir.join("dup.blob");
+        let manifest_path = dir.join("dup.manifest.json");
+
+        let err = pack_experts(&source, &pool, &[0, 1, 1], &blob_path, &manifest_path)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

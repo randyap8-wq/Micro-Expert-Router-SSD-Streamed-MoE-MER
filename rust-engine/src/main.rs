@@ -2799,10 +2799,10 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     // Tier 1 — emit the accumulated expert-popularity profile so a later
     // run can warm-start static residency with `--static-residency-profile`.
     if let Some(path) = args.profile_out.as_ref() {
-        match engine.dump_route_profile(std::path::Path::new(path)) {
-            Ok(()) => info!(path = %path, "wrote route-observation profile"),
-            Err(e) => warn!(path = %path, error = %e, "failed to write route profile"),
-        }
+        engine
+            .dump_route_profile(std::path::Path::new(path))
+            .map_err(|e| format!("failed to write route profile {}: {e}", path))?;
+        info!(path = %path, "wrote route-observation profile");
     }
 
     Ok(())

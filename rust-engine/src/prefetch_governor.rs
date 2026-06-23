@@ -111,6 +111,25 @@ pub struct PrefetchGovernor {
     admitted: AtomicU64,
 }
 
+/// RAII token for foreground-read accounting. Dropping the guard always
+/// balances the corresponding [`PrefetchGovernor::begin_foreground`] call.
+pub struct ForegroundGuard<'a> {
+    governor: &'a PrefetchGovernor,
+}
+
+impl<'a> ForegroundGuard<'a> {
+    fn new(governor: &'a PrefetchGovernor) -> Self {
+        governor.begin_foreground();
+        Self { governor }
+    }
+}
+
+impl Drop for ForegroundGuard<'_> {
+    fn drop(&mut self) {
+        self.governor.end_foreground();
+    }
+}
+
 impl PrefetchGovernor {
     /// Construct a governor. When `enabled` is `false` the controller is
     /// a transparent pass-through: [`Self::admit`] always returns `true`
@@ -196,6 +215,14 @@ impl PrefetchGovernor {
         if self.enabled {
             self.foreground_inflight.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Begin foreground-read accounting and return a guard that ends it
+    /// on drop. Preserves the disabled-governor no-op semantics of the
+    /// explicit begin/end methods.
+    #[inline]
+    pub fn foreground_guard(&self) -> ForegroundGuard<'_> {
+        ForegroundGuard::new(self)
     }
 
     /// Record that a speculative read landed (became resident).
@@ -329,6 +356,24 @@ mod tests {
         g.end_foreground();
         g.end_foreground();
         assert!(g.admit(0.3));
+    }
+
+    #[test]
+    fn foreground_guard_releases_on_drop() {
+        let g = PrefetchGovernor::new(true, GovernorConfig::default());
+        let before = g.foreground_inflight();
+        {
+            let _guard = g.foreground_guard();
+            assert_eq!(g.foreground_inflight(), before + 1);
+        }
+        assert_eq!(g.foreground_inflight(), before);
+
+        let disabled = PrefetchGovernor::disabled();
+        {
+            let _guard = disabled.foreground_guard();
+            assert_eq!(disabled.foreground_inflight(), 0);
+        }
+        assert_eq!(disabled.foreground_inflight(), 0);
     }
 
     #[test]
