@@ -45,6 +45,7 @@ mod multi_layer_cache;
 mod numa;
 mod parallel;
 mod prefetch_governor;
+mod residency;
 mod router;
 mod rpc;
 mod sampling;
@@ -379,6 +380,26 @@ enum Cmd {
         /// next-layer prefetch from it. Off by default.
         #[arg(long)]
         pregate: bool,
+        /// **Tier 1 — static residency.** Fraction of the global expert
+        /// namespace to pin permanently in RAM (the hottest experts), in
+        /// `(0, 1]`. `0.0` (default) disables it. Lifts the hit-rate
+        /// ceiling above the bare cache fraction on a *skewed* workload.
+        #[arg(long, default_value_t = 0.0)]
+        static_residency_fraction: f64,
+        /// Tokens to observe before deriving the online static-residency
+        /// hot set (ignored when `--static-residency-profile` is given).
+        #[arg(long, default_value_t = 0)]
+        static_residency_warmup_tokens: u64,
+        /// Path to an offline expert-popularity profile JSON
+        /// (`{ "<id>": <count> }`) to seed static residency at startup.
+        /// When omitted, the hot set is derived online.
+        #[arg(long)]
+        static_residency_profile: Option<String>,
+        /// Write the run's accumulated route-observation profile to this
+        /// JSON path at shutdown (consumable by
+        /// `--static-residency-profile` on a later run).
+        #[arg(long)]
+        profile_out: Option<String>,
         /// Number of transformer layers, used to size the affinity
         /// matrix. `1` (default) is the single-namespace synthetic
         /// benchmark.
@@ -637,6 +658,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prefetch_contention_weight,
                     cost_aware_eviction,
                     pregate,
+                    static_residency_fraction,
+                    static_residency_warmup_tokens,
+                    static_residency_profile,
+                    profile_out,
                     num_layers,
                     num_experts_per_layer,
                 } = cli.cmd
@@ -689,6 +714,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         prefetch_contention_weight,
                         cost_aware_eviction,
                         pregate,
+                        static_residency_fraction,
+                        static_residency_warmup_tokens,
+                        static_residency_profile,
+                        profile_out,
                         num_layers,
                         num_experts_per_layer,
                         },
@@ -1221,6 +1250,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             prefetch_contention_weight: cfg.predictive.prefetch_contention_weight,
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
+            collect_route_profile: false,
         },
     );
     // Apply the configured look-ahead pipeline depth (`[storage]
@@ -1278,6 +1308,28 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             affinity,
             cfg.predictive.affinity_neighbors_k,
             cfg.predictive.affinity_decay_epoch,
+        );
+    }
+    // Tier 1 — static residency. Pin the hottest `fraction` of experts
+    // permanently (from an offline profile when `static_residency_profile`
+    // is set, else online after the warmup window).
+    if cfg.predictive.static_residency_fraction > 0.0 {
+        let profile = match cfg.predictive.static_residency_profile.as_ref() {
+            Some(path) => {
+                let p = crate::residency::ResidencyProfile::load_json(std::path::Path::new(path))?;
+                info!(
+                    path = %path,
+                    experts = p.len(),
+                    "loaded static-residency popularity profile"
+                );
+                Some(p)
+            }
+            None => None,
+        };
+        engine_builder = engine_builder.with_static_residency(
+            cfg.predictive.static_residency_fraction,
+            cfg.predictive.static_residency_warmup_tokens,
+            profile,
         );
     }
     // Phase 2: optional VRAM (GPU) expert cache (3-tier hierarchy
@@ -1699,6 +1751,10 @@ struct RunArgs {
     prefetch_contention_weight: f64,
     cost_aware_eviction: bool,
     pregate: bool,
+    static_residency_fraction: f64,
+    static_residency_warmup_tokens: u64,
+    static_residency_profile: Option<String>,
+    profile_out: Option<String>,
     num_layers: u32,
     num_experts_per_layer: Option<u32>,
 }
@@ -2048,6 +2104,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 prefetch_contention_weight: args.prefetch_contention_weight,
                 cost_aware_eviction: args.cost_aware_eviction,
                 pregate_enabled: args.pregate,
+                collect_route_profile: args.profile_out.is_some(),
             },
         );
         if let Some(gpu_cache) = args.gpu_expert_cache.clone() {
@@ -2121,6 +2178,30 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 affinity,
                 args.affinity_neighbors_k,
                 args.affinity_decay_epoch,
+            );
+        }
+        // Tier 1 — static residency. Pin the hottest `fraction` of the
+        // expert namespace permanently. With `--static-residency-profile`
+        // the hot set comes from an offline popularity profile (warm at
+        // startup); otherwise it is derived online from route counts after
+        // `--static-residency-warmup-tokens`.
+        if args.static_residency_fraction > 0.0 {
+            let profile = match args.static_residency_profile.as_ref() {
+                Some(path) => {
+                    let p = crate::residency::ResidencyProfile::load_json(std::path::Path::new(path))?;
+                    info!(
+                        path = %path,
+                        experts = p.len(),
+                        "loaded static-residency popularity profile"
+                    );
+                    Some(p)
+                }
+                None => None,
+            };
+            base = base.with_static_residency(
+                args.static_residency_fraction,
+                args.static_residency_warmup_tokens,
+                profile,
             );
         }
         // Optional alias map (Change 6: expert deduplication).
@@ -2259,6 +2340,15 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     // Flush the trace before returning so the JSONL file is complete.
     if let Some(tw) = trace_writer.as_ref() {
         tw.flush();
+    }
+
+    // Tier 1 — emit the accumulated expert-popularity profile so a later
+    // run can warm-start static residency with `--static-residency-profile`.
+    if let Some(path) = args.profile_out.as_ref() {
+        match engine.dump_route_profile(std::path::Path::new(path)) {
+            Ok(()) => info!(path = %path, "wrote route-observation profile"),
+            Err(e) => warn!(path = %path, error = %e, "failed to write route profile"),
+        }
     }
 
     Ok(())

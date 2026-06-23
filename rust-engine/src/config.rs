@@ -514,6 +514,29 @@ pub struct PredictiveConfig {
     /// speculator/Markov look-ahead untouched.
     #[serde(default)]
     pub pregate_enabled: bool,
+
+    /// **Tier 1 — static residency.** Fraction of the global expert
+    /// namespace to pin permanently in the RAM cache (the hottest
+    /// experts). `0.0` (default) disables the feature; a value in
+    /// `(0, 1]` pins `ceil(fraction × num_experts)` experts. Clamped to
+    /// `[0, 1]`.
+    #[serde(default)]
+    pub static_residency_fraction: f64,
+
+    /// Tokens to observe before deriving the *online* static-residency
+    /// hot set from live route counts. Ignored when
+    /// `static_residency_profile` is set (an offline profile is applied
+    /// immediately, with no warmup).
+    #[serde(default)]
+    pub static_residency_warmup_tokens: u64,
+
+    /// Optional path to an offline expert-popularity profile
+    /// (`{ "<id>": <count> }` JSON, e.g. from a previous run's
+    /// `--profile-out`). When present, its hottest `fraction` is pinned
+    /// at startup for an immediately warm cache. `None` derives the hot
+    /// set online instead.
+    #[serde(default)]
+    pub static_residency_profile: Option<String>,
 }
 
 fn default_prefetch_precision_floor() -> f64 { 0.05 }
@@ -542,6 +565,9 @@ impl Default for PredictiveConfig {
             prefetch_contention_weight: default_prefetch_contention_weight(),
             cost_aware_eviction: false,
             pregate_enabled: false,
+            static_residency_fraction: 0.0,
+            static_residency_warmup_tokens: 0,
+            static_residency_profile: None,
         }
     }
 }
@@ -762,6 +788,12 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "storage.partial_load_fraction ({}) must be in [0.1, 1.0]",
                 self.storage.partial_load_fraction
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.predictive.static_residency_fraction) {
+            return Err(ConfigError::Invalid(format!(
+                "predictive.static_residency_fraction ({}) must be in [0.0, 1.0]",
+                self.predictive.static_residency_fraction
             )));
         }
         // [gpu_cache] validation — only meaningful when enabled.

@@ -248,6 +248,14 @@ impl MultiLayerExpertCache {
         self.caches.iter().map(|c| c.pinned_count()).sum()
     }
 
+    /// Snapshot of all pinned ids across every per-layer cache, sorted
+    /// ascending (diagnostics / tests).
+    pub fn pinned_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.caches.iter().flat_map(|c| c.pinned_ids()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub fn resident_ids(&self) -> Vec<u32> {
         let mut ids = Vec::with_capacity(self.len());
         for c in &self.caches {

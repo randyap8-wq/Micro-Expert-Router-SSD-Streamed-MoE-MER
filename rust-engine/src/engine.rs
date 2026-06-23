@@ -926,6 +926,13 @@ pub struct EngineOptions {
     /// trace-replay path. `false` (the default) leaves the existing
     /// speculator/Markov look-ahead untouched.
     pub pregate_enabled: bool,
+    /// **Tier 1 — route-profile collection.** When `true`, the engine
+    /// always bumps per-expert `route_observations` (even when neither
+    /// frequency pinning nor online static residency would otherwise
+    /// need them) so a run can emit a popularity profile via
+    /// `--profile-out`. `false` (the default) keeps the per-token bump
+    /// free when no consumer needs the counts.
+    pub collect_route_profile: bool,
 }
 
 /// Default semaphore ceiling for `Engine::spawn_prefetch`. Matches a
@@ -969,6 +976,7 @@ impl Default for EngineOptions {
             prefetch_contention_weight: 1.0,
             cost_aware_eviction: false,
             pregate_enabled: false,
+            collect_route_profile: false,
         }
     }
 }
@@ -1185,6 +1193,13 @@ pub(crate) struct EngineSpeculation {
     /// lifetime; dropping it stops the worker. `None` when the
     /// affinity arm is disabled.
     pub(super) affinity_decay: Option<DecayWorkerHandle>,
+    /// Tier 1 — **static residency** controller. When present, the
+    /// engine pins the hottest `fraction` of experts permanently in the
+    /// RAM cache (from an offline profile at startup, or an online hot
+    /// set derived from [`Self::route_observations`] after a warmup
+    /// window) so a skewed routing distribution can exceed the bare
+    /// cache-capacity hit-rate ceiling. `None` disables the feature.
+    pub(super) static_residency: Option<crate::residency::StaticResidencyState>,
 }
 
 /// Observability: latency histograms, cumulative timing atomics,
@@ -1346,6 +1361,7 @@ impl EngineSpeculation {
             affinity: None,
             affinity_neighbors_k: 0,
             affinity_decay: None,
+            static_residency: None,
         }
     }
 }
@@ -1827,6 +1843,110 @@ impl Engine {
         self
     }
 
+    /// Tier 1 — install the **static residency** controller. `fraction`
+    /// is the share of the global expert namespace to pin permanently
+    /// (`<= 0.0` disables the feature and leaves the engine unchanged).
+    /// When `profile` is `Some`, its hot set is pinned at the first
+    /// token with no warmup; when `None`, the engine derives the hot set
+    /// online from [`Self::route_observations`] after `warmup_tokens`
+    /// tokens. The pin budget is sized against the router's expert
+    /// namespace so it is a true fraction of *all* experts.
+    pub fn with_static_residency(
+        mut self,
+        fraction: f64,
+        warmup_tokens: u64,
+        profile: Option<crate::residency::ResidencyProfile>,
+    ) -> Self {
+        if fraction <= 0.0 {
+            return self;
+        }
+        let namespace = self.core.router.num_experts() as usize;
+        self.speculation.static_residency = Some(crate::residency::StaticResidencyState::new(
+            fraction.min(1.0),
+            warmup_tokens,
+            namespace,
+            profile,
+        ));
+        self
+    }
+
+    /// Whether the static-residency controller still needs
+    /// `route_observations` populated this token — true only while an
+    /// *online* (profile-less) controller is configured and has not yet
+    /// pinned its hot set. Keeps the per-token observation bump free
+    /// when the feature is off or already applied.
+    fn static_residency_needs_counts(&self) -> bool {
+        self.speculation
+            .static_residency
+            .as_ref()
+            .map(|sr| sr.is_online() && !sr.applied.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    /// Build a [`ResidencyProfile`] snapshot from the live
+    /// `route_observations` counters. Cheap relaxed reads — the counts
+    /// are advisory, so a torn-but-consistent snapshot is acceptable.
+    fn snapshot_route_profile(&self) -> crate::residency::ResidencyProfile {
+        let mut counts = HashMap::new();
+        for entry in self.speculation.route_observations.iter() {
+            counts.insert(*entry.key(), entry.value().load(Ordering::Relaxed));
+        }
+        crate::residency::ResidencyProfile::from_counts(counts)
+    }
+
+    /// Dump the engine's live route-observation profile to `path` as
+    /// JSON (`{ "<id>": <count> }`). Used by the `--profile-out` flag so
+    /// a run can emit its own hot-set profile for a later
+    /// `--static-residency-profile` warm start.
+    pub fn dump_route_profile(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.snapshot_route_profile().dump_json(path)
+    }
+
+    /// Apply the static-residency hot set exactly once, when ready. For
+    /// a profile-seeded controller this fires on the first token; for an
+    /// online controller it waits until `token_idx >= warmup_tokens` and
+    /// then derives the hot set from the accumulated route observations.
+    /// The pin is latched behind a compare-and-swap so concurrent
+    /// per-token calls apply it a single time.
+    fn maybe_apply_static_residency(&self, token_idx: u64) {
+        let Some(sr) = self.speculation.static_residency.as_ref() else {
+            return;
+        };
+        if sr.applied.load(Ordering::Acquire) {
+            return;
+        }
+        let hot = if let Some(profile) = sr.profile.as_ref() {
+            profile.hot_set(sr.fraction, sr.namespace)
+        } else {
+            if token_idx < sr.warmup_tokens {
+                return;
+            }
+            self.snapshot_route_profile()
+                .hot_set(sr.fraction, sr.namespace)
+        };
+        if hot.is_empty() {
+            return;
+        }
+        // Latch: exactly one caller transitions false -> true and pins.
+        if sr
+            .applied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        for id in &hot {
+            self.core.cache.pin(*id);
+        }
+        info!(
+            pinned = hot.len(),
+            fraction = sr.fraction,
+            source = if sr.profile.is_some() { "profile" } else { "online" },
+            warmup_tokens = sr.warmup_tokens,
+            "static residency: pinned hot expert set"
+        );
+    }
+
     /// Wire a Prometheus metrics sink. The engine will mirror its
     /// telemetry counters (locality / speculator hits & misses, SSD
     /// stall) into the metrics registry alongside its own atomics.
@@ -1903,9 +2023,18 @@ impl Engine {
 
         // Frequency-based pinning: bump observation counts and ask the
         // cache to pin any id that crossed the threshold this token.
-        if self.core.options.pin_after_observations > 0 {
+        // Also bump (without pinning) when an online static-residency
+        // controller still needs route counts to derive its hot set, or
+        // when the run is collecting a popularity profile for export.
+        if self.core.options.pin_after_observations > 0
+            || self.core.options.collect_route_profile
+            || self.static_residency_needs_counts()
+        {
             self.bump_route_observations(&target);
         }
+        // Tier 1: pin the static-residency hot set once it is ready
+        // (immediately for a profile seed, post-warmup for online).
+        self.maybe_apply_static_residency(token_idx);
 
         // 1) Make sure every required expert is resident.
         //
@@ -3462,10 +3591,17 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // online against the gate's actual top-K decision.
         let m_speculator = self.speculator_predict_and_train(x, &target, Some(layer));
 
-        // Frequency-based pinning: same logic as `generate`.
-        if self.core.options.pin_after_observations > 0 {
+        // Frequency-based pinning: same logic as `generate`. Also bump
+        // (without pinning) for an online static-residency controller or
+        // when collecting a popularity profile for export.
+        if self.core.options.pin_after_observations > 0
+            || self.core.options.collect_route_profile
+            || self.static_residency_needs_counts()
+        {
             self.bump_route_observations(&target);
         }
+        // Tier 1: pin the static-residency hot set once it is ready.
+        self.maybe_apply_static_residency(token_idx);
 
         // **Speculative I/O union-fetch (S ∪ L ∪ M), issued
         // concurrently with the target-miss fetches.** Fire the
@@ -5066,6 +5202,128 @@ mod tests {
         assert_eq!(affinity.affinity(1, 0, 1), 3, "co-fired three times");
         // No leakage into layer 0's matrix.
         assert!(affinity.neighbors(0, 0, 2).is_empty(), "layer 0 must be untouched");
+    }
+
+    /// **Tier 1 — online static residency.** With no seed profile the
+    /// engine must derive its hot set from the live route observations
+    /// after the warmup window and pin exactly `ceil(fraction × N)`
+    /// experts — the most-frequently routed ones — exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_residency_online_pins_hottest_after_warmup() {
+        let dir = TempDir::new("static-residency-online");
+        let total_experts: u32 = 8;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed: u64 = 0x5EED_1234_u64;
+
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, total_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .expect("storage init"),
+        );
+        storage.warmup_fds(0..total_experts).expect("pre-open fds");
+
+        let pool = BufferPool::new(total_experts as usize + 2, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(total_experts as usize));
+        let router = Router::Markov(Arc::new(TopKRouter::new(total_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(total_experts, 2, 0.05, seed));
+
+        // fraction 0.25 of 8 experts ⇒ pin the 2 hottest. Warm up 4 tokens.
+        let engine = Arc::new(
+            Engine::new(
+                cache.clone(),
+                pool,
+                storage,
+                router,
+                predictor,
+                ModelShape { d_model, d_ff, hidden_seed: seed },
+            )
+            .with_static_residency(0.25, /*warmup_tokens=*/ 4, /*profile=*/ None),
+        );
+
+        let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
+        // Skewed stream: experts {2,5} fire every token; a rotating cold
+        // expert fires once each so {2,5} are unambiguously hottest.
+        for t in 0..8u64 {
+            let cold = 6 + (t % 2) as u32; // 6 or 7, never as hot as {2,5}
+            let _ = engine.moe_step(t, /*layer=*/ 0, &hidden, &[2, 5, cold]).await;
+        }
+
+        // After warmup the hot set must be pinned exactly once.
+        assert_eq!(cache.pinned_count(), 2, "ceil(0.25*8)=2 experts pinned");
+        assert_eq!(cache.pinned_ids(), vec![2, 5], "the two hottest experts");
+    }
+
+    /// **Tier 1 — profile-seeded static residency.** With an offline
+    /// popularity profile the hot set is pinned at the first token with
+    /// no warmup, independent of the live routing stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_residency_profile_pins_immediately() {
+        let dir = TempDir::new("static-residency-profile");
+        let total_experts: u32 = 8;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed: u64 = 0x5EED_ABCD_u64;
+
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, total_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .expect("storage init"),
+        );
+        storage.warmup_fds(0..total_experts).expect("pre-open fds");
+
+        let pool = BufferPool::new(total_experts as usize + 2, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(total_experts as usize));
+        let router = Router::Markov(Arc::new(TopKRouter::new(total_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(total_experts, 2, 0.05, seed));
+
+        // Profile makes experts 0 and 3 hottest regardless of the stream.
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(0u32, 1000u64);
+        counts.insert(3u32, 900u64);
+        counts.insert(1u32, 5u64);
+        let profile = crate::residency::ResidencyProfile::from_counts(counts);
+
+        let engine = Arc::new(
+            Engine::new(
+                cache.clone(),
+                pool,
+                storage,
+                router,
+                predictor,
+                ModelShape { d_model, d_ff, hidden_seed: seed },
+            )
+            .with_static_residency(0.25, /*warmup_tokens=*/ 100, Some(profile)),
+        );
+
+        let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
+        // A single token suffices — the seed profile ignores warmup.
+        let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[5, 6]).await;
+
+        assert_eq!(cache.pinned_count(), 2, "ceil(0.25*8)=2 experts pinned");
+        assert_eq!(cache.pinned_ids(), vec![0, 3], "profile's two hottest experts");
     }
 
     /// **Layer-scoped speculator accuracy.** On the `moe_step` path the
