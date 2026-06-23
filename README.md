@@ -316,7 +316,8 @@ experts, no high-end AI GPU required):
   request under continuous batching shares **one bounded pool** instead
   of each fanning out to `cores` fresh threads and oversubscribing the
   box. The pool is **sized once at startup to the host's logical cores
-  minus a small reservation** (two on a typical many-core server; see
+  minus a small reservation** (0 on <=4-core hosts, 1 on 5-8, 2 on 9-31,
+  and `n/16` on 32+; see
   [`parallel::default_compute_threads`](rust-engine/src/parallel.rs)) so a
   saturated fan-out can never starve the async runtime — the tokio workers
   driving the scheduler, the gRPC server, and io_uring SSD streaming. Set
