@@ -187,27 +187,6 @@ impl ExpertResident {
         *guard = Some((need, cached.clone()));
         Some(cached)
     }
-
-    /// Raw buffer bytes, including any U.T.H. prefix. Used by paths
-    /// that need the literal on-disk image (e.g. the cache-integrity
-    /// verifier, the dump tools).
-    #[allow(dead_code)]
-    pub fn raw(&self) -> &[u8] {
-        self.buffer.as_slice()
-    }
-
-    /// Parsed Unified Tensor Header, if one is present at the start of
-    /// the buffer. Returns `None` for legacy files (and for the
-    /// synthetic-expert fixtures, which deliberately omit the header).
-    ///
-    /// This is a cold-path accessor (used by dump/diagnostic tools);
-    /// the header is re-probed here rather than stored to keep the
-    /// resident struct small.
-    #[allow(dead_code)]
-    pub fn header(&self) -> Option<TensorHeader> {
-        let raw = self.buffer.as_slice();
-        TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN).0
-    }
 }
 
 /// Thread-safe fixed-capacity LRU cache of resident experts.

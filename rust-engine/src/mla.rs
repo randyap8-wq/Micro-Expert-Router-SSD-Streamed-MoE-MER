@@ -51,7 +51,24 @@ fn softmax_inplace(scores: &mut [f32]) {
     if scores.is_empty() {
         return;
     }
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut max = f32::NEG_INFINITY;
+    let mut saw_nan = false;
+    for &s in scores.iter() {
+        if s.is_nan() {
+            saw_nan = true;
+        } else if s > max {
+            max = s;
+        }
+    }
+    // Non-finite fallback: a stray `NaN`, a `+inf`, or a fully-masked row
+    // (every score `-inf`, leaving `max == -inf`) cannot yield a meaningful
+    // distribution, so emit a uniform distribution rather than letting NaN
+    // propagate downstream.
+    if saw_nan || !max.is_finite() {
+        let uniform = 1.0 / scores.len() as f32;
+        scores.iter_mut().for_each(|s| *s = uniform);
+        return;
+    }
     let mut sum = 0.0f32;
     for s in scores.iter_mut() {
         *s = (*s - max).exp();
@@ -369,6 +386,35 @@ pub fn dequant_fp8_e4m3_blockwise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn softmax_all_neg_inf_is_uniform() {
+        // A fully-masked row must degrade to a uniform distribution rather
+        // than propagating NaNs from `(-inf) - (-inf)`.
+        let mut scores = vec![f32::NEG_INFINITY; 3];
+        softmax_inplace(&mut scores);
+        let expected = 1.0 / 3.0;
+        assert!(
+            scores.iter().all(|&s| (s - expected).abs() < 1e-6),
+            "got {scores:?}"
+        );
+    }
+
+    #[test]
+    fn softmax_mixed_nan_is_uniform() {
+        // A stray NaN with an otherwise-finite max must not poison the row.
+        // The previous `!max.is_finite()` guard missed this because
+        // `f32::max` ignores NaN, leaving a finite max.
+        let mut scores = vec![0.0, f32::NAN, 1.0];
+        softmax_inplace(&mut scores);
+        let expected = 1.0 / 3.0;
+        assert!(
+            scores
+                .iter()
+                .all(|&s| s.is_finite() && (s - expected).abs() < 1e-6),
+            "got {scores:?}"
+        );
+    }
 
     /// Build a small, deterministic MLA block for shape/behaviour tests.
     fn tiny_mla(q_lora_rank: usize) -> MultiHeadLatentAttention {

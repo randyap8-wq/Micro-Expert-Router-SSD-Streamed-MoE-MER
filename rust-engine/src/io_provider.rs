@@ -1370,14 +1370,17 @@ impl NvmeStorage {
 
     /// Blob offset of a packed expert id. Panics only if called without a
     /// packed blob attached (an internal invariant of the packed read
-    /// paths), and returns `0` for an id missing from the manifest — the
-    /// subsequent read then surfaces the bounds error.
+    /// paths). For an id missing from the manifest — which the callers
+    /// already rule out by resolving every entry up front in
+    /// `read_experts_batch_packed` — it returns `u64::MAX` so the
+    /// subsequent `pread` fails loudly instead of silently aliasing the
+    /// first expert's bytes at offset `0`.
     fn packed_offset(&self, id: u32) -> u64 {
         self.packed
             .as_ref()
             .and_then(|p| p.entry(id))
             .map(|e| e.offset)
-            .unwrap_or(0)
+            .unwrap_or(u64::MAX)
     }
     /// of an expert's `gate_proj` and `up_proj` plus the full `down_proj`,
     /// packed into `buf` in the layout consumed by

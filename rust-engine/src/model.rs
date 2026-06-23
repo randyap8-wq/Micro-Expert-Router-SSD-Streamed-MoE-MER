@@ -305,6 +305,14 @@ impl RealModelConfig {
                     f
                 ));
             }
+            if self.rope_dim() == 0 {
+                return Err(format!(
+                    "partial_rotary_factor ({}) with head_dim ({}) rounds the RoPE width down \
+                     to zero, which would silently disable rotary embeddings; raise \
+                     partial_rotary_factor or head_dim",
+                    f, self.head_dim
+                ));
+            }
         }
         if let Some(v) = adv.v_head_dim {
             if v == 0 || v > self.head_dim {
@@ -1368,7 +1376,7 @@ if let Ok(sv) = s.tensor(&scale_name) {
                 maybe!(&naming.k_proj_bias(l), kv_dim, |v| {
                     model.layers[l].attn.bk = Some(v);
                 });
-                maybe!(&naming.v_proj_bias(l), kv_dim, |v| {
+                maybe!(&naming.v_proj_bias(l), v_proj_dim, |v| {
                     model.layers[l].attn.bv = Some(v);
                 });
                 maybe!(&naming.o_proj_bias(l), d_model, |v| {
@@ -2063,7 +2071,6 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
     use crate::engine::{Engine, EngineOptions, ModelShape};
-    use crate::expert_cache::ExpertCache;
     use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
     use crate::router::{PredictiveLoader, TopKRouter};
@@ -2104,6 +2111,20 @@ mod tests {
         let mut c = RealModelConfig::tiny();
         c.top_k = 99;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_rope_dim() {
+        // A `partial_rotary_factor` in (0, 1] that nonetheless rounds the
+        // RoPE width down to zero must be rejected — otherwise rotary
+        // embeddings are silently disabled for the whole model.
+        let mut c = RealModelConfig::tiny(); // head_dim = 8
+        c.advanced.partial_rotary_factor = Some(0.1); // floor(8*0.1) = 0
+        assert_eq!(c.rope_dim(), 0);
+        assert!(c.validate().is_err());
+        // A factor that leaves a non-zero even width still validates.
+        c.advanced.partial_rotary_factor = Some(0.5); // floor(8*0.5) = 4
+        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -2537,6 +2558,68 @@ mod tests {
         let lm = &model.lm_head.weights;
         let first = lm[0];
         assert!(lm.iter().any(|&x| x != first), "lm_head should remain seeded, not constant");
+    }
+
+    /// Regression: a checkpoint with `attention_bias = true` AND an
+    /// asymmetric V head (`v_head_dim != head_dim`, MiMo-V2-Flash style)
+    /// ships a `v_proj.bias` of length `num_kv_heads * v_head_dim`
+    /// (`v_proj_dim`), NOT `num_kv_heads * head_dim` (`kv_dim`). The loader
+    /// must size the V-bias expectation by `v_proj_dim`; otherwise the
+    /// size-checked `find_f32` silently drops the tensor and the bias is
+    /// lost.
+    #[test]
+    fn from_safetensors_loads_asymmetric_v_proj_bias() {
+        use safetensors::tensor::{Dtype, TensorView};
+        use safetensors::serialize_to_file;
+        let mut adv = AdvancedConfig::default();
+        adv.attention_bias = true;
+        adv.v_head_dim = Some(2); // V uses 2 while Q/K use head_dim = 4
+        let cfg = RealModelConfig {
+            vocab_size: 8,
+            d_model: 8, // = num_heads * head_dim (Mixtral tie)
+            d_ff: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            num_layers: 1,
+            num_experts: 2,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: adv,
+        };
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim; // 8
+        let v_proj_dim = cfg.num_kv_heads * cfg.v_head_dim(); // 4
+        assert_ne!(kv_dim, v_proj_dim, "test requires an asymmetric V head");
+
+        let bv = vec![0.375f32; v_proj_dim];
+        let to_bytes = |v: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out
+        };
+        let bv_bytes = to_bytes(&bv);
+        let dir = TempDir::new("safetensors_vbias");
+        let tensors: Vec<(String, TensorView)> = vec![(
+            "model.layers.0.self_attn.v_proj.bias".to_string(),
+            TensorView::new(Dtype::F32, vec![v_proj_dim], &bv_bytes).unwrap(),
+        )];
+        let out_path = dir.path.join("model.safetensors");
+        serialize_to_file(tensors, &None, &out_path).unwrap();
+
+        let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
+        let bv_loaded = model.layers[0]
+            .attn
+            .bv
+            .as_ref()
+            .expect("v_proj.bias must load for an asymmetric V head (was sized by kv_dim)");
+        assert_eq!(bv_loaded.len(), v_proj_dim);
+        assert!(bv_loaded.iter().all(|&x| x == 0.375));
     }
 
     /// Phi-4 (`phi3`) ships a single fused `qkv_proj` tensor. The loader

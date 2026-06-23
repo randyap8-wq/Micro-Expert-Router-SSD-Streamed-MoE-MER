@@ -108,10 +108,13 @@ impl PerLayerPreGate {
     /// once.
     pub fn observe_and_predict(&self, layer: u32, routed: &[u32]) -> Vec<u32> {
         {
-            let mut last = self.last.lock();
+            let last = self.last.lock();
             if let Some(prev) = last.as_ref() {
-                // Only link strictly-consecutive layers.
-                if layer == prev.layer.wrapping_add(1) {
+                // Only link strictly-consecutive layers. Guard against the
+                // `u32::MAX` sentinel wrapping back to `0` and falsely
+                // linking an unrelated first layer onto a stale final-layer
+                // observation.
+                if prev.layer != u32::MAX && layer == prev.layer.wrapping_add(1) {
                     self.record_transition(prev.layer, &prev.routed, routed);
                     self.score_prediction(&prev.predicted_next, routed);
                 }
