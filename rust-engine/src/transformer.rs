@@ -1446,6 +1446,14 @@ pub fn softmax_inplace(v: &mut [f32]) {
             max = x;
         }
     }
+    // Fully-masked or otherwise non-finite input (every logit `-inf`, or a
+    // stray `NaN`): emit a uniform distribution instead of letting the
+    // `x - max` subtraction produce `NaN`s that then propagate downstream.
+    if !max.is_finite() {
+        let uniform = 1.0 / v.len() as f32;
+        v.iter_mut().for_each(|x| *x = uniform);
+        return;
+    }
     let mut sum = 0.0f32;
     for x in v.iter_mut() {
         *x = (*x - max).exp();
@@ -1745,6 +1753,18 @@ mod tests {
         let mut v: Vec<f32> = Vec::new();
         softmax_inplace(&mut v);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn softmax_all_neg_inf_is_uniform() {
+        // A fully-masked attention row (every score `-inf`) must not
+        // produce NaNs: `(-inf) - (-inf)` is NaN and would poison the
+        // whole distribution. We fall back to a uniform distribution.
+        let mut v = vec![f32::NEG_INFINITY; 4];
+        softmax_inplace(&mut v);
+        assert!(v.iter().all(|&x| (x - 0.25).abs() < 1e-6), "got {v:?}");
+        let sum: f32 = v.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "softmax sum={sum}");
     }
 
     #[test]

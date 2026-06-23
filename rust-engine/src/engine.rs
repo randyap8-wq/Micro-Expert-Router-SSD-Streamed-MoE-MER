@@ -34,7 +34,6 @@ use crate::router::{
 };
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
-use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -4133,8 +4132,6 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             tokens_processed: tokens,
             avg_io_wait_us,
             avg_compute_us,
-            total_io_wait_us,
-            total_cycle_us,
             pct_time_io,
             io_only: self.core.options.io_only,
             pinned_count: self.core.cache.pinned_count(),
@@ -4233,6 +4230,11 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 .as_ref()
                 .map(|pg| pg.stats().1)
                 .unwrap_or(0),
+            singleflight_followers: self
+                .metrics
+                .counters
+                .singleflight_followers
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -4269,6 +4271,15 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             r.io_count,
             r.bytes_read as f64 / (1024.0 * 1024.0)
         );
+        // SSD read de-duplication win — only emitted when singleflight
+        // coalescing actually saved a read, so the legacy summary shape is
+        // preserved for runs/tests that never contend on the same expert.
+        if r.singleflight_followers > 0 {
+            info!(
+                "dedup:         {} concurrent reads coalesced onto in-flight leaders",
+                r.singleflight_followers
+            );
+        }
         info!(
             "i/o latency:   p50={}us  p95={}us  p99={}us",
             r.io_p50_us, r.io_p95_us, r.io_p99_us
@@ -4343,6 +4354,30 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 r.pregate_hits + r.pregate_misses,
             );
         }
+        // Health diagnostics — only emitted when something actually
+        // degraded, so the legacy summary shape is preserved for clean
+        // runs. These counters are otherwise only legible via the
+        // Prometheus exporter; surfacing them here makes a problem run
+        // self-explanatory from the CLI summary alone.
+        let prefetch_dropped = r.prefetch_dropped_concurrency
+            + r.prefetch_dropped_pool_starved
+            + r.prefetch_dropped_governor;
+        if prefetch_dropped > 0
+            || r.gpu_cpu_fallbacks > 0
+            || r.speculator_dmodel_mismatch > 0
+            || r.expert_read_failures > 0
+        {
+            info!(
+                "diagnostics:   prefetch_dropped={} (concurrency={} pool_starved={} governor={})  gpu_cpu_fallbacks={}  speculator_dmodel_mismatch={}  expert_read_failures={}",
+                prefetch_dropped,
+                r.prefetch_dropped_concurrency,
+                r.prefetch_dropped_pool_starved,
+                r.prefetch_dropped_governor,
+                r.gpu_cpu_fallbacks,
+                r.speculator_dmodel_mismatch,
+                r.expert_read_failures,
+            );
+        }
         info!("=======================================================");
     }
 }
@@ -4379,13 +4414,9 @@ pub struct EngineReport {
     /// Mean per-token compute (FFN forward, or XOR-digest under
     /// `--io-only`), in microseconds.
     pub avg_compute_us: f64,
-    /// Sum of per-token critical-path I/O wait (microseconds).
-    pub total_io_wait_us: u64,
-    /// Sum of per-token cycle time (microseconds).
-    pub total_cycle_us: u64,
-    /// `total_io_wait_us / total_cycle_us * 100` — the headline "what
-    /// fraction of token time was the engine waiting on SSD?" number
-    /// the gist asks the run summary to print.
+    /// Total per-token critical-path I/O wait as a percentage of total
+    /// token cycle time — the headline "what fraction of token time was
+    /// the engine waiting on SSD?" number the run summary prints.
     pub pct_time_io: f64,
     /// Whether this run was executed in `--io-only` mode (FFN skipped).
     pub io_only: bool,
@@ -4487,6 +4518,11 @@ pub struct EngineReport {
     pub pregate_hits: u64,
     /// **Tier 3.** Pre-gate predictions that missed.
     pub pregate_misses: u64,
+    /// Concurrent `fetch_with_retry` callers that piggy-backed on an
+    /// in-flight leader's read (or a just-published resident) instead of
+    /// issuing their own (Phase 1 — SSD read de-duplication). Each one
+    /// maps directly to one disk read that was avoided.
+    pub singleflight_followers: u64,
 }
 
 #[cfg(test)]
@@ -4501,7 +4537,6 @@ mod tests {
     //! Engine::generate loop" gap closed.
     use super::*;
     use crate::buffer_pool::BufferPool;
-    use crate::expert_cache::ExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
     use crate::router::{PredictiveLoader, TopKRouter};
     use std::path::PathBuf;

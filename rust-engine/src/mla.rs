@@ -52,6 +52,13 @@ fn softmax_inplace(scores: &mut [f32]) {
         return;
     }
     let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    // Fully-masked row (every score `-inf`): fall back to a uniform
+    // distribution rather than propagating `NaN`s from `(-inf) - (-inf)`.
+    if !max.is_finite() {
+        let uniform = 1.0 / scores.len() as f32;
+        scores.iter_mut().for_each(|s| *s = uniform);
+        return;
+    }
     let mut sum = 0.0f32;
     for s in scores.iter_mut() {
         *s = (*s - max).exp();
@@ -369,6 +376,19 @@ pub fn dequant_fp8_e4m3_blockwise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn softmax_all_neg_inf_is_uniform() {
+        // A fully-masked row must degrade to a uniform distribution rather
+        // than propagating NaNs from `(-inf) - (-inf)`.
+        let mut scores = vec![f32::NEG_INFINITY; 3];
+        softmax_inplace(&mut scores);
+        let expected = 1.0 / 3.0;
+        assert!(
+            scores.iter().all(|&s| (s - expected).abs() < 1e-6),
+            "got {scores:?}"
+        );
+    }
 
     /// Build a small, deterministic MLA block for shape/behaviour tests.
     fn tiny_mla(q_lora_rank: usize) -> MultiHeadLatentAttention {

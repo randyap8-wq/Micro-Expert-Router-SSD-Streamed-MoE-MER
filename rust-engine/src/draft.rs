@@ -443,7 +443,6 @@ impl RealModel {
 mod tests {
     use super::*;
     use crate::engine::{EngineOptions, ModelShape};
-    use crate::expert_cache::ExpertCache;
     use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::buffer_pool::BufferPool;
     use crate::io_provider::{NvmeStorage, StorageConfig};
