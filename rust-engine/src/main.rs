@@ -505,6 +505,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and drift from the startup contract.
     std::env::remove_var("MER_PIN_CORES");
 
+    // Size the shared compute (`rayon`) pool now: after affinity pinning so
+    // its workers inherit the startup mask, and before any matmul touches
+    // it. By default it spans the host's logical cores *minus a small
+    // reservation* (`parallel::default_compute_threads`) so a saturated
+    // compute fan-out can't starve the async runtime under continuous
+    // batching; an explicit `RAYON_NUM_THREADS` overrides the default.
+    crate::parallel::init_global_pool();
+
     // Log the selected math kernel backend once. The dispatcher itself
     // is lazy, but emitting this at startup gives ops a single line in
     // the journal that tells them "you're running the scalar path"
