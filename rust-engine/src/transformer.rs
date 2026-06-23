@@ -1440,16 +1440,20 @@ pub fn softmax_inplace(v: &mut [f32]) {
     if v.is_empty() {
         return;
     }
-    let mut max = v[0];
+    let mut max = f32::NEG_INFINITY;
+    let mut saw_nan = false;
     for &x in v.iter() {
-        if x > max {
+        if x.is_nan() {
+            saw_nan = true;
+        } else if x > max {
             max = x;
         }
     }
-    // Fully-masked or otherwise non-finite input (every logit `-inf`, or a
-    // stray `NaN`): emit a uniform distribution instead of letting the
-    // `x - max` subtraction produce `NaN`s that then propagate downstream.
-    if !max.is_finite() {
+    // Non-finite fallback: a stray `NaN`, a `+inf`, or a fully-masked row
+    // (every logit `-inf`, leaving `max == -inf`) cannot yield a meaningful
+    // distribution, so emit a uniform distribution rather than letting the
+    // `x - max` subtraction produce `NaN`s that propagate downstream.
+    if saw_nan || !max.is_finite() {
         let uniform = 1.0 / v.len() as f32;
         v.iter_mut().for_each(|x| *x = uniform);
         return;
@@ -1763,6 +1767,22 @@ mod tests {
         let mut v = vec![f32::NEG_INFINITY; 4];
         softmax_inplace(&mut v);
         assert!(v.iter().all(|&x| (x - 0.25).abs() < 1e-6), "got {v:?}");
+        let sum: f32 = v.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "softmax sum={sum}");
+    }
+
+    #[test]
+    fn softmax_mixed_nan_is_uniform() {
+        // A stray NaN that is NOT at index 0 must not poison the row. The
+        // previous `!max.is_finite()` guard missed this because the running
+        // max ignores NaN, leaving a finite max.
+        let mut v = vec![0.0, f32::NAN, 1.0, -1.0];
+        softmax_inplace(&mut v);
+        let expected = 0.25;
+        assert!(
+            v.iter().all(|&x| x.is_finite() && (x - expected).abs() < 1e-6),
+            "got {v:?}"
+        );
         let sum: f32 = v.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "softmax sum={sum}");
     }
