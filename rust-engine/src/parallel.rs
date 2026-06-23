@@ -141,26 +141,33 @@ pub fn init_global_pool() -> usize {
         .unwrap_or(1);
     let threads = default_compute_threads(logical);
 
-    match rayon::ThreadPoolBuilder::new()
+    let build_result = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|i| format!("mer-compute-{i}"))
-        .build_global()
-    {
-        Ok(()) => info!(
-            logical,
-            threads,
-            reserved = logical - threads,
-            "compute pool: sized with reserved async-runtime headroom"
-        ),
+        .build_global();
+
+    match build_result {
+        Ok(()) => {
+            info!(
+                logical,
+                threads,
+                reserved = logical - threads,
+                "compute pool: sized with reserved async-runtime headroom"
+            );
+            threads
+        }
         // `build_global` only errors if the global pool was already built
         // (a prior call, or a rayon use before init). Keep what exists.
-        Err(e) => warn!(
-            error = %e,
-            "compute pool already initialised; keeping existing configuration"
-        ),
+        Err(e) => {
+            let current = rayon::current_num_threads().max(1);
+            warn!(
+                error = %e,
+                current_threads = current,
+                "compute pool already initialised; keeping existing configuration"
+            );
+            current
+        }
     }
-    threads
-}
 
 /// Fill `out` in parallel by computing disjoint row-chunks on the shared
 /// `rayon` pool.
