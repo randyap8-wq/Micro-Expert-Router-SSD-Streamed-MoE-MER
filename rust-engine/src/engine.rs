@@ -1200,6 +1200,12 @@ pub(crate) struct EngineSpeculation {
     /// window) so a skewed routing distribution can exceed the bare
     /// cache-capacity hit-rate ceiling. `None` disables the feature.
     pub(super) static_residency: Option<crate::residency::StaticResidencyState>,
+    /// Tier 3 — **per-layer pre-gate** predictor. When present, every
+    /// `moe_step` records the layer-to-layer routing transition and
+    /// prefetches the predicted next-layer experts (a high-precision
+    /// signal conditioned on the previous layer's actual routing).
+    /// `None` disables the feature.
+    pub(super) pregate: Option<Arc<crate::pregate::PerLayerPreGate>>,
 }
 
 /// Observability: latency histograms, cumulative timing atomics,
@@ -1362,6 +1368,7 @@ impl EngineSpeculation {
             affinity_neighbors_k: 0,
             affinity_decay: None,
             static_residency: None,
+            pregate: None,
         }
     }
 }
@@ -1867,6 +1874,15 @@ impl Engine {
             namespace,
             profile,
         ));
+        self
+    }
+
+    /// Tier 3 — install the **per-layer pre-gate** predictor. Once set,
+    /// every `moe_step` records the layer-to-layer routing transition
+    /// and prefetches the predicted next-layer experts. `top_n` bounds
+    /// how many next-layer experts are prefetched per step.
+    pub fn with_pregate(mut self, pregate: Arc<crate::pregate::PerLayerPreGate>) -> Self {
+        self.speculation.pregate = Some(pregate);
         self
     }
 
@@ -3311,6 +3327,24 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         }
     }
 
+    /// Tier 3 — drive the per-layer pre-gate. Records this layer's
+    /// routing transition into the conditional map and prefetches the
+    /// experts it predicts for the *next* layer. A disabled pre-gate
+    /// (`None`) makes this a no-op, preserving legacy behaviour.
+    fn pregate_prefetch(self: &Arc<Self>, layer: u32, target: &[u32]) {
+        let Some(pregate) = self.speculation.pregate.as_ref() else {
+            return;
+        };
+        let predicted = pregate.observe_and_predict(layer, target);
+        for id in predicted {
+            // Resolve aliases defensively (idempotent) so deduplicated
+            // experts share the canonical resident copy, then issue the
+            // speculative read with the pre-gate's high confidence tag.
+            let id = self.resolve_alias(id);
+            self.spawn_prefetch(id, crate::pregate::PREGATE_PREFETCH_PROB);
+        }
+    }
+
     /// Prefetch every id in the union `S ∪ L ∪ M` (plus the optional
     /// affinity/spatial neighbour fold) that isn't already resident —
     /// the **speculative I/O union-fetch** described in the design spec.
@@ -3653,6 +3687,13 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // submit their reads now, so they overlap this layer's compute
         // and the next layer finds them already resident.
         self.speculate_layer_ahead(x, layer);
+
+        // **Tier 3 pre-gate look-ahead.** Record this layer's routing
+        // transition and prefetch the predicted next-layer experts — a
+        // high-precision signal conditioned on the previous layer's
+        // *actual* routing, complementing the hidden-state speculation
+        // above. No-op when the pre-gate is disabled.
+        self.pregate_prefetch(layer, &target);
 
         // Concurrent miss fetches; hits resolved inline.
         let io_wait_start = Instant::now();
@@ -4142,6 +4183,25 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             governor_precision: self.core.governor.precision(),
             governor_admitted: self.core.governor.decisions().0,
             governor_throttled: self.core.governor.decisions().1,
+            pregate_enabled: self.speculation.pregate.is_some(),
+            pregate_accuracy: self
+                .speculation
+                .pregate
+                .as_ref()
+                .map(|pg| pg.accuracy())
+                .unwrap_or(0.0),
+            pregate_hits: self
+                .speculation
+                .pregate
+                .as_ref()
+                .map(|pg| pg.stats().0)
+                .unwrap_or(0),
+            pregate_misses: self
+                .speculation
+                .pregate
+                .as_ref()
+                .map(|pg| pg.stats().1)
+                .unwrap_or(0),
         }
     }
 
@@ -4240,6 +4300,16 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 r.governor_admitted,
                 r.governor_throttled,
                 admit_rate,
+            );
+        }
+        // Tier 3 pre-gate line — only when the per-layer pre-gate is
+        // enabled, keeping the legacy summary shape otherwise.
+        if r.pregate_enabled {
+            info!(
+                "pregate:       on  accuracy={:.2}%  predictions={}/{} (hit/total)",
+                r.pregate_accuracy * 100.0,
+                r.pregate_hits,
+                r.pregate_hits + r.pregate_misses,
             );
         }
         info!("=======================================================");
@@ -4375,6 +4445,17 @@ pub struct EngineReport {
     /// **Tier 4.** Cumulative speculative prefetches the governor
     /// throttled (declined).
     pub governor_throttled: u64,
+    /// **Tier 3.** Whether the per-layer pre-gate predictor is enabled.
+    pub pregate_enabled: bool,
+    /// **Tier 3.** Fraction of scored pre-gate predictions that
+    /// intersected the actually-routed next-layer set, in `[0, 1]`.
+    /// `0.0` when the pre-gate is disabled or nothing was scored yet.
+    pub pregate_accuracy: f64,
+    /// **Tier 3.** Pre-gate predictions that intersected the actual
+    /// next-layer routed set.
+    pub pregate_hits: u64,
+    /// **Tier 3.** Pre-gate predictions that missed.
+    pub pregate_misses: u64,
 }
 
 #[cfg(test)]

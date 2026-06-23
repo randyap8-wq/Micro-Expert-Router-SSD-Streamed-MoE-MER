@@ -45,6 +45,7 @@ mod multi_layer_cache;
 mod numa;
 mod parallel;
 mod prefetch_governor;
+mod pregate;
 mod residency;
 mod router;
 mod rpc;
@@ -1362,6 +1363,16 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             profile,
         );
     }
+    // Tier 3 — per-layer pre-gate. Predict + prefetch the next layer's
+    // experts from the current layer's routed set on the multi-layer
+    // `moe_step` path.
+    if cfg.predictive.pregate_enabled {
+        let pregate = Arc::new(crate::pregate::PerLayerPreGate::new(
+            cfg.model.num_layers.max(1),
+            cfg.model.top_k,
+        ));
+        engine_builder = engine_builder.with_pregate(pregate);
+    }
     // Phase 2: optional VRAM (GPU) expert cache (3-tier hierarchy
     // SSD → RAM → VRAM). When `[gpu_cache].enabled = false` (default)
     // the engine retains its historical 2-tier posture.
@@ -2237,6 +2248,24 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 args.static_residency_warmup_tokens,
                 profile,
             );
+        }
+        // Tier 3 — per-layer pre-gate. Predict (and prefetch) the next
+        // layer's experts from the current layer's routed set. Only
+        // effective on the multi-layer `moe_step` path; warn when no
+        // layer geometry is configured so it can't actually fire.
+        if args.pregate {
+            if args.num_layers <= 1 {
+                warn!(
+                    "--pregate has no effect with --num-layers 1: the pre-gate predicts \
+                     the *next* layer's experts, so it needs a multi-layer geometry \
+                     (set --num-layers > 1, typically with --gate-weights / a real model)."
+                );
+            }
+            let pregate = Arc::new(crate::pregate::PerLayerPreGate::new(
+                args.num_layers.max(1) as usize,
+                args.top_k,
+            ));
+            base = base.with_pregate(pregate);
         }
         // Optional alias map (Change 6: expert deduplication).
         match args.alias_map_path.as_ref() {
