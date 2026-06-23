@@ -44,6 +44,7 @@ mod model;
 mod multi_layer_cache;
 mod numa;
 mod parallel;
+mod prefetch_governor;
 mod router;
 mod rpc;
 mod sampling;
@@ -349,6 +350,35 @@ enum Cmd {
         /// cumulative observations (with `--affinity`).
         #[arg(long, default_value_t = 10_000)]
         affinity_decay_epoch: u64,
+        /// **Tier 4 — adaptive prefetch governor.** Throttle speculative
+        /// prefetches by measured precision (consumed / completed) and
+        /// foreground-read contention, so low-value speculation can't
+        /// inflate the latency of the foreground misses that actually
+        /// block token generation. Off by default (legacy unbounded
+        /// admission). This is the highest-leverage knob on a
+        /// bandwidth-bound SSD.
+        #[arg(long)]
+        prefetch_governor: bool,
+        /// Precision floor / optimistic EWMA seed for the governor, in
+        /// `[0, 1]` (with `--prefetch-governor`).
+        #[arg(long, default_value_t = 0.05)]
+        prefetch_precision_floor: f64,
+        /// Per-outstanding-foreground-read multiplier on the governor's
+        /// admission threshold (with `--prefetch-governor`). Higher ⇒
+        /// speculation backs off harder while real misses are in flight.
+        #[arg(long, default_value_t = 1.0)]
+        prefetch_contention_weight: f64,
+        /// **Tier 4 — cost-aware eviction.** Evict the coldest resident
+        /// by decaying heat score instead of strict LRU, so a hot expert
+        /// that briefly fell to the LRU tail isn't dumped ahead of a
+        /// one-shot cold expert. Off by default (pure LRU).
+        #[arg(long)]
+        cost_aware_eviction: bool,
+        /// **Tier 3 — per-layer pre-gate predictor.** Train an online
+        /// layer-L→L+1 conditional map and drive high-precision
+        /// next-layer prefetch from it. Off by default.
+        #[arg(long)]
+        pregate: bool,
         /// Number of transformer layers, used to size the affinity
         /// matrix. `1` (default) is the single-namespace synthetic
         /// benchmark.
@@ -602,6 +632,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     affinity,
                     affinity_neighbors_k,
                     affinity_decay_epoch,
+                    prefetch_governor,
+                    prefetch_precision_floor,
+                    prefetch_contention_weight,
+                    cost_aware_eviction,
+                    pregate,
                     num_layers,
                     num_experts_per_layer,
                 } = cli.cmd
@@ -649,6 +684,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         affinity,
                         affinity_neighbors_k,
                         affinity_decay_epoch,
+                        prefetch_governor,
+                        prefetch_precision_floor,
+                        prefetch_contention_weight,
+                        cost_aware_eviction,
+                        pregate,
                         num_layers,
                         num_experts_per_layer,
                         },
@@ -1176,6 +1216,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             use_qmm_for_q4: true,
             max_concurrent_prefetches: cfg.real_transformer.max_concurrent_prefetches,
             max_fetch_yields: cfg.real_transformer.max_fetch_yields,
+            prefetch_governor: cfg.predictive.prefetch_governor,
+            prefetch_precision_floor: cfg.predictive.prefetch_precision_floor,
+            prefetch_contention_weight: cfg.predictive.prefetch_contention_weight,
+            cost_aware_eviction: cfg.predictive.cost_aware_eviction,
+            pregate_enabled: cfg.predictive.pregate_enabled,
         },
     );
     // Apply the configured look-ahead pipeline depth (`[storage]
@@ -1649,6 +1694,11 @@ struct RunArgs {
     affinity: bool,
     affinity_neighbors_k: usize,
     affinity_decay_epoch: u64,
+    prefetch_governor: bool,
+    prefetch_precision_floor: f64,
+    prefetch_contention_weight: f64,
+    cost_aware_eviction: bool,
+    pregate: bool,
     num_layers: u32,
     num_experts_per_layer: Option<u32>,
 }
@@ -1993,6 +2043,11 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 use_qmm_for_q4: true,
                 max_concurrent_prefetches: 64,
                 max_fetch_yields: crate::engine::DEFAULT_MAX_FETCH_YIELDS,
+                prefetch_governor: args.prefetch_governor,
+                prefetch_precision_floor: args.prefetch_precision_floor,
+                prefetch_contention_weight: args.prefetch_contention_weight,
+                cost_aware_eviction: args.cost_aware_eviction,
+                pregate_enabled: args.pregate,
             },
         );
         if let Some(gpu_cache) = args.gpu_expert_cache.clone() {

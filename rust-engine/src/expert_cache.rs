@@ -19,8 +19,21 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+
+/// Pack/unpack an `f64` heat score into the bits of an `AtomicU64` so it
+/// can be read and updated without a lock. The cost-aware eviction
+/// scorer tolerates the occasional torn update from a racing reader —
+/// the score is a heuristic, not an invariant.
+#[inline]
+fn load_heat_f64(a: &AtomicU64) -> f64 {
+    f64::from_bits(a.load(Ordering::Relaxed))
+}
+#[inline]
+fn store_heat_f64(a: &AtomicU64, v: f64) {
+    a.store(v.to_bits(), Ordering::Relaxed);
+}
 
 /// One resident expert: id + the bytes loaded from the SSD.
 ///
@@ -50,6 +63,18 @@ pub struct ExpertResident {
     /// on-disk bytes are slightly short (≤ one block/page) of the
     /// derived expected size.
     q4_0_padded: StdMutex<Option<(usize, Arc<[u8]>)>>,
+    /// **Tier 4 cost-aware eviction.** Decaying heat score: bumped by
+    /// `+1` on every cache hit and exponentially decayed by the number
+    /// of intervening insertions (cache-pressure events). Only
+    /// maintained when the owning [`ExpertCache`] has cost-aware
+    /// eviction enabled; otherwise it stays at its initial value and is
+    /// never read. Stored as `f64` bits behind an `AtomicU64` so the
+    /// lock-free hit path can update it.
+    heat_bits: AtomicU64,
+    /// Insertion epoch (a logical cache-pressure clock) at which this
+    /// resident's heat was last refreshed. Paired with `heat_bits` to
+    /// apply lazy exponential decay.
+    heat_last_epoch: AtomicU64,
 }
 
 impl ExpertResident {
@@ -73,6 +98,8 @@ impl ExpertResident {
             payload_offset,
             hits: AtomicU64::new(0),
             q4_0_padded: StdMutex::new(None),
+            heat_bits: AtomicU64::new(0.0f64.to_bits()),
+            heat_last_epoch: AtomicU64::new(0),
         }
     }
 
@@ -84,6 +111,33 @@ impl ExpertResident {
     #[inline]
     pub fn record_hit(&self) -> u64 {
         self.hits.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// **Tier 4 cost-aware eviction.** Refresh this resident's decaying
+    /// heat score for an access at logical insertion-`epoch`: decay the
+    /// stored heat by `decay^(epoch − last_epoch)`, add `1.0` for this
+    /// access, and stamp `epoch`. `decay ∈ (0, 1]`; `epoch` is the
+    /// owning cache's monotonic insertion counter, so an expert reused
+    /// every few insertions keeps a high score while one untouched
+    /// across many insertions fades toward zero. Approximate under
+    /// concurrent access (heat is a heuristic), never a correctness
+    /// hazard.
+    #[inline]
+    pub fn bump_heat(&self, epoch: u64, decay: f64) {
+        let prev = self.heat_last_epoch.swap(epoch, Ordering::Relaxed);
+        let dt = epoch.saturating_sub(prev).min(4096) as i32;
+        let decayed = load_heat_f64(&self.heat_bits) * decay.powi(dt);
+        store_heat_f64(&self.heat_bits, decayed + 1.0);
+    }
+
+    /// Current heat score decayed forward to `epoch` (read-only; does
+    /// not mutate the stored score). Used by the cost-aware victim
+    /// scorer to compare residents at a single point in logical time.
+    #[inline]
+    pub fn decayed_heat(&self, epoch: u64, decay: f64) -> f64 {
+        let last = self.heat_last_epoch.load(Ordering::Relaxed);
+        let dt = epoch.saturating_sub(last).min(4096) as i32;
+        load_heat_f64(&self.heat_bits) * decay.powi(dt)
     }
 
     /// Whether this resident's bytes live in a **shadow** (Buffer B)
@@ -165,7 +219,25 @@ pub struct ExpertCache {
     /// (see [`crate::engine::Engine`] / `pin_after_observations`).
     pinned: Mutex<HashSet<u32>>,
     capacity: usize,
+    /// **Tier 4 — cost-aware eviction.** When `true`, [`Self::insert`]'s
+    /// pre-eviction and [`Self::evict_lru`] choose the lowest decaying
+    /// **heat** resident rather than the strict LRU victim, and
+    /// [`Self::get`] maintains each resident's heat score on hit. When
+    /// `false` (the default) the cache is a pure LRU and the heat
+    /// machinery is completely inert, so legacy behaviour is preserved
+    /// bit-for-bit. Interior-mutable so the engine can flip it on a
+    /// shared `Arc<ExpertCache>` after construction.
+    cost_aware: AtomicBool,
+    /// Logical cache-pressure clock: incremented once per insertion.
+    /// Drives the exponential decay of resident heat scores.
+    epoch: AtomicU64,
 }
+
+/// Per-insertion decay factor applied to resident heat scores in
+/// cost-aware mode. `0.98` gives heat a half-life of ~34 insertions, so
+/// an expert needs to keep getting hit to stay resident — long enough to
+/// ride out a brief lull, short enough to release genuinely cold experts.
+const COST_AWARE_HEAT_DECAY: f64 = 0.98;
 
 impl ExpertCache {
     pub fn new(capacity: usize) -> Self {
@@ -174,6 +246,8 @@ impl ExpertCache {
             inner: Mutex::new(LruCache::new(cap)),
             pinned: Mutex::new(HashSet::new()),
             capacity,
+            cost_aware: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -181,9 +255,30 @@ impl ExpertCache {
         self.capacity
     }
 
-    /// Look up an expert. Updates LRU recency on hit.
+    /// Enable or disable **Tier 4 cost-aware eviction** on this cache.
+    /// Cheap and idempotent; safe to call on a shared `Arc<ExpertCache>`
+    /// at startup. No-op effect on the hot path while `false`.
+    pub fn set_cost_aware(&self, on: bool) {
+        self.cost_aware.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether cost-aware eviction is currently enabled.
+    #[inline]
+    pub fn is_cost_aware(&self) -> bool {
+        self.cost_aware.load(Ordering::Relaxed)
+    }
+
+    /// Look up an expert. Updates LRU recency on hit, and (in cost-aware
+    /// mode) refreshes the resident's decaying heat score.
     pub fn get(&self, id: u32) -> Option<Arc<ExpertResident>> {
-        self.inner.lock().get(&id).cloned()
+        let resident = self.inner.lock().get(&id).cloned();
+        if let Some(r) = resident.as_ref() {
+            if self.is_cost_aware() {
+                let epoch = self.epoch.load(Ordering::Relaxed);
+                r.bump_heat(epoch, COST_AWARE_HEAT_DECAY);
+            }
+        }
+        resident
     }
 
     /// Peek without changing recency. Useful for the predictive loader to
@@ -214,27 +309,36 @@ impl ExpertCache {
         // then silently evict the LRU entry — which may be pinned.
         let pinned = self.pinned.lock();
         let mut guard = self.inner.lock();
+        // Tier 4: every insertion is one tick of the cache-pressure
+        // clock that ages resident heat scores. Cheap; only meaningful
+        // when cost-aware mode is enabled.
+        let cost_aware = self.is_cost_aware();
+        let epoch = if cost_aware {
+            self.epoch.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        };
         let mut pre_evicted = None;
         if guard.len() >= self.capacity && guard.peek(&id).is_none() {
-            // Walk LRU order (`iter()` yields most-recently-used
-            // first, so the *last* item is the LRU) and pop the first
-            // non-pinned entry.
-            let id_order: Vec<u32> = guard.iter().map(|(k, _)| *k).collect();
-            for &cand in id_order.iter().rev() {
-                if !pinned.contains(&cand) {
-                    if let Some(v) = guard.pop(&cand) {
-                        pre_evicted = Some(v);
-                        break;
-                    }
+            // Pick the victim under the active policy: strict LRU by
+            // default, or the lowest decaying-heat resident in
+            // cost-aware mode.
+            match self.select_victim_id(&guard, &pinned) {
+                Some(victim) => pre_evicted = guard.pop(&victim),
+                None => {
+                    // Cache is full *and* every resident expert is
+                    // pinned. We must refuse the insert: calling `push`
+                    // here would evict a pinned id (LruCache has no
+                    // pinning concept).
+                    return Err(resident);
                 }
             }
-            if pre_evicted.is_none() {
-                // Cache is full *and* every resident expert is
-                // pinned. We must refuse the insert: calling `push`
-                // here would evict a pinned id (LruCache has no
-                // pinning concept).
-                return Err(resident);
-            }
+        }
+        // Tier 4: seed the freshly-loaded resident's heat for *this*
+        // access so it isn't the instant next eviction victim (which
+        // would thrash the very expert we just paid an SSD read for).
+        if cost_aware {
+            resident.bump_heat(epoch, COST_AWARE_HEAT_DECAY);
         }
         // `LruCache::push` returns the (k, v) pair that was evicted, if any.
         // With the pre-eviction above we never hit a second eviction
@@ -242,6 +346,47 @@ impl ExpertCache {
         // value — which is fine to surface as "evicted" too.
         let push_evicted = guard.push(id, resident).map(|(_, v)| v);
         Ok(push_evicted.or(pre_evicted))
+    }
+
+    /// Choose the id to evict from `guard` under the active policy.
+    /// Returns the least-recently-used non-pinned id by default, or the
+    /// resident with the lowest decaying **heat** in cost-aware mode.
+    /// Ties resolve toward the more-LRU candidate. `None` when every
+    /// resident is pinned.
+    fn select_victim_id(
+        &self,
+        guard: &LruCache<u32, Arc<ExpertResident>>,
+        pinned: &HashSet<u32>,
+    ) -> Option<u32> {
+        if self.is_cost_aware() {
+            let epoch = self.epoch.load(Ordering::Relaxed);
+            // `iter()` yields most-recently-used first, so iterating in
+            // order and replacing on `score <= best` makes the more-LRU
+            // candidate win heat ties.
+            let mut best: Option<(u32, f64)> = None;
+            for (k, v) in guard.iter() {
+                if pinned.contains(k) {
+                    continue;
+                }
+                let score = v.decayed_heat(epoch, COST_AWARE_HEAT_DECAY);
+                let replace = match best {
+                    None => true,
+                    Some((_, bs)) => score <= bs,
+                };
+                if replace {
+                    best = Some((*k, score));
+                }
+            }
+            best.map(|(k, _)| k)
+        } else {
+            // Strict LRU: `iter()` is MRU-first, so the last non-pinned
+            // id is the least-recently-used non-pinned victim.
+            guard
+                .iter()
+                .map(|(k, _)| *k)
+                .filter(|k| !pinned.contains(k))
+                .last()
+        }
     }
 
     /// Number of resident experts currently in the cache.
@@ -257,24 +402,16 @@ impl ExpertCache {
     /// `None`, meaning there is no room to evict.
     pub fn evict_lru(&self) -> Option<Arc<ExpertResident>> {
         let pinned = self.pinned.lock();
-        if pinned.is_empty() {
-            // Fast path: no pinning, just pop LRU.
+        if pinned.is_empty() && !self.is_cost_aware() {
+            // Fast path: no pinning and pure LRU, just pop LRU.
             return self.inner.lock().pop_lru().map(|(_, v)| v);
         }
-        // Walk LRU order from least-recent to most-recent and pop the
-        // first non-pinned entry.
+        // Otherwise defer to the policy-aware victim selector (strict
+        // LRU, or lowest decaying heat in cost-aware mode), skipping
+        // pinned residents.
         let mut guard = self.inner.lock();
-        // Collect ids in reverse-recency order. `LruCache::iter` yields
-        // most-recently-used first, so the *last* item is the LRU.
-        let id_order: Vec<u32> = guard.iter().map(|(k, _)| *k).collect();
-        for &id in id_order.iter().rev() {
-            if !pinned.contains(&id) {
-                if let Some(v) = guard.pop(&id) {
-                    return Some(v);
-                }
-            }
-        }
-        None
+        let victim = self.select_victim_id(&guard, &pinned)?;
+        guard.pop(&victim)
     }
 
     /// Pop the least-recently-used entry that is **shadow-backed**
@@ -812,6 +949,92 @@ mod tests {
         cache.pin(0);
         cache.pin(1);
         assert!(cache.evict_lru().is_none());
+    }
+
+    #[test]
+    fn cost_aware_evicts_coldest_not_lru() {
+        // Scenario where strict LRU and cost-aware eviction diverge: the
+        // *least-recently-used* resident is also the *hottest*. Cost-aware
+        // mode must keep the hot expert and evict the cold newcomer.
+        let pool = BufferPool::new(4, 4096, 4096);
+        let cache = ExpertCache::new(2);
+        cache.set_cost_aware(true);
+        // A (id 0) is loaded and then hit many times → high heat. The
+        // hits make it most-recently-used for now.
+        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        for _ in 0..10 {
+            let _ = cache.get(0);
+        }
+        // B (id 1) is loaded cold. Now A is the LRU (B is MRU) but A is
+        // far hotter than B.
+        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        // Inserting C evicts a victim: cost-aware keeps hot A, drops cold B.
+        let evicted = match cache.insert(make(2, &pool)) {
+            Ok(Some(e)) => e,
+            other => panic!("expected an eviction, got ok={}", other.is_ok()),
+        };
+        assert_eq!(
+            evicted.id, 1,
+            "cost-aware eviction should drop the cold expert (1), not the hot LRU (0)"
+        );
+        assert!(cache.contains(0));
+        assert!(!cache.contains(1));
+        assert!(cache.contains(2));
+    }
+
+    #[test]
+    fn cost_aware_disabled_is_pure_lru() {
+        // The same access pattern as `cost_aware_evicts_coldest_not_lru`,
+        // but with cost-aware mode OFF (the default), must reproduce the
+        // legacy strict-LRU outcome: the hot-but-LRU expert is evicted.
+        let pool = BufferPool::new(4, 4096, 4096);
+        let cache = ExpertCache::new(2);
+        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        for _ in 0..10 {
+            let _ = cache.get(0);
+        }
+        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        // 0 is MRU after the hits, then 1 is inserted → 1 MRU, 0 LRU.
+        let evicted = match cache.insert(make(2, &pool)) {
+            Ok(Some(e)) => e,
+            other => panic!("expected an eviction, got ok={}", other.is_ok()),
+        };
+        assert_eq!(evicted.id, 0, "pure LRU should evict the least-recently-used expert (0)");
+        assert!(!cache.contains(0));
+        assert!(cache.contains(1));
+        assert!(cache.contains(2));
+    }
+
+    #[test]
+    fn cost_aware_heat_decays_releasing_stale_hot() {
+        // An expert that was hot long ago but has gone cold must
+        // eventually become the eviction victim as its heat decays under
+        // sustained churn from other experts.
+        let pool = BufferPool::new(8, 4096, 4096);
+        let cache = ExpertCache::new(2);
+        cache.set_cost_aware(true);
+        // Make expert 0 very hot, then never touch it again.
+        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        for _ in 0..20 {
+            let _ = cache.get(0);
+        }
+        // Churn many distinct cold experts through the other slot. Each
+        // insertion ages expert 0's heat; after enough churn its decayed
+        // heat falls below a freshly-loaded expert's seed and it is
+        // finally evicted.
+        let mut zero_evicted = false;
+        for id in 1..400u32 {
+            if let Ok(Some(ev)) = cache.insert(make(id, &pool)) {
+                if ev.id == 0 {
+                    zero_evicted = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            zero_evicted,
+            "stale-hot expert 0 should eventually be released once its heat decays"
+        );
     }
 
     #[test]

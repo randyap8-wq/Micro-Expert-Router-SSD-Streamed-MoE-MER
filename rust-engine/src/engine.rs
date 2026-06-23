@@ -810,6 +810,13 @@ pub(crate) struct Counters {
     /// `EngineReport::prefetch_dropped_pool_starved` and
     /// `mer_prefetch_dropped_pool_starved_total`.
     prefetch_dropped_pool_starved: AtomicU64,
+    /// **Tier 4.** Speculative prefetches the adaptive
+    /// [`crate::prefetch_governor::PrefetchGovernor`] declined to admit
+    /// because their expected value did not clear the contention-scaled
+    /// bar. Always `0` when the governor is disabled (the default), so
+    /// legacy telemetry is unchanged. Surfaced via
+    /// `EngineReport::prefetch_dropped_governor`.
+    prefetch_dropped_governor: AtomicU64,
     /// Tokens for which the neural speculator (M arm) was silently
     /// disabled because the hidden-state width didn't match the
     /// speculator's `d_model`. A persistent non-zero rate means the
@@ -887,6 +894,38 @@ pub struct EngineOptions {
     /// concurrent prefetches under steady-state load (gist feedback
     /// #1.3). Values less than `1` are clamped to `1` at use.
     pub max_fetch_yields: usize,
+    /// **Tier 4 — adaptive prefetch governor.** When `true`, every
+    /// speculative prefetch is admitted by
+    /// [`crate::prefetch_governor::PrefetchGovernor`], which throttles
+    /// speculation as measured prefetch precision falls or as foreground
+    /// (token-blocking) reads queue up for the device. `false` (the
+    /// default) preserves the legacy unbounded-admission behaviour
+    /// exactly. This is the highest-leverage knob on a bandwidth-bound
+    /// SSD: it stops low-precision speculation from inflating the latency
+    /// of the foreground misses that actually block token generation.
+    pub prefetch_governor: bool,
+    /// Precision floor (and optimistic EWMA seed lower bound) for the
+    /// prefetch governor, in `[0, 1]`. Only consulted when
+    /// `prefetch_governor` is set.
+    pub prefetch_precision_floor: f64,
+    /// Per-outstanding-foreground-read multiplier the prefetch governor
+    /// applies to its admission threshold. Higher values make
+    /// speculation back off harder while real misses are in flight.
+    pub prefetch_contention_weight: f64,
+    /// **Tier 4 — cost-aware eviction.** When `true`, the RAM expert
+    /// cache evicts the non-pinned resident with the lowest *decaying
+    /// heat score* (frequency of use, aged over time) rather than the
+    /// strict LRU victim, so a genuinely hot expert that briefly fell to
+    /// the LRU tail is not dumped ahead of a one-shot cold expert.
+    /// `false` (the default) keeps pure-LRU + binary pin-set eviction.
+    pub cost_aware_eviction: bool,
+    /// **Tier 3 — per-layer pre-gate predictor.** When `true`, the
+    /// engine trains an online conditional map from one layer's routed
+    /// expert set to the *next* layer's experts and uses it to drive
+    /// high-precision next-layer prefetch on the real-transformer /
+    /// trace-replay path. `false` (the default) leaves the existing
+    /// speculator/Markov look-ahead untouched.
+    pub pregate_enabled: bool,
 }
 
 /// Default semaphore ceiling for `Engine::spawn_prefetch`. Matches a
@@ -925,6 +964,11 @@ impl Default for EngineOptions {
             use_qmm_for_q4: true,
             max_concurrent_prefetches: DEFAULT_MAX_CONCURRENT_PREFETCHES,
             max_fetch_yields: DEFAULT_MAX_FETCH_YIELDS,
+            prefetch_governor: false,
+            prefetch_precision_floor: 0.05,
+            prefetch_contention_weight: 1.0,
+            cost_aware_eviction: false,
+            pregate_enabled: false,
         }
     }
 }
@@ -1002,6 +1046,14 @@ pub(crate) struct EngineCore {
     /// `BackendBox::Cpu` automatically if no GPU is available, so this
     /// field is always installed (see gist Phase 3, CHANGE 3).
     pub(super) backend: Arc<crate::backend::BackendBox>,
+    /// **Tier 4 — adaptive prefetch admission controller.** Always
+    /// present; constructed in the transparent pass-through state unless
+    /// [`EngineOptions::prefetch_governor`] is set, in which case it
+    /// gates every `spawn_prefetch` admission on measured prefetch
+    /// precision and foreground-read contention. Lock-free, so the
+    /// per-prefetch `admit` check and the per-hit precision feedback add
+    /// only a handful of relaxed atomic ops to the hot path.
+    pub(super) governor: Arc<crate::prefetch_governor::PrefetchGovernor>,
 }
 
 /// Predictive-routing state: aliasing & frequency-based pinning,
@@ -1238,6 +1290,17 @@ impl EngineCore {
                 .max_concurrent_prefetches
                 .min(pool_headroom.saturating_sub(1))
         };
+        let governor = Arc::new(crate::prefetch_governor::PrefetchGovernor::new(
+            options.prefetch_governor,
+            crate::prefetch_governor::GovernorConfig {
+                precision_floor: options.prefetch_precision_floor,
+                contention_weight: options.prefetch_contention_weight,
+                ..crate::prefetch_governor::GovernorConfig::default()
+            },
+        ));
+        // Tier 4: flip the RAM cache into cost-aware (lowest-heat)
+        // eviction when requested. Off by default ⇒ pure LRU.
+        cache.set_cost_aware(options.cost_aware_eviction);
         Self {
             cache,
             pool,
@@ -1256,6 +1319,7 @@ impl EngineCore {
             backend: Arc::new(crate::backend::BackendBox::Cpu(
                 crate::backend::CandleBackend::new(),
             )),
+            governor,
         }
     }
 }
@@ -1809,6 +1873,10 @@ impl Engine {
         token_idx: u64,
     ) -> Result<CycleStats, ExpertReadError> {
         let cycle_start = Instant::now();
+        // Tier 4: fold the previous token's prefetch precision window
+        // into the governor's EWMA before this token issues any new
+        // speculative reads. No-op when the governor is disabled.
+        self.core.governor.refresh();
         // Compute the residual-stream hidden state up front. The
         // production `Router::Linear` path needs it to compute the
         // gate's softmax logits; the legacy `Router::Markov` path
@@ -1882,6 +1950,16 @@ impl Engine {
                 // promotion only on the threshold crossing, and only if
                 // the expert is not already resident in the GPU cache.
                 let new_hits = r.record_hit();
+                // Tier 4 precision feedback: the first hit on a
+                // shadow-backed resident means a speculative prefetch
+                // paid off (it was consumed before eviction). Credit the
+                // governor so its precision EWMA tracks reality, and bump
+                // the (previously dead) `prefetch_used` counter so the
+                // run summary can report end-to-end prefetch precision.
+                if new_hits == 1 && r.is_shadow_backed() {
+                    self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
+                    self.core.governor.record_used();
+                }
                 if let (Some(gpu), Some(tx)) = (
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
@@ -2435,7 +2513,14 @@ impl Engine {
             }
         }
         let mut buf = self.core.pool.acquire().await;
-        match self.core.storage.read_expert(id, &mut buf).await {
+        // Tier 4: mark this as a foreground (token-blocking) read for the
+        // duration of the device I/O so the governor throttles
+        // speculation that would otherwise queue ahead of it. No-op when
+        // the governor is disabled.
+        self.core.governor.begin_foreground();
+        let read_result = self.core.storage.read_expert(id, &mut buf).await;
+        self.core.governor.end_foreground();
+        match read_result {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.metrics.io_hist.lock().record(io_us.max(1));
@@ -2490,6 +2575,21 @@ impl Engine {
         // fine: the post-spawn `contains` re-check and the singleflight
         // entry below stay authoritative.
         if self.core.cache.contains(id) || self.core.in_flight.contains_key(&id) {
+            return;
+        }
+        // **Tier 4 admission gate.** Before spending a semaphore permit
+        // (or any device bandwidth), ask the adaptive governor whether
+        // this speculative read is worth issuing *right now*, given its
+        // predicted score `p`, the recently-measured prefetch precision,
+        // and how many foreground (token-blocking) misses are currently
+        // competing for the SSD. A disabled governor always admits, so
+        // the legacy unbounded behaviour is preserved bit-for-bit.
+        if !self.core.governor.admit(p) {
+            self.metrics
+                .counters
+                .prefetch_dropped_governor
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(expert = id, score = p, "governor throttled speculative prefetch");
             return;
         }
         // Speculative prefetches are *bounded*: each spawn must hold
@@ -2611,6 +2711,12 @@ impl Engine {
             match me.core.storage.read_expert(id, &mut buf).await {
                 Ok(_) => {
                     me.metrics.counters.prefetch_completed.fetch_add(1, Ordering::Relaxed);
+                    // Tier 4: a speculative read landed in the cache. This
+                    // is the precision *denominator*; the matching
+                    // numerator (`record_used`) fires if/when a hit later
+                    // consumes this shadow-backed resident. No-op when the
+                    // governor is disabled.
+                    me.core.governor.record_completed();
                     me.metrics.counters
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
@@ -3322,6 +3428,10 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         experts: &[u32],
     ) -> Vec<HiddenState> {
         let cycle_start = Instant::now();
+        // Tier 4: fold the previous step's prefetch precision window into
+        // the governor's EWMA before issuing this step's speculation.
+        // No-op when the governor is disabled.
+        self.core.governor.refresh();
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids (mirrors `generate`).
         let target: Vec<u32> = experts.iter().map(|&id| self.resolve_alias(id)).collect();
@@ -3433,6 +3543,13 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             if let Some(r) = self.core.cache.get(id) {
                 self.metrics.counters.hits.fetch_add(1, Ordering::Relaxed);
                 let new_hits = r.record_hit();
+                // Tier 4 precision feedback (mirrors `generate`): a
+                // first hit on a shadow-backed resident is a prefetch
+                // that paid off. No-op when the governor is disabled.
+                if new_hits == 1 && r.is_shadow_backed() {
+                    self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
+                    self.core.governor.record_used();
+                }
                 if let (Some(gpu), Some(tx)) = (
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
@@ -3879,6 +3996,16 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 .as_ref()
                 .map(|g| g.lru_len())
                 .unwrap_or(0),
+            prefetch_used: self.metrics.counters.prefetch_used.load(Ordering::Relaxed),
+            prefetch_dropped_governor: self
+                .metrics
+                .counters
+                .prefetch_dropped_governor
+                .load(Ordering::Relaxed),
+            governor_enabled: self.core.governor.is_enabled(),
+            governor_precision: self.core.governor.precision(),
+            governor_admitted: self.core.governor.decisions().0,
+            governor_throttled: self.core.governor.decisions().1,
         }
     }
 
@@ -3956,6 +4083,27 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 if r.speculator_enabled { "on" } else { "off" },
                 r.predictive.speculator_accuracy * 100.0,
                 r.predictive.ssd_stall_us as f64 / 1000.0,
+            );
+        }
+        // Tier 4 governor line — only emitted when the adaptive
+        // prefetch governor is enabled, so the legacy summary shape is
+        // untouched for existing runs/tests.
+        if r.governor_enabled {
+            let precision_pct = r.governor_precision * 100.0;
+            let admit_total = r.governor_admitted + r.governor_throttled;
+            let admit_rate = if admit_total == 0 {
+                0.0
+            } else {
+                r.governor_admitted as f64 / admit_total as f64 * 100.0
+            };
+            info!(
+                "governor:      on  precision={:.2}%  prefetch_used={}/{}  admitted={} throttled={} ({:.1}% admit)",
+                precision_pct,
+                r.prefetch_used,
+                r.prefetch_completed,
+                r.governor_admitted,
+                r.governor_throttled,
+                admit_rate,
             );
         }
         info!("=======================================================");
@@ -4072,6 +4220,25 @@ pub struct EngineReport {
     pub gpu_anchor_count: usize,
     /// Number of experts in the VRAM LRU (cold-edge) region.
     pub gpu_lru_count: usize,
+    /// **Tier 4.** Speculative prefetches that landed in cache and were
+    /// then consumed by a hit before eviction (precision numerator).
+    /// Previously always `0` (the counter was dead); now wired on both
+    /// the `generate` and `moe_step` hit paths.
+    pub prefetch_used: u64,
+    /// **Tier 4.** Speculative prefetches the adaptive governor declined
+    /// to admit. `0` when the governor is disabled (the default).
+    pub prefetch_dropped_governor: u64,
+    /// **Tier 4.** Whether the adaptive prefetch governor is enabled.
+    pub governor_enabled: bool,
+    /// **Tier 4.** Current governor precision EWMA (consumed / completed),
+    /// in `[0, 1]`. Meaningless when `governor_enabled` is `false`.
+    pub governor_precision: f64,
+    /// **Tier 4.** Cumulative speculative prefetches the governor
+    /// admitted.
+    pub governor_admitted: u64,
+    /// **Tier 4.** Cumulative speculative prefetches the governor
+    /// throttled (declined).
+    pub governor_throttled: u64,
 }
 
 #[cfg(test)]

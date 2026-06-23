@@ -475,7 +475,49 @@ pub struct PredictiveConfig {
     /// distribution shifts and prevents `u32::MAX` saturation.
     #[serde(default = "default_affinity_decay_epoch")]
     pub affinity_decay_epoch: u64,
+
+    /// **Tier 4 — adaptive prefetch governor.** Master switch for the
+    /// [`crate::prefetch_governor::PrefetchGovernor`]. When `true`,
+    /// speculative prefetches are admitted only when their expected
+    /// value (predicted score × measured precision) beats a bar that
+    /// rises with the number of foreground (token-blocking) misses
+    /// queued for the device. `false` (default) preserves the legacy
+    /// unbounded admission behaviour. This is the highest-leverage knob
+    /// on a bandwidth-bound SSD: it stops low-precision speculation from
+    /// inflating the latency of the foreground misses that actually
+    /// block token generation.
+    #[serde(default)]
+    pub prefetch_governor: bool,
+    /// Precision floor / optimistic EWMA seed for the governor, in
+    /// `[0, 1]`. Only consulted when `prefetch_governor = true`.
+    #[serde(default = "default_prefetch_precision_floor")]
+    pub prefetch_precision_floor: f64,
+    /// Per-outstanding-foreground-read multiplier the governor applies
+    /// to its admission threshold. Higher ⇒ speculation backs off harder
+    /// while real misses are in flight.
+    #[serde(default = "default_prefetch_contention_weight")]
+    pub prefetch_contention_weight: f64,
+
+    /// **Tier 4 — cost-aware eviction.** When `true`, the RAM expert
+    /// cache evicts the non-pinned resident with the lowest decaying
+    /// heat score rather than the strict LRU victim, so a genuinely hot
+    /// expert that briefly fell to the LRU tail is not dumped ahead of a
+    /// one-shot cold expert. `false` (default) keeps pure LRU eviction.
+    #[serde(default)]
+    pub cost_aware_eviction: bool,
+
+    /// **Tier 3 — per-layer pre-gate predictor.** When `true`, the
+    /// engine trains an online conditional map from one layer's routed
+    /// set to the next layer's experts and uses it to drive
+    /// high-precision next-layer prefetch on the real-transformer /
+    /// trace-replay path. `false` (default) leaves the existing
+    /// speculator/Markov look-ahead untouched.
+    #[serde(default)]
+    pub pregate_enabled: bool,
 }
+
+fn default_prefetch_precision_floor() -> f64 { 0.05 }
+fn default_prefetch_contention_weight() -> f64 { 1.0 }
 
 fn default_locality_window() -> usize { 256 }
 fn default_locality_threshold() -> f32 { 0.10 }
@@ -495,6 +537,11 @@ impl Default for PredictiveConfig {
             affinity_enabled: false,
             affinity_neighbors_k: default_affinity_neighbors_k(),
             affinity_decay_epoch: default_affinity_decay_epoch(),
+            prefetch_governor: false,
+            prefetch_precision_floor: default_prefetch_precision_floor(),
+            prefetch_contention_weight: default_prefetch_contention_weight(),
+            cost_aware_eviction: false,
+            pregate_enabled: false,
         }
     }
 }
