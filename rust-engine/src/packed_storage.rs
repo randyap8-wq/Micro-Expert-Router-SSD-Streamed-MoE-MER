@@ -116,6 +116,32 @@ impl PackedManifest {
             .unwrap_or(0)
     }
 
+    /// Validate that each manifest entry matches the uniform-slot layout used
+    /// by the packed read path.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+        if self.expert_size == 0 {
+            return Err("packed manifest expert_size must be non-zero".to_string());
+        }
+        for (&id, entry) in &self.entries {
+            if entry.len != self.expert_size {
+                return Err(format!(
+                    "packed manifest entry for expert {id} has len {} but expert_size is {}",
+                    entry.len, self.expert_size
+                ));
+            }
+            if entry.offset % self.expert_size != 0 {
+                return Err(format!(
+                    "packed manifest entry for expert {id} has offset {} which is not a multiple of expert_size {}",
+                    entry.offset, self.expert_size
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Serialise to pretty JSON.
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
@@ -203,6 +229,26 @@ impl PackedBlob {
     pub fn path(&self) -> &Path {
         &self.blob_path
     }
+
+    /// Validate manifest invariants and ensure the blob file is long enough
+    /// for the manifest's declared slots.
+    pub fn validate(&self) -> io::Result<()> {
+        self.manifest
+            .validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let actual_len = self.file.metadata()?.len();
+        let expected_len = self.manifest.blob_len();
+        if actual_len < expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "packed blob {} is truncated: length {actual_len} bytes but manifest requires {expected_len} bytes",
+                    self.blob_path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A maximal run of experts whose blob slots are physically contiguous, i.e.
@@ -286,6 +332,30 @@ mod tests {
         assert_eq!(m.entries[&7].len, 4096);
         assert_eq!(m.blob_len(), 3 * 4096);
         assert_eq!(m.order, vec![7, 3, 9]);
+    }
+
+    #[test]
+    fn packed_manifest_validate_accepts_uniform_slots() {
+        let m = PackedManifest::uniform(vec![7, 3, 9], 4096, 4096);
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn packed_manifest_validate_rejects_len_mismatch() {
+        let mut m = PackedManifest::uniform(vec![7, 3], 4096, 4096);
+        m.entries.get_mut(&3).unwrap().len = 2048;
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("expert 3"), "unexpected error: {err}");
+        assert!(err.contains("len 2048"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn packed_manifest_validate_rejects_unaligned_offset() {
+        let mut m = PackedManifest::uniform(vec![7, 3], 4096, 4096);
+        m.entries.get_mut(&3).unwrap().offset = 512;
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("expert 3"), "unexpected error: {err}");
+        assert!(err.contains("offset 512"), "unexpected error: {err}");
     }
 
     #[test]

@@ -974,6 +974,8 @@ fn maybe_attach_packed_blob(
                 manifest_path,
                 use_direct_io,
             )?;
+            blob.validate()
+                .map_err(|e| format!("packed blob validation failed: {e}"))?;
             let slot = blob.manifest().expert_size;
             if slot != expert_size as u64 {
                 return Err(format!(
@@ -1913,14 +1915,32 @@ fn parse_order_file(path: &std::path::Path) -> Result<Vec<u32>, Box<dyn std::err
         return Ok(ids);
     }
     let mut ids = Vec::new();
-    for tok in raw.split(|c: char| c.is_whitespace() || c == ',') {
-        let t = tok.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
+    for line in raw.lines() {
+        let without_comment = line.split_once('#').map_or(line, |(body, _)| body);
+        for tok in without_comment.split(|c: char| c.is_whitespace() || c == ',') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            ids.push(t.parse::<u32>()?);
         }
-        ids.push(t.parse::<u32>()?);
     }
     Ok(ids)
+}
+
+fn validate_order(ids: &[u32], num_experts: u32) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    for &id in ids {
+        if id >= num_experts {
+            return Err(format!(
+                "--order id {id} is out of range for --num-experts {num_experts}"
+            ));
+        }
+        if !seen.insert(id) {
+            return Err(format!("--order contains duplicate expert id {id}"));
+        }
+    }
+    Ok(())
 }
 
 /// **Tier 2.** Build a packed blob + manifest from a per-expert directory.
@@ -1948,6 +1968,14 @@ async fn cmd_repack(args: RepackArgs) -> Result<(), Box<dyn std::error::Error>> 
         let ids = parse_order_file(order_path)?;
         if ids.is_empty() {
             return Err(format!("--order file {} listed no ids", order_path.display()).into());
+        }
+        validate_order(&ids, args.num_experts)?;
+        let missing = args.num_experts as usize - ids.len();
+        if missing > 0 {
+            warn!(
+                missing,
+                "repack: explicit order omits experts; running/serving in packed mode will hard-error with NotFound if an omitted expert is routed"
+            );
         }
         info!(
             count = ids.len(),
@@ -2670,19 +2698,29 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
             // Structured workloads: drive `moe_step` with the harness's
             // explicit expert set and measure the engine-counter delta.
             crate::workload::Workload::Skewed | crate::workload::Workload::Replay => {
-                let experts: Vec<u32> = match workload {
-                    crate::workload::Workload::Skewed => {
-                        skewed_stream.as_mut().expect("skewed stream").next_experts()
+                let (tok_idx, layer_idx, experts): (u64, u32, Vec<u32>) = match workload {
+                    crate::workload::Workload::Skewed => (
+                        t,
+                        0,
+                        skewed_stream.as_mut().expect("skewed stream").next_experts(),
+                    ),
+                    _ => {
+                        let record = replay_stream
+                            .as_mut()
+                            .expect("replay stream")
+                            .next_record()
+                            .expect("replay stream non-empty");
+                        let layer = u32::try_from(record.layer).map_err(|_| {
+                            format!("replay layer {} does not fit in u32", record.layer)
+                        })?;
+                        (record.token, layer, record.experts)
                     }
-                    _ => replay_stream
-                        .as_mut()
-                        .expect("replay stream")
-                        .next_experts()
-                        .expect("replay stream non-empty"),
                 };
-                let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
+                let hidden = crate::inference::synth_hidden_state(tok_idx, args.d_model, args.seed);
                 let pre = engine.report();
-                let _ = engine.moe_step(t, 0, &hidden, &experts).await;
+                let _ = engine
+                    .moe_step(tok_idx, layer_idx, &hidden, &experts)
+                    .await;
                 let post = engine.report();
                 crate::engine::CycleStats {
                     hits: post.hits.saturating_sub(pre.hits),
@@ -3518,6 +3556,37 @@ mod tests {
         assert_eq!(parse_gate_layer_index("gate_1.bin.bak"), None);
         assert_eq!(parse_gate_layer_index("rms_moe_1.bin"), None);
         assert_eq!(parse_gate_layer_index("gate.bin"), None);
+    }
+
+    #[test]
+    fn parse_order_file_strips_inline_comments() {
+        let path = tempdir_unique("order-inline-comments.txt");
+        std::fs::write(
+            &path,
+            "# full-line comment\n12  # hot expert\n3,4\n8 9\n",
+        )
+        .unwrap();
+        let ids = parse_order_file(&path).unwrap();
+        assert_eq!(ids, vec![12, 3, 4, 8, 9]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn repack_order_validation_rejects_duplicate_ids() {
+        let err = validate_order(&[0, 1, 1], 4).unwrap_err();
+        assert!(err.contains("duplicate expert id 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn repack_order_validation_rejects_out_of_range_ids() {
+        let err = validate_order(&[0, 4], 4).unwrap_err();
+        assert!(err.contains("out of range"), "unexpected error: {err}");
+        assert!(err.contains("4"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn repack_order_validation_allows_subsets() {
+        assert!(validate_order(&[0, 2], 4).is_ok());
     }
 
     #[test]

@@ -175,20 +175,29 @@ impl SkewedStream {
     }
 }
 
-/// Replays the `experts` arrays of a recorded JSONL routing trace (the
-/// `--trace-out` format). Cycles back to the start when exhausted so a
-/// short trace can drive an arbitrarily long benchmark.
+/// One replayed routing record from a JSONL trace.
+#[derive(Debug, Clone)]
+pub struct ReplayRecord {
+    pub token: u64,
+    pub layer: usize,
+    pub experts: Vec<u32>,
+}
+
+/// Replays recorded JSONL routing trace records (the `--trace-out` format).
+/// Cycles back to the start when exhausted so a short trace can drive an
+/// arbitrarily long benchmark.
 #[derive(Debug)]
 pub struct ReplayStream {
-    records: Vec<Vec<u32>>,
+    records: Vec<ReplayRecord>,
     idx: usize,
 }
 
 impl ReplayStream {
-    /// Load every `{"experts":[...]}` record from `path`, in file order.
+    /// Load every usable `{"experts":[...]}` record from `path`, in file order.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let mut records = Vec::new();
+        let mut record_index = 0u64;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -196,13 +205,25 @@ impl ReplayStream {
             }
             let value: serde_json::Value = serde_json::from_str(line)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let default_token = record_index;
+            record_index += 1;
             if let Some(arr) = value.get("experts").and_then(|e| e.as_array()) {
                 let experts: Vec<u32> = arr
                     .iter()
                     .filter_map(|x| x.as_u64().map(|n| n as u32))
                     .collect();
                 if !experts.is_empty() {
-                    records.push(experts);
+                    records.push(ReplayRecord {
+                        token: value
+                            .get("token")
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(default_token),
+                        layer: value
+                            .get("layer")
+                            .and_then(|l| l.as_u64())
+                            .unwrap_or(0) as usize,
+                        experts,
+                    });
                 }
             }
         }
@@ -217,15 +238,22 @@ impl ReplayStream {
         self.records.len()
     }
 
-    /// Next expert set, cycling through the trace. `None` only when the
+    /// Next replay record, cycling through the trace. `None` only when the
     /// trace contained no usable records.
-    pub fn next_experts(&mut self) -> Option<Vec<u32>> {
+    pub fn next_record(&mut self) -> Option<ReplayRecord> {
         if self.records.is_empty() {
             return None;
         }
         let rec = self.records[self.idx % self.records.len()].clone();
         self.idx += 1;
         Some(rec)
+    }
+
+    /// Next expert set, cycling through the trace. `None` only when the
+    /// trace contained no usable records.
+    #[allow(dead_code)]
+    pub fn next_experts(&mut self) -> Option<Vec<u32>> {
+        self.next_record().map(|record| record.experts)
     }
 }
 
@@ -309,15 +337,25 @@ mod tests {
         let path = dir.join(format!("replay_test_{}.jsonl", std::process::id()));
         std::fs::write(
             &path,
-            "{\"token\":0,\"layer\":0,\"experts\":[3,7]}\n\
-             \n\
-             {\"token\":1,\"layer\":0,\"experts\":[1,4,9]}\n",
+            "{\"token\":10,\"layer\":2,\"experts\":[3,7]}\n\
+             {\"token\":11,\"layer\":3,\"experts\":[1,4,9]}\n\
+             {\"experts\":[5]}\n",
         )
         .unwrap();
         let mut r = ReplayStream::load(&path).unwrap();
-        assert_eq!(r.len(), 2);
-        assert_eq!(r.next_experts(), Some(vec![3, 7]));
-        assert_eq!(r.next_experts(), Some(vec![1, 4, 9]));
+        assert_eq!(r.len(), 3);
+        let first = r.next_record().unwrap();
+        assert_eq!(first.token, 10);
+        assert_eq!(first.layer, 2);
+        assert_eq!(first.experts, vec![3, 7]);
+        let second = r.next_record().unwrap();
+        assert_eq!(second.token, 11);
+        assert_eq!(second.layer, 3);
+        assert_eq!(second.experts, vec![1, 4, 9]);
+        let third = r.next_record().unwrap();
+        assert_eq!(third.token, 2);
+        assert_eq!(third.layer, 0);
+        assert_eq!(third.experts, vec![5]);
         // Cycles back to the start.
         assert_eq!(r.next_experts(), Some(vec![3, 7]));
         let _ = std::fs::remove_file(&path);
