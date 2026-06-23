@@ -810,6 +810,13 @@ pub(crate) struct Counters {
     /// `EngineReport::prefetch_dropped_pool_starved` and
     /// `mer_prefetch_dropped_pool_starved_total`.
     prefetch_dropped_pool_starved: AtomicU64,
+    /// **Tier 4.** Speculative prefetches the adaptive
+    /// [`crate::prefetch_governor::PrefetchGovernor`] declined to admit
+    /// because their expected value did not clear the contention-scaled
+    /// bar. Always `0` when the governor is disabled (the default), so
+    /// legacy telemetry is unchanged. Surfaced via
+    /// `EngineReport::prefetch_dropped_governor`.
+    prefetch_dropped_governor: AtomicU64,
     /// Tokens for which the neural speculator (M arm) was silently
     /// disabled because the hidden-state width didn't match the
     /// speculator's `d_model`. A persistent non-zero rate means the
@@ -887,6 +894,45 @@ pub struct EngineOptions {
     /// concurrent prefetches under steady-state load (gist feedback
     /// #1.3). Values less than `1` are clamped to `1` at use.
     pub max_fetch_yields: usize,
+    /// **Tier 4 — adaptive prefetch governor.** When `true`, every
+    /// speculative prefetch is admitted by
+    /// [`crate::prefetch_governor::PrefetchGovernor`], which throttles
+    /// speculation as measured prefetch precision falls or as foreground
+    /// (token-blocking) reads queue up for the device. `false` (the
+    /// default) preserves the legacy unbounded-admission behaviour
+    /// exactly. This is the highest-leverage knob on a bandwidth-bound
+    /// SSD: it stops low-precision speculation from inflating the latency
+    /// of the foreground misses that actually block token generation.
+    pub prefetch_governor: bool,
+    /// Precision floor (and optimistic EWMA seed lower bound) for the
+    /// prefetch governor, in `[0, 1]`. Only consulted when
+    /// `prefetch_governor` is set.
+    pub prefetch_precision_floor: f64,
+    /// Per-outstanding-foreground-read multiplier the prefetch governor
+    /// applies to its admission threshold. Higher values make
+    /// speculation back off harder while real misses are in flight.
+    pub prefetch_contention_weight: f64,
+    /// **Tier 4 — cost-aware eviction.** When `true`, the RAM expert
+    /// cache evicts the non-pinned resident with the lowest *decaying
+    /// heat score* (frequency of use, aged over time) rather than the
+    /// strict LRU victim, so a genuinely hot expert that briefly fell to
+    /// the LRU tail is not dumped ahead of a one-shot cold expert.
+    /// `false` (the default) keeps pure-LRU + binary pin-set eviction.
+    pub cost_aware_eviction: bool,
+    /// **Tier 3 — per-layer pre-gate predictor.** When `true`, the
+    /// engine trains an online conditional map from one layer's routed
+    /// expert set to the *next* layer's experts and uses it to drive
+    /// high-precision next-layer prefetch on the real-transformer /
+    /// trace-replay path. `false` (the default) leaves the existing
+    /// speculator/Markov look-ahead untouched.
+    pub pregate_enabled: bool,
+    /// **Tier 1 — route-profile collection.** When `true`, the engine
+    /// always bumps per-expert `route_observations` (even when neither
+    /// frequency pinning nor online static residency would otherwise
+    /// need them) so a run can emit a popularity profile via
+    /// `--profile-out`. `false` (the default) keeps the per-token bump
+    /// free when no consumer needs the counts.
+    pub collect_route_profile: bool,
 }
 
 /// Default semaphore ceiling for `Engine::spawn_prefetch`. Matches a
@@ -925,6 +971,12 @@ impl Default for EngineOptions {
             use_qmm_for_q4: true,
             max_concurrent_prefetches: DEFAULT_MAX_CONCURRENT_PREFETCHES,
             max_fetch_yields: DEFAULT_MAX_FETCH_YIELDS,
+            prefetch_governor: false,
+            prefetch_precision_floor: 0.05,
+            prefetch_contention_weight: 1.0,
+            cost_aware_eviction: false,
+            pregate_enabled: false,
+            collect_route_profile: false,
         }
     }
 }
@@ -1002,6 +1054,14 @@ pub(crate) struct EngineCore {
     /// `BackendBox::Cpu` automatically if no GPU is available, so this
     /// field is always installed (see gist Phase 3, CHANGE 3).
     pub(super) backend: Arc<crate::backend::BackendBox>,
+    /// **Tier 4 — adaptive prefetch admission controller.** Always
+    /// present; constructed in the transparent pass-through state unless
+    /// [`EngineOptions::prefetch_governor`] is set, in which case it
+    /// gates every `spawn_prefetch` admission on measured prefetch
+    /// precision and foreground-read contention. Lock-free, so the
+    /// per-prefetch `admit` check and the per-hit precision feedback add
+    /// only a handful of relaxed atomic ops to the hot path.
+    pub(super) governor: Arc<crate::prefetch_governor::PrefetchGovernor>,
 }
 
 /// Predictive-routing state: aliasing & frequency-based pinning,
@@ -1063,6 +1123,11 @@ pub(crate) struct EngineSpeculation {
     /// `fetch_add` in steady state, so concurrent `moe_step` calls
     /// from batched requests no longer serialize on one writer lock.
     pub(super) route_observations: DashMap<u32, AtomicU64>,
+    /// Engine-owned monotonic token counter for route-observation bumps.
+    /// Online static-residency warmup gates on this instead of the
+    /// caller-supplied `token_idx`, which can be per-stream or reused on
+    /// `moe_step`.
+    pub(super) route_observation_tokens: AtomicU64,
     /// Two-deep Markov history (`last` + `last_last`) behind a single
     /// mutex — see [`MarkovRing`] for why the entries share one lock.
     pub(super) markov_ring: parking_lot::Mutex<MarkovRing>,
@@ -1077,6 +1142,9 @@ pub(crate) struct EngineSpeculation {
     /// reconciliation. Diff'd against the current hot set so we only
     /// `pin`/`unpin` ids that actually changed status.
     pub(super) locality_pinned: parking_lot::Mutex<HashSet<u32>>,
+    /// Expert ids pinned by static residency. Locality reconciliation must
+    /// not unpin these ids when they leave the sliding-window hot set.
+    pub(super) static_pinned: parking_lot::Mutex<HashSet<u32>>,
     /// Heat threshold for [`Self::locality`]. Mirrors
     /// [`LocalityMonitor::DEFAULT_THRESHOLD_PCT`] when not overridden.
     pub(super) locality_threshold_pct: f32,
@@ -1133,6 +1201,19 @@ pub(crate) struct EngineSpeculation {
     /// lifetime; dropping it stops the worker. `None` when the
     /// affinity arm is disabled.
     pub(super) affinity_decay: Option<DecayWorkerHandle>,
+    /// Tier 1 — **static residency** controller. When present, the
+    /// engine pins the hottest `fraction` of experts permanently in the
+    /// RAM cache (from an offline profile at startup, or an online hot
+    /// set derived from [`Self::route_observations`] after a warmup
+    /// window) so a skewed routing distribution can exceed the bare
+    /// cache-capacity hit-rate ceiling. `None` disables the feature.
+    pub(super) static_residency: Option<crate::residency::StaticResidencyState>,
+    /// Tier 3 — **per-layer pre-gate** predictor. When present, every
+    /// `moe_step` records the layer-to-layer routing transition and
+    /// prefetches the predicted next-layer experts (a high-precision
+    /// signal conditioned on the previous layer's actual routing).
+    /// `None` disables the feature.
+    pub(super) pregate: Option<Arc<crate::pregate::PerLayerPreGate>>,
 }
 
 /// Observability: latency histograms, cumulative timing atomics,
@@ -1238,6 +1319,17 @@ impl EngineCore {
                 .max_concurrent_prefetches
                 .min(pool_headroom.saturating_sub(1))
         };
+        let governor = Arc::new(crate::prefetch_governor::PrefetchGovernor::new(
+            options.prefetch_governor,
+            crate::prefetch_governor::GovernorConfig {
+                precision_floor: options.prefetch_precision_floor,
+                contention_weight: options.prefetch_contention_weight,
+                ..crate::prefetch_governor::GovernorConfig::default()
+            },
+        ));
+        // Tier 4: flip the RAM cache into cost-aware (lowest-heat)
+        // eviction when requested. Off by default ⇒ pure LRU.
+        cache.set_cost_aware(options.cost_aware_eviction);
         Self {
             cache,
             pool,
@@ -1256,6 +1348,7 @@ impl EngineCore {
             backend: Arc::new(crate::backend::BackendBox::Cpu(
                 crate::backend::CandleBackend::new(),
             )),
+            governor,
         }
     }
 }
@@ -1266,9 +1359,11 @@ impl EngineSpeculation {
             alias_map: None,
             alias_redirects: AtomicU64::new(0),
             route_observations: DashMap::new(),
+            route_observation_tokens: AtomicU64::new(0),
             markov_ring: parking_lot::Mutex::new(MarkovRing::default()),
             locality: None,
             locality_pinned: parking_lot::Mutex::new(HashSet::new()),
+            static_pinned: parking_lot::Mutex::new(HashSet::new()),
             locality_threshold_pct: LocalityMonitor::DEFAULT_THRESHOLD_PCT,
             locality_hits: AtomicU64::new(0),
             locality_misses: AtomicU64::new(0),
@@ -1282,6 +1377,8 @@ impl EngineSpeculation {
             affinity: None,
             affinity_neighbors_k: 0,
             affinity_decay: None,
+            static_residency: None,
+            pregate: None,
         }
     }
 }
@@ -1763,6 +1860,129 @@ impl Engine {
         self
     }
 
+    /// Tier 1 — install the **static residency** controller. `fraction`
+    /// is the share of the global expert namespace to pin permanently
+    /// (`<= 0.0` disables the feature and leaves the engine unchanged).
+    /// When `profile` is `Some`, its hot set is pinned at the first
+    /// token with no warmup; when `None`, the engine derives the hot set
+    /// online from [`Self::route_observations`] after `warmup_tokens`
+    /// tokens. The pin budget is sized against the router's expert
+    /// namespace so it is a true fraction of *all* experts.
+    pub fn with_static_residency(
+        mut self,
+        fraction: f64,
+        warmup_tokens: u64,
+        profile: Option<crate::residency::ResidencyProfile>,
+    ) -> Self {
+        if fraction <= 0.0 {
+            return self;
+        }
+        let namespace = self.core.router.num_experts() as usize;
+        self.speculation.static_residency = Some(crate::residency::StaticResidencyState::new(
+            fraction.min(1.0),
+            warmup_tokens,
+            namespace,
+            profile,
+        ));
+        self
+    }
+
+    /// Tier 3 — install the **per-layer pre-gate** predictor. Once set,
+    /// every `moe_step` records the layer-to-layer routing transition
+    /// and prefetches the predicted next-layer experts. `top_n` bounds
+    /// how many next-layer experts are prefetched per step.
+    pub fn with_pregate(mut self, pregate: Arc<crate::pregate::PerLayerPreGate>) -> Self {
+        self.speculation.pregate = Some(pregate);
+        self
+    }
+
+    /// Whether the static-residency controller still needs
+    /// `route_observations` populated this token — true only while an
+    /// *online* (profile-less) controller is configured and has not yet
+    /// pinned its hot set. Keeps the per-token observation bump free
+    /// when the feature is off or already applied.
+    fn static_residency_needs_counts(&self) -> bool {
+        self.speculation
+            .static_residency
+            .as_ref()
+            .map(|sr| sr.is_online() && !sr.applied.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    /// Build a [`ResidencyProfile`] snapshot from the live
+    /// `route_observations` counters. Cheap relaxed reads — the counts
+    /// are advisory, so a torn-but-consistent snapshot is acceptable.
+    fn snapshot_route_profile(&self) -> crate::residency::ResidencyProfile {
+        let mut counts = HashMap::new();
+        for entry in self.speculation.route_observations.iter() {
+            counts.insert(*entry.key(), entry.value().load(Ordering::Relaxed));
+        }
+        crate::residency::ResidencyProfile::from_counts(counts)
+    }
+
+    /// Dump the engine's live route-observation profile to `path` as
+    /// JSON (`{ "<id>": <count> }`). Used by the `--profile-out` flag so
+    /// a run can emit its own hot-set profile for a later
+    /// `--static-residency-profile` warm start.
+    pub fn dump_route_profile(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.snapshot_route_profile().dump_json(path)
+    }
+
+    /// Apply the static-residency hot set exactly once, when ready. For
+    /// a profile-seeded controller this fires on the first token; for an
+    /// online controller it waits until the engine has bumped route
+    /// observations for `warmup_tokens` tokens, then derives the hot set
+    /// from the accumulated route observations.
+    /// The pin is latched behind a compare-and-swap so concurrent
+    /// per-token calls apply it a single time.
+    fn maybe_apply_static_residency(&self) {
+        let Some(sr) = self.speculation.static_residency.as_ref() else {
+            return;
+        };
+        if sr.applied.load(Ordering::Acquire) {
+            return;
+        }
+        let hot = if let Some(profile) = sr.profile.as_ref() {
+            profile.hot_set(sr.fraction, sr.namespace)
+        } else {
+            if self
+                .speculation
+                .route_observation_tokens
+                .load(Ordering::Acquire)
+                < sr.warmup_tokens
+            {
+                return;
+            }
+            self.snapshot_route_profile()
+                .hot_set(sr.fraction, sr.namespace)
+        };
+        if hot.is_empty() {
+            return;
+        }
+        // Latch: exactly one caller transitions false -> true and pins.
+        if sr
+            .applied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        for id in &hot {
+            self.core.cache.pin(*id);
+        }
+        {
+            let mut static_pinned = self.speculation.static_pinned.lock();
+            static_pinned.extend(hot.iter().copied());
+        }
+        info!(
+            pinned = hot.len(),
+            fraction = sr.fraction,
+            source = if sr.profile.is_some() { "profile" } else { "online" },
+            warmup_tokens = sr.warmup_tokens,
+            "static residency: pinned hot expert set"
+        );
+    }
+
     /// Wire a Prometheus metrics sink. The engine will mirror its
     /// telemetry counters (locality / speculator hits & misses, SSD
     /// stall) into the metrics registry alongside its own atomics.
@@ -1784,6 +2004,14 @@ impl Engine {
             }
         }
         id
+    }
+
+    #[inline]
+    fn credit_prefetch_use(&self, resident: &Arc<ExpertResident>, new_hits: u64) {
+        if new_hits == 1 && resident.is_shadow_backed() {
+            self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
+            self.core.governor.record_used();
+        }
     }
 
     /// Total number of distinct experts the engine's router can
@@ -1809,6 +2037,10 @@ impl Engine {
         token_idx: u64,
     ) -> Result<CycleStats, ExpertReadError> {
         let cycle_start = Instant::now();
+        // Tier 4: fold the previous token's prefetch precision window
+        // into the governor's EWMA before this token issues any new
+        // speculative reads. No-op when the governor is disabled.
+        self.core.governor.refresh();
         // Compute the residual-stream hidden state up front. The
         // production `Router::Linear` path needs it to compute the
         // gate's softmax logits; the legacy `Router::Markov` path
@@ -1835,9 +2067,18 @@ impl Engine {
 
         // Frequency-based pinning: bump observation counts and ask the
         // cache to pin any id that crossed the threshold this token.
-        if self.core.options.pin_after_observations > 0 {
+        // Also bump (without pinning) when an online static-residency
+        // controller still needs route counts to derive its hot set, or
+        // when the run is collecting a popularity profile for export.
+        if self.core.options.pin_after_observations > 0
+            || self.core.options.collect_route_profile
+            || self.static_residency_needs_counts()
+        {
             self.bump_route_observations(&target);
         }
+        // Tier 1: pin the static-residency hot set once it is ready
+        // (immediately for a profile seed, post-warmup for online).
+        self.maybe_apply_static_residency();
 
         // 1) Make sure every required expert is resident.
         //
@@ -1882,6 +2123,13 @@ impl Engine {
                 // promotion only on the threshold crossing, and only if
                 // the expert is not already resident in the GPU cache.
                 let new_hits = r.record_hit();
+                // Tier 4 precision feedback: the first hit on a
+                // shadow-backed resident means a speculative prefetch
+                // paid off (it was consumed before eviction). Credit the
+                // governor so its precision EWMA tracks reality, and bump
+                // the (previously dead) `prefetch_used` counter so the
+                // run summary can report end-to-end prefetch precision.
+                self.credit_prefetch_use(&r, new_hits);
                 if let (Some(gpu), Some(tx)) = (
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
@@ -1985,6 +2233,8 @@ impl Engine {
             // fetch task (a bug, not an I/O failure), preserving the
             // pre-concurrency panic-propagation semantics for that case.
             let r = h.await.expect("expert fetch task panicked")?;
+            let new_hits = r.record_hit();
+            self.credit_prefetch_use(&r, new_hits);
             // We still account the per-call `stats.bytes_read` here
             // for the synthetic-benchmark accumulator (it tracks
             // logical bytes consumed, not bytes actually pulled
@@ -2435,7 +2685,13 @@ impl Engine {
             }
         }
         let mut buf = self.core.pool.acquire().await;
-        match self.core.storage.read_expert(id, &mut buf).await {
+        // Tier 4: mark this as a foreground (token-blocking) read for the
+        // duration of the device I/O so the governor throttles
+        // speculation that would otherwise queue ahead of it. No-op when
+        // the governor is disabled.
+        let _fg = self.core.governor.foreground_guard();
+        let read_result = self.core.storage.read_expert(id, &mut buf).await;
+        match read_result {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.metrics.io_hist.lock().record(io_us.max(1));
@@ -2490,6 +2746,21 @@ impl Engine {
         // fine: the post-spawn `contains` re-check and the singleflight
         // entry below stay authoritative.
         if self.core.cache.contains(id) || self.core.in_flight.contains_key(&id) {
+            return;
+        }
+        // **Tier 4 admission gate.** Before spending a semaphore permit
+        // (or any device bandwidth), ask the adaptive governor whether
+        // this speculative read is worth issuing *right now*, given its
+        // predicted score `p`, the recently-measured prefetch precision,
+        // and how many foreground (token-blocking) misses are currently
+        // competing for the SSD. A disabled governor always admits, so
+        // the legacy unbounded behaviour is preserved bit-for-bit.
+        if !self.core.governor.admit(p) {
+            self.metrics
+                .counters
+                .prefetch_dropped_governor
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(expert = id, score = p, "governor throttled speculative prefetch");
             return;
         }
         // Speculative prefetches are *bounded*: each spawn must hold
@@ -2611,6 +2882,12 @@ impl Engine {
             match me.core.storage.read_expert(id, &mut buf).await {
                 Ok(_) => {
                     me.metrics.counters.prefetch_completed.fetch_add(1, Ordering::Relaxed);
+                    // Tier 4: a speculative read landed in the cache. This
+                    // is the precision *denominator*; the matching
+                    // numerator (`record_used`) fires if/when a hit later
+                    // consumes this shadow-backed resident. No-op when the
+                    // governor is disabled.
+                    me.core.governor.record_completed();
                     me.metrics.counters
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
@@ -2800,6 +3077,9 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
     /// previous value makes the threshold crossing exact: precisely
     /// one caller observes `prev + 1 == threshold` and issues the pin.
     fn bump_route_observations(&self, target: &[u32]) {
+        self.speculation
+            .route_observation_tokens
+            .fetch_add(1, Ordering::Release);
         let threshold = self.core.options.pin_after_observations;
         for &id in target {
             let prev = if let Some(counter) = self.speculation.route_observations.get(&id) {
@@ -2889,7 +3169,10 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         }
         for &id in prev.iter() {
             if !new_hot.contains(&id) {
-                self.core.cache.unpin(id);
+                let is_static_pinned = self.speculation.static_pinned.lock().contains(&id);
+                if !is_static_pinned {
+                    self.core.cache.unpin(id);
+                }
             }
         }
         let len = new_hot.len();
@@ -3073,6 +3356,24 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                     self.spawn_prefetch(canon, prob);
                 }
             }
+        }
+    }
+
+    /// Tier 3 — drive the per-layer pre-gate. Records this layer's
+    /// routing transition into the conditional map and prefetches the
+    /// experts it predicts for the *next* layer. A disabled pre-gate
+    /// (`None`) makes this a no-op, preserving legacy behaviour.
+    fn pregate_prefetch(self: &Arc<Self>, layer: u32, target: &[u32]) {
+        let Some(pregate) = self.speculation.pregate.as_ref() else {
+            return;
+        };
+        let predicted = pregate.observe_and_predict(layer, target);
+        for id in predicted {
+            // Resolve aliases defensively (idempotent) so deduplicated
+            // experts share the canonical resident copy, then issue the
+            // speculative read with the pre-gate's high confidence tag.
+            let id = self.resolve_alias(id);
+            self.spawn_prefetch(id, crate::pregate::PREGATE_PREFETCH_PROB);
         }
     }
 
@@ -3322,6 +3623,10 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         experts: &[u32],
     ) -> Vec<HiddenState> {
         let cycle_start = Instant::now();
+        // Tier 4: fold the previous step's prefetch precision window into
+        // the governor's EWMA before issuing this step's speculation.
+        // No-op when the governor is disabled.
+        self.core.governor.refresh();
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids (mirrors `generate`).
         let target: Vec<u32> = experts.iter().map(|&id| self.resolve_alias(id)).collect();
@@ -3352,10 +3657,17 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // online against the gate's actual top-K decision.
         let m_speculator = self.speculator_predict_and_train(x, &target, Some(layer));
 
-        // Frequency-based pinning: same logic as `generate`.
-        if self.core.options.pin_after_observations > 0 {
+        // Frequency-based pinning: same logic as `generate`. Also bump
+        // (without pinning) for an online static-residency controller or
+        // when collecting a popularity profile for export.
+        if self.core.options.pin_after_observations > 0
+            || self.core.options.collect_route_profile
+            || self.static_residency_needs_counts()
+        {
             self.bump_route_observations(&target);
         }
+        // Tier 1: pin the static-residency hot set once it is ready.
+        self.maybe_apply_static_residency();
 
         // **Speculative I/O union-fetch (S ∪ L ∪ M), issued
         // concurrently with the target-miss fetches.** Fire the
@@ -3408,6 +3720,13 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // and the next layer finds them already resident.
         self.speculate_layer_ahead(x, layer);
 
+        // **Tier 3 pre-gate look-ahead.** Record this layer's routing
+        // transition and prefetch the predicted next-layer experts — a
+        // high-precision signal conditioned on the previous layer's
+        // *actual* routing, complementing the hidden-state speculation
+        // above. No-op when the pre-gate is disabled.
+        self.pregate_prefetch(layer, &target);
+
         // Concurrent miss fetches; hits resolved inline.
         let io_wait_start = Instant::now();
         let mut residents: Vec<Option<Arc<ExpertResident>>> = vec![None; target.len()];
@@ -3433,6 +3752,10 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             if let Some(r) = self.core.cache.get(id) {
                 self.metrics.counters.hits.fetch_add(1, Ordering::Relaxed);
                 let new_hits = r.record_hit();
+                // Tier 4 precision feedback (mirrors `generate`): a
+                // first hit on a shadow-backed resident is a prefetch
+                // that paid off. No-op when the governor is disabled.
+                self.credit_prefetch_use(&r, new_hits);
                 if let (Some(gpu), Some(tx)) = (
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
@@ -3498,6 +3821,8 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             // re-raise so the supervising scheduler can restart us.
             match h.await.expect("expert fetch task panicked") {
                 Ok(r) => {
+                    let new_hits = r.record_hit();
+                    self.credit_prefetch_use(&r, new_hits);
                     // `bytes_read` is already bumped inside
                     // `fetch_once` on the actual leader path, so we
                     // don't double-count here. Followers that
@@ -3879,6 +4204,35 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 .as_ref()
                 .map(|g| g.lru_len())
                 .unwrap_or(0),
+            prefetch_used: self.metrics.counters.prefetch_used.load(Ordering::Relaxed),
+            prefetch_dropped_governor: self
+                .metrics
+                .counters
+                .prefetch_dropped_governor
+                .load(Ordering::Relaxed),
+            governor_enabled: self.core.governor.is_enabled(),
+            governor_precision: self.core.governor.precision(),
+            governor_admitted: self.core.governor.decisions().0,
+            governor_throttled: self.core.governor.decisions().1,
+            pregate_enabled: self.speculation.pregate.is_some(),
+            pregate_accuracy: self
+                .speculation
+                .pregate
+                .as_ref()
+                .map(|pg| pg.accuracy())
+                .unwrap_or(0.0),
+            pregate_hits: self
+                .speculation
+                .pregate
+                .as_ref()
+                .map(|pg| pg.stats().0)
+                .unwrap_or(0),
+            pregate_misses: self
+                .speculation
+                .pregate
+                .as_ref()
+                .map(|pg| pg.stats().1)
+                .unwrap_or(0),
         }
     }
 
@@ -3956,6 +4310,37 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 if r.speculator_enabled { "on" } else { "off" },
                 r.predictive.speculator_accuracy * 100.0,
                 r.predictive.ssd_stall_us as f64 / 1000.0,
+            );
+        }
+        // Tier 4 governor line — only emitted when the adaptive
+        // prefetch governor is enabled, so the legacy summary shape is
+        // untouched for existing runs/tests.
+        if r.governor_enabled {
+            let precision_pct = r.governor_precision * 100.0;
+            let admit_total = r.governor_admitted + r.governor_throttled;
+            let admit_rate = if admit_total == 0 {
+                0.0
+            } else {
+                r.governor_admitted as f64 / admit_total as f64 * 100.0
+            };
+            info!(
+                "governor:      on  precision={:.2}%  prefetch_used={}/{}  admitted={} throttled={} ({:.1}% admit)",
+                precision_pct,
+                r.prefetch_used,
+                r.prefetch_completed,
+                r.governor_admitted,
+                r.governor_throttled,
+                admit_rate,
+            );
+        }
+        // Tier 3 pre-gate line — only when the per-layer pre-gate is
+        // enabled, keeping the legacy summary shape otherwise.
+        if r.pregate_enabled {
+            info!(
+                "pregate:       on  accuracy={:.2}%  predictions={}/{} (hit/total)",
+                r.pregate_accuracy * 100.0,
+                r.pregate_hits,
+                r.pregate_hits + r.pregate_misses,
             );
         }
         info!("=======================================================");
@@ -4072,6 +4457,36 @@ pub struct EngineReport {
     pub gpu_anchor_count: usize,
     /// Number of experts in the VRAM LRU (cold-edge) region.
     pub gpu_lru_count: usize,
+    /// **Tier 4.** Speculative prefetches that landed in cache and were
+    /// then consumed by a hit before eviction (precision numerator).
+    /// Previously always `0` (the counter was dead); now wired on both
+    /// the `generate` and `moe_step` hit paths.
+    pub prefetch_used: u64,
+    /// **Tier 4.** Speculative prefetches the adaptive governor declined
+    /// to admit. `0` when the governor is disabled (the default).
+    pub prefetch_dropped_governor: u64,
+    /// **Tier 4.** Whether the adaptive prefetch governor is enabled.
+    pub governor_enabled: bool,
+    /// **Tier 4.** Current governor precision EWMA (consumed / completed),
+    /// in `[0, 1]`. Meaningless when `governor_enabled` is `false`.
+    pub governor_precision: f64,
+    /// **Tier 4.** Cumulative speculative prefetches the governor
+    /// admitted.
+    pub governor_admitted: u64,
+    /// **Tier 4.** Cumulative speculative prefetches the governor
+    /// throttled (declined).
+    pub governor_throttled: u64,
+    /// **Tier 3.** Whether the per-layer pre-gate predictor is enabled.
+    pub pregate_enabled: bool,
+    /// **Tier 3.** Fraction of scored pre-gate predictions that
+    /// intersected the actually-routed next-layer set, in `[0, 1]`.
+    /// `0.0` when the pre-gate is disabled or nothing was scored yet.
+    pub pregate_accuracy: f64,
+    /// **Tier 3.** Pre-gate predictions that intersected the actual
+    /// next-layer routed set.
+    pub pregate_hits: u64,
+    /// **Tier 3.** Pre-gate predictions that missed.
+    pub pregate_misses: u64,
 }
 
 #[cfg(test)]
@@ -4899,6 +5314,223 @@ mod tests {
         assert_eq!(affinity.affinity(1, 0, 1), 3, "co-fired three times");
         // No leakage into layer 0's matrix.
         assert!(affinity.neighbors(0, 0, 2).is_empty(), "layer 0 must be untouched");
+    }
+
+    /// **Tier 1 — online static residency.** With no seed profile the
+    /// engine must derive its hot set from the live route observations
+    /// after the warmup window and pin exactly `ceil(fraction × N)`
+    /// experts — the most-frequently routed ones — exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_residency_online_pins_hottest_after_warmup() {
+        let dir = TempDir::new("static-residency-online");
+        let total_experts: u32 = 8;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed: u64 = 0x5EED_1234_u64;
+
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, total_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .expect("storage init"),
+        );
+        storage.warmup_fds(0..total_experts).expect("pre-open fds");
+
+        let pool = BufferPool::new(total_experts as usize + 2, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(total_experts as usize));
+        let router = Router::Markov(Arc::new(TopKRouter::new(total_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(total_experts, 2, 0.05, seed));
+
+        // fraction 0.25 of 8 experts ⇒ pin the 2 hottest. Warm up 4 tokens.
+        let engine = Arc::new(
+            Engine::new(
+                cache.clone(),
+                pool,
+                storage,
+                router,
+                predictor,
+                ModelShape { d_model, d_ff, hidden_seed: seed },
+            )
+            .with_static_residency(0.25, /*warmup_tokens=*/ 4, /*profile=*/ None),
+        );
+
+        let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
+        // Skewed stream: experts {2,5} fire every token; a rotating cold
+        // expert fires once each so {2,5} are unambiguously hottest.
+        // Reuse token_idx=0 on every call to prove online warmup is driven
+        // by the engine-owned observation counter, not the caller seed.
+        for t in 0..3u64 {
+            let cold = 6 + (t % 2) as u32; // 6 or 7, never as hot as {2,5}
+            let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[2, 5, cold]).await;
+        }
+        assert_eq!(cache.pinned_count(), 0, "warmup should not fire before 4 bumps");
+        for t in 3..8u64 {
+            let cold = 6 + (t % 2) as u32;
+            let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[2, 5, cold]).await;
+        }
+
+        // After warmup the hot set must be pinned exactly once.
+        assert_eq!(cache.pinned_count(), 2, "ceil(0.25*8)=2 experts pinned");
+        assert_eq!(cache.pinned_ids(), vec![2, 5], "the two hottest experts");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_residency_pin_survives_locality_unpin() {
+        let dir = TempDir::new("static-locality-pin");
+        let total_experts: u32 = 4;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed: u64 = 0x51A7_1C_u64;
+        let engine = build_engine(
+            &dir.path,
+            total_experts,
+            d_model,
+            d_ff,
+            /*cache_slots=*/ 4,
+            /*top_k=*/ 1,
+            /*predict_fanout=*/ 1,
+            seed,
+        );
+        let profile = crate::residency::ResidencyProfile::from_counts(HashMap::from([
+            (0, 10),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+        ]));
+        let engine = {
+            let cache = engine.core.cache.clone();
+            let pool = engine.core.pool.clone();
+            let storage = engine.core.storage.clone();
+            let router = engine.core.router.clone();
+            let predictor = engine.core.predictor.clone();
+            let shape = engine.core.shape;
+            let monitor = Arc::new(LocalityMonitor::new(total_experts, /*window=*/ 2));
+            Arc::new(
+                Engine::new(cache, pool, storage, router, predictor, shape)
+                    .with_static_residency(0.25, /*warmup_tokens=*/ 100, Some(profile))
+                    .with_locality_monitor(monitor, 0.5),
+            )
+        };
+
+        engine.maybe_apply_static_residency();
+        assert!(
+            engine.core.cache.pinned_ids().contains(&0),
+            "static residency pins expert 0"
+        );
+
+        engine.locality_observe_and_reconcile(&[0]);
+        assert!(
+            engine.core.cache.pinned_ids().contains(&0),
+            "locality also sees expert 0 hot"
+        );
+        engine.locality_observe_and_reconcile(&[1]);
+        engine.locality_observe_and_reconcile(&[1]);
+
+        assert!(
+            engine.core.cache.pinned_ids().contains(&0),
+            "locality must not unpin an expert pinned by static residency"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credit_prefetch_use_counts_shadow_resident_once() {
+        let dir = TempDir::new("prefetch-use-credit");
+        let engine = build_engine(
+            &dir.path,
+            /*num_experts=*/ 2,
+            /*d_model=*/ 16,
+            /*d_ff=*/ 32,
+            /*cache_slots=*/ 2,
+            /*top_k=*/ 1,
+            /*predict_fanout=*/ 1,
+            0xC0FF_EE_u64,
+        );
+        let shadow_pool = BufferPool::new_with_shadow(1, 1, 4096, 4096);
+        let buf = shadow_pool.try_acquire_shadow().expect("shadow buffer");
+        let resident = Arc::new(ExpertResident::new(0, buf));
+        assert!(resident.is_shadow_backed());
+
+        let first = resident.record_hit();
+        engine.credit_prefetch_use(&resident, first);
+        let second = resident.record_hit();
+        engine.credit_prefetch_use(&resident, second);
+
+        assert_eq!(
+            engine.metrics.counters.prefetch_used.load(Ordering::Relaxed),
+            1,
+            "only the first consumption of a shadow-backed resident is credited"
+        );
+    }
+
+    /// **Tier 1 — profile-seeded static residency.** With an offline
+    /// popularity profile the hot set is pinned at the first token with
+    /// no warmup, independent of the live routing stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_residency_profile_pins_immediately() {
+        let dir = TempDir::new("static-residency-profile");
+        let total_experts: u32 = 8;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed: u64 = 0x5EED_ABCD_u64;
+
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(&dir.path, total_experts, expert_size, d_model, d_ff)
+            .expect("generate synthetic experts");
+
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .expect("storage init"),
+        );
+        storage.warmup_fds(0..total_experts).expect("pre-open fds");
+
+        let pool = BufferPool::new(total_experts as usize + 2, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::single_layer(total_experts as usize));
+        let router = Router::Markov(Arc::new(TopKRouter::new(total_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(total_experts, 2, 0.05, seed));
+
+        // Profile makes experts 0 and 3 hottest regardless of the stream.
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(0u32, 1000u64);
+        counts.insert(3u32, 900u64);
+        counts.insert(1u32, 5u64);
+        let profile = crate::residency::ResidencyProfile::from_counts(counts);
+
+        let engine = Arc::new(
+            Engine::new(
+                cache.clone(),
+                pool,
+                storage,
+                router,
+                predictor,
+                ModelShape { d_model, d_ff, hidden_seed: seed },
+            )
+            .with_static_residency(0.25, /*warmup_tokens=*/ 100, Some(profile)),
+        );
+
+        let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
+        // A single token suffices — the seed profile ignores warmup.
+        let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[5, 6]).await;
+
+        assert_eq!(cache.pinned_count(), 2, "ceil(0.25*8)=2 experts pinned");
+        assert_eq!(cache.pinned_ids(), vec![0, 3], "profile's two hottest experts");
     }
 
     /// **Layer-scoped speculator accuracy.** On the `moe_step` path the

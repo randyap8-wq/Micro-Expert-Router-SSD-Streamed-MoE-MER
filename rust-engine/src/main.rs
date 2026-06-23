@@ -43,7 +43,11 @@ mod mla;
 mod model;
 mod multi_layer_cache;
 mod numa;
+mod packed_storage;
 mod parallel;
+mod prefetch_governor;
+mod pregate;
+mod residency;
 mod router;
 mod rpc;
 mod sampling;
@@ -52,6 +56,7 @@ mod session;
 mod tensor_header;
 mod tokenizer;
 mod transformer;
+mod workload;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -121,6 +126,51 @@ enum Cmd {
         /// byte width of every weight in the generated files.
         #[arg(long, default_value = "f32")]
         dtype: String,
+    },
+
+    /// **Tier 2.** Repack a directory of `expert_<id>.bin` files into a
+    /// single packed blob + JSON manifest for the packed storage layout.
+    /// Experts are written back-to-back (one block-aligned `expert_size`
+    /// slot each) in an order chosen by `--profile` / `--order` so the
+    /// engine can coalesce co-fetched experts into single `preadv`s.
+    Repack {
+        /// Source directory containing `expert_<id>.bin` (or
+        /// `expert_<layer>_<local>.bin` with `--num-experts-per-layer`).
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        /// Output blob path (all expert payloads concatenated).
+        #[arg(long)]
+        out_blob: PathBuf,
+        /// Output manifest path. Defaults to `<out_blob>.manifest.json`.
+        #[arg(long)]
+        out_manifest: Option<PathBuf>,
+        /// Number of experts to pack (ids `0..num_experts`, unless
+        /// `--order` restricts the set).
+        #[arg(long, default_value_t = 64)]
+        num_experts: u32,
+        /// Bytes per expert. Must equal the source files' `expert_size`.
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        expert_size: usize,
+        /// Block alignment (must match `gen-data` / the source files).
+        #[arg(long, default_value_t = 4096)]
+        block_align: usize,
+        /// Disable `O_DIRECT` when reading the source files (needed on
+        /// tmpfs / macOS / CI).
+        #[arg(long)]
+        no_direct: bool,
+        /// Experts per layer for layer-qualified source naming.
+        #[arg(long)]
+        num_experts_per_layer: Option<u32>,
+        /// Order experts hottest-first using a routing-frequency profile
+        /// JSON (as produced by `run --profile-out`). Unobserved experts
+        /// are appended in numeric order. Ignored if `--order` is set.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// Explicit physical layout: a file listing expert ids (one per
+        /// line, or a JSON array). Overrides `--profile`. Only the listed
+        /// experts are packed.
+        #[arg(long)]
+        order: Option<PathBuf>,
     },
 
     /// Run the token-generation simulation against the on-disk experts.
@@ -349,6 +399,76 @@ enum Cmd {
         /// cumulative observations (with `--affinity`).
         #[arg(long, default_value_t = 10_000)]
         affinity_decay_epoch: u64,
+        /// **Tier 4 — adaptive prefetch governor.** Throttle speculative
+        /// prefetches by measured precision (consumed / completed) and
+        /// foreground-read contention, so low-value speculation can't
+        /// inflate the latency of the foreground misses that actually
+        /// block token generation. Off by default (legacy unbounded
+        /// admission). This is the highest-leverage knob on a
+        /// bandwidth-bound SSD.
+        #[arg(long)]
+        prefetch_governor: bool,
+        /// Precision floor / optimistic EWMA seed for the governor, in
+        /// `[0, 1]` (with `--prefetch-governor`).
+        #[arg(long, default_value_t = 0.05)]
+        prefetch_precision_floor: f64,
+        /// Per-outstanding-foreground-read multiplier on the governor's
+        /// admission threshold (with `--prefetch-governor`). Higher ⇒
+        /// speculation backs off harder while real misses are in flight.
+        #[arg(long, default_value_t = 1.0)]
+        prefetch_contention_weight: f64,
+        /// **Tier 4 — cost-aware eviction.** Evict the coldest resident
+        /// by decaying heat score instead of strict LRU, so a hot expert
+        /// that briefly fell to the LRU tail isn't dumped ahead of a
+        /// one-shot cold expert. Off by default (pure LRU).
+        #[arg(long)]
+        cost_aware_eviction: bool,
+        /// **Tier 3 — per-layer pre-gate predictor.** Train an online
+        /// layer-L→L+1 conditional map and drive high-precision
+        /// next-layer prefetch from it. Off by default.
+        #[arg(long)]
+        pregate: bool,
+        /// **Tier 1 — static residency.** Fraction of the global expert
+        /// namespace to pin permanently in RAM (the hottest experts), in
+        /// `(0, 1]`. `0.0` (default) disables it. Lifts the hit-rate
+        /// ceiling above the bare cache fraction on a *skewed* workload.
+        #[arg(long, default_value_t = 0.0)]
+        static_residency_fraction: f64,
+        /// Tokens to observe before deriving the online static-residency
+        /// hot set (ignored when `--static-residency-profile` is given).
+        #[arg(long, default_value_t = 0)]
+        static_residency_warmup_tokens: u64,
+        /// Path to an offline expert-popularity profile JSON
+        /// (`{ "<id>": <count> }`) to seed static residency at startup.
+        /// When omitted, the hot set is derived online.
+        #[arg(long)]
+        static_residency_profile: Option<String>,
+        /// Write the run's accumulated route-observation profile to this
+        /// JSON path at shutdown (consumable by
+        /// `--static-residency-profile` on a later run).
+        #[arg(long)]
+        profile_out: Option<String>,
+        /// **Benchmark workload.** `synthetic` (default) keeps the legacy
+        /// uniform-i.i.d. stream (the engine/gate routes its own hidden
+        /// state); `skewed` drives `moe_step` from a Zipf-popular,
+        /// Markov-correlated expert generator (so static residency and
+        /// the predictors are exercisable); `replay` replays a recorded
+        /// JSONL routing trace via `--replay-trace`.
+        #[arg(long, default_value = "synthetic")]
+        workload: String,
+        /// Zipf exponent for `--workload skewed` (larger ⇒ more skew;
+        /// `1.0` ≈ classic Zipf, `0.0` ≈ uniform).
+        #[arg(long, default_value_t = 1.1)]
+        zipf_s: f64,
+        /// Markov stay-probability for `--workload skewed`, in `[0, 1]`:
+        /// the chance a token reuses the previous token's expert set
+        /// (temporal correlation the predictors can exploit).
+        #[arg(long, default_value_t = 0.0)]
+        workload_correlation: f64,
+        /// JSONL routing trace to replay with `--workload replay` (the
+        /// `--trace-out` format).
+        #[arg(long)]
+        replay_trace: Option<String>,
         /// Number of transformer layers, used to size the affinity
         /// matrix. `1` (default) is the single-namespace synthetic
         /// benchmark.
@@ -362,6 +482,16 @@ enum Cmd {
         /// flat single-namespace benchmark (no layer-ahead).
         #[arg(long)]
         num_experts_per_layer: Option<u32>,
+        /// **Tier 2 — packed storage.** Read every expert from this single
+        /// packed blob (produced by the `repack` subcommand) instead of
+        /// one file per expert. Requires `--packed-manifest`. Adjacent
+        /// experts are fetched with coalesced `preadv` syscalls.
+        #[arg(long)]
+        packed_blob: Option<PathBuf>,
+        /// **Tier 2.** JSON manifest (`id -> offset,len`) accompanying
+        /// `--packed-blob`. Required when `--packed-blob` is set.
+        #[arg(long)]
+        packed_manifest: Option<PathBuf>,
     },
 
     /// Convert a GGUF checkpoint (Mixtral-style) into the engine's
@@ -556,6 +686,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             block_align,
             dtype,
         } => cmd_gen_data(&data_dir, num_experts, expert_size, d_model, d_ff, block_align, &dtype),
+        Cmd::Repack {
+            data_dir,
+            out_blob,
+            out_manifest,
+            num_experts,
+            expert_size,
+            block_align,
+            no_direct,
+            num_experts_per_layer,
+            profile,
+            order,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_repack(RepackArgs {
+                data_dir,
+                out_blob,
+                out_manifest,
+                num_experts,
+                expert_size,
+                block_align,
+                no_direct,
+                num_experts_per_layer,
+                profile,
+                order,
+            }))
+        }
         Cmd::Run { .. } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -602,8 +760,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     affinity,
                     affinity_neighbors_k,
                     affinity_decay_epoch,
+                    prefetch_governor,
+                    prefetch_precision_floor,
+                    prefetch_contention_weight,
+                    cost_aware_eviction,
+                    pregate,
+                    static_residency_fraction,
+                    static_residency_warmup_tokens,
+                    static_residency_profile,
+                    profile_out,
+                    workload,
+                    zipf_s,
+                    workload_correlation,
+                    replay_trace,
                     num_layers,
                     num_experts_per_layer,
+                    packed_blob,
+                    packed_manifest,
                 } = cli.cmd
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
@@ -649,8 +822,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         affinity,
                         affinity_neighbors_k,
                         affinity_decay_epoch,
+                        prefetch_governor,
+                        prefetch_precision_floor,
+                        prefetch_contention_weight,
+                        cost_aware_eviction,
+                        pregate,
+                        static_residency_fraction,
+                        static_residency_warmup_tokens,
+                        static_residency_profile,
+                        profile_out,
+                        workload,
+                        zipf_s,
+                        workload_correlation,
+                        replay_trace,
                         num_layers,
                         num_experts_per_layer,
+                        packed_blob,
+                        packed_manifest,
                         },
                         startup_pinned,
                     )
@@ -764,6 +952,49 @@ fn install_run_gpu_backend(
             "GpuBackend installed for run benchmark"
         );
         Some(gpu_expert_cache)
+    }
+}
+
+/// **Tier 2.** Attach a packed expert blob to `storage` when both the blob
+/// and its manifest are configured, after validating the manifest's slot
+/// size against the engine's `expert_size`. Returns the storage unchanged
+/// when no packed layout is configured (the default). Shared by the
+/// `serve` and `run` engine-build paths.
+fn maybe_attach_packed_blob(
+    storage: NvmeStorage,
+    packed_blob: Option<&std::path::Path>,
+    packed_manifest: Option<&std::path::Path>,
+    use_direct_io: bool,
+    expert_size: usize,
+) -> Result<NvmeStorage, Box<dyn std::error::Error>> {
+    match (packed_blob, packed_manifest) {
+        (Some(blob_path), Some(manifest_path)) => {
+            let blob = crate::packed_storage::PackedBlob::open(
+                blob_path,
+                manifest_path,
+                use_direct_io,
+            )?;
+            blob.validate()
+                .map_err(|e| format!("packed blob validation failed: {e}"))?;
+            let slot = blob.manifest().expert_size;
+            if slot != expert_size as u64 {
+                return Err(format!(
+                    "packed manifest expert_size ({slot}) != expert_size ({expert_size}); \
+                     re-run `repack` with the matching --expert-size"
+                )
+                .into());
+            }
+            info!(
+                experts = blob.len(),
+                blob = %blob_path.display(),
+                "Tier 2: packed expert blob attached (single-fd reads + coalesced preadv)"
+            );
+            Ok(storage.with_packed_blob(Arc::new(blob)))
+        }
+        (Some(_), None) | (None, Some(_)) => Err(
+            "both packed_blob and packed_manifest must be set to enable the packed layout".into(),
+        ),
+        (None, None) => Ok(storage),
     }
 }
 
@@ -966,7 +1197,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
 
     // Wire the multi-layer extractor naming when num_layers > 1, so
     // either `expert_<id>.bin` or `expert_<layer>_<local>.bin` works.
-    let storage = Arc::new(NvmeStorage::new(StorageConfig {
+    let storage = NvmeStorage::new(StorageConfig {
         base_path: cfg.model.data_dir.clone(),
         expert_size: cfg.model.expert_size,
         block_align: cfg.storage.block_align,
@@ -976,12 +1207,25 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         } else {
             None
         },
-    })?);
+    })?;
+    // Tier 2: attach the packed blob if configured (defaults: no-op).
+    let storage = maybe_attach_packed_blob(
+        storage,
+        cfg.storage.packed_blob.as_deref(),
+        cfg.storage.packed_manifest.as_deref(),
+        !cfg.storage.no_direct,
+        cfg.model.expert_size,
+    )?;
+    let storage = Arc::new(storage);
     // Warm fds across the whole multi-layer namespace (one global id
     // per (layer, local_expert) pair) so the steady-state path never
-    // pays the open() cost.
+    // pays the open() cost. Skipped in packed mode: every expert is
+    // served from the single already-open blob fd, and the per-expert
+    // files may not even exist on disk.
     let total_experts = (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts);
-    storage.warmup_fds(0..total_experts)?;
+    if !storage.is_packed() {
+        storage.warmup_fds(0..total_experts)?;
+    }
 
     // Double-buffered pool (Parts 1–2): split the RAM buffers into a
     // **primary** (Buffer A) half that backs the resident LRU plus one
@@ -1176,6 +1420,12 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             use_qmm_for_q4: true,
             max_concurrent_prefetches: cfg.real_transformer.max_concurrent_prefetches,
             max_fetch_yields: cfg.real_transformer.max_fetch_yields,
+            prefetch_governor: cfg.predictive.prefetch_governor,
+            prefetch_precision_floor: cfg.predictive.prefetch_precision_floor,
+            prefetch_contention_weight: cfg.predictive.prefetch_contention_weight,
+            cost_aware_eviction: cfg.predictive.cost_aware_eviction,
+            pregate_enabled: cfg.predictive.pregate_enabled,
+            collect_route_profile: false,
         },
     );
     // Apply the configured look-ahead pipeline depth (`[storage]
@@ -1234,6 +1484,38 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cfg.predictive.affinity_neighbors_k,
             cfg.predictive.affinity_decay_epoch,
         );
+    }
+    // Tier 1 — static residency. Pin the hottest `fraction` of experts
+    // permanently (from an offline profile when `static_residency_profile`
+    // is set, else online after the warmup window).
+    if cfg.predictive.static_residency_fraction > 0.0 {
+        let profile = match cfg.predictive.static_residency_profile.as_ref() {
+            Some(path) => {
+                let p = crate::residency::ResidencyProfile::load_json(std::path::Path::new(path))?;
+                info!(
+                    path = %path,
+                    experts = p.len(),
+                    "loaded static-residency popularity profile"
+                );
+                Some(p)
+            }
+            None => None,
+        };
+        engine_builder = engine_builder.with_static_residency(
+            cfg.predictive.static_residency_fraction,
+            cfg.predictive.static_residency_warmup_tokens,
+            profile,
+        );
+    }
+    // Tier 3 — per-layer pre-gate. Predict + prefetch the next layer's
+    // experts from the current layer's routed set on the multi-layer
+    // `moe_step` path.
+    if cfg.predictive.pregate_enabled {
+        let pregate = Arc::new(crate::pregate::PerLayerPreGate::new(
+            cfg.model.num_layers.max(1),
+            cfg.model.top_k,
+        ));
+        engine_builder = engine_builder.with_pregate(pregate);
     }
     // Phase 2: optional VRAM (GPU) expert cache (3-tier hierarchy
     // SSD → RAM → VRAM). When `[gpu_cache].enabled = false` (default)
@@ -1609,6 +1891,162 @@ fn cmd_gen_data(
     Ok(())
 }
 
+struct RepackArgs {
+    data_dir: PathBuf,
+    out_blob: PathBuf,
+    out_manifest: Option<PathBuf>,
+    num_experts: u32,
+    expert_size: usize,
+    block_align: usize,
+    no_direct: bool,
+    num_experts_per_layer: Option<u32>,
+    profile: Option<PathBuf>,
+    order: Option<PathBuf>,
+}
+
+/// Parse an explicit `--order` file: either a JSON array of ids or a
+/// newline / whitespace-separated list (blank lines and `#` comments
+/// ignored).
+fn parse_order_file(path: &std::path::Path) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(path)?;
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with('[') {
+        let ids: Vec<u32> = serde_json::from_str(trimmed)?;
+        return Ok(ids);
+    }
+    let mut ids = Vec::new();
+    for line in raw.lines() {
+        let without_comment = line.split_once('#').map_or(line, |(body, _)| body);
+        for tok in without_comment.split(|c: char| c.is_whitespace() || c == ',') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            ids.push(t.parse::<u32>()?);
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_order(ids: &[u32], num_experts: u32) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    for &id in ids {
+        if id >= num_experts {
+            return Err(format!(
+                "--order id {id} is out of range for --num-experts {num_experts}"
+            ));
+        }
+        if !seen.insert(id) {
+            return Err(format!("--order contains duplicate expert id {id}"));
+        }
+    }
+    Ok(())
+}
+
+/// **Tier 2.** Build a packed blob + manifest from a per-expert directory.
+async fn cmd_repack(args: RepackArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.block_align == 0 || !args.block_align.is_power_of_two() {
+        return Err(format!(
+            "--block-align ({}) must be a positive power of two",
+            args.block_align
+        )
+        .into());
+    }
+    if args.expert_size % args.block_align != 0 {
+        return Err(format!(
+            "--expert-size ({}) must be a multiple of --block-align ({})",
+            args.expert_size, args.block_align
+        )
+        .into());
+    }
+    if !args.data_dir.is_dir() {
+        return Err(format!("data dir {} does not exist", args.data_dir.display()).into());
+    }
+
+    // Resolve the physical layout order.
+    let order: Vec<u32> = if let Some(order_path) = &args.order {
+        let ids = parse_order_file(order_path)?;
+        if ids.is_empty() {
+            return Err(format!("--order file {} listed no ids", order_path.display()).into());
+        }
+        validate_order(&ids, args.num_experts)?;
+        let missing = args.num_experts as usize - ids.len();
+        if missing > 0 {
+            warn!(
+                missing,
+                "repack: explicit order omits experts; running/serving in packed mode will hard-error with NotFound if an omitted expert is routed"
+            );
+        }
+        info!(
+            count = ids.len(),
+            path = %order_path.display(),
+            "repack: using explicit expert order"
+        );
+        ids
+    } else if let Some(profile_path) = &args.profile {
+        let profile = crate::residency::ResidencyProfile::load_json(profile_path)?;
+        // Hottest-first over the whole namespace, then append any expert
+        // the profile never observed so the blob still covers 0..N.
+        let mut ranked = profile.hot_set(1.0, args.num_experts as usize);
+        let seen: std::collections::HashSet<u32> = ranked.iter().copied().collect();
+        for id in 0..args.num_experts {
+            if !seen.contains(&id) {
+                ranked.push(id);
+            }
+        }
+        info!(
+            observed = seen.len(),
+            total = ranked.len(),
+            path = %profile_path.display(),
+            "repack: ordering experts hottest-first from profile"
+        );
+        ranked
+    } else {
+        info!(num_experts = args.num_experts, "repack: using numeric expert order");
+        (0..args.num_experts).collect()
+    };
+
+    let manifest_path = args.out_manifest.clone().unwrap_or_else(|| {
+        let mut p = args.out_blob.clone().into_os_string();
+        p.push(".manifest.json");
+        PathBuf::from(p)
+    });
+
+    let storage = NvmeStorage::new(StorageConfig {
+        base_path: args.data_dir.clone(),
+        expert_size: args.expert_size,
+        block_align: args.block_align,
+        use_direct_io: !args.no_direct,
+        num_experts_per_layer: args.num_experts_per_layer,
+    })?;
+    // One reusable buffer is enough (we read sequentially), but a tiny
+    // pool keeps the acquire/release ergonomics and alignment.
+    let pool = BufferPool::new(2, args.expert_size, args.block_align);
+
+    info!(
+        experts = order.len(),
+        out_blob = %args.out_blob.display(),
+        out_manifest = %manifest_path.display(),
+        "repack: writing packed blob"
+    );
+    let started = Instant::now();
+    let manifest = crate::io_provider::pack_experts(
+        &storage,
+        &pool,
+        &order,
+        &args.out_blob,
+        &manifest_path,
+    )
+    .await?;
+    info!(
+        elapsed_s = started.elapsed().as_secs_f64(),
+        blob_mib = manifest.blob_len() as f64 / (1024.0 * 1024.0),
+        experts = manifest.len(),
+        "repack complete — point [storage] packed_blob / packed_manifest at these files"
+    );
+    Ok(())
+}
+
 struct RunArgs {
     data_dir: PathBuf,
     num_experts: u32,
@@ -1649,8 +2087,23 @@ struct RunArgs {
     affinity: bool,
     affinity_neighbors_k: usize,
     affinity_decay_epoch: u64,
+    prefetch_governor: bool,
+    prefetch_precision_floor: f64,
+    prefetch_contention_weight: f64,
+    cost_aware_eviction: bool,
+    pregate: bool,
+    static_residency_fraction: f64,
+    static_residency_warmup_tokens: u64,
+    static_residency_profile: Option<String>,
+    profile_out: Option<String>,
+    workload: String,
+    zipf_s: f64,
+    workload_correlation: f64,
+    replay_trace: Option<String>,
     num_layers: u32,
     num_experts_per_layer: Option<u32>,
+    packed_blob: Option<PathBuf>,
+    packed_manifest: Option<PathBuf>,
 }
 
 async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -1875,12 +2328,23 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         // restrict the speculator head per layer and prefetch ahead.
         num_experts_per_layer: args.num_experts_per_layer,
     };
-    let storage = Arc::new(if data_dirs.len() > 1 {
+    let storage = if data_dirs.len() > 1 {
         NvmeStorage::striped(storage_cfg, data_dirs.clone())?
     } else {
         NvmeStorage::new(storage_cfg)?
-    });
-    storage.warmup_fds(0..args.num_experts)?;
+    };
+    // Tier 2: attach the packed blob if configured (defaults: no-op).
+    let storage = maybe_attach_packed_blob(
+        storage,
+        args.packed_blob.as_deref(),
+        args.packed_manifest.as_deref(),
+        !args.no_direct,
+        args.expert_size,
+    )?;
+    let storage = Arc::new(storage);
+    if !storage.is_packed() {
+        storage.warmup_fds(0..args.num_experts)?;
+    }
 
     let pipeline_depth = args.pipeline_depth.max(1) as usize;
     let prefetch_headroom = if args.no_prefetch || args.predict_fanout == 0 {
@@ -1993,6 +2457,12 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 use_qmm_for_q4: true,
                 max_concurrent_prefetches: 64,
                 max_fetch_yields: crate::engine::DEFAULT_MAX_FETCH_YIELDS,
+                prefetch_governor: args.prefetch_governor,
+                prefetch_precision_floor: args.prefetch_precision_floor,
+                prefetch_contention_weight: args.prefetch_contention_weight,
+                cost_aware_eviction: args.cost_aware_eviction,
+                pregate_enabled: args.pregate,
+                collect_route_profile: args.profile_out.is_some(),
             },
         );
         if let Some(gpu_cache) = args.gpu_expert_cache.clone() {
@@ -2068,6 +2538,48 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 args.affinity_decay_epoch,
             );
         }
+        // Tier 1 — static residency. Pin the hottest `fraction` of the
+        // expert namespace permanently. With `--static-residency-profile`
+        // the hot set comes from an offline popularity profile (warm at
+        // startup); otherwise it is derived online from route counts after
+        // `--static-residency-warmup-tokens`.
+        if args.static_residency_fraction > 0.0 {
+            let profile = match args.static_residency_profile.as_ref() {
+                Some(path) => {
+                    let p = crate::residency::ResidencyProfile::load_json(std::path::Path::new(path))?;
+                    info!(
+                        path = %path,
+                        experts = p.len(),
+                        "loaded static-residency popularity profile"
+                    );
+                    Some(p)
+                }
+                None => None,
+            };
+            base = base.with_static_residency(
+                args.static_residency_fraction,
+                args.static_residency_warmup_tokens,
+                profile,
+            );
+        }
+        // Tier 3 — per-layer pre-gate. Predict (and prefetch) the next
+        // layer's experts from the current layer's routed set. Only
+        // effective on the multi-layer `moe_step` path; warn when no
+        // layer geometry is configured so it can't actually fire.
+        if args.pregate {
+            if args.num_layers <= 1 {
+                warn!(
+                    "--pregate has no effect with --num-layers 1: the pre-gate predicts \
+                     the *next* layer's experts, so it needs a multi-layer geometry \
+                     (set --num-layers > 1, typically with --gate-weights / a real model)."
+                );
+            }
+            let pregate = Arc::new(crate::pregate::PerLayerPreGate::new(
+                args.num_layers.max(1) as usize,
+                args.top_k,
+            ));
+            base = base.with_pregate(pregate);
+        }
         // Optional alias map (Change 6: expert deduplication).
         match args.alias_map_path.as_ref() {
             Some(path) => {
@@ -2138,28 +2650,106 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         None => None,
     };
 
+    // Benchmark workload selection (Tier 1/3 falsifiability). `synthetic`
+    // keeps the legacy uniform-i.i.d. stream; `skewed`/`replay` drive
+    // `moe_step` with an explicit, structured expert set so the
+    // skew-aware and correlation-aware machinery is exercisable.
+    let workload = crate::workload::Workload::from_str_opt(&args.workload).ok_or_else(|| {
+        format!(
+            "--workload: unknown value {:?} (use 'synthetic', 'skewed', or 'replay')",
+            args.workload
+        )
+    })?;
+    let mut skewed_stream = if workload == crate::workload::Workload::Skewed {
+        info!(
+            zipf_s = args.zipf_s,
+            correlation = args.workload_correlation,
+            top_k = args.top_k,
+            "workload: skewed (Zipf popularity + Markov correlation)"
+        );
+        Some(crate::workload::SkewedStream::new(
+            args.num_experts,
+            args.top_k,
+            args.zipf_s,
+            args.workload_correlation,
+            args.seed,
+        ))
+    } else {
+        None
+    };
+    let mut replay_stream = if workload == crate::workload::Workload::Replay {
+        let path = args
+            .replay_trace
+            .as_ref()
+            .ok_or("--workload replay requires --replay-trace <path>")?;
+        let stream = crate::workload::ReplayStream::load(std::path::Path::new(path))?;
+        if stream.is_empty() {
+            return Err(format!("--replay-trace {path}: no usable routing records").into());
+        }
+        info!(path = %path, records = stream.len(), "workload: replay JSONL routing trace");
+        Some(stream)
+    } else {
+        None
+    };
+
     for t in 0..args.tokens {
         let start = Instant::now();
-        let stats = if let Some(gate) = gate.as_ref() {
-            // Real gating-network path. Hidden state is the same
-            // synthetic activation `Engine::generate` would have used,
-            // so the only difference relative to the legacy path is
-            // *which* experts are selected.
-            let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
-            let dec = gate.route(&hidden);
-            let pre_hits = engine.report().hits;
-            let pre_misses = engine.report().misses;
-            let pre_bytes = engine.report().bytes_read;
-            let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
-            let post = engine.report();
-            crate::engine::CycleStats {
-                hits: post.hits.saturating_sub(pre_hits),
-                misses: post.misses.saturating_sub(pre_misses),
-                prefetch_hits: 0,
-                bytes_read: post.bytes_read.saturating_sub(pre_bytes),
+        let stats = match workload {
+            // Structured workloads: drive `moe_step` with the harness's
+            // explicit expert set and measure the engine-counter delta.
+            crate::workload::Workload::Skewed | crate::workload::Workload::Replay => {
+                let (tok_idx, layer_idx, experts): (u64, u32, Vec<u32>) = match workload {
+                    crate::workload::Workload::Skewed => (
+                        t,
+                        0,
+                        skewed_stream.as_mut().expect("skewed stream").next_experts(),
+                    ),
+                    _ => {
+                        let record = replay_stream
+                            .as_mut()
+                            .expect("replay stream")
+                            .next_record()
+                            .expect("replay stream non-empty");
+                        let layer = u32::try_from(record.layer).map_err(|_| {
+                            format!("replay layer {} does not fit in u32", record.layer)
+                        })?;
+                        (record.token, layer, record.experts)
+                    }
+                };
+                let hidden = crate::inference::synth_hidden_state(tok_idx, args.d_model, args.seed);
+                let pre = engine.report();
+                let _ = engine
+                    .moe_step(tok_idx, layer_idx, &hidden, &experts)
+                    .await;
+                let post = engine.report();
+                crate::engine::CycleStats {
+                    hits: post.hits.saturating_sub(pre.hits),
+                    misses: post.misses.saturating_sub(pre.misses),
+                    prefetch_hits: 0,
+                    bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
+                }
             }
-        } else {
-            engine.generate(t).await?
+            crate::workload::Workload::Synthetic => {
+                if let Some(gate) = gate.as_ref() {
+                    // Real gating-network path. Hidden state is the same
+                    // synthetic activation `Engine::generate` would have
+                    // used, so the only difference relative to the legacy
+                    // path is *which* experts are selected.
+                    let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
+                    let dec = gate.route(&hidden);
+                    let pre = engine.report();
+                    let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
+                    let post = engine.report();
+                    crate::engine::CycleStats {
+                        hits: post.hits.saturating_sub(pre.hits),
+                        misses: post.misses.saturating_sub(pre.misses),
+                        prefetch_hits: 0,
+                        bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
+                    }
+                } else {
+                    engine.generate(t).await?
+                }
+            }
         };
         let elapsed = start.elapsed();
         let throughput = if elapsed.as_secs_f64() > 0.0 {
@@ -2204,6 +2794,15 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     // Flush the trace before returning so the JSONL file is complete.
     if let Some(tw) = trace_writer.as_ref() {
         tw.flush();
+    }
+
+    // Tier 1 — emit the accumulated expert-popularity profile so a later
+    // run can warm-start static residency with `--static-residency-profile`.
+    if let Some(path) = args.profile_out.as_ref() {
+        engine
+            .dump_route_profile(std::path::Path::new(path))
+            .map_err(|e| format!("failed to write route profile {}: {e}", path))?;
+        info!(path = %path, "wrote route-observation profile");
     }
 
     Ok(())
@@ -2957,6 +3556,37 @@ mod tests {
         assert_eq!(parse_gate_layer_index("gate_1.bin.bak"), None);
         assert_eq!(parse_gate_layer_index("rms_moe_1.bin"), None);
         assert_eq!(parse_gate_layer_index("gate.bin"), None);
+    }
+
+    #[test]
+    fn parse_order_file_strips_inline_comments() {
+        let path = tempdir_unique("order-inline-comments.txt");
+        std::fs::write(
+            &path,
+            "# full-line comment\n12  # hot expert\n3,4\n8 9\n",
+        )
+        .unwrap();
+        let ids = parse_order_file(&path).unwrap();
+        assert_eq!(ids, vec![12, 3, 4, 8, 9]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn repack_order_validation_rejects_duplicate_ids() {
+        let err = validate_order(&[0, 1, 1], 4).unwrap_err();
+        assert!(err.contains("duplicate expert id 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn repack_order_validation_rejects_out_of_range_ids() {
+        let err = validate_order(&[0, 4], 4).unwrap_err();
+        assert!(err.contains("out of range"), "unexpected error: {err}");
+        assert!(err.contains("4"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn repack_order_validation_allows_subsets() {
+        assert!(validate_order(&[0, 2], 4).is_ok());
     }
 
     #[test]

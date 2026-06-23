@@ -172,6 +172,16 @@ impl MultiLayerExpertCache {
         self.caches[self.layer_idx(id)].unpin(id);
     }
 
+    /// **Tier 4 — cost-aware eviction.** Enable or disable the
+    /// lowest-heat eviction policy across every per-layer cache. No-op
+    /// effect until at least one layer fills; off by default so the
+    /// engine preserves pure-LRU behaviour unless asked.
+    pub fn set_cost_aware(&self, on: bool) {
+        for c in &self.caches {
+            c.set_cost_aware(on);
+        }
+    }
+
     /// Pop a least-recently-used non-pinned entry. With multiple
     /// layers, evicts from the layer whose per-layer LRU has the most
     /// residents (so we relieve the most-pressured layer first); ties
@@ -236,6 +246,14 @@ impl MultiLayerExpertCache {
 
     pub fn pinned_count(&self) -> usize {
         self.caches.iter().map(|c| c.pinned_count()).sum()
+    }
+
+    /// Snapshot of all pinned ids across every per-layer cache, sorted
+    /// ascending (diagnostics / tests).
+    pub fn pinned_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.caches.iter().flat_map(|c| c.pinned_ids()).collect();
+        ids.sort_unstable();
+        ids
     }
 
     pub fn resident_ids(&self) -> Vec<u32> {

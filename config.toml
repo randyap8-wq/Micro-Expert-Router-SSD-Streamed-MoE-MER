@@ -141,6 +141,17 @@ partial_load_fraction = 1.0
 # permanently in the LRU cache so it is never evicted by cold experts.
 # 0 (default) disables frequency-based pinning.
 pin_after_observations = 0
+# --- Tier 2: packed expert storage (opt-in) -------------------------------
+# Read every expert from one packed blob (built by the `repack` subcommand)
+# instead of one file per expert. The engine then uses a single shared fd
+# and coalesces physically-adjacent experts into one vectored `preadv`,
+# raising effective queue depth and cutting per-miss open()/syscall cost.
+# Leave both unset (default) for the original one-file-per-expert layout.
+# Build the blob with, e.g.:
+#   micro-expert-router repack --data-dir ./data --out-blob ./experts.blob \
+#       --num-experts 256 --expert-size 99090432 --profile hot.json
+# packed_blob = "./experts.blob"
+# packed_manifest = "./experts.blob.manifest.json"
 
 [tokenizer]
 # Path to a HuggingFace `tokenizer.json` (e.g. the one shipped with
@@ -229,6 +240,62 @@ speculator_hidden_dim = 128
 # Top-K experts pulled from the speculator each routing step. 0 ⇒
 # inherit `model.top_k`.
 speculator_top_k = 0
+# -- Per-layer expert-affinity arm (co-occurrence prefetch) ----------
+# Tracks which experts co-fire inside the same MoE layer and folds
+# their co-fired + disk-adjacent neighbours into the prefetch union.
+# Only effective on the layer-qualified `moe_step` path.
+affinity_enabled = false
+# Co-fired neighbours pulled per high-confidence seed.
+affinity_neighbors_k = 4
+# Cumulative observations between background decay sweeps of the
+# co-occurrence counters (larger = slower aging).
+affinity_decay_epoch = 100000
+
+# -- Tier 4: adaptive prefetch governor ------------------------------
+# Throttle speculative prefetches by measured precision (consumed /
+# completed) and foreground-read contention, so low-value speculation
+# can't inflate the latency of the foreground misses that actually
+# block token generation. This is the highest-leverage knob on a
+# bandwidth-bound SSD (a saturated NVMe queue inflates foreground miss
+# latency several-fold). Off by default (legacy unbounded admission).
+prefetch_governor = false
+# Precision floor / optimistic EWMA seed for the governor, in [0, 1].
+# The governor never lets the effective precision multiplier fall
+# below this, so a cold predictor still gets a small admission budget.
+prefetch_precision_floor = 0.05
+# Per-outstanding-foreground-read multiplier on the governor's
+# admission threshold. Higher ⇒ speculation backs off harder while
+# real misses are in flight.
+prefetch_contention_weight = 1.0
+
+# -- Tier 4: cost-aware eviction -------------------------------------
+# Evict the coldest resident by decaying heat score instead of strict
+# LRU, so a genuinely hot expert that briefly fell to the LRU tail is
+# not dumped ahead of a one-shot cold expert. Off by default (LRU).
+cost_aware_eviction = false
+
+# -- Tier 3: per-layer pre-gate predictor ----------------------------
+# Train an online conditional map from one layer's routed expert set
+# to the next layer's experts and drive high-precision next-layer
+# prefetch from it (real-transformer / trace-replay path). Off by
+# default.
+pregate_enabled = false
+
+# -- Tier 1: skew-aware static residency -----------------------------
+# Pin the hottest `fraction` of the expert namespace permanently in
+# the RAM cache so a *skewed* routing distribution can exceed the bare
+# cache-capacity hit-rate ceiling (the "C/E wall"). 0.0 (default)
+# disables it; a value in (0, 1] pins ceil(fraction * num_experts)
+# experts. Has no benefit on a uniform-i.i.d. workload.
+static_residency_fraction = 0.0
+# Tokens to observe before deriving the *online* hot set from live
+# route counts. Ignored when `static_residency_profile` is set.
+static_residency_warmup_tokens = 0
+# Optional path to an offline popularity profile ({ "<id>": <count> }
+# JSON, e.g. from a previous run's `--profile-out`). When set, its
+# hottest `fraction` is pinned at startup for an immediately warm
+# cache instead of deriving the hot set online.
+# static_residency_profile = "hot_experts.json"
 
 # 3-tier heterogeneous memory cache (SSD → RAM → VRAM).
 #

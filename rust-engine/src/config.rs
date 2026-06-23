@@ -218,6 +218,22 @@ pub struct StorageConfigToml {
     /// evicted by cold experts. `0` (default) disables pinning.
     #[serde(default = "default_pin_after_observations")]
     pub pin_after_observations: u64,
+
+    /// **Tier 2 — packed expert storage.** Path to a single packed blob
+    /// file containing every expert payload back-to-back (one block-aligned
+    /// `expert_size` slot each), produced by the `repack` subcommand. When
+    /// set (together with [`Self::packed_manifest`]) the engine reads all
+    /// experts from this one fd and coalesces physically-adjacent experts
+    /// into single vectored `preadv` syscalls. `None` (default) keeps the
+    /// one-file-per-expert layout bit-for-bit.
+    #[serde(default)]
+    pub packed_blob: Option<PathBuf>,
+
+    /// **Tier 2.** Path to the JSON manifest (`id -> offset,len`) that
+    /// accompanies [`Self::packed_blob`]. Required when `packed_blob` is
+    /// set; ignored otherwise.
+    #[serde(default)]
+    pub packed_manifest: Option<PathBuf>,
 }
 
 fn default_partial_load_fraction() -> f64 { 1.0 }
@@ -475,7 +491,72 @@ pub struct PredictiveConfig {
     /// distribution shifts and prevents `u32::MAX` saturation.
     #[serde(default = "default_affinity_decay_epoch")]
     pub affinity_decay_epoch: u64,
+
+    /// **Tier 4 — adaptive prefetch governor.** Master switch for the
+    /// [`crate::prefetch_governor::PrefetchGovernor`]. When `true`,
+    /// speculative prefetches are admitted only when their expected
+    /// value (predicted score × measured precision) beats a bar that
+    /// rises with the number of foreground (token-blocking) misses
+    /// queued for the device. `false` (default) preserves the legacy
+    /// unbounded admission behaviour. This is the highest-leverage knob
+    /// on a bandwidth-bound SSD: it stops low-precision speculation from
+    /// inflating the latency of the foreground misses that actually
+    /// block token generation.
+    #[serde(default)]
+    pub prefetch_governor: bool,
+    /// Precision floor / optimistic EWMA seed for the governor, in
+    /// `[0, 1]`. Only consulted when `prefetch_governor = true`.
+    #[serde(default = "default_prefetch_precision_floor")]
+    pub prefetch_precision_floor: f64,
+    /// Per-outstanding-foreground-read multiplier the governor applies
+    /// to its admission threshold. Higher ⇒ speculation backs off harder
+    /// while real misses are in flight.
+    #[serde(default = "default_prefetch_contention_weight")]
+    pub prefetch_contention_weight: f64,
+
+    /// **Tier 4 — cost-aware eviction.** When `true`, the RAM expert
+    /// cache evicts the non-pinned resident with the lowest decaying
+    /// heat score rather than the strict LRU victim, so a genuinely hot
+    /// expert that briefly fell to the LRU tail is not dumped ahead of a
+    /// one-shot cold expert. `false` (default) keeps pure LRU eviction.
+    #[serde(default)]
+    pub cost_aware_eviction: bool,
+
+    /// **Tier 3 — per-layer pre-gate predictor.** When `true`, the
+    /// engine trains an online conditional map from one layer's routed
+    /// set to the next layer's experts and uses it to drive
+    /// high-precision next-layer prefetch on the real-transformer /
+    /// trace-replay path. `false` (default) leaves the existing
+    /// speculator/Markov look-ahead untouched.
+    #[serde(default)]
+    pub pregate_enabled: bool,
+
+    /// **Tier 1 — static residency.** Fraction of the global expert
+    /// namespace to pin permanently in the RAM cache (the hottest
+    /// experts). `0.0` (default) disables the feature; a value in
+    /// `(0, 1]` pins `ceil(fraction × num_experts)` experts. Clamped to
+    /// `[0, 1]`.
+    #[serde(default)]
+    pub static_residency_fraction: f64,
+
+    /// Tokens to observe before deriving the *online* static-residency
+    /// hot set from live route counts. Ignored when
+    /// `static_residency_profile` is set (an offline profile is applied
+    /// immediately, with no warmup).
+    #[serde(default)]
+    pub static_residency_warmup_tokens: u64,
+
+    /// Optional path to an offline expert-popularity profile
+    /// (`{ "<id>": <count> }` JSON, e.g. from a previous run's
+    /// `--profile-out`). When present, its hottest `fraction` is pinned
+    /// at startup for an immediately warm cache. `None` derives the hot
+    /// set online instead.
+    #[serde(default)]
+    pub static_residency_profile: Option<String>,
 }
+
+fn default_prefetch_precision_floor() -> f64 { 0.05 }
+fn default_prefetch_contention_weight() -> f64 { 1.0 }
 
 fn default_locality_window() -> usize { 256 }
 fn default_locality_threshold() -> f32 { 0.10 }
@@ -495,6 +576,14 @@ impl Default for PredictiveConfig {
             affinity_enabled: false,
             affinity_neighbors_k: default_affinity_neighbors_k(),
             affinity_decay_epoch: default_affinity_decay_epoch(),
+            prefetch_governor: false,
+            prefetch_precision_floor: default_prefetch_precision_floor(),
+            prefetch_contention_weight: default_prefetch_contention_weight(),
+            cost_aware_eviction: false,
+            pregate_enabled: false,
+            static_residency_fraction: 0.0,
+            static_residency_warmup_tokens: 0,
+            static_residency_profile: None,
         }
     }
 }
@@ -715,6 +804,43 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "storage.partial_load_fraction ({}) must be in [0.1, 1.0]",
                 self.storage.partial_load_fraction
+            )));
+        }
+        // Tier 2 packed storage: the blob and its manifest must be set
+        // together — one without the other is a misconfiguration.
+        match (&self.storage.packed_blob, &self.storage.packed_manifest) {
+            (Some(_), None) => {
+                return Err(ConfigError::Invalid(
+                    "storage.packed_blob is set but storage.packed_manifest is missing; \
+                     both are required to enable the packed layout"
+                        .into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "storage.packed_manifest is set but storage.packed_blob is missing; \
+                     both are required to enable the packed layout"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        if !(0.0..=1.0).contains(&self.predictive.static_residency_fraction) {
+            return Err(ConfigError::Invalid(format!(
+                "predictive.static_residency_fraction ({}) must be in [0.0, 1.0]",
+                self.predictive.static_residency_fraction
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.predictive.prefetch_precision_floor) {
+            return Err(ConfigError::Invalid(format!(
+                "predictive.prefetch_precision_floor ({}) must be in [0.0, 1.0]",
+                self.predictive.prefetch_precision_floor
+            )));
+        }
+        if self.predictive.prefetch_contention_weight < 0.0 {
+            return Err(ConfigError::Invalid(format!(
+                "predictive.prefetch_contention_weight ({}) must be >= 0.0",
+                self.predictive.prefetch_contention_weight
             )));
         }
         // [gpu_cache] validation — only meaningful when enabled.
@@ -1077,6 +1203,8 @@ mod tests {
                 predict_min_prob: 0.0,
                 partial_load_fraction: 1.0,
                 pin_after_observations: 0,
+                packed_blob: None,
+                packed_manifest: None,
             },
             tokenizer: TokenizerConfig::default(),
             real_transformer: RealTransformerConfig::default(),
@@ -1242,6 +1370,20 @@ mod tests {
         let mut c = minimal_cfg();
         c.predictive.speculator_enabled = true;
         c.predictive.speculator_top_k = 9999;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn predictive_rejects_out_of_range_precision_floor() {
+        let mut c = minimal_cfg();
+        c.predictive.prefetch_precision_floor = 1.5;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn predictive_rejects_negative_contention_weight() {
+        let mut c = minimal_cfg();
+        c.predictive.prefetch_contention_weight = -0.1;
         assert!(c.validate().is_err());
     }
 }
