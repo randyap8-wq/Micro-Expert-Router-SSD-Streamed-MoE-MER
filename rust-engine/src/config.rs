@@ -218,6 +218,22 @@ pub struct StorageConfigToml {
     /// evicted by cold experts. `0` (default) disables pinning.
     #[serde(default = "default_pin_after_observations")]
     pub pin_after_observations: u64,
+
+    /// **Tier 2 — packed expert storage.** Path to a single packed blob
+    /// file containing every expert payload back-to-back (one block-aligned
+    /// `expert_size` slot each), produced by the `repack` subcommand. When
+    /// set (together with [`Self::packed_manifest`]) the engine reads all
+    /// experts from this one fd and coalesces physically-adjacent experts
+    /// into single vectored `preadv` syscalls. `None` (default) keeps the
+    /// one-file-per-expert layout bit-for-bit.
+    #[serde(default)]
+    pub packed_blob: Option<PathBuf>,
+
+    /// **Tier 2.** Path to the JSON manifest (`id -> offset,len`) that
+    /// accompanies [`Self::packed_blob`]. Required when `packed_blob` is
+    /// set; ignored otherwise.
+    #[serde(default)]
+    pub packed_manifest: Option<PathBuf>,
 }
 
 fn default_partial_load_fraction() -> f64 { 1.0 }
@@ -790,6 +806,25 @@ impl Config {
                 self.storage.partial_load_fraction
             )));
         }
+        // Tier 2 packed storage: the blob and its manifest must be set
+        // together — one without the other is a misconfiguration.
+        match (&self.storage.packed_blob, &self.storage.packed_manifest) {
+            (Some(_), None) => {
+                return Err(ConfigError::Invalid(
+                    "storage.packed_blob is set but storage.packed_manifest is missing; \
+                     both are required to enable the packed layout"
+                        .into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "storage.packed_manifest is set but storage.packed_blob is missing; \
+                     both are required to enable the packed layout"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
         if !(0.0..=1.0).contains(&self.predictive.static_residency_fraction) {
             return Err(ConfigError::Invalid(format!(
                 "predictive.static_residency_fraction ({}) must be in [0.0, 1.0]",
@@ -1156,6 +1191,8 @@ mod tests {
                 predict_min_prob: 0.0,
                 partial_load_fraction: 1.0,
                 pin_after_observations: 0,
+                packed_blob: None,
+                packed_manifest: None,
             },
             tokenizer: TokenizerConfig::default(),
             real_transformer: RealTransformerConfig::default(),

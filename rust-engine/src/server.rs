@@ -1499,6 +1499,8 @@ mod tests {
                 predict_min_prob: 0.05,
                 partial_load_fraction: 1.0,
                 pin_after_observations: 0,
+                packed_blob: None,
+                packed_manifest: None,
             },
             tokenizer: crate::config::TokenizerConfig::default(),
             real_transformer: crate::config::RealTransformerConfig::default(),

@@ -43,6 +43,7 @@ mod mla;
 mod model;
 mod multi_layer_cache;
 mod numa;
+mod packed_storage;
 mod parallel;
 mod prefetch_governor;
 mod pregate;
@@ -125,6 +126,51 @@ enum Cmd {
         /// byte width of every weight in the generated files.
         #[arg(long, default_value = "f32")]
         dtype: String,
+    },
+
+    /// **Tier 2.** Repack a directory of `expert_<id>.bin` files into a
+    /// single packed blob + JSON manifest for the packed storage layout.
+    /// Experts are written back-to-back (one block-aligned `expert_size`
+    /// slot each) in an order chosen by `--profile` / `--order` so the
+    /// engine can coalesce co-fetched experts into single `preadv`s.
+    Repack {
+        /// Source directory containing `expert_<id>.bin` (or
+        /// `expert_<layer>_<local>.bin` with `--num-experts-per-layer`).
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        /// Output blob path (all expert payloads concatenated).
+        #[arg(long)]
+        out_blob: PathBuf,
+        /// Output manifest path. Defaults to `<out_blob>.manifest.json`.
+        #[arg(long)]
+        out_manifest: Option<PathBuf>,
+        /// Number of experts to pack (ids `0..num_experts`, unless
+        /// `--order` restricts the set).
+        #[arg(long, default_value_t = 64)]
+        num_experts: u32,
+        /// Bytes per expert. Must equal the source files' `expert_size`.
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        expert_size: usize,
+        /// Block alignment (must match `gen-data` / the source files).
+        #[arg(long, default_value_t = 4096)]
+        block_align: usize,
+        /// Disable `O_DIRECT` when reading the source files (needed on
+        /// tmpfs / macOS / CI).
+        #[arg(long)]
+        no_direct: bool,
+        /// Experts per layer for layer-qualified source naming.
+        #[arg(long)]
+        num_experts_per_layer: Option<u32>,
+        /// Order experts hottest-first using a routing-frequency profile
+        /// JSON (as produced by `run --profile-out`). Unobserved experts
+        /// are appended in numeric order. Ignored if `--order` is set.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// Explicit physical layout: a file listing expert ids (one per
+        /// line, or a JSON array). Overrides `--profile`. Only the listed
+        /// experts are packed.
+        #[arg(long)]
+        order: Option<PathBuf>,
     },
 
     /// Run the token-generation simulation against the on-disk experts.
@@ -436,6 +482,16 @@ enum Cmd {
         /// flat single-namespace benchmark (no layer-ahead).
         #[arg(long)]
         num_experts_per_layer: Option<u32>,
+        /// **Tier 2 — packed storage.** Read every expert from this single
+        /// packed blob (produced by the `repack` subcommand) instead of
+        /// one file per expert. Requires `--packed-manifest`. Adjacent
+        /// experts are fetched with coalesced `preadv` syscalls.
+        #[arg(long)]
+        packed_blob: Option<PathBuf>,
+        /// **Tier 2.** JSON manifest (`id -> offset,len`) accompanying
+        /// `--packed-blob`. Required when `--packed-blob` is set.
+        #[arg(long)]
+        packed_manifest: Option<PathBuf>,
     },
 
     /// Convert a GGUF checkpoint (Mixtral-style) into the engine's
@@ -630,6 +686,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             block_align,
             dtype,
         } => cmd_gen_data(&data_dir, num_experts, expert_size, d_model, d_ff, block_align, &dtype),
+        Cmd::Repack {
+            data_dir,
+            out_blob,
+            out_manifest,
+            num_experts,
+            expert_size,
+            block_align,
+            no_direct,
+            num_experts_per_layer,
+            profile,
+            order,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_repack(RepackArgs {
+                data_dir,
+                out_blob,
+                out_manifest,
+                num_experts,
+                expert_size,
+                block_align,
+                no_direct,
+                num_experts_per_layer,
+                profile,
+                order,
+            }))
+        }
         Cmd::Run { .. } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -691,6 +775,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     replay_trace,
                     num_layers,
                     num_experts_per_layer,
+                    packed_blob,
+                    packed_manifest,
                 } = cli.cmd
                 {
                     let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
@@ -751,6 +837,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         replay_trace,
                         num_layers,
                         num_experts_per_layer,
+                        packed_blob,
+                        packed_manifest,
                         },
                         startup_pinned,
                     )
@@ -864,6 +952,47 @@ fn install_run_gpu_backend(
             "GpuBackend installed for run benchmark"
         );
         Some(gpu_expert_cache)
+    }
+}
+
+/// **Tier 2.** Attach a packed expert blob to `storage` when both the blob
+/// and its manifest are configured, after validating the manifest's slot
+/// size against the engine's `expert_size`. Returns the storage unchanged
+/// when no packed layout is configured (the default). Shared by the
+/// `serve` and `run` engine-build paths.
+fn maybe_attach_packed_blob(
+    storage: NvmeStorage,
+    packed_blob: Option<&std::path::Path>,
+    packed_manifest: Option<&std::path::Path>,
+    use_direct_io: bool,
+    expert_size: usize,
+) -> Result<NvmeStorage, Box<dyn std::error::Error>> {
+    match (packed_blob, packed_manifest) {
+        (Some(blob_path), Some(manifest_path)) => {
+            let blob = crate::packed_storage::PackedBlob::open(
+                blob_path,
+                manifest_path,
+                use_direct_io,
+            )?;
+            let slot = blob.manifest().expert_size;
+            if slot != expert_size as u64 {
+                return Err(format!(
+                    "packed manifest expert_size ({slot}) != expert_size ({expert_size}); \
+                     re-run `repack` with the matching --expert-size"
+                )
+                .into());
+            }
+            info!(
+                experts = blob.len(),
+                blob = %blob_path.display(),
+                "Tier 2: packed expert blob attached (single-fd reads + coalesced preadv)"
+            );
+            Ok(storage.with_packed_blob(Arc::new(blob)))
+        }
+        (Some(_), None) | (None, Some(_)) => Err(
+            "both packed_blob and packed_manifest must be set to enable the packed layout".into(),
+        ),
+        (None, None) => Ok(storage),
     }
 }
 
@@ -1066,7 +1195,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
 
     // Wire the multi-layer extractor naming when num_layers > 1, so
     // either `expert_<id>.bin` or `expert_<layer>_<local>.bin` works.
-    let storage = Arc::new(NvmeStorage::new(StorageConfig {
+    let storage = NvmeStorage::new(StorageConfig {
         base_path: cfg.model.data_dir.clone(),
         expert_size: cfg.model.expert_size,
         block_align: cfg.storage.block_align,
@@ -1076,12 +1205,25 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         } else {
             None
         },
-    })?);
+    })?;
+    // Tier 2: attach the packed blob if configured (defaults: no-op).
+    let storage = maybe_attach_packed_blob(
+        storage,
+        cfg.storage.packed_blob.as_deref(),
+        cfg.storage.packed_manifest.as_deref(),
+        !cfg.storage.no_direct,
+        cfg.model.expert_size,
+    )?;
+    let storage = Arc::new(storage);
     // Warm fds across the whole multi-layer namespace (one global id
     // per (layer, local_expert) pair) so the steady-state path never
-    // pays the open() cost.
+    // pays the open() cost. Skipped in packed mode: every expert is
+    // served from the single already-open blob fd, and the per-expert
+    // files may not even exist on disk.
     let total_experts = (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts);
-    storage.warmup_fds(0..total_experts)?;
+    if !storage.is_packed() {
+        storage.warmup_fds(0..total_experts)?;
+    }
 
     // Double-buffered pool (Parts 1–2): split the RAM buffers into a
     // **primary** (Buffer A) half that backs the resident LRU plus one
@@ -1747,6 +1889,136 @@ fn cmd_gen_data(
     Ok(())
 }
 
+struct RepackArgs {
+    data_dir: PathBuf,
+    out_blob: PathBuf,
+    out_manifest: Option<PathBuf>,
+    num_experts: u32,
+    expert_size: usize,
+    block_align: usize,
+    no_direct: bool,
+    num_experts_per_layer: Option<u32>,
+    profile: Option<PathBuf>,
+    order: Option<PathBuf>,
+}
+
+/// Parse an explicit `--order` file: either a JSON array of ids or a
+/// newline / whitespace-separated list (blank lines and `#` comments
+/// ignored).
+fn parse_order_file(path: &std::path::Path) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(path)?;
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with('[') {
+        let ids: Vec<u32> = serde_json::from_str(trimmed)?;
+        return Ok(ids);
+    }
+    let mut ids = Vec::new();
+    for tok in raw.split(|c: char| c.is_whitespace() || c == ',') {
+        let t = tok.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        ids.push(t.parse::<u32>()?);
+    }
+    Ok(ids)
+}
+
+/// **Tier 2.** Build a packed blob + manifest from a per-expert directory.
+async fn cmd_repack(args: RepackArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.block_align == 0 || !args.block_align.is_power_of_two() {
+        return Err(format!(
+            "--block-align ({}) must be a positive power of two",
+            args.block_align
+        )
+        .into());
+    }
+    if args.expert_size % args.block_align != 0 {
+        return Err(format!(
+            "--expert-size ({}) must be a multiple of --block-align ({})",
+            args.expert_size, args.block_align
+        )
+        .into());
+    }
+    if !args.data_dir.is_dir() {
+        return Err(format!("data dir {} does not exist", args.data_dir.display()).into());
+    }
+
+    // Resolve the physical layout order.
+    let order: Vec<u32> = if let Some(order_path) = &args.order {
+        let ids = parse_order_file(order_path)?;
+        if ids.is_empty() {
+            return Err(format!("--order file {} listed no ids", order_path.display()).into());
+        }
+        info!(
+            count = ids.len(),
+            path = %order_path.display(),
+            "repack: using explicit expert order"
+        );
+        ids
+    } else if let Some(profile_path) = &args.profile {
+        let profile = crate::residency::ResidencyProfile::load_json(profile_path)?;
+        // Hottest-first over the whole namespace, then append any expert
+        // the profile never observed so the blob still covers 0..N.
+        let mut ranked = profile.hot_set(1.0, args.num_experts as usize);
+        let seen: std::collections::HashSet<u32> = ranked.iter().copied().collect();
+        for id in 0..args.num_experts {
+            if !seen.contains(&id) {
+                ranked.push(id);
+            }
+        }
+        info!(
+            observed = seen.len(),
+            total = ranked.len(),
+            path = %profile_path.display(),
+            "repack: ordering experts hottest-first from profile"
+        );
+        ranked
+    } else {
+        info!(num_experts = args.num_experts, "repack: using numeric expert order");
+        (0..args.num_experts).collect()
+    };
+
+    let manifest_path = args.out_manifest.clone().unwrap_or_else(|| {
+        let mut p = args.out_blob.clone().into_os_string();
+        p.push(".manifest.json");
+        PathBuf::from(p)
+    });
+
+    let storage = NvmeStorage::new(StorageConfig {
+        base_path: args.data_dir.clone(),
+        expert_size: args.expert_size,
+        block_align: args.block_align,
+        use_direct_io: !args.no_direct,
+        num_experts_per_layer: args.num_experts_per_layer,
+    })?;
+    // One reusable buffer is enough (we read sequentially), but a tiny
+    // pool keeps the acquire/release ergonomics and alignment.
+    let pool = BufferPool::new(2, args.expert_size, args.block_align);
+
+    info!(
+        experts = order.len(),
+        out_blob = %args.out_blob.display(),
+        out_manifest = %manifest_path.display(),
+        "repack: writing packed blob"
+    );
+    let started = Instant::now();
+    let manifest = crate::io_provider::pack_experts(
+        &storage,
+        &pool,
+        &order,
+        &args.out_blob,
+        &manifest_path,
+    )
+    .await?;
+    info!(
+        elapsed_s = started.elapsed().as_secs_f64(),
+        blob_mib = manifest.blob_len() as f64 / (1024.0 * 1024.0),
+        experts = manifest.len(),
+        "repack complete — point [storage] packed_blob / packed_manifest at these files"
+    );
+    Ok(())
+}
+
 struct RunArgs {
     data_dir: PathBuf,
     num_experts: u32,
@@ -1802,6 +2074,8 @@ struct RunArgs {
     replay_trace: Option<String>,
     num_layers: u32,
     num_experts_per_layer: Option<u32>,
+    packed_blob: Option<PathBuf>,
+    packed_manifest: Option<PathBuf>,
 }
 
 async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -2026,12 +2300,23 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         // restrict the speculator head per layer and prefetch ahead.
         num_experts_per_layer: args.num_experts_per_layer,
     };
-    let storage = Arc::new(if data_dirs.len() > 1 {
+    let storage = if data_dirs.len() > 1 {
         NvmeStorage::striped(storage_cfg, data_dirs.clone())?
     } else {
         NvmeStorage::new(storage_cfg)?
-    });
-    storage.warmup_fds(0..args.num_experts)?;
+    };
+    // Tier 2: attach the packed blob if configured (defaults: no-op).
+    let storage = maybe_attach_packed_blob(
+        storage,
+        args.packed_blob.as_deref(),
+        args.packed_manifest.as_deref(),
+        !args.no_direct,
+        args.expert_size,
+    )?;
+    let storage = Arc::new(storage);
+    if !storage.is_packed() {
+        storage.warmup_fds(0..args.num_experts)?;
+    }
 
     let pipeline_depth = args.pipeline_depth.max(1) as usize;
     let prefetch_headroom = if args.no_prefetch || args.predict_fanout == 0 {

@@ -45,6 +45,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -463,6 +464,13 @@ pub struct NvmeStorage {
     /// keeps a one-element vector. Eagerly sized at construction so
     /// the hot path is a plain index load, no `RwLock` access.
     drive_breakers: Vec<Arc<DriveBreakerState>>,
+    /// **Tier 2.** Optional packed-blob layout. When attached via
+    /// [`NvmeStorage::with_packed_blob`], every expert is read from a
+    /// single shared blob fd at the manifest-recorded offset, and
+    /// [`Self::read_experts_batch`] coalesces physically-adjacent
+    /// experts into one vectored `preadv`. `None` (default) keeps the
+    /// original one-file-per-expert path bit-for-bit.
+    packed: Option<Arc<crate::packed_storage::PackedBlob>>,
 }
 
 impl NvmeStorage {
@@ -485,6 +493,7 @@ impl NvmeStorage {
             manifest: None,
             breakers: RwLock::new(HashMap::new()),
             drive_breakers: vec![Arc::new(DriveBreakerState::default())],
+            packed: None,
         })
     }
 
@@ -561,6 +570,33 @@ impl NvmeStorage {
     /// indexing — the legacy per-fetch resolution path is used.
     pub fn manifest(&self) -> Option<&Arc<Manifest>> {
         self.manifest.as_ref()
+    }
+
+    /// **Tier 2.** Attach a packed blob (single-file layout + manifest)
+    /// produced by the `repack` CLI subcommand. Once attached, every
+    /// `read_expert*` call sources bytes from the shared blob fd at the
+    /// expert's recorded offset, and [`Self::read_experts_batch`]
+    /// coalesces adjacent experts into one vectored `preadv`.
+    ///
+    /// Builder-style: returns `self` for chaining at construction
+    /// (`NvmeStorage::new(cfg)?.with_packed_blob(blob)`).
+    pub fn with_packed_blob(
+        mut self,
+        blob: Arc<crate::packed_storage::PackedBlob>,
+    ) -> Self {
+        self.packed = Some(blob);
+        self
+    }
+
+    /// The packed blob attached via [`Self::with_packed_blob`], if any.
+    #[allow(dead_code)] // public accessor; engine uses `is_packed()` on the hot path.
+    pub fn packed(&self) -> Option<&Arc<crate::packed_storage::PackedBlob>> {
+        self.packed.as_ref()
+    }
+
+    /// Whether this storage is serving experts from a packed blob.
+    pub fn is_packed(&self) -> bool {
+        self.packed.is_some()
     }
 
     /// Number of drives this storage is striped across. `1` for the
@@ -1024,6 +1060,29 @@ impl NvmeStorage {
     /// on success — short reads are surfaced as an `UnexpectedEof` error).
     pub async fn read_expert(&self, expert_id: u32, buf: &mut PooledBuffer) -> io::Result<usize> {
         debug_assert_eq!(buf.len(), self.cfg.expert_size);
+        // Tier 2 packed path: source the bytes from the shared blob fd at
+        // the expert's recorded offset. The fault-tolerant retry +
+        // circuit-breaker wrapper is reused unchanged — only the (file,
+        // offset) pair differs from the per-file path.
+        if let Some(packed) = &self.packed {
+            let entry = packed.entry(expert_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("expert {expert_id} is not present in the packed blob manifest"),
+                )
+            })?;
+            let file = packed.file().clone();
+            let dst_len = buf.len();
+            let n = tokio::task::block_in_place(|| {
+                self.read_at_with_retries(
+                    &file,
+                    expert_id,
+                    entry.offset,
+                    &mut buf.as_mut_slice()[..dst_len],
+                )
+            })?;
+            return Ok(n);
+        }
         // Note: the breaker fast-fail used to live here for symmetry
         // with `read_at_with_retries`, but that bypassed the
         // half-open probe gate (a tripped breaker could never reach
@@ -1072,6 +1131,12 @@ impl NvmeStorage {
         );
         if ids.is_empty() {
             return Ok(0);
+        }
+        // Tier 2 packed path: coalesce physically-adjacent experts into
+        // single vectored `preadv` syscalls. Distinct ids ⇒ disjoint
+        // destination buffers, so the scatter is sound.
+        if self.packed.is_some() {
+            return self.read_experts_batch_packed(ids, bufs).await;
         }
         // Resolve all fds before donating the worker — `fd_for` takes a
         // (rare) write lock the first time it sees an id, and we don't
@@ -1148,7 +1213,172 @@ impl NvmeStorage {
         Ok(total)
     }
 
-    /// Partial-column read: load only the listed input-feature columns
+    /// **Tier 2.** Packed-blob sibling of [`Self::read_experts_batch`].
+    ///
+    /// Resolves every requested expert to its `(offset, len)` slot in the
+    /// shared blob, groups physically-adjacent slots into contiguous runs
+    /// (see [`crate::packed_storage::coalesce_runs`]), and issues **one
+    /// `preadv(2)` per run** that scatters the bytes straight into the
+    /// per-expert [`PooledBuffer`]s. A run of `K` adjacent experts thus
+    /// costs a single vectored syscall at full device queue depth instead
+    /// of `K` independent `pread`s.
+    ///
+    /// Robustness: a singleton run, an oversized iovec batch, or any
+    /// `preadv` error / short read falls back to the ordinary
+    /// per-expert [`Self::read_at_with_retries`] path, so the circuit
+    /// breaker, retry budget and short-read accounting behave exactly as
+    /// on the one-file-per-expert path.
+    #[allow(dead_code)] // reached via `read_experts_batch` (batched-miss path).
+    async fn read_experts_batch_packed(
+        &self,
+        ids: &[u32],
+        bufs: &mut [&mut PooledBuffer],
+    ) -> io::Result<usize> {
+        let packed = self
+            .packed
+            .as_ref()
+            .expect("read_experts_batch_packed called without a packed blob");
+        let expert_size = self.cfg.expert_size;
+
+        // Resolve slots and capture the (disjoint) destination pointers.
+        // Distinct ids ⇒ distinct slots ⇒ disjoint buffers, so the raw
+        // pointers never alias and reconstructing `&mut [u8]` from them
+        // inside the blocking closure is sound.
+        let mut requested: Vec<(u32, usize, crate::packed_storage::PackedEntry)> =
+            Vec::with_capacity(ids.len());
+        for (idx, &id) in ids.iter().enumerate() {
+            let entry = packed.entry(id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("expert {id} is not present in the packed blob manifest"),
+                )
+            })?;
+            requested.push((id, idx, entry));
+        }
+        let mut dst: Vec<(*mut u8, usize)> = Vec::with_capacity(bufs.len());
+        for buf in bufs.iter_mut() {
+            let b: &mut PooledBuffer = &mut *buf;
+            debug_assert_eq!(b.len(), expert_size);
+            let s = b.as_mut_slice();
+            dst.push((s.as_mut_ptr(), s.len()));
+        }
+
+        let runs = crate::packed_storage::coalesce_runs(requested);
+        let file = packed.file().clone();
+
+        let total = tokio::task::block_in_place(|| -> io::Result<usize> {
+            let mut total = 0usize;
+            for run in &runs {
+                total += self.read_run(&file, run, &dst)?;
+            }
+            Ok(total)
+        })?;
+        Ok(total)
+    }
+
+    /// Read a single coalesced run into its destination buffers.
+    ///
+    /// Multi-member runs go through one vectored `preadv`; singletons and
+    /// any failed/short `preadv` fall back to the per-expert
+    /// fault-tolerant path. `dst[i]` is the `(ptr, len)` of the caller's
+    /// `i`-th request buffer.
+    #[allow(dead_code)] // reached via `read_experts_batch_packed`.
+    fn read_run(
+        &self,
+        file: &File,
+        run: &crate::packed_storage::ContiguousRun,
+        dst: &[(*mut u8, usize)],
+    ) -> io::Result<usize> {
+        // Singleton (or, defensively, an oversized iovec batch): per-expert
+        // path. `IOV_MAX` is 1024 on Linux / macOS; top-k miss sets are
+        // orders of magnitude smaller, so the cap is never hit in practice.
+        const IOV_MAX_SAFE: usize = 512;
+        if run.members.len() == 1 || run.members.len() > IOV_MAX_SAFE {
+            let mut total = 0usize;
+            for &(id, idx) in &run.members {
+                let (ptr, len) = dst[idx];
+                // SAFETY: disjoint per-expert buffer, valid for `len`
+                // bytes for the duration of this call.
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                let off = self.packed_offset(id);
+                total += self.read_at_with_retries(file, id, off, slice)?;
+            }
+            return Ok(total);
+        }
+
+        // Multi-member contiguous run: one vectored read.
+        let iovecs: Vec<libc::iovec> = run
+            .members
+            .iter()
+            .map(|&(_, idx)| {
+                let (ptr, len) = dst[idx];
+                libc::iovec {
+                    iov_base: ptr as *mut libc::c_void,
+                    iov_len: len,
+                }
+            })
+            .collect();
+        let want = run.total_len as usize;
+        // SAFETY: `iovecs` point into the caller's disjoint, live
+        // destination buffers; `file` is a valid open fd; the run is
+        // physically contiguous starting at `start_offset`.
+        let n = unsafe {
+            libc::preadv(
+                file.as_raw_fd(),
+                iovecs.as_ptr(),
+                iovecs.len() as libc::c_int,
+                run.start_offset as libc::off_t,
+            )
+        };
+        if n >= 0 && n as usize == want {
+            // Full coalesced read: credit each member's breaker.
+            for &(id, _) in &run.members {
+                self.note_read_success(id);
+            }
+            return Ok(want);
+        }
+        // Short or failed preadv — fall back to independent, fully
+        // fault-tolerant per-expert reads so a single bad slot can't wedge
+        // the whole run and the retry/breaker accounting is preserved.
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            tracing::warn!(
+                error = %err,
+                run_start = run.start_offset,
+                members = run.members.len(),
+                "coalesced preadv failed; falling back to per-expert reads"
+            );
+        } else {
+            tracing::warn!(
+                got = n,
+                want,
+                run_start = run.start_offset,
+                members = run.members.len(),
+                "coalesced preadv short read; falling back to per-expert reads"
+            );
+        }
+        let mut total = 0usize;
+        for &(id, idx) in &run.members {
+            let (ptr, len) = dst[idx];
+            // SAFETY: see the singleton branch above.
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            let off = self.packed_offset(id);
+            total += self.read_at_with_retries(file, id, off, slice)?;
+        }
+        Ok(total)
+    }
+
+    /// Blob offset of a packed expert id. Panics only if called without a
+    /// packed blob attached (an internal invariant of the packed read
+    /// paths), and returns `0` for an id missing from the manifest — the
+    /// subsequent read then surfaces the bounds error.
+    fn packed_offset(&self, id: u32) -> u64 {
+        self.packed
+            .as_ref()
+            .and_then(|p| p.entry(id))
+            .map(|e| e.offset)
+            .unwrap_or(0)
+    }
     /// of an expert's `gate_proj` and `up_proj` plus the full `down_proj`,
     /// packed into `buf` in the layout consumed by
     /// [`crate::inference::OwnedExpertWeights::from_bytes_partial`]:
@@ -1247,8 +1477,53 @@ impl NvmeStorage {
 
 }
 
+/// **Tier 2.** Build a packed blob + manifest from a source storage.
+///
+/// Reads each expert in `order` from `source` (which may be a plain
+/// one-file-per-expert [`NvmeStorage`], honouring its path resolution and
+/// fault-tolerant retries) and writes the payloads back-to-back into
+/// `blob_path`, one uniform `expert_size` slot each. Emits the JSON
+/// [`crate::packed_storage::PackedManifest`] to `manifest_path`.
+///
+/// `order` defines the **physical layout**: experts that the engine tends to
+/// fetch together (a routing-frequency hot set, or a co-firing affinity
+/// ordering) should be adjacent so the steady-state read path can coalesce
+/// them into a single `preadv`. Returns the manifest it wrote.
+pub async fn pack_experts(
+    source: &NvmeStorage,
+    pool: &crate::buffer_pool::BufferPool,
+    order: &[u32],
+    blob_path: &Path,
+    manifest_path: &Path,
+) -> io::Result<crate::packed_storage::PackedManifest> {
+    use std::io::Write;
+    let expert_size = source.cfg.expert_size;
+    let block_align = source.cfg.block_align;
+    let blob = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(blob_path)?;
+    let mut writer = std::io::BufWriter::with_capacity(8 * 1024 * 1024, blob);
+    for &id in order {
+        let mut buf = pool.acquire().await;
+        debug_assert_eq!(buf.len(), expert_size);
+        source.read_expert(id, &mut buf).await?;
+        writer.write_all(buf.as_slice())?;
+    }
+    writer.flush()?;
+    writer.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    let manifest = crate::packed_storage::PackedManifest::uniform(
+        order.to_vec(),
+        expert_size as u64,
+        block_align as u64,
+    );
+    manifest.write_to(manifest_path)?;
+    Ok(manifest)
+}
+
 #[cfg(target_os = "linux")]
-fn open_expert_file(path: &Path, direct: bool) -> io::Result<File> {
+pub(crate) fn open_expert_file(path: &Path, direct: bool) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     if direct {
@@ -1276,7 +1551,7 @@ fn open_expert_file(path: &Path, direct: bool) -> io::Result<File> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_expert_file(path: &Path, _direct: bool) -> io::Result<File> {
+pub(crate) fn open_expert_file(path: &Path, _direct: bool) -> io::Result<File> {
     OpenOptions::new().read(true).open(path)
 }
 
@@ -2105,7 +2380,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The bounded fd cache must (a) keep at most `max_open_files`
+    /// **Tier 2.** A packed blob must return byte-identical payloads to the
+    /// one-file-per-expert path for both single (`read_expert`) and
+    /// coalesced (`read_experts_batch`) reads — including a shuffled
+    /// request that exercises the offset sort, a contiguous run serviced
+    /// by one `preadv`, and an isolated slot serviced by the singleton
+    /// fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn packed_blob_reads_match_per_file_including_coalesce() {
+        let dir = tempdir("packed");
+        let num_experts = 6u32;
+        let d_model = 8usize;
+        let d_ff = 16usize;
+        let block = 4096usize;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let expert_size = weight_bytes.div_ceil(block) * block;
+        generate_synthetic_experts(&dir, num_experts, expert_size, d_model, d_ff).unwrap();
+
+        let cfg = StorageConfig {
+            base_path: dir.clone(),
+            expert_size,
+            block_align: block,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        };
+        let source = NvmeStorage::new(cfg.clone()).unwrap();
+        let pool = BufferPool::new(num_experts as usize * 2 + 4, expert_size, block);
+
+        // Reference bytes via the per-file path.
+        let mut ref_bufs: Vec<Vec<u8>> = Vec::with_capacity(num_experts as usize);
+        for id in 0..num_experts {
+            let mut b = pool.acquire().await;
+            source.read_expert(id, &mut b).await.unwrap();
+            ref_bufs.push(b.as_slice().to_vec());
+        }
+
+        // Pack experts in id order, then open a packed storage over the blob.
+        let order: Vec<u32> = (0..num_experts).collect();
+        let blob_path = dir.join("experts.blob");
+        let manifest_path = dir.join("experts.manifest.json");
+        let manifest = pack_experts(&source, &pool, &order, &blob_path, &manifest_path)
+            .await
+            .unwrap();
+        assert_eq!(manifest.len(), num_experts as usize);
+        assert_eq!(manifest.entries[&3].offset, 3 * expert_size as u64);
+
+        let blob =
+            crate::packed_storage::PackedBlob::open(&blob_path, &manifest_path, false).unwrap();
+        let packed = NvmeStorage::new(cfg).unwrap().with_packed_blob(Arc::new(blob));
+        assert!(packed.is_packed());
+
+        // Single packed reads match the per-file bytes.
+        for id in 0..num_experts {
+            let mut b = pool.acquire().await;
+            packed.read_expert(id, &mut b).await.unwrap();
+            assert_eq!(
+                b.as_slice(),
+                ref_bufs[id as usize].as_slice(),
+                "single packed read mismatch on expert {id}"
+            );
+        }
+
+        // Coalesced batch: {0,1,2} is a contiguous run (one preadv) and {5}
+        // is isolated (singleton fallback). The request is shuffled so the
+        // offset sort is exercised; results must land in request order.
+        let ids = vec![2u32, 0, 1, 5];
+        let mut bufs: Vec<_> = Vec::with_capacity(ids.len());
+        for _ in &ids {
+            bufs.push(pool.acquire().await);
+        }
+        let mut buf_refs: Vec<&mut crate::buffer_pool::PooledBuffer> =
+            bufs.iter_mut().collect();
+        let total = packed
+            .read_experts_batch(&ids, &mut buf_refs)
+            .await
+            .unwrap();
+        assert_eq!(total, expert_size * ids.len());
+        for (slot, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                bufs[slot].as_slice(),
+                ref_bufs[id as usize].as_slice(),
+                "coalesced read mismatch: expert {id} in request slot {slot}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// descriptors resident, evicting the least-recently-used when a
     /// new expert is opened, and (b) still return correct bytes for an
     /// expert whose fd was evicted (it is simply re-opened on demand).
