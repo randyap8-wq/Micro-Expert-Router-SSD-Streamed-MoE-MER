@@ -1,94 +1,94 @@
 # Micro-Expert-Router, SSD-Streamed MoE Execution Engine
 
-A Rust execution engine for **Mixture-of-Experts** models that keeps the
-router resident in RAM and **hot-swaps individual experts on demand** from a
-PCIe-attached NVMe drive into a pool of pre-allocated, page-aligned RAM
-buffers using **`O_DIRECT`** positional reads (`pread(2)` via
-`tokio::task::block_in_place`, kernel-page-cache bypass). Each routed
-expert then **executes a real SwiGLU FFN forward pass** — the Mixtral /
-Llama expert shape shared by every supported family — directly over the
-bytes that just arrived from the drive.
+A Rust execution engine for **Mixture-of-Experts** models that treats SSD
+as the backing store for expert weights and RAM/VRAM as cache tiers. The
+engine streams routed expert blobs into page-aligned buffers with
+`O_DIRECT` positional reads, then executes a real SwiGLU FFN over those
+bytes. The current verified path is the `run` expert-streaming benchmark
+on **Mixtral 8x7B Q4_0** expert blobs.
 
-The premise is straightforward: a **modern PCIe-4 / 5 NVMe SSD sustains
-6-14 GB/s** of sequential read; a single Mixtral-8x7B expert is
-~336 MiB at bf16 / f16 and **~95 MiB at q4_K_M or q4_0** (the format
-llama.cpp ships by default); pulling the top-K active experts per token
-therefore costs a small fraction of a second of I/O per MoE layer, and
-**tens of milliseconds at 4-bit**, even when the *full* parameter set
-is 10-100× DRAM. Quantisation is what makes the trade-off practical
-on real models: 4-bit weights cut SSD bytes per token by ~3.5× vs bf16
-and let a single PCIe-4 NVMe sustain interactive token rates on
-modern MoE checkpoints (Mixtral, Qwen3-MoE, DeepSeek-V3, MiMo-V2-Flash,
-GPT-OSS, …). So you can run much larger models on much
-more modest hardware by treating the SSD as the main weight store and
-DRAM as a small cache of *active* experts. This engine is the
-substrate that makes that trade-off observable and measurable.
+The core question this repository measures is cache pressure: how routing
+locality, cache size, prefetching, and foreground SSD reads affect a real
+expert-FFN workload. PCIe-4/5 SSD sequential bandwidth is useful context,
+but the measured workload is shaped by random expert access, queue
+contention, VM storage virtualization, speculative traffic, and CPU
+compute. The benchmark numbers below are therefore observed workload
+throughput, not theoretical drive bandwidth and not full LLM generation
+throughput.
 
 The engine lives under [`rust-engine/`](./rust-engine).
 
-## Supported model families
+## Supported model status
 
-The loader is **architecture-aware**: point it at a HuggingFace
-`.safetensors` checkpoint and the engine auto-detects the family from its
-`config.json`, remaps every tensor name and hyperparameter, and runs the
-unified dense + SSD-streamed-MoE forward path — no hand-edited config
-required. Supported families:
+The loader has architecture-aware tensor-name and config handling for
+several families, but validation is not the same thing as parsing support.
+Current status:
 
-* **Mixtral 8x7B / 8x22B** (`mixtral`) — the original, fully-streamed MoE path.
-* **Qwen3-MoE** (`qwen3_moe`) + **Qwen3 dense** (`qwen3`) — `mlp.experts.*` names, QK-Norm attention.
-* **DeepSeek-V3 / V3.1** (`deepseek_v3`) — MLA latent-KV attention, FP8 `e4m3` weights, shared expert, sigmoid grouped-top-K routing, `first_k_dense_replace` dense prefix.
-* **Xiaomi MiMo-V2-Flash** (`mimo_v2_flash`) + **OpenAI GPT-OSS 20B / 120B** (`gpt_oss`) — per-layer **hybrid** sliding-window / global attention.
-* **Mistral Small 3** (`mistral3`) + **Phi-4** (`phi3`) — dense decoders (fused QKV / gate-up split at load).
-
-Mixtral remains the canonical streamed example (and the model behind the
-benchmark below), but it is no longer the only target. See
-[Supported model architectures](#supported-model-architectures) for the
-per-family tensor schemas, routing and attention details.
+| Status | Scope |
+|---|---|
+| **Verified expert-streaming benchmark target** | Mixtral 8x7B Q4_0 expert blobs from `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`, run on the CPU path with 256 layer-qualified experts and top-2 routing. |
+| **Implemented, not benchmark-validated here** | Mixtral/Llama-MoE `mixtral`, Qwen3-MoE `qwen3_moe`, DeepSeek-V3/V3.1 `deepseek_v3`, MiMo-V2-Flash `mimo_v2_flash`, and GPT-OSS `gpt_oss` source paths. See [Supported model architectures](#supported-model-architectures) for the implementation details and limitations. |
+| **Dense model support only** | Qwen3 dense, Mistral Small 3, and Phi-4 load dense decoder tensors but do not exercise SSD expert streaming. |
+| **Unsupported or known limitation** | Arbitrary sparse MoEs, arbitrary GGUF quantization recipes, and mixed expert projection dtypes are not automatically validated or supported. |
 
 ---
 
-## 🚀 Benchmark Results: Endurance Scaling
+## Verified CPU-Only Expert-Cache Scaling — Mixtral 8x7B
 
-Our latest endurance tests demonstrate the engine's ability to maintain stable performance at high context lengths (100k tokens) by utilizing an asynchronous out-of-core MoE architecture.
+These are the latest observed **CPU-only** results for the `run`
+expert-streaming benchmark. The benchmark executes real Q4_0 SwiGLU
+expert FFNs while exercising the cache, SSD reads, routing, and prefetch
+infrastructure. It is **not** full autoregressive decoder inference:
+`tokens/s` means benchmark iterations per second, not end-to-end
+generated language tokens per second. The synthetic benchmark router
+does not derive labels from the neural speculator's hidden state.
 
-### Comparative Performance
-| Metric | 5k Token Benchmark (Initial) | 100k Token Benchmark (Endurance) |
-| :--- | :--- | :--- |
-| **Sustained TPS** | 21.38 | **17.40** |
-| **Cache Hit Rate** | 97.46% | **99.87%** |
-| **I/O Share of Cycle** | 12.37% | **0.41%** |
-| **Context Length** | 5,000 tokens | **100,000 tokens** |
+Hardware and model: 2026-06-25, GCP `g2-standard-32`, 32 vCPUs / 16
+physical cores, 128 GB RAM, GCP local SSD, `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`.
+An NVIDIA L4 was attached to the VM but was not used for these runs.
+The GGUF was converted to native Q4_0 expert blobs: 256 layer-qualified
+expert files, top-2 routing, 99,090,432 bytes per expert
+(approximately 94.5 MiB).
 
-### Endurance Test Configuration (100k Tokens)
-* **Model:** mixtral-8x7b-instruct-v0.1.Q4_0.gguf
-* **Hardware:** VM g2-standard-32 (32 vCPU, 16 core, 128 GB RAM)
-* **GPU:** Optional (Engine dynamically optimized for CPU-native AVX-512)
-* **Memory Pool:** 256 cache slots (Out-of-core streaming)
+| Expert cache | Namespace cached | Approx. expert-cache payload | Iterations | Sustained benchmark TPS | Hit rate | Avg. I/O wait/token | I/O share |
+| -----------: | ---------------: | ---------------------------: | ---------: | ----------------------: | -------: | ------------------: | --------: |
+|     16 slots |            6.25% |                     1.48 GiB |     10,000 |                    2.91 |   79.64% |            251.6 ms |    73.86% |
+|     64 slots |              25% |                     5.91 GiB |     30,000 |                    7.78 |   94.71% |             16.0 ms |    12.99% |
+|    128 slots |              50% |                    11.81 GiB |     10,000 |                    9.45 |   96.83% |              7.7 ms |     7.55% |
 
-### Latency Stats (SwiGLU FFN per Token)
-| Operation | p50 | p95 | p99 |
-| :--- | :--- | :--- | :--- |
-| **Compute Latency** | 56.80 ms | 58.27 ms | 64.96 ms |
-| **I/O Latency** | 115.46 ms | 276.74 ms | 441.86 ms |
-| **Cycle Latency** | 56.83 ms | 58.34 ms | 65.15 ms |
+What the results show: at 16 slots the workload is strongly I/O-bound.
+Increasing the cache from 16 to 64 slots raised throughput by about
+2.67x and reduced I/O share from 73.86% to 12.99%. A 64-slot cache holds
+only 25% of the 256-expert namespace but reached a 94.71% hit rate under
+the tested skewed/correlated workload. Increasing from 64 to 128 slots
+added another roughly 21% throughput, showing diminishing returns as the
+run becomes more compute-bound. In this benchmark, routing locality and
+cache capacity dominate sustained performance.
 
-### Raw Run Summary (100k Tokens)
-```text
-2026-06-05T18:57:42.055300Z  INFO stream complete wall_s=5748.00s sustained_tps=17.40
-2026-06-05T18:57:42.055361Z  INFO experts:       256 (top-2), cache=256 slots
-2026-06-05T18:57:42.055379Z  INFO lookups:       hits=199748 misses=252 hit_rate=99.87%
-2026-06-05T18:57:42.055398Z  INFO i/o:           reads=252  bytes=24193.00 MiB
-2026-06-05T18:57:42.055410Z  INFO cycle latency: p50=56.83ms p95=58.34ms p99=65.15ms
-2026-06-05T18:57:42.055422Z  INFO per-token avg: io_wait=233.0us compute=57118.4us
-2026-06-05T18:57:42.055428Z  INFO I/O share:     0.41% of token cycle time spent waiting on SSD reads
-```
+The 64-slot run used 30,000 iterations, while the 16- and 128-slot runs
+used 10,000. Treat these as latest observed runs, not a perfectly
+controlled suite. A formal comparison should rerun every cache size with
+the same commit, seed, flags, workload trace, warm-up policy, and
+iteration count.
+
+Hardware ceiling footnote: these measurements ran inside a GCP VM on
+GCP local SSD. Bare-metal PCIe-4/5 NVMe devices can advertise higher
+sequential-read ceilings, commonly in the single-digit to low-teens
+GB/s range per drive, and striping can raise that ceiling further.
+Those ceilings are not directly comparable to this table because the
+benchmark issues routed expert reads with cache misses, foreground
+contention, speculative reads, and CPU FFN work in the loop. Use them as
+capacity-planning context, not as claimed benchmark TPS.
+
+Raw summaries and metric definitions live in
+[`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md).
 
 ---
 
 ## Table of Contents
 
-- [Supported model families](#supported-model-families)
-- [Benchmark Results](#-benchmark-results-endurance-scaling)
+- [Supported model status](#supported-model-status)
+- [Verified CPU-Only Expert-Cache Scaling — Mixtral 8x7B](#verified-cpu-only-expert-cache-scaling--mixtral-8x7b)
 - [What it actually does](#what-it-actually-does)
   - [End-to-end pipeline](#end-to-end-pipeline)
   - [What "running" actually does](#what-running-actually-does)
@@ -146,7 +146,6 @@ Our latest endurance tests demonstrate the engine's ability to maintain stable p
   - [Tier 3 — per-layer pre-gate (cross-layer prefetch)](#tier-3--per-layer-pre-gate-cross-layer-prefetch)
   - [Tier 4 — adaptive prefetch governor + cost-aware eviction](#tier-4--adaptive-prefetch-governor--cost-aware-eviction)
   - [Putting it together](#putting-it-together)
-- [3-tier heterogeneous memory cache (SSD → RAM → VRAM)](#3-tier-heterogeneous-memory-cache-ssd--ram--vram)
   - [`monitor` subcommand](#monitor-subcommand)
 - [Limitations / next steps](#limitations--next-steps)
 
@@ -193,7 +192,7 @@ token → |   Router   | → | Expert IDs   | → | LRU Cache | →  | SwiGLU FF
        non-evicting prefetches             NVMe SSD → DMA → RAM ────┘
                                                    ↓
                                           bytes reinterpreted as
-                                          f32 / f16 / int8 / Q4_K_M /
+                                          f32 / f16 / int8 / Q4_K /
                                           Q4_0 / Q8_0 weights → matmul
 ```
 
@@ -285,7 +284,7 @@ For each token, the engine:
    `pread(2)` per miss, or one fused `io_uring_enter` for the whole
    batch with `--io-uring`);
 3. **reinterprets the buffer as weight matrices** in the configured
-   dtype (`F32`, `F16`, `Int8`, `Q4_K_M`, `Q4_0`, or `Q8_0`, see
+   dtype (`F32`, `F16`, `Int8`, `Q4_K`, `Q4_0`, or `Q8_0`, see
    [Quantization](#1-on-disk-quantization---dtype)). For the
    floating-point dtypes this is a zero-copy reinterpretation; for
    the integer / block-quantised dtypes a small per-fetch
@@ -309,10 +308,10 @@ project's thesis is about **storage bandwidth**, not compute. The
 engine ships a **hardware auto-escalation** layer so a single binary
 picks the best available kernel on the host without recompilation,
 **and** an opt-in path that offloads the dense transformer body onto
-a **budget GPU** when one is available (the SSD-streamed expert
-pipeline always stays on CPU, matching the cost-efficiency thesis:
-cheap consumer cards for the dense body, NVMe + CPU for the long-tail
-experts, no high-end AI GPU required):
+a **budget GPU** when one is available. Default execution has a CPU
+fallback; setting `[real_transformer].compute_offload = "gpu"` selects
+the wgpu-backed `GpuBackend` at runtime and can use VRAM-resident
+experts when the GPU cache is enabled:
 
 * **Runtime row-parallel matmul**, always compiled. `matmul_row_major`
   and the per-expert `gate_up_swiglu` / `down_proj` paths fan their
@@ -395,9 +394,10 @@ experts, no high-end AI GPU required):
   (`attn_block`, `RmsNorm`, `LMHead`). When no GPU device can be
   acquired at startup the backend transparently falls back to the CPU
   `CandleBackend` (`BackendBox::init` logs `GPU init failed — activating
-  CPU fallback`). The SSD-streamed MoE experts continue to crunch on the
-  CPU auto-escalating SIMD dispatcher (or, with `--features cuda`, the
-  candle CUDA path, see [Building with CUDA](#building-with-cuda)). The
+  CPU fallback`). SSD-streamed MoE experts use the CPU fallback unless
+  they are promoted into the VRAM tier and dispatched through the
+  wgpu expert path; `--features cuda` is a separate candle CUDA path, see
+  [Building with CUDA](#building-with-cuda). The
   backend logs the **actual device runtime** (`cpu-fallback`,
   `cuda-0`, `wgpu-vulkan` …) at startup, gist Part 2 retired the
   previous stale `gpu-fallback` label so the log faithfully reports
@@ -425,14 +425,13 @@ INFO math backend installed backend=candle compute_offload=Cpu
 
 The **per-expert SwiGLU FFN itself** runs through Hugging Face
 [`candle-core`](https://github.com/huggingface/candle) on CPU
-by default (no `candle-nn`, no GPU backends pulled into the default
-build). When `compute_offload = "gpu"` selects the `wgpu`-backed
-`GpuBackend` at runtime (no cargo feature required), the dense
-transformer body's matmuls and SwiGLU rows are dispatched
-through `GpuBackend`'s wgpu compute pipeline; the per-expert
-SwiGLU FFN remains on the CPU path so the SSD-streaming guarantees
-hold (page-aligned `&[u8]` from `ExpertResident::data()` →
-`candle_core::Tensor` via `ExpertWeights::to_candle_tensors`). The
+by default (no `candle-nn` or candle GPU feature required for the CPU
+fallback). When `compute_offload = "gpu"` selects the `wgpu`-backed
+`GpuBackend` at runtime (no cargo feature required), dense matmuls,
+SwiGLU rows, softmax, attention, and eligible VRAM-resident expert
+matmuls can dispatch through the wgpu compute pipeline. If GPU init
+fails or an expert is not GPU-eligible/resident, execution falls back to
+the CPU path. The
 proprietary I/O substrate (`expert_cache`, `buffer_pool`, `io_provider`,
 the O_DIRECT `pread(2)` path) is strictly preserved regardless of
 which backend the dense body uses.
@@ -453,7 +452,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 |---|---|
 | `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. Reused by [`AlignedKvCache`](#page-aligned-kv-cache-buffer) so the session-scoped K/V state can be snapshotted to NVMe with no extra copy. |
 | `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s, optionally split into **primary** + **shadow** halves sharing one `Notify`. Hands out `PooledBuffer` RAII guards; `try_acquire`/`try_acquire_shadow` route to the corresponding free list; dropping a guard returns the buffer to its originating list and wakes waiters. `promote_shadow` does the zero-copy slot-tag swap when a speculative prefetch is confirmed. The literal "pre-allocated RAM buffer" the spec asks for. |
-| `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Eviction returns the `Arc`; once all references drop, the buffer goes back to the pool automatically. |
+| `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Also owns the optional `GpuExpertCache` VRAM tier: hot RAM residents can promote into Anchor Core + LRU Edge regions, wgpu can materialize promoted experts as device buffers, and the CPU path remains the fallback when GPU execution is unavailable. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. **Now wired into the engine hot path** (gist Part 1 fix #2): `EngineCore::cache` is an `Arc<MultiLayerExpertCache>` and `run`/`serve` distribute `--cache-slots` across `num_layers` (uniform per-layer caps via `MultiLayerExpertCache::with_capacities`, with any remainder going to the lowest-indexed layers). Single-layer / `--io-only` mode collapses to `MultiLayerExpertCache::single_layer(cap)` so existing benchmark paths are byte-identical. |
 | `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. Exposes `utilization()` and a three-level `PressureLevel { Normal, High, Critical }` whose soft-cap / critical ratios default to `SOFT_CAP_RATIO = 0.90` / `CRITICAL_PRESSURE_RATIO = 0.98` but are **operator-configurable** via `[real_transformer].pressure_high_threshold` / `pressure_critical_threshold` in `config.toml` (gist Part 1 fix #4), the [batch scheduler](#continuous-batching) reads the current level every batch to drive **preemptive idle-block eviction** and **speculation-depth clamping**. The overflow slab is **bounded** by `[real_transformer].max_overflow_capacity` (`PressureThresholds::with_max_overflow_capacity`, gist Part 1 fix #5): once the pool grows past the cap, `allocate` returns `None` so `BlockManager` surfaces `BlockAllocError::Exhausted` to the admission path instead of letting overflow grow unboundedly. |
 | `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`) routed through the **fault-tolerant `read_at_with_retries` path**: three-tier exponential backoff on transient errors (EIO / EINTR / `WouldBlock` / `TimedOut` / `EAGAIN`; short reads / `UnexpectedEof` fail fast) plus a per-expert **circuit breaker** that trips after `STORAGE_BREAKER_THRESHOLD = 3` consecutive failures and short-circuits to a structured `HardwareFailure::ExpertUnavailable`. A **per-drive** breaker (`STORAGE_DRIVE_BREAKER_THRESHOLD = 3`, sticky `DriveBreakerState`) sums failures across all experts sharded onto the same shard and short-circuits to `HardwareFailure::DriveUnavailable` so the engine stops routing to a known-bad drive without ever issuing the syscall, gist Phase 3. Both breakers transition to **half-open** after `STORAGE_BREAKER_PROBE_INTERVAL = 500 ms`, admitting exactly one probe read per interval via a `compare_exchange` on `tripped_at_ms` so a recovered drive can actually reach the `note_read_success` path and clear the breaker. Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
@@ -479,7 +478,6 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[security]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`, `[gpu_cache]`. Validated at startup. |
-| `expert_cache` (3-tier extension) | Alongside the legacy RAM-resident `ExpertCache`, this module now also defines `GpuExpertCache`, the optional **VRAM tier** of a 3-tier SSD → RAM → VRAM hierarchy. It is an **Anchor Core + LRU Edge** structure: experts whose RAM-side hit count (`ExpertResident::hits`) crosses `[gpu_cache] promote_after_hits` are pinned into the Anchor Core (HashMap, capped at `vram_anchor_ratio * vram_capacity_mb`); all other promotions land in the LRU Edge (capped at the remainder). Engine wiring is hot-path additive, `Engine::generate` / `Engine::moe_step` probe the VRAM tier first, bump RAM hits on a miss, and enqueue a promotion on a background tokio task installed by `Engine::install_gpu_cache`. On CPU-only builds the VRAM bytes are emulated host-side; with `--features cuda`, `inference::run_inference_gpu` dispatches the SwiGLU matmul through `candle-core`'s CUDA backend (falls back to the existing CPU kernel if the device is unavailable). |
 | `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`micro-expert-router monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a 3-tier hit grid with one **delta-calculated** sparkline per tier (VRAM / RAM / SSD, pulse per refresh tick, not a cumulative staircase), a VRAM/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`, plus the operator endpoints `GET /v1/admin/health/experts` and `POST /v1/admin/evict`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
 | `middleware` | Production-readiness HTTP middleware layered onto the `server` router via `axum::middleware::from_fn_with_state`: per-request UUID tracing span, optional **API-key gate** (`[security].api_keys`; `401` when configured and missing/unknown), optional **per-key token-bucket rate limit** (`rate_limit_rps` / `rate_limit_burst`; `429` on overflow), and **admission control** (`[server].max_concurrent_requests`, `[server].admission_min_free_blocks` against the paged-KV pool; `503` when saturated). Defaults are fully permissive so legacy benchmark / development flows are byte-identical. |
@@ -872,11 +870,10 @@ verified end-to-end.
 ### Run the simulation
 
 ```bash
-# 200-token stream, top-2 routing. The cache holds 4 experts at a time
-# (the engine's default, the whole point is to stream from SSD, so a
-# big in-RAM cache hides the metric you're trying to measure; the
-# engine warns above 16). d_model / d_ff MUST match what was passed to
-# gen-data.
+# 200-iteration stream, top-2 routing. Tiny synthetic examples can use
+# 4 cache slots. Full Mixtral cache-scaling runs should sweep cache size
+# against hit rate, I/O share, and TPS; larger caches do not invalidate
+# the experiment. d_model / d_ff MUST match what was passed to gen-data.
 ./target/release/micro-expert-router run \
   --data-dir ./data \
   --num-experts 64 \
@@ -1535,7 +1532,7 @@ INFO energy knobs:  dtype=f32  partial_load_fraction=1.00  pinned=0  alias_redir
 When the predictive `L` / `M` arms are enabled, one extra line is appended:
 
 ```
-INFO predictive:    locality=on (hit_rate=64.32%)  speculator=on (accuracy=58.10%)  ssd_stall=12.4ms
+INFO predictive:    locality=on (hit_rate=64.32%)  speculator=on (top1=0.28% precision_at_k=58.10%)  ssd_stall=12.4ms
 ```
 
 #### Enabling the predictive prefetcher (and A/B testing it)
@@ -1653,7 +1650,9 @@ micro-expert-router run
   --expert-size <BYTES>      Must match gen-data
   --d-model <N>              Must match gen-data
   --d-ff <N>                 Must match gen-data
-  --cache-slots <N>          Resident experts (default 4; warns if > 16)
+  --cache-slots <N>          Resident experts. Tiny synthetic examples often
+                              use 4; full 256-expert Mixtral cache-scaling
+                              runs tested 16, 64, and 128 slots.
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
   --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 | q8_0 (default f32).
@@ -1886,17 +1885,23 @@ cargo run --release --manifest-path rust-engine/Cargo.toml -- \
 
 **2. From a GGUF checkpoint (`gguf-convert`).** No Python required,
 the engine's built-in GGUF reader handles llama.cpp / Ollama-style
-files directly. Supports `F32`, `F16`, `Q4_0`, `Q4_K_M`, and `Q8_0`
-natively; `Q6_K` tensors are recognised but fall back to seeded init
-(the engine doesn't dequantise Q6_K). The output directory has the
-same shape as the Mixtral extractor's: `expert_<layer>_<id>.bin`
-blobs + `metadata.json` + per-tensor dense weight files.
+files directly. The currently verified Mixtral conversion and benchmark
+path is **Q4_0**. Native passthrough supports homogeneous expert
+projection triples in `Q4_0`, `Q4_K`, or `Q8_0` when gate, up, and down
+all share that dtype and the tensor shapes satisfy the block-alignment
+requirements. Arbitrary model-level `Q4_K_M` files are **not** the same
+as homogeneous `q4k` expert blobs: common `Q4_K_M` recipes can mix
+`Q4_K` and `Q6_K` projections, and mixed triples are unsupported until
+the runtime format supports per-projection dtypes. The output directory
+has the same shape as the Mixtral extractor's:
+`expert_<layer>_<id>.bin` blobs + `metadata.json` + per-tensor dense
+weight files.
 
 `gguf-convert` defaults to a **streaming reader** that parses only
 the GGUF header and seeks each tensor body on demand, a strict win
 for ≥ 100 GB checkpoints. `--gguf-path` may point to a normal GGUF
 or to any file in a standard split set such as
-`Model-Q4_K_M-00002-of-00005.gguf`; the converter discovers sibling
+`Model-Q4_0-00002-of-00005.gguf`; the converter discovers sibling
 shards, validates split metadata when present, and exposes one tensor
 namespace without merging files. Pass `--legacy-eager` to fall back to the
 in-memory reader for ordinary single-file GGUFs. By default every `expert_<id>.bin` is prefixed with
@@ -1905,21 +1910,24 @@ quant-scale offset) padded to 4 KiB so the weight payload still
 starts at an `O_DIRECT`-friendly boundary; pass `--no-uth` to opt
 out for compatibility with consumers that pre-date the header.
 
-For source GGUFs whose expert tensors are already stored as `Q4_0`,
-`Q4_K_M`, or `Q8_0`, pass `--native-quant` to write the **raw
-quantised block stream** to disk instead of dequantising to F32
-first. The output `expert_<id>.bin` is then ~7× smaller for the
-4-bit dtypes (~4× smaller for `Q8_0`) and the engine's
-`run_inference_q4_0` / `run_inference_q4k` / `run_inference_q8_0`
-paths consume it directly. The flag falls back automatically (with
-a logged warning) when the source dtype isn't one of these or when
-the per-expert weight count `d_ff*d_model` isn't a clean multiple of
-the block size; the converter records what was actually written
-into `metadata.json::dtype`.
+For source GGUFs whose expert tensors are already stored as homogeneous
+`Q4_0`, `Q4_K`, or `Q8_0`, pass `--native-quant` to write the **raw
+quantised block stream** to disk instead of dequantising to F32 first.
+The output `expert_<id>.bin` is then ~7× smaller for the 4-bit dtypes
+(~4× smaller for `Q8_0`) and the engine's `run_inference_q4_0` /
+`run_inference_q4k` / `run_inference_q8_0` paths consume it directly.
+The flag falls back automatically (with a logged warning) when the
+source dtype is ineligible, mixed, or not block-aligned; the converter
+records what was actually written into `metadata.json::dtype`.
+
+> **Conversion warning:** logs containing `emitting zero blob` mean the
+> converter wrote placeholder expert weights because source tensors were
+> missing or unsupported. That output is useful for surfacing a loader
+> problem, but it is **not** a successful usable model conversion.
 
 ```bash
 ./target/release/micro-expert-router gguf-convert \
-    --gguf-path ./mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf \
+    --gguf-path ./mixtral-8x7b-instruct-v0.1.Q4_0.gguf \
     --out-dir   ./mixtral-data \
     --native-quant \
     # add --no-uth and/or --legacy-eager if your tooling needs them
@@ -2034,7 +2042,9 @@ Per-family specifics:
   `expert_<layer>_<id>.bin` with `scripts/extract_mixtral_experts.py` or
   `gguf-convert` (see options 1–2 above) and point `--data-dir` /
   `[model].data_dir` at them; `weights_dir` supplies the resident dense
-  tensors. `q4_K_M` is the practical default dtype.
+  tensors. Q4_0 is the currently verified Mixtral GGUF conversion and
+  benchmark path; homogeneous `Q4_K` passthrough is supported only when
+  the expert projection triples are eligible.
 * **Qwen3-MoE (`qwen3_moe`) — ✅ loadable.** Just set `weights_dir`; the
   128-expert router and `mlp.experts.*` names load automatically. Expert
   FFNs still stream from `--data-dir`; extract them with
@@ -2078,13 +2088,14 @@ zero-padding tail so the on-disk blob is a multiple of the 4 KiB
 | `f32` | 4 | ~672 MiB | ~5.3 GiB | ~170 GB |
 | `bf16` / `f16` | 2 | **~336 MiB** | ~2.6 GiB | ~85 GB |
 | `int8` / `q8_0` | 1 / ~1.0625 | ~168–178 MiB | ~1.3–1.4 GiB | ~43–46 GB |
-| `q4_0` / `q4_K_M` | ~0.5625 | **~95 MiB** | ~750 MiB | ~24 GB |
+| `q4_0` / homogeneous `q4k` | ~0.5625 | **~94.5-95 MiB** | ~750 MiB | ~24 GB |
 
 **Mixtral-8x22B** is ~1.7× larger per expert
 (`d_model = 6144`, `d_ff = 16384`, ~302 M weights/expert):
-~576 MiB at bf16, ~302 MiB at q8_0, ~162 MiB at q4_K_M; one of its
-8-expert layers occupies ~4.6 GiB at bf16 or ~1.3 GiB at q4_K_M, and
-the full 56 layers come to ~258 GB at bf16 or ~73 GB at q4_K_M.
+~576 MiB at bf16, ~302 MiB at q8_0, ~162 MiB at homogeneous 4-bit
+expert storage; one of its 8-expert layers occupies ~4.6 GiB at bf16 or
+~1.3 GiB at homogeneous 4-bit, and the full 56 layers come to ~258 GB at
+bf16 or ~73 GB at homogeneous 4-bit.
 
 **What this translates to at runtime.** With top-2 routing the per-token
 SSD bandwidth requirement is `2 · per_expert_bytes` for every MoE layer
@@ -2096,19 +2107,22 @@ PCIe-4 (~6 GB/s) and PCIe-5 (~12 GB/s) NVMe that works out to roughly:
 |---|---:|---:|---:|---|
 | `bf16` / `f16` | ~672 MiB | ~110 ms | ~55 ms | only with high cache hit rate + small `cache_slots` ratio; this is the regime where the predictive arms earn their keep |
 | `q8_0` | ~340 MiB | ~55 ms | ~27 ms | comfortable on PCIe-5, tight on PCIe-4 |
-| `q4_K_M` / `q4_0` | ~190 MiB | ~30 ms | ~15 ms | comfortable on any modern NVMe, including a single PCIe-4 drive |
+| `q4_0` / homogeneous `q4k` | ~190 MiB | ~30 ms | ~15 ms | comfortable on any modern NVMe, including a single PCIe-4 drive |
 
 Numbers are sequential-read wall-clock assuming every fetch is a cache
 miss; in practice the predictor + LRU + frequency-pin path turns most
 fetches into hits and the engine reports the **realised** per-token I/O
 wait as `i/o latency` and `I/O share` in the run summary. The headline
-is that **`q4_K_M` (or `q4_0`) is the practical default for running
-real Mixtral checkpoints from SSD**: it fits the full 8x7B in ~24 GB of
-NVMe, keeps per-layer I/O under a PCIe-4 frame budget, and is exactly
-the dtype `gguf-convert --native-quant` writes to disk. Mixtral-8x22B
-needs PCIe-5 or multi-drive striping (see `--data-dir DIR1,DIR2...`)
-to stay interactive even at q4_K_M; bf16 / f16 are best treated as
-fidelity references rather than production knobs.
+is that **Q4_0 is the verified practical path for running Mixtral 8x7B
+expert blobs from SSD**: it fits the full 8x7B expert namespace in
+about 24 GB of NVMe and keeps per-layer cold-miss I/O in the tens of
+milliseconds on PCIe-4-class storage. Homogeneous `Q4_K` can use the
+same native expert-blob path when eligible, but mixed `Q4_K/Q6_K`
+model-level recipes need converter/runtime work before they should be
+documented as usable. Mixtral-8x22B needs PCIe-5 or multi-drive striping
+(see `--data-dir DIR1,DIR2...`) to stay interactive at 4-bit; bf16 /
+f16 are best treated as fidelity references rather than production
+knobs.
 
 ### Routing model, Markov chain, transition matrix, or LinearGate
 
@@ -2119,8 +2133,10 @@ Three routers are available, all reproducible given `--seed`:
    `--router-clusters` groups (by `id % cluster_count`) and the chain
    stays inside its current cluster with probability
    `--router-intra-p` (default `0.9`). Produces the "topic-sticky"
-   behaviour real MoE traces show, the predictor converges quickly
-   and prefetch hit rate climbs above 60%.
+   behaviour seen in skewed routing traces. The synthetic Markov
+   labels are independent of `synth_hidden_state`, so the neural
+   speculator's top-1 accuracy is expected to stay near random unless
+   the labels are actually hidden-state-derived.
 2. **Loaded transition matrix (`--router-matrix path.txt`).** Supply a
    whitespace-separated `num_experts × num_experts` matrix of `f64`
    transition probabilities, row-major. Rows are normalised to sum to
@@ -2147,158 +2163,42 @@ for clean numbers.
 
 ## What can it actually run today?
 
-**Today, in this repository: a real, architecture-aware MoE transformer
-forward pass with experts streamed from NVMe** — Mixtral, Qwen3-MoE,
-DeepSeek-V3 (MLA), MiMo-V2-Flash and GPT-OSS all run the same path. When
-`[real_transformer].enabled = true` the server runs the full decoder
+When `[real_transformer].enabled = true`, the server uses the full
+decoder skeleton:
 
-```
-embedding -> for each layer: ( RMSNorm -> MultiHeadSelfAttention -> +
-                               RMSNorm -> LinearGate.route -> moe_step -> + )
-            -> final RMSNorm -> LMHead -> sample
+```text
+embedding -> per layer: RMSNorm -> attention -> RMSNorm -> LinearGate -> moe_step
+          -> final RMSNorm -> LMHead -> sample
 ```
 
-`moe_step` reads expert weights from SSD via the LRU cache, so the
-SSD-streaming substrate is exercised on every routed expert. The
-dense (resident) tensors, embedding, attention projections, the
-learned MoE gate, RMSNorm gains, LM head, are loaded from
-`real_transformer.weights_dir` (or fall back to a deterministic
-seeded init when files are missing, so a smoke run is always
-possible). Each routed expert performs the exact
-`down · (silu(gate·x) ⊙ (up·x))` block that every modern sparse
-MoE transformer uses for its experts, at synthetic-or-real
-dimensions (`d_model`, `d_ff`).
+`moe_step` reads expert weights from SSD through the same cache used by
+the benchmark and executes `down · (silu(gate·x) ⊙ (up·x))` for each
+routed expert. The benchmark path defaults to a deterministic Markov
+router so cache behavior is reproducible; the real-transformer path uses
+the learned per-layer `LinearGate` driven by hidden state.
 
-Tokenisation goes through the [`tokenizers`] crate when the
-`tokenizer` cargo feature is enabled and `tokenizer.json` is
-configured, with a deterministic byte-level fallback otherwise.
-Next-token selection runs through a configurable
-softmax-temperature + top-K + top-P sampler (see
-[Sampling](#sampling)), and per-request KV caches can be persisted
-between HTTP calls via the [Session API](#session-api).
+| Category | What is present today | Validation status |
+|---|---|---|
+| Verified end-to-end benchmark | Mixtral 8x7B Q4_0 expert blobs, 256 layer-qualified experts, top-2 routing, CPU path | Latest observed cache-scaling results are in the benchmark section above. |
+| Implemented but not benchmark-validated here | Mixtral/Llama-MoE, Qwen3-MoE, DeepSeek-V3/V3.1, MiMo-V2-Flash, GPT-OSS source paths | Architecture parsing, model construction, routing, and runtime hooks exist, but this README should not imply published throughput/quality validation for each family. |
+| Loader/schema or dense support | Qwen3 dense, Mistral Small 3, Phi-4 | Useful for tensor-name coverage and dense smoke runs; they do not exercise SSD expert streaming. |
+| Known limitations | Arbitrary sparse MoE families, mixed `Q4_K/Q6_K` expert triples, unsupported projection dtypes, and conversion logs with `emitting zero blob` | Require separate implementation or validation before being documented as usable. |
 
-What is **still synthetic by default**:
-
-- **The router** is, by default, a deterministic Markov chain over
-  expert ids (clustered locality, or load a real Mixtral routing-trace
-  matrix via `--router-matrix`). When `[real_transformer]` is enabled
-  routing instead goes through the per-layer learned `LinearGate`
-  driven by the actual hidden state, the same `softmax`-over-gate-
-  logits a real MoE implementation uses. The Markov path stays
-  available for benchmarks where you want a fixed, reproducible
-  routing distribution independent of the model weights.
-- **Combining** uses the gate's softmax probabilities as weights on
-  the K expert outputs (real gate-weighted sum). The legacy
-  uniform-average path is preserved for the synthetic / benchmark
-  pipeline only.
-
-So: the engine demonstrates **the per-token forward pass of a sparse
-MoE transformer**, end-to-end, with experts paged off the SSD and
-real logit-driven token sampling. The per-expert SwiGLU forward pass
-**already runs through the Hugging Face [`candle-core`](https://github.com/huggingface/candle)
-tensor backend** (CPU-only, no `candle-nn`, no GPU backends pulled
-in); the page-aligned `&[u8]` returned by `ExpertResident::data()` is
-reinterpreted by `inference::ExpertWeights::from_bytes` and bridged
-into `candle_core::Tensor`s via `ExpertWeights::to_candle_tensors`,
-so the SSD-streaming substrate (`expert_cache`, `buffer_pool`,
-`io_provider`, the O_DIRECT `pread(2)` path) is preserved unchanged
-while the matmul + `silu` activation use Candle's built-in kernels.
-Swapping in a different backend (e.g. a GPU-enabled Candle build, or
-`tch` / `cudarc`) is a localised change inside `inference.rs`.
-
-Real MoE expert weights can already be fed to the engine end-to-end
-via [`scripts/extract_mixtral_experts.py`](./scripts/extract_mixtral_experts.py)
-(architecture-aware despite the name — Mixtral, Qwen3-MoE and DeepSeek
-schemas are auto-detected), which dumps a layer's experts into the
-on-disk format the engine expects (plus a `metadata.json` that `run`
-auto-loads). See [Running on real MoE weights](#running-on-real-moe-weights).
-
-That said, the architecture (per-expert files, fixed expert size,
-top-K activation, LRU + prefetch) is shaped specifically for **sparse
-Mixture-of-Experts transformers where the expert FFNs are the dominant
-weight**. Concretely, the following published models drop into this layout
-with no architectural changes, only a real attention/embedding kernel and
-a sharding script that splits their `safetensors` into one
-`expert_<id>.bin` per expert (or per-layer-per-expert, see "Sharding
-granularity" below):
-
-| Model | Total params | Active / token | Experts | Top-K | Per-expert FFN (bf16) | Per-expert at q4_K_M | Notes |
-|---|---|---|---|---|---|---|---|
-| **Mixtral 8x7B** | ~47 B | ~12.9 B | 8 × 32 layers | 2 | ~336 MiB | ~95 MiB | Canonical fit. ~85 GB of expert weight at bf16, ~24 GB at q4_K_M; the 4-bit case streams comfortably from a single PCIe-4 NVMe. |
-| **Mixtral 8x22B** | ~141 B | ~39 B | 8 × 56 layers | 2 | ~576 MiB | ~162 MiB | bf16 wants PCIe-5 (or multi-drive striping via `--data-dir DIR1,DIR2...`); q4_K_M is comfortable on a single PCIe-4. Cache 8–16 experts; prefetcher learns the routing well. |
-| **Phi-3.5-MoE-instruct** | ~42 B | ~6.6 B | 16 × 32 layers | 2 | ~150 MiB | ~42 MiB | Smaller experts, more of them, exercises the predictor harder. |
-| **Qwen1.5-MoE-A2.7B / Qwen2-MoE** | ~14 B | ~2.7 B | 60 × 24 layers | 4 | ~16 MiB | ~5 MiB | Fine-grained experts; ideal for demonstrating prefetch hit-rate. |
-| **DeepSeek-MoE 16B** | ~16.4 B | ~2.8 B | 64 routed + 2 shared × 28 layers | 6 | ~16 MiB | ~5 MiB | "Shared experts" should be pinned (use `--first-token` to warm them, set `--cache-slots` ≥ shared count). |
-| **DeepSeek-V2-Lite / V2** | 16 B / 236 B | 2.4 B / 21 B | 64–160 × many layers | 6 | small (≤ ~20 MiB) | small (≤ ~6 MiB) | Same shape, larger scale. V2-full needs PCIe-5 + ≥ 32 cache slots to keep p99 sane. |
-| **DeepSeek-V3 / V3-0324** | 671 B | 37 B | 256 routed + 1 shared × 61 layers | 8 | small but many (~15 K tensors) | ditto | Stress test of the design. Sharding at per-layer-per-expert is mandatory. |
-| **OLMoE-1B-7B** | 7 B | 1.3 B | 64 × 16 layers | 8 | ~12 MiB | ~3.5 MiB | Open-everything; good for benchmarking and reproducibility. |
-| **Snowflake Arctic** | 480 B | 17 B | 128 × 35 layers | 2 | medium (dense + sparse mix) | medium | Hybrid dense + MoE; top-2 on the sparse side makes the prefetcher very effective. |
-| **Grok-1** | 314 B | ~78 B | 8 × 64 layers | 2 | ~1.1 GiB | ~315 MiB | Per-expert footprint approaches a gigabyte even at 4-bit; keep `--cache-slots` modest and let the LRU breathe, or stripe across drives. |
-
-Numbers above are weight-only (the three SwiGLU matrices
-`3 · d_model · d_ff` per expert), rounded for legibility, and assume
-the GGUF block-quant overhead the engine actually reads from disk
-(see [Quantization](#1-on-disk-quantization---dtype) for the byte-
-per-weight constants). On-disk blobs add 4 KiB of zero-pad to land
-on an `O_DIRECT` block boundary, and INT8 adds a 12-byte per-expert
-scale header.
-
-**How that translates to running them.** For a top-K MoE layer with
-every expert missing the cache, the per-layer SSD bandwidth at token
-*t* is approximately `K · per_expert_bytes`. Multiplying by the layer
-count and dividing by the drive's sequential read rate gives the
-per-token worst-case SSD wait; the predictor + LRU + frequency-pin
-path cuts this dramatically once the routing converges (the
-`/metrics` `mer_*_hits_total` counters and the run summary's
-`I/O share` quantify how much). For the top-2 models above on a
-single PCIe-4 (~6 GB/s) NVMe:
-
-* **Mixtral-8x7B at q4_K_M**: ~190 MiB / layer worst-case ⇒ ~30 ms
-  layer wait; whole-token worst-case across 32 layers is ~1 s if
-  every layer misses both experts, which essentially never happens
-  once `L` + `M` are engaged.
-* **Mixtral-8x7B at bf16**: ~672 MiB / layer worst-case ⇒ ~110 ms
-  layer wait. PCIe-5 (~12 GB/s) cuts that to ~55 ms. Practical
-  only with a high cache hit rate; this is the regime where the
-  predictive arms (`S ∪ L ∪ M`) and frequency-pinning earn their
-  keep.
-* **Mixtral-8x22B at q4_K_M**: ~325 MiB / layer worst-case ⇒
-  ~55 ms on PCIe-4, ~27 ms on PCIe-5. Comfortable with a warm cache.
-* **Qwen-/OLMoE-/DeepSeek-MoE-class (small experts, high top-K)**:
-  the per-layer fetch is dominated by the *number* of activated
-  experts, not their size, top-4 / top-6 / top-8 over ~5–16 MiB
-  experts is ~20–100 MiB / layer worst-case, ⇒ a handful of
-  milliseconds per layer on any modern NVMe. These are the
-  configurations where the prefetcher's hit-rate is the dominant
-  knob.
-
-The practical rule is: **`q4_K_M` (or `q4_0`) is the default for
-running real Mixtral / Llama-MoE checkpoints from SSD**; bf16 / f16
-are fidelity references for small models or development; `int8` /
-`q8_0` are a middle ground when accuracy is sensitive but 4-bit is
-too lossy. Use `gguf-convert --native-quant` to write the on-disk
-4-bit block stream directly (no F32 detour), pair it with
-`--features io_uring` on Linux, and pick `--cache-slots` so the
-resident set is a few times your top-K but well below the full
-expert count, that's the configuration the engine is shaped for.
-
-What this means in practice:
-
-- **Any **sparse MoE** transformer whose forward pass is "router → top-K MLPs"
-  is compatible.** That covers essentially every modern open-weights MoE.
-- **Dense models do not benefit.** A dense Llama-3 has no experts to swap.
-- **Vision/multimodal MoEs (e.g. DeepSeek-VL2-MoE) work the same way** as
-  long as the visual encoder is held resident in RAM (it's tiny next to the
-  expert pool).
+Per-expert sizing is still useful for planning: a Mixtral 8x7B expert is
+about 336 MiB at bf16/f16, about 168-178 MiB at int8/Q8_0, and about
+94.5 MiB for the verified Q4_0 benchmark blobs. Do not automatically
+assign that same size to model-level `Q4_K_M` files because mixed
+quantization recipes can have different storage costs.
 
 ### Agents
 
 The engine is *inference infrastructure*, not an agent runtime. There is
 nothing here that loops over tool calls, parses ReAct traces, or manages
-memory between turns. However, **any agent framework that delegates
-generation to one of the LLMs above can use this engine as the underlying
-serving layer** (the per-expert SwiGLU FFN already runs through
-`candle-core`, and the OpenAI-compatible HTTP server is in place),
+memory between turns. However, an agent framework that delegates
+generation to an OpenAI-compatible model server can use this engine as
+the underlying serving layer once the target model path is validated
+(the per-expert SwiGLU FFN already runs through `candle-core`, and the
+HTTP server is in place),
 LangChain, LangGraph, Microsoft AutoGen, CrewAI, llama-index,
 OpenAI-Agents-SDK, and the `smolagents` family are all framework-agnostic
 about the model server. The practical path is: this engine's
@@ -2327,15 +2227,15 @@ latency / throughput numbers for that model's I/O profile.
 
 ### Picking a tensor backend
 
-The per-expert SwiGLU FFN currently runs through **`candle-core`**
-(CPU-only, no `candle-nn`, no GPU backends), bridged in
-`inference::ExpertWeights::to_candle_tensors` /
-`ExpertWeights::forward_candle`. Alternative backends are a
-localised swap inside `inference.rs`:
+The per-expert SwiGLU FFN has a CPU fallback and can also route through
+the wgpu-backed `GpuBackend` when `[real_transformer].compute_offload =
+"gpu"` is selected and experts are VRAM-resident. Alternative executors
+plug in through the backend trait:
 
 | Backend | Language | MoE support | Notes |
 |---|---|---|---|
-| **`candle-core`** *(in tree, default)* | Rust | Used here for the per-expert SwiGLU | CPU-only build; a future PR can flip on a GPU backend (`cuda`, `metal`) without touching call sites. |
+| **`candle-core` / CPU fallback** *(in tree, default)* | Rust | Used here for the per-expert SwiGLU | Default execution path when GPU init is disabled or unavailable. |
+| **`GpuBackend`** *(in tree, wgpu)* | Rust/WGSL | Runtime-selected expert and dense compute path | Enabled through `[real_transformer].compute_offload = "gpu"`; falls back to CPU when no suitable device is acquired. |
 | **`mistral.rs`** | Rust | First-class (Mixtral, DeepSeek, Phi-MoE, Qwen-MoE) | Closest fit if you want a higher-level engine; replace its weight loader with this engine's `ExpertCache::get`. |
 | **`burn`** | Rust | Generic; community Mixtral | Pluggable compute backends (wgpu, cuda, ndarray). |
 | **`llama.cpp` (GGUF MoE)** | C++ | Mixtral, DeepSeek, Qwen-MoE, OLMoE | FFI required. GGUF stores experts contiguously per layer, easy to map to per-expert files. |
@@ -2486,7 +2386,7 @@ read. Six on-disk dtypes are first-class:
 | `f32` | 4 | none | zero-copy reinterpret + Candle matmul | reference / highest fidelity |
 | `f16` | 2 | none | per-fetch `f16 → f32` then Candle matmul | ~2× less SSD energy than `f32` |
 | `int8` | 1 | 12 B (`[gate, up, down]: [f32; 3]` per-tensor scales) | symmetric per-tensor dequant + Candle matmul | ~4× less SSD energy than `f32` |
-| `q4k` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q4_K_M` 256-block stream, no F32 dequant of the weights. **Fallback**: 256-block dequant (f16 super-scale + 6-bit sub-scales + 4-bit weights) when `cols % 256 != 0`. | GGUF-compatible 4-bit |
+| `q4k` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over a homogeneous on-disk `Q4_K` 256-block stream, no F32 dequant of the weights. **Fallback**: 256-block dequant (f16 super-scale + 6-bit sub-scales + 4-bit weights) when `cols % 256 != 0`. | GGUF-compatible 4-bit expert blob; do not confuse with arbitrary model-level `Q4_K_M` recipes |
 | `q4_0` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q4_0` 32-block stream, no F32 dequant of the weights. **Fallback**: 32-block dequant (f16 scale, symmetric 4-bit nibbles) when `cols % 32 != 0`. | the most widely-used 4-bit format; chosen by the predictive-controller spec |
 | `q8_0` | ~1.0625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q8_0` 32-block stream (one `f16` scale + 32 signed `i8` weights per block). **Fallback**: 32-block dequant when `cols % 32 != 0`. | GGUF-compatible 8-bit; same density as `int8` but with **per-block** scales, so dynamic range stays bounded inside each 32-weight neighbourhood |
 
@@ -2799,7 +2699,7 @@ The CLI run summary (`print_summary`) appends an extra line when
 either arm is enabled, e.g.:
 
 ```
-predictive:    locality=on (hit_rate=64.32%)  speculator=on (accuracy=58.10%)  ssd_stall=12.4ms
+predictive:    locality=on (hit_rate=64.32%)  speculator=on (top1=0.28% precision_at_k=58.10%)  ssd_stall=12.4ms
 ```
 
 When `[predictive]` is left at its defaults (everything off), the
@@ -3060,10 +2960,13 @@ the engine layers an Anchor + LRU-Edge **VRAM tier** on top of it:
 ```
 
 * **RAM hits are still authoritative.** On a VRAM hit we still resolve
-  from RAM; VRAM only **shadows** the bytes, so the inference contract
-  is identical to the 2-tier path. CPU-only builds emulate VRAM host-
-  side with a `Vec<u8>`; `--features cuda` swaps in `candle-core`'s
-  CUDA backend via [`run_inference_gpu`](rust-engine/src/inference.rs).
+  from RAM; VRAM shadows the bytes so the inference contract is
+  identical to the 2-tier path. With the wgpu backend active, promoted
+  experts can be materialized as device buffers for GPU expert matmul;
+  otherwise the cache remains a RAM-side promotion/observability tier
+  and execution falls back to CPU. The optional `cuda` cargo feature is
+  a separate candle CUDA path via
+  [`run_inference_gpu`](rust-engine/src/inference.rs).
 * **Anchor Core.** A HashMap pinning the experts whose RAM hit count
   has crossed `[gpu_cache] promote_after_hits`. Sized to
   `vram_anchor_ratio * vram_capacity_mb`.
@@ -3136,18 +3039,13 @@ The genuinely open items are:
   figures quoted above are cache-simulator results, not full-model
   inference numbers.
 
-- **GPU / alternative math backend.** The per-expert SwiGLU FFN runs
-  through **`candle-core`**. The default build is CPU-only (no
-  `candle-nn`, no GPU backends); building with `--features cuda`
-  unlocks `inference::run_inference_gpu`, which dispatches the
-  matmul through `candle-core::Device::new_cuda(0)` and falls back
-  to the existing CPU kernel if the device is unavailable. For
-  swappable executors without touching `inference.rs`, an additional
-  `Backend` implementation registered via `backend::set_backend` is
-  the alternative path, see
-  [Decoupled math backend](#decoupled-math-backend). Validating the
-  CUDA path requires GPU hardware, so it is left to contributors
-  with the appropriate target.
+- **GPU validation scope.** `GpuBackend` uses wgpu and is selected at
+  runtime through `[real_transformer].compute_offload = "gpu"`. GPU
+  initialization can fail and fall back to CPU, and the CPU-only Mixtral
+  benchmark above does not validate the attached NVIDIA L4 path. The
+  separate `cuda` feature unlocks `inference::run_inference_gpu` through
+  candle CUDA; CUDA validation requires appropriate GPU hardware and is
+  tracked separately from the wgpu runtime path.
 - **AMX tile intrinsics.** `--features amx` compiles in the Intel
   AMX tile skeleton in `src/kernels/`, but currently routes back to
   the AVX-512 / scalar path on stable Rust until the tile intrinsics
