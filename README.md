@@ -924,7 +924,7 @@ Endpoints:
 | method   | path                       | purpose                                            |
 | -------- | -------------------------- | -------------------------------------------------- |
 | `GET`    | `/health`                  | liveness probe (`{"status":"ok"...}`)             |
-| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and, when the predictive arms are enabled, `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, `mer_speculator_accuracy_total`, and the `mer_ssd_stall_seconds` histogram. When `[gpu_cache] enabled = true`, also exports `mer_vram_used_bytes`, `mer_vram_capacity_bytes`, `mer_gpu_cache_hits_total`, `mer_gpu_cache_misses_total`, and `mer_promotions_total` |
+| `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and, when the predictive arms are enabled, `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, `mer_speculator_accuracy_total`, `mer_speculator_evaluations_total`, and the `mer_ssd_stall_seconds` histogram. When `[gpu_cache] enabled = true`, also exports `mer_vram_used_bytes`, `mer_vram_capacity_bytes`, `mer_gpu_cache_hits_total`, `mer_gpu_cache_misses_total`, and `mer_promotions_total` |
 | `GET`    | `/v1/admin/health/experts` | JSON snapshot of the 3-tier hierarchy: per-tier hit/miss counters (SSD, RAM, VRAM), VRAM used / capacity bytes, total RAM→VRAM promotions, and engine status fields. Consumed by `micro-expert-router monitor`. |
 | `POST`   | `/v1/admin/evict`          | One-shot reclaim pass on the paged-KV pool's overflow slab. Returns `{"reclaimed_overflow_blocks": N}`. Useful after a transient burst inflated the heap-backed fallback, returns memory to the allocator immediately rather than waiting for the periodic background sweep. |
 | `POST`   | `/v1/completions`          | OpenAI text-completion shape (`prompt`, `max_tokens`...) |
@@ -2775,17 +2775,18 @@ small MLP forward + SGD step per token, plus one ring-buffer
 update) that is far below the energy cost of even a single
 NVMe expert read.
 
-**Telemetry.** The engine maintains four atomic counters
-(`spec_hits`, `spec_misses`, `locality_hits`, `locality_misses`)
-and a cumulative `total_ssd_stall_us`, all readable through
-`Engine::predictive_telemetry()` and exported as Prometheus
+**Telemetry.** The engine maintains speculator prediction precision@K
+counters, speculator top-1 match/evaluation counters, locality
+hit/miss counters, and a cumulative `total_ssd_stall_us`, all readable
+through `Engine::predictive_telemetry()` and exported as Prometheus
 counters / a histogram on `/metrics`:
 
 | Metric | Meaning |
 |---|---|
-| `mer_speculator_hits_total` | Per-token speculator predictions that intersected the gate's actual top-K. |
-| `mer_speculator_misses_total` | Per-token speculator predictions that did not. The ratio is the speculator's running accuracy. |
-| `mer_speculator_accuracy_total` | Tokens for which the speculator's **top-1** prediction matched the gate's actual top-1 routed expert. The primary quality signal called out by the Omniscient Predictive Architecture spec; divide by tokens-generated to read accuracy as a fraction. |
+| `mer_speculator_hits_total` | Predicted expert IDs contained in the gate's actual top-K; numerator of prediction precision@K. |
+| `mer_speculator_misses_total` | Predicted expert IDs not contained in the gate's actual top-K; with hits, forms the prediction precision@K denominator. |
+| `mer_speculator_accuracy_total` | Tokens for which the speculator's **top-1** prediction matched the gate's actual top-1 routed expert; numerator for top-1 accuracy. |
+| `mer_speculator_evaluations_total` | Valid top-1 speculator evaluations, whether or not the prediction matched; denominator for top-1 accuracy. |
 | `mer_locality_hits_total` | Routed experts that were already in the locality monitor's hot set at routing time (would-be cache miss avoided by pinning). |
 | `mer_locality_misses_total` | Routed experts that were not. |
 | `mer_ssd_stall_seconds` | Histogram of cumulative SSD critical-path stall time per token, the wall-clock window the engine spent blocked waiting for cache-miss reads to land. The headline number the L / M arms aim to drive down. |
