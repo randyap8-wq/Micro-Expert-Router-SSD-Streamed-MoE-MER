@@ -56,7 +56,16 @@ impl AdapterMetadata {
             self.name, self.driver, self.driver_info
         )
         .to_ascii_lowercase();
-        ["llvmpipe", "lavapipe", "swiftshader", "software", "warp"]
+        [
+            "llvmpipe",
+            "lavapipe",
+            "softpipe",
+            "swrast",
+            "openswr",
+            "swiftshader",
+            "software",
+            "warp",
+        ]
             .iter()
             .any(|needle| text.contains(needle))
     }
@@ -2282,6 +2291,19 @@ mod tests {
         let err = select_wgpu_adapter_candidates(&adapters, Some(0), false).unwrap_err();
 
         assert_eq!(err, AdapterSelectionError::OnlySoftware { count: 1 });
+    }
+
+    #[test]
+    fn adapter_policy_rejects_named_software_renderers_even_when_not_cpu_typed() {
+        let adapters = vec![
+            adapter("softpipe", wgpu::Backend::Gl, wgpu::DeviceType::Other),
+            adapter("swrast", wgpu::Backend::Gl, wgpu::DeviceType::Other),
+            adapter("OpenSWR", wgpu::Backend::Gl, wgpu::DeviceType::Other),
+        ];
+
+        let err = select_wgpu_adapter_candidates(&adapters, None, false).unwrap_err();
+
+        assert_eq!(err, AdapterSelectionError::OnlySoftware { count: 3 });
     }
 
     #[test]
