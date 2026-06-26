@@ -33,9 +33,11 @@ struct MetricsInner {
     pub cache_hits_total: Counter,
     pub cache_misses_total: Counter,
     pub io_wait_seconds: Histogram,
-    /// Speculator predictions that intersected the gate's actual top-K.
+    /// Predicted expert IDs contained in the gate's actual top-K
+    /// (prediction precision@K numerator).
     pub speculator_hits_total: Counter,
-    /// Speculator predictions that did **not** intersect the gate's actual top-K.
+    /// Predicted expert IDs not contained in the gate's actual top-K
+    /// (prediction precision@K denominator component).
     pub speculator_misses_total: Counter,
     /// Tokens for which the speculator's **top-1** prediction matched
     /// the actual top-1 routed expert. The "Omniscient Predictive
@@ -43,6 +45,9 @@ struct MetricsInner {
     /// `mer_speculator_accuracy_total` and uses it as the primary
     /// quality signal for the predictive controller.
     pub speculator_accuracy_total: Counter,
+    /// Valid top-1 speculator evaluations, whether or not the
+    /// prediction matched. Denominator for top-1 accuracy.
+    pub speculator_evaluations_total: Counter,
     /// Activations whose chosen expert was already in the locality
     /// monitor's hot set at the time of routing.
     pub locality_hits_total: Counter,
@@ -145,13 +150,13 @@ impl Metrics {
         .expect("metric registration: mer_io_wait_seconds");
         let speculator_hits_total = register_counter_with_registry!(
             "mer_speculator_hits_total",
-            "Neural speculator predictions that intersected the gate's chosen top-K.",
+            "Neural speculator predicted expert IDs contained in the gate's actual top-K; numerator of prediction precision@K.",
             registry
         )
         .expect("metric registration: mer_speculator_hits_total");
         let speculator_misses_total = register_counter_with_registry!(
             "mer_speculator_misses_total",
-            "Neural speculator predictions that did NOT intersect the gate's chosen top-K.",
+            "Neural speculator predicted expert IDs not contained in the gate's actual top-K; with hits, forms the prediction precision@K denominator.",
             registry
         )
         .expect("metric registration: mer_speculator_misses_total");
@@ -161,6 +166,12 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_speculator_accuracy_total");
+        let speculator_evaluations_total = register_counter_with_registry!(
+            "mer_speculator_evaluations_total",
+            "Valid neural speculator top-1 evaluations, whether or not the prediction matched.",
+            registry
+        )
+        .expect("metric registration: mer_speculator_evaluations_total");
         let locality_hits_total = register_counter_with_registry!(
             "mer_locality_hits_total",
             "Routed activations whose chosen expert was in the locality monitor's hot set.",
@@ -242,6 +253,7 @@ impl Metrics {
                 speculator_hits_total,
                 speculator_misses_total,
                 speculator_accuracy_total,
+                speculator_evaluations_total,
                 locality_hits_total,
                 locality_misses_total,
                 ssd_stall_seconds,
@@ -279,8 +291,10 @@ impl Metrics {
         self.inner.io_wait_seconds.observe(seconds);
     }
 
-    /// Record speculator top-K overlap: `hits` predictions that overlapped
-    /// the gate's top-K and `misses` that did not. Either may be zero.
+    /// Record speculator prediction precision@K components: `hits`
+    /// predicted expert IDs contained in the gate's actual top-K and
+    /// `misses` predicted expert IDs not contained in that top-K.
+    /// Either may be zero; `hits / (hits + misses)` is precision@K.
     pub fn record_speculator(&self, hits: u64, misses: u64) {
         if hits > 0 {
             self.inner.speculator_hits_total.inc_by(hits as f64);
@@ -293,12 +307,12 @@ impl Metrics {
     /// Record one token's worth of **top-1** speculator accuracy.
     /// Pass `1` if the speculator's highest-logit expert matched the
     /// gate's actual top-1 routed expert for this token, `0` otherwise.
-    /// Increments `mer_speculator_accuracy_total` by `top1_match`.
+    /// Increments `mer_speculator_evaluations_total` once per call and
+    /// `mer_speculator_accuracy_total` only on a match.
     pub fn record_speculator_top1(&self, top1_match: u64) {
-        if top1_match > 0 {
-            self.inner
-                .speculator_accuracy_total
-                .inc_by(top1_match as f64);
+        self.inner.speculator_evaluations_total.inc();
+        if top1_match == 1 {
+            self.inner.speculator_accuracy_total.inc();
         }
     }
 
@@ -394,6 +408,7 @@ mod tests {
         m.record_io_wait(0.002);
         m.record_speculator(7, 3);
         m.record_speculator_top1(1);
+        m.record_speculator_top1(0);
         m.record_locality(5, 2);
         m.record_ssd_stall(0.0005);
         m.record_gpu_cache(2, 1);
@@ -414,6 +429,7 @@ mod tests {
             "mer_speculator_hits_total",
             "mer_speculator_misses_total",
             "mer_speculator_accuracy_total",
+            "mer_speculator_evaluations_total",
             "mer_locality_hits_total",
             "mer_locality_misses_total",
             "mer_ssd_stall_seconds",
@@ -428,6 +444,8 @@ mod tests {
         ] {
             assert!(body.contains(name), "metric {name} missing from /metrics body:\n{body}");
         }
+        assert_metric_value(&body, "mer_speculator_accuracy_total", 1.0);
+        assert_metric_value(&body, "mer_speculator_evaluations_total", 2.0);
         // The label we recorded must show up in the rendered text.
         assert!(body.contains("/v1/completions"));
     }
@@ -439,5 +457,22 @@ mod tests {
         let body = String::from_utf8(m.render().unwrap()).unwrap();
         // Counters should still be exported (with value 0).
         assert!(body.contains("mer_cache_hits_total"));
+    }
+
+    fn assert_metric_value(body: &str, name: &str, expected: f64) {
+        let line = body
+            .lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("metric {name} missing from /metrics body:\n{body}"));
+        let value: f64 = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("metric {name} line missing value: {line}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("metric {name} line has non-numeric value: {line}"));
+        assert!(
+            (value - expected).abs() < f64::EPSILON,
+            "metric {name} expected {expected}, got {value} in line {line}"
+        );
     }
 }

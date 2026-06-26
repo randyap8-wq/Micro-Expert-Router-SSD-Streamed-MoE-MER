@@ -738,9 +738,12 @@ pub struct PredictiveTelemetry {
     pub speculator_hits: u64,
     pub speculator_misses: u64,
     /// `speculator_hits / (speculator_hits + speculator_misses)`, or
-    /// `0.0` when neither has fired. This is the **top-K overlap**
-    /// accuracy and is preserved for backwards compatibility — the
-    /// design spec's "speculator accuracy" is the top-1 metric below.
+    /// `0.0` when neither has fired. Hits are predicted expert IDs
+    /// contained in the gate's actual top-K; misses are predicted
+    /// expert IDs not contained in the gate's actual top-K. The ratio
+    /// is prediction precision@K. The field name is preserved for
+    /// backwards compatibility — the design spec's "speculator
+    /// accuracy" is the top-1 metric below.
     pub speculator_accuracy: f64,
     /// Cumulative count of tokens for which the speculator's **top-1**
     /// prediction matched the gate's actual top-1 routed expert.
@@ -1172,10 +1175,11 @@ pub(crate) struct EngineSpeculation {
     /// out are staler, so the per-layer fanout is tapered with distance to
     /// keep low-confidence far-layer reads from flooding the SSD.
     pub(super) pipeline_depth: u32,
-    /// Cumulative speculator hit count (predictions that intersected
-    /// the gate's actual top-K).
+    /// Cumulative speculator hit count: predicted expert IDs contained
+    /// in the gate's actual top-K.
     pub(super) spec_hits: AtomicU64,
-    /// Cumulative speculator miss count.
+    /// Cumulative speculator miss count: predicted expert IDs not
+    /// contained in the gate's actual top-K.
     pub(super) spec_misses: AtomicU64,
     /// Cumulative count of tokens for which the speculator's **top-1**
     /// prediction matched the gate's actual top-1 routed expert.
@@ -3237,6 +3241,9 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             }
             _ => spec.predict_topk(x, self.speculation.speculator_topk),
         };
+        // Prediction precision@K components: hits are predicted expert
+        // IDs contained in the gate's actual top-K, misses are
+        // predicted expert IDs outside that top-K.
         let target_set: HashSet<u32> = target.iter().copied().collect();
         let mut hits: u64 = 0;
         for &p in &preds {
@@ -4315,7 +4322,7 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // summary shape so older diff-on-output tests stay valid.
         if r.locality_enabled || r.speculator_enabled {
             info!(
-                "predictive:    locality={} (hit_rate={:.2}%)  speculator={} (top1={:.2}% topk_overlap={:.2}%)  ssd_stall={:.1}ms",
+                "predictive:    locality={} (hit_rate={:.2}%)  speculator={} (top1={:.2}% precision_at_k={:.2}%)  ssd_stall={:.1}ms",
                 if r.locality_enabled { "on" } else { "off" },
                 r.predictive.locality_hit_rate * 100.0,
                 if r.speculator_enabled { "on" } else { "off" },
@@ -5004,14 +5011,28 @@ mod tests {
             spec.train_step(&hidden, &[0], 0.1);
         }
         assert_eq!(spec.predict_topk(&hidden, 1), vec![0]);
+        let train_steps_before = spec.train_steps_for_test();
 
-        let engine = rebuild_with_speculator(&base, spec, 1);
-        let preds = engine.speculator_predict_and_train(&hidden, &[1], None);
+        let ((engine, preds), queued) =
+            NeuralSpeculator::capture_queued_train_for_test(&spec, || {
+                let engine = rebuild_with_speculator(&base, spec.clone(), 1);
+                let preds = engine.speculator_predict_and_train(&hidden, &[1], None);
+                (engine, preds)
+            });
         assert_eq!(
             preds,
             vec![0],
             "prediction should use weights from before the current target is queued"
         );
+        assert_eq!(
+            spec.train_steps_for_test(),
+            train_steps_before,
+            "current sample must not be trained synchronously on the caller thread"
+        );
+        assert_eq!(spec.predict_topk(&hidden, 1), vec![0]);
+        assert_eq!(queued.x, hidden);
+        assert_eq!(queued.actual_top_k, vec![1]);
+        assert_eq!(queued.lr, NeuralSpeculator::DEFAULT_LR);
 
         let tele = engine.predictive_telemetry();
         assert_eq!(tele.speculator_top1_matches, 0);
@@ -5029,7 +5050,19 @@ mod tests {
         let seed = 0xD15A_B1ED;
         let base = build_engine(&dir.path, num_experts, d_model, d_ff, 4, 1, 1, seed);
         let spec = Arc::new(NeuralSpeculator::new(d_model + 1, 16, num_experts, seed));
-        let engine = rebuild_with_speculator(&base, spec, 1);
+        let metrics = Metrics::new();
+        let engine = Arc::new(
+            Engine::new(
+                base.core.cache.clone(),
+                base.core.pool.clone(),
+                base.core.storage.clone(),
+                base.core.router.clone(),
+                base.core.predictor.clone(),
+                base.core.shape,
+            )
+            .with_metrics(metrics.clone())
+            .with_speculator(spec, 1),
+        );
 
         let preds = engine.speculator_predict_and_train(&[0.0f32; 4], &[0], None);
         assert!(preds.is_empty());
@@ -5039,6 +5072,11 @@ mod tests {
         let tele = engine.predictive_telemetry();
         assert_eq!(tele.speculator_top1_total, 0);
         assert_eq!(tele.speculator_hits + tele.speculator_misses, 0);
+        let prom = String::from_utf8(metrics.render().unwrap()).unwrap();
+        assert!(
+            prom.contains("mer_speculator_evaluations_total 0"),
+            "d_model mismatch must not count as a valid top-1 evaluation:\n{prom}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
