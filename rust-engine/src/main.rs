@@ -498,7 +498,8 @@ enum Cmd {
     /// per-expert binary format plus a `metadata.json` and the dense
     /// weight files [`RealModel::from_dir`] consumes. Phase 2.
     GgufConvert {
-        /// Path to the source `*.gguf` file.
+        /// Path to a normal `*.gguf` file or any file in a standard
+        /// `*-00001-of-00005.gguf` shard set.
         #[arg(long)]
         gguf_path: PathBuf,
         /// Output directory. Created if it doesn't exist.
@@ -3309,41 +3310,17 @@ fn cmd_gguf_convert(
         "opening GGUF file"
     );
     let opts = crate::gguf_loader::ExtractOptions { emit_uth, native_quant };
-    let report = if legacy_eager {
-        // Eager path: slurps the file into memory before slicing.
-        // Retained for compatibility and small fixtures.
-        let gguf = crate::gguf::GgufFile::open(gguf_path)?;
-        if let Some(arch) = gguf.architecture() {
-            info!(architecture = arch, version = gguf.version, "GGUF parsed (eager)");
-        }
-        crate::gguf_loader::extract_experts_from_source(
-            &gguf,
-            out_dir,
-            num_layers,
-            num_experts,
-            opts,
-        )?
-    } else {
-        // Streaming path: only the header (KV + tensor info table)
-        // is parsed up front; each tensor body is read on demand
-        // via `seek + read_exact`. This is the strict-win path for
-        // ≥ 100 GB checkpoints.
-        let reader = crate::gguf::GgufStreamReader::open(gguf_path)?;
-        if let Some(arch) = reader.architecture() {
-            info!(
-                architecture = arch,
-                version = reader.version,
-                "GGUF parsed (streaming)"
-            );
-        }
-        crate::gguf_loader::extract_experts_from_source(
-            &reader,
-            out_dir,
-            num_layers,
-            num_experts,
-            opts,
-        )?
-    };
+    let source = crate::gguf::open_gguf_source(gguf_path, legacy_eager)?;
+    if let Some(arch) = source.architecture() {
+        info!(architecture = arch, "GGUF source opened");
+    }
+    let report = crate::gguf_loader::extract_experts_from_source(
+        &*source,
+        out_dir,
+        num_layers,
+        num_experts,
+        opts,
+    )?;
     let total_gib = report.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let read_time_at_7gbps = report.total_bytes as f64 / (7.0 * 1024.0 * 1024.0 * 1024.0);
     info!(

@@ -30,7 +30,7 @@ use crate::inference::{
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The 4-byte ASCII magic at the start of every GGUF file: `"GGUF"`.
 pub const GGUF_MAGIC: &[u8; 4] = b"GGUF";
@@ -673,14 +673,338 @@ fn read_count_bytes(bytes: &[u8], version: u32) -> u64 {
 }
 
 // -----------------------------------------------------------------------
+// Native GGUF shard sets.
+// -----------------------------------------------------------------------
+
+/// Read-only view over a standard tensor-level GGUF shard set.
+///
+/// Tensor offsets remain local to the owning shard. The unified tensor
+/// table only records which shard owns each tensor name so body reads can
+/// dispatch back to that shard's streaming reader without merging files.
+pub struct GgufShardSet {
+    readers: Vec<GgufStreamReader>,
+    metadata: HashMap<String, GgufValue>,
+    tensors: HashMap<String, GgufTensorInfo>,
+    owners: HashMap<String, usize>,
+}
+
+impl GgufShardSet {
+    /// Open a standard `*-00001-of-00005.gguf` style shard set from any
+    /// shard path in the set.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let spec = parse_shard_filename(path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} does not look like a standard GGUF shard name (*-00001-of-00005.gguf)",
+                    path.display()
+                ),
+            )
+        })?;
+        Self::open_from_spec(spec)
+    }
+
+    fn open_from_spec(spec: GgufShardSpec) -> io::Result<Self> {
+        let mut readers = Vec::with_capacity(spec.count);
+        for shard_number in 1..=spec.count {
+            let shard_path = spec.path_for(shard_number);
+            if !shard_path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "missing GGUF shard {shard_number} of {}: {}",
+                        spec.count,
+                        shard_path.display()
+                    ),
+                ));
+            }
+            let reader = GgufStreamReader::open(&shard_path).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to open GGUF shard {shard_number} of {} ({}): {e}",
+                        spec.count,
+                        shard_path.display()
+                    ),
+                )
+            })?;
+            readers.push(reader);
+        }
+
+        validate_shards(&readers, spec.count)?;
+
+        let metadata = readers[0].metadata.clone();
+        let mut tensors = HashMap::new();
+        let mut owners = HashMap::new();
+        for (owner, reader) in readers.iter().enumerate() {
+            for (name, info) in &reader.tensors {
+                if let Some(previous_owner) = owners.get(name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "duplicate tensor name `{name}` in GGUF shard {} and shard {}",
+                            *previous_owner + 1,
+                            owner + 1
+                        ),
+                    ));
+                }
+                tensors.insert(name.clone(), info.clone());
+                owners.insert(name.clone(), owner);
+            }
+        }
+
+        if let Some(declared) = declared_split_tensor_count(&readers)? {
+            let actual = tensors.len() as u64;
+            if declared != actual {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "GGUF split.tensors.count={declared} disagrees with unified tensor count {actual}"
+                    ),
+                ));
+            }
+        }
+
+        Ok(Self {
+            readers,
+            metadata,
+            tensors,
+            owners,
+        })
+    }
+}
+
+/// Open either a normal single GGUF file or a standard tensor-level GGUF
+/// shard set. Discovery is based on the filename convention; split
+/// metadata, when present, is used as validation.
+pub fn open_gguf_source(path: &Path, legacy_eager: bool) -> io::Result<Box<dyn GgufSource>> {
+    if let Some(spec) = parse_shard_filename(path)? {
+        return Ok(Box::new(GgufShardSet::open_from_spec(spec)?));
+    }
+
+    if legacy_eager {
+        Ok(Box::new(GgufFile::open(path)?))
+    } else {
+        Ok(Box::new(GgufStreamReader::open(path)?))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GgufShardSpec {
+    parent: PathBuf,
+    prefix: String,
+    count: usize,
+    index_width: usize,
+    count_width: usize,
+}
+
+impl GgufShardSpec {
+    fn path_for(&self, shard_number: usize) -> PathBuf {
+        let file_name = format!(
+            "{}-{shard_number:0index_width$}-of-{count:0count_width$}.gguf",
+            self.prefix,
+            count = self.count,
+            index_width = self.index_width,
+            count_width = self.count_width
+        );
+        self.parent.join(file_name)
+    }
+}
+
+fn parse_shard_filename(path: &Path) -> io::Result<Option<GgufShardSpec>> {
+    let Some(file_name) = path.file_name().and_then(|f| f.to_str()) else {
+        return Ok(None);
+    };
+    let Some(stem) = file_name.strip_suffix(".gguf") else {
+        return Ok(None);
+    };
+    let Some((before_count, count_str)) = stem.rsplit_once("-of-") else {
+        return Ok(None);
+    };
+    let Some((prefix, index_str)) = before_count.rsplit_once('-') else {
+        return Ok(None);
+    };
+    if prefix.is_empty()
+        || index_str.is_empty()
+        || count_str.is_empty()
+        || !index_str.bytes().all(|b| b.is_ascii_digit())
+        || !count_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Ok(None);
+    }
+
+    let index = index_str.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("GGUF shard index `{index_str}` in {file_name} is too large"),
+        )
+    })?;
+    let count = count_str.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("GGUF shard count `{count_str}` in {file_name} is too large"),
+        )
+    })?;
+    if count == 0 || index == 0 || index > count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid GGUF shard numbering in {file_name}: shard {index} of {count}"),
+        ));
+    }
+
+    Ok(Some(GgufShardSpec {
+        parent: path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+        prefix: prefix.to_owned(),
+        count,
+        index_width: index_str.len(),
+        count_width: count_str.len(),
+    }))
+}
+
+fn validate_shards(readers: &[GgufStreamReader], expected_count: usize) -> io::Result<()> {
+    if readers.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GGUF shard set is empty",
+        ));
+    }
+
+    let expected_version = readers[0].version;
+    let expected_arch =
+        metadata_str(&readers[0].metadata, "general.architecture", 1)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GGUF shard 1 missing required metadata `general.architecture`",
+            )
+        })?;
+
+    for (idx, reader) in readers.iter().enumerate() {
+        let shard_number = idx + 1;
+        if reader.version != expected_version {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "GGUF shard {shard_number} version {} disagrees with shard 1 version {expected_version}",
+                    reader.version
+                ),
+            ));
+        }
+
+        let arch = metadata_str(&reader.metadata, "general.architecture", shard_number)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "GGUF shard {shard_number} missing required metadata `general.architecture`"
+                    ),
+                )
+            })?;
+        if arch != expected_arch {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "GGUF shard {shard_number} general.architecture `{arch}` disagrees with shard 1 `{expected_arch}`"
+                ),
+            ));
+        }
+
+        if let Some(split_no) = metadata_u64(&reader.metadata, "split.no", shard_number)? {
+            let expected_split_no = idx as u64;
+            if split_no != expected_split_no {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "GGUF shard {shard_number} split.no={split_no} disagrees with filename order; expected {expected_split_no}"
+                    ),
+                ));
+            }
+        }
+
+        if let Some(split_count) = metadata_u64(&reader.metadata, "split.count", shard_number)? {
+            if split_count != expected_count as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "GGUF shard {shard_number} split.count={split_count} disagrees with filename count {expected_count}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn declared_split_tensor_count(readers: &[GgufStreamReader]) -> io::Result<Option<u64>> {
+    let mut declared = None;
+    for (idx, reader) in readers.iter().enumerate() {
+        let shard_number = idx + 1;
+        if let Some(count) = metadata_u64(&reader.metadata, "split.tensors.count", shard_number)? {
+            if let Some(previous) = declared {
+                if previous != count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "GGUF shard {shard_number} split.tensors.count={count} disagrees with earlier declaration {previous}"
+                        ),
+                    ));
+                }
+            } else {
+                declared = Some(count);
+            }
+        }
+    }
+    Ok(declared)
+}
+
+fn metadata_u64(
+    metadata: &HashMap<String, GgufValue>,
+    key: &str,
+    shard_number: usize,
+) -> io::Result<Option<u64>> {
+    metadata
+        .get(key)
+        .map(|v| {
+            v.as_u64().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("GGUF shard {shard_number} metadata `{key}` is not an integer"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn metadata_str<'a>(
+    metadata: &'a HashMap<String, GgufValue>,
+    key: &str,
+    shard_number: usize,
+) -> io::Result<Option<&'a str>> {
+    metadata
+        .get(key)
+        .map(|v| {
+            v.as_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("GGUF shard {shard_number} metadata `{key}` is not a string"),
+                )
+            })
+        })
+        .transpose()
+}
+
+// -----------------------------------------------------------------------
 // `GgufSource` — uniform abstraction over the eager and streaming readers.
 // -----------------------------------------------------------------------
 
-/// Read-only view over a GGUF file. The `gguf_loader` module is
+/// Read-only view over GGUF tensors. The `gguf_loader` module is
 /// parametrised over this trait so it can drive either the eager
 /// in-memory [`GgufFile`] (used by the tests and small fixtures) or
 /// the on-disk streaming [`GgufStreamReader`] (used by `gguf-convert`
-/// at production scale).
+/// at production scale) or a unified [`GgufShardSet`].
 pub trait GgufSource {
     fn metadata(&self) -> &HashMap<String, GgufValue>;
     fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo>;
@@ -722,6 +1046,21 @@ impl GgufSource for GgufStreamReader {
     }
     fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
         self.read_tensor_data(name)
+    }
+}
+
+impl GgufSource for GgufShardSet {
+    fn metadata(&self) -> &HashMap<String, GgufValue> {
+        &self.metadata
+    }
+    fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
+        self.tensors.get(name)
+    }
+    fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        let Some(owner) = self.owners.get(name).copied() else {
+            return Ok(None);
+        };
+        self.readers[owner].read_tensor_data(name)
     }
 }
 
@@ -776,6 +1115,150 @@ mod tests {
             out.extend_from_slice(&f.to_le_bytes());
         }
         out
+    }
+
+    struct SynthTensor {
+        name: String,
+        shape: Vec<u64>,
+        dtype: u32,
+        data: Vec<u8>,
+    }
+
+    fn synth_f32_tensor(name: &str, values: &[f32]) -> SynthTensor {
+        SynthTensor {
+            name: name.to_owned(),
+            shape: vec![values.len() as u64],
+            dtype: ggml_dtype::F32,
+            data: f32_bytes(values),
+        }
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    fn push_gguf_string(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn push_gguf_value(out: &mut Vec<u8>, value: &GgufValue) {
+        match value {
+            GgufValue::U32(v) => {
+                out.extend_from_slice(&(GgufType::UINT32 as u32).to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            GgufValue::U64(v) => {
+                out.extend_from_slice(&(GgufType::UINT64 as u32).to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            GgufValue::String(s) => {
+                out.extend_from_slice(&(GgufType::STRING as u32).to_le_bytes());
+                push_gguf_string(out, s);
+            }
+            other => panic!("test helper cannot encode metadata value {other:?}"),
+        }
+    }
+
+    fn push_metadata(out: &mut Vec<u8>, key: &str, value: &GgufValue) {
+        push_gguf_string(out, key);
+        push_gguf_value(out, value);
+    }
+
+    fn synth_gguf_custom(
+        arch: &str,
+        extra_metadata: &[(&str, GgufValue)],
+        tensors: &[SynthTensor],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(GGUF_MAGIC);
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(2u64 + extra_metadata.len() as u64).to_le_bytes());
+
+        push_metadata(&mut out, "general.alignment", &GgufValue::U32(32));
+        push_metadata(
+            &mut out,
+            "general.architecture",
+            &GgufValue::String(arch.to_owned()),
+        );
+        for (key, value) in extra_metadata {
+            push_metadata(&mut out, key, value);
+        }
+
+        let mut offset = 0u64;
+        for tensor in tensors {
+            push_gguf_string(&mut out, &tensor.name);
+            out.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
+            for dim in &tensor.shape {
+                out.extend_from_slice(&dim.to_le_bytes());
+            }
+            out.extend_from_slice(&tensor.dtype.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+            offset += ggml_tensor_bytes(tensor.dtype, &tensor.shape).unwrap();
+        }
+
+        while out.len() % 32 != 0 {
+            out.push(0);
+        }
+        for tensor in tensors {
+            out.extend_from_slice(&tensor.data);
+        }
+        out
+    }
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{label}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn shard_path(dir: &Path, prefix: &str, idx: usize, count: usize) -> PathBuf {
+        dir.join(format!("{prefix}-{idx:05}-of-{count:05}.gguf"))
+    }
+
+    fn write_synth_shard(
+        dir: &Path,
+        prefix: &str,
+        idx: usize,
+        count: usize,
+        arch: &str,
+        tensors: &[SynthTensor],
+        split_count: u64,
+        split_tensors_count: u64,
+    ) -> PathBuf {
+        let path = shard_path(dir, prefix, idx, count);
+        let metadata = [
+            ("split.no", GgufValue::U32((idx - 1) as u32)),
+            ("split.count", GgufValue::U64(split_count)),
+            ("split.tensors.count", GgufValue::U64(split_tensors_count)),
+        ];
+        let bytes = synth_gguf_custom(arch, &metadata, tensors);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn write_basic_two_shards(dir: &Path) -> (PathBuf, PathBuf) {
+        let shard1_tensors = [synth_f32_tensor("left", &[1.0, 2.0, 3.0, 4.0])];
+        let shard2_tensors = [synth_f32_tensor("right", &[9.0, 10.0, 11.0, 12.0])];
+        let shard1 = write_synth_shard(dir, "Model-Q4_K_M", 1, 2, "llama", &shard1_tensors, 2, 2);
+        let shard2 = write_synth_shard(dir, "Model-Q4_K_M", 2, 2, "llama", &shard2_tensors, 2, 2);
+        (shard1, shard2)
+    }
+
+    fn open_err(path: &Path) -> String {
+        match open_gguf_source(path, false) {
+            Ok(_) => panic!("expected open_gguf_source to fail for {}", path.display()),
+            Err(e) => e.to_string(),
+        }
     }
 
     #[test]
@@ -854,6 +1337,188 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn open_factory_single_file_streaming_and_eager_remain_unchanged() {
+        let dir = temp_test_dir("gguf-source-single");
+        let path = dir.join("single.gguf");
+        std::fs::write(&path, synth_gguf()).unwrap();
+
+        for legacy_eager in [false, true] {
+            let source = open_gguf_source(&path, legacy_eager).expect("open source");
+            assert_eq!(source.architecture(), Some("llama"));
+            let info = source.tensor_info("t").expect("tensor info");
+            assert_eq!(info.shape, vec![4]);
+            assert_eq!(info.offset, 0);
+            assert_eq!(source.tensor_dtype("t"), Some(WeightDtype::F32));
+            let body = source.read_tensor_owned("t").unwrap().expect("body");
+            assert_eq!(body, f32_bytes(&[1.0, 2.0, 3.0, 4.0]));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shard_set_exposes_tensors_from_all_files() {
+        let dir = temp_test_dir("gguf-shards-expose");
+        let (shard1, _) = write_basic_two_shards(&dir);
+
+        let source = open_gguf_source(&shard1, false).expect("open shard set");
+        assert_eq!(source.architecture(), Some("llama"));
+        assert!(source.tensor_info("left").is_some());
+        assert!(source.tensor_info("right").is_some());
+        assert_eq!(source.tensor_info("left").unwrap().offset, 0);
+        assert_eq!(source.tensor_info("right").unwrap().offset, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shard_set_reads_tensor_from_owning_shard() {
+        let dir = temp_test_dir("gguf-shards-read");
+        let (shard1, _) = write_basic_two_shards(&dir);
+
+        let source = open_gguf_source(&shard1, false).expect("open shard set");
+        let right = source
+            .read_tensor_owned("right")
+            .unwrap()
+            .expect("right tensor");
+        assert_eq!(right, f32_bytes(&[9.0, 10.0, 11.0, 12.0]));
+        let left = source
+            .read_tensor_owned("left")
+            .unwrap()
+            .expect("left tensor");
+        assert_eq!(left, f32_bytes(&[1.0, 2.0, 3.0, 4.0]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opening_second_shard_discovers_the_complete_set() {
+        let dir = temp_test_dir("gguf-shards-second");
+        let (_, shard2) = write_basic_two_shards(&dir);
+
+        let source = open_gguf_source(&shard2, false).expect("open from shard 2");
+        assert!(source.tensor_info("left").is_some());
+        assert!(source.tensor_info("right").is_some());
+        let left = source
+            .read_tensor_owned("left")
+            .unwrap()
+            .expect("left tensor");
+        assert_eq!(left, f32_bytes(&[1.0, 2.0, 3.0, 4.0]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_shard_fails_clearly() {
+        let dir = temp_test_dir("gguf-shards-missing");
+        let shard2_tensors = [synth_f32_tensor("right", &[9.0, 10.0, 11.0, 12.0])];
+        let shard2 = write_synth_shard(&dir, "Model-Q4_K_M", 2, 2, "llama", &shard2_tensors, 2, 2);
+
+        let err = open_err(&shard2);
+        assert!(err.contains("missing GGUF shard 1 of 2"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_tensor_name_fails() {
+        let dir = temp_test_dir("gguf-shards-duplicate");
+        let shard1_tensors = [synth_f32_tensor("dup", &[1.0, 2.0, 3.0, 4.0])];
+        let shard2_tensors = [synth_f32_tensor("dup", &[9.0, 10.0, 11.0, 12.0])];
+        let shard1 = write_synth_shard(&dir, "Model-Q4_K_M", 1, 2, "llama", &shard1_tensors, 2, 2);
+        write_synth_shard(&dir, "Model-Q4_K_M", 2, 2, "llama", &shard2_tensors, 2, 2);
+
+        let err = open_err(&shard1);
+        assert!(err.contains("duplicate tensor name `dup`"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inconsistent_shard_count_fails() {
+        let dir = temp_test_dir("gguf-shards-count");
+        let shard1_tensors = [synth_f32_tensor("left", &[1.0, 2.0, 3.0, 4.0])];
+        let shard2_tensors = [synth_f32_tensor("right", &[9.0, 10.0, 11.0, 12.0])];
+        let shard1 = write_synth_shard(&dir, "Model-Q4_K_M", 1, 2, "llama", &shard1_tensors, 3, 2);
+        write_synth_shard(&dir, "Model-Q4_K_M", 2, 2, "llama", &shard2_tensors, 2, 2);
+
+        let err = open_err(&shard1);
+        assert!(err.contains("split.count=3"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn architecture_mismatch_fails() {
+        let dir = temp_test_dir("gguf-shards-arch");
+        let shard1_tensors = [synth_f32_tensor("left", &[1.0, 2.0, 3.0, 4.0])];
+        let shard2_tensors = [synth_f32_tensor("right", &[9.0, 10.0, 11.0, 12.0])];
+        let shard1 = write_synth_shard(&dir, "Model-Q4_K_M", 1, 2, "llama", &shard1_tensors, 2, 2);
+        write_synth_shard(
+            &dir,
+            "Model-Q4_K_M",
+            2,
+            2,
+            "qwen2moe",
+            &shard2_tensors,
+            2,
+            2,
+        );
+
+        let err = open_err(&shard1);
+        assert!(
+            err.contains("general.architecture `qwen2moe` disagrees"),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_tensor_count_mismatch_fails() {
+        let dir = temp_test_dir("gguf-shards-tensor-count");
+        let shard1_tensors = [synth_f32_tensor("left", &[1.0, 2.0, 3.0, 4.0])];
+        let shard2_tensors = [synth_f32_tensor("right", &[9.0, 10.0, 11.0, 12.0])];
+        let shard1 = write_synth_shard(&dir, "Model-Q4_K_M", 1, 2, "llama", &shard1_tensors, 2, 3);
+        write_synth_shard(&dir, "Model-Q4_K_M", 2, 2, "llama", &shard2_tensors, 2, 3);
+
+        let err = open_err(&shard1);
+        assert!(err.contains("split.tensors.count=3"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shard_set_open_does_not_require_tensor_bodies() {
+        let dir = temp_test_dir("gguf-shards-header-only");
+        let shard1_tensors = [SynthTensor {
+            name: "huge_left".to_owned(),
+            shape: vec![2_000_000],
+            dtype: ggml_dtype::F32,
+            data: Vec::new(),
+        }];
+        let shard2_tensors = [SynthTensor {
+            name: "huge_right".to_owned(),
+            shape: vec![2_000_000],
+            dtype: ggml_dtype::F32,
+            data: Vec::new(),
+        }];
+        let shard1 = write_synth_shard(&dir, "Model-Q4_K_M", 1, 2, "llama", &shard1_tensors, 2, 2);
+        write_synth_shard(&dir, "Model-Q4_K_M", 2, 2, "llama", &shard2_tensors, 2, 2);
+
+        let source = open_gguf_source(&shard1, false).expect("open shard set from headers");
+        assert!(source.tensor_info("huge_left").is_some());
+        assert!(source.tensor_info("huge_right").is_some());
+        let err = source
+            .read_tensor_owned("huge_right")
+            .err()
+            .expect("body read should validate the local shard range");
+        assert!(err.to_string().contains("past end of file"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
