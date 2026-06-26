@@ -279,7 +279,7 @@ impl Metrics {
         self.inner.io_wait_seconds.observe(seconds);
     }
 
-    /// Record speculator accuracy: `hits` predictions that overlapped
+    /// Record speculator top-K overlap: `hits` predictions that overlapped
     /// the gate's top-K and `misses` that did not. Either may be zero.
     pub fn record_speculator(&self, hits: u64, misses: u64) {
         if hits > 0 {
