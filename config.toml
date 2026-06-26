@@ -102,8 +102,9 @@ expert_size = 16777216
 # data; 32 for full Mixtral-8x7B.
 num_layers = 1
 # On-disk weight dtype: "f32" (4 B/weight, default, legacy), "f16"
-# (2 B/weight), "int8" (1 B/weight + per-tensor scales), "q4k" (Q4_K_M
-# 256-block, GGUF-compatible 4-bit), or "q4_0" (Q4_0 32-block, 4-bit).
+# (2 B/weight), "int8" (1 B/weight + per-tensor scales), "q4k"
+# (homogeneous Q4_K 256-block expert blobs, not arbitrary Q4_K_M model
+# recipes), or "q4_0" (Q4_0 32-block, 4-bit).
 # Lower-precision dtypes halve/quarter SSD bytes per expert read, the
 # dominant energy term in this engine. Must match what
 # `extract_mixtral_experts.py` / `gguf-convert` / `gen-data` was invoked
@@ -111,9 +112,9 @@ num_layers = 1
 dtype = "f32"
 
 [storage]
-# LRU cache slots (per layer). The whole point of this engine is that
-# experts stream from SSD; a large cache hides the metric you're trying
-# to measure. Recommended: 4-8.
+# LRU cache slots (per layer). Tiny synthetic examples often use 4 slots.
+# Full model experiments should sweep cache size and compare hit rate,
+# foreground I/O share, and benchmark TPS.
 cache_slots = 4
 # O_DIRECT block alignment, bytes. 4096 on most NVMe drives.
 block_align = 4096
@@ -309,11 +310,11 @@ static_residency_warmup_tokens = 0
 #   * `mer_promotions_total` counter
 #   * extended `/v1/admin/health/experts` JSON
 #
-# On CPU-only builds (no `cuda` feature) the VRAM tier is emulated
-# host-side and inference still runs through the existing CPU path —
-# the cache only changes *where the bytes live*, not how they are
-# computed. With `--features cuda`, `run_inference_gpu` dispatches
-# the matmul through candle-core's CUDA backend.
+# With `[real_transformer].compute_offload = "gpu"`, the wgpu backend can
+# materialize promoted experts as device buffers. If GPU init is disabled
+# or unavailable, inference falls back to the CPU path and this cache is
+# only a RAM-side promotion/observability tier. The optional `cuda` feature
+# is a separate candle CUDA path.
 [gpu_cache]
 enabled = false
 # VRAM budget in MiB. 0 ⇒ cache created with zero capacity, every
