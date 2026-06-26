@@ -108,7 +108,9 @@ half = { version = "2", features = ["bytemuck"] }
 # Moving to a newer wgpu — e.g. for Vulkan subgroup-operation support to
 # speed up the GPU matmul — will require a dedicated API migration pass
 # across `src/backend/mod.rs`; do not bump this casually.
-wgpu = { version = "0.20", features = ["wgsl"] }
+# `vulkan-portability` is wgpu 0.20's public feature that enables the
+# Vulkan HAL; without it Linux `run --gpu` cannot see NVIDIA Vulkan ICDs.
+wgpu = { version = "0.20", features = ["wgsl", "vulkan-portability"] }
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 anyhow = "1"

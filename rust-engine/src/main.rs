@@ -670,7 +670,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if !matches!(cli.cmd, Cmd::Serve { .. }) {
         crate::backend::install_default();
         let b = crate::backend::current();
-        info!(backend = b.device_name(), "math backend installed");
+        info!(
+            backend = b.device_name(),
+            compute_plane = b.compute_plane(),
+            "math backend installed"
+        );
         None
     } else {
         None
@@ -931,23 +935,33 @@ fn install_run_gpu_backend(
         gpu_expert_cache.clone(),
     );
     if !backend_box.is_gpu() {
-        warn!("--gpu requested but no GPU device available; falling back to default backend");
+        warn!("GPU REQUEST FAILED — RUNNING ON CPU");
         crate::backend::install_default();
         let b = crate::backend::current();
-        info!(backend = b.device_name(), "math backend installed");
+        info!(
+            backend = b.device_name(),
+            compute_plane = b.compute_plane(),
+            "math backend installed"
+        );
         return None;
     }
     let device_name = backend_box.device_name().to_string();
+    let compute_plane = backend_box.compute_plane().to_string();
     let gpu = std::sync::Arc::new(backend_box);
     if let Err(e) = crate::backend::set_backend(gpu) {
-        warn!(error = e, "failed to install GpuBackend for run; falling back to default");
+        warn!(error = e, "GPU REQUEST FAILED — RUNNING ON CPU");
         crate::backend::install_default();
         let b = crate::backend::current();
-        info!(backend = b.device_name(), "math backend installed");
+        info!(
+            backend = b.device_name(),
+            compute_plane = b.compute_plane(),
+            "math backend installed"
+        );
         None
     } else {
         info!(
             device = device_name,
+            compute_plane,
             vram_capacity_mb = gpu_cache_mb,
             "GpuBackend installed for run benchmark"
         );
@@ -1163,6 +1177,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         );
         let has_device = backend_box.is_gpu();
         let device_name = backend_box.device_name().to_string();
+        let compute_plane = backend_box.compute_plane().to_string();
         let gpu = std::sync::Arc::new(backend_box);
         if let Err(e) = crate::backend::set_backend(gpu) {
             warn!(
@@ -1172,6 +1187,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         } else {
             info!(
                 device = device_name,
+                compute_plane,
                 has_device,
                 "GpuBackend installed for dense backbone"
             );
@@ -1182,6 +1198,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let b = crate::backend::current();
         info!(
             backend = b.device_name(),
+            compute_plane = b.compute_plane(),
             compute_offload = ?cfg.real_transformer.compute_offload,
             "math backend installed"
         );

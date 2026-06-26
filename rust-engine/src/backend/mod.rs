@@ -1,5 +1,6 @@
 //! Math-backend module connecting GPU execution via wgpu and providing a CPU fallback.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use anyhow::{anyhow, Result};
@@ -15,6 +16,164 @@ const MATMUL_Q4_0_SHADER: &str = include_str!("wgpu_shaders/matmul_q4_0.wgsl");
 const SWIGLU_SHADER: &str = include_str!("wgpu_shaders/swiglu.wgsl");
 const SOFTMAX_SHADER: &str = include_str!("wgpu_shaders/softmax.wgsl");
 const ATTENTION_SHADER: &str = include_str!("wgpu_shaders/attention.wgsl");
+
+/// Explicit opt-in for treating software adapters (llvmpipe, SwiftShader,
+/// WARP, etc.) as an allowed wgpu plane. The normal `--gpu` path should
+/// never report these as a real GPU benchmark.
+const ALLOW_SOFTWARE_WGPU_ADAPTER_ENV: &str = "MER_WGPU_ALLOW_SOFTWARE_ADAPTER";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdapterMetadata {
+    name: String,
+    vendor: u32,
+    device: u32,
+    device_type: wgpu::DeviceType,
+    driver: String,
+    driver_info: String,
+    backend: wgpu::Backend,
+}
+
+impl AdapterMetadata {
+    fn from_info(info: wgpu::AdapterInfo) -> Self {
+        Self {
+            name: info.name,
+            vendor: info.vendor,
+            device: info.device,
+            device_type: info.device_type,
+            driver: info.driver,
+            driver_info: info.driver_info,
+            backend: info.backend,
+        }
+    }
+
+    fn is_software(&self) -> bool {
+        if self.device_type == wgpu::DeviceType::Cpu {
+            return true;
+        }
+
+        let text = format!(
+            "{} {} {}",
+            self.name, self.driver, self.driver_info
+        )
+        .to_ascii_lowercase();
+        ["llvmpipe", "lavapipe", "swiftshader", "software", "warp"]
+            .iter()
+            .any(|needle| text.contains(needle))
+    }
+
+    fn is_non_cpu_gpu(&self) -> bool {
+        !self.is_software()
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.vendor == other.vendor
+            && self.device == other.device
+            && self.device_type == other.device_type
+            && self.backend == other.backend
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{} via {} ({:?}, vendor={:#06x}, device={:#06x}, driver={})",
+            self.name, self.backend, self.device_type, self.vendor, self.device, self.driver
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdapterSelectionError {
+    NoAdapters,
+    OnlySoftware { count: usize },
+}
+
+impl fmt::Display for AdapterSelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AdapterSelectionError::NoAdapters => {
+                write!(f, "no adapters exposed by wgpu")
+            }
+            AdapterSelectionError::OnlySoftware { count } => {
+                write!(f, "only software adapters found by wgpu ({count})")
+            }
+        }
+    }
+}
+
+fn allow_software_wgpu_adapter() -> bool {
+    std::env::var(ALLOW_SOFTWARE_WGPU_ADAPTER_ENV)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn required_wgpu_features() -> wgpu::Features {
+    wgpu::Features::PUSH_CONSTANTS
+}
+
+fn required_wgpu_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_push_constant_size: 32,
+        ..wgpu::Limits::default()
+    }
+}
+
+fn wgpu_compute_plane(backend: wgpu::Backend) -> String {
+    format!("wgpu-{}", backend.to_str())
+}
+
+fn select_wgpu_adapter_candidates(
+    adapters: &[AdapterMetadata],
+    high_performance_index: Option<usize>,
+    allow_software: bool,
+) -> std::result::Result<Vec<usize>, AdapterSelectionError> {
+    if adapters.is_empty() {
+        return Err(AdapterSelectionError::NoAdapters);
+    }
+
+    let mut selected = Vec::with_capacity(adapters.len());
+    let mut push_unique = |idx: usize| {
+        if !selected.contains(&idx) {
+            selected.push(idx);
+        }
+    };
+
+    if let Some(idx) = high_performance_index.filter(|idx| *idx < adapters.len()) {
+        if allow_software || adapters[idx].is_non_cpu_gpu() {
+            push_unique(idx);
+        }
+    }
+
+    for (idx, meta) in adapters.iter().enumerate() {
+        if meta.device_type == wgpu::DeviceType::DiscreteGpu && meta.is_non_cpu_gpu() {
+            push_unique(idx);
+        }
+    }
+
+    for (idx, meta) in adapters.iter().enumerate() {
+        if meta.is_non_cpu_gpu() {
+            push_unique(idx);
+        }
+    }
+
+    if allow_software {
+        for idx in 0..adapters.len() {
+            push_unique(idx);
+        }
+    }
+
+    if selected.is_empty() {
+        Err(AdapterSelectionError::OnlySoftware {
+            count: adapters.len(),
+        })
+    } else {
+        Ok(selected)
+    }
+}
+
+struct EnumeratedAdapter {
+    adapter: wgpu::Adapter,
+    metadata: AdapterMetadata,
+}
 
 /// Zero-copy view of a f16 tensor borrowed from the caller.
 #[derive(Copy, Clone, Debug)]
@@ -258,6 +417,7 @@ pub struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     device_name: String,
+    compute_plane: String,
 
     matmul_pipeline: wgpu::ComputePipeline,
     /// Q4_0 inline-dequant GEMV pipeline (`matmul_q4_0.wgsl`) for expert
@@ -342,31 +502,176 @@ impl GpuBackend {
             ..Default::default()
         });
 
-        let adapter = instance
+        let allow_software = allow_software_wgpu_adapter();
+        let mut adapters: Vec<EnumeratedAdapter> = instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .into_iter()
+            .map(|adapter| {
+                let metadata = AdapterMetadata::from_info(adapter.get_info());
+                EnumeratedAdapter { adapter, metadata }
+            })
+            .collect();
+
+        for (index, candidate) in adapters.iter().enumerate() {
+            tracing::info!(
+                index,
+                name = %candidate.metadata.name,
+                backend = %candidate.metadata.backend,
+                device_type = ?candidate.metadata.device_type,
+                vendor = format_args!("{:#06x}", candidate.metadata.vendor),
+                device = format_args!("{:#06x}", candidate.metadata.device),
+                driver = %candidate.metadata.driver,
+                driver_info = %candidate.metadata.driver_info,
+                software = candidate.metadata.is_software(),
+                "wgpu adapter visible"
+            );
+        }
+
+        let high_performance_adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
-            .await
-            .ok_or_else(|| anyhow!("No HighPerformance adapter found"))?;
+            .await;
 
-        let info = adapter.get_info();
-        let device_name = format!("wgpu-{:?}-{}", info.backend, info.name);
+        let mut high_performance_index = None;
+        if let Some(adapter) = high_performance_adapter {
+            let metadata = AdapterMetadata::from_info(adapter.get_info());
+            high_performance_index = adapters
+                .iter()
+                .position(|candidate| candidate.metadata.matches(&metadata));
+            if high_performance_index.is_none() {
+                high_performance_index = Some(adapters.len());
+                tracing::info!(
+                    index = high_performance_index.unwrap(),
+                    name = %metadata.name,
+                    backend = %metadata.backend,
+                    device_type = ?metadata.device_type,
+                    vendor = format_args!("{:#06x}", metadata.vendor),
+                    device = format_args!("{:#06x}", metadata.device),
+                    driver = %metadata.driver,
+                    driver_info = %metadata.driver_info,
+                    software = metadata.is_software(),
+                    "wgpu HighPerformance adapter was not returned by enumerate_adapters; adding to candidates"
+                );
+                adapters.push(EnumeratedAdapter { adapter, metadata });
+            }
+        } else {
+            tracing::warn!(
+                "wgpu request_adapter(HighPerformance) returned no adapter; falling back to enumerated non-CPU adapters"
+            );
+        }
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("MER-GpuBackend"),
-                    required_features: wgpu::Features::PUSH_CONSTANTS,
-                    required_limits: wgpu::Limits {
-                        max_push_constant_size: 32,
-                        ..wgpu::Limits::default()
-                    },
+        let metadata: Vec<AdapterMetadata> = adapters
+            .iter()
+            .map(|candidate| candidate.metadata.clone())
+            .collect();
+        let candidate_indices =
+            select_wgpu_adapter_candidates(&metadata, high_performance_index, allow_software)
+                .map_err(|e| match e {
+                    AdapterSelectionError::NoAdapters => anyhow!(
+                        "no adapters exposed by wgpu; check that the Linux Vulkan loader and a vendor ICD are installed and visible"
+                    ),
+                    AdapterSelectionError::OnlySoftware { count } => anyhow!(
+                        "only software adapters found by wgpu ({count}); refusing to treat a software renderer as GPU. Set {ALLOW_SOFTWARE_WGPU_ADAPTER_ENV}=1 only for explicit software-adapter testing"
+                    ),
+                })?;
+
+        let required_features = required_wgpu_features();
+        let required_limits = required_wgpu_limits();
+        let mut unsupported = Vec::new();
+        let mut request_device_errors = Vec::new();
+        let mut selected = None;
+
+        for index in candidate_indices {
+            let candidate = &adapters[index];
+            let adapter_features = candidate.adapter.features();
+            let missing_features = required_features.difference(adapter_features);
+            let adapter_limits = candidate.adapter.limits();
+            let mut limit_failures = Vec::new();
+            required_limits.check_limits_with_fail_fn(
+                &adapter_limits,
+                false,
+                |name, requested, available| {
+                    limit_failures.push(format!(
+                        "{name} required {requested}, adapter supports {available}"
+                    ));
                 },
-                None,
-            )
-            .await?;
+            );
+
+            if !missing_features.is_empty() || !limit_failures.is_empty() {
+                tracing::warn!(
+                    adapter = %candidate.metadata.summary(),
+                    missing_features = ?missing_features,
+                    limits = %limit_failures.join("; "),
+                    "wgpu adapter rejected: required feature or limit unsupported"
+                );
+                unsupported.push(format!(
+                    "{} missing_features={missing_features:?} limits=[{}]",
+                    candidate.metadata.summary(),
+                    limit_failures.join("; ")
+                ));
+                continue;
+            }
+
+            match candidate
+                .adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("MER-GpuBackend"),
+                        required_features,
+                        required_limits: required_limits.clone(),
+                    },
+                    None,
+                )
+                .await
+            {
+                Ok((device, queue)) => {
+                    selected = Some((candidate.metadata.clone(), device, queue));
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        adapter = %candidate.metadata.summary(),
+                        error = %e,
+                        "wgpu request_device failed"
+                    );
+                    request_device_errors.push(format!(
+                        "{}: {e}",
+                        candidate.metadata.summary()
+                    ));
+                }
+            }
+        }
+
+        let (info, device, queue) = if let Some(selected) = selected {
+            selected
+        } else if !request_device_errors.is_empty() {
+            return Err(anyhow!(
+                "adapter found but request_device failed: {}",
+                request_device_errors.join(" | ")
+            ));
+        } else {
+            return Err(anyhow!(
+                "required feature or limit unsupported by visible wgpu adapters: {}",
+                unsupported.join(" | ")
+            ));
+        };
+
+        let compute_plane = wgpu_compute_plane(info.backend);
+        let device_name = format!("{}-{}", compute_plane, info.name);
+        tracing::info!(
+            compute_plane = %compute_plane,
+            adapter = %info.name,
+            backend = %info.backend,
+            device_type = ?info.device_type,
+            vendor = format_args!("{:#06x}", info.vendor),
+            device = format_args!("{:#06x}", info.device),
+            driver = %info.driver,
+            driver_info = %info.driver_info,
+            "selected wgpu compute plane"
+        );
 
         // Compile modules
         let matmul_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -677,6 +982,7 @@ impl GpuBackend {
             device,
             queue,
             device_name,
+            compute_plane,
             matmul_pipeline,
             matmul_q4_0_pipeline,
             swiglu_pipeline,
@@ -1568,6 +1874,12 @@ impl Backend for GpuBackend {
     }
 }
 
+impl GpuBackend {
+    fn compute_plane(&self) -> &str {
+        &self.compute_plane
+    }
+}
+
 // =====================================================================
 // Candle CPU Fallback Backend
 // =====================================================================
@@ -1740,7 +2052,11 @@ impl BackendBox {
         match GpuBackend::try_new(num_layers, max_seq_len, num_heads, num_kv_heads, head_dim, gpu_expert_cache).await {
             Ok(gpu) => BackendBox::Gpu(gpu),
             Err(e) => {
-                tracing::warn!(reason = %e, "GPU init failed — activating CPU fallback");
+                tracing::warn!(
+                    reason = %e,
+                    compute_plane = "cpu-fallback",
+                    "GPU init failed — activating CPU fallback"
+                );
                 BackendBox::Cpu(CandleBackend::new())
             }
         }
@@ -1762,6 +2078,13 @@ impl BackendBox {
             head_dim,
             gpu_expert_cache,
         ))
+    }
+
+    pub fn compute_plane(&self) -> &str {
+        match self {
+            BackendBox::Gpu(gpu) => gpu.compute_plane(),
+            BackendBox::Cpu(_) => "cpu-fallback",
+        }
     }
 }
 
@@ -1895,6 +2218,84 @@ impl Default for ComputeOffload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn adapter(
+        name: &str,
+        backend: wgpu::Backend,
+        device_type: wgpu::DeviceType,
+    ) -> AdapterMetadata {
+        AdapterMetadata {
+            name: name.to_string(),
+            vendor: 0x10de,
+            device: 0x27b8,
+            device_type,
+            driver: "test-driver".to_string(),
+            driver_info: "test-driver-info".to_string(),
+            backend,
+        }
+    }
+
+    #[test]
+    fn adapter_policy_prefers_high_performance_adapter() {
+        let adapters = vec![
+            adapter("integrated", wgpu::Backend::Vulkan, wgpu::DeviceType::IntegratedGpu),
+            adapter("discrete", wgpu::Backend::Vulkan, wgpu::DeviceType::DiscreteGpu),
+        ];
+
+        let order = select_wgpu_adapter_candidates(&adapters, Some(0), false).unwrap();
+
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    #[test]
+    fn adapter_policy_falls_back_to_discrete_when_high_performance_is_absent() {
+        let adapters = vec![
+            adapter("integrated", wgpu::Backend::Vulkan, wgpu::DeviceType::IntegratedGpu),
+            adapter("discrete", wgpu::Backend::Vulkan, wgpu::DeviceType::DiscreteGpu),
+        ];
+
+        let order = select_wgpu_adapter_candidates(&adapters, None, false).unwrap();
+
+        assert_eq!(order, vec![1, 0]);
+    }
+
+    #[test]
+    fn adapter_policy_skips_software_high_performance_for_real_gpu() {
+        let adapters = vec![
+            adapter("llvmpipe", wgpu::Backend::Vulkan, wgpu::DeviceType::Cpu),
+            adapter("integrated", wgpu::Backend::Vulkan, wgpu::DeviceType::IntegratedGpu),
+        ];
+
+        let order = select_wgpu_adapter_candidates(&adapters, Some(0), false).unwrap();
+
+        assert_eq!(order, vec![1]);
+    }
+
+    #[test]
+    fn adapter_policy_rejects_only_software_without_opt_in() {
+        let adapters = vec![adapter(
+            "llvmpipe",
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::Cpu,
+        )];
+
+        let err = select_wgpu_adapter_candidates(&adapters, Some(0), false).unwrap_err();
+
+        assert_eq!(err, AdapterSelectionError::OnlySoftware { count: 1 });
+    }
+
+    #[test]
+    fn adapter_policy_allows_software_when_explicitly_enabled() {
+        let adapters = vec![adapter(
+            "llvmpipe",
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::Cpu,
+        )];
+
+        let order = select_wgpu_adapter_candidates(&adapters, Some(0), true).unwrap();
+
+        assert_eq!(order, vec![0]);
+    }
 
     #[test]
     fn test_candle_matmul_correctness() {
