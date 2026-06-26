@@ -1082,6 +1082,14 @@ struct TrainSample {
     lr: f32,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct QueuedTrainSampleForTest {
+    pub x: Vec<f32>,
+    pub actual_top_k: Vec<u32>,
+    pub lr: f32,
+}
+
 struct SpeculatorWeights {
     /// `[hidden, d_model]` row-major.
     w1: Vec<f32>,
@@ -1595,6 +1603,35 @@ impl NeuralSpeculator {
             // contain useful gradient signal).
             let _ = tx.try_send(sample);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn train_steps_for_test(&self) -> u64 {
+        self.train_steps.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_queued_train_for_test<R>(
+        spec: &std::sync::Arc<Self>,
+        f: impl FnOnce() -> R,
+    ) -> (R, QueuedTrainSampleForTest) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TrainSample>(1);
+        if spec.train_queue.set(tx).is_err() {
+            panic!("test training queue must be installed before spawning the worker");
+        }
+
+        let result = f();
+        let sample = rx
+            .try_recv()
+            .expect("current sample should be submitted to the training queue");
+        (
+            result,
+            QueuedTrainSampleForTest {
+                x: sample.x,
+                actual_top_k: sample.actual_top_k,
+                lr: sample.lr,
+            },
+        )
     }
 }
 
@@ -2543,23 +2580,49 @@ mod tests {
 
     #[test]
     fn speculator_uncorrelated_labels_remain_near_random() {
-        let num_experts = 4u32;
-        let s = NeuralSpeculator::new(4, 16, num_experts, 0xC0117E);
-        let x = vec![0.5f32, -0.25, 0.125, -0.75];
+        use rand::Rng;
 
-        for _ in 0..400 {
-            for target in 0..num_experts {
-                s.train_step(&x, &[target], 0.05);
+        let d_model = 8usize;
+        let num_experts = 8u32;
+        let train_len = 2_048usize;
+        let heldout_len = 2_048usize;
+        let s = NeuralSpeculator::new(d_model, 16, num_experts, 0xC011_7E);
+
+        let mut train_x_rng = StdRng::seed_from_u64(0xA11C_E5EED);
+        let mut train_label_rng = StdRng::seed_from_u64(0x1A8E_15EED);
+        let train: Vec<(Vec<f32>, u32)> = (0..train_len)
+            .map(|_| {
+                let x = (0..d_model)
+                    .map(|_| train_x_rng.gen_range(-1.0f32..1.0))
+                    .collect();
+                let label = train_label_rng.gen_range(0..num_experts);
+                (x, label)
+            })
+            .collect();
+
+        for _ in 0..3 {
+            for (x, target) in &train {
+                s.train_step(x, &[*target], 0.05);
             }
         }
 
-        let pred = s.predict_topk(&x, 1);
-        assert_eq!(pred.len(), 1);
-        let correct = (0..num_experts).filter(|&target| target == pred[0]).count();
-        let accuracy = correct as f32 / num_experts as f32;
+        let mut heldout_x_rng = StdRng::seed_from_u64(0x5E1F_1E55);
+        let mut heldout_label_rng = StdRng::seed_from_u64(0xBADC_0FFE);
+        let correct = (0..heldout_len)
+            .filter(|_| {
+                let x: Vec<f32> = (0..d_model)
+                    .map(|_| heldout_x_rng.gen_range(-1.0f32..1.0))
+                    .collect();
+                let label = heldout_label_rng.gen_range(0..num_experts);
+                s.predict_topk(&x, 1).first() == Some(&label)
+            })
+            .count();
+        let accuracy = correct as f32 / heldout_len as f32;
+        let random = 1.0 / num_experts as f32;
+        let tolerance = 0.06;
         assert!(
-            accuracy <= (1.0 / num_experts as f32) + f32::EPSILON,
-            "constant hidden state carries no label signal; got accuracy={accuracy}"
+            (random - tolerance..=random + tolerance).contains(&accuracy),
+            "held-out labels are independent of hidden states; accuracy should stay near random ({random}), got {accuracy} ({correct}/{heldout_len})"
         );
     }
 

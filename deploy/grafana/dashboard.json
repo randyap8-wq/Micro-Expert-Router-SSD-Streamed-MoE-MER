@@ -30,7 +30,7 @@
       "type": "graph",
       "title": "Tokens / sec",
       "datasource": "Prometheus",
-      "targets": [{ "expr": "rate(mer_tokens_total[1m])" }],
+      "targets": [{ "expr": "rate(mer_tokens_generated_total[1m])" }],
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
     },
     {
@@ -65,7 +65,7 @@
       "title": "Speculator top-1 accuracy",
       "datasource": "Prometheus",
       "targets": [{
-        "expr": "rate(mer_speculator_accuracy_total[5m]) / rate(mer_speculator_total[5m])"
+        "expr": "rate(mer_speculator_accuracy_total[5m]) / clamp_min(rate(mer_speculator_evaluations_total[5m]), 1e-9)"
       }],
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 }
     },
