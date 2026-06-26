@@ -537,7 +537,7 @@ impl GgufStreamReader {
                 tensor_count,
                 kv_count,
                 header_preamble_len,
-            ) {
+            )? {
                 return Ok(Self {
                     version: parsed.version,
                     metadata: parsed.metadata,
@@ -621,16 +621,16 @@ impl GgufStreamReader {
         self.metadata.get("general.architecture").and_then(|v| v.as_str())
     }
 
-    /// Try to parse the full header out of `bytes`. Returns `None` if
-    /// `bytes` is too short to contain the full header yet — the caller
-    /// should pull more bytes and retry.
+    /// Try to parse the full header out of `bytes`. Returns `Ok(None)`
+    /// only if `bytes` is too short to contain the full header yet — the
+    /// caller should pull more bytes and retry.
     fn try_parse_header(
         bytes: &[u8],
         _version: u32,
         _tensor_count: u64,
         _kv_count: u64,
         _preamble_len: u64,
-    ) -> Option<ParsedGgufHeader> {
+    ) -> io::Result<Option<ParsedGgufHeader>> {
         // We can't easily know "is this enough?" without partially
         // parsing — so reuse the existing eager parser. If it succeeds
         // we extract the header fields and discard the body bytes the
@@ -643,14 +643,15 @@ impl GgufStreamReader {
         // when we converge on a parseable header is fine.
         let parsed = match GgufFile::parse(bytes.to_vec()) {
             Ok(p) => p,
-            Err(_) => return None,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
         };
-        Some(ParsedGgufHeader {
+        Ok(Some(ParsedGgufHeader {
             version: parsed.version,
             metadata: parsed.metadata,
             tensors: parsed.tensors,
             tensor_data_start: parsed.tensor_data_start as u64,
-        })
+        }))
     }
 }
 
@@ -731,6 +732,10 @@ mod tests {
     /// Build a tiny in-memory GGUF v3 file with one F32 metadata value
     /// and one 4-element F32 tensor named `"t"`, then parse it back.
     fn synth_gguf() -> Vec<u8> {
+        synth_gguf_with_dtype(ggml_dtype::F32)
+    }
+
+    fn synth_gguf_with_dtype(dtype: u32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(GGUF_MAGIC);
         out.extend_from_slice(&3u32.to_le_bytes()); // version
@@ -759,7 +764,7 @@ mod tests {
         out.extend_from_slice(tname);
         out.extend_from_slice(&1u32.to_le_bytes()); // n_dims
         out.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
-        out.extend_from_slice(&0u32.to_le_bytes()); // dtype = F32
+        out.extend_from_slice(&dtype.to_le_bytes());
         out.extend_from_slice(&0u64.to_le_bytes()); // offset = 0
 
         // pad to alignment
@@ -846,6 +851,39 @@ mod tests {
 
         // Missing tensor → Ok(None), not an error.
         assert!(r.read_tensor_data("missing").unwrap().is_none());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn stream_header_parse_reports_incomplete_on_truncated_header() {
+        let bytes = synth_gguf();
+        let parsed = GgufStreamReader::try_parse_header(&bytes[..24], 3, 1, 2, 24)
+            .expect("truncated header should not be a permanent error");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn stream_reader_rejects_unsupported_dtype_without_reading_to_eof() {
+        let mut bytes = synth_gguf_with_dtype(ggml_dtype::Q2_K);
+        bytes.resize(bytes.len() + 5 * 1024 * 1024, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "gguf-stream-invalid-dtype-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unsupported-dtype.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = GgufStreamReader::open(&path)
+            .err()
+            .expect("unsupported dtype should fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("tensor t"), "{msg}");
+        assert!(msg.contains("dtype 10"), "{msg}");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
