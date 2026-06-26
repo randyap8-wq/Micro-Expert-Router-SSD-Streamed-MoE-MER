@@ -1569,7 +1569,7 @@ impl NeuralSpeculator {
             std::thread::Builder::new()
                 .name("mer-speculator-train".to_string())
                 .spawn(move || speculator_training_loop(weak, rx))
-                .ok(); // Failing to spawn is non-fatal; fall back to in-line train.
+                .ok(); // Failing to spawn is non-fatal; queued samples will drop.
             tx
         });
     }
@@ -2506,6 +2506,81 @@ mod tests {
         let preds = s.predict_topk(&x, 2);
         assert!(preds.contains(&2), "preds={preds:?}");
         assert!(preds.contains(&3), "preds={preds:?}");
+    }
+
+    #[test]
+    fn speculator_learns_hidden_derived_labels_above_random() {
+        let d_model = 8usize;
+        let num_experts = 4u32;
+        let s = NeuralSpeculator::new(d_model, 32, num_experts, 0x1EAF);
+        let samples: Vec<(Vec<f32>, u32)> = (0..num_experts)
+            .map(|id| {
+                let mut x = vec![-0.5f32; d_model];
+                x[id as usize] = 1.0;
+                x[id as usize + num_experts as usize] =
+                    if id % 2 == 0 { 0.25 } else { -0.25 };
+                (x, id)
+            })
+            .collect();
+
+        for _ in 0..500 {
+            for (x, target) in &samples {
+                s.train_step(x, &[*target], 0.05);
+            }
+        }
+
+        let correct = samples
+            .iter()
+            .filter(|(x, target)| s.predict_topk(x, 1).first() == Some(target))
+            .count();
+        let accuracy = correct as f32 / samples.len() as f32;
+        assert!(
+            accuracy >= 0.75,
+            "hidden-derived labels should be learnable well above random: {correct}/{}",
+            samples.len()
+        );
+    }
+
+    #[test]
+    fn speculator_uncorrelated_labels_remain_near_random() {
+        let num_experts = 4u32;
+        let s = NeuralSpeculator::new(4, 16, num_experts, 0xC0117E);
+        let x = vec![0.5f32, -0.25, 0.125, -0.75];
+
+        for _ in 0..400 {
+            for target in 0..num_experts {
+                s.train_step(&x, &[target], 0.05);
+            }
+        }
+
+        let pred = s.predict_topk(&x, 1);
+        assert_eq!(pred.len(), 1);
+        let correct = (0..num_experts).filter(|&target| target == pred[0]).count();
+        let accuracy = correct as f32 / num_experts as f32;
+        assert!(
+            accuracy <= (1.0 / num_experts as f32) + f32::EPSILON,
+            "constant hidden state carries no label signal; got accuracy={accuracy}"
+        );
+    }
+
+    #[test]
+    fn speculator_training_worker_consumes_samples_and_advances_steps() {
+        let s = std::sync::Arc::new(NeuralSpeculator::new(4, 8, 4, 0x57E9));
+        s.spawn_training_worker();
+        let x = vec![0.25f32, -0.5, 0.75, 1.0];
+        for _ in 0..16 {
+            s.queue_train(&x, &[2], 0.1);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while s.train_steps.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            s.train_steps.load(Ordering::Relaxed) > 0,
+            "background worker should consume queued samples"
+        );
     }
 
     #[test]

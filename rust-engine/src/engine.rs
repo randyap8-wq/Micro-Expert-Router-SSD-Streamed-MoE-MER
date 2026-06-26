@@ -4315,10 +4315,11 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // summary shape so older diff-on-output tests stay valid.
         if r.locality_enabled || r.speculator_enabled {
             info!(
-                "predictive:    locality={} (hit_rate={:.2}%)  speculator={} (accuracy={:.2}%)  ssd_stall={:.1}ms",
+                "predictive:    locality={} (hit_rate={:.2}%)  speculator={} (top1={:.2}% topk_overlap={:.2}%)  ssd_stall={:.1}ms",
                 if r.locality_enabled { "on" } else { "off" },
                 r.predictive.locality_hit_rate * 100.0,
                 if r.speculator_enabled { "on" } else { "off" },
+                r.predictive.speculator_top1_accuracy * 100.0,
                 r.predictive.speculator_accuracy * 100.0,
                 r.predictive.ssd_stall_us as f64 / 1000.0,
             );
@@ -4620,6 +4621,24 @@ mod tests {
             predictor,
             ModelShape { d_model, d_ff, hidden_seed: seed },
         ))
+    }
+
+    fn rebuild_with_speculator(
+        base: &Arc<Engine>,
+        spec: Arc<NeuralSpeculator>,
+        top_k: usize,
+    ) -> Arc<Engine> {
+        Arc::new(
+            Engine::new(
+                base.core.cache.clone(),
+                base.core.pool.clone(),
+                base.core.storage.clone(),
+                base.core.router.clone(),
+                base.core.predictor.clone(),
+                base.core.shape,
+            )
+            .with_speculator(spec, top_k),
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4968,6 +4987,58 @@ mod tests {
             tele
         );
         assert!(tele.speculator_accuracy >= 0.0 && tele.speculator_accuracy <= 1.0);
+    }
+
+    #[test]
+    fn speculator_prediction_is_recorded_before_current_sample_training() {
+        let dir = TempDir::new("spec-before-train");
+        let num_experts: u32 = 4;
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let seed = 0xB4E0_1ABE;
+        let base = build_engine(&dir.path, num_experts, d_model, d_ff, 4, 1, 1, seed);
+        let spec = Arc::new(NeuralSpeculator::new(d_model, 16, num_experts, seed));
+        let hidden = vec![1.0f32, -0.5, 0.25, -0.125];
+
+        for _ in 0..400 {
+            spec.train_step(&hidden, &[0], 0.1);
+        }
+        assert_eq!(spec.predict_topk(&hidden, 1), vec![0]);
+
+        let engine = rebuild_with_speculator(&base, spec, 1);
+        let preds = engine.speculator_predict_and_train(&hidden, &[1], None);
+        assert_eq!(
+            preds,
+            vec![0],
+            "prediction should use weights from before the current target is queued"
+        );
+
+        let tele = engine.predictive_telemetry();
+        assert_eq!(tele.speculator_top1_matches, 0);
+        assert_eq!(tele.speculator_top1_total, 1);
+        assert_eq!(tele.speculator_hits, 0);
+        assert_eq!(tele.speculator_misses, 1);
+    }
+
+    #[test]
+    fn speculator_dmodel_mismatch_returns_empty_and_counts_disabled() {
+        let dir = TempDir::new("spec-dmodel-mismatch");
+        let num_experts: u32 = 4;
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let seed = 0xD15A_B1ED;
+        let base = build_engine(&dir.path, num_experts, d_model, d_ff, 4, 1, 1, seed);
+        let spec = Arc::new(NeuralSpeculator::new(d_model + 1, 16, num_experts, seed));
+        let engine = rebuild_with_speculator(&base, spec, 1);
+
+        let preds = engine.speculator_predict_and_train(&[0.0f32; 4], &[0], None);
+        assert!(preds.is_empty());
+
+        let report = engine.report();
+        assert_eq!(report.speculator_dmodel_mismatch, 1);
+        let tele = engine.predictive_telemetry();
+        assert_eq!(tele.speculator_top1_total, 0);
+        assert_eq!(tele.speculator_hits + tele.speculator_misses, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
