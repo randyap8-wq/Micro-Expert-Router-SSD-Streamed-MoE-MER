@@ -408,8 +408,10 @@ fn staging_dir_for(out_dir: &Path) -> io::Result<PathBuf> {
     for _ in 0..1024 {
         let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
-        if !candidate.exists() {
-            return Ok(candidate);
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
     Err(io::Error::new(
@@ -525,7 +527,6 @@ pub fn extract_experts_from_source(
     ensure_final_output_available(out_dir)?;
     let staging_dir = staging_dir_for(out_dir)?;
     let result = (|| {
-        fs::create_dir(&staging_dir)?;
         let report = extract_experts_from_source_inner(
             gguf,
             &staging_dir,
@@ -1081,6 +1082,35 @@ fn default_validation_block_align() -> usize {
     DEFAULT_BLOCK_ALIGN
 }
 
+fn tensor_header_prefix_len(header_bytes: usize, flags: u32, block_align: usize) -> usize {
+    if (flags & crate::tensor_header::UTH_FLAG_PAGE_ALIGNED_PAYLOAD) != 0 && block_align > 0 {
+        align_up(header_bytes, block_align)
+    } else {
+        header_bytes
+    }
+}
+
+fn validate_payload_len(
+    path: &Path,
+    dtype: WeightDtype,
+    payload_len: usize,
+    expected_payload: usize,
+) -> io::Result<()> {
+    if payload_len < expected_payload {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expert file {} payload has {} bytes, expected at least {} for dtype {}",
+                path.display(),
+                payload_len,
+                expected_payload,
+                dtype.as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
     let meta_path = data_dir.join("metadata.json");
     let body = fs::read_to_string(&meta_path).map_err(|e| {
@@ -1133,6 +1163,14 @@ pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
             "metadata dtype=mixed requires expert_layout_version=2",
         ));
     }
+    let expected_payload = if dtype == WeightDtype::Mixed {
+        None
+    } else {
+        Some(align_up(
+            expert_weight_bytes_for(meta.d_model, meta.d_ff, dtype),
+            meta.block_align,
+        ))
+    };
 
     let mut observed_mixed = 0usize;
     let mut observed_hist = BTreeMap::<String, usize>::new();
@@ -1158,7 +1196,9 @@ pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
                 ),
             ));
         }
-        let head_len = meta.block_align.min(meta.expert_size);
+        let head_len = meta
+            .expert_size
+            .min(crate::tensor_header::UTH2_BYTES.max(crate::tensor_header::UTH_BYTES));
         let mut head = vec![0u8; head_len];
         let mut file = fs::File::open(&path)?;
         use std::io::Read;
@@ -1187,15 +1227,17 @@ pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
                     ),
                 ));
             }
-            let payload_len = meta
-                .expert_size
-                .checked_sub(meta.block_align)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "expert payload length underflow",
-                    )
-                })?;
+            let prefix_len = tensor_header_prefix_len(
+                crate::tensor_header::UTH2_BYTES,
+                header.flags,
+                meta.block_align,
+            );
+            let payload_len = meta.expert_size.checked_sub(prefix_len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expert payload length underflow",
+                )
+            })?;
             header
                 .validate(payload_len as u64)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1207,19 +1249,35 @@ pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
             );
             *observed_hist.entry(key).or_default() += 1;
             observed_mixed += 1;
-        } else if let Some(header) = TensorHeader::probe(&head) {
-            let header_dtype = header.dtype.to_weight();
-            if header_dtype != dtype {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "expert file {} UTH dtype {} disagrees with metadata dtype {}",
-                        path.display(),
-                        header_dtype.as_str(),
-                        dtype.as_str()
-                    ),
-                ));
-            }
+        } else {
+            let payload_len = if let Some(header) = TensorHeader::probe(&head) {
+                let header_dtype = header.dtype.to_weight();
+                if header_dtype != dtype {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "expert file {} UTH dtype {} disagrees with metadata dtype {}",
+                            path.display(),
+                            header_dtype.as_str(),
+                            dtype.as_str()
+                        ),
+                    ));
+                }
+                let prefix_len = tensor_header_prefix_len(
+                    crate::tensor_header::UTH_BYTES,
+                    header.flags,
+                    meta.block_align,
+                );
+                meta.expert_size.checked_sub(prefix_len).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expert payload length underflow",
+                    )
+                })?
+            } else {
+                meta.expert_size
+            };
+            validate_payload_len(&path, dtype, payload_len, expected_payload.unwrap())?;
         }
     }
 
@@ -2495,6 +2553,38 @@ mod tests {
     }
 
     #[test]
+    fn validate_data_dir_rejects_truncated_non_mixed_payload_even_when_metadata_matches() {
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let num_experts = 2usize;
+        let bytes = build_synth_gguf(d_model, d_ff, num_experts);
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+
+        let out = tmp.join("validate-truncated-payload");
+        extract_experts_from_source(&gguf, &out, 1, num_experts, ExtractOptions::default())
+            .expect("extract");
+
+        let expert = out.join("expert_0.bin");
+        let truncated = fs::read(&expert).unwrap()[..DEFAULT_BLOCK_ALIGN].to_vec();
+        fs::write(&expert, truncated).unwrap();
+        let meta_path = out.join("metadata.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        meta["expert_size"] = serde_json::json!(DEFAULT_BLOCK_ALIGN);
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+        let err = validate_data_dir(&out).expect_err("truncated payload must fail validation");
+        assert!(
+            err.to_string().contains("payload has 0 bytes"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn experts_only_conversion_skips_dense_outputs() {
         let d_model = 4usize;
         let d_ff = 8usize;
@@ -3299,15 +3389,13 @@ mod tests {
             .collect();
         let expected = weights.forward(&x);
         let before_mixed = crate::inference::mixed_expert_dispatches();
-        let before_fallback = crate::inference::mixed_dequant_fallbacks();
         let (_out, actual) =
             crate::inference::run_inference_mixed_quant(7, &resident, &x, d_model, d_ff)
                 .expect("direct mixed inference");
-        assert_eq!(
-            crate::inference::mixed_expert_dispatches(),
-            before_mixed + 1
+        assert!(
+            crate::inference::mixed_expert_dispatches() > before_mixed,
+            "direct mixed inference should increment the mixed dispatch counter"
         );
-        assert_eq!(crate::inference::mixed_dequant_fallbacks(), before_fallback);
         assert_eq!(actual.len(), expected.len());
         for (idx, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
             assert!(

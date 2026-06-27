@@ -1670,7 +1670,8 @@ micro-expert-router gen-data
   --d-model <N>              FFN hidden dim (default 512)
   --d-ff <N>                 FFN intermediate dim (default 2048)
   --block-align <BYTES>      O_DIRECT alignment (default 4096)
-  --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 | q8_0 (default f32)
+  --dtype <DTYPE>            f32 | f16 | bf16 | int8 | q4k | q4_0 | q8_0
+                              | mxfp4 (default f32)
 
 micro-expert-router repack    # Tier 2: build a packed expert blob + manifest
   --data-dir <PATH>          Source dir of expert_<id>.bin (default ./data)
@@ -1703,8 +1704,10 @@ micro-expert-router run
                               runs tested 16, 64, and 128 slots.
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
-  --dtype <DTYPE>            f32 | f16 | int8 | q4k | q4_0 | q8_0 (default f32).
-                              Must match gen-data / the offline extractor.
+  --dtype <DTYPE>            f32 | f16 | bf16 | int8 | q4k | q4_0 | q5k
+                              | q6k | q8_0 | mxfp4 | mixed (default f32).
+                              Must match gen-data / gguf-convert / the
+                              offline extractor.
   --predict-fanout <N>       Prefetch candidates per token (default 2)
   --pipeline-depth <N>       Look-ahead pipeline depth (default 3). In serve
                               mode, how many MoE layers ahead the speculator
@@ -2442,7 +2445,7 @@ explains which of these the change moves and why.
 
 The engine reads weight bytes straight off the SSD; halving, or
 quartering, the byte width of each weight halves / quarters every
-read. Six on-disk dtypes are first-class:
+read. Seven on-disk modes are first-class in the energy table:
 
 | `--dtype` | Bytes / weight | Per-blob header | Compute kernel | Use |
 |---|---:|:---:|---|---|
@@ -2454,16 +2457,18 @@ read. Six on-disk dtypes are first-class:
 | `q8_0` | ~1.0625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q8_0` 32-block stream (one `f16` scale + 32 signed `i8` weights per block). **Fallback**: 32-block dequant when `cols % 32 != 0`. | GGUF-compatible 8-bit; same density as `int8` but with **per-block** scales, so dynamic range stays bounded inside each 32-weight neighbourhood |
 | `mixed` | varies by projection | UTH2 required | CPU direct projection dispatch over gate/up/down ranges without full-weight F32 expansion. Supported projection dtypes include `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `F32`, `F16`, and `BF16`; unsupported projection dtypes fail before execution. | GGUF mixed expert triples such as `Q4_K/Q4_K/Q6_K`; GPU execution is not advertised for Q5_K/Q6_K |
 
-Selectable on **`gen-data`** (synthetic data, every dtype has a
-matching generator arm), on **`gguf-convert`** (input format detected
-from the GGUF tensor dtype, pass `--native-quant` to write raw
-`Q4_0` / `Q4_K` / `Q5_K` / `Q6_K` / `Q8_0` projection streams and UTH2
-mixed layouts instead of dequantising to F32), and on **`run` / `serve`**
-(must match the on-disk files). Native quant conversion is fail-closed:
-unsupported projection dtypes or unsafe shapes abort preflight instead of
-silently expanding experts to F32. The forward pass dispatches to
-`inference::run_inference_*` per dtype, all producing scalar `f32`
-SwiGLU output, so a benchmark run is a one-flag diff.
+Selectable on **`gen-data`** for the synthetic generator dtypes (`f32`,
+`f16`, `bf16`, `int8`, `q4k`, `q4_0`, `q8_0`, `mxfp4`), on
+**`gguf-convert`** from the GGUF tensor dtype (pass `--native-quant` to
+write raw `Q4_0` / `Q4_K` / `Q5_K` / `Q6_K` / `Q8_0` projection streams
+and UTH2 mixed layouts instead of dequantising to F32), and on **`run` /
+`serve`** for every runtime dtype accepted by the engine (`f32`, `f16`,
+`bf16`, `int8`, `q4k`, `q4_0`, `q5k`, `q6k`, `q8_0`, `mxfp4`, `mixed`).
+The runtime dtype must match the on-disk files. Native quant conversion
+is fail-closed: unsupported projection dtypes or unsafe shapes abort
+preflight instead of silently expanding experts to F32. The forward pass
+dispatches to `inference::run_inference_*` per dtype, all producing
+scalar `f32` SwiGLU output, so a benchmark run is a one-flag diff.
 
 **Quantised fast path.** For `q4k`, `q4_0`, and `q8_0` the engine
 prefers the `QMatMul` path (`run_inference_q4_0_qmm` /

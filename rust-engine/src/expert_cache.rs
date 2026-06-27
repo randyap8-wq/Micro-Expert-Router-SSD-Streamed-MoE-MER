@@ -896,6 +896,28 @@ mod tests {
         assert_eq!(resident.data().len(), block_align);
         assert!(resident.data()[..64].iter().all(|&b| b == 0xA5));
         assert!(resident.data()[64..].iter().all(|&b| b == 0));
+
+        let range = |offset| crate::tensor_header::ProjectionRange {
+            dtype: crate::tensor_header::UthDtypeId::F32,
+            offset,
+            len: 16,
+            weights: 4,
+        };
+        let mixed =
+            crate::tensor_header::MixedExpertHeader::new(2, 2, range(0), range(16), range(32));
+        let mut mixed_file = Vec::new();
+        mixed.write_padded(block_align, &mut mixed_file);
+        mixed_file.extend_from_slice(&[0x5Au8; 64]);
+        mixed_file.resize(block_align * 2, 0);
+
+        let pool = BufferPool::new(1, mixed_file.len(), block_align);
+        let mut buffer = pool.try_acquire().unwrap();
+        buffer.as_mut_slice().copy_from_slice(&mixed_file);
+        let resident = ExpertResident::new_with_block_align(1, buffer, block_align);
+        assert!(resident.mixed_layout().is_some());
+        assert_eq!(resident.data().len(), block_align);
+        assert!(resident.data()[..64].iter().all(|&b| b == 0x5A));
+        assert!(resident.data()[64..].iter().all(|&b| b == 0));
     }
 
     #[test]

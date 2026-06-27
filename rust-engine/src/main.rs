@@ -77,6 +77,10 @@ use crate::router::{
     LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter,
 };
 
+const SUPPORTED_SYNTHETIC_DTYPES: &str = "f32, f16, bf16, int8, q4k, q4_0, q8_0, mxfp4";
+const SUPPORTED_RUNTIME_DTYPES: &str =
+    "f32, f16, bf16, int8, q4k, q4_0, q5k, q6k, q8_0, mxfp4, mixed";
+
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
 #[derive(Parser, Debug)]
 #[command(name = "micro-expert-router", version, about)]
@@ -122,8 +126,9 @@ enum Cmd {
         /// without `EINVAL`. Must match what `run` is invoked with.
         #[arg(long, default_value_t = 4096)]
         block_align: usize,
-        /// On-disk weight dtype: `f32` (default) or `f16`. Selects the
-        /// byte width of every weight in the generated files.
+        /// On-disk weight dtype for synthetic files: f32, f16, bf16, int8,
+        /// q4k, q4_0, q8_0, or mxfp4. q5k, q6k, and mixed are GGUF/runtime
+        /// formats and are not synthesized by this generator.
         #[arg(long, default_value = "f32")]
         dtype: String,
     },
@@ -236,10 +241,9 @@ enum Cmd {
         /// PRNG seed for reproducible runs.
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
-        /// On-disk weight dtype: `f32` (default, 4 B/weight) or `f16`
-        /// (2 B/weight). Halving the byte width halves SSD-read bytes
-        /// per cache miss, which is the dominant energy term in this
-        /// engine. Must match what `gen-data` was invoked with.
+        /// On-disk weight dtype. Accepts f32, f16, bf16, int8, q4k, q4_0,
+        /// q5k, q6k, q8_0, mxfp4, or mixed. Must match the generated or
+        /// converted expert dataset.
         #[arg(long, default_value = "f32")]
         dtype: String,
         /// Fraction (`0.1..=1.0`) of input dimensions loaded per expert
@@ -805,7 +809,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let dtype =
                         crate::inference::WeightDtype::from_str_opt(&dtype).ok_or_else(|| {
-                            format!("--dtype: unknown value {dtype:?} (use 'f32' or 'f16')")
+                            format!(
+                                "--dtype: unknown value {dtype:?} (supported: {SUPPORTED_RUNTIME_DTYPES})"
+                            )
                         })?;
                     cmd_run(
                         RunArgs {
@@ -1901,8 +1907,20 @@ fn cmd_gen_data(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::inference::WeightDtype;
     let dtype = WeightDtype::from_str_opt(dtype_str).ok_or_else(|| {
-        format!("--dtype: unknown value {dtype_str:?} (use 'f32', 'f16', or 'int8')")
+        format!(
+            "--dtype: unknown value {dtype_str:?} (supported for gen-data: {SUPPORTED_SYNTHETIC_DTYPES})"
+        )
     })?;
+    if matches!(
+        dtype,
+        WeightDtype::Q5K | WeightDtype::Q6K | WeightDtype::Mixed
+    ) {
+        return Err(format!(
+            "gen-data does not synthesize dtype {}; use gguf-convert --native-quant or an offline extractor for this layout",
+            dtype.as_str()
+        )
+        .into());
+    }
     if block_align == 0 || !block_align.is_power_of_two() {
         return Err(format!(
             "--block-align ({block_align}) must be a positive power of two \

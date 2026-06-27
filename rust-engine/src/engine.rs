@@ -4371,6 +4371,7 @@ impl Engine {
             r.expert_size,
             if r.dtype == WeightDtype::Mixed {
                 r.expert_size
+                    .saturating_sub(self.core.storage.config().block_align)
             } else {
                 crate::inference::expert_weight_bytes_for(r.d_model, r.d_ff, r.dtype)
             },
