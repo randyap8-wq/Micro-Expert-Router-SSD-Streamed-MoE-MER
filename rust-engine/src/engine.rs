@@ -17,18 +17,18 @@ use crate::aligned_buffer::AlignedBuffer;
 use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{ExpertResident, GpuExpertCache, GpuResident};
-use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::gating::Router;
 use crate::inference::{
-    combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8, run_inference_mxfp4,
-    run_inference_q4_0,
-    run_inference_q4_0_qmm, run_inference_q4k, run_inference_q4k_qmm,
-    run_inference_q8_0, run_inference_q8_0_qmm, synth_hidden_state,
-    uniform_scores, ExpertWeightsError, HiddenState,
-    InferenceOutput, WeightDtype, Q4_0_BLOCK_ELEMS, Q4K_BLOCK_ELEMS, Q8_0_BLOCK_ELEMS,
+    combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
+    run_inference_mixed_quant, run_inference_mxfp4, run_inference_q4_0, run_inference_q4_0_qmm,
+    run_inference_q4k, run_inference_q4k_qmm, run_inference_q5k, run_inference_q6k,
+    run_inference_q8_0, run_inference_q8_0_qmm, synth_hidden_state, uniform_scores,
+    ExpertWeightsError, HiddenState, InferenceOutput, WeightDtype, Q4K_BLOCK_ELEMS,
+    Q4_0_BLOCK_ELEMS, Q8_0_BLOCK_ELEMS,
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
+use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::router::{
     DecayWorkerHandle, LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader,
 };
@@ -182,8 +182,16 @@ impl AlignedKvCache {
     ///
     /// Panics if either slice's length differs from `kv_dim`.
     pub fn append(&mut self, k: &[f32], v: &[f32]) -> bool {
-        assert_eq!(k.len(), self.kv_dim, "AlignedKvCache::append: kv_dim mismatch");
-        assert_eq!(v.len(), self.kv_dim, "AlignedKvCache::append: kv_dim mismatch");
+        assert_eq!(
+            k.len(),
+            self.kv_dim,
+            "AlignedKvCache::append: kv_dim mismatch"
+        );
+        assert_eq!(
+            v.len(),
+            self.kv_dim,
+            "AlignedKvCache::append: kv_dim mismatch"
+        );
         let evicted = if self.seq_len == self.window_tokens {
             self.shift_one_left();
             true
@@ -206,7 +214,10 @@ impl AlignedKvCache {
 
     /// Read the i-th cached value.
     pub fn value(&self, i: usize) -> &[f32] {
-        assert!(i < self.seq_len, "AlignedKvCache::value: index out of bounds");
+        assert!(
+            i < self.seq_len,
+            "AlignedKvCache::value: index out of bounds"
+        );
         self.row_floats(self.values.as_slice(), i)
     }
 
@@ -246,10 +257,8 @@ impl AlignedKvCache {
         // in-memory representation of `[f32]` already matches the desired
         // serialized layout. `[f32]` is contiguous, and the produced byte
         // slices cover exactly `row_bytes`.
-        let k_bytes =
-            unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, row_bytes) };
-        let v_bytes =
-            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, row_bytes) };
+        let k_bytes = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, row_bytes) };
+        let v_bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, row_bytes) };
         kb.copy_from_slice(k_bytes);
         vb.copy_from_slice(v_bytes);
     }
@@ -276,9 +285,7 @@ impl AlignedKvCache {
             0,
             "row_floats: byte slice pointer must be 4-byte aligned for f32"
         );
-        unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.kv_dim)
-        }
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.kv_dim) }
     }
 
     /// Shift the K/V rows one slot toward index 0. Called by `append`
@@ -341,7 +348,11 @@ pub enum ExpertReadError {
 impl std::fmt::Display for ExpertReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExpertReadError::Io { id, attempts, source } => write!(
+            ExpertReadError::Io {
+                id,
+                attempts,
+                source,
+            } => write!(
                 f,
                 "expert {id} read failed after {attempts} attempts: {source}"
             ),
@@ -447,7 +458,11 @@ pub struct TraceWriter {
     /// Shared with the worker so `flush` can synchronise on a
     /// definite "everything queued so far has been written" point
     /// (used in shutdown paths and tests).
-    flush_signal: Arc<(parking_lot::Mutex<u64>, parking_lot::Condvar, std::sync::atomic::AtomicU64)>,
+    flush_signal: Arc<(
+        parking_lot::Mutex<u64>,
+        parking_lot::Condvar,
+        std::sync::atomic::AtomicU64,
+    )>,
     /// Producer-side high-water mark: the largest sequence number
     /// successfully enqueued onto the channel. Updated *after* a
     /// successful `try_send` so `flush()` never waits on a record the
@@ -644,9 +659,7 @@ impl TraceWriter {
                 // The store uses a CAS-style max so out-of-order
                 // success notifications (rare under contention) can't
                 // walk the HWM backwards.
-                let mut current = self
-                    .producer_hwm
-                    .load(std::sync::atomic::Ordering::Acquire);
+                let mut current = self.producer_hwm.load(std::sync::atomic::Ordering::Acquire);
                 while seq > current {
                     match self.producer_hwm.compare_exchange_weak(
                         current,
@@ -687,9 +700,7 @@ impl TraceWriter {
         // Snapshot the *producer* HWM (not the worker's HWM); the
         // worker's HWM lags the producer and would let `flush` return
         // before the worker has actually drained the latest records.
-        let snapshot = self
-            .producer_hwm
-            .load(std::sync::atomic::Ordering::Acquire);
+        let snapshot = self.producer_hwm.load(std::sync::atomic::Ordering::Acquire);
         if snapshot == 0 {
             return; // nothing ever queued (or every send dropped)
         }
@@ -700,10 +711,7 @@ impl TraceWriter {
             if now >= deadline {
                 break;
             }
-            let _ = self
-                .flush_signal
-                .1
-                .wait_for(&mut guard, deadline - now);
+            let _ = self.flush_signal.1.wait_for(&mut guard, deadline - now);
         }
     }
 }
@@ -1445,9 +1453,7 @@ pub struct Engine {
 fn run_compute_donated<R>(f: impl FnOnce() -> R) -> R {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
         _ => f(),
     }
 }
@@ -1496,16 +1502,13 @@ fn dispatch_expert_forward(
         // Without the feature this is a direct call to the CPU path, so
         // default builds are byte-for-byte unchanged.
         #[cfg(feature = "cuda")]
-        WeightDtype::F32 => {
-            crate::inference::run_inference_gpu(token_idx, r, x, d_model, d_ff)
-        }
+        WeightDtype::F32 => crate::inference::run_inference_gpu(token_idx, r, x, d_model, d_ff),
         #[cfg(not(feature = "cuda"))]
         WeightDtype::F32 => crate::inference::run_inference(token_idx, r, x, d_model, d_ff),
         WeightDtype::F16 => run_inference_f16(token_idx, r, x, d_model, d_ff),
         WeightDtype::Int8 => run_inference_int8(token_idx, r, x, d_model, d_ff),
-        WeightDtype::Q4K if use_qmm
-            && d_model % Q4K_BLOCK_ELEMS == 0
-            && d_ff % Q4K_BLOCK_ELEMS == 0 =>
+        WeightDtype::Q4K
+            if use_qmm && d_model % Q4K_BLOCK_ELEMS == 0 && d_ff % Q4K_BLOCK_ELEMS == 0 =>
         {
             match run_inference_q4k_qmm(token_idx, r, x, d_model, d_ff) {
                 Ok(v) => Ok(v),
@@ -1516,9 +1519,8 @@ fn dispatch_expert_forward(
             }
         }
         WeightDtype::Q4K => run_inference_q4k(token_idx, r, x, d_model, d_ff),
-        WeightDtype::Q4_0 if use_qmm
-            && d_model % Q4_0_BLOCK_ELEMS == 0
-            && d_ff % Q4_0_BLOCK_ELEMS == 0 =>
+        WeightDtype::Q4_0
+            if use_qmm && d_model % Q4_0_BLOCK_ELEMS == 0 && d_ff % Q4_0_BLOCK_ELEMS == 0 =>
         {
             match run_inference_q4_0_qmm(token_idx, r, x, d_model, d_ff) {
                 Ok(v) => Ok(v),
@@ -1529,9 +1531,8 @@ fn dispatch_expert_forward(
             }
         }
         WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, d_model, d_ff),
-        WeightDtype::Q8_0 if use_qmm
-            && d_model % Q8_0_BLOCK_ELEMS == 0
-            && d_ff % Q8_0_BLOCK_ELEMS == 0 =>
+        WeightDtype::Q8_0
+            if use_qmm && d_model % Q8_0_BLOCK_ELEMS == 0 && d_ff % Q8_0_BLOCK_ELEMS == 0 =>
         {
             match run_inference_q8_0_qmm(token_idx, r, x, d_model, d_ff) {
                 Ok(v) => Ok(v),
@@ -1542,8 +1543,11 @@ fn dispatch_expert_forward(
             }
         }
         WeightDtype::Q8_0 => run_inference_q8_0(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Q5K => run_inference_q5k(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Q6K => run_inference_q6k(token_idx, r, x, d_model, d_ff),
         WeightDtype::BF16 => run_inference_bf16(token_idx, r, x, d_model, d_ff),
         WeightDtype::MXFP4 => run_inference_mxfp4(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Mixed => run_inference_mixed_quant(token_idx, r, x, d_model, d_ff),
     }
 }
 
@@ -1560,7 +1564,11 @@ fn summarise_output_like_cpu(token_idx: u64, expert_id: u32, y: &[f32]) -> Infer
         digest ^= v.to_bits() as u64;
         digest = digest.wrapping_mul(FNV_PRIME);
     }
-    InferenceOutput { expert_id, digest, out_norm }
+    InferenceOutput {
+        expert_id,
+        digest,
+        out_norm,
+    }
 }
 
 impl Engine {
@@ -1572,7 +1580,15 @@ impl Engine {
         predictor: Arc<PredictiveLoader>,
         shape: ModelShape,
     ) -> Self {
-        Self::with_options(cache, pool, storage, router, predictor, shape, EngineOptions::default())
+        Self::with_options(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            shape,
+            EngineOptions::default(),
+        )
     }
 
     pub fn with_options(
@@ -1684,8 +1700,7 @@ impl Engine {
     /// Updates the `mer_vram_used_bytes` Prometheus gauge after every
     /// successful promotion.
     pub fn install_gpu_cache(&mut self, gpu: Arc<GpuExpertCache>) {
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
         let gpu_for_task = gpu.clone();
         let prom_for_task = self.metrics.prom.clone();
         // Snapshot the (immutable) expert dtype so each promoted
@@ -1735,12 +1750,8 @@ impl Engine {
         // automatically when no adapter is present, so this never
         // panics.
         let backend = crate::backend::BackendBox::init_blocking(
-            /* num_layers   = */ 1,
-            /* max_seq_len  = */ 1,
-            /* num_heads    = */ 1,
-            /* num_kv_heads = */ 1,
-            /* head_dim     = */ 1,
-            gpu,
+            /* num_layers   = */ 1, /* max_seq_len  = */ 1, /* num_heads    = */ 1,
+            /* num_kv_heads = */ 1, /* head_dim     = */ 1, gpu,
         );
         self.core.backend = Arc::new(backend);
     }
@@ -1762,8 +1773,7 @@ impl Engine {
         &mut self,
         gpu: Arc<GpuExpertCache>,
     ) -> tokio::sync::mpsc::UnboundedReceiver<(u32, Arc<ExpertResident>)> {
-        let (tx, rx) =
-            tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
         self.core.gpu_cache = Some(gpu);
         self.core.gpu_promotion_tx = Some(tx);
         rx
@@ -1795,7 +1805,11 @@ impl Engine {
     /// `moe_step`, reconcile the monitor's hot set with the cache's pin
     /// state — newly hot ids are pinned, ids that fell below the heat
     /// threshold are unpinned.
-    pub fn with_locality_monitor(mut self, monitor: Arc<LocalityMonitor>, threshold_pct: f32) -> Self {
+    pub fn with_locality_monitor(
+        mut self,
+        monitor: Arc<LocalityMonitor>,
+        threshold_pct: f32,
+    ) -> Self {
         self.speculation.locality = Some(monitor);
         // Clamp into a sane range; values outside `[0,1]` make no
         // semantic sense for a "fraction of the window" threshold.
@@ -1980,7 +1994,11 @@ impl Engine {
         info!(
             pinned = hot.len(),
             fraction = sr.fraction,
-            source = if sr.profile.is_some() { "profile" } else { "online" },
+            source = if sr.profile.is_some() {
+                "profile"
+            } else {
+                "online"
+            },
             warmup_tokens = sr.warmup_tokens,
             "static residency: pinned hot expert set"
         );
@@ -2001,7 +2019,9 @@ impl Engine {
         if let Some(m) = &self.speculation.alias_map {
             if let Some(&canon) = m.get(&id) {
                 if canon != id {
-                    self.speculation.alias_redirects.fetch_add(1, Ordering::Relaxed);
+                    self.speculation
+                        .alias_redirects
+                        .fetch_add(1, Ordering::Relaxed);
                     return canon;
                 }
             }
@@ -2012,7 +2032,10 @@ impl Engine {
     #[inline]
     fn credit_prefetch_use(&self, resident: &Arc<ExpertResident>, new_hits: u64) {
         if new_hits == 1 && resident.is_shadow_backed() {
-            self.metrics.counters.prefetch_used.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .counters
+                .prefetch_used
+                .fetch_add(1, Ordering::Relaxed);
             self.core.governor.record_used();
         }
     }
@@ -2035,10 +2058,7 @@ impl Engine {
     /// from the top-K mixture), so the only safe degradation is to
     /// surface the error to the caller — the HTTP serving path maps it
     /// to a 500 instead of crashing the process.
-    pub async fn generate(
-        self: &Arc<Self>,
-        token_idx: u64,
-    ) -> Result<CycleStats, ExpertReadError> {
+    pub async fn generate(self: &Arc<Self>, token_idx: u64) -> Result<CycleStats, ExpertReadError> {
         let cycle_start = Instant::now();
         // Tier 4: fold the previous token's prefetch precision window
         // into the governor's EWMA before this token issues any new
@@ -2050,14 +2070,20 @@ impl Engine {
         // ignores it. Either way the value is re-used by the FFN
         // forward pass below, so this is at worst the same single
         // `synth_hidden_state` call the legacy path always made.
-        let hidden: HiddenState =
-            synth_hidden_state(token_idx, self.core.shape.d_model, self.core.shape.hidden_seed);
+        let hidden: HiddenState = synth_hidden_state(
+            token_idx,
+            self.core.shape.d_model,
+            self.core.shape.hidden_seed,
+        );
         let decision = self.core.router.route(&hidden, token_idx);
         let raw_target = decision.experts;
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids. This is what makes deduplicated
         // experts share one resident copy.
-        let target: Vec<u32> = raw_target.iter().map(|&id| self.resolve_alias(id)).collect();
+        let target: Vec<u32> = raw_target
+            .iter()
+            .map(|&id| self.resolve_alias(id))
+            .collect();
         let mut stats = CycleStats::default();
 
         // Locality monitor: observe the chosen experts and reconcile
@@ -2149,10 +2175,7 @@ impl Engine {
                 stats.misses += 1;
                 debug!(expert = id, "cache miss, fetching from NVMe");
                 let me = self.clone();
-                miss_handles.push((
-                    i,
-                    tokio::spawn(async move { me.fetch(id).await }),
-                ));
+                miss_handles.push((i, tokio::spawn(async move { me.fetch(id).await })));
             }
         }
         // Aggregate VRAM-tier outcome for this routing decision.
@@ -2195,7 +2218,10 @@ impl Engine {
                     .observe_step2(&ring.last_last.ids, &ring.last.ids, &target);
             }
             ring.last_last = ring.last.clone();
-            ring.last = MarkovHistory { ids: target.clone(), layer: None };
+            ring.last = MarkovHistory {
+                ids: target.clone(),
+                layer: None,
+            };
         }
         // Kick off speculative prefetches for the most-recent expert,
         // using the 2nd-order predictor when a prev_prev is available
@@ -2269,7 +2295,9 @@ impl Engine {
         // exports it as its own histogram so future overlapped-fetch
         // refactors can decouple the two without breaking dashboards.
         if io_wait_us > 0 {
-            self.metrics.total_ssd_stall_us.fetch_add(io_wait_us, Ordering::Relaxed);
+            self.metrics
+                .total_ssd_stall_us
+                .fetch_add(io_wait_us, Ordering::Relaxed);
             if let Some(m) = &self.metrics.prom {
                 m.record_ssd_stall(io_wait_us as f64 / 1_000_000.0);
             }
@@ -2294,175 +2322,186 @@ impl Engine {
         //    duration — otherwise the speculative prefetch tasks fired
         //    above can't get a worker to overlap this compute.
         let compute_start = Instant::now();
-        let compute_us = run_compute_donated(|| if self.core.options.io_only {
-            let mut digest: u64 = 0;
-            let mut total_bytes: u64 = 0;
-            for r in &residents {
-                let bytes = r.data();
-                total_bytes += bytes.len() as u64;
-                // XOR every byte. The accumulator is 64 bits wide so we
-                // also rotate per chunk; this prevents a smart compiler
-                // from folding the loop and guarantees every read byte
-                // is observed, the whole point of `--io-only`.
-                let mut acc: u64 = 0;
-                for chunk in bytes.chunks(8) {
-                    // Final chunk may be < 8 bytes; the remaining slots
-                    // in `buf` stay zero. XOR with zero is a no-op, so
-                    // the digest is still deterministic and every
-                    // actually-read byte still contributes.
-                    let mut buf = [0u8; 8];
-                    buf[..chunk.len()].copy_from_slice(chunk);
-                    acc ^= u64::from_le_bytes(buf);
+        let compute_us = run_compute_donated(|| {
+            if self.core.options.io_only {
+                let mut digest: u64 = 0;
+                let mut total_bytes: u64 = 0;
+                for r in &residents {
+                    let bytes = r.data();
+                    total_bytes += bytes.len() as u64;
+                    // XOR every byte. The accumulator is 64 bits wide so we
+                    // also rotate per chunk; this prevents a smart compiler
+                    // from folding the loop and guarantees every read byte
+                    // is observed, the whole point of `--io-only`.
+                    let mut acc: u64 = 0;
+                    for chunk in bytes.chunks(8) {
+                        // Final chunk may be < 8 bytes; the remaining slots
+                        // in `buf` stay zero. XOR with zero is a no-op, so
+                        // the digest is still deterministic and every
+                        // actually-read byte still contributes.
+                        let mut buf = [0u8; 8];
+                        buf[..chunk.len()].copy_from_slice(chunk);
+                        acc ^= u64::from_le_bytes(buf);
+                    }
+                    // `% 63` (deliberately not 64): `rotate_left(0)` and
+                    // `rotate_left(64)` are both no-ops on `u64`. Using 63
+                    // keeps the rotation amount in `0..63` so adjacent
+                    // expert ids actually pick different rotations and
+                    // the per-expert contributions don't collapse.
+                    digest ^= acc.rotate_left((r.id % 63) as u32);
                 }
-                // `% 63` (deliberately not 64): `rotate_left(0)` and
-                // `rotate_left(64)` are both no-ops on `u64`. Using 63
-                // keeps the rotation amount in `0..63` so adjacent
-                // expert ids actually pick different rotations and
-                // the per-expert contributions don't collapse.
-                digest ^= acc.rotate_left((r.id % 63) as u32);
-            }
-            let us = compute_start.elapsed().as_micros() as u64;
-            debug!(
-                token = token_idx,
-                bytes_touched = total_bytes,
-                io_only_digest = digest,
-                "io-only mode: skipped FFN, touched buffer bytes"
-            );
-            us
-        } else {
-            // Real expert FFN forward pass over weights streamed from SSD.
-            // `hidden` is the residual-stream activation already
-            // computed at the top of `generate`; under
-            // `Router::Linear` it is *the same* tensor that drove the
-            // routing decision, so the FFN sees the exact gate
-            // input (the production path), and under `Router::Markov`
-            // it stays the synthetic placeholder the benchmark path
-            // has always used.
-            let x: &HiddenState = &hidden;
-            let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
-            let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
-            for r in &residents {
-                // ── Phase 3: GPU fast path ────────────────────────────────
-                // CandleBackend::expert_matmul bails unconditionally, so we
-                // always guard behind is_gpu(). A VRAM miss returns Err
-                // and we fall through to the CPU path below. Both F32 and
-                // (block-aligned) Q4_0 experts are eligible — see
-                // `Engine::gpu_eligible_dtype`.
+                let us = compute_start.elapsed().as_micros() as u64;
                 debug!(
-                    expert = r.id,
-                    is_gpu = self.core.backend.is_gpu(),
-                    gpu_eligible_dtype = self.gpu_eligible_dtype(),
-                    "generate GPU fast-path guard"
+                    token = token_idx,
+                    bytes_touched = total_bytes,
+                    io_only_digest = digest,
+                    "io-only mode: skipped FFN, touched buffer bytes"
                 );
-                info!(
-                    is_gpu = self.core.backend.is_gpu(),
-                    gpu_eligible = self.gpu_eligible_dtype(),
-                    "generate GPU fast-path guard check"
-                );
-                let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
-                {
-                    let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
-                    let x_f16: Vec<half::f16> =
-                        x.iter().map(|&f| half::f16::from_f32(f)).collect();
-                    let x_view = crate::backend::TensorView {
-                        data: &x_f16,
-                        rows: 1,
-                        cols: self.core.shape.d_model,
-                    };
-                    let mut out_view = crate::backend::TensorViewMut {
-                        data: &mut out_f16,
-                        rows: 1,
-                        cols: self.core.shape.d_model,
-                    };
-                    // `generate` is the synthetic-benchmark path; it has no
-                    // per-layer iteration, so we route everything through
-                    // layer 0 — `expert_matmul` ignores `layer_idx` anyway
-                    // (the trait API takes it only for future logging).
+                us
+            } else {
+                // Real expert FFN forward pass over weights streamed from SSD.
+                // `hidden` is the residual-stream activation already
+                // computed at the top of `generate`; under
+                // `Router::Linear` it is *the same* tensor that drove the
+                // routing decision, so the FFN sees the exact gate
+                // input (the production path), and under `Router::Markov`
+                // it stays the synthetic placeholder the benchmark path
+                // has always used.
+                let x: &HiddenState = &hidden;
+                let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
+                let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
+                for r in &residents {
+                    // ── Phase 3: GPU fast path ────────────────────────────────
+                    // CandleBackend::expert_matmul bails unconditionally, so we
+                    // always guard behind is_gpu(). A VRAM miss returns Err
+                    // and we fall through to the CPU path below. Both F32 and
+                    // (block-aligned) Q4_0 experts are eligible — see
+                    // `Engine::gpu_eligible_dtype`.
                     debug!(
                         expert = r.id,
                         is_gpu = self.core.backend.is_gpu(),
-                        dtype = ?self.core.options.dtype,
-                        "calling backend.expert_matmul"
+                        gpu_eligible_dtype = self.gpu_eligible_dtype(),
+                        "generate GPU fast-path guard"
                     );
-                    let matmul_res = self.core.backend.expert_matmul(
-                        0,
-                        r.id,
-                        x_view,
-                        self.core.shape.d_model,
-                        self.core.shape.d_ff,
-                        &mut out_view,
-                    );
-                    debug!(
-                        expert = r.id,
+                    info!(
                         is_gpu = self.core.backend.is_gpu(),
-                        dtype = ?self.core.options.dtype,
-                        ok = matmul_res.is_ok(),
-                        "returned from backend.expert_matmul"
+                        gpu_eligible = self.gpu_eligible_dtype(),
+                        "generate GPU fast-path guard check"
                     );
-                    match matmul_res {
-                        Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-
-                let res = if let Some(gpu_out) = gpu_result {
-                    Ok((
-                        summarise_output_like_cpu(token_idx, r.id, &gpu_out),
-                        gpu_out,
-                    ))
-                } else {
-                    dispatch_expert_forward(
-                        self.core.options.dtype,
-                        self.core.options.use_qmm_for_q4,
-                        token_idx,
-                        r,
-                        x,
-                        self.core.shape.d_model,
-                        self.core.shape.d_ff,
-                    )
-                };
-                match res {
-                    Ok((out, y)) => {
-                        outputs.push(out);
-                        per_expert_y.push(y);
-                    }
-                    Err(e) => {
-                        warn!(
-                            token = token_idx,
+                    let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype() {
+                        let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
+                        let x_f16: Vec<half::f16> =
+                            x.iter().map(|&f| half::f16::from_f32(f)).collect();
+                        let x_view = crate::backend::TensorView {
+                            data: &x_f16,
+                            rows: 1,
+                            cols: self.core.shape.d_model,
+                        };
+                        let mut out_view = crate::backend::TensorViewMut {
+                            data: &mut out_f16,
+                            rows: 1,
+                            cols: self.core.shape.d_model,
+                        };
+                        // `generate` is the synthetic-benchmark path; it has no
+                        // per-layer iteration, so we route everything through
+                        // layer 0 — `expert_matmul` ignores `layer_idx` anyway
+                        // (the trait API takes it only for future logging).
+                        debug!(
                             expert = r.id,
-                            error = %e,
-                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                            is_gpu = self.core.backend.is_gpu(),
+                            dtype = ?self.core.options.dtype,
+                            "calling backend.expert_matmul"
                         );
+                        let matmul_res = self.core.backend.expert_matmul(
+                            0,
+                            r.id,
+                            x_view,
+                            self.core.shape.d_model,
+                            self.core.shape.d_ff,
+                            &mut out_view,
+                        );
+                        debug!(
+                            expert = r.id,
+                            is_gpu = self.core.backend.is_gpu(),
+                            dtype = ?self.core.options.dtype,
+                            ok = matmul_res.is_ok(),
+                            "returned from backend.expert_matmul"
+                        );
+                        match matmul_res {
+                            Ok(()) => {
+                                Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>())
+                            }
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let res = if let Some(gpu_out) = gpu_result {
+                        Ok((
+                            summarise_output_like_cpu(token_idx, r.id, &gpu_out),
+                            gpu_out,
+                        ))
+                    } else {
+                        dispatch_expert_forward(
+                            self.core.options.dtype,
+                            self.core.options.use_qmm_for_q4,
+                            token_idx,
+                            r,
+                            x,
+                            self.core.shape.d_model,
+                            self.core.shape.d_ff,
+                        )
+                    };
+                    match res {
+                        Ok((out, y)) => {
+                            outputs.push(out);
+                            per_expert_y.push(y);
+                        }
+                        Err(e) => {
+                            warn!(
+                                token = token_idx,
+                                expert = r.id,
+                                error = %e,
+                                "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                            );
+                        }
                     }
                 }
+                // Synthetic / benchmark path has no real gating network, so
+                // weight every routed expert uniformly (`1/k`) — that matches
+                // the legacy averaging behaviour bit-for-bit while flowing
+                // through the new softmax-gated combiner signature.
+                let scores = uniform_scores(per_expert_y.len());
+                let combined = combine_outputs(&per_expert_y, &scores);
+                let us = compute_start.elapsed().as_micros() as u64;
+                debug!(
+                    token = token_idx,
+                    d_model = self.core.shape.d_model,
+                    d_ff = self.core.shape.d_ff,
+                    ?outputs,
+                    combined_norm = combined.iter().map(|v| v * v).sum::<f32>().sqrt(),
+                    "FFN forward complete"
+                );
+                us
             }
-            // Synthetic / benchmark path has no real gating network, so
-            // weight every routed expert uniformly (`1/k`) — that matches
-            // the legacy averaging behaviour bit-for-bit while flowing
-            // through the new softmax-gated combiner signature.
-            let scores = uniform_scores(per_expert_y.len());
-            let combined = combine_outputs(&per_expert_y, &scores);
-            let us = compute_start.elapsed().as_micros() as u64;
-            debug!(
-                token = token_idx,
-                d_model = self.core.shape.d_model,
-                d_ff = self.core.shape.d_ff,
-                ?outputs,
-                combined_norm = combined.iter().map(|v| v * v).sum::<f32>().sqrt(),
-                "FFN forward complete"
-            );
-            us
         });
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
-        self.metrics.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
-        self.metrics.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
+        self.metrics
+            .total_compute_us
+            .fetch_add(compute_us, Ordering::Relaxed);
+        self.metrics
+            .total_io_wait_us
+            .fetch_add(io_wait_us, Ordering::Relaxed);
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
         let _ = self.metrics.cycle_hist.lock().record(cycle_us.max(1));
-        self.metrics.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
-        self.metrics.tokens_processed.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .total_cycle_us
+            .fetch_add(cycle_us, Ordering::Relaxed);
+        self.metrics
+            .tokens_processed
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(stats)
     }
@@ -2552,14 +2591,18 @@ impl Engine {
                 tokio::pin!(fut);
                 fut.as_mut().enable();
                 if let Some(r) = self.core.cache.get(id) {
-                    self.metrics.counters.singleflight_followers
+                    self.metrics
+                        .counters
+                        .singleflight_followers
                         .fetch_add(1, Ordering::Relaxed);
                     return Ok(r);
                 }
                 if self.core.in_flight.contains_key(&id) {
                     fut.await;
                     if let Some(r) = self.core.cache.get(id) {
-                        self.metrics.counters.singleflight_followers
+                        self.metrics
+                            .counters
+                            .singleflight_followers
                             .fetch_add(1, Ordering::Relaxed);
                         return Ok(r);
                     }
@@ -2600,7 +2643,9 @@ impl Engine {
             // guard still runs on this early return, freeing the slot
             // we installed and waking any followers parked on us.
             if let Some(r) = self.core.cache.get(id) {
-                self.metrics.counters.singleflight_followers
+                self.metrics
+                    .counters
+                    .singleflight_followers
                     .fetch_add(1, Ordering::Relaxed);
                 return Ok(r);
             }
@@ -2660,10 +2705,7 @@ impl Engine {
     /// if the pool is under pressure), issues the read, and either
     /// installs the resident in the cache or surfaces the I/O error
     /// to the retry loop.
-    async fn fetch_once(
-        self: &Arc<Self>,
-        id: u32,
-    ) -> Result<Arc<ExpertResident>, FetchOnceError> {
+    async fn fetch_once(self: &Arc<Self>, id: u32) -> Result<Arc<ExpertResident>, FetchOnceError> {
         let io_start = Instant::now();
         // Acquire-with-eviction: evict an LRU entry if the cache is at
         // capacity (which releases its `PooledBuffer` on `Arc` drop),
@@ -2707,7 +2749,8 @@ impl Engine {
                 // a deduplicated batch of N concurrent fetches must
                 // increase `bytes_read` by exactly one expert's
                 // worth, regardless of which call site issued them.
-                self.metrics.counters
+                self.metrics
+                    .counters
                     .bytes_read
                     .fetch_add(buf.len() as u64, Ordering::Relaxed);
                 let resident = Arc::new(ExpertResident::new(id, buf));
@@ -2763,7 +2806,11 @@ impl Engine {
                 .counters
                 .prefetch_dropped_governor
                 .fetch_add(1, Ordering::Relaxed);
-            debug!(expert = id, score = p, "governor throttled speculative prefetch");
+            debug!(
+                expert = id,
+                score = p,
+                "governor throttled speculative prefetch"
+            );
             return;
         }
         // Speculative prefetches are *bounded*: each spawn must hold
@@ -2781,7 +2828,10 @@ impl Engine {
                     .counters
                     .prefetch_dropped_concurrency
                     .fetch_add(1, Ordering::Relaxed);
-                debug!(expert = id, "skipping prefetch: concurrency ceiling reached");
+                debug!(
+                    expert = id,
+                    "skipping prefetch: concurrency ceiling reached"
+                );
                 return;
             }
         };
@@ -2840,15 +2890,13 @@ impl Engine {
             // load.
             let mut buf = match me.core.pool.try_acquire_shadow() {
                 Some(b) => b,
-                None if me.core.pool.shadow_capacity() == 0 => {
-                    match me.core.pool.try_acquire() {
-                        Some(b) => b,
-                        None => {
-                            me.note_prefetch_dropped_pool_starved(id);
-                            return;
-                        }
+                None if me.core.pool.shadow_capacity() == 0 => match me.core.pool.try_acquire() {
+                    Some(b) => b,
+                    None => {
+                        me.note_prefetch_dropped_pool_starved(id);
+                        return;
                     }
-                }
+                },
                 None => {
                     // **Shadow recycling (Finding 3).** Buffer B is
                     // starved — but its capacity may be parked inside
@@ -2860,19 +2908,15 @@ impl Engine {
                     // If a clone of the resident is still referenced
                     // elsewhere the buffer comes back later — drop
                     // this speculative load, exactly like before.
-                    match me
-                        .core
-                        .cache
-                        .evict_lru_shadow_backed()
-                        .and_then(|victim| {
-                            debug!(
-                                expert = id,
-                                recycled = victim.id,
-                                "shadow pool starved: recycled LRU shadow-backed resident"
-                            );
-                            drop(victim);
-                            me.core.pool.try_acquire_shadow()
-                        }) {
+                    match me.core.cache.evict_lru_shadow_backed().and_then(|victim| {
+                        debug!(
+                            expert = id,
+                            recycled = victim.id,
+                            "shadow pool starved: recycled LRU shadow-backed resident"
+                        );
+                        drop(victim);
+                        me.core.pool.try_acquire_shadow()
+                    }) {
                         Some(b) => b,
                         None => {
                             me.note_prefetch_dropped_pool_starved(id);
@@ -2884,14 +2928,18 @@ impl Engine {
             let started = Instant::now();
             match me.core.storage.read_expert(id, &mut buf).await {
                 Ok(_) => {
-                    me.metrics.counters.prefetch_completed.fetch_add(1, Ordering::Relaxed);
+                    me.metrics
+                        .counters
+                        .prefetch_completed
+                        .fetch_add(1, Ordering::Relaxed);
                     // Tier 4: a speculative read landed in the cache. This
                     // is the precision *denominator*; the matching
                     // numerator (`record_used`) fires if/when a hit later
                     // consumes this shadow-backed resident. No-op when the
                     // governor is disabled.
                     me.core.governor.record_completed();
-                    me.metrics.counters
+                    me.metrics
+                        .counters
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     // **Self-balancing shadow accounting.** We insert the
@@ -2927,15 +2975,16 @@ impl Engine {
                     // of waiting for `promote_after_hits` RAM hits — the
                     // lazy path can leave a predicted expert on the CPU
                     // fallback for its first N activations (one CPU
-// Only attempt eager VRAM promotion when the cache definitely has room;
-// otherwise we would copy ~expert_size bytes into a Vec only to have the
-// non-evicting promotion path immediately reject it.
-if let Some(gpu) = me.core.gpu_cache.as_ref() {
-    let bytes = resident.data().len();
-    if (gpu.used_bytes() as usize).saturating_add(bytes) <= gpu.capacity_bytes() {
-        me.try_promote_resident_to_gpu(&resident);
-    }
-}
+                    // Only attempt eager VRAM promotion when the cache definitely has room;
+                    // otherwise we would copy ~expert_size bytes into a Vec only to have the
+                    // non-evicting promotion path immediately reject it.
+                    if let Some(gpu) = me.core.gpu_cache.as_ref() {
+                        let bytes = resident.data().len();
+                        if (gpu.used_bytes() as usize).saturating_add(bytes) <= gpu.capacity_bytes()
+                        {
+                            me.try_promote_resident_to_gpu(&resident);
+                        }
+                    }
                     debug!(
                         expert = id,
                         prob = p,
@@ -3127,10 +3176,14 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             }
         }
         if hits > 0 {
-            self.speculation.locality_hits.fetch_add(hits, Ordering::Relaxed);
+            self.speculation
+                .locality_hits
+                .fetch_add(hits, Ordering::Relaxed);
         }
         if misses > 0 {
-            self.speculation.locality_misses.fetch_add(misses, Ordering::Relaxed);
+            self.speculation
+                .locality_misses
+                .fetch_add(misses, Ordering::Relaxed);
         }
         if let Some(m) = &self.metrics.prom {
             m.record_locality(hits, misses);
@@ -3253,10 +3306,14 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         }
         let misses = preds.len() as u64 - hits;
         if hits > 0 {
-            self.speculation.spec_hits.fetch_add(hits, Ordering::Relaxed);
+            self.speculation
+                .spec_hits
+                .fetch_add(hits, Ordering::Relaxed);
         }
         if misses > 0 {
-            self.speculation.spec_misses.fetch_add(misses, Ordering::Relaxed);
+            self.speculation
+                .spec_misses
+                .fetch_add(misses, Ordering::Relaxed);
         }
         // Top-1 accuracy: 1 if the speculator's #1 expert matches the
         // gate's #1 expert for this token, 0 otherwise. This is the
@@ -3266,7 +3323,9 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             _ => 0,
         };
         if top1_match > 0 {
-            self.speculation.spec_top1_matches.fetch_add(1, Ordering::Relaxed);
+            self.speculation
+                .spec_top1_matches
+                .fetch_add(1, Ordering::Relaxed);
         }
         // One token observed by the speculator (regardless of match).
         self.speculation.spec_tokens.fetch_add(1, Ordering::Relaxed);
@@ -3524,7 +3583,9 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         affinity: &LayeredExpertAffinity,
         per_layer: u32,
     ) -> Vec<(u32, f32)> {
-        use crate::router::{spatial_neighbors, SPATIAL_CONFIDENCE_THRESHOLD, W_AFFINITY, W_SPATIAL};
+        use crate::router::{
+            spatial_neighbors, SPATIAL_CONFIDENCE_THRESHOLD, W_AFFINITY, W_SPATIAL,
+        };
         let seeds: Vec<u32> = base
             .iter()
             .filter(|(_, s)| *s >= SPATIAL_CONFIDENCE_THRESHOLD)
@@ -3550,14 +3611,8 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 }
             }
         }
-        let mut out: Vec<(u32, f32)> = combined
-            .into_iter()
-            .filter(|&(_, p)| p > 0.0)
-            .collect();
-        out.sort_by(|a, b| {
-            b.1.total_cmp(&a.1)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        let mut out: Vec<(u32, f32)> = combined.into_iter().filter(|&(_, p)| p > 0.0).collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
     }
 
@@ -3809,9 +3864,17 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // trained) above this token, so we reuse it as the `predicted`
         // column rather than running a second forward.
         if let Some(tw) = self.metrics.trace_writer.read().as_ref() {
-            let predicted: Vec<u32> =
-                m_speculator.iter().map(|&id| self.resolve_alias(id)).collect();
-            tw.write_record(token_idx, layer, &target, &cache_hits_per_expert, &predicted);
+            let predicted: Vec<u32> = m_speculator
+                .iter()
+                .map(|&id| self.resolve_alias(id))
+                .collect();
+            tw.write_record(
+                token_idx,
+                layer,
+                &target,
+                &cache_hits_per_expert,
+                &predicted,
+            );
         }
         let had_misses = !miss_handles.is_empty();
         // Track expert slots whose fetch task failed: we'll drop them
@@ -3841,7 +3904,8 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 }
                 Err(e) => {
                     let id = target[i];
-                    self.metrics.counters
+                    self.metrics
+                        .counters
                         .expert_read_failures
                         .fetch_add(1, Ordering::Relaxed);
                     warn!(token = token_idx, layer, expert = id, error = %e,
@@ -3862,8 +3926,8 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         // (same semantics as `run_inference` failing for a single
         // expert). The engine itself never panics anymore.
         let _ = failed_experts; // retained for telemetry below
-        // Reconstruct a Vec<Option<Arc<ExpertResident>>> aligned with
-        // `target.len()`; None entries correspond to failed fetches.
+                                // Reconstruct a Vec<Option<Arc<ExpertResident>>> aligned with
+                                // `target.len()`; None entries correspond to failed fetches.
         let residents: Vec<Option<Arc<ExpertResident>>> = residents;
 
         // Run the SwiGLU FFN per expert against the hidden state.
@@ -3894,11 +3958,9 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 // miss returns Err and we fall through to the CPU path below.
                 // Both F32 and (block-aligned) Q4_0 experts are eligible —
                 // see `Engine::gpu_eligible_dtype`.
-                let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
-                {
+                let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype() {
                     let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
-                    let x_f16: Vec<half::f16> =
-                        x.iter().map(|&f| half::f16::from_f32(f)).collect();
+                    let x_f16: Vec<half::f16> = x.iter().map(|&f| half::f16::from_f32(f)).collect();
                     let x_view = crate::backend::TensorView {
                         data: &x_f16,
                         rows: 1,
@@ -3985,10 +4047,16 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         });
         let compute_us = compute_start.elapsed().as_micros() as u64;
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
-        self.metrics.total_compute_us.fetch_add(compute_us, Ordering::Relaxed);
-        self.metrics.total_io_wait_us.fetch_add(io_wait_us, Ordering::Relaxed);
+        self.metrics
+            .total_compute_us
+            .fetch_add(compute_us, Ordering::Relaxed);
+        self.metrics
+            .total_io_wait_us
+            .fetch_add(io_wait_us, Ordering::Relaxed);
         if io_wait_us > 0 {
-            self.metrics.total_ssd_stall_us.fetch_add(io_wait_us, Ordering::Relaxed);
+            self.metrics
+                .total_ssd_stall_us
+                .fetch_add(io_wait_us, Ordering::Relaxed);
             if let Some(m) = &self.metrics.prom {
                 m.record_ssd_stall(io_wait_us as f64 / 1_000_000.0);
             }
@@ -4018,16 +4086,25 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                     } else {
                         &[]
                     };
-                self.core.predictor.observe_step2(pp, &ring.last.ids, &target);
+                self.core
+                    .predictor
+                    .observe_step2(pp, &ring.last.ids, &target);
             }
             ring.last_last = ring.last.clone();
-            ring.last = MarkovHistory { ids: target.clone(), layer: Some(layer) };
+            ring.last = MarkovHistory {
+                ids: target.clone(),
+                layer: Some(layer),
+            };
         }
 
         let cycle_us = cycle_start.elapsed().as_micros() as u64;
         let _ = self.metrics.cycle_hist.lock().record(cycle_us.max(1));
-        self.metrics.total_cycle_us.fetch_add(cycle_us, Ordering::Relaxed);
-        self.metrics.tokens_processed.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .total_cycle_us
+            .fetch_add(cycle_us, Ordering::Relaxed);
+        self.metrics
+            .tokens_processed
+            .fetch_add(1, Ordering::Relaxed);
 
         per_expert_y
     }
@@ -4076,9 +4153,9 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         let mut handles = Vec::with_capacity(unique.len());
         for id in unique {
             let me = self.clone();
-            handles.push(tokio::spawn(async move {
-                (id, me.fetch_with_retry(id).await)
-            }));
+            handles.push(tokio::spawn(
+                async move { (id, me.fetch_with_retry(id).await) },
+            ));
         }
         for h in handles {
             match h.await {
@@ -4106,8 +4183,16 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         let total_io_wait_us = self.metrics.total_io_wait_us.load(Ordering::Relaxed);
         let total_compute_us = self.metrics.total_compute_us.load(Ordering::Relaxed);
         let total_cycle_us = self.metrics.total_cycle_us.load(Ordering::Relaxed);
-        let avg_io_wait_us = if tokens == 0 { 0.0 } else { total_io_wait_us as f64 / tokens as f64 };
-        let avg_compute_us = if tokens == 0 { 0.0 } else { total_compute_us as f64 / tokens as f64 };
+        let avg_io_wait_us = if tokens == 0 {
+            0.0
+        } else {
+            total_io_wait_us as f64 / tokens as f64
+        };
+        let avg_compute_us = if tokens == 0 {
+            0.0
+        } else {
+            total_compute_us as f64 / tokens as f64
+        };
         let pct_time_io = if total_cycle_us == 0 {
             0.0
         } else {
@@ -4116,7 +4201,11 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
         EngineReport {
             hits: self.metrics.counters.hits.load(Ordering::Relaxed),
             misses: self.metrics.counters.misses.load(Ordering::Relaxed),
-            prefetch_completed: self.metrics.counters.prefetch_completed.load(Ordering::Relaxed),
+            prefetch_completed: self
+                .metrics
+                .counters
+                .prefetch_completed
+                .load(Ordering::Relaxed),
             bytes_read: self.metrics.counters.bytes_read.load(Ordering::Relaxed),
             cycle_p50_us: cycle.value_at_quantile(0.50),
             cycle_p95_us: cycle.value_at_quantile(0.95),
@@ -4148,7 +4237,11 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             predictive: self.predictive_telemetry(),
             locality_enabled: self.speculation.locality.is_some(),
             speculator_enabled: self.speculation.speculator.is_some(),
-            expert_read_failures: self.metrics.counters.expert_read_failures.load(Ordering::Relaxed),
+            expert_read_failures: self
+                .metrics
+                .counters
+                .expert_read_failures
+                .load(Ordering::Relaxed),
             prefetch_dropped_concurrency: self
                 .metrics
                 .counters
@@ -4164,7 +4257,11 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 .counters
                 .speculator_dmodel_mismatch
                 .load(Ordering::Relaxed),
-            gpu_cpu_fallbacks: self.metrics.counters.gpu_cpu_fallbacks.load(Ordering::Relaxed),
+            gpu_cpu_fallbacks: self
+                .metrics
+                .counters
+                .gpu_cpu_fallbacks
+                .load(Ordering::Relaxed),
             gpu_cache_enabled: self.core.gpu_cache.is_some(),
             vram_used_bytes: self
                 .core
@@ -4184,12 +4281,7 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
                 .as_ref()
                 .map(|g| g.promotions())
                 .unwrap_or(0),
-            gpu_cache_hits: self
-                .core
-                .gpu_cache
-                .as_ref()
-                .map(|g| g.hits())
-                .unwrap_or(0),
+            gpu_cache_hits: self.core.gpu_cache.as_ref().map(|g| g.hits()).unwrap_or(0),
             gpu_cache_misses: self
                 .core
                 .gpu_cache
@@ -4296,7 +4388,11 @@ if let Some(gpu) = me.core.gpu_cache.as_ref() {
             r.compute_p50_us,
             r.compute_p95_us,
             r.compute_p99_us,
-            if r.io_only { "io-only XOR digest, FFN skipped" } else { "SwiGLU FFN per token" }
+            if r.io_only {
+                "io-only XOR digest, FFN skipped"
+            } else {
+                "SwiGLU FFN per token"
+            }
         );
         info!(
             "cycle latency: p50={}us  p95={}us  p99={}us  max={}us",
@@ -4618,7 +4714,12 @@ mod tests {
         let pool = BufferPool::new(pool_slots, expert_size, block_align);
         let cache = Arc::new(MultiLayerExpertCache::single_layer(cache_slots));
         let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, top_k, seed)));
-        let predictor = Arc::new(PredictiveLoader::new(num_experts, predict_fanout, 0.05, seed));
+        let predictor = Arc::new(PredictiveLoader::new(
+            num_experts,
+            predict_fanout,
+            0.05,
+            seed,
+        ));
 
         Arc::new(Engine::new(
             cache,
@@ -4626,7 +4727,11 @@ mod tests {
             storage,
             router,
             predictor,
-            ModelShape { d_model, d_ff, hidden_seed: seed },
+            ModelShape {
+                d_model,
+                d_ff,
+                hidden_seed: seed,
+            },
         ))
     }
 
@@ -4691,9 +4796,18 @@ mod tests {
         // The first token always misses (cold cache); after that the
         // cache + prefetcher should eventually start serving experts
         // from RAM rather than disk.
-        assert!(total_hits > 0, "expected at least some cache hits across {tokens} tokens");
-        assert!(total_misses > 0, "expected at least some cache misses across {tokens} tokens");
-        assert!(total_bytes > 0, "expected the engine to read bytes from the SSD");
+        assert!(
+            total_hits > 0,
+            "expected at least some cache hits across {tokens} tokens"
+        );
+        assert!(
+            total_misses > 0,
+            "expected at least some cache misses across {tokens} tokens"
+        );
+        assert!(
+            total_bytes > 0,
+            "expected the engine to read bytes from the SSD"
+        );
 
         // The aggregate report mirrors the per-cycle totals on the
         // critical path. `r.bytes_read` may exceed `total_bytes` because
@@ -4717,7 +4831,10 @@ mod tests {
         //     that was never a foreground miss.
         // The only guaranteed invariant is that the cold-start miss forces
         // at least one physical read, so the histogram is non-empty.
-        assert!(r.io_count > 0, "io histogram must record at least the cold-start read");
+        assert!(
+            r.io_count > 0,
+            "io histogram must record at least the cold-start read"
+        );
         // Latency histograms must have observed at least one sample of each
         // category (compute always, I/O at least once because a cold start
         // forces a miss).
@@ -4883,7 +5000,10 @@ mod tests {
             cache_slots
         );
         // Misses dominate when cache_slots is small relative to working set.
-        assert!(r.misses > r.hits / 2, "expected eviction churn to produce many misses");
+        assert!(
+            r.misses > r.hits / 2,
+            "expected eviction churn to produce many misses"
+        );
     }
 
     // ----------- Locality / Speculator / Union-Fetch tests ----------
@@ -5090,7 +5210,14 @@ mod tests {
         let cache_slots = 2;
         let predict_fanout = 1;
         let engine = build_engine(
-            &dir.path, num_experts, d_model, d_ff, cache_slots, top_k, predict_fanout, 0xDEADBEEF,
+            &dir.path,
+            num_experts,
+            d_model,
+            d_ff,
+            cache_slots,
+            top_k,
+            predict_fanout,
+            0xDEADBEEF,
         );
         for t in 0..16u64 {
             let _ = engine.generate(t).await.expect("generate should succeed");
@@ -5132,9 +5259,8 @@ mod tests {
         const TOP_K: usize = 2;
         const N: u64 = 32;
         let engine = build_engine(
-            &dir.path, /*num_experts=*/ 8, /*d_model=*/ 16,
-            /*d_ff=*/ 32, /*cache_slots=*/ 4, TOP_K,
-            /*predict_fanout=*/ 2, /*seed=*/ 0xE2E5EED1,
+            &dir.path, /*num_experts=*/ 8, /*d_model=*/ 16, /*d_ff=*/ 32,
+            /*cache_slots=*/ 4, TOP_K, /*predict_fanout=*/ 2, /*seed=*/ 0xE2E5EED1,
         );
         let mut total_fetches: u64 = 0;
         let mut total_prefetch: u64 = 0;
@@ -5178,7 +5304,11 @@ mod tests {
         let block_align = 4096usize;
         let expert_size = weight_bytes.div_ceil(block_align) * block_align;
         crate::io_provider::generate_synthetic_experts(
-            &dir.path, num_experts, expert_size, d_model, d_ff,
+            &dir.path,
+            num_experts,
+            expert_size,
+            d_model,
+            d_ff,
         )
         .expect("generate experts");
         let storage = Arc::new(
@@ -5196,7 +5326,12 @@ mod tests {
         let pool = BufferPool::new(pool_slots, expert_size, block_align);
         let cache = Arc::new(MultiLayerExpertCache::single_layer(cache_slots));
         let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, 2, seed)));
-        let predictor = Arc::new(PredictiveLoader::new(num_experts, predict_fanout, 0.05, seed));
+        let predictor = Arc::new(PredictiveLoader::new(
+            num_experts,
+            predict_fanout,
+            0.05,
+            seed,
+        ));
         let mut opts = EngineOptions::default();
         opts.max_concurrent_prefetches = 1; // adversarial ceiling
         let engine = Arc::new(Engine::with_options(
@@ -5205,7 +5340,11 @@ mod tests {
             storage,
             router,
             predictor,
-            ModelShape { d_model, d_ff, hidden_seed: seed },
+            ModelShape {
+                d_model,
+                d_ff,
+                hidden_seed: seed,
+            },
             opts,
         ));
         // Fire a burst of prefetches well past the ceiling. With a
@@ -5322,14 +5461,23 @@ mod tests {
 
         // Build a plain engine (no GPU cache yet).
         let engine = build_engine(
-            &dir.path, num_experts, d_model, d_ff, cache_slots, top_k,
-            predict_fanout, seed,
+            &dir.path,
+            num_experts,
+            d_model,
+            d_ff,
+            cache_slots,
+            top_k,
+            predict_fanout,
+            seed,
         );
 
         // Warm the RAM cache with one expert so every moe_step is a
         // RAM hit (the path that drives promotion).
         let target_id: u32 = 0;
-        engine.warm_with(&[target_id]).await.expect("warm RAM cache");
+        engine
+            .warm_with(&[target_id])
+            .await
+            .expect("warm RAM cache");
         assert!(
             engine.core.cache.get(target_id).is_some(),
             "warm_with must leave the expert resident"
@@ -5363,7 +5511,9 @@ mod tests {
         // and passing the target expert id.
         let hidden = crate::inference::synth_hidden_state(0, d_model, seed);
         for t in 0..total_hits {
-            let _ = engine.moe_step(t, /*layer=*/ 0, &hidden, &[target_id]).await;
+            let _ = engine
+                .moe_step(t, /*layer=*/ 0, &hidden, &[target_id])
+                .await;
         }
 
         // Drain the channel — must contain exactly one message,
@@ -5439,9 +5589,17 @@ mod tests {
                 storage,
                 router,
                 predictor,
-                ModelShape { d_model, d_ff, hidden_seed: seed },
+                ModelShape {
+                    d_model,
+                    d_ff,
+                    hidden_seed: seed,
+                },
             )
-            .with_affinity(affinity.clone(), /*neighbors_k=*/ 2, /*decay_epoch=*/ 1_000_000),
+            .with_affinity(
+                affinity.clone(),
+                /*neighbors_k=*/ 2,
+                /*decay_epoch=*/ 1_000_000,
+            ),
         );
 
         // Co-fire global experts {4,5} in layer 1 (local {0,1}) a few
@@ -5453,11 +5611,22 @@ mod tests {
 
         // Layer 1's matrix (local namespace) must show 0 and 1 as mutual
         // neighbours.
-        assert_eq!(affinity.neighbors(1, 0, 2), vec![1], "local 0's neighbour in layer 1");
-        assert_eq!(affinity.neighbors(1, 1, 2), vec![0], "local 1's neighbour in layer 1");
+        assert_eq!(
+            affinity.neighbors(1, 0, 2),
+            vec![1],
+            "local 0's neighbour in layer 1"
+        );
+        assert_eq!(
+            affinity.neighbors(1, 1, 2),
+            vec![0],
+            "local 1's neighbour in layer 1"
+        );
         assert_eq!(affinity.affinity(1, 0, 1), 3, "co-fired three times");
         // No leakage into layer 0's matrix.
-        assert!(affinity.neighbors(0, 0, 2).is_empty(), "layer 0 must be untouched");
+        assert!(
+            affinity.neighbors(0, 0, 2).is_empty(),
+            "layer 0 must be untouched"
+        );
     }
 
     /// **Tier 1 — online static residency.** With no seed profile the
@@ -5503,7 +5672,11 @@ mod tests {
                 storage,
                 router,
                 predictor,
-                ModelShape { d_model, d_ff, hidden_seed: seed },
+                ModelShape {
+                    d_model,
+                    d_ff,
+                    hidden_seed: seed,
+                },
             )
             .with_static_residency(0.25, /*warmup_tokens=*/ 4, /*profile=*/ None),
         );
@@ -5515,12 +5688,20 @@ mod tests {
         // by the engine-owned observation counter, not the caller seed.
         for t in 0..3u64 {
             let cold = 6 + (t % 2) as u32; // 6 or 7, never as hot as {2,5}
-            let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[2, 5, cold]).await;
+            let _ = engine
+                .moe_step(0, /*layer=*/ 0, &hidden, &[2, 5, cold])
+                .await;
         }
-        assert_eq!(cache.pinned_count(), 0, "warmup should not fire before 4 bumps");
+        assert_eq!(
+            cache.pinned_count(),
+            0,
+            "warmup should not fire before 4 bumps"
+        );
         for t in 3..8u64 {
             let cold = 6 + (t % 2) as u32;
-            let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[2, 5, cold]).await;
+            let _ = engine
+                .moe_step(0, /*layer=*/ 0, &hidden, &[2, 5, cold])
+                .await;
         }
 
         // After warmup the hot set must be pinned exactly once.
@@ -5610,7 +5791,11 @@ mod tests {
         engine.credit_prefetch_use(&resident, second);
 
         assert_eq!(
-            engine.metrics.counters.prefetch_used.load(Ordering::Relaxed),
+            engine
+                .metrics
+                .counters
+                .prefetch_used
+                .load(Ordering::Relaxed),
             1,
             "only the first consumption of a shadow-backed resident is credited"
         );
@@ -5664,7 +5849,11 @@ mod tests {
                 storage,
                 router,
                 predictor,
-                ModelShape { d_model, d_ff, hidden_seed: seed },
+                ModelShape {
+                    d_model,
+                    d_ff,
+                    hidden_seed: seed,
+                },
             )
             .with_static_residency(0.25, /*warmup_tokens=*/ 100, Some(profile)),
         );
@@ -5674,7 +5863,11 @@ mod tests {
         let _ = engine.moe_step(0, /*layer=*/ 0, &hidden, &[5, 6]).await;
 
         assert_eq!(cache.pinned_count(), 2, "ceil(0.25*8)=2 experts pinned");
-        assert_eq!(cache.pinned_ids(), vec![0, 3], "profile's two hottest experts");
+        assert_eq!(
+            cache.pinned_ids(),
+            vec![0, 3],
+            "profile's two hottest experts"
+        );
     }
 
     /// **Layer-scoped speculator accuracy.** On the `moe_step` path the
@@ -5725,7 +5918,11 @@ mod tests {
                 storage,
                 router,
                 predictor,
-                ModelShape { d_model, d_ff, hidden_seed: seed },
+                ModelShape {
+                    d_model,
+                    d_ff,
+                    hidden_seed: seed,
+                },
             )
             .with_speculator(spec, /*top_k=*/ 2),
         );
@@ -5735,7 +5932,10 @@ mod tests {
             let base = layer * per_layer;
             let target = [base, base + 1];
             let preds = engine.speculator_predict_and_train(&hidden, &target, Some(layer));
-            assert!(!preds.is_empty(), "speculator must predict for layer {layer}");
+            assert!(
+                !preds.is_empty(),
+                "speculator must predict for layer {layer}"
+            );
             for &p in &preds {
                 assert!(
                     p >= base && p < base + per_layer,
@@ -5791,7 +5991,11 @@ mod tests {
                 storage,
                 router,
                 predictor,
-                ModelShape { d_model, d_ff, hidden_seed: seed },
+                ModelShape {
+                    d_model,
+                    d_ff,
+                    hidden_seed: seed,
+                },
             )
             .with_locality_monitor(monitor, 0.0),
         );
@@ -5851,7 +6055,11 @@ mod tests {
             storage,
             router,
             predictor,
-            ModelShape { d_model, d_ff, hidden_seed: seed },
+            ModelShape {
+                d_model,
+                d_ff,
+                hidden_seed: seed,
+            },
         ));
 
         // Contiguous: L -> L+1, and last-layer -> 0 (token boundary).
@@ -5909,7 +6117,11 @@ mod tests {
             storage,
             router,
             predictor,
-            ModelShape { d_model, d_ff, hidden_seed: seed },
+            ModelShape {
+                d_model,
+                d_ff,
+                hidden_seed: seed,
+            },
         ));
 
         // Helper: spawn a prefetch and wait until the id is resident.
@@ -6001,7 +6213,11 @@ mod tests {
                     storage,
                     router,
                     predictor,
-                    ModelShape { d_model, d_ff, hidden_seed: seed },
+                    ModelShape {
+                        d_model,
+                        d_ff,
+                        hidden_seed: seed,
+                    },
                 )
                 .with_speculator(spec, /*top_k=*/ 2)
                 .with_pipeline_depth(pipeline_depth),

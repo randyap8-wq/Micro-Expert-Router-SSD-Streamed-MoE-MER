@@ -56,9 +56,9 @@ mod session;
 mod tensor_header;
 mod tokenizer;
 mod transformer;
-mod workload;
 #[cfg(feature = "tui")]
 mod tui;
+mod workload;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -70,9 +70,9 @@ use tracing_subscriber::EnvFilter;
 use crate::backend::Backend;
 use crate::buffer_pool::BufferPool;
 use crate::engine::{Engine, EngineOptions, ModelShape};
-use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::inference::expert_weight_bytes_for;
 use crate::io_provider::{NvmeStorage, StorageConfig};
+use crate::multi_layer_cache::MultiLayerExpertCache;
 use crate::router::{
     LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter,
 };
@@ -531,17 +531,11 @@ enum Cmd {
         legacy_eager: bool,
         /// **Native quantised pass-through.** When set and the
         /// source GGUF stores its expert tensors as `Q4_0`, `Q4_K`,
-        /// or `Q8_0`, write the raw quantised block stream to disk
+        /// `Q5_K`, `Q6_K`, or `Q8_0`, write the raw quantised block stream to disk
         /// instead of dequantising to F32 first. The output
-        /// `expert_<id>.bin` is then ~7× smaller (Q4_0 / Q4_K) or
-        /// ~4× smaller (Q8_0) than F32, and the engine's
-        /// `run_inference_q4_0` / `run_inference_q4k` /
-        /// `run_inference_q8_0` paths consume it directly. Falls
-        /// back to F32 dequant when the source dtype isn't one of
-        /// the supported quantisations or the per-expert weight
-        /// count isn't a clean multiple of the block size; the
-        /// converter's emitted `metadata.json::dtype` records what
-        /// was actually written.
+        /// `expert_<id>.bin` stays quantized. Mixed projection triples
+        /// are written with UTH2 headers. If quantized output is not
+        /// possible, conversion fails before writing expert files.
         #[arg(long, default_value_t = false)]
         native_quant: bool,
     },
@@ -666,7 +660,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--gpu` it must initialise the GPU compute backend *before* the
     // default CPU backend claims the `OnceLock` (gist Fix 2), mirroring
     // `cmd_serve`. A failed GPU init falls back to `install_default`.
-    let run_gpu_cache = if let Cmd::Run { gpu: true, gpu_cache_mb, .. } = &cli.cmd {
+    let run_gpu_cache = if let Cmd::Run {
+        gpu: true,
+        gpu_cache_mb,
+        ..
+    } = &cli.cmd
+    {
         install_run_gpu_backend(*gpu_cache_mb)
     } else if !matches!(cli.cmd, Cmd::Serve { .. }) {
         crate::backend::install_default();
@@ -690,7 +689,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             d_ff,
             block_align,
             dtype,
-        } => cmd_gen_data(&data_dir, num_experts, expert_size, d_model, d_ff, block_align, &dtype),
+        } => cmd_gen_data(
+            &data_dir,
+            num_experts,
+            expert_size,
+            d_model,
+            d_ff,
+            block_align,
+            &dtype,
+        ),
         Cmd::Repack {
             data_dir,
             out_blob,
@@ -784,66 +791,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     packed_manifest,
                 } = cli.cmd
                 {
-                    let dtype = crate::inference::WeightDtype::from_str_opt(&dtype)
-                        .ok_or_else(|| format!("--dtype: unknown value {dtype:?} (use 'f32' or 'f16')"))?;
+                    let dtype =
+                        crate::inference::WeightDtype::from_str_opt(&dtype).ok_or_else(|| {
+                            format!("--dtype: unknown value {dtype:?} (use 'f32' or 'f16')")
+                        })?;
                     cmd_run(
                         RunArgs {
-                        data_dir,
-                        num_experts,
-                        expert_size,
-                        d_model,
-                        d_ff,
-                        cache_slots,
-                        top_k,
-                        tokens,
-                        predict_fanout,
-                        predict_min_prob,
-                        no_direct,
-                        block_align,
-                        seed,
-                        dtype,
-                        partial_load_fraction,
-                        pin_after_observations,
-                        alias_map_path: alias_map,
-                        io_uring,
-                        token_pause_us,
-                        first_token,
-                        no_prefetch,
-                        io_only,
-                        force_ssd,
-                        router_clusters,
-                        router_intra_p,
-                        router_matrix,
-                        gate_weights,
-                        trace_out,
-                        gpu_expert_cache: if gpu { run_gpu_cache.clone() } else { None },
-                        pipeline_depth,
-                        speculator,
-                        speculator_hidden_dim,
-                        speculator_top_k,
-                        locality,
-                        locality_window,
-                        locality_threshold_pct,
-                        affinity,
-                        affinity_neighbors_k,
-                        affinity_decay_epoch,
-                        prefetch_governor,
-                        prefetch_precision_floor,
-                        prefetch_contention_weight,
-                        cost_aware_eviction,
-                        pregate,
-                        static_residency_fraction,
-                        static_residency_warmup_tokens,
-                        static_residency_profile,
-                        profile_out,
-                        workload,
-                        zipf_s,
-                        workload_correlation,
-                        replay_trace,
-                        num_layers,
-                        num_experts_per_layer,
-                        packed_blob,
-                        packed_manifest,
+                            data_dir,
+                            num_experts,
+                            expert_size,
+                            d_model,
+                            d_ff,
+                            cache_slots,
+                            top_k,
+                            tokens,
+                            predict_fanout,
+                            predict_min_prob,
+                            no_direct,
+                            block_align,
+                            seed,
+                            dtype,
+                            partial_load_fraction,
+                            pin_after_observations,
+                            alias_map_path: alias_map,
+                            io_uring,
+                            token_pause_us,
+                            first_token,
+                            no_prefetch,
+                            io_only,
+                            force_ssd,
+                            router_clusters,
+                            router_intra_p,
+                            router_matrix,
+                            gate_weights,
+                            trace_out,
+                            gpu_expert_cache: if gpu { run_gpu_cache.clone() } else { None },
+                            pipeline_depth,
+                            speculator,
+                            speculator_hidden_dim,
+                            speculator_top_k,
+                            locality,
+                            locality_window,
+                            locality_threshold_pct,
+                            affinity,
+                            affinity_neighbors_k,
+                            affinity_decay_epoch,
+                            prefetch_governor,
+                            prefetch_precision_floor,
+                            prefetch_contention_weight,
+                            cost_aware_eviction,
+                            pregate,
+                            static_residency_fraction,
+                            static_residency_warmup_tokens,
+                            static_residency_profile,
+                            profile_out,
+                            workload,
+                            zipf_s,
+                            workload_correlation,
+                            replay_trace,
+                            num_layers,
+                            num_experts_per_layer,
+                            packed_blob,
+                            packed_manifest,
                         },
                         startup_pinned,
                     )
@@ -984,11 +993,8 @@ fn maybe_attach_packed_blob(
 ) -> Result<NvmeStorage, Box<dyn std::error::Error>> {
     match (packed_blob, packed_manifest) {
         (Some(blob_path), Some(manifest_path)) => {
-            let blob = crate::packed_storage::PackedBlob::open(
-                blob_path,
-                manifest_path,
-                use_direct_io,
-            )?;
+            let blob =
+                crate::packed_storage::PackedBlob::open(blob_path, manifest_path, use_direct_io)?;
             blob.validate()
                 .map_err(|e| format!("packed blob validation failed: {e}"))?;
             let slot = blob.manifest().expert_size;
@@ -1058,12 +1064,12 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         if let Some(arch_str) = cfg.real_transformer.architecture.clone() {
             resolved_architecture = crate::architecture::Architecture::from_model_type(&arch_str)
                 .ok_or_else(|| {
-                    format!(
-                        "[real_transformer] architecture = \"{arch_str}\" is not a recognised \
+                format!(
+                    "[real_transformer] architecture = \"{arch_str}\" is not a recognised \
                          model_type (expected one of: mixtral, qwen3, qwen3_moe, deepseek_v3, \
                          mistral3, phi3)"
-                    )
-                })?;
+                )
+            })?;
         } else if let Some(dir) = cfg.real_transformer.weights_dir.clone() {
             match crate::architecture::HfConfig::from_dir(&dir) {
                 Ok(Some(hf)) => {
@@ -1076,8 +1082,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                     // Map the checkpoint's routing hyperparameters (scoring
                     // function, group-limited top-K, routed scaling factor,
                     // `norm_topk_prob`) so they reach the per-layer gate.
-                    resolved_advanced =
-                        crate::model::RealModelConfig::from_hf_config(&hf).advanced;
+                    resolved_advanced = crate::model::RealModelConfig::from_hf_config(&hf).advanced;
                     // GPT-OSS SwiGLU gate clamp: install the process-global
                     // limit so the expert-FFN hot path applies it (no-op for
                     // every architecture that leaves `swiglu_limit` unset).
@@ -1107,11 +1112,9 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                 }
                 Ok(None) => {} // no config.json — keep TOML-derived config
                 Err(e) => {
-                    return Err(format!(
-                        "failed to read config.json from {}: {e}",
-                        dir.display()
-                    )
-                    .into());
+                    return Err(
+                        format!("failed to read config.json from {}: {e}", dir.display()).into(),
+                    );
                 }
             }
         }
@@ -1156,7 +1159,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     };
     if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu {
         let num_layers = cfg.model.num_layers;
-        let max_seq_len = if cfg.real_transformer.window_size == 0 { 4096 } else { cfg.real_transformer.window_size };
+        let max_seq_len = if cfg.real_transformer.window_size == 0 {
+            4096
+        } else {
+            cfg.real_transformer.window_size
+        };
         let num_heads = cfg.real_transformer.num_heads;
         let num_kv_heads = if cfg.real_transformer.num_kv_heads == 0 {
             num_heads
@@ -1164,7 +1171,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cfg.real_transformer.num_kv_heads
         };
         let head_dim = if cfg.real_transformer.head_dim == 0 {
-            if num_heads > 0 { cfg.model.d_model / num_heads } else { 64 }
+            if num_heads > 0 {
+                cfg.model.d_model / num_heads
+            } else {
+                64
+            }
         } else {
             cfg.real_transformer.head_dim
         };
@@ -1188,9 +1199,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         } else {
             info!(
                 device = device_name,
-                compute_plane,
-                has_device,
-                "GpuBackend installed for dense backbone"
+                compute_plane, has_device, "GpuBackend installed for dense backbone"
             );
         }
     }
@@ -1269,7 +1278,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cfg.storage.block_align,
         )
     } else {
-        BufferPool::new(primary_slots, cfg.model.expert_size, cfg.storage.block_align)
+        BufferPool::new(
+            primary_slots,
+            cfg.model.expert_size,
+            cfg.storage.block_align,
+        )
     };
     let cache = {
         let num_layers = cfg.model.num_layers.max(1);
@@ -1299,8 +1312,9 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // count. Otherwise layer-≥1 ids silently fall outside the
     // predictor's row table and the locality monitor's `is_hot` always
     // returns false for them.
-    let total_experts: u32 =
-        (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts).max(cfg.model.num_experts);
+    let total_experts: u32 = (cfg.model.num_layers as u32)
+        .saturating_mul(cfg.model.num_experts)
+        .max(cfg.model.num_experts);
 
     let predictor = Arc::new(PredictiveLoader::new(
         total_experts,
@@ -1330,7 +1344,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         } else {
             rt.head_dim
         };
-        let num_kv_heads = if rt.num_kv_heads == 0 { rt.num_heads } else { rt.num_kv_heads };
+        let num_kv_heads = if rt.num_kv_heads == 0 {
+            rt.num_heads
+        } else {
+            rt.num_kv_heads
+        };
         // Hyperparameters were already reconciled from `config.json` (when
         // present) at the top of `cmd_serve`, so `cfg.model` /
         // `cfg.real_transformer` are the single source of truth here. We
@@ -1349,7 +1367,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             top_k: cfg.model.top_k,
             rope_base: rt.rope_base,
             rms_eps: rt.rms_eps,
-            window_size: if rt.window_size == 0 { None } else { Some(rt.window_size) },
+            window_size: if rt.window_size == 0 {
+                None
+            } else {
+                Some(rt.window_size)
+            },
             architecture: resolved_architecture,
             first_k_dense_replace: resolved_first_k_dense_replace,
             advanced: resolved_advanced,
@@ -1371,20 +1393,20 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // path costs one additional `vocab_size * d_model * 4` bytes of
     // resident memory. See `draft::DraftEngine::from_main` for the exact
     // allocation site.
-    let draft_engine: Option<Arc<crate::draft::DraftEngine>> =
-        if cfg.predictive.speculator_enabled {
-            real_model.as_ref().map(|m| {
-                let d = crate::draft::DraftEngine::from_main(m);
-                tracing::info!(
-                    vocab_size = m.config.vocab_size,
-                    d_model = m.config.d_model,
-                    "draft engine built for speculative decoding"
-                );
-                Arc::new(d)
-            })
-        } else {
-            None
-        };
+    let draft_engine: Option<Arc<crate::draft::DraftEngine>> = if cfg.predictive.speculator_enabled
+    {
+        real_model.as_ref().map(|m| {
+            let d = crate::draft::DraftEngine::from_main(m);
+            tracing::info!(
+                vocab_size = m.config.vocab_size,
+                d_model = m.config.d_model,
+                "draft engine built for speculative decoding"
+            );
+            Arc::new(d)
+        })
+    } else {
+        None
+    };
 
     let speculation_k = cfg.real_transformer.speculation_base_depth.max(1);
 
@@ -1470,8 +1492,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             .locality_window
             .saturating_mul(cfg.model.num_layers.max(1));
         let monitor = Arc::new(LocalityMonitor::new(total_experts, window));
-        engine_builder = engine_builder
-            .with_locality_monitor(monitor, cfg.predictive.locality_threshold_pct);
+        engine_builder =
+            engine_builder.with_locality_monitor(monitor, cfg.predictive.locality_threshold_pct);
     }
     if cfg.predictive.speculator_enabled {
         let top_k = if cfg.predictive.speculator_top_k == 0 {
@@ -1496,7 +1518,10 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // layer-qualified geometry (`num_experts_per_layer`).
     if cfg.predictive.affinity_enabled {
         let num_layers = cfg.model.num_layers.max(1);
-        let affinity = Arc::new(LayeredExpertAffinity::new(num_layers, cfg.model.num_experts));
+        let affinity = Arc::new(LayeredExpertAffinity::new(
+            num_layers,
+            cfg.model.num_experts,
+        ));
         engine_builder = engine_builder.with_affinity(
             affinity,
             cfg.predictive.affinity_neighbors_k,
@@ -1545,9 +1570,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         // bytes into VRAM without conversion or repacking. Parse it
         // here purely so the startup log records the operator's
         // declared intent.
-        let dtype_for_logging =
-            crate::inference::WeightDtype::from_str_opt(&cfg.gpu_cache.dtype)
-                .unwrap_or(crate::inference::WeightDtype::F16);
+        let dtype_for_logging = crate::inference::WeightDtype::from_str_opt(&cfg.gpu_cache.dtype)
+            .unwrap_or(crate::inference::WeightDtype::F16);
         info!(
             vram_capacity_mb = cfg.gpu_cache.vram_capacity_mb,
             anchor_ratio = cfg.gpu_cache.vram_anchor_ratio,
@@ -1587,12 +1611,17 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         } else {
             rt.head_dim
         };
-        let num_kv_heads = if rt.num_kv_heads == 0 { rt.num_heads } else { rt.num_kv_heads };
+        let num_kv_heads = if rt.num_kv_heads == 0 {
+            rt.num_heads
+        } else {
+            rt.num_kv_heads
+        };
         let batch_cfg = crate::batch_scheduler::BatchConfig {
             max_batch_size: rt.max_batch_size,
             batch_timeout: std::time::Duration::from_millis(rt.batch_timeout_ms),
-            idle_eviction_threshold:
-                std::time::Duration::from_millis(rt.idle_eviction_threshold_ms),
+            idle_eviction_threshold: std::time::Duration::from_millis(
+                rt.idle_eviction_threshold_ms,
+            ),
             speculation_base_depth: rt.speculation_base_depth,
             // Pool back-pressure ladder is now config-driven
             // (gist Part 1, fix #4). Validation in `Config::validate`
@@ -1658,9 +1687,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         // Sweep every TTL/2 (or once a minute, whichever is shorter) so
         // peak memory stays bounded but the evictor doesn't dominate
         // the wakeup budget.
-        let sweep = std::time::Duration::from_secs(
-            (cfg.server.session_ttl_secs / 2).max(1).min(60),
-        );
+        let sweep =
+            std::time::Duration::from_secs((cfg.server.session_ttl_secs / 2).max(1).min(60));
         store.spawn_evictor(sweep);
         Some(store)
     } else {
@@ -1898,7 +1926,12 @@ fn cmd_gen_data(
     );
     let started = Instant::now();
     crate::io_provider::generate_synthetic_experts_with_dtype(
-        data_dir, num_experts, expert_size, d_model, d_ff, dtype,
+        data_dir,
+        num_experts,
+        expert_size,
+        d_model,
+        d_ff,
+        dtype,
     )?;
     let total_bytes = num_experts as u64 * expert_size as u64;
     info!(
@@ -2020,7 +2053,10 @@ async fn cmd_repack(args: RepackArgs) -> Result<(), Box<dyn std::error::Error>> 
         );
         ranked
     } else {
-        info!(num_experts = args.num_experts, "repack: using numeric expert order");
+        info!(
+            num_experts = args.num_experts,
+            "repack: using numeric expert order"
+        );
         (0..args.num_experts).collect()
     };
 
@@ -2048,14 +2084,9 @@ async fn cmd_repack(args: RepackArgs) -> Result<(), Box<dyn std::error::Error>> 
         "repack: writing packed blob"
     );
     let started = Instant::now();
-    let manifest = crate::io_provider::pack_experts(
-        &storage,
-        &pool,
-        &order,
-        &args.out_blob,
-        &manifest_path,
-    )
-    .await?;
+    let manifest =
+        crate::io_provider::pack_experts(&storage, &pool, &order, &args.out_blob, &manifest_path)
+            .await?;
     info!(
         elapsed_s = started.elapsed().as_secs_f64(),
         blob_mib = manifest.blob_len() as f64 / (1024.0 * 1024.0),
@@ -2124,7 +2155,10 @@ struct RunArgs {
     packed_manifest: Option<PathBuf>,
 }
 
-async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_run(
+    mut args: RunArgs,
+    startup_pinned: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 0) If `metadata.json` exists alongside the expert blobs (e.g. as
     //    written by `scripts/extract_mixtral_experts.py`), use it to fill
     //    in any args the user didn't override on the command line. We
@@ -2231,7 +2265,10 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     // single-dir path is unchanged. Done early because the io_uring
     // NUMA probe below also takes the (canonical) data dir.
     let data_dirs: Vec<PathBuf> = parse_striped_data_dir(&args.data_dir)?;
-    let primary_dir = data_dirs.first().cloned().unwrap_or_else(|| args.data_dir.clone());
+    let primary_dir = data_dirs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| args.data_dir.clone());
     for d in &data_dirs {
         if !d.is_dir() {
             return Err(format!(
@@ -2282,7 +2319,10 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
             // pinning entirely.
             let numa_node = detect_data_dir_numa_node(&args.data_dir);
             if let Some(n) = numa_node {
-                info!(numa_node = n, "detected NUMA node for data dir; will pin io_uring");
+                info!(
+                    numa_node = n,
+                    "detected NUMA node for data dir; will pin io_uring"
+                );
             }
             // Build the backend from the same pool we'll hand the
             // engine; the registration happens inside ::new(). We log
@@ -2450,7 +2490,11 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
     };
     let predictor = Arc::new(PredictiveLoader::new(
         args.num_experts,
-        if args.no_prefetch { 0 } else { args.predict_fanout },
+        if args.no_prefetch {
+            0
+        } else {
+            args.predict_fanout
+        },
         resolve_predict_min_prob(args.predict_min_prob, args.num_experts),
         args.seed,
     ));
@@ -2564,7 +2608,8 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
         if args.static_residency_fraction > 0.0 {
             let profile = match args.static_residency_profile.as_ref() {
                 Some(path) => {
-                    let p = crate::residency::ResidencyProfile::load_json(std::path::Path::new(path))?;
+                    let p =
+                        crate::residency::ResidencyProfile::load_json(std::path::Path::new(path))?;
                     info!(
                         path = %path,
                         experts = p.len(),
@@ -2720,7 +2765,10 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                     crate::workload::Workload::Skewed => (
                         t,
                         0,
-                        skewed_stream.as_mut().expect("skewed stream").next_experts(),
+                        skewed_stream
+                            .as_mut()
+                            .expect("skewed stream")
+                            .next_experts(),
                     ),
                     _ => {
                         let record = replay_stream
@@ -2736,9 +2784,7 @@ async fn cmd_run(mut args: RunArgs, startup_pinned: bool) -> Result<(), Box<dyn 
                 };
                 let hidden = crate::inference::synth_hidden_state(tok_idx, args.d_model, args.seed);
                 let pre = engine.report();
-                let _ = engine
-                    .moe_step(tok_idx, layer_idx, &hidden, &experts)
-                    .await;
+                let _ = engine.moe_step(tok_idx, layer_idx, &hidden, &experts).await;
                 let post = engine.report();
                 crate::engine::CycleStats {
                     hits: post.hits.saturating_sub(pre.hits),
@@ -3037,7 +3083,12 @@ fn load_gate_weights(
         buf.copy_from_slice(chunk);
         weights.push(f32::from_le_bytes(buf));
     }
-    Ok(crate::gating::LinearGate::new(weights, num_experts, d_model, top_k))
+    Ok(crate::gating::LinearGate::new(
+        weights,
+        num_experts,
+        d_model,
+        top_k,
+    ))
 }
 
 /// Discover and concatenate the per-layer `gate_<L>.bin` files in `dir`,
@@ -3049,9 +3100,12 @@ fn read_gate_dir_concatenated(
     dir: &std::path::Path,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut entries: Vec<(u32, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .map_err(|e| format!("failed to scan gate-weights directory {}: {e}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).map_err(|e| {
+        format!(
+            "failed to scan gate-weights directory {}: {e}",
+            dir.display()
+        )
+    })? {
         let entry = entry
             .map_err(|e| format!("failed to read a directory entry in {}: {e}", dir.display()))?;
         let path = entry.path();
@@ -3101,8 +3155,12 @@ fn read_gate_dir_concatenated(
     );
     let mut bytes = Vec::new();
     for (idx, p) in &entries {
-        let mut chunk = std::fs::read(p)
-            .map_err(|e| format!("failed to read gate file {} (layer {idx}): {e}", p.display()))?;
+        let mut chunk = std::fs::read(p).map_err(|e| {
+            format!(
+                "failed to read gate file {} (layer {idx}): {e}",
+                p.display()
+            )
+        })?;
         bytes.append(&mut chunk);
     }
     Ok(bytes)
@@ -3225,7 +3283,11 @@ fn read_local_node_cpus() -> Option<Vec<usize>> {
             out.push(part.parse().ok()?);
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Detect the NUMA node of the block device backing `data_dir`.
@@ -3256,7 +3318,11 @@ pub fn detect_data_dir_numa_node(data_dir: &std::path::Path) -> Option<i32> {
         let body = std::fs::read_to_string(&sys_path).ok()?;
         let node: i32 = body.trim().parse().ok()?;
         // Kernel reports `-1` when NUMA is disabled or unknown.
-        if node < 0 { None } else { Some(node) }
+        if node < 0 {
+            None
+        } else {
+            Some(node)
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -3268,9 +3334,7 @@ pub fn detect_data_dir_numa_node(data_dir: &std::path::Path) -> Option<i32> {
 /// Parse `--data-dir` into a list of directories. If the path
 /// stringifies to a comma-separated list, split it; otherwise return a
 /// single-element vec. Used by gist Phase 4 (multi-drive striping).
-fn parse_striped_data_dir(
-    p: &std::path::Path,
-) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+fn parse_striped_data_dir(p: &std::path::Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let s = p.to_string_lossy();
     if s.contains(',') {
         let dirs: Vec<PathBuf> = s
@@ -3309,7 +3373,10 @@ fn cmd_gguf_convert(
         native_quant,
         "opening GGUF file"
     );
-    let opts = crate::gguf_loader::ExtractOptions { emit_uth, native_quant };
+    let opts = crate::gguf_loader::ExtractOptions {
+        emit_uth,
+        native_quant,
+    };
     let source = crate::gguf::open_gguf_source(gguf_path, legacy_eager)?;
     if let Some(arch) = source.architecture() {
         info!(architecture = arch, "GGUF source opened");
@@ -3555,11 +3622,7 @@ mod tests {
     #[test]
     fn parse_order_file_strips_inline_comments() {
         let path = tempdir_unique("order-inline-comments.txt");
-        std::fs::write(
-            &path,
-            "# full-line comment\n12  # hot expert\n3,4\n8 9\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "# full-line comment\n12  # hot expert\n3,4\n8 9\n").unwrap();
         let ids = parse_order_file(&path).unwrap();
         assert_eq!(ids, vec![12, 3, 4, 8, 9]);
         let _ = std::fs::remove_file(&path);
@@ -3568,7 +3631,10 @@ mod tests {
     #[test]
     fn repack_order_validation_rejects_duplicate_ids() {
         let err = validate_order(&[0, 1, 1], 4).unwrap_err();
-        assert!(err.contains("duplicate expert id 1"), "unexpected error: {err}");
+        assert!(
+            err.contains("duplicate expert id 1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3604,8 +3670,10 @@ mod tests {
         write("gate_0.bin", &[1.0, 2.0]);
         write("notes.txt", &[]);
 
-        let gate = load_gate_weights(&dir, /*num_experts=*/ 2, /*d_model=*/ 2, /*top_k=*/ 1)
-            .expect("directory gate load should succeed");
+        let gate = load_gate_weights(
+            &dir, /*num_experts=*/ 2, /*d_model=*/ 2, /*top_k=*/ 1,
+        )
+        .expect("directory gate load should succeed");
         // Concatenation must be layer 0 then layer 1.
         assert_eq!(gate.weights, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(gate.num_experts, 2);

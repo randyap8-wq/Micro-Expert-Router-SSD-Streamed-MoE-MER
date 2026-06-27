@@ -227,7 +227,6 @@ fn saturating_increment_u32(c: &AtomicU32) -> u32 {
     }
 }
 
-
 /// Configuration for the storage layer.
 #[derive(Clone, Debug)]
 pub struct StorageConfig {
@@ -580,10 +579,7 @@ impl NvmeStorage {
     ///
     /// Builder-style: returns `self` for chaining at construction
     /// (`NvmeStorage::new(cfg)?.with_packed_blob(blob)`).
-    pub fn with_packed_blob(
-        mut self,
-        blob: Arc<crate::packed_storage::PackedBlob>,
-    ) -> Self {
+    pub fn with_packed_blob(mut self, blob: Arc<crate::packed_storage::PackedBlob>) -> Self {
         self.packed = Some(blob);
         self
     }
@@ -861,8 +857,7 @@ impl NvmeStorage {
         // arrived here because they observed `tripped == true`
         // synchronises-with that Release and therefore reads the
         // real, non-zero stamp.
-        if last != 0
-            && now.saturating_sub(last) < STORAGE_BREAKER_PROBE_INTERVAL.as_millis() as u64
+        if last != 0 && now.saturating_sub(last) < STORAGE_BREAKER_PROBE_INTERVAL.as_millis() as u64
         {
             return false;
         }
@@ -943,7 +938,10 @@ impl NvmeStorage {
                     let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
                     let err = io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        format!("short read on expert {expert_id}: got {n} bytes, expected {}", dst.len()),
+                        format!(
+                            "short read on expert {expert_id}: got {n} bytes, expected {}",
+                            dst.len()
+                        ),
                     );
                     if drive_tripped {
                         return Err(HardwareFailure::DriveUnavailable {
@@ -1477,7 +1475,6 @@ impl NvmeStorage {
 
         Ok(pos)
     }
-
 }
 
 /// **Tier 2.** Build a packed blob + manifest from a source storage.
@@ -1524,7 +1521,10 @@ pub async fn pack_experts(
         writer.write_all(buf.as_slice())?;
     }
     writer.flush()?;
-    writer.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    writer
+        .into_inner()
+        .map_err(|e| e.into_error())?
+        .sync_all()?;
     let manifest = crate::packed_storage::PackedManifest::uniform(
         order.to_vec(),
         expert_size as u64,
@@ -1577,7 +1577,14 @@ pub fn generate_synthetic_experts(
     d_model: usize,
     d_ff: usize,
 ) -> io::Result<()> {
-    generate_synthetic_experts_with_dtype(dir, num_experts, expert_size, d_model, d_ff, WeightDtype::F32)
+    generate_synthetic_experts_with_dtype(
+        dir,
+        num_experts,
+        expert_size,
+        d_model,
+        d_ff,
+        WeightDtype::F32,
+    )
 }
 
 /// Generate `num_experts` deterministic test files in `dir`. Each file
@@ -1623,6 +1630,19 @@ pub fn generate_synthetic_experts_with_dtype(
     let zero_pad = vec![0u8; (1 << 20).min(pad_bytes.max(1))];
     let chunk_floats = 16 * 1024;
 
+    if matches!(
+        dtype,
+        WeightDtype::Q5K | WeightDtype::Q6K | WeightDtype::Mixed
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "synthetic expert generation does not support dtype {}",
+                dtype.as_str()
+            ),
+        ));
+    }
+
     for id in 0..num_experts {
         let path = dir.join(format!("expert_{id}.bin"));
         let mut f = OpenOptions::new()
@@ -1631,8 +1651,8 @@ pub fn generate_synthetic_experts_with_dtype(
             .truncate(true)
             .open(&path)?;
 
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15u64
-            .wrapping_add((id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        let mut state: u64 =
+            0x9E37_79B9_7F4A_7C15u64.wrapping_add((id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
 
         // For INT8, write the 12-byte per-tensor scale header first.
         // Synthetic weights are drawn from `U(-scale, +scale)`, so the
@@ -1709,14 +1729,12 @@ pub fn generate_synthetic_experts_with_dtype(
                         *slot = 0.0;
                     }
                     match dtype {
-                        WeightDtype::Q4_0 => quantize_q4_0_block(
-                            &block_floats[..block_elems],
-                            &mut block_bytes_buf,
-                        ),
-                        WeightDtype::Q8_0 => quantize_q8_0_block(
-                            &block_floats[..block_elems],
-                            &mut block_bytes_buf,
-                        ),
+                        WeightDtype::Q4_0 => {
+                            quantize_q4_0_block(&block_floats[..block_elems], &mut block_bytes_buf)
+                        }
+                        WeightDtype::Q8_0 => {
+                            quantize_q8_0_block(&block_floats[..block_elems], &mut block_bytes_buf)
+                        }
                         _ => unreachable!(),
                     }
                     f.write_all(&block_bytes_buf)?;
@@ -1787,7 +1805,10 @@ pub fn generate_synthetic_experts_with_dtype(
                         WeightDtype::Q4K => unreachable!("Q4K handled above"),
                         WeightDtype::Q4_0 => unreachable!("Q4_0 handled above"),
                         WeightDtype::Q8_0 => unreachable!("Q8_0 handled above"),
+                        WeightDtype::Q5K => unreachable!("Q5K rejected above"),
+                        WeightDtype::Q6K => unreachable!("Q6K rejected above"),
                         WeightDtype::MXFP4 => unreachable!("MXFP4 handled above"),
+                        WeightDtype::Mixed => unreachable!("mixed rejected above"),
                     }
                 }
                 f.write_all(&buf)?;
@@ -2069,9 +2090,8 @@ impl Manifest {
                 Some(h) => (block_align, Some(h.dtype.to_weight())),
                 None => (0usize, None),
             };
-            let payload_size = (file_size as usize)
-                .saturating_sub(payload_offset)
-                & !(block_align - 1);
+            let payload_size =
+                (file_size as usize).saturating_sub(payload_offset) & !(block_align - 1);
 
             entries.insert(
                 id,
@@ -2086,7 +2106,10 @@ impl Manifest {
             );
         }
 
-        Ok(Self { entries, block_align })
+        Ok(Self {
+            entries,
+            block_align,
+        })
     }
 
     /// Look up a manifest entry by expert id. `None` if the file
@@ -2361,7 +2384,7 @@ mod tests {
             expert_size,
             block_align: block,
             use_direct_io: false,
-                num_experts_per_layer: None,
+            num_experts_per_layer: None,
         })
         .unwrap();
 
@@ -2382,10 +2405,17 @@ mod tests {
         }
         let ids: Vec<u32> = (0..num_experts).collect();
         let mut buf_refs: Vec<&mut crate::buffer_pool::PooledBuffer> = bufs.iter_mut().collect();
-        let total = storage.read_experts_batch(&ids, &mut buf_refs).await.unwrap();
+        let total = storage
+            .read_experts_batch(&ids, &mut buf_refs)
+            .await
+            .unwrap();
         assert_eq!(total, expert_size * num_experts as usize);
         for (i, b) in bufs.iter().enumerate() {
-            assert_eq!(b.as_slice(), ref_bufs[i].as_slice(), "mismatch on expert {i}");
+            assert_eq!(
+                b.as_slice(),
+                ref_bufs[i].as_slice(),
+                "mismatch on expert {i}"
+            );
         }
 
         // Cleanup
@@ -2439,7 +2469,9 @@ mod tests {
 
         let blob =
             crate::packed_storage::PackedBlob::open(&blob_path, &manifest_path, false).unwrap();
-        let packed = NvmeStorage::new(cfg).unwrap().with_packed_blob(Arc::new(blob));
+        let packed = NvmeStorage::new(cfg)
+            .unwrap()
+            .with_packed_blob(Arc::new(blob));
         assert!(packed.is_packed());
 
         // Single packed reads match the per-file bytes.
@@ -2461,8 +2493,7 @@ mod tests {
         for _ in &ids {
             bufs.push(pool.acquire().await);
         }
-        let mut buf_refs: Vec<&mut crate::buffer_pool::PooledBuffer> =
-            bufs.iter_mut().collect();
+        let mut buf_refs: Vec<&mut crate::buffer_pool::PooledBuffer> = bufs.iter_mut().collect();
         let total = packed
             .read_experts_batch(&ids, &mut buf_refs)
             .await
@@ -2645,9 +2676,7 @@ mod tests {
         std::fs::write(dir.join("expert_0.bin"), vec![0u8; expert_size]).unwrap();
         std::fs::write(dir.join("expert_1.bin"), vec![0u8; expert_size]).unwrap();
 
-        let manifest = Arc::new(
-            Manifest::scan(&[dir.clone()], [0u32, 1u32], block, None).unwrap(),
-        );
+        let manifest = Arc::new(Manifest::scan(&[dir.clone()], [0u32, 1u32], block, None).unwrap());
         let storage = NvmeStorage::new(StorageConfig {
             base_path: dir.clone(),
             expert_size,
@@ -2874,7 +2903,7 @@ mod tests {
     #[test]
     fn try_admit_probe_admits_at_most_one_per_interval() {
         let stamp = AtomicU64::new(0); // last probe was "long ago"
-        // First call wins the CAS and advances `stamp` to now.
+                                       // First call wins the CAS and advances `stamp` to now.
         assert!(NvmeStorage::try_admit_probe(&stamp));
         let first = stamp.load(Ordering::Acquire);
         assert!(first >= 1, "stamp should advance past zero");
@@ -2892,8 +2921,14 @@ mod tests {
     #[test]
     fn transient_io_error_classification() {
         use std::io::{Error, ErrorKind};
-        assert!(is_transient_io_error(&Error::new(ErrorKind::Interrupted, "")));
-        assert!(is_transient_io_error(&Error::new(ErrorKind::WouldBlock, "")));
+        assert!(is_transient_io_error(&Error::new(
+            ErrorKind::Interrupted,
+            ""
+        )));
+        assert!(is_transient_io_error(&Error::new(
+            ErrorKind::WouldBlock,
+            ""
+        )));
         assert!(is_transient_io_error(&Error::new(ErrorKind::TimedOut, "")));
         // EIO maps to a raw-OS retryable error too.
         let eio = Error::from_raw_os_error(libc::EIO);
@@ -2903,10 +2938,16 @@ mod tests {
         // the short read on the first observation rather than wasting
         // 3×backoff. Short reads are handled by a dedicated branch in
         // `read_at_with_retries` that fails fast.
-        assert!(!is_transient_io_error(&Error::new(ErrorKind::UnexpectedEof, "")));
+        assert!(!is_transient_io_error(&Error::new(
+            ErrorKind::UnexpectedEof,
+            ""
+        )));
         // Permission denied is NOT transient — surfacing it lets the
         // operator fix the mount rather than retry forever.
-        assert!(!is_transient_io_error(&Error::new(ErrorKind::PermissionDenied, "")));
+        assert!(!is_transient_io_error(&Error::new(
+            ErrorKind::PermissionDenied,
+            ""
+        )));
     }
 
     /// `HardwareFailure` converts to an `io::Error` and round-trips
@@ -2920,9 +2961,7 @@ mod tests {
         };
         let ioerr: io::Error = hf.into();
         let inner = ioerr.into_inner().expect("inner");
-        let hf = inner
-            .downcast::<HardwareFailure>()
-            .expect("downcast");
+        let hf = inner.downcast::<HardwareFailure>().expect("downcast");
         match *hf {
             HardwareFailure::ExpertUnavailable { expert_id, .. } => assert_eq!(expert_id, 7),
             _ => panic!("wrong variant"),
