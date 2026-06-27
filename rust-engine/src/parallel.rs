@@ -238,6 +238,10 @@ where
 mod tests {
     use super::*;
 
+    fn build_test_pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap()
+    }
+
     /// Reference row-major mat-vec used as the parity oracle.
     fn serial_matvec(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
         (0..rows)
@@ -264,10 +268,11 @@ mod tests {
     fn matches_serial_across_sizes() {
         // Span the inline path (tiny), the boundary, and the fanned-out
         // path (large) to exercise both branches and the chunk seam.
+        let pool = build_test_pool(4);
         for &(rows, cols) in &[(1usize, 1usize), (3, 5), (64, 64), (1024, 512), (4096, 256)] {
             let w: Vec<f32> = (0..rows * cols).map(|i| ((i % 17) as f32) * 0.01 - 0.5).collect();
             let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32) * 0.1 - 0.3).collect();
-            let got = par_matvec(&w, &x, rows, cols);
+            let got = pool.install(|| par_matvec(&w, &x, rows, cols));
             let want = serial_matvec(&w, &x, rows, cols);
             assert_eq!(got.len(), want.len());
             for (g, e) in got.iter().zip(want.iter()) {
@@ -283,11 +288,14 @@ mod tests {
         // index, so any double-write or skipped row would corrupt it.
         let rows = 1000usize;
         let mut out = vec![usize::MAX; rows];
-        // Force the parallel path regardless of arithmetic width.
-        par_row_chunks(&mut out, MIN_TOTAL_FOR_PARALLEL, |row_start, chunk| {
-            for (i, slot) in chunk.iter_mut().enumerate() {
-                *slot = row_start + i;
-            }
+        let pool = build_test_pool(4);
+        pool.install(|| {
+            // Force the parallel path regardless of arithmetic width.
+            par_row_chunks(&mut out, MIN_TOTAL_FOR_PARALLEL, |row_start, chunk| {
+                for (i, slot) in chunk.iter_mut().enumerate() {
+                    *slot = row_start + i;
+                }
+            });
         });
         for (i, v) in out.iter().enumerate() {
             assert_eq!(*v, i, "row {i} was not written exactly once");
@@ -302,10 +310,13 @@ mod tests {
         // 1` capture would make it `FnMut`, which `par_row_chunks`
         // rejects). A single row must take the inline path: one call.
         let calls = AtomicUsize::new(0);
-        par_row_chunks(&mut out, 1_000_000, |row_start, chunk| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            assert_eq!(row_start, 0);
-            chunk[0] = 42;
+        let pool = build_test_pool(4);
+        pool.install(|| {
+            par_row_chunks(&mut out, 1_000_000, |row_start, chunk| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(row_start, 0);
+                chunk[0] = 42;
+            });
         });
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(out[0], 42);

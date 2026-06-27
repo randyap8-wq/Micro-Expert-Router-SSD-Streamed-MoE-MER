@@ -2009,6 +2009,7 @@ dependencies = [
  "libc",
  "lru",
  "matrixmultiply",
+ "once_cell",
  "parking_lot",
  "pollster",
  "prometheus",

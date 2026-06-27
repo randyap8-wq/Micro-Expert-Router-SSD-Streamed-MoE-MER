@@ -16,11 +16,12 @@ use crate::buffer_pool::PooledBuffer;
 use crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
 use crate::tensor_header::TensorHeader;
 use lru::LruCache;
+use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 /// Pack/unpack an `f64` heat score into the bits of an `AtomicU64` so it
 /// can be read and updated without a lock. The cost-aware eviction
@@ -62,7 +63,7 @@ pub struct ExpertResident {
     /// Cached once-per-resident Q4_0 zero-padded payload used when the
     /// on-disk bytes are slightly short (≤ one block/page) of the
     /// derived expected size.
-    q4_0_padded: StdMutex<Option<(usize, Arc<[u8]>)>>,
+    q4_0_padded: OnceCell<(usize, Arc<[u8]>)>,
     /// **Tier 4 cost-aware eviction.** Decaying heat score: bumped by
     /// `+1` on every cache hit and exponentially decayed by the number
     /// of intervening insertions (cache-pressure events). Only
@@ -97,7 +98,7 @@ impl ExpertResident {
             buffer,
             payload_offset,
             hits: AtomicU64::new(0),
-            q4_0_padded: StdMutex::new(None),
+            q4_0_padded: OnceCell::new(),
             heat_bits: AtomicU64::new(0.0f64.to_bits()),
             heat_last_epoch: AtomicU64::new(0),
         }
@@ -163,7 +164,7 @@ impl ExpertResident {
 
     /// Return a cached zero-padded Q4_0 payload when the resident is at
     /// most `tolerance` bytes short of `need`. The padded allocation is
-    /// created at most once per `need` for this resident.
+    /// created at most once for this resident.
     pub fn q4_0_padded_payload(&self, need: usize, tolerance: usize) -> Option<Arc<[u8]>> {
         let data = self.data();
         if data.len() >= need {
@@ -174,18 +175,13 @@ impl ExpertResident {
             return None;
         }
 
-        let mut guard = self.q4_0_padded.lock().expect("q4_0_padded poisoned");
-        if let Some((cached_need, cached)) = guard.as_ref() {
-            if *cached_need == need {
-                return Some(cached.clone());
-            }
-        }
-        let mut padded = Vec::with_capacity(need);
-        padded.extend_from_slice(data);
-        padded.resize(need, 0);
-        let cached: Arc<[u8]> = Arc::from(padded.into_boxed_slice());
-        *guard = Some((need, cached.clone()));
-        Some(cached)
+        let (cached_need, cached) = self.q4_0_padded.get_or_init(|| {
+            let mut padded = Vec::with_capacity(need);
+            padded.extend_from_slice(data);
+            padded.resize(need, 0);
+            (need, Arc::from(padded.into_boxed_slice()))
+        });
+        (*cached_need == need).then(|| cached.clone())
     }
 }
 

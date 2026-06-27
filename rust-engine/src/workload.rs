@@ -134,7 +134,7 @@ impl SkewedStream {
     fn sample_rank(&self, u: f64) -> usize {
         match self
             .cdf
-            .binary_search_by(|p| p.partial_cmp(&u).unwrap_or(std::cmp::Ordering::Less))
+            .binary_search_by(|p| p.total_cmp(&u))
         {
             Ok(i) => i,
             Err(i) => i.min(self.cdf.len().saturating_sub(1)),
@@ -340,6 +340,16 @@ mod tests {
             correlated > independent * 3,
             "rho=0.9 ({correlated} repeats) must be far more correlated than rho=0 ({independent})"
         );
+    }
+
+    #[test]
+    fn sample_rank_handles_nan_cdf_entry() {
+        let mut s = SkewedStream::new(8, 1, 1.0, 0.0, 11);
+        s.cdf[3] = f64::NAN;
+
+        let rank = s.sample_rank(0.5);
+
+        assert!(rank < s.cdf.len(), "rank {rank} should stay within the CDF");
     }
 
     #[test]

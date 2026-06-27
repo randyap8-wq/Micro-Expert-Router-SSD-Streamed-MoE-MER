@@ -40,6 +40,7 @@ prometheus = { version = "0.13", default-features = false }
 # Sync primitive for the LRU + buffer pool. parking_lot is faster and not async,
 # which is exactly what we want around a short critical section.
 parking_lot = "0.12"
+once_cell = "1"
 
 # Persistent, work-stealing thread pool for the architecture-agnostic
 # dense-compute kernels (`matmul_row_major`, per-expert `gate_up_swiglu`
