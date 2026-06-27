@@ -688,6 +688,8 @@ pub enum ArchitectureError {
     UnknownArchitecture { model_type: String, architectures: Vec<String> },
     /// A required hyperparameter was missing or the wrong type.
     MissingField(&'static str),
+    /// A recognised hyperparameter had an unsupported value or shape.
+    InvalidField(String),
 }
 
 impl std::fmt::Display for ArchitectureError {
@@ -705,6 +707,7 @@ impl std::fmt::Display for ArchitectureError {
             Self::MissingField(name) => {
                 write!(f, "config.json is missing required field `{name}`")
             }
+            Self::InvalidField(message) => write!(f, "invalid config.json field: {message}"),
         }
     }
 }
@@ -1079,6 +1082,35 @@ impl HfConfig {
             .or_else(|| get("num_experts").and_then(as_usize))
             .or_else(|| get("n_routed_experts").and_then(as_usize));
 
+        let first_k_dense_replace =
+            if let Some(first_k_dense_replace) = get("first_k_dense_replace").and_then(as_usize) {
+                Some(first_k_dense_replace)
+            } else if let Some(arr) = get("moe_layer_freq").and_then(|v| v.as_array()) {
+                // MiMo-V2-Flash has no `first_k_dense_replace`; it marks
+                // dense vs MoE layers via `moe_layer_freq` (0 = dense FFN,
+                // 1 = MoE). MER models this as a contiguous dense prefix,
+                // so reject interleaved dense layers instead of silently
+                // mapping them to MoE.
+                let leading_dense = arr.iter().take_while(|e| e.as_u64() == Some(0)).count();
+                let mut seen_moe = false;
+                for (i, e) in arr.iter().enumerate() {
+                    match e.as_u64() {
+                        Some(1) => seen_moe = true,
+                        Some(0) if seen_moe => {
+                            return Err(ArchitectureError::InvalidField(format!(
+                                "moe_layer_freq contains non-leading zero at index {i}; \
+                                 MER only supports a contiguous dense prefix \
+                                 (first_k_dense_replace), not interleaved dense layers"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                Some(leading_dense)
+            } else {
+                None
+            };
+
         Ok(HfConfig {
             architecture,
             model_type: if top_model_type.is_empty() {
@@ -1103,17 +1135,7 @@ impl HfConfig {
             num_routed_experts,
             num_experts_per_tok: get("num_experts_per_tok").and_then(as_usize),
             num_shared_experts: get("n_shared_experts").and_then(as_usize),
-            first_k_dense_replace: get("first_k_dense_replace")
-                .and_then(as_usize)
-                // MiMo-V2-Flash has no `first_k_dense_replace`; it marks
-                // dense vs MoE layers via `moe_layer_freq` (0 = dense FFN,
-                // 1 = MoE). Layer 0 is dense, so the number of leading dense
-                // layers is the count of leading zeros in that array.
-                .or_else(|| {
-                    get("moe_layer_freq").and_then(|v| v.as_array()).map(|arr| {
-                        arr.iter().take_while(|e| e.as_u64() == Some(0)).count()
-                    })
-                }),
+            first_k_dense_replace,
             scoring_func: get("scoring_func").and_then(|v| v.as_str().map(String::from)),
             topk_method: get("topk_method").and_then(|v| v.as_str().map(String::from)),
             n_group: get("n_group").and_then(as_usize),
@@ -2002,5 +2024,21 @@ mod tests {
         }"#;
         let cfg = HfConfig::from_json_str(json).unwrap();
         assert_eq!(cfg.first_k_dense_replace, Some(0));
+    }
+
+    #[test]
+    fn moe_layer_freq_rejects_non_leading_zero() {
+        let json = r#"{
+            "architectures": ["MiMoV2FlashForCausalLM"],
+            "model_type": "mimo_v2_flash",
+            "hidden_size": 4096, "num_hidden_layers": 6,
+            "num_attention_heads": 64, "vocab_size": 152576,
+            "moe_layer_freq": [0, 1, 1, 0, 1, 1]
+        }"#;
+        let err = HfConfig::from_json_str(json).unwrap_err();
+        assert!(
+            err.to_string().contains("non-leading zero"),
+            "unexpected error: {err}"
+        );
     }
 }
