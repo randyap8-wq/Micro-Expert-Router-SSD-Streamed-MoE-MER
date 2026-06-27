@@ -903,21 +903,19 @@ fn validate_shards(readers: &[GgufStreamReader], expected_count: usize) -> io::R
             ));
         }
 
-        let arch = metadata_str(&reader.metadata, "general.architecture", shard_number)?
-            .ok_or_else(|| {
-                io::Error::new(
+        if let Some(arch) = metadata_str(&reader.metadata, "general.architecture", shard_number)? {
+            if arch != expected_arch {
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "GGUF shard {shard_number} missing required metadata `general.architecture`"
+                        "GGUF shard {shard_number} metadata `general.architecture` mismatch: expected `{expected_arch}`, actual `{arch}`"
                     ),
-                )
-            })?;
-        if arch != expected_arch {
+                ));
+            }
+        } else if shard_number == 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "GGUF shard {shard_number} general.architecture `{arch}` disagrees with shard 1 `{expected_arch}`"
-                ),
+                format!("GGUF shard 1 missing required metadata `general.architecture`"),
             ));
         }
 
@@ -1186,18 +1184,29 @@ mod tests {
         extra_metadata: &[(&str, GgufValue)],
         tensors: &[SynthTensor],
     ) -> Vec<u8> {
+        synth_gguf_custom_maybe_arch(Some(arch), extra_metadata, tensors)
+    }
+
+    fn synth_gguf_custom_maybe_arch(
+        arch: Option<&str>,
+        extra_metadata: &[(&str, GgufValue)],
+        tensors: &[SynthTensor],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(GGUF_MAGIC);
         out.extend_from_slice(&3u32.to_le_bytes());
         out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(2u64 + extra_metadata.len() as u64).to_le_bytes());
+        let base_metadata = 1u64 + u64::from(arch.is_some());
+        out.extend_from_slice(&(base_metadata + extra_metadata.len() as u64).to_le_bytes());
 
         push_metadata(&mut out, "general.alignment", &GgufValue::U32(32));
-        push_metadata(
-            &mut out,
-            "general.architecture",
-            &GgufValue::String(arch.to_owned()),
-        );
+        if let Some(arch) = arch {
+            push_metadata(
+                &mut out,
+                "general.architecture",
+                &GgufValue::String(arch.to_owned()),
+            );
+        }
         for (key, value) in extra_metadata {
             push_metadata(&mut out, key, value);
         }
@@ -1254,6 +1263,26 @@ mod tests {
             ("split.tensors.count", GgufValue::U64(split_tensors_count)),
         ];
         let bytes = synth_gguf_custom(arch, &metadata, tensors);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn write_synth_shard_without_arch(
+        dir: &Path,
+        prefix: &str,
+        idx: usize,
+        count: usize,
+        tensors: &[SynthTensor],
+        split_count: u64,
+        split_tensors_count: u64,
+    ) -> PathBuf {
+        let path = shard_path(dir, prefix, idx, count);
+        let metadata = [
+            ("split.no", GgufValue::U32((idx - 1) as u32)),
+            ("split.count", GgufValue::U64(split_count)),
+            ("split.tensors.count", GgufValue::U64(split_tensors_count)),
+        ];
+        let bytes = synth_gguf_custom_maybe_arch(None, &metadata, tensors);
         std::fs::write(&path, bytes).unwrap();
         path
     }
@@ -1443,6 +1472,27 @@ mod tests {
     }
 
     #[test]
+    fn later_shards_may_omit_model_metadata() {
+        let dir = temp_test_dir("gguf-shards-metadata-inheritance");
+        let shard1_tensors = [synth_f32_tensor("left", &[1.0, 2.0, 3.0, 4.0])];
+        let shard2_tensors = [synth_f32_tensor("right", &[9.0, 10.0, 11.0, 12.0])];
+        let shard1 = write_synth_shard(&dir, "Model-Q4_K_M", 1, 2, "llama", &shard1_tensors, 2, 2);
+        write_synth_shard_without_arch(&dir, "Model-Q4_K_M", 2, 2, &shard2_tensors, 2, 2);
+
+        let source = open_gguf_source(&shard1, false).expect("open shard set");
+        assert_eq!(source.architecture(), Some("llama"));
+        assert!(source.tensor_info("left").is_some());
+        assert!(source.tensor_info("right").is_some());
+        let right = source
+            .read_tensor_owned("right")
+            .unwrap()
+            .expect("right tensor");
+        assert_eq!(right, f32_bytes(&[9.0, 10.0, 11.0, 12.0]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn missing_shard_fails_clearly() {
         let dir = temp_test_dir("gguf-shards-missing");
         let shard2_tensors = [synth_f32_tensor("right", &[9.0, 10.0, 11.0, 12.0])];
@@ -1501,7 +1551,9 @@ mod tests {
 
         let err = open_err(&shard1);
         assert!(
-            err.contains("general.architecture `qwen2moe` disagrees"),
+            err.contains("metadata `general.architecture` mismatch")
+                && err.contains("expected `llama`")
+                && err.contains("actual `qwen2moe`"),
             "{err}"
         );
 

@@ -77,6 +77,10 @@ use crate::router::{
     LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader, TopKRouter,
 };
 
+const SUPPORTED_SYNTHETIC_DTYPES: &str = "f32, f16, bf16, int8, q4k, q4_0, q8_0, mxfp4";
+const SUPPORTED_RUNTIME_DTYPES: &str =
+    "f32, f16, bf16, int8, q4k, q4_0, q5k, q6k, q8_0, mxfp4, mixed";
+
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
 #[derive(Parser, Debug)]
 #[command(name = "micro-expert-router", version, about)]
@@ -122,8 +126,9 @@ enum Cmd {
         /// without `EINVAL`. Must match what `run` is invoked with.
         #[arg(long, default_value_t = 4096)]
         block_align: usize,
-        /// On-disk weight dtype: `f32` (default) or `f16`. Selects the
-        /// byte width of every weight in the generated files.
+        /// On-disk weight dtype for synthetic files: f32, f16, bf16, int8,
+        /// q4k, q4_0, q8_0, or mxfp4. q5k, q6k, and mixed are GGUF/runtime
+        /// formats and are not synthesized by this generator.
         #[arg(long, default_value = "f32")]
         dtype: String,
     },
@@ -236,10 +241,9 @@ enum Cmd {
         /// PRNG seed for reproducible runs.
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
-        /// On-disk weight dtype: `f32` (default, 4 B/weight) or `f16`
-        /// (2 B/weight). Halving the byte width halves SSD-read bytes
-        /// per cache miss, which is the dominant energy term in this
-        /// engine. Must match what `gen-data` was invoked with.
+        /// On-disk weight dtype. Accepts f32, f16, bf16, int8, q4k, q4_0,
+        /// q5k, q6k, q8_0, mxfp4, or mixed. Must match the generated or
+        /// converted expert dataset.
         #[arg(long, default_value = "f32")]
         dtype: String,
         /// Fraction (`0.1..=1.0`) of input dimensions loaded per expert
@@ -538,6 +542,18 @@ enum Cmd {
         /// possible, conversion fails before writing expert files.
         #[arg(long, default_value_t = false)]
         native_quant: bool,
+        /// Convert only routed expert blobs and metadata. Dense
+        /// transformer tensors are skipped deliberately; the output is
+        /// valid for expert-streaming benchmarks, not full-model runs.
+        #[arg(long, default_value_t = false)]
+        experts_only: bool,
+    },
+
+    /// Validate a converted expert dataset before running inference.
+    ValidateData {
+        /// Directory containing `expert_<id>.bin` files and metadata.json.
+        #[arg(long)]
+        data_dir: PathBuf,
     },
 
     /// Replay a routing trace through the predictive prefetcher and
@@ -793,7 +809,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let dtype =
                         crate::inference::WeightDtype::from_str_opt(&dtype).ok_or_else(|| {
-                            format!("--dtype: unknown value {dtype:?} (use 'f32' or 'f16')")
+                            format!(
+                                "--dtype: unknown value {dtype:?} (supported: {SUPPORTED_RUNTIME_DTYPES})"
+                            )
                         })?;
                     cmd_run(
                         RunArgs {
@@ -876,6 +894,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_uth,
             legacy_eager,
             native_quant,
+            experts_only,
         } => cmd_gguf_convert(
             &gguf_path,
             &out_dir,
@@ -884,7 +903,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             !no_uth,
             legacy_eager,
             native_quant,
+            experts_only,
         ),
+        Cmd::ValidateData { data_dir } => cmd_validate_data(&data_dir),
         Cmd::ValidatePredictor { trace, cache_slots } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1886,8 +1907,20 @@ fn cmd_gen_data(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::inference::WeightDtype;
     let dtype = WeightDtype::from_str_opt(dtype_str).ok_or_else(|| {
-        format!("--dtype: unknown value {dtype_str:?} (use 'f32', 'f16', or 'int8')")
+        format!(
+            "--dtype: unknown value {dtype_str:?} (supported for gen-data: {SUPPORTED_SYNTHETIC_DTYPES})"
+        )
     })?;
+    if matches!(
+        dtype,
+        WeightDtype::Q5K | WeightDtype::Q6K | WeightDtype::Mixed
+    ) {
+        return Err(format!(
+            "gen-data does not synthesize dtype {}; use gguf-convert --native-quant or an offline extractor for this layout",
+            dtype.as_str()
+        )
+        .into());
+    }
     if block_align == 0 || !block_align.is_power_of_two() {
         return Err(format!(
             "--block-align ({block_align}) must be a positive power of two \
@@ -2167,6 +2200,11 @@ async fn cmd_run(
     apply_metadata_if_present(&mut args);
 
     let weight_bytes = expert_weight_bytes_for(args.d_model, args.d_ff, args.dtype);
+    let reported_weight_bytes = if args.dtype == crate::inference::WeightDtype::Mixed {
+        args.expert_size
+    } else {
+        weight_bytes
+    };
     info!(
         num_experts = args.num_experts,
         top_k = args.top_k,
@@ -2174,7 +2212,7 @@ async fn cmd_run(
         expert_mib = args.expert_size as f64 / (1024.0 * 1024.0),
         d_model = args.d_model,
         d_ff = args.d_ff,
-        weight_mib = weight_bytes as f64 / (1024.0 * 1024.0),
+        weight_mib = reported_weight_bytes as f64 / (1024.0 * 1024.0),
         direct_io = !args.no_direct,
         block_align = args.block_align,
         io_only = args.io_only,
@@ -2250,7 +2288,7 @@ async fn cmd_run(
         )
         .into());
     }
-    if weight_bytes > args.expert_size {
+    if weight_bytes > 0 && weight_bytes > args.expert_size {
         return Err(format!(
             "expert_size ({}) is too small for the SwiGLU weights of d_model={}, \
              d_ff={} ({} bytes). Increase --expert-size or shrink --d-model / --d-ff \
@@ -2881,6 +2919,7 @@ mod cli_defaults {
     pub const D_MODEL: usize = 512;
     pub const D_FF: usize = 2048;
     pub const TOP_K: usize = 2;
+    pub const BLOCK_ALIGN: usize = 4096;
 }
 
 /// Hand-rolled `metadata.json` parser. The only fields we care about are
@@ -2940,6 +2979,12 @@ fn apply_metadata_if_present(args: &mut RunArgs) {
         args.expert_size as u64,
         cli_defaults::EXPERT_SIZE as u64,
         &mut |v| args.expert_size = v as usize,
+    );
+    set_if_default(
+        "block_align",
+        args.block_align as u64,
+        cli_defaults::BLOCK_ALIGN as u64,
+        &mut |v| args.block_align = v as usize,
     );
     if args.dtype == crate::inference::WeightDtype::F32 {
         if let Some(dtype_str) = parse_json_string(&body, "dtype") {
@@ -3365,17 +3410,20 @@ fn cmd_gguf_convert(
     emit_uth: bool,
     legacy_eager: bool,
     native_quant: bool,
+    experts_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         path = %gguf_path.display(),
         emit_uth,
         legacy_eager,
         native_quant,
+        experts_only,
         "opening GGUF file"
     );
     let opts = crate::gguf_loader::ExtractOptions {
         emit_uth,
         native_quant,
+        experts_only,
     };
     let source = crate::gguf::open_gguf_source(gguf_path, legacy_eager)?;
     if let Some(arch) = source.architecture() {
@@ -3407,6 +3455,19 @@ fn cmd_gguf_convert(
         "gguf-convert: wrote {} expert files + {} dense tensors ({:.2} GiB total). \
          At 7 GB/s aggregate SSD read bandwidth, a full warm-up scan would take ~{:.2}s.",
         report.experts_written, report.dense_written, total_gib, read_time_at_7gbps
+    );
+    Ok(())
+}
+
+fn cmd_validate_data(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let report = crate::gguf_loader::validate_data_dir(data_dir)?;
+    println!(
+        "validate-data: ok (experts={}, expert_size={} bytes, block_align={}, dtype={}, mixed_experts={})",
+        report.num_experts,
+        report.expert_size,
+        report.block_align,
+        report.dtype.as_str(),
+        report.mixed_experts
     );
     Ok(())
 }

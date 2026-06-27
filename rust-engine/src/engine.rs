@@ -1483,11 +1483,16 @@ fn dispatch_expert_forward(
     static LOG_FIRST_EXPERT_SIZE_ONCE: std::sync::Once = std::sync::Once::new();
     LOG_FIRST_EXPERT_SIZE_ONCE.call_once(|| {
         let actual = r.data().len();
-        let expected = crate::inference::expert_weight_bytes_for(d_model, d_ff, dtype);
+        let expected = if dtype == WeightDtype::Mixed {
+            r.buffer.as_slice().len()
+        } else {
+            crate::inference::expert_weight_bytes_for(d_model, d_ff, dtype)
+        };
         info!(
             expert = r.id,
             dtype = dtype.as_str(),
-            actual_bytes = actual,
+            payload_bytes = actual,
+            physical_slot_bytes = r.buffer.as_slice().len(),
             expected_bytes = expected,
             d_model,
             d_ff,
@@ -2753,7 +2758,11 @@ impl Engine {
                     .counters
                     .bytes_read
                     .fetch_add(buf.len() as u64, Ordering::Relaxed);
-                let resident = Arc::new(ExpertResident::new(id, buf));
+                let resident = Arc::new(ExpertResident::new_with_block_align(
+                    id,
+                    buf,
+                    self.core.storage.config().block_align,
+                ));
                 match self.core.cache.insert(resident.clone()) {
                     Ok(Some(_evicted)) => debug!(expert = id, "inserted (with eviction)"),
                     Ok(None) => debug!(expert = id, "inserted"),
@@ -2957,7 +2966,11 @@ impl Engine {
                     // identical either way (promotion only changes the
                     // drop destination), and a shadow-backed resident
                     // serves cache hits exactly like a primary-backed one.
-                    let resident = Arc::new(ExpertResident::new(id, buf));
+                    let resident = Arc::new(ExpertResident::new_with_block_align(
+                        id,
+                        buf,
+                        me.core.storage.config().block_align,
+                    ));
                     // Prefetches are best-effort: if the cache rejects
                     // the insert (every slot pinned), the resident drops
                     // here and its buffer returns to the shadow pool —
@@ -4224,6 +4237,7 @@ impl Engine {
             top_k: self.core.router.top_k(),
             d_model: self.core.shape.d_model,
             d_ff: self.core.shape.d_ff,
+            expert_size: self.core.storage.config().expert_size,
             predictor_observations: self.core.predictor.observations(),
             tokens_processed: tokens,
             avg_io_wait_us,
@@ -4351,12 +4365,27 @@ impl Engine {
             r.num_experts, r.top_k, r.cache_capacity, r.pool_capacity
         );
         info!(
-            "ffn shape:     d_model={}  d_ff={}  bytes/expert={} (dtype={})",
+            "ffn shape:     d_model={}  d_ff={}  expert slot={} bytes  payload={} bytes (dtype={})",
             r.d_model,
             r.d_ff,
-            crate::inference::expert_weight_bytes_for(r.d_model, r.d_ff, r.dtype),
+            r.expert_size,
+            if r.dtype == WeightDtype::Mixed {
+                r.expert_size
+                    .saturating_sub(self.core.storage.config().block_align)
+            } else {
+                crate::inference::expert_weight_bytes_for(r.d_model, r.d_ff, r.dtype)
+            },
             r.dtype.as_str()
         );
+        if r.dtype == WeightDtype::Mixed {
+            info!(
+                "mixed quant:   experts={}  projections={}  dequant_fallbacks={}  unsupported_dispatches={}",
+                crate::inference::mixed_expert_dispatches(),
+                crate::inference::quantized_projection_dispatches(),
+                crate::inference::mixed_dequant_fallbacks(),
+                crate::inference::unsupported_quant_dispatches()
+            );
+        }
         info!(
             "lookups:       hits={}  misses={}  hit_rate={:.2}%",
             r.hits, r.misses, hit_rate
@@ -4509,6 +4538,7 @@ pub struct EngineReport {
     pub top_k: usize,
     pub d_model: usize,
     pub d_ff: usize,
+    pub expert_size: usize,
     pub predictor_observations: u64,
     /// Number of `Engine::generate` calls completed.
     pub tokens_processed: u64,
