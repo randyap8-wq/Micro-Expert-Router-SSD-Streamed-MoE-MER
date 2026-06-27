@@ -36,40 +36,85 @@ Current status:
 ## Verified CPU-Only Expert-Cache Scaling — Mixtral 8x7B
 
 These are the latest observed **CPU-only** results for the `run`
-expert-streaming benchmark. The benchmark executes real Q4_0 SwiGLU
-expert FFNs while exercising the cache, SSD reads, routing, and prefetch
-infrastructure. It is **not** full autoregressive decoder inference:
-`tokens/s` means benchmark iterations per second, not end-to-end
-generated language tokens per second. The synthetic benchmark router
-does not derive labels from the neural speculator's hidden state.
+expert-streaming benchmark. The benchmark performs real Q4_0 SwiGLU
+expert FFN execution while exercising the cache, SSD reads, routing, and
+prefetch infrastructure. It is **not** full autoregressive decoder inference:
+benchmark iterations per second are not end-to-end generated language
+tokens per second. The CPU-only expert path uses the synthetic benchmark
+router and does not derive labels from the neural speculator's hidden
+state.
 
-Hardware and model: 2026-06-25, GCP `g2-standard-32`, 32 vCPUs / 16
-physical cores, 128 GB RAM, GCP local SSD, `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`.
-An NVIDIA L4 was attached to the VM but was not used for these runs.
-The GGUF was converted to native Q4_0 expert blobs: 256 layer-qualified
-expert files, top-2 routing, 99,090,432 bytes per expert
-(approximately 94.5 MiB).
+In the latest verified CPU-only run, MER sustained 11.78 real Q4_0
+expert-FFN benchmark iterations per second with only a 16-slot,
+approximately 1.48 GiB expert cache. That configuration cached 6.25% of
+the 256-expert namespace while retaining 78.1% of the throughput
+measured with a 124-slot cache. The best observed 10,000-iteration run
+reached 15.08 benchmark iterations per second with 124 slots.
 
-| Expert cache | Namespace cached | Approx. expert-cache payload | Iterations | Sustained benchmark TPS | Hit rate | Avg. I/O wait/token | I/O share |
-| -----------: | ---------------: | ---------------------------: | ---------: | ----------------------: | -------: | ------------------: | --------: |
-|     16 slots |            6.25% |                     1.48 GiB |     10,000 |                    2.91 |   79.64% |            251.6 ms |    73.86% |
-|     64 slots |              25% |                     5.91 GiB |     30,000 |                    7.78 |   94.71% |             16.0 ms |    12.99% |
-|    128 slots |              50% |                    11.81 GiB |     10,000 |                    9.45 |   96.83% |              7.7 ms |     7.55% |
+Hardware and model: 2026-06-27, GCP `g2-standard-32`, 32 vCPUs / 16
+physical cores, 128 GB RAM, GCP local NVMe SSD,
+`mixtral-8x7b-instruct-v0.1.Q4_0.gguf`. An NVIDIA L4 was attached to
+the VM but was not used for these CPU benchmark runs. The GGUF was
+converted by `gguf-convert` to native Q4_0 expert blobs: 256
+layer-qualified experts, 32 layers, 8 experts per layer, top-2 routing,
+`d_model = 4096`, `d_ff = 14336`, 99,090,432 bytes per expert
+(approximately 94.5 MiB). The primary runs used 10,000 benchmark
+iterations, the skewed workload, Zipf `s = 1.2`, workload correlation
+`0.7`, seed `42`, locality, affinity, the adaptive prefetch governor,
+`io_uring`, and `--force-ssd`. The neural speculator was disabled.
 
-What the results show: at 16 slots the workload is strongly I/O-bound.
-Increasing the cache from 16 to 64 slots raised throughput by about
-2.67x and reduced I/O share from 73.86% to 12.99%. A 64-slot cache holds
-only 25% of the 256-expert namespace but reached a 94.71% hit rate under
-the tested skewed/correlated workload. Increasing from 64 to 128 slots
-added another roughly 21% throughput, showing diminishing returns as the
-run becomes more compute-bound. In this benchmark, routing locality and
-cache capacity dominate sustained performance.
+| Expert cache | Namespace cached | Approx. expert-cache payload | Iterations | Sustained benchmark iterations/s | Hit rate | Avg. compute/iteration | Avg. I/O wait/iteration | I/O share |
+| -----------: | ---------------: | ---------------------------: | ---------: | -------------------------------: | -------: | ---------------------: | ----------------------: | --------: |
+|     16 slots |            6.25% |                     1.48 GiB |     10,000 |                            11.78 |   86.78% |               56.09 ms |                28.58 ms |    33.74% |
+|     32 slots |           12.50% |                     2.95 GiB |     10,000 |                            13.50 |   91.63% |               55.49 ms |                18.37 ms |    24.86% |
+|     64 slots |           25.00% |                     5.91 GiB |     10,000 |                             8.87 |   94.62% |               96.33 ms |                11.96 ms |    11.04% |
+|    124 slots |           48.44% |                    11.44 GiB |     10,000 |                            15.08 |   96.68% |               58.36 ms |                 7.52 ms |    11.41% |
 
-The 64-slot run used 30,000 iterations, while the 16- and 128-slot runs
-used 10,000. Treat these as latest observed runs, not a perfectly
-controlled suite. A formal comparison should rerun every cache size with
-the same commit, seed, flags, workload trace, warm-up policy, and
-iteration count.
+The defensible central result is that MER retained most of the measured
+expert-FFN benchmark throughput while caching only a small fraction of
+the expert namespace. The 16-slot run is the most important low-memory
+result: it cached only 6.25% of the 256-expert namespace, used about
+1.48 GiB of expert payload, sustained 11.78 benchmark iterations per
+second, and reached an 86.78% cache hit rate. Relative to 124 slots, the
+16-slot configuration used 12.9% as much cache capacity and retained
+78.1% of the measured throughput. The 32-slot configuration used 25.8%
+as much cache capacity as 124 slots and retained 89.5% of the measured
+throughput.
+
+This supports MER's intended design goal: useful expert execution
+without keeping most of the expert namespace in RAM. High routing
+locality lets a small resident working set serve most lookups, while SSD
+reads handle the remaining cold expert activations.
+
+### Known bimodal FFN compute anomaly
+
+Do not read the table above as a normal monotonic cache-scaling curve.
+The 64-slot cache achieved a healthy 94.62% hit rate and average
+foreground I/O wait was only 11.96 ms, but the result dropped to 8.87
+benchmark iterations per second because average FFN compute time rose to
+96.33 ms. Normal fast-state FFN compute in the 16-, 32-, and mostly the
+124-slot runs was approximately 55-58 ms.
+
+Repeated short tests between 60 and 68 slots showed compute p50 values
+near 98-100 ms. A 32-slot control remained fully in the fast state. A
+124-slot control was bimodal: p50 remained fast while p95 approached
+99 ms. The issue is under investigation. Possible memory placement,
+buffer identity, worker scheduling, NUMA locality, or kernel behavior
+remain hypotheses, not established conclusions. The 64-slot result is
+included for transparency and should not be interpreted as proof that
+larger caches inherently reduce performance.
+
+Compared cautiously with the non-identical June 25 configuration, the
+June 27 16-slot run improved from `sustained_tps=2.9101667108676104`,
+79.635% hit rate, 251.5833 ms average I/O wait, 21,353 completed
+prefetches, and the speculator enabled to
+`sustained_tps=11.78248398546161`, 86.775% hit rate, 28.5783 ms average
+I/O wait, 30 completed prefetches, speculator disabled, and the adaptive
+governor enabled. That is approximately 4.05x the historical 16-slot
+throughput while dramatically reducing speculative SSD traffic and
+foreground I/O wait. This difference is attributed to the updated
+benchmark configuration and much stricter speculative-I/O behavior, not
+to one isolated code change.
 
 Hardware ceiling footnote: these measurements ran inside a GCP VM on
 GCP local SSD. Bare-metal PCIe-4/5 NVMe devices can advertise higher
@@ -78,10 +123,13 @@ GB/s range per drive, and striping can raise that ceiling further.
 Those ceilings are not directly comparable to this table because the
 benchmark issues routed expert reads with cache misses, foreground
 contention, speculative reads, and CPU FFN work in the loop. Use them as
-capacity-planning context, not as claimed benchmark TPS.
+capacity-planning context, not as claimed benchmark iterations per second.
 
-Raw summaries and metric definitions live in
-[`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md).
+Full June 27 summaries, boundary controls, and metric definitions are
+recorded in
+[`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md).
+The previous June 25 results remain available as a
+[historical baseline](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md).
 
 ---
 
