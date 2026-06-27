@@ -29,7 +29,7 @@ Current status:
 | **Verified expert-streaming benchmark target** | Mixtral 8x7B Q4_0 expert blobs from `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`, run on the CPU path with 256 layer-qualified experts and top-2 routing. |
 | **Implemented, not benchmark-validated here** | Mixtral/Llama-MoE `mixtral`, Qwen3-MoE `qwen3_moe`, DeepSeek-V3/V3.1 `deepseek_v3`, MiMo-V2-Flash `mimo_v2_flash`, and GPT-OSS `gpt_oss` source paths. See [Supported model architectures](#supported-model-architectures) for the implementation details and limitations. |
 | **Dense model support only** | Qwen3 dense, Mistral Small 3, and Phi-4 load dense decoder tensors but do not exercise SSD expert streaming. |
-| **Unsupported or known limitation** | Arbitrary sparse MoEs, arbitrary GGUF quantization recipes, and mixed expert projection dtypes are not automatically validated or supported. |
+| **Unsupported or known limitation** | Arbitrary sparse MoEs and arbitrary GGUF quantization recipes are not automatically supported. Mixed expert projection dtypes are supported only when every projection maps to an executable CPU kernel and the dataset carries UTH2 metadata. |
 
 ---
 
@@ -507,7 +507,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `io_uring_storage` | Linux-only `io_uring` backend with **registered fixed buffers** (`IORING_REGISTER_BUFFERS`) and a batched `submit_and_wait(K)` entry point (`read_experts_batch_fixed`). Also exposes `read_experts_batch_fixed_promote`, the **zero-latency speculative → resident** path: one `submit_and_wait(K)` against shadow `PooledBuffer`s, then a `BufferPool::promote_shadow` per CQE so the bytes that just arrived become resident without a re-read. Built behind the `io_uring` cargo feature. |
 | `router` | The three-signal predictive controller in one module: `TopKRouter` (deterministic 1st-order Markov router, clustered locality by default, or a precomputed `N×N` matrix), `PredictiveLoader` (online **1st- and 2nd-order** sparse Markov predictor with a Laplace prior, plus the unified `predict_unified(S ∪ L ∪ M)` scoring API and the extended `predict_unified_with_spatial(…)` that folds in **expert-affinity** + **UTH-spatial** neighbours when a seed scores ≥ 0.80), `LocalityMonitor` (sliding-window heat map, the **L** arm), `NeuralSpeculator` (2-layer MLP trained online by SGD on an off-path worker thread, the **M** arm), `ExpertAffinity` (lock-free `N×N` `AtomicU32` co-occurrence matrix tracking which experts fire together in the same MoE layer) plus the new `LayeredExpertAffinity` wrapper that **keeps one matrix per layer** (gist Part 2 fix #2) so layer-0 co-firings cannot leak into other layers' neighbour signal, and a background **exponential-decay worker** (gist Part 2 fix #7) that right-shifts the counter matrix per `epoch_threshold` cumulative observations to prevent atomic saturation, and `SpeculationController` (latency-aware speculation window, grows under rising `ssd_stall_us`, clamps to 0 under critical pool pressure; `update_from_stall` swaps the high-water-mark with one relaxed atomic, no `compare_exchange`). |
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
-| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q8_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For the GGUF block-quantised dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm` / `run_inference_q8_0_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels, no F32 dequantise of the weights. The legacy `run_inference_q4_0` / `run_inference_q4k` / `run_inference_q8_0` dequant kernels are kept as a graceful fallback when `cols % block_size != 0`. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
+| `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q8_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For homogeneous GGUF block-quantised dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm` / `run_inference_q8_0_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels, no F32 dequantise of the weights. For `dtype=mixed`, UTH2 supplies independent gate/up/down dtype+range metadata and the CPU path executes each projection directly from its quantised bytes (`Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, plus float projections) without materialising full F32 matrices per activation. The legacy dequant kernels remain as reference/debug paths. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
 | `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention, resolved **per layer** so hybrid SWA/global families like MiMo-V2 and GPT-OSS mix modes within one model), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab; `evict_before` drops leading blocks to bound sliding-window caches), `LMHead`, and the `matmul_row_major` dispatch. `matmul_row_major` auto-escalates: scalar → runtime row-parallel (always compiled, via `parallel::par_row_chunks`) → `matrixmultiply` SGEMV under `--features blas`. |
 | `parallel` | Architecture-agnostic **row-parallel execution helper** shared by every dense kernel across every supported family (`matmul_row_major`, the per-expert `gate_up_swiglu` / `down_proj`, the MoE router gate, DeepSeek MLA projections, the LM head). `par_row_chunks` fans disjoint output-row chunks onto a **shared, process-wide `rayon` work-stealing pool** that is created once and reused, so the per-token hot path never spawns/joins OS threads per call (the previous `std::thread::scope` design spawned fresh threads on every matmul), and concurrent requests under continuous batching contend for **one bounded pool** instead of each oversubscribing the box by `N × cores`. The pool is sized at startup by `init_global_pool` to the host's logical cores **minus a small reservation** (`default_compute_threads`: 0 on ≤4-core hosts, 1 on 5–8, two from 9 up, growing by one per extra 16 cores) so a saturated fan-out cannot starve the tokio async runtime; `RAYON_NUM_THREADS` overrides it. Matmuls below an element threshold run inline on the caller; output is bit-identical to the serial reference. |
 | `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. Also exposes `peek_experts` (cheap, side-effect-free routing pre-pass) and `step_speculative` (verify K draft tokens with a unified expert prefetch, gist Phase 2; the preview KV growth for positions `k ≥ 1` is now seeded from a layer-0 draft-token embedding + RoPE projection rather than zero vectors so the verifier's lookahead is not routed on garbage activations, gist Part 2 fix #3). |
@@ -517,9 +517,9 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `session` | In-memory KV-cache session store (`DashMap`-backed) for multi-turn chat. Per-session position cursor + idle-TTL evictor. TTL-driven `evict_expired` now zeroizes each expired session's KV buffers **before** the `Arc<SessionState>` is dropped (gist Part 1 fix #1) so residual user context cannot survive in freed heap pages; `delete` does the same on explicit removal. |
 | `batch_scheduler` | **Continuous batching + multi-tenant fair-share.** An `mpsc`-fed background task drains per-token `StepRequest`s, fuses up to `max_batch_size` requests (or whatever has arrived within `batch_timeout_ms`) into a single batch, and runs their `RealModel::step` calls concurrently against the shared `Engine`. Owns a central `RequestRegistry` so the channel carries only `{ id, token, pos, params }` per token, never the full `Vec<KvCache>`, and optionally owns the shared `BlockPool` for paged KV. Each batched step starts with a **peek/warm pre-pass** that calls `RealModel::peek_experts` for every request, unions the predicted expert ids, and fires one `engine.warm_with(&ids)` so the NVMe sees one read per unique expert across the entire batch (gist Phase 1). Registered sessions carry a **`SessionClass`** (`Interactive` weight 4, `Audit` weight 1) consumed by the **Weighted Round-Robin admission policy** so an Audit flood cannot starve Interactive callers, plus a monotonic `last_activity_us` timestamp the scheduler loop uses to **reclaim KV blocks** from sessions idle ≥ `idle_eviction_threshold` (default 5 s) when the pool crosses its soft-cap. Under `PressureLevel::Critical` the scheduler suspends the shared `SpeculationController` so prefetch depth is clamped to zero. |
 | `engine` | Top-level orchestrator. Owns the router, predictor (`S` + `L` + `M`), cache, pool, storage, alias map, frequency-pin counters, HDR histograms, and the alias/locality/speculator atomic telemetry. Drives the per-token cycle (`Engine::generate` and `Engine::moe_step`), schedules `union_prefetch`es, and reconciles the locality hot set with the cache's pin set. `spawn_prefetch` is **bounded** by a `tokio::sync::Semaphore` sized from `EngineOptions::max_concurrent_prefetches` (default 64, configurable via `[real_transformer].max_concurrent_prefetches`, gist Part 1 fix #3): an owned permit is acquired *before* `tokio::spawn`, so the bound is enforced before any task work happens; refusals bump `Counters::prefetch_dropped_concurrency` (also surfaced on `EngineReport`). `Engine::fetch_once` likewise bounds its `tokio::task::yield_now()` spin loop at `EngineOptions::max_fetch_yields` (default 128, configurable via `[real_transformer].max_fetch_yields`, gist feedback #1.3): when the cache is full of pinned residents and no `PooledBuffer` frees within the budget, `fetch_once` returns `FetchOnceError::PoolStarved` instead of yielding indefinitely. |
-| `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q6_K`, `Q8_0`. Two single-file readers ship side-by-side: `GgufFile::open` (eager, slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming, keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Standard `*-00001-of-00005.gguf` shard sets are opened as one read-only `GgufSource` without merging shard files. |
-| `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + dense weight files. Each expert file is page-aligned and (by default) prefixed with a 64-byte **Unified Tensor Header**; `--no-uth` opts out. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q8_0` block streams to disk instead of dequantising to F32 (~7× smaller `.bin` files for the 4-bit dtypes, ~4× smaller for `Q8_0`; falls back automatically if the source dtype is ineligible). Driven by the `gguf-convert` subcommand. |
-| `tensor_header` | 64-byte **U.T.H.** (`UTH1` magic, dtype, shape, quant-scale offset, AMX tile hint, flags). Self-describing prefix written by `gguf-convert` and transparently stripped by `ExpertResident::data()` so downstream kernels never see it. |
+| `gguf` | Minimal **GGUF reader** (versions 1, 2, 3): magic / metadata / tensor table, recognises `F32`, `F16`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`. Two single-file readers ship side-by-side: `GgufFile::open` (eager, slurps the file into RAM, useful for tests) and `GgufStreamReader::open` (streaming, keeps only the header resident and seeks tensor bodies on demand, the default for `gguf-convert`). Standard `*-00001-of-00005.gguf` shard sets are opened as one read-only `GgufSource` without merging shard files; shard 1 supplies canonical model metadata and later shards may omit duplicated model-level keys when tensor/split metadata remains consistent. |
+| `gguf_loader` | Glue from a `GgufSource` → per-expert `.bin` files + `metadata.json` + optional dense weight files. Conversion preflights the expert layout before publishing output, writes into a sibling staging directory, validates the staged dataset, then renames it into place. Each expert file is page-aligned and (by default) prefixed with **UTH1** for homogeneous tensors or **UTH2** for mixed projection layouts; `--no-uth` opts out where the selected layout permits it. Pass `--native-quant` to write raw `Q4_0` / `Q4_K` / `Q5_K` / `Q6_K` / `Q8_0` projection streams to disk instead of dequantising to F32; unsupported or non-executable layouts fail during preflight. `--experts-only` skips dense tensor extraction and records `conversion_mode=experts_only`. |
+| `tensor_header` | **U.T.H.** metadata prefix. `UTH1` is a 64-byte homogeneous tensor header (`dtype`, shape, quant-scale offset, AMX tile hint, flags). `UTH2` is a mixed-projection expert header with independent gate/up/down dtype, offset, length, and weight counts. Both are padded to the configured block alignment and transparently stripped by `ExpertResident::data()` so downstream kernels see payload bytes only. |
 | `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()` + `cpu_features()`), with `scalar.rs` (always on, also home of the `swiglu_f32` reference oracle plus the `dot_int8_int8` scalar reference for VNNI), `avx2.rs` (always compiled on x86_64, no cargo feature; the `#[target_feature]` entry points are gated on the runtime probe), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot, the 4×-unrolled `dot_f32_avx512`, the fused per-row `swiglu_f32_avx512` kernel, **and** the AVX-512 VNNI int8×int8 dot `dot_int8_int8_avx512_vnni` built on `_mm512_dpbusd_epi32`, gist Part 2 fix #8, with the i8→u8 bias-trick correction so the inner reduction stays in i32 integer registers), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The dispatcher also exposes `swiglu_f32_into(gate_w, up_w, x, rows, cols, y)` which routes to the AVX-512 fused kernel on capable hosts and the scalar reference elsewhere, caller owns `y`, no allocation on the hot path. The probe reads `/proc/cpuinfo` to recognise Sapphire-Rapids-class Xeons so AMX can be preferred on the chips it ships on. The selected backend is logged once at startup. |
 | `backend` | Plugin-system math `Backend` trait (`matmul`, `matmul_into`, `swiglu_into`, `softmax`, `silu_inplace`) with three built-in implementations: `ScalarBackend` (pure Rust reference), `CandleBackend` (default CPU executor, dispatches through `kernels::dot_f32` / `kernels::swiglu_f32_into`, no `candle_core::Tensor` rebuild on the hot path, **zero allocation** in either call), and `GpuBackend` (gist Part 2 fix #5, budget-GPU executor selected by `[real_transformer].compute_offload = "gpu"`; both the integration seam and the `wgpu` compute pipeline compile on every build, the `gpu` cargo feature is now a no-op kept only for backwards compatibility). Both CPU backends override `matmul_into` to dispatch through `kernels::dot_f32` (auto-escalates AVX-512 → AVX2 → scalar). The active backend is installed once at startup via `backend::install_default()` (or, when `compute_offload = "gpu"`, `set_backend(GpuBackend::try_new())` runs first) and resolved on the hot path through `backend::current()`, a single `OnceLock` load, no `cfg!` dispatch. New executors (Burn, Tract, custom CUDA) implement `Backend` and call `set_backend(Arc<dyn Backend>)` before the first token is generated. |
 | `io_reactor` | **Actor-pattern I/O reactor** (gist Part 5 doc fix). Wraps an `NvmeStorage` behind a single-owner tokio task that runs a **bounded serial loop**: it dequeues read requests from a bounded `mpsc` channel one at a time, `await`s the read inline, replies over the per-request `oneshot`, and only then pulls the next request, the bounded queue therefore also bounds active I/O concurrency. `IoReactorHandle` is cheaply cloneable (the sender side is reference-counted by tokio); workers issue `read_expert(id, buf)` without ever touching a shared `DashMap` shard / `RwLock` write guard. Backpressure is automatic, when the I/O substrate saturates, callers park on `mpsc::send` instead of overflowing a per-thread queue. Exposed as a standalone helper alongside the legacy `engine` path so the in-flight `DashMap<u32, Notify>` deduplicator can retire one subsystem at a time. |
@@ -532,7 +532,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `rpc` | Sharded `RouteExperts` RPC frames (gist Part 4): the deterministic `shard_for_expert` routing function plus the packed `RouteExpertsRequest` / `RouteExpertsResponse` f16 wire frames documented in `docs/distributed.md`. Dependency-free so the default build stays slim; the real `tonic`/`prost` gRPC transport in `grpc` (behind `--features grpc`) reuses these frames and their f16 pack/unpack helpers as the single source of truth for the on-wire layout. |
 | `distributed` | `ShardRouter` trait + `LocalShardRouter` default for distributed expert sharding. Routes expert lookups into `ShardInstruction::{Local, Remote}` decisions; remote fetches return a boxed `ShardFetchFuture` (object-safe without `async-trait`) and surface structured `ShardRouterError`s (`Timeout`, `Unreachable`, `NotFound`, `Transport`, `PartialFailure { node, delivered, missing }`, the last covers streaming-gRPC partial-success responses where some experts arrived and others did not) wrapped in `InferenceError::RemoteShardFetchFailed`. The default `LocalShardRouter` always routes locally, so single-node deployments behave identically to today; new transports plug in by implementing the trait. `RpcShardRouter` is a working gRPC router: with `--features grpc` its `fetch_remote` performs a real tonic `Health` round-trip against the owning shard (via `grpc::probe_remote`) and translates tonic status codes through `map_tonic_status` (`DeadlineExceeded`/`Cancelled` → `Timeout`, `Unavailable` → `Unreachable`, `NotFound` → `NotFound`, `Aborted`/other → `Transport`); without the feature the remote path returns a structured `Unreachable`. |
 | `grpc` | **Real gRPC/tonic transport for expert sharding (behind `--features grpc`).** The `ExpertShard` server (`grpc::serve` over a `ShardCompute` backend), the `ShardClient` (`route_experts` + `health`), and `probe_remote` (the reachability check `RpcShardRouter::fetch_remote` calls). Bridges the packed-f16 `rpc` frames to the committed `prost` stubs in `grpc_gen` (generated from `proto/route_experts.proto`; **no build-time `protoc`**). Off by default so `tonic`/`prost` (~150 crates) stay out of the standard build. |
-| `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-predictor`, `serve`, and (with `--features tui`, on by default) `monitor` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2...` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
+| `main` | `clap`-based CLI with `gen-data`, `run`, `gguf-convert`, `validate-data`, `validate-predictor`, `serve`, and (with `--features tui`, on by default) `monitor` subcommands; structured `tracing` logs; `--first-token 3,7` to reproduce the spec example; `--io-only` for pure-I/O benchmarking; `--force-ssd` to refuse page-cache shortcuts; `--data-dir DIR1,DIR2...` for multi-drive striping; and auto-loading of `metadata.json` (written by `scripts/extract_mixtral_experts.py` or `gguf-convert`) so a real Mixtral checkpoint runs with no further flags. |
 
 ### Key design decisions
 
@@ -1865,12 +1865,18 @@ micro-expert-router gguf-convert
                               expert blob (compat with pre-UTH consumers)
   --legacy-eager             Use the in-memory GGUF reader instead of the
                               default streaming reader
-  --native-quant             For Q4_0 / Q4_K / Q8_0 source tensors,
+  --native-quant             For executable quantised source tensors
+                              (Q4_0 / Q4_K / Q5_K / Q6_K / Q8_0),
                               write the raw quantised block stream to
                               disk instead of dequantising to F32.
-                              Falls back to F32 (with a logged warning)
-                              when the source dtype isn't quantised or
-                              shapes aren't block-aligned.
+                              Fails during preflight when the source dtype
+                              or shape cannot be executed safely.
+  --experts-only             Write expert blobs + metadata only, skipping
+                              dense transformer tensor extraction.
+
+micro-expert-router validate-data
+  --data-dir <PATH>          Validate converted expert_<id>.bin files and
+                              metadata.json before running inference.
 
 micro-expert-router validate-predictor
   --trace <PATH>             JSONL trace from `run --trace-out`
@@ -1935,15 +1941,15 @@ cargo run --release --manifest-path rust-engine/Cargo.toml -- \
 the engine's built-in GGUF reader handles llama.cpp / Ollama-style
 files directly. The currently verified Mixtral conversion and benchmark
 path is **Q4_0**. Native passthrough supports homogeneous expert
-projection triples in `Q4_0`, `Q4_K`, or `Q8_0` when gate, up, and down
-all share that dtype and the tensor shapes satisfy the block-alignment
-requirements. Arbitrary model-level `Q4_K_M` files are **not** the same
-as homogeneous `q4k` expert blobs: common `Q4_K_M` recipes can mix
-`Q4_K` and `Q6_K` projections, and mixed triples are unsupported until
-the runtime format supports per-projection dtypes. The output directory
-has the same shape as the Mixtral extractor's:
-`expert_<layer>_<id>.bin` blobs + `metadata.json` + per-tensor dense
-weight files.
+projection triples in `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, or `Q8_0`.
+When gate, up, and down use different executable projection dtypes, the
+converter writes `dtype=mixed` experts with UTH2 range metadata and the
+runtime dispatches each projection independently. Arbitrary model-level
+quantization recipes are still not automatically supported: every
+expert projection must be present, sized correctly, block-addressable,
+and executable by the CPU runtime. The output directory uses global
+`expert_<id>.bin` blobs + `metadata.json`; full conversion also writes
+per-tensor dense weight files.
 
 `gguf-convert` defaults to a **streaming reader** that parses only
 the GGUF header and seeks each tensor body on demand, a strict win
@@ -1951,34 +1957,41 @@ for ≥ 100 GB checkpoints. `--gguf-path` may point to a normal GGUF
 or to any file in a standard split set such as
 `Model-Q4_0-00002-of-00005.gguf`; the converter discovers sibling
 shards, validates split metadata when present, and exposes one tensor
-namespace without merging files. Pass `--legacy-eager` to fall back to the
-in-memory reader for ordinary single-file GGUFs. By default every `expert_<id>.bin` is prefixed with
-a 64-byte **Unified Tensor Header** (dtype + shape + AMX tile hint +
-quant-scale offset) padded to 4 KiB so the weight payload still
-starts at an `O_DIRECT`-friendly boundary; pass `--no-uth` to opt
-out for compatibility with consumers that pre-date the header.
+namespace without merging files. Shard 1 is the canonical source of
+model-level metadata such as `general.architecture`; later shards may
+omit those keys, and any repeated canonical value must match shard 1.
+Pass `--legacy-eager` to fall back to the in-memory reader for ordinary
+single-file GGUFs. By default every `expert_<id>.bin` is prefixed with a
+Unified Tensor Header padded to the configured block alignment so the
+weight payload still starts at an `O_DIRECT`-friendly boundary: UTH1 for
+homogeneous experts, UTH2 for mixed per-projection experts. Pass
+`--no-uth` only for layouts that do not require UTH2.
 
-For source GGUFs whose expert tensors are already stored as homogeneous
-`Q4_0`, `Q4_K`, or `Q8_0`, pass `--native-quant` to write the **raw
-quantised block stream** to disk instead of dequantising to F32 first.
-The output `expert_<id>.bin` is then ~7× smaller for the 4-bit dtypes
-(~4× smaller for `Q8_0`) and the engine's `run_inference_q4_0` /
-`run_inference_q4k` / `run_inference_q8_0` paths consume it directly.
-The flag falls back automatically (with a logged warning) when the
-source dtype is ineligible, mixed, or not block-aligned; the converter
-records what was actually written into `metadata.json::dtype`.
+Pass `--native-quant` to write the **raw quantised block stream** to disk
+instead of dequantising to F32 first. Conversion is fail-closed: if any
+required expert tensor is missing, malformed, unsupported, or not
+executable by the planned runtime, preflight fails before the final
+output directory is created. The converter writes into a sibling
+`.tmp-<pid>-<nonce>` staging directory, validates every staged expert
+file and `metadata.json`, then atomically renames staging into place.
+Existing nonempty output directories are refused rather than destroyed.
 
-> **Conversion warning:** logs containing `emitting zero blob` mean the
-> converter wrote placeholder expert weights because source tensors were
-> missing or unsupported. That output is useful for surfacing a loader
-> problem, but it is **not** a successful usable model conversion.
+Use `--experts-only` for the expert-streaming benchmark path. It writes
+expert blobs and metadata, skips dense transformer tensors, and records
+`"conversion_mode": "experts_only"` in `metadata.json`. Validate any
+converted dataset explicitly with:
+
+```bash
+./target/release/micro-expert-router validate-data \
+    --data-dir ./mixtral-data
+```
 
 ```bash
 ./target/release/micro-expert-router gguf-convert \
     --gguf-path ./mixtral-8x7b-instruct-v0.1.Q4_0.gguf \
     --out-dir   ./mixtral-data \
     --native-quant \
-    # add --no-uth and/or --legacy-eager if your tooling needs them
+    --experts-only
 
 ./target/release/micro-expert-router run --data-dir ./mixtral-data
 ```
@@ -2165,12 +2178,14 @@ is that **Q4_0 is the verified practical path for running Mixtral 8x7B
 expert blobs from SSD**: it fits the full 8x7B expert namespace in
 about 24 GB of NVMe and keeps per-layer cold-miss I/O in the tens of
 milliseconds on PCIe-4-class storage. Homogeneous `Q4_K` can use the
-same native expert-blob path when eligible, but mixed `Q4_K/Q6_K`
-model-level recipes need converter/runtime work before they should be
-documented as usable. Mixtral-8x22B needs PCIe-5 or multi-drive striping
-(see `--data-dir DIR1,DIR2...`) to stay interactive at 4-bit; bf16 /
-f16 are best treated as fidelity references rather than production
-knobs.
+same native expert-blob path when eligible, and mixed executable triples
+such as `Q4_K/Q4_K/Q6_K` are represented with UTH2 and run on the CPU
+mixed path without full-weight F32 expansion. Mixtral-8x22B still needs
+PCIe-5 or multi-drive striping (see `--data-dir DIR1,DIR2...`) to stay
+interactive at 4-bit, and this README does not claim a measured 8x22B
+end-to-end throughput result without running the original split
+checkpoint; bf16 / f16 are best treated as fidelity references rather
+than production knobs.
 
 ### Routing model, Markov chain, transition matrix, or LinearGate
 
@@ -2230,7 +2245,7 @@ the learned per-layer `LinearGate` driven by hidden state.
 | Verified end-to-end benchmark | Mixtral 8x7B Q4_0 expert blobs, 256 layer-qualified experts, top-2 routing, CPU path | Latest observed cache-scaling results are in the benchmark section above. |
 | Implemented but not benchmark-validated here | Mixtral/Llama-MoE, Qwen3-MoE, DeepSeek-V3/V3.1, MiMo-V2-Flash, GPT-OSS source paths | Architecture parsing, model construction, routing, and runtime hooks exist, but this README should not imply published throughput/quality validation for each family. |
 | Loader/schema or dense support | Qwen3 dense, Mistral Small 3, Phi-4 | Useful for tensor-name coverage and dense smoke runs; they do not exercise SSD expert streaming. |
-| Known limitations | Arbitrary sparse MoE families, mixed `Q4_K/Q6_K` expert triples, unsupported projection dtypes, and conversion logs with `emitting zero blob` | Require separate implementation or validation before being documented as usable. |
+| Known limitations | Arbitrary sparse MoE families, unsupported projection dtypes, dense quantized GGUF transformer kernels, and unvalidated quantization recipes outside the executable projection set | Require separate implementation or validation before being documented as usable. |
 
 Per-expert sizing is still useful for planning: a Mixtral 8x7B expert is
 about 336 MiB at bf16/f16, about 168-178 MiB at int8/Q8_0, and about
@@ -2437,15 +2452,18 @@ read. Six on-disk dtypes are first-class:
 | `q4k` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over a homogeneous on-disk `Q4_K` 256-block stream, no F32 dequant of the weights. **Fallback**: 256-block dequant (f16 super-scale + 6-bit sub-scales + 4-bit weights) when `cols % 256 != 0`. | GGUF-compatible 4-bit expert blob; do not confuse with arbitrary model-level `Q4_K_M` recipes |
 | `q4_0` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q4_0` 32-block stream, no F32 dequant of the weights. **Fallback**: 32-block dequant (f16 scale, symmetric 4-bit nibbles) when `cols % 32 != 0`. | the most widely-used 4-bit format; chosen by the predictive-controller spec |
 | `q8_0` | ~1.0625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q8_0` 32-block stream (one `f16` scale + 32 signed `i8` weights per block). **Fallback**: 32-block dequant when `cols % 32 != 0`. | GGUF-compatible 8-bit; same density as `int8` but with **per-block** scales, so dynamic range stays bounded inside each 32-weight neighbourhood |
+| `mixed` | varies by projection | UTH2 required | CPU direct projection dispatch over gate/up/down ranges without full-weight F32 expansion. Supported projection dtypes include `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `F32`, `F16`, and `BF16`; unsupported projection dtypes fail before execution. | GGUF mixed expert triples such as `Q4_K/Q4_K/Q6_K`; GPU execution is not advertised for Q5_K/Q6_K |
 
 Selectable on **`gen-data`** (synthetic data, every dtype has a
 matching generator arm), on **`gguf-convert`** (input format detected
-from the GGUF tensor dtype, output written in the same dtype, pass
-`--native-quant` to write the raw `Q4_0` / `Q4_K` / `Q8_0` block
-stream instead of dequantising to F32), and on **`run` / `serve`**
-(must match the on-disk files). The forward pass dispatches to
-`inference::run_inference_*` per dtype, all producing the same scalar
-`f32` SwiGLU output, so a benchmark run is a one-flag diff.
+from the GGUF tensor dtype, pass `--native-quant` to write raw
+`Q4_0` / `Q4_K` / `Q5_K` / `Q6_K` / `Q8_0` projection streams and UTH2
+mixed layouts instead of dequantising to F32), and on **`run` / `serve`**
+(must match the on-disk files). Native quant conversion is fail-closed:
+unsupported projection dtypes or unsafe shapes abort preflight instead of
+silently expanding experts to F32. The forward pass dispatches to
+`inference::run_inference_*` per dtype, all producing scalar `f32`
+SwiGLU output, so a benchmark run is a one-flag diff.
 
 **Quantised fast path.** For `q4k`, `q4_0`, and `q8_0` the engine
 prefers the `QMatMul` path (`run_inference_q4_0_qmm` /
@@ -2457,6 +2475,14 @@ path on real Mixtral shapes (`d_model=4096`, `d_ff=14336`, all three
 formats block-aligned). The dequant kernel remains as a graceful
 fallback for shapes that aren't block-aligned and is always selected
 when `EngineOptions::use_qmm_for_q4 = false`.
+
+**Mixed quantized path.** For `mixed`, UTH2 is parsed when the expert
+becomes resident using the dataset's configured `block_align`; the hot
+path reuses those projection ranges and allocates only activation-sized
+F32 buffers (`d_ff` and `d_model`). The reference full-dequant decoder is
+kept for tests/debugging, while normal mixed execution increments the
+mixed/quantized dispatch counters and should leave
+`mixed_dequant_fallbacks` at zero.
 
 **How this saves energy.** Every cache miss reads
 `3 · d_model · d_ff` weights off the SSD. Going from `f32` → `f16`

@@ -59,6 +59,7 @@ compile_error!(
 
 use crate::expert_cache::ExpertResident;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Hugging Face Candle is the math backend for the per-expert SwiGLU
 // forward pass. The on-disk f32 layout (gate || up || down, row-major)
@@ -1960,6 +1961,7 @@ impl OwnedExpertWeights {
     }
 
     /// Build an owned weight set from a UTH2 mixed-projection expert.
+    #[allow(dead_code)]
     pub fn from_bytes_mixed_quant(
         bytes: &[u8],
         header: crate::tensor_header::MixedExpertHeader,
@@ -2373,6 +2375,7 @@ impl OwnedExpertWeights {
     }
 }
 
+#[allow(dead_code)]
 fn decode_mixed_projection(
     payload: &[u8],
     range: crate::tensor_header::ProjectionRange,
@@ -2451,6 +2454,244 @@ fn decode_mixed_projection(
         )));
     }
     Ok(out)
+}
+
+static QUANTIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static MIXED_EXPERT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static MIXED_DEQUANT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static UNSUPPORTED_QUANT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+pub fn quantized_projection_dispatches() -> u64 {
+    QUANTIZED_PROJECTION_DISPATCHES.load(Ordering::Relaxed)
+}
+
+pub fn mixed_expert_dispatches() -> u64 {
+    MIXED_EXPERT_DISPATCHES.load(Ordering::Relaxed)
+}
+
+pub fn mixed_dequant_fallbacks() -> u64 {
+    MIXED_DEQUANT_FALLBACKS.load(Ordering::Relaxed)
+}
+
+pub fn unsupported_quant_dispatches() -> u64 {
+    UNSUPPORTED_QUANT_DISPATCHES.load(Ordering::Relaxed)
+}
+
+pub struct QuantProjectionView<'a> {
+    dtype: WeightDtype,
+    bytes: &'a [u8],
+    rows: usize,
+    cols: usize,
+    weights: usize,
+}
+
+pub struct MixedQuantExpertView<'a> {
+    gate: QuantProjectionView<'a>,
+    up: QuantProjectionView<'a>,
+    down: QuantProjectionView<'a>,
+}
+
+impl<'a> MixedQuantExpertView<'a> {
+    fn from_payload(
+        payload: &'a [u8],
+        header: crate::tensor_header::MixedExpertHeader,
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        if header.d_model as usize != d_model || header.d_ff as usize != d_ff {
+            return Err(ExpertWeightsError::InvalidLayout(format!(
+                "UTH2 shape d_model={} d_ff={} does not match runtime d_model={} d_ff={}",
+                header.d_model, header.d_ff, d_model, d_ff
+            )));
+        }
+        header
+            .validate(payload.len() as u64)
+            .map_err(ExpertWeightsError::InvalidLayout)?;
+        Ok(Self {
+            gate: projection_view(payload, header.gate, d_ff, d_model, "gate")?,
+            up: projection_view(payload, header.up, d_ff, d_model, "up")?,
+            down: projection_view(payload, header.down, d_model, d_ff, "down")?,
+        })
+    }
+}
+
+fn projection_view<'a>(
+    payload: &'a [u8],
+    range: crate::tensor_header::ProjectionRange,
+    rows: usize,
+    cols: usize,
+    name: &str,
+) -> Result<QuantProjectionView<'a>, ExpertWeightsError> {
+    let dtype = range.dtype.to_weight();
+    let weights = rows.checked_mul(cols).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout(format!("{name} projection shape overflows usize"))
+    })?;
+    if range.weights as usize != weights {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "{name} projection records {} weights, expected {weights}",
+            range.weights
+        )));
+    }
+    let expected_bytes = projection_weight_bytes_for(weights, dtype).ok_or_else(|| {
+        UNSUPPORTED_QUANT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        ExpertWeightsError::InvalidLayout(format!(
+            "{name} projection dtype {} is not executable by direct mixed dispatch",
+            dtype.as_str()
+        ))
+    })?;
+    if range.len as usize != expected_bytes {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "{name} projection length {} does not match {expected_bytes} bytes for {}",
+            range.len,
+            dtype.as_str()
+        )));
+    }
+    let start: usize = range.offset.try_into().map_err(|_| {
+        ExpertWeightsError::InvalidLayout(format!("{name} projection offset overflows usize"))
+    })?;
+    let end = start.checked_add(expected_bytes).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout(format!("{name} projection range overflows usize"))
+    })?;
+    let bytes = payload
+        .get(start..end)
+        .ok_or_else(|| ExpertWeightsError::BufferTooSmall {
+            have: payload.len(),
+            need: end,
+            d_model: cols,
+            d_ff: rows,
+        })?;
+    Ok(QuantProjectionView {
+        dtype,
+        bytes,
+        rows,
+        cols,
+        weights,
+    })
+}
+
+fn quantized_matvec(
+    view: &QuantProjectionView<'_>,
+    x: &[f32],
+) -> Result<Vec<f32>, ExpertWeightsError> {
+    if x.len() != view.cols {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "projection input length {} does not match cols {}",
+            x.len(),
+            view.cols
+        )));
+    }
+    QUANTIZED_PROJECTION_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    let mut y = vec![0.0f32; view.rows];
+    match view.dtype {
+        WeightDtype::F32 => {
+            for (idx, chunk) in view.bytes.chunks_exact(4).take(view.weights).enumerate() {
+                let row = idx / view.cols;
+                let col = idx % view.cols;
+                let w = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                y[row] += w * x[col];
+            }
+        }
+        WeightDtype::F16 => {
+            for (idx, chunk) in view.bytes.chunks_exact(2).take(view.weights).enumerate() {
+                let row = idx / view.cols;
+                let col = idx % view.cols;
+                let w = half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+                y[row] += w * x[col];
+            }
+        }
+        WeightDtype::BF16 => {
+            for (idx, chunk) in view.bytes.chunks_exact(2).take(view.weights).enumerate() {
+                let row = idx / view.cols;
+                let col = idx % view.cols;
+                let w = half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+                y[row] += w * x[col];
+            }
+        }
+        WeightDtype::Q4_0 => matvec_block_stream(
+            view,
+            x,
+            &mut y,
+            Q4_0_BLOCK_ELEMS,
+            Q4_0_BLOCK_BYTES,
+            dequantize_q4_0_block,
+        )?,
+        WeightDtype::Q4K => matvec_block_stream(
+            view,
+            x,
+            &mut y,
+            Q4K_BLOCK_ELEMS,
+            Q4K_BLOCK_BYTES,
+            dequantize_q4k_block,
+        )?,
+        WeightDtype::Q5K => matvec_block_stream(
+            view,
+            x,
+            &mut y,
+            Q5K_BLOCK_ELEMS,
+            Q5K_BLOCK_BYTES,
+            dequantize_q5k_block,
+        )?,
+        WeightDtype::Q6K => matvec_block_stream(
+            view,
+            x,
+            &mut y,
+            Q6K_BLOCK_ELEMS,
+            Q6K_BLOCK_BYTES,
+            dequantize_q6k_block,
+        )?,
+        WeightDtype::Q8_0 => matvec_block_stream(
+            view,
+            x,
+            &mut y,
+            Q8_0_BLOCK_ELEMS,
+            Q8_0_BLOCK_BYTES,
+            dequantize_q8_0_block,
+        )?,
+        WeightDtype::Int8 | WeightDtype::MXFP4 | WeightDtype::Mixed => {
+            UNSUPPORTED_QUANT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            return Err(ExpertWeightsError::InvalidLayout(format!(
+                "projection dtype {} is not executable by direct mixed dispatch",
+                view.dtype.as_str()
+            )));
+        }
+    }
+    Ok(y)
+}
+
+fn matvec_block_stream(
+    view: &QuantProjectionView<'_>,
+    x: &[f32],
+    y: &mut [f32],
+    block_elems: usize,
+    block_bytes: usize,
+    decode: fn(&[u8], &mut [f32]),
+) -> Result<(), ExpertWeightsError> {
+    let blocks = view.weights.div_ceil(block_elems);
+    let need = blocks.checked_mul(block_bytes).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout("quantized projection byte size overflow".to_string())
+    })?;
+    if view.bytes.len() < need {
+        return Err(ExpertWeightsError::BufferTooSmall {
+            have: view.bytes.len(),
+            need,
+            d_model: view.cols,
+            d_ff: view.rows,
+        });
+    }
+    let mut scratch = vec![0.0f32; block_elems];
+    for block in 0..blocks {
+        let start = block * block_bytes;
+        decode(&view.bytes[start..start + block_bytes], &mut scratch);
+        let base = block * block_elems;
+        let n = (view.weights - base).min(block_elems);
+        for (i, &w) in scratch.iter().take(n).enumerate() {
+            let flat = base + i;
+            let row = flat / view.cols;
+            let col = flat % view.cols;
+            y[row] += w * x[col];
+        }
+    }
+    Ok(())
 }
 
 /// Generate the per-token hidden-state vector that flows into the FFN.
@@ -2745,9 +2986,21 @@ pub fn run_inference_mixed_quant(
             "runtime dtype is mixed but resident expert has no valid UTH2 header".to_string(),
         )
     })?;
-    let weights =
-        OwnedExpertWeights::from_bytes_mixed_quant(resident.data(), header, d_model, d_ff)?;
-    let y = weights.forward(x);
+    MIXED_EXPERT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    let view = MixedQuantExpertView::from_payload(resident.data(), header, d_model, d_ff)?;
+    let gate = quantized_matvec(&view.gate, x)?;
+    let up = quantized_matvec(&view.up, x)?;
+    let limit = swiglu_limit();
+    let mut hidden = vec![0.0f32; d_ff];
+    for i in 0..d_ff {
+        let g = if let Some(limit) = limit {
+            gate[i].clamp(-limit, limit)
+        } else {
+            gate[i]
+        };
+        hidden[i] = silu(g) * up[i];
+    }
+    let y = quantized_matvec(&view.down, &hidden)?;
     let out = summarise_output(token_idx, resident.id, &y);
     Ok((out, y))
 }

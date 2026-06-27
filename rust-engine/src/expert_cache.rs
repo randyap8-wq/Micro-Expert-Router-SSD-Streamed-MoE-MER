@@ -85,13 +85,21 @@ impl ExpertResident {
     /// payload offset once. Subsequent calls to [`Self::data`] do not
     /// re-probe the header.
     pub fn new(id: u32, buffer: PooledBuffer) -> Self {
+        Self::new_with_block_align(id, buffer, DEFAULT_BLOCK_ALIGN)
+    }
+
+    /// Construct a resident expert using the block alignment declared
+    /// by the storage metadata. This is required for UTH1/UTH2 payload
+    /// offsets to be parsed correctly when a dataset was converted with
+    /// an alignment other than 4096 bytes.
+    pub fn new_with_block_align(id: u32, buffer: PooledBuffer, block_align: usize) -> Self {
         let (payload_offset, mixed_layout) = {
             let raw = buffer.as_slice();
             let (payload, mixed) =
-                if let Some((h, payload)) = MixedExpertHeader::strip(raw, DEFAULT_BLOCK_ALIGN) {
+                if let Some((h, payload)) = MixedExpertHeader::strip(raw, block_align) {
                     (payload, Some(h))
                 } else {
-                    let (_, payload) = TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN);
+                    let (_, payload) = TensorHeader::strip(raw, block_align);
                     (payload, None)
                 };
             // `payload` is either `raw` unchanged (offset 0) or a suffix
@@ -866,6 +874,28 @@ mod tests {
     fn make(id: u32, pool: &BufferPool) -> Arc<ExpertResident> {
         let buffer = pool.try_acquire().unwrap();
         Arc::new(ExpertResident::new(id, buffer))
+    }
+
+    #[test]
+    fn resident_uses_configured_block_align_for_uth_payload() {
+        let block_align = 8192usize;
+        let mut file = Vec::new();
+        crate::tensor_header::TensorHeader::for_swiglu_expert(
+            crate::inference::WeightDtype::F32,
+            8,
+            16,
+        )
+        .write_padded(block_align, &mut file);
+        file.extend_from_slice(&[0xA5u8; 64]);
+        file.resize(block_align * 2, 0);
+
+        let pool = BufferPool::new(1, file.len(), block_align);
+        let mut buffer = pool.try_acquire().unwrap();
+        buffer.as_mut_slice().copy_from_slice(&file);
+        let resident = ExpertResident::new_with_block_align(0, buffer, block_align);
+        assert_eq!(resident.data().len(), block_align);
+        assert!(resident.data()[..64].iter().all(|&b| b == 0xA5));
+        assert!(resident.data()[64..].iter().all(|&b| b == 0));
     }
 
     #[test]

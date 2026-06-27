@@ -32,11 +32,12 @@ use crate::inference::{
     Q5K_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
 };
 use crate::tensor_header::{MixedExpertHeader, ProjectionRange, TensorHeader, UthDtypeId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn};
 
 /// Summary of what `extract_experts_from_gguf` wrote.
@@ -70,7 +71,10 @@ pub struct ExtractionReport {
 
 #[derive(Serialize)]
 struct ExtractedMetadata<'a> {
+    format_version: u32,
+    conversion_mode: &'a str,
     model: &'a str,
+    architecture: &'a str,
     /// `-1` here means "experts from all layers were concatenated";
     /// we mirror the convention of [`scripts/extract_mixtral_experts.py`]
     /// which writes a single integer for one-layer dumps and `-1` for
@@ -81,6 +85,7 @@ struct ExtractedMetadata<'a> {
     d_model: usize,
     d_ff: usize,
     expert_size: usize,
+    maximum_payload_bytes: usize,
     block_align: usize,
     dtype: &'a str,
     weight_layout: &'a str,
@@ -90,11 +95,331 @@ struct ExtractedMetadata<'a> {
     expert_layout_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     projection_dtype_histogram: Option<BTreeMap<String, usize>>,
+    experts_written: usize,
+    dense_tensors_written: usize,
 }
 
 /// Block alignment used for every expert file written by this loader.
 /// Mirrors the engine's default in `main.rs`.
 pub const DEFAULT_BLOCK_ALIGN: usize = 4096;
+
+#[derive(Debug, Clone)]
+struct ConversionPreflightPlan {
+    architecture: String,
+    num_layers: usize,
+    num_experts: usize,
+    total_experts: usize,
+    d_model: usize,
+    d_ff: usize,
+    top_k: usize,
+    expert_size: usize,
+    maximum_payload_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConversionGeometry {
+    num_layers: usize,
+    num_experts: usize,
+    total_experts: usize,
+    d_model: usize,
+    d_ff: usize,
+    top_k: usize,
+}
+
+fn metadata_lookup<'a>(
+    meta: &'a std::collections::HashMap<String, GgufValue>,
+    arch: Option<&str>,
+    suffix: &str,
+) -> Option<&'a GgufValue> {
+    let dotted = format!(".{suffix}");
+    meta.get(&format!("llama.{suffix}"))
+        .or_else(|| arch.and_then(|a| meta.get(&format!("{a}.{suffix}"))))
+        .or_else(|| {
+            meta.iter()
+                .filter(|(k, _)| k.ends_with(&dotted))
+                .min_by(|(a, _), (b, _)| a.cmp(b))
+                .map(|(_, v)| v)
+        })
+}
+
+fn resolve_geometry(
+    gguf: &dyn GgufSource,
+    num_layers_hint: usize,
+    num_experts_hint: usize,
+) -> io::Result<ConversionGeometry> {
+    let meta = gguf.metadata();
+    let arch = meta.get("general.architecture").and_then(|v| v.as_str());
+    let lookup = |suffix: &str| metadata_lookup(meta, arch, suffix);
+
+    let num_layers = if num_layers_hint > 0 {
+        num_layers_hint
+    } else {
+        lookup("block_count")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GGUF missing `block_count`; pass --num-layers explicitly",
+                )
+            })? as usize
+    };
+    let num_experts = if num_experts_hint > 0 {
+        num_experts_hint
+    } else {
+        lookup("expert_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize
+    };
+    if num_experts == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GGUF has no `expert_count` and no --num-experts override",
+        ));
+    }
+    let d_model = lookup("embedding_length")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "GGUF missing embedding_length")
+        })? as usize;
+    let d_ff = lookup("expert_feed_forward_length")
+        .or_else(|| lookup("feed_forward_length"))
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GGUF missing feed_forward_length",
+            )
+        })? as usize;
+    let top_k = lookup("expert_used_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2) as usize;
+    let total_experts = num_experts.checked_mul(num_layers).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "num_experts * num_layers overflows usize: num_experts={num_experts}, num_layers={num_layers}"
+            ),
+        )
+    })?;
+
+    Ok(ConversionGeometry {
+        num_layers,
+        num_experts,
+        total_experts,
+        d_model,
+        d_ff,
+        top_k,
+    })
+}
+
+fn build_preflight_plan(
+    gguf: &dyn GgufSource,
+    num_layers_hint: usize,
+    num_experts_hint: usize,
+    opts: &ExtractOptions,
+) -> io::Result<ConversionPreflightPlan> {
+    let geometry = resolve_geometry(gguf, num_layers_hint, num_experts_hint)?;
+    let (expert_size, maximum_payload_bytes) = if opts.native_quant {
+        let scan = scan_expert_quant_layouts(
+            gguf,
+            geometry.num_layers,
+            geometry.num_experts,
+            geometry.d_model,
+            geometry.d_ff,
+        )?;
+        if !scan.rejection_reasons.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "native quantization cannot continue: {}",
+                    scan.rejection_reasons.join("; ")
+                ),
+            ));
+        }
+        match scan.into_plan(DEFAULT_BLOCK_ALIGN, opts.emit_uth)? {
+            NativeQuantPlan::Homogeneous { dtype } => {
+                let payload = align_up(
+                    expert_weight_bytes_for(geometry.d_model, geometry.d_ff, dtype),
+                    DEFAULT_BLOCK_ALIGN,
+                );
+                (
+                    payload
+                        + if opts.emit_uth {
+                            DEFAULT_BLOCK_ALIGN
+                        } else {
+                            0
+                        },
+                    payload,
+                )
+            }
+            NativeQuantPlan::Mixed {
+                expert_size,
+                payload_slot_size,
+                ..
+            } => (expert_size, payload_slot_size),
+        }
+    } else {
+        preflight_f32_expert_tensors(gguf, geometry)?;
+        let payload = align_up(
+            expert_weight_bytes_for(geometry.d_model, geometry.d_ff, WeightDtype::F32),
+            DEFAULT_BLOCK_ALIGN,
+        );
+        (
+            payload
+                + if opts.emit_uth {
+                    DEFAULT_BLOCK_ALIGN
+                } else {
+                    0
+                },
+            payload,
+        )
+    };
+
+    Ok(ConversionPreflightPlan {
+        architecture: gguf.architecture().unwrap_or("unknown").to_string(),
+        num_layers: geometry.num_layers,
+        num_experts: geometry.num_experts,
+        total_experts: geometry.total_experts,
+        d_model: geometry.d_model,
+        d_ff: geometry.d_ff,
+        top_k: geometry.top_k,
+        expert_size,
+        maximum_payload_bytes,
+    })
+}
+
+fn preflight_f32_expert_tensors(
+    gguf: &dyn GgufSource,
+    geometry: ConversionGeometry,
+) -> io::Result<()> {
+    let weights = geometry.d_model.checked_mul(geometry.d_ff).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "d_model * d_ff overflows usize")
+    })?;
+    for layer in 0..geometry.num_layers {
+        let interleaved_gate = format!("blk.{layer}.ffn_gate_exps.weight");
+        if gguf.has_tensor(&interleaved_gate) {
+            for name in [
+                interleaved_gate,
+                format!("blk.{layer}.ffn_up_exps.weight"),
+                format!("blk.{layer}.ffn_down_exps.weight"),
+            ] {
+                let info = gguf.tensor_info(&name).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("missing tensor {name}"))
+                })?;
+                if crate::gguf::ggml_to_weight_dtype(info.ggml_dtype).is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!(
+                            "tensor {name} uses unsupported GGML dtype {}",
+                            info.ggml_dtype
+                        ),
+                    ));
+                }
+                let expected = weights.checked_mul(geometry.num_experts).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "expert tensor shape overflow")
+                })?;
+                if info.elem_count() != expected as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "tensor {name} has {} elements, expected {expected}",
+                            info.elem_count()
+                        ),
+                    ));
+                }
+            }
+            continue;
+        }
+
+        if !gguf.has_tensor(&format!("blk.{layer}.ffn_gate.0.weight")) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("layer {layer} has no expert tensors"),
+            ));
+        }
+        for expert in 0..geometry.num_experts {
+            for name in [
+                format!("blk.{layer}.ffn_gate.{expert}.weight"),
+                format!("blk.{layer}.ffn_up.{expert}.weight"),
+                format!("blk.{layer}.ffn_down.{expert}.weight"),
+            ] {
+                let info = gguf.tensor_info(&name).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("missing tensor {name}"))
+                })?;
+                if crate::gguf::ggml_to_weight_dtype(info.ggml_dtype).is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!(
+                            "tensor {name} uses unsupported GGML dtype {}",
+                            info.ggml_dtype
+                        ),
+                    ));
+                }
+                if info.elem_count() != weights as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "tensor {name} has {} elements, expected {weights}",
+                            info.elem_count()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_final_output_available(out_dir: &Path) -> io::Result<()> {
+    match fs::metadata(out_dir) {
+        Ok(meta) if meta.is_dir() => {
+            if fs::read_dir(out_dir)?.next().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "output directory {} already exists and is not empty; remove it before conversion",
+                        out_dir.display()
+                    ),
+                ));
+            }
+            fs::remove_dir(out_dir)?;
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "output path {} exists and is not a directory",
+                    out_dir.display()
+                ),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+fn staging_dir_for(out_dir: &Path) -> io::Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = out_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = out_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gguf-output");
+    for _ in 0..1024 {
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "could not allocate a staging directory for {} after 1024 attempts",
+            out_dir.display()
+        ),
+    ))
+}
 
 /// Extract Mixtral expert + dense weights from `gguf` into `out_dir`.
 ///
@@ -147,12 +472,14 @@ pub struct ExtractOptions {
     /// ~672 MiB f32 down to ~96 MiB Q4_0 — half a GiB less per
     /// expert read off the SSD).
     ///
-    /// Layers / models that don't satisfy the alignment precondition
-    /// **fall back to F32 dequant** transparently and the converter
-    /// keeps making forward progress; the report's `expert_dtype`
-    /// records what was actually written so downstream tooling /
-    /// `metadata.json` always describe the on-disk reality.
+    /// Layers / models that don't satisfy the native quant preconditions
+    /// fail during preflight before any final output is published.
     pub native_quant: bool,
+
+    /// Convert only routed experts. Dense transformer tensors are
+    /// skipped deliberately, metadata records `experts_only`, and the
+    /// resulting dataset remains valid for expert-streaming runs.
+    pub experts_only: bool,
 }
 
 impl Default for ExtractOptions {
@@ -160,6 +487,7 @@ impl Default for ExtractOptions {
         Self {
             emit_uth: true,
             native_quant: false,
+            experts_only: false,
         }
     }
 }
@@ -172,6 +500,51 @@ impl Default for ExtractOptions {
 /// header resident and seeks tensor bodies on demand). For checkpoints
 /// ≥ ~10 GB the streaming reader is the right default.
 pub fn extract_experts_from_source(
+    gguf: &dyn GgufSource,
+    out_dir: &Path,
+    num_layers_hint: usize,
+    num_experts_hint: usize,
+    opts: ExtractOptions,
+) -> io::Result<ExtractionReport> {
+    let plan = build_preflight_plan(gguf, num_layers_hint, num_experts_hint, &opts)?;
+    info!(
+        architecture = %plan.architecture,
+        num_layers = plan.num_layers,
+        experts_per_layer = plan.num_experts,
+        total_experts = plan.total_experts,
+        d_model = plan.d_model,
+        d_ff = plan.d_ff,
+        top_k = plan.top_k,
+        expert_size = plan.expert_size,
+        maximum_payload_bytes = plan.maximum_payload_bytes,
+        native_quant = opts.native_quant,
+        experts_only = opts.experts_only,
+        "gguf-convert preflight complete"
+    );
+
+    ensure_final_output_available(out_dir)?;
+    let staging_dir = staging_dir_for(out_dir)?;
+    let result = (|| {
+        fs::create_dir(&staging_dir)?;
+        let report = extract_experts_from_source_inner(
+            gguf,
+            &staging_dir,
+            num_layers_hint,
+            num_experts_hint,
+            opts,
+        )?;
+        validate_data_dir(&staging_dir)?;
+        fs::rename(&staging_dir, out_dir)?;
+        Ok(report)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+    result
+}
+
+fn extract_experts_from_source_inner(
     gguf: &dyn GgufSource,
     out_dir: &Path,
     num_layers_hint: usize,
@@ -475,140 +848,147 @@ pub fn extract_experts_from_source(
         }
     }
 
-    // Dense weights. The engine's `RealModel::from_dir` uses its own
-    // file-name convention (`embed.bin`, `attn_<L>_q.bin`, …), so we
-    // write *both* the gist-mandated llama.cpp-style names and the
-    // engine's native names. The duplicate write is small relative to
-    // the expert files and means the converter satisfies both APIs.
-    let dense_specs: Vec<(&str, &[&str], Vec<u64>)> = vec![
-        // (gguf_name, [engine_aliases...], expected_shape_innermost_first)
-        (
-            "token_embd.weight",
-            &["embedding.bin", "embed.bin"],
-            vec![d_model as u64, 0],
-        ),
-        (
-            "output_norm.weight",
-            &["final_norm.bin", "final_rms.bin"],
-            vec![d_model as u64],
-        ),
-        ("output.weight", &["lm_head.bin"], vec![d_model as u64, 0]),
-    ];
-    for (gname, aliases, _) in &dense_specs {
-        if let Some(info) = gguf.tensor_info(gname).cloned() {
-            match dense_tensor_to_f32(gguf, &info) {
-                Ok(f32s) => {
-                    for alias in *aliases {
-                        let path = out_dir.join(alias);
-                        let bytes = f32_vec_to_le_bytes(&f32s);
-                        write_file(&path, &bytes)?;
-                        report.dense_written += 1;
-                        report.total_bytes += bytes.len() as u64;
-                    }
-                }
-                Err(e) => {
-                    warn!(name = gname, error = %e, "skipping dense tensor");
-                    report.skipped += 1;
-                }
-            }
-        } else {
-            report.skipped += 1;
-        }
-    }
-
-    // Per-layer dense tensors.
-    for layer in 0..num_layers {
-        let mut emit = |gname: String, aliases: Vec<String>| -> io::Result<()> {
-            if let Some(info) = gguf.tensor_info(&gname).cloned() {
+    if opts.experts_only {
+        info!(
+            num_layers,
+            "experts-only conversion selected; skipping dense tensor extraction"
+        );
+    } else {
+        // Dense weights. The engine's `RealModel::from_dir` uses its own
+        // file-name convention (`embed.bin`, `attn_<L>_q.bin`, …), so we
+        // write *both* the gist-mandated llama.cpp-style names and the
+        // engine's native names. The duplicate write is small relative to
+        // the expert files and means the converter satisfies both APIs.
+        let dense_specs: Vec<(&str, &[&str], Vec<u64>)> = vec![
+            // (gguf_name, [engine_aliases...], expected_shape_innermost_first)
+            (
+                "token_embd.weight",
+                &["embedding.bin", "embed.bin"],
+                vec![d_model as u64, 0],
+            ),
+            (
+                "output_norm.weight",
+                &["final_norm.bin", "final_rms.bin"],
+                vec![d_model as u64],
+            ),
+            ("output.weight", &["lm_head.bin"], vec![d_model as u64, 0]),
+        ];
+        for (gname, aliases, _) in &dense_specs {
+            if let Some(info) = gguf.tensor_info(gname).cloned() {
                 match dense_tensor_to_f32(gguf, &info) {
                     Ok(f32s) => {
-                        let bytes = f32_vec_to_le_bytes(&f32s);
-                        for alias in &aliases {
+                        for alias in *aliases {
                             let path = out_dir.join(alias);
+                            let bytes = f32_vec_to_le_bytes(&f32s);
                             write_file(&path, &bytes)?;
                             report.dense_written += 1;
                             report.total_bytes += bytes.len() as u64;
                         }
                     }
                     Err(e) => {
-                        warn!(name = gname, error = %e, "skipping per-layer dense tensor");
+                        warn!(name = gname, error = %e, "skipping dense tensor");
                         report.skipped += 1;
                     }
                 }
             } else {
                 report.skipped += 1;
             }
-            Ok(())
-        };
-        emit(
-            format!("blk.{layer}.attn_q.weight"),
-            vec![
-                format!("layer_{layer}_q.bin"),
-                format!("attn_{layer}_q.bin"),
-            ],
-        )?;
-        emit(
-            format!("blk.{layer}.attn_k.weight"),
-            vec![
-                format!("layer_{layer}_k.bin"),
-                format!("attn_{layer}_k.bin"),
-            ],
-        )?;
-        emit(
-            format!("blk.{layer}.attn_v.weight"),
-            vec![
-                format!("layer_{layer}_v.bin"),
-                format!("attn_{layer}_v.bin"),
-            ],
-        )?;
-        emit(
-            format!("blk.{layer}.attn_output.weight"),
-            vec![
-                format!("layer_{layer}_o.bin"),
-                format!("attn_{layer}_o.bin"),
-            ],
-        )?;
-        emit(
-            format!("blk.{layer}.attn_norm.weight"),
-            vec![
-                format!("layer_{layer}_attn_norm.bin"),
-                format!("rms_attn_{layer}.bin"),
-            ],
-        )?;
-        emit(
-            format!("blk.{layer}.ffn_norm.weight"),
-            vec![
-                format!("layer_{layer}_ffn_norm.bin"),
-                format!("rms_moe_{layer}.bin"),
-            ],
-        )?;
-        emit(
-            format!("blk.{layer}.ffn_gate_inp.weight"),
-            vec![format!("gate_{layer}.bin")],
-        )?;
-        // Qwen2-MoE-style "shared experts" — dense FFN tensors applied to
-        // *every* token in addition to the routed experts. They are stored
-        // under the `_shexp` suffix and were previously dropped, leaving the
-        // converted engine missing weights. Emit them as dense `.bin` files
-        // (both the gguf-style name and an engine-friendly alias). Files are
-        // only written when the tensor exists, so non-MoE / no-shared-expert
-        // architectures (e.g. Mixtral) are unaffected.
-        emit(
-            format!("blk.{layer}.ffn_gate_shexp.weight"),
-            vec![format!("layer_{layer}_shexp_gate.bin")],
-        )?;
-        emit(
-            format!("blk.{layer}.ffn_up_shexp.weight"),
-            vec![format!("layer_{layer}_shexp_up.bin")],
-        )?;
-        emit(
-            format!("blk.{layer}.ffn_down_shexp.weight"),
-            vec![format!("layer_{layer}_shexp_down.bin")],
-        )?;
-        emit(
-            format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
-            vec![format!("layer_{layer}_shexp_gate_inp.bin")],
-        )?;
+        }
+
+        // Per-layer dense tensors.
+        for layer in 0..num_layers {
+            let mut emit = |gname: String, aliases: Vec<String>| -> io::Result<()> {
+                if let Some(info) = gguf.tensor_info(&gname).cloned() {
+                    match dense_tensor_to_f32(gguf, &info) {
+                        Ok(f32s) => {
+                            let bytes = f32_vec_to_le_bytes(&f32s);
+                            for alias in &aliases {
+                                let path = out_dir.join(alias);
+                                write_file(&path, &bytes)?;
+                                report.dense_written += 1;
+                                report.total_bytes += bytes.len() as u64;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(name = gname, error = %e, "skipping per-layer dense tensor");
+                            report.skipped += 1;
+                        }
+                    }
+                } else {
+                    report.skipped += 1;
+                }
+                Ok(())
+            };
+            emit(
+                format!("blk.{layer}.attn_q.weight"),
+                vec![
+                    format!("layer_{layer}_q.bin"),
+                    format!("attn_{layer}_q.bin"),
+                ],
+            )?;
+            emit(
+                format!("blk.{layer}.attn_k.weight"),
+                vec![
+                    format!("layer_{layer}_k.bin"),
+                    format!("attn_{layer}_k.bin"),
+                ],
+            )?;
+            emit(
+                format!("blk.{layer}.attn_v.weight"),
+                vec![
+                    format!("layer_{layer}_v.bin"),
+                    format!("attn_{layer}_v.bin"),
+                ],
+            )?;
+            emit(
+                format!("blk.{layer}.attn_output.weight"),
+                vec![
+                    format!("layer_{layer}_o.bin"),
+                    format!("attn_{layer}_o.bin"),
+                ],
+            )?;
+            emit(
+                format!("blk.{layer}.attn_norm.weight"),
+                vec![
+                    format!("layer_{layer}_attn_norm.bin"),
+                    format!("rms_attn_{layer}.bin"),
+                ],
+            )?;
+            emit(
+                format!("blk.{layer}.ffn_norm.weight"),
+                vec![
+                    format!("layer_{layer}_ffn_norm.bin"),
+                    format!("rms_moe_{layer}.bin"),
+                ],
+            )?;
+            emit(
+                format!("blk.{layer}.ffn_gate_inp.weight"),
+                vec![format!("gate_{layer}.bin")],
+            )?;
+            // Qwen2-MoE-style "shared experts" — dense FFN tensors applied to
+            // *every* token in addition to the routed experts. They are stored
+            // under the `_shexp` suffix and were previously dropped, leaving the
+            // converted engine missing weights. Emit them as dense `.bin` files
+            // (both the gguf-style name and an engine-friendly alias). Files are
+            // only written when the tensor exists, so non-MoE / no-shared-expert
+            // architectures (e.g. Mixtral) are unaffected.
+            emit(
+                format!("blk.{layer}.ffn_gate_shexp.weight"),
+                vec![format!("layer_{layer}_shexp_gate.bin")],
+            )?;
+            emit(
+                format!("blk.{layer}.ffn_up_shexp.weight"),
+                vec![format!("layer_{layer}_shexp_up.bin")],
+            )?;
+            emit(
+                format!("blk.{layer}.ffn_down_shexp.weight"),
+                vec![format!("layer_{layer}_shexp_down.bin")],
+            )?;
+            emit(
+                format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+                vec![format!("layer_{layer}_shexp_gate_inp.bin")],
+            )?;
+        }
     }
 
     // metadata.json
@@ -618,13 +998,21 @@ pub fn extract_experts_from_source(
         .and_then(|v| v.as_str())
         .unwrap_or("gguf-extracted");
     let meta = ExtractedMetadata {
+        format_version: 2,
+        conversion_mode: if opts.experts_only {
+            "experts_only"
+        } else {
+            "full"
+        },
         model: model_name,
+        architecture: arch.unwrap_or("unknown"),
         layer: if num_layers == 1 { 0 } else { -1 },
         num_experts: total_experts,
         top_k,
         d_model,
         d_ff,
         expert_size,
+        maximum_payload_bytes: payload_size,
         block_align: DEFAULT_BLOCK_ALIGN,
         dtype: expert_dtype.as_str(),
         weight_layout: "gate_proj || up_proj || down_proj (row-major)",
@@ -636,6 +1024,8 @@ pub fn extract_experts_from_source(
         projection_dtype_histogram: native_plan
             .as_ref()
             .and_then(NativeQuantPlan::metadata_histogram),
+        experts_written: report.experts_written,
+        dense_tensors_written: report.dense_written,
     };
     let meta_path = out_dir.join("metadata.json");
     let mut f = fs::File::create(&meta_path)?;
@@ -659,6 +1049,199 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, bytes)
+}
+
+#[derive(Debug, Clone)]
+pub struct DataValidationReport {
+    pub num_experts: usize,
+    pub expert_size: usize,
+    pub block_align: usize,
+    pub dtype: WeightDtype,
+    pub mixed_experts: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ValidationMetadata {
+    num_experts: usize,
+    d_model: usize,
+    d_ff: usize,
+    expert_size: usize,
+    #[serde(default = "default_validation_block_align")]
+    block_align: usize,
+    dtype: String,
+    #[serde(default)]
+    expert_layout_version: Option<u32>,
+    #[serde(default)]
+    projection_dtype_histogram: Option<BTreeMap<String, usize>>,
+    #[serde(default)]
+    experts_written: Option<usize>,
+}
+
+fn default_validation_block_align() -> usize {
+    DEFAULT_BLOCK_ALIGN
+}
+
+pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
+    let meta_path = data_dir.join("metadata.json");
+    let body = fs::read_to_string(&meta_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("failed to read metadata {}: {e}", meta_path.display()),
+        )
+    })?;
+    let meta: ValidationMetadata = serde_json::from_str(&body).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("metadata {} is invalid JSON: {e}", meta_path.display()),
+        )
+    })?;
+    let dtype = WeightDtype::from_str_opt(&meta.dtype).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("metadata dtype {:?} is not supported", meta.dtype),
+        )
+    })?;
+    if meta.block_align == 0 || !meta.block_align.is_power_of_two() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("metadata block_align {} is invalid", meta.block_align),
+        ));
+    }
+    if meta.expert_size == 0 || meta.expert_size % meta.block_align != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "metadata expert_size {} is not aligned to block_align {}",
+                meta.expert_size, meta.block_align
+            ),
+        ));
+    }
+    if let Some(written) = meta.experts_written {
+        if written != meta.num_experts {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "metadata experts_written {written} does not match num_experts {}",
+                    meta.num_experts
+                ),
+            ));
+        }
+    }
+    if dtype == WeightDtype::Mixed && meta.expert_layout_version != Some(2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata dtype=mixed requires expert_layout_version=2",
+        ));
+    }
+
+    let mut observed_mixed = 0usize;
+    let mut observed_hist = BTreeMap::<String, usize>::new();
+    for id in 0..meta.num_experts {
+        let path = data_dir.join(format!("expert_{id}.bin"));
+        let stat = fs::metadata(&path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "expert file {} is missing or unreadable: {e}",
+                    path.display()
+                ),
+            )
+        })?;
+        if stat.len() != meta.expert_size as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expert file {} has {} bytes, expected {}",
+                    path.display(),
+                    stat.len(),
+                    meta.expert_size
+                ),
+            ));
+        }
+        let head_len = meta.block_align.min(meta.expert_size);
+        let mut head = vec![0u8; head_len];
+        let mut file = fs::File::open(&path)?;
+        use std::io::Read;
+        file.read_exact(&mut head)?;
+
+        if dtype == WeightDtype::Mixed {
+            let header = MixedExpertHeader::probe(&head).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "expert file {} is mixed but has no valid UTH2 header",
+                        path.display()
+                    ),
+                )
+            })?;
+            if header.d_model as usize != meta.d_model || header.d_ff as usize != meta.d_ff {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "expert file {} UTH2 shape d_model={} d_ff={} disagrees with metadata d_model={} d_ff={}",
+                        path.display(),
+                        header.d_model,
+                        header.d_ff,
+                        meta.d_model,
+                        meta.d_ff
+                    ),
+                ));
+            }
+            let payload_len = meta
+                .expert_size
+                .checked_sub(meta.block_align)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expert payload length underflow",
+                    )
+                })?;
+            header
+                .validate(payload_len as u64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let key = format!(
+                "{}/{}/{}",
+                dtype_label(header.gate.dtype.to_weight()).to_ascii_lowercase(),
+                dtype_label(header.up.dtype.to_weight()).to_ascii_lowercase(),
+                dtype_label(header.down.dtype.to_weight()).to_ascii_lowercase()
+            );
+            *observed_hist.entry(key).or_default() += 1;
+            observed_mixed += 1;
+        } else if let Some(header) = TensorHeader::probe(&head) {
+            let header_dtype = header.dtype.to_weight();
+            if header_dtype != dtype {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "expert file {} UTH dtype {} disagrees with metadata dtype {}",
+                        path.display(),
+                        header_dtype.as_str(),
+                        dtype.as_str()
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(expected_hist) = meta.projection_dtype_histogram {
+        if dtype == WeightDtype::Mixed && expected_hist != observed_hist {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "mixed projection histogram mismatch: metadata {:?}, observed {:?}",
+                    expected_hist, observed_hist
+                ),
+            ));
+        }
+    }
+
+    Ok(DataValidationReport {
+        num_experts: meta.num_experts,
+        expert_size: meta.expert_size,
+        block_align: meta.block_align,
+        dtype,
+        mixed_experts: observed_mixed,
+    })
 }
 
 fn f32_vec_to_le_bytes(v: &[f32]) -> Vec<u8> {
@@ -785,15 +1368,9 @@ fn bytes_to_f32(data: &[u8], dtype: u32, elems: usize, name: &str) -> io::Result
 /// (`O(1)` full-tensor decodes instead of `O(num_experts)`) and slices
 /// each expert's stride from the cached f32 buffer.
 ///
-/// Fallbacks mirror `load_expert_matrices`:
-/// * If a layer has neither interleaved nor per-expert tensors,
-///   `num_experts` deterministic-zero triples are produced (the engine
-///   reseeds these at runtime).
-/// * If a tensor uses a dtype `bytes_to_f32` doesn't understand yet
-///   (e.g. some Q6_K/Q8_0 variants), the whole layer falls back to
-///   zero blobs — matching the documented "recognised for sizing only"
-///   behaviour. The convert never aborts on a single unsupported
-///   layer.
+/// Required expert tensors are fail-closed: missing, malformed, or
+/// unsupported expert weights abort conversion instead of writing
+/// placeholder zero blobs.
 fn load_layer_expert_matrices(
     gguf: &dyn GgufSource,
     layer: usize,
@@ -806,19 +1383,6 @@ fn load_layer_expert_matrices(
     let interleaved_down_name = format!("blk.{layer}.ffn_down_exps.weight");
     let per_expert_gate0 = format!("blk.{layer}.ffn_gate.0.weight");
 
-    let zero_layer = |reason: &str| {
-        warn!(layer, reason, "emitting zero blob for layer experts");
-        (0..num_experts)
-            .map(|_| {
-                (
-                    vec![0.0f32; d_ff * d_model],
-                    vec![0.0f32; d_ff * d_model],
-                    vec![0.0f32; d_model * d_ff],
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-
     if gguf.has_tensor(&interleaved_gate_name) {
         // Decode each interleaved tensor exactly once and reuse it for
         // all experts in the layer.
@@ -828,9 +1392,6 @@ fn load_layer_expert_matrices(
             num_experts * d_ff * d_model,
         ) {
             Ok(v) => v,
-            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-                return Ok(zero_layer("unsupported dtype in interleaved gate tensor"));
-            }
             Err(err) => return Err(err),
         };
         let up_all = match dense_layer_tensor_f32(
@@ -839,9 +1400,6 @@ fn load_layer_expert_matrices(
             num_experts * d_ff * d_model,
         ) {
             Ok(v) => v,
-            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-                return Ok(zero_layer("unsupported dtype in interleaved up tensor"));
-            }
             Err(err) => return Err(err),
         };
         let down_all = match dense_layer_tensor_f32(
@@ -850,9 +1408,6 @@ fn load_layer_expert_matrices(
             num_experts * d_model * d_ff,
         ) {
             Ok(v) => v,
-            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-                return Ok(zero_layer("unsupported dtype in interleaved down tensor"));
-            }
             Err(err) => return Err(err),
         };
 
@@ -872,34 +1427,24 @@ fn load_layer_expert_matrices(
         Ok(out)
     } else if gguf.has_tensor(&per_expert_gate0) {
         // Per-expert tensors: each expert's tensors are already
-        // separate, so a layer-level cache buys nothing — just dispatch
-        // to `load_expert_matrices`, catching Unsupported per expert.
+        // separate, so a layer-level cache buys nothing.
         let mut out = Vec::with_capacity(num_experts);
         for e in 0..num_experts {
-            match load_expert_matrices(gguf, layer, e, num_experts, d_model, d_ff) {
-                Ok(triple) => out.push(triple),
-                Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-                    warn!(
-                        layer,
-                        expert = e,
-                        "unsupported dtype in per-expert tensor; emitting zero blob"
-                    );
-                    out.push((
-                        vec![0.0f32; d_ff * d_model],
-                        vec![0.0f32; d_ff * d_model],
-                        vec![0.0f32; d_model * d_ff],
-                    ));
-                }
-                Err(err) => return Err(err),
-            }
+            out.push(load_expert_matrices(
+                gguf,
+                layer,
+                e,
+                num_experts,
+                d_model,
+                d_ff,
+            )?);
         }
         Ok(out)
     } else {
-        warn!(
-            layer,
-            "no expert weight tensor found in GGUF; emitting zero blobs"
-        );
-        Ok(zero_layer("no expert weight tensor"))
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("layer {layer} has no expert weight tensors"),
+        ))
     }
 }
 
@@ -990,18 +1535,9 @@ fn load_expert_matrices(
         )?;
         Ok((gate, up, down))
     } else {
-        // No expert tensors present — fall back to deterministic-zero
-        // matrices so the rest of the pipeline produces a syntactically
-        // valid expert file (the engine will fall back to seeded init
-        // at run time anyway when the file is shaped right but zeroed).
-        warn!(
-            layer,
-            expert, "no expert weight tensor found in GGUF; emitting zero blob"
-        );
-        Ok((
-            vec![0.0; d_ff * d_model],
-            vec![0.0; d_ff * d_model],
-            vec![0.0; d_model * d_ff],
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("layer {layer} expert {expert} has no expert weight tensors"),
         ))
     }
 }
@@ -1914,6 +2450,7 @@ mod tests {
             ExtractOptions {
                 emit_uth: false,
                 native_quant: false,
+                experts_only: false,
             },
         )
         .expect("extract no-uth");
@@ -1930,6 +2467,66 @@ mod tests {
             assert_eq!(payload.len(), buf.len());
         }
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_data_dir_rejects_corrupt_expert_file() {
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let num_experts = 2usize;
+        let bytes = build_synth_gguf(d_model, d_ff, num_experts);
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+
+        let out = tmp.join("validate-corrupt");
+        extract_experts_from_source(&gguf, &out, 1, num_experts, ExtractOptions::default())
+            .expect("extract");
+        fs::write(out.join("expert_0.bin"), vec![0u8; 32]).unwrap();
+
+        let err = validate_data_dir(&out).expect_err("corrupt expert must fail validation");
+        assert!(
+            err.to_string().contains("has 32 bytes, expected"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn experts_only_conversion_skips_dense_outputs() {
+        let d_model = 4usize;
+        let d_ff = 8usize;
+        let num_experts = 2usize;
+        let bytes = build_synth_gguf(d_model, d_ff, num_experts);
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+
+        let out = tmp.join("experts-only");
+        let report = extract_experts_from_source(
+            &gguf,
+            &out,
+            1,
+            num_experts,
+            ExtractOptions {
+                emit_uth: true,
+                native_quant: false,
+                experts_only: true,
+            },
+        )
+        .expect("extract experts only");
+
+        assert_eq!(report.experts_written, num_experts);
+        assert_eq!(report.dense_written, 0);
+        assert!(!out.join("rms_attn_0.bin").exists());
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(meta["conversion_mode"], "experts_only");
+        assert_eq!(meta["dense_tensors_written"], 0);
+        validate_data_dir(&out).expect("experts-only output validates");
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -2149,6 +2746,7 @@ mod tests {
             ExtractOptions {
                 emit_uth: true,
                 native_quant: true,
+                experts_only: false,
             },
         )
         .expect_err("F32 native quant should fail closed");
@@ -2596,6 +3194,7 @@ mod tests {
             ExtractOptions {
                 emit_uth: true,
                 native_quant: true,
+                experts_only: false,
             },
         )
         .expect("extract");
@@ -2650,6 +3249,7 @@ mod tests {
             ExtractOptions {
                 emit_uth: true,
                 native_quant: true,
+                experts_only: false,
             },
         )
         .expect("extract mixed");
@@ -2688,6 +3288,33 @@ mod tests {
         .expect("runtime mixed decode");
         assert_eq!(weights.gate.len(), d_ff * d_model);
         assert_eq!(weights.down.len(), d_model * d_ff);
+
+        let pool = crate::buffer_pool::BufferPool::new(1, first.len(), DEFAULT_BLOCK_ALIGN);
+        let mut buf = pool.try_acquire().expect("pooled buffer");
+        buf.as_mut_slice()[..first.len()].copy_from_slice(&first);
+        let resident =
+            crate::expert_cache::ExpertResident::new_with_block_align(0, buf, DEFAULT_BLOCK_ALIGN);
+        let x: Vec<f32> = (0..d_model)
+            .map(|i| (i as f32 + 1.0) / d_model as f32)
+            .collect();
+        let expected = weights.forward(&x);
+        let before_mixed = crate::inference::mixed_expert_dispatches();
+        let before_fallback = crate::inference::mixed_dequant_fallbacks();
+        let (_out, actual) =
+            crate::inference::run_inference_mixed_quant(7, &resident, &x, d_model, d_ff)
+                .expect("direct mixed inference");
+        assert_eq!(
+            crate::inference::mixed_expert_dispatches(),
+            before_mixed + 1
+        );
+        assert_eq!(crate::inference::mixed_dequant_fallbacks(), before_fallback);
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-5,
+                "mixed direct output mismatch at {idx}: actual={a}, expected={b}"
+            );
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 }
