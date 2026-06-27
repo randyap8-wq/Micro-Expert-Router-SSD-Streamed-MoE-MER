@@ -1107,6 +1107,12 @@ impl ProjectionQuantLayout {
         }
     }
 
+    fn all_projections_block_aligned(self) -> bool {
+        [self.gate, self.up, self.down]
+            .into_iter()
+            .all(|spec| spec.weights % spec.block_elems == 0)
+    }
+
     fn triple_key(self) -> String {
         format!(
             "{}/{}/{}",
@@ -1223,6 +1229,10 @@ impl ExpertQuantScan {
                 .layouts
                 .iter()
                 .all(|layout| layout.uniform_dtype() == Some(dtype))
+                && self
+                    .layouts
+                    .iter()
+                    .all(|layout| layout.all_projections_block_aligned())
             {
                 return Ok(NativeQuantPlan::Homogeneous { dtype });
             }
@@ -2241,6 +2251,58 @@ mod tests {
         // (32 % 256 != 0); the converter must fall back to F32.
         let q4k_block_elems = 256usize;
         assert_ne!(per_expert_weights % q4k_block_elems, 0);
+    }
+
+    #[test]
+    fn uniform_tail_block_layout_uses_uth2_plan() {
+        let weights = Q5K_BLOCK_ELEMS + 1;
+        let payload_bytes =
+            projection_weight_bytes_for(weights, WeightDtype::Q5K).expect("Q5_K sizing");
+        let spec = ProjectionQuantSpec {
+            dtype: WeightDtype::Q5K,
+            block_elems: Q5K_BLOCK_ELEMS,
+            block_bytes: Q5K_BLOCK_BYTES,
+            weights,
+            payload_bytes,
+        };
+        let layout = ProjectionQuantLayout {
+            gate: spec,
+            up: spec,
+            down: spec,
+        };
+        assert_eq!(payload_bytes, Q5K_BLOCK_BYTES * 2);
+        assert!(!layout.all_projections_block_aligned());
+
+        let mut scan = ExpertQuantScan::new();
+        scan.layouts.push(layout);
+        match scan
+            .into_plan(DEFAULT_BLOCK_ALIGN, true)
+            .expect("UTH2 plan")
+        {
+            NativeQuantPlan::Mixed {
+                payload_slot_size,
+                expert_size,
+                layouts,
+                histogram,
+            } => {
+                let payload = layout.payload_bytes().expect("layout payload");
+                assert_eq!(layouts, vec![layout]);
+                assert_eq!(payload_slot_size, align_up(payload, DEFAULT_BLOCK_ALIGN));
+                assert_eq!(expert_size, payload_slot_size + DEFAULT_BLOCK_ALIGN);
+                assert_eq!(histogram.get("q5_k/q5_k/q5_k"), Some(&1));
+            }
+            other => panic!("tail-block per-expert layout must use UTH2, got {other:?}"),
+        }
+
+        let mut no_uth_scan = ExpertQuantScan::new();
+        no_uth_scan.layouts.push(layout);
+        let err = no_uth_scan
+            .into_plan(DEFAULT_BLOCK_ALIGN, false)
+            .expect_err("tail-block layout needs UTH2");
+        assert!(
+            err.to_string().contains("requires UTH2"),
+            "unexpected error: {err}"
+        );
     }
 
     fn lstring(s: &[u8]) -> Vec<u8> {
