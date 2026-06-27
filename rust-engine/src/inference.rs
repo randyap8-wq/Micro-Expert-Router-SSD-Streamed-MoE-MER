@@ -154,7 +154,14 @@ pub enum WeightDtype {
     /// in a given RAM budget versus `F16`. See [`Q4K_BLOCK_BYTES`] /
     /// [`Q4K_BLOCK_ELEMS`] for the layout constants and
     /// [`dequantize_q4k_block`] for the inverse kernel.
-    #[serde(alias = "Q4K", alias = "Q4_K", alias = "Q4_K_M", alias = "q4_k", alias = "q4_k_m", alias = "q4km")]
+    #[serde(
+        alias = "Q4K",
+        alias = "Q4_K",
+        alias = "Q4_K_M",
+        alias = "q4_k",
+        alias = "q4_k_m",
+        alias = "q4km"
+    )]
     Q4K,
     /// **GGUF-style Q4_0 block quantisation.** Each 32-weight block
     /// occupies 18 bytes: an `f16` block scale `d` followed by 16
@@ -187,6 +194,17 @@ pub enum WeightDtype {
     /// kernel.
     #[serde(alias = "Q8_0", alias = "q80", alias = "q8_0_gguf")]
     Q8_0,
+    /// **GGUF-style Q5_K block quantisation.** Each 256-weight block
+    /// occupies 176 bytes. MER supports this as a native expert
+    /// projection dtype, primarily for mixed GGUF MoE experts whose
+    /// gate/up/down projections do not share one quant format.
+    #[serde(alias = "Q5K", alias = "Q5_K", alias = "q5_k")]
+    Q5K,
+    /// **GGUF-style Q6_K block quantisation.** Each 256-weight block
+    /// occupies 210 bytes. Like [`Self::Q5K`], this is supported for
+    /// native mixed expert projections and homogeneous expert blobs.
+    #[serde(alias = "Q6K", alias = "Q6_K", alias = "q6_k")]
+    Q6K,
     /// Little-endian IEEE-754 `bfloat16` (`half::bf16`), 2 bytes per
     /// weight, no header. Decodes to f32 exactly like [`Self::F16`] but
     /// via `half::bf16::from_le_bytes`. BF16 is the native dense-body
@@ -208,6 +226,11 @@ pub enum WeightDtype {
     /// [`crate::dequant::dequant_mxfp4`].
     #[serde(alias = "MXFP4", alias = "mxfp4", alias = "mx_fp4")]
     MXFP4,
+    /// Versioned mixed-projection expert storage. This is a runtime
+    /// dispatch label used with UTH2 headers; each projection's real
+    /// dtype and byte range is recorded independently in the header.
+    #[serde(alias = "MIXED", alias = "mixed")]
+    Mixed,
 }
 
 impl WeightDtype {
@@ -232,11 +255,14 @@ impl WeightDtype {
             WeightDtype::Q4_0 => 1,
             // 34 / 32 rounded up = 2; not used for sizing — see docs.
             WeightDtype::Q8_0 => 2,
+            // K-quants are sized exactly by `expert_weight_bytes_for`.
+            WeightDtype::Q5K | WeightDtype::Q6K => 1,
             WeightDtype::BF16 => 2,
             // ~4.25 bits/weight; sizing is done exactly via
             // [`expert_weight_bytes_for`] — this rounded value is only a
             // placeholder for callers that ignore the block layout.
             WeightDtype::MXFP4 => 1,
+            WeightDtype::Mixed => 0,
         }
     }
 
@@ -254,8 +280,11 @@ impl WeightDtype {
             | WeightDtype::Q4K
             | WeightDtype::Q4_0
             | WeightDtype::Q8_0
+            | WeightDtype::Q5K
+            | WeightDtype::Q6K
             | WeightDtype::BF16
-            | WeightDtype::MXFP4 => 0,
+            | WeightDtype::MXFP4
+            | WeightDtype::Mixed => 0,
             WeightDtype::Int8 => INT8_HEADER_BYTES,
         }
     }
@@ -269,8 +298,11 @@ impl WeightDtype {
             "q4k" | "q4_k" | "q4_k_m" | "q4km" => Some(WeightDtype::Q4K),
             "q4_0" | "q40" | "q4" => Some(WeightDtype::Q4_0),
             "q8_0" | "q80" => Some(WeightDtype::Q8_0),
+            "q5k" | "q5_k" => Some(WeightDtype::Q5K),
+            "q6k" | "q6_k" => Some(WeightDtype::Q6K),
             "bf16" | "bfloat16" => Some(WeightDtype::BF16),
             "mxfp4" | "mx_fp4" => Some(WeightDtype::MXFP4),
+            "mixed" => Some(WeightDtype::Mixed),
             _ => None,
         }
     }
@@ -284,8 +316,11 @@ impl WeightDtype {
             WeightDtype::Q4K => "q4k",
             WeightDtype::Q4_0 => "q4_0",
             WeightDtype::Q8_0 => "q8_0",
+            WeightDtype::Q5K => "q5k",
+            WeightDtype::Q6K => "q6k",
             WeightDtype::BF16 => "bf16",
             WeightDtype::MXFP4 => "mxfp4",
+            WeightDtype::Mixed => "mixed",
         }
     }
 }
@@ -312,7 +347,11 @@ impl Int8ExpertMeta {
         let g = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let u = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let d = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        Some(Self { gate_scale: g, up_scale: u, down_scale: d })
+        Some(Self {
+            gate_scale: g,
+            up_scale: u,
+            down_scale: d,
+        })
     }
 
     /// Serialise the header to its on-disk byte layout.
@@ -517,6 +556,147 @@ pub fn dequantize_q4k_to_f32(src: &[u8], n_weights: usize, dst: &mut Vec<f32>) {
         dequantize_q4k_block(s, d);
     }
     // Truncate any padding at the tail (for n_weights not divisible by 256).
+    dst.truncate(n_weights);
+}
+
+// ---------------------------------------------------------------------
+// Q5_K / Q6_K (GGUF K-quants).
+// ---------------------------------------------------------------------
+
+/// Number of weights per Q5_K/Q6_K super-block.
+pub const Q5K_BLOCK_ELEMS: usize = 256;
+pub const Q6K_BLOCK_ELEMS: usize = 256;
+/// Bytes per Q5_K super-block on disk.
+///
+/// Upstream layout: `d: f16`, `dmin: f16`, `scales[12]`, `qh[32]`,
+/// `qs[128]` for 176 bytes total. Ported from GGML/Candle
+/// `BlockQ5K` (`candle-core/src/quantized/k_quants.rs`, which cites
+/// llama.cpp `k_quants.c`).
+pub const Q5K_BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
+/// Bytes per Q6_K super-block on disk.
+///
+/// Upstream layout: `ql[128]`, `qh[64]`, signed `scales[16]`, `d: f16`
+/// for 210 bytes total. Ported from GGML/Candle `BlockQ6K`.
+pub const Q6K_BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
+
+/// Dequantise one Q5_K super-block into `dst`.
+pub fn dequantize_q5k_block(src: &[u8], dst: &mut [f32]) {
+    assert_eq!(
+        src.len(),
+        Q5K_BLOCK_BYTES,
+        "Q5_K block must be {Q5K_BLOCK_BYTES} bytes"
+    );
+    assert_eq!(
+        dst.len(),
+        Q5K_BLOCK_ELEMS,
+        "Q5_K dst must hold {Q5K_BLOCK_ELEMS} floats"
+    );
+
+    let d = half::f16::from_bits(u16::from_le_bytes([src[0], src[1]])).to_f32();
+    let dmin = half::f16::from_bits(u16::from_le_bytes([src[2], src[3]])).to_f32();
+    let scales: [u8; 12] = src[4..16].try_into().expect("12-byte slice");
+    let pairs = q4k_unpack_scales(&scales);
+    let qh = &src[16..48];
+    let qs = &src[48..176];
+
+    let mut is = 0usize;
+    let mut hi_low_mask = 1u8;
+    let mut hi_high_mask = 2u8;
+    let mut out = 0usize;
+    for j in (0..Q5K_BLOCK_ELEMS).step_by(64) {
+        let q = &qs[j / 2..j / 2 + 32];
+        let (sc1, min1) = pairs[is];
+        let (sc2, min2) = pairs[is + 1];
+        let d1 = d * sc1 as f32;
+        let m1 = dmin * min1 as f32;
+        let d2 = d * sc2 as f32;
+        let m2 = dmin * min2 as f32;
+        for (&ql, &qh) in q.iter().zip(qh.iter()) {
+            let hi = if qh & hi_low_mask != 0 { 16.0 } else { 0.0 };
+            dst[out] = d1 * ((ql & 0x0F) as f32 + hi) - m1;
+            out += 1;
+        }
+        for (&ql, &qh) in q.iter().zip(qh.iter()) {
+            let hi = if qh & hi_high_mask != 0 { 16.0 } else { 0.0 };
+            dst[out] = d2 * ((ql >> 4) as f32 + hi) - m2;
+            out += 1;
+        }
+        is += 2;
+        hi_low_mask <<= 2;
+        hi_high_mask <<= 2;
+    }
+}
+
+/// Dequantise a contiguous Q5_K stream of `n_weights` weights.
+pub fn dequantize_q5k_to_f32(src: &[u8], n_weights: usize, dst: &mut Vec<f32>) {
+    let blocks = n_weights.div_ceil(Q5K_BLOCK_ELEMS);
+    assert!(
+        src.len() >= blocks * Q5K_BLOCK_BYTES,
+        "Q5_K source has {} bytes, need {} for {n_weights} weights",
+        src.len(),
+        blocks * Q5K_BLOCK_BYTES
+    );
+    dst.clear();
+    dst.resize(blocks * Q5K_BLOCK_ELEMS, 0.0);
+    for b in 0..blocks {
+        let s = &src[b * Q5K_BLOCK_BYTES..(b + 1) * Q5K_BLOCK_BYTES];
+        let d = &mut dst[b * Q5K_BLOCK_ELEMS..(b + 1) * Q5K_BLOCK_ELEMS];
+        dequantize_q5k_block(s, d);
+    }
+    dst.truncate(n_weights);
+}
+
+/// Dequantise one Q6_K super-block into `dst`.
+pub fn dequantize_q6k_block(src: &[u8], dst: &mut [f32]) {
+    assert_eq!(
+        src.len(),
+        Q6K_BLOCK_BYTES,
+        "Q6_K block must be {Q6K_BLOCK_BYTES} bytes"
+    );
+    assert_eq!(
+        dst.len(),
+        Q6K_BLOCK_ELEMS,
+        "Q6_K dst must hold {Q6K_BLOCK_ELEMS} floats"
+    );
+
+    let ql = &src[0..128];
+    let qh = &src[128..192];
+    let scales = &src[192..208];
+    let d = half::f16::from_bits(u16::from_le_bytes([src[208], src[209]])).to_f32();
+
+    for ip in 0..2 {
+        for il in 0..32 {
+            let is = 8 * ip + il / 16;
+            let out = 128 * ip + il;
+            let ql_base = 64 * ip + il;
+            let qh_byte = qh[32 * ip + il];
+            let sc = |idx: usize| -> f32 { scales[idx] as i8 as f32 };
+            let q =
+                |low: u8, high_bits: u8| -> f32 { (((low | (high_bits << 4)) as i32) - 32) as f32 };
+            dst[out] = d * sc(is) * q(ql[ql_base] & 0x0F, qh_byte & 0x03);
+            dst[out + 32] = d * sc(is + 2) * q(ql[ql_base + 32] & 0x0F, (qh_byte >> 2) & 0x03);
+            dst[out + 64] = d * sc(is + 4) * q(ql[ql_base] >> 4, (qh_byte >> 4) & 0x03);
+            dst[out + 96] = d * sc(is + 6) * q(ql[ql_base + 32] >> 4, (qh_byte >> 6) & 0x03);
+        }
+    }
+}
+
+/// Dequantise a contiguous Q6_K stream of `n_weights` weights.
+pub fn dequantize_q6k_to_f32(src: &[u8], n_weights: usize, dst: &mut Vec<f32>) {
+    let blocks = n_weights.div_ceil(Q6K_BLOCK_ELEMS);
+    assert!(
+        src.len() >= blocks * Q6K_BLOCK_BYTES,
+        "Q6_K source has {} bytes, need {} for {n_weights} weights",
+        src.len(),
+        blocks * Q6K_BLOCK_BYTES
+    );
+    dst.clear();
+    dst.resize(blocks * Q6K_BLOCK_ELEMS, 0.0);
+    for b in 0..blocks {
+        let s = &src[b * Q6K_BLOCK_BYTES..(b + 1) * Q6K_BLOCK_BYTES];
+        let d = &mut dst[b * Q6K_BLOCK_ELEMS..(b + 1) * Q6K_BLOCK_ELEMS];
+        dequantize_q6k_block(s, d);
+    }
     dst.truncate(n_weights);
 }
 
@@ -844,6 +1024,34 @@ pub const fn mxfp4_projection_bytes(rows: usize, cols: usize) -> usize {
     weight_bytes.saturating_add(scale_bytes)
 }
 
+/// Exact byte count for one projection with `weights` logical weights
+/// in a native expert-storage dtype. Returns `None` for dtypes that do
+/// not have an independent projection byte stream (notably `Mixed`,
+/// which is a header-level dispatch label).
+pub fn projection_weight_bytes_for(weights: usize, dtype: WeightDtype) -> Option<usize> {
+    Some(match dtype {
+        WeightDtype::F32 => weights.checked_mul(4)?,
+        WeightDtype::F16 | WeightDtype::BF16 => weights.checked_mul(2)?,
+        WeightDtype::Int8 => weights,
+        WeightDtype::Q4K => weights
+            .div_ceil(Q4K_BLOCK_ELEMS)
+            .checked_mul(Q4K_BLOCK_BYTES)?,
+        WeightDtype::Q4_0 => weights
+            .div_ceil(Q4_0_BLOCK_ELEMS)
+            .checked_mul(Q4_0_BLOCK_BYTES)?,
+        WeightDtype::Q8_0 => weights
+            .div_ceil(Q8_0_BLOCK_ELEMS)
+            .checked_mul(Q8_0_BLOCK_BYTES)?,
+        WeightDtype::Q5K => weights
+            .div_ceil(Q5K_BLOCK_ELEMS)
+            .checked_mul(Q5K_BLOCK_BYTES)?,
+        WeightDtype::Q6K => weights
+            .div_ceil(Q6K_BLOCK_ELEMS)
+            .checked_mul(Q6K_BLOCK_BYTES)?,
+        WeightDtype::MXFP4 | WeightDtype::Mixed => return None,
+    })
+}
+
 /// Number of bytes an expert with these dimensions occupies on disk
 /// for the given dtype, **including** any per-expert header (e.g. the
 /// 12-byte INT8 scale header).
@@ -880,6 +1088,18 @@ pub const fn expert_weight_bytes_for(d_model: usize, d_ff: usize, dtype: WeightD
             let total_blocks = one_blocks.saturating_mul(3);
             total_blocks.saturating_mul(Q8_0_BLOCK_BYTES)
         }
+        WeightDtype::Q5K => {
+            let one = d_model.saturating_mul(d_ff);
+            let one_blocks = one.div_ceil(Q5K_BLOCK_ELEMS);
+            let total_blocks = one_blocks.saturating_mul(3);
+            total_blocks.saturating_mul(Q5K_BLOCK_BYTES)
+        }
+        WeightDtype::Q6K => {
+            let one = d_model.saturating_mul(d_ff);
+            let one_blocks = one.div_ceil(Q6K_BLOCK_ELEMS);
+            let total_blocks = one_blocks.saturating_mul(3);
+            total_blocks.saturating_mul(Q6K_BLOCK_BYTES)
+        }
         WeightDtype::MXFP4 => {
             // Three projections (gate, up, down) stored back to back.
             // Each projection is its packed U8 weight bytes (two E2M1
@@ -892,9 +1112,10 @@ pub const fn expert_weight_bytes_for(d_model: usize, d_ff: usize, dtype: WeightD
             let down = mxfp4_projection_bytes(d_model, d_ff);
             gate.saturating_add(up).saturating_add(down)
         }
+        WeightDtype::Mixed => 0,
         _ => {
-            let payload = expert_weight_count(d_model, d_ff)
-                .saturating_mul(dtype.bytes_per_weight());
+            let payload =
+                expert_weight_count(d_model, d_ff).saturating_mul(dtype.bytes_per_weight());
             payload.saturating_add(dtype.header_bytes())
         }
     }
@@ -923,12 +1144,20 @@ pub enum ExpertWeightsError {
     /// `Result` rather than panicking so the engine can log and skip
     /// the offending expert instead of aborting the whole run.
     Candle(String),
+    /// The expert's self-describing header is malformed or incompatible
+    /// with the runtime shape/dtype dispatch.
+    InvalidLayout(String),
 }
 
 impl fmt::Display for ExpertWeightsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExpertWeightsError::BufferTooSmall { have, need, d_model, d_ff } => write!(
+            ExpertWeightsError::BufferTooSmall {
+                have,
+                need,
+                d_model,
+                d_ff,
+            } => write!(
                 f,
                 "expert buffer too small: have {have} bytes, need {need} for \
                  d_model={d_model}, d_ff={d_ff}"
@@ -938,8 +1167,12 @@ impl fmt::Display for ExpertWeightsError {
                 "expert buffer is not f32-aligned: addr=0x{addr:x}, required={required}"
             ),
             ExpertWeightsError::Candle(msg) => {
-                write!(f, "candle-core operation failed during expert forward pass: {msg}")
+                write!(
+                    f,
+                    "candle-core operation failed during expert forward pass: {msg}"
+                )
             }
+            ExpertWeightsError::InvalidLayout(msg) => write!(f, "invalid expert layout: {msg}"),
         }
     }
 }
@@ -999,9 +1232,8 @@ impl<'a> ExpertWeights<'a> {
         //   is correct.
         // * The lifetime of the resulting `&[f32]` is tied to `bytes`, so
         //   the borrow checker prevents mutation while the view exists.
-        let floats: &'a [f32] = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), need_floats)
-        };
+        let floats: &'a [f32] =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), need_floats) };
 
         let gate_len = d_ff * d_model;
         let up_len = d_ff * d_model;
@@ -1010,7 +1242,13 @@ impl<'a> ExpertWeights<'a> {
         let (up, rest) = rest.split_at(up_len);
         let (down, _trailing) = rest.split_at(down_len);
 
-        Ok(Self { d_model, d_ff, gate, up, down })
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate,
+            up,
+            down,
+        })
     }
 
     /// Build the three-matrix view from a fully-materialised `&[f32]`
@@ -1038,9 +1276,14 @@ impl<'a> ExpertWeights<'a> {
         let (gate, rest) = floats[..need_floats].split_at(gate_len);
         let (up, rest) = rest.split_at(up_len);
         let (down, _trailing) = rest.split_at(down_len);
-        Ok(Self { d_model, d_ff, gate, up, down })
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate,
+            up,
+            down,
+        })
     }
-
 
     /// **The memory bridge to Candle.**
     ///
@@ -1066,12 +1309,11 @@ impl<'a> ExpertWeights<'a> {
         device: &Device,
     ) -> Result<(Tensor, Tensor, Tensor), ExpertWeightsError> {
         let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
-        let gate = Tensor::from_slice(self.gate, (self.d_ff, self.d_model), device)
-            .map_err(map_err)?;
-        let up = Tensor::from_slice(self.up, (self.d_ff, self.d_model), device)
-            .map_err(map_err)?;
-        let down = Tensor::from_slice(self.down, (self.d_model, self.d_ff), device)
-            .map_err(map_err)?;
+        let gate =
+            Tensor::from_slice(self.gate, (self.d_ff, self.d_model), device).map_err(map_err)?;
+        let up = Tensor::from_slice(self.up, (self.d_ff, self.d_model), device).map_err(map_err)?;
+        let down =
+            Tensor::from_slice(self.down, (self.d_model, self.d_ff), device).map_err(map_err)?;
         Ok((gate, up, down))
     }
 
@@ -1221,16 +1463,36 @@ fn gate_up_swiglu(gate: &[f32], up: &[f32], x: &[f32], gated: &mut [f32], d_mode
             // and neither aliases `gate`, `up`, or `x`.
             unsafe {
                 matrixmultiply::sgemm(
-                    d_ff, d_model, 1, 1.0,
-                    gate.as_ptr(), d_model as isize, 1,
-                    x.as_ptr(), 1, 1,
-                    0.0, gated.as_mut_ptr(), 1, 1,
+                    d_ff,
+                    d_model,
+                    1,
+                    1.0,
+                    gate.as_ptr(),
+                    d_model as isize,
+                    1,
+                    x.as_ptr(),
+                    1,
+                    1,
+                    0.0,
+                    gated.as_mut_ptr(),
+                    1,
+                    1,
                 );
                 matrixmultiply::sgemm(
-                    d_ff, d_model, 1, 1.0,
-                    up.as_ptr(), d_model as isize, 1,
-                    x.as_ptr(), 1, 1,
-                    0.0, u_vec.as_mut_ptr(), 1, 1,
+                    d_ff,
+                    d_model,
+                    1,
+                    1.0,
+                    up.as_ptr(),
+                    d_model as isize,
+                    1,
+                    x.as_ptr(),
+                    1,
+                    1,
+                    0.0,
+                    u_vec.as_mut_ptr(),
+                    1,
+                    1,
                 );
             }
             for (g, &u) in gated.iter_mut().zip(u_vec.iter()) {
@@ -1273,10 +1535,20 @@ fn down_proj(down: &[f32], gated: &[f32], y: &mut [f32], d_ff: usize) {
         let d_model = y.len();
         unsafe {
             matrixmultiply::sgemm(
-                d_model, d_ff, 1, 1.0,
-                down.as_ptr(), d_ff as isize, 1,
-                gated.as_ptr(), 1, 1,
-                0.0, y.as_mut_ptr(), 1, 1,
+                d_model,
+                d_ff,
+                1,
+                1.0,
+                down.as_ptr(),
+                d_ff as isize,
+                1,
+                gated.as_ptr(),
+                1,
+                1,
+                0.0,
+                y.as_mut_ptr(),
+                1,
+                1,
             );
         }
     }
@@ -1358,8 +1630,7 @@ impl OwnedExpertWeights {
         let gate_blocks = gate_n.div_ceil(Q4K_BLOCK_ELEMS);
         let up_blocks = up_n.div_ceil(Q4K_BLOCK_ELEMS);
         let down_blocks = down_n.div_ceil(Q4K_BLOCK_ELEMS);
-        let need_bytes = (gate_blocks + up_blocks + down_blocks)
-            .saturating_mul(Q4K_BLOCK_BYTES);
+        let need_bytes = (gate_blocks + up_blocks + down_blocks).saturating_mul(Q4K_BLOCK_BYTES);
         if bytes.len() < need_bytes {
             return Err(ExpertWeightsError::BufferTooSmall {
                 have: bytes.len(),
@@ -1436,8 +1707,7 @@ impl OwnedExpertWeights {
         let gate_blocks = gate_n.div_ceil(Q4_0_BLOCK_ELEMS);
         let up_blocks = up_n.div_ceil(Q4_0_BLOCK_ELEMS);
         let down_blocks = down_n.div_ceil(Q4_0_BLOCK_ELEMS);
-        let need_bytes = (gate_blocks + up_blocks + down_blocks)
-            .saturating_mul(Q4_0_BLOCK_BYTES);
+        let need_bytes = (gate_blocks + up_blocks + down_blocks).saturating_mul(Q4_0_BLOCK_BYTES);
         let buf = q4_expert_bytes_with_tolerance(bytes, need_bytes, d_model, d_ff)?;
         let bytes: &[u8] = &buf;
 
@@ -1537,8 +1807,7 @@ impl OwnedExpertWeights {
         let gate_blocks = gate_n.div_ceil(Q8_0_BLOCK_ELEMS);
         let up_blocks = up_n.div_ceil(Q8_0_BLOCK_ELEMS);
         let down_blocks = down_n.div_ceil(Q8_0_BLOCK_ELEMS);
-        let need_bytes = (gate_blocks + up_blocks + down_blocks)
-            .saturating_mul(Q8_0_BLOCK_BYTES);
+        let need_bytes = (gate_blocks + up_blocks + down_blocks).saturating_mul(Q8_0_BLOCK_BYTES);
         if bytes.len() < need_bytes {
             return Err(ExpertWeightsError::BufferTooSmall {
                 have: bytes.len(),
@@ -1576,6 +1845,146 @@ impl OwnedExpertWeights {
             gate: gate_buf,
             up: up_buf,
             down: down_buf,
+            col_indices: None,
+        })
+    }
+
+    /// Build an owned weight set by dequantising a **Q5_K** expert byte
+    /// buffer into a fresh `Vec<f32>`.
+    pub fn from_bytes_q5k(
+        bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        let gate_n = d_ff.saturating_mul(d_model);
+        let up_n = d_ff.saturating_mul(d_model);
+        let down_n = d_model.saturating_mul(d_ff);
+        let gate_blocks = gate_n.div_ceil(Q5K_BLOCK_ELEMS);
+        let up_blocks = up_n.div_ceil(Q5K_BLOCK_ELEMS);
+        let down_blocks = down_n.div_ceil(Q5K_BLOCK_ELEMS);
+        let need_bytes = (gate_blocks + up_blocks + down_blocks).saturating_mul(Q5K_BLOCK_BYTES);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
+
+        let mut off = 0;
+        let mut gate_buf = Vec::new();
+        dequantize_q5k_to_f32(
+            &bytes[off..off + gate_blocks * Q5K_BLOCK_BYTES],
+            gate_n,
+            &mut gate_buf,
+        );
+        off += gate_blocks * Q5K_BLOCK_BYTES;
+        let mut up_buf = Vec::new();
+        dequantize_q5k_to_f32(
+            &bytes[off..off + up_blocks * Q5K_BLOCK_BYTES],
+            up_n,
+            &mut up_buf,
+        );
+        off += up_blocks * Q5K_BLOCK_BYTES;
+        let mut down_buf = Vec::new();
+        dequantize_q5k_to_f32(
+            &bytes[off..off + down_blocks * Q5K_BLOCK_BYTES],
+            down_n,
+            &mut down_buf,
+        );
+
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate: gate_buf,
+            up: up_buf,
+            down: down_buf,
+            col_indices: None,
+        })
+    }
+
+    /// Build an owned weight set by dequantising a **Q6_K** expert byte
+    /// buffer into a fresh `Vec<f32>`.
+    pub fn from_bytes_q6k(
+        bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        let gate_n = d_ff.saturating_mul(d_model);
+        let up_n = d_ff.saturating_mul(d_model);
+        let down_n = d_model.saturating_mul(d_ff);
+        let gate_blocks = gate_n.div_ceil(Q6K_BLOCK_ELEMS);
+        let up_blocks = up_n.div_ceil(Q6K_BLOCK_ELEMS);
+        let down_blocks = down_n.div_ceil(Q6K_BLOCK_ELEMS);
+        let need_bytes = (gate_blocks + up_blocks + down_blocks).saturating_mul(Q6K_BLOCK_BYTES);
+        if bytes.len() < need_bytes {
+            return Err(ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need: need_bytes,
+                d_model,
+                d_ff,
+            });
+        }
+
+        let mut off = 0;
+        let mut gate_buf = Vec::new();
+        dequantize_q6k_to_f32(
+            &bytes[off..off + gate_blocks * Q6K_BLOCK_BYTES],
+            gate_n,
+            &mut gate_buf,
+        );
+        off += gate_blocks * Q6K_BLOCK_BYTES;
+        let mut up_buf = Vec::new();
+        dequantize_q6k_to_f32(
+            &bytes[off..off + up_blocks * Q6K_BLOCK_BYTES],
+            up_n,
+            &mut up_buf,
+        );
+        off += up_blocks * Q6K_BLOCK_BYTES;
+        let mut down_buf = Vec::new();
+        dequantize_q6k_to_f32(
+            &bytes[off..off + down_blocks * Q6K_BLOCK_BYTES],
+            down_n,
+            &mut down_buf,
+        );
+
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate: gate_buf,
+            up: up_buf,
+            down: down_buf,
+            col_indices: None,
+        })
+    }
+
+    /// Build an owned weight set from a UTH2 mixed-projection expert.
+    pub fn from_bytes_mixed_quant(
+        bytes: &[u8],
+        header: crate::tensor_header::MixedExpertHeader,
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Self, ExpertWeightsError> {
+        if header.d_model as usize != d_model || header.d_ff as usize != d_ff {
+            return Err(ExpertWeightsError::InvalidLayout(format!(
+                "UTH2 shape d_model={} d_ff={} does not match runtime d_model={} d_ff={}",
+                header.d_model, header.d_ff, d_model, d_ff
+            )));
+        }
+        header
+            .validate(bytes.len() as u64)
+            .map_err(ExpertWeightsError::InvalidLayout)?;
+        let expected = d_model.saturating_mul(d_ff);
+        let gate = decode_mixed_projection(bytes, header.gate, expected, d_model, d_ff, "gate")?;
+        let up = decode_mixed_projection(bytes, header.up, expected, d_model, d_ff, "up")?;
+        let down = decode_mixed_projection(bytes, header.down, expected, d_model, d_ff, "down")?;
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate,
+            up,
+            down,
             col_indices: None,
         })
     }
@@ -1641,44 +2050,56 @@ impl OwnedExpertWeights {
 
         // Decode one [rows × cols] projection starting at `off`, returning
         // the dequantised f32 matrix and the new offset.
-let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, usize), ExpertWeightsError> {
-    let weight_bytes = rows.saturating_mul(cols.div_ceil(2));
-    let scale_bytes = rows.saturating_mul(cols.div_ceil(MXFP4_SCALE_BLOCK));
-    let w_end = off.checked_add(weight_bytes).ok_or(ExpertWeightsError::BufferTooSmall {
-        have: bytes.len(),
-        need: need_bytes,
-        d_model,
-        d_ff,
-    })?;
-    let s_end = w_end.checked_add(scale_bytes).ok_or(ExpertWeightsError::BufferTooSmall {
-        have: bytes.len(),
-        need: need_bytes,
-        d_model,
-        d_ff,
-    })?;
-    let packed = bytes.get(off..w_end).ok_or(ExpertWeightsError::BufferTooSmall {
-        have: bytes.len(),
-        need: need_bytes,
-        d_model,
-        d_ff,
-    })?;
-    let scales = bytes.get(w_end..s_end).ok_or(ExpertWeightsError::BufferTooSmall {
-        have: bytes.len(),
-        need: need_bytes,
-        d_model,
-        d_ff,
-    })?;
-    let out = crate::dequant::dequant_mxfp4(packed, scales, rows, cols);
-    if out.len() != rows.saturating_mul(cols) {
-        return Err(ExpertWeightsError::BufferTooSmall {
-            have: bytes.len(),
-            need: need_bytes,
-            d_model,
-            d_ff,
-        });
-    }
-    Ok((out, s_end))
-};
+        let decode_proj = |off: usize,
+                           rows: usize,
+                           cols: usize|
+         -> Result<(Vec<f32>, usize), ExpertWeightsError> {
+            let weight_bytes = rows.saturating_mul(cols.div_ceil(2));
+            let scale_bytes = rows.saturating_mul(cols.div_ceil(MXFP4_SCALE_BLOCK));
+            let w_end =
+                off.checked_add(weight_bytes)
+                    .ok_or(ExpertWeightsError::BufferTooSmall {
+                        have: bytes.len(),
+                        need: need_bytes,
+                        d_model,
+                        d_ff,
+                    })?;
+            let s_end =
+                w_end
+                    .checked_add(scale_bytes)
+                    .ok_or(ExpertWeightsError::BufferTooSmall {
+                        have: bytes.len(),
+                        need: need_bytes,
+                        d_model,
+                        d_ff,
+                    })?;
+            let packed = bytes
+                .get(off..w_end)
+                .ok_or(ExpertWeightsError::BufferTooSmall {
+                    have: bytes.len(),
+                    need: need_bytes,
+                    d_model,
+                    d_ff,
+                })?;
+            let scales = bytes
+                .get(w_end..s_end)
+                .ok_or(ExpertWeightsError::BufferTooSmall {
+                    have: bytes.len(),
+                    need: need_bytes,
+                    d_model,
+                    d_ff,
+                })?;
+            let out = crate::dequant::dequant_mxfp4(packed, scales, rows, cols);
+            if out.len() != rows.saturating_mul(cols) {
+                return Err(ExpertWeightsError::BufferTooSmall {
+                    have: bytes.len(),
+                    need: need_bytes,
+                    d_model,
+                    d_ff,
+                });
+            }
+            Ok((out, s_end))
+        };
 
         let (gate, off) = decode_proj(0, d_ff, d_model)?;
         let (up, off) = decode_proj(off, d_ff, d_model)?;
@@ -1743,7 +2164,14 @@ let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, us
             &payload[gate_len + up_len..gate_len + up_len + down_len],
             meta.down_scale,
         );
-        Ok(Self { d_model, d_ff, gate, up, down, col_indices: None })
+        Ok(Self {
+            d_model,
+            d_ff,
+            gate,
+            up,
+            down,
+            col_indices: None,
+        })
     }
 
     /// Build an owned weight set by dequantising a little-endian `f16`
@@ -1803,7 +2231,10 @@ let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, us
     ) -> Result<Self, ExpertWeightsError> {
         let m = col_indices.len();
         for &c in col_indices {
-            assert!(c < d_model, "col index {c} out of range for d_model={d_model}");
+            assert!(
+                c < d_model,
+                "col index {c} out of range for d_model={d_model}"
+            );
         }
         let packed_floats = d_ff
             .saturating_mul(m)
@@ -1841,6 +2272,8 @@ let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, us
             | WeightDtype::Q4K
             | WeightDtype::Q4_0
             | WeightDtype::Q8_0
+            | WeightDtype::Q5K
+            | WeightDtype::Q6K
             | WeightDtype::MXFP4 => {
                 // Partial-load + INT8 / Q4K / Q4_0 / Q8_0 / MXFP4 isn't
                 // supported (the partial-load packing is column-major
@@ -1854,6 +2287,11 @@ let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, us
                     d_model,
                     d_ff,
                 });
+            }
+            WeightDtype::Mixed => {
+                return Err(ExpertWeightsError::InvalidLayout(
+                    "partial-load does not support mixed UTH2 experts".to_string(),
+                ));
             }
         };
         let gate_len = d_ff * m;
@@ -1935,6 +2373,86 @@ let decode_proj = |off: usize, rows: usize, cols: usize| -> Result<(Vec<f32>, us
     }
 }
 
+fn decode_mixed_projection(
+    payload: &[u8],
+    range: crate::tensor_header::ProjectionRange,
+    expected_weights: usize,
+    d_model: usize,
+    d_ff: usize,
+    name: &str,
+) -> Result<Vec<f32>, ExpertWeightsError> {
+    let dtype = range.dtype.to_weight();
+    let expected_bytes = projection_weight_bytes_for(expected_weights, dtype).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout(format!(
+            "{name} projection uses {}, which is not supported in mixed UTH2 experts",
+            dtype.as_str()
+        ))
+    })?;
+    if range.weights as usize != expected_weights {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "{name} projection records {} weights, expected {expected_weights}",
+            range.weights
+        )));
+    }
+    if range.len as usize != expected_bytes {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "{name} projection length {} does not match {} bytes required for {}",
+            range.len,
+            expected_bytes,
+            dtype.as_str()
+        )));
+    }
+    let start: usize = range.offset.try_into().map_err(|_| {
+        ExpertWeightsError::InvalidLayout(format!("{name} projection offset overflows usize"))
+    })?;
+    let end = start.checked_add(expected_bytes).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout(format!("{name} projection range overflows usize"))
+    })?;
+    let bytes = payload
+        .get(start..end)
+        .ok_or_else(|| ExpertWeightsError::BufferTooSmall {
+            have: payload.len(),
+            need: end,
+            d_model,
+            d_ff,
+        })?;
+
+    let mut out = Vec::with_capacity(expected_weights);
+    match dtype {
+        WeightDtype::F32 => {
+            for chunk in bytes.chunks_exact(4) {
+                out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+        }
+        WeightDtype::F16 => dequantize_f16_to_f32(bytes, &mut out),
+        WeightDtype::BF16 => {
+            out.extend(
+                bytes
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()),
+            );
+        }
+        WeightDtype::Q4K => dequantize_q4k_to_f32(bytes, expected_weights, &mut out),
+        WeightDtype::Q4_0 => dequantize_q4_0_to_f32(bytes, expected_weights, &mut out),
+        WeightDtype::Q8_0 => dequantize_q8_0_to_f32(bytes, expected_weights, &mut out),
+        WeightDtype::Q5K => dequantize_q5k_to_f32(bytes, expected_weights, &mut out),
+        WeightDtype::Q6K => dequantize_q6k_to_f32(bytes, expected_weights, &mut out),
+        WeightDtype::Int8 | WeightDtype::MXFP4 | WeightDtype::Mixed => {
+            return Err(ExpertWeightsError::InvalidLayout(format!(
+                "{name} projection dtype {} cannot be decoded independently",
+                dtype.as_str()
+            )));
+        }
+    }
+    if out.len() != expected_weights {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "{name} projection decoded {} weights, expected {expected_weights}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
 /// Generate the per-token hidden-state vector that flows into the FFN.
 ///
 /// In a real model this would be the residual-stream activation produced
@@ -1979,7 +2497,11 @@ fn summarise_output(token_idx: u64, expert_id: u32, y: &[f32]) -> InferenceOutpu
         digest ^= bits;
         digest = digest.wrapping_mul(FNV_PRIME);
     }
-    InferenceOutput { expert_id, digest, out_norm }
+    InferenceOutput {
+        expert_id,
+        digest,
+        out_norm,
+    }
 }
 
 /// Run one expert's FFN on the hidden state. The buffer behind `resident`
@@ -2034,9 +2556,7 @@ pub fn run_inference_gpu(
         use candle_core::{Device, Tensor};
         static CUDA_DEVICE: std::sync::OnceLock<Result<Device, String>> =
             std::sync::OnceLock::new();
-        let dev = match CUDA_DEVICE
-            .get_or_init(|| Device::new_cuda(0).map_err(|e| e.to_string()))
-        {
+        let dev = match CUDA_DEVICE.get_or_init(|| Device::new_cuda(0).map_err(|e| e.to_string())) {
             Ok(dev) => dev,
             Err(e) => {
                 static WARNED: std::sync::Once = std::sync::Once::new();
@@ -2058,7 +2578,10 @@ pub fn run_inference_gpu(
         let u = up_t.matmul(&x_t).map_err(map_err)?;
         // GPT-OSS `swiglu_limit` clamp before silu (no-op otherwise).
         let g = clamp_swiglu_gate(g).map_err(map_err)?;
-        let gated = Tensor::silu(&g).map_err(map_err)?.mul(&u).map_err(map_err)?;
+        let gated = Tensor::silu(&g)
+            .map_err(map_err)?
+            .mul(&u)
+            .map_err(map_err)?;
         let y_t = down_t.matmul(&gated).map_err(map_err)?;
         let y_t = y_t.squeeze(1).map_err(map_err)?;
         let y: HiddenState = y_t.to_vec1::<f32>().map_err(map_err)?;
@@ -2181,6 +2704,54 @@ pub fn run_inference_q8_0(
     Ok((out, y))
 }
 
+/// Q5_K counterpart of [`run_inference`].
+pub fn run_inference_q5k(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = OwnedExpertWeights::from_bytes_q5k(resident.data(), d_model, d_ff)?;
+    let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+/// Q6_K counterpart of [`run_inference`].
+pub fn run_inference_q6k(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let weights = OwnedExpertWeights::from_bytes_q6k(resident.data(), d_model, d_ff)?;
+    let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+/// UTH2 mixed-projection counterpart of [`run_inference`].
+pub fn run_inference_mixed_quant(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let header = resident.mixed_layout().ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout(
+            "runtime dtype is mixed but resident expert has no valid UTH2 header".to_string(),
+        )
+    })?;
+    let weights =
+        OwnedExpertWeights::from_bytes_mixed_quant(resident.data(), header, d_model, d_ff)?;
+    let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
 /// BF16 counterpart of [`run_inference`]: dequantises the resident
 /// `bf16` bytes into an owned `Vec<f32>` (via
 /// [`OwnedExpertWeights::from_bytes_bf16`]) and runs the same SwiGLU
@@ -2259,8 +2830,7 @@ use std::sync::Arc as StdArc;
 /// than skipping the expert, we accept files within one block
 /// alignment of the expected size and zero-pad the (≤ one page) tail
 /// so the per-matrix block slices stay in-bounds. See gist Fix 1.
-pub(crate) const EXPERT_SIZE_TOLERANCE_BYTES: usize =
-    crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
+pub(crate) const EXPERT_SIZE_TOLERANCE_BYTES: usize = crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
 
 /// Return a buffer that is at least `need` bytes long — either a
 /// borrowed view of `bytes` or, when `bytes` is slightly short, an
@@ -2323,8 +2893,8 @@ fn cpu_qtensor_from_blocks(
     let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
     // `QStorage::from_data` copies the bytes into typed block storage,
     // so a borrowed `Cow` is sufficient.
-    let storage = QStorage::from_data(Cow::Borrowed(bytes), &Device::Cpu, dtype)
-        .map_err(map_err)?;
+    let storage =
+        QStorage::from_data(Cow::Borrowed(bytes), &Device::Cpu, dtype).map_err(map_err)?;
     QTensor::new(storage, (rows, cols)).map_err(map_err)
 }
 
@@ -2345,15 +2915,15 @@ fn forward_qmm(
     // `[1, d_model]` so the result is `[1, d_ff]` / `[1, d_model]`.
     let x_t = Tensor::from_slice(x, (1, d_model), &Device::Cpu).map_err(map_err)?;
 
-    let g = gate.forward(&x_t).map_err(map_err)?;        // [1, d_ff]
-    let u = up.forward(&x_t).map_err(map_err)?;          // [1, d_ff]
-    // GPT-OSS `swiglu_limit` clamp before silu (no-op otherwise).
+    let g = gate.forward(&x_t).map_err(map_err)?; // [1, d_ff]
+    let u = up.forward(&x_t).map_err(map_err)?; // [1, d_ff]
+                                                // GPT-OSS `swiglu_limit` clamp before silu (no-op otherwise).
     let g = clamp_swiglu_gate(g).map_err(map_err)?;
     let gated = candle_core::Tensor::silu(&g)
         .map_err(map_err)?
         .mul(&u)
-        .map_err(map_err)?;                              // [1, d_ff]
-    let y = down.forward(&gated).map_err(map_err)?;      // [1, d_model]
+        .map_err(map_err)?; // [1, d_ff]
+    let y = down.forward(&gated).map_err(map_err)?; // [1, d_model]
     let y = y.squeeze(0).map_err(map_err)?;
     y.to_vec1::<f32>().map_err(map_err)
 }
@@ -2413,15 +2983,24 @@ fn forward_q4_0_qmm_from_exact_bytes(
     let down_b = &bytes[2 * one_bytes..3 * one_bytes];
 
     let gate = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        gate_b, d_ff, d_model, GgmlDType::Q4_0,
+        gate_b,
+        d_ff,
+        d_model,
+        GgmlDType::Q4_0,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
     let up = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        up_b, d_ff, d_model, GgmlDType::Q4_0,
+        up_b,
+        d_ff,
+        d_model,
+        GgmlDType::Q4_0,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
     let down = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        down_b, d_model, d_ff, GgmlDType::Q4_0,
+        down_b,
+        d_model,
+        d_ff,
+        GgmlDType::Q4_0,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
@@ -2477,15 +3056,24 @@ pub fn run_inference_q4k_qmm(
     let down_b = &bytes[2 * one_bytes..3 * one_bytes];
 
     let gate = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        gate_b, d_ff, d_model, GgmlDType::Q4K,
+        gate_b,
+        d_ff,
+        d_model,
+        GgmlDType::Q4K,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
     let up = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        up_b, d_ff, d_model, GgmlDType::Q4K,
+        up_b,
+        d_ff,
+        d_model,
+        GgmlDType::Q4K,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
     let down = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        down_b, d_model, d_ff, GgmlDType::Q4K,
+        down_b,
+        d_model,
+        d_ff,
+        GgmlDType::Q4K,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
@@ -2524,15 +3112,24 @@ pub fn run_inference_q8_0_qmm(
     let down_b = &bytes[2 * one_bytes..3 * one_bytes];
 
     let gate = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        gate_b, d_ff, d_model, GgmlDType::Q8_0,
+        gate_b,
+        d_ff,
+        d_model,
+        GgmlDType::Q8_0,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
     let up = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        up_b, d_ff, d_model, GgmlDType::Q8_0,
+        up_b,
+        d_ff,
+        d_model,
+        GgmlDType::Q8_0,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
     let down = QMatMul::from_arc(StdArc::new(cpu_qtensor_from_blocks(
-        down_b, d_model, d_ff, GgmlDType::Q8_0,
+        down_b,
+        d_model,
+        d_ff,
+        GgmlDType::Q8_0,
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
@@ -2554,13 +3151,8 @@ pub fn run_inference_partial(
     d_ff: usize,
     dtype: WeightDtype,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
-    let weights = OwnedExpertWeights::from_bytes_partial(
-        resident.data(),
-        col_indices,
-        d_model,
-        d_ff,
-        dtype,
-    )?;
+    let weights =
+        OwnedExpertWeights::from_bytes_partial(resident.data(), col_indices, d_model, d_ff, dtype)?;
     let y = weights.forward_partial(x);
     let out = summarise_output(token_idx, resident.id, &y);
     Ok((out, y))
@@ -2660,7 +3252,10 @@ mod tests {
         let x = synth_hidden_state(7, d_model, 1234);
         let y = w.forward(&x);
         assert_eq!(y.len(), d_model);
-        assert!(y.iter().all(|v| v.is_finite()), "got non-finite output: {y:?}");
+        assert!(
+            y.iter().all(|v| v.is_finite()),
+            "got non-finite output: {y:?}"
+        );
     }
 
     #[test]
@@ -2788,7 +3383,10 @@ mod tests {
     fn int8_short_buffer_returns_error() {
         let bytes = vec![0u8; INT8_HEADER_BYTES + 4]; // way too small
         let res = OwnedExpertWeights::from_bytes_int8(&bytes, 8, 8);
-        assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
+        assert!(matches!(
+            res,
+            Err(ExpertWeightsError::BufferTooSmall { .. })
+        ));
     }
 
     #[test]
@@ -2964,13 +3562,53 @@ mod tests {
     }
 
     #[test]
+    fn q5k_q6k_zero_blocks_decode_to_zero() {
+        assert_eq!(Q5K_BLOCK_ELEMS, 256);
+        assert_eq!(Q5K_BLOCK_BYTES, 176);
+        assert_eq!(Q6K_BLOCK_ELEMS, 256);
+        assert_eq!(Q6K_BLOCK_BYTES, 210);
+
+        let mut out = vec![1.0f32; Q5K_BLOCK_ELEMS];
+        dequantize_q5k_block(&vec![0u8; Q5K_BLOCK_BYTES], &mut out);
+        assert!(out.iter().all(|&v| v == 0.0));
+
+        let mut out = vec![1.0f32; Q6K_BLOCK_ELEMS];
+        dequantize_q6k_block(&vec![0u8; Q6K_BLOCK_BYTES], &mut out);
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q5k_q6k_owned_experts_reject_short_input() {
+        let d_model = 256;
+        let d_ff = 1;
+        let q5_total = expert_weight_bytes_for(d_model, d_ff, WeightDtype::Q5K);
+        let q6_total = expert_weight_bytes_for(d_model, d_ff, WeightDtype::Q6K);
+        assert_eq!(q5_total, Q5K_BLOCK_BYTES * 3);
+        assert_eq!(q6_total, Q6K_BLOCK_BYTES * 3);
+        assert!(OwnedExpertWeights::from_bytes_q5k(&vec![0; q5_total - 1], d_model, d_ff).is_err());
+        assert!(OwnedExpertWeights::from_bytes_q6k(&vec![0; q6_total - 1], d_model, d_ff).is_err());
+    }
+
+    #[test]
     fn bf16_mxfp4_dtypes_round_trip_through_str() {
         assert_eq!(WeightDtype::from_str_opt("bf16"), Some(WeightDtype::BF16));
-        assert_eq!(WeightDtype::from_str_opt("BFloat16"), Some(WeightDtype::BF16));
+        assert_eq!(
+            WeightDtype::from_str_opt("BFloat16"),
+            Some(WeightDtype::BF16)
+        );
         assert_eq!(WeightDtype::from_str_opt("mxfp4"), Some(WeightDtype::MXFP4));
-        assert_eq!(WeightDtype::from_str_opt("MX_FP4"), Some(WeightDtype::MXFP4));
+        assert_eq!(
+            WeightDtype::from_str_opt("MX_FP4"),
+            Some(WeightDtype::MXFP4)
+        );
+        assert_eq!(WeightDtype::from_str_opt("q5_k"), Some(WeightDtype::Q5K));
+        assert_eq!(WeightDtype::from_str_opt("Q6K"), Some(WeightDtype::Q6K));
+        assert_eq!(WeightDtype::from_str_opt("mixed"), Some(WeightDtype::Mixed));
         assert_eq!(WeightDtype::BF16.as_str(), "bf16");
         assert_eq!(WeightDtype::MXFP4.as_str(), "mxfp4");
+        assert_eq!(WeightDtype::Q5K.as_str(), "q5k");
+        assert_eq!(WeightDtype::Q6K.as_str(), "q6k");
+        assert_eq!(WeightDtype::Mixed.as_str(), "mixed");
         assert_eq!(WeightDtype::BF16.bytes_per_weight(), 2);
         assert_eq!(WeightDtype::MXFP4.bytes_per_weight(), 1);
     }
@@ -3020,14 +3658,9 @@ mod tests {
         let fill = 0.1;
         let cols: Vec<usize> = (0..d_model).collect();
         let packed = make_packed_partial_buffer(d_model, d_ff, &cols, fill);
-        let owned = OwnedExpertWeights::from_bytes_partial(
-            &packed,
-            &cols,
-            d_model,
-            d_ff,
-            WeightDtype::F32,
-        )
-        .unwrap();
+        let owned =
+            OwnedExpertWeights::from_bytes_partial(&packed, &cols, d_model, d_ff, WeightDtype::F32)
+                .unwrap();
 
         let full = make_weights_buffer(d_model, d_ff, fill);
         let full_view = ExpertWeights::from_bytes(full.as_slice(), d_model, d_ff).unwrap();
@@ -3048,14 +3681,9 @@ mod tests {
         let cols: Vec<usize> = (0..d_model).step_by(2).collect();
         assert_eq!(cols.len(), 4);
         let packed = make_packed_partial_buffer(d_model, d_ff, &cols, fill);
-        let owned = OwnedExpertWeights::from_bytes_partial(
-            &packed,
-            &cols,
-            d_model,
-            d_ff,
-            WeightDtype::F32,
-        )
-        .unwrap();
+        let owned =
+            OwnedExpertWeights::from_bytes_partial(&packed, &cols, d_model, d_ff, WeightDtype::F32)
+                .unwrap();
         let x = synth_hidden_state(0, d_model, 1);
         let y = owned.forward_partial(&x);
         assert_eq!(y.len(), d_model);
@@ -3214,7 +3842,10 @@ mod tests {
         let d_ff = 32;
         let bytes = vec![0u8; 100]; // way too small
         let res = OwnedExpertWeights::from_bytes_q4k(&bytes, d_model, d_ff);
-        assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
+        assert!(matches!(
+            res,
+            Err(ExpertWeightsError::BufferTooSmall { .. })
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -3406,7 +4037,10 @@ mod tests {
         let d_ff = 32;
         let bytes = vec![0u8; 16]; // way too small
         let res = OwnedExpertWeights::from_bytes_q4_0(&bytes, d_model, d_ff);
-        assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
+        assert!(matches!(
+            res,
+            Err(ExpertWeightsError::BufferTooSmall { .. })
+        ));
     }
 
     #[test]
@@ -3428,8 +4062,7 @@ mod tests {
         }
 
         let f32_bytes =
-            OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(&bytes, d_model, d_ff)
-                .unwrap();
+            OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(&bytes, d_model, d_ff).unwrap();
         // Exactly three tightly-packed F32 projection matrices.
         assert_eq!(f32_bytes.len(), 3 * d_model * d_ff * 4);
 
@@ -3459,9 +4092,11 @@ mod tests {
         let d_model = 32;
         let d_ff = 32;
         let bytes = vec![0u8; 16]; // far too small
-        let res =
-            OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(&bytes, d_model, d_ff);
-        assert!(matches!(res, Err(ExpertWeightsError::BufferTooSmall { .. })));
+        let res = OwnedExpertWeights::dequantize_q4_0_expert_to_f32_bytes(&bytes, d_model, d_ff);
+        assert!(matches!(
+            res,
+            Err(ExpertWeightsError::BufferTooSmall { .. })
+        ));
     }
 
     /// Scalar reference for `gate_up_swiglu`, deliberately independent
@@ -3516,10 +4151,10 @@ mod tests {
         }
 
         let cases = [
-            (8usize, 16usize),   // small
-            (8, 32),             // grow scratch (d_ff bigger than first call)
-            (8, 16),             // shrink back — scratch len stays >= d_ff
-            (4, 4),              // tiny, exercises d_ff == d_model
+            (8usize, 16usize), // small
+            (8, 32),           // grow scratch (d_ff bigger than first call)
+            (8, 16),           // shrink back — scratch len stays >= d_ff
+            (4, 4),            // tiny, exercises d_ff == d_model
         ];
 
         for (idx, &(d_model, d_ff)) in cases.iter().enumerate() {
@@ -3548,7 +4183,8 @@ mod tests {
                     diff <= tol,
                     "blas vs scalar mismatch at case {idx}, idx {i}: \
                      blas={} ref={} diff={diff} tol={tol}",
-                    out_blas[i], out_ref[i]
+                    out_blas[i],
+                    out_ref[i]
                 );
             }
         }

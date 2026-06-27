@@ -47,12 +47,21 @@ use std::fmt;
 /// 4-byte ASCII magic at the start of every U.T.H. blob.
 pub const UTH_MAGIC: [u8; 4] = *b"UTH1";
 
+/// 4-byte ASCII magic for the mixed-projection expert header.
+pub const UTH2_MAGIC: [u8; 4] = *b"UTH2";
+
 /// Total on-disk size of the header itself (excluding any page padding
 /// that may follow it).
 pub const UTH_BYTES: usize = 64;
 
 /// Current header version. Incremented on incompatible layout changes.
 pub const UTH_VERSION: u16 = 1;
+
+/// Current mixed-projection header version.
+pub const UTH2_VERSION: u16 = 2;
+
+/// Fixed on-disk size of the UTH2 header itself, excluding page padding.
+pub const UTH2_BYTES: usize = 128;
 
 /// `flags` bit indicating that the payload (post-header) is itself
 /// page-aligned (i.e. the writer padded the header region up to the
@@ -75,6 +84,9 @@ pub enum UthDtypeId {
     Q8_0 = 5,
     BF16 = 6,
     MXFP4 = 7,
+    Q5K = 8,
+    Q6K = 9,
+    Mixed = 10,
 }
 
 impl UthDtypeId {
@@ -88,6 +100,9 @@ impl UthDtypeId {
             WeightDtype::Q8_0 => UthDtypeId::Q8_0,
             WeightDtype::BF16 => UthDtypeId::BF16,
             WeightDtype::MXFP4 => UthDtypeId::MXFP4,
+            WeightDtype::Q5K => UthDtypeId::Q5K,
+            WeightDtype::Q6K => UthDtypeId::Q6K,
+            WeightDtype::Mixed => UthDtypeId::Mixed,
         }
     }
 
@@ -101,6 +116,9 @@ impl UthDtypeId {
             UthDtypeId::Q8_0 => WeightDtype::Q8_0,
             UthDtypeId::BF16 => WeightDtype::BF16,
             UthDtypeId::MXFP4 => WeightDtype::MXFP4,
+            UthDtypeId::Q5K => WeightDtype::Q5K,
+            UthDtypeId::Q6K => WeightDtype::Q6K,
+            UthDtypeId::Mixed => WeightDtype::Mixed,
         }
     }
 
@@ -114,8 +132,237 @@ impl UthDtypeId {
             5 => Some(UthDtypeId::Q8_0),
             6 => Some(UthDtypeId::BF16),
             7 => Some(UthDtypeId::MXFP4),
+            8 => Some(UthDtypeId::Q5K),
+            9 => Some(UthDtypeId::Q6K),
+            10 => Some(UthDtypeId::Mixed),
             _ => None,
         }
+    }
+}
+
+/// One projection range inside a mixed UTH2 expert payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectionRange {
+    pub dtype: UthDtypeId,
+    pub offset: u64,
+    pub len: u64,
+    pub weights: u32,
+}
+
+impl ProjectionRange {
+    pub fn end(self) -> Option<u64> {
+        self.offset.checked_add(self.len)
+    }
+}
+
+/// Parsed UTH2 mixed expert header. Offsets are relative to the payload
+/// start, not the start of the file, so page padding after the header is
+/// never part of any projection range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixedExpertHeader {
+    pub version: u16,
+    pub d_model: u32,
+    pub d_ff: u32,
+    pub flags: u32,
+    pub gate: ProjectionRange,
+    pub up: ProjectionRange,
+    pub down: ProjectionRange,
+}
+
+impl MixedExpertHeader {
+    pub fn new(
+        d_model: usize,
+        d_ff: usize,
+        gate: ProjectionRange,
+        up: ProjectionRange,
+        down: ProjectionRange,
+    ) -> Self {
+        Self {
+            version: UTH2_VERSION,
+            d_model: d_model as u32,
+            d_ff: d_ff as u32,
+            flags: UTH_FLAG_PAGE_ALIGNED_PAYLOAD,
+            gate,
+            up,
+            down,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn projection_payload_len(&self) -> Option<u64> {
+        [self.gate, self.up, self.down]
+            .into_iter()
+            .map(ProjectionRange::end)
+            .try_fold(0u64, |max_end, end| end.map(|e| max_end.max(e)))
+    }
+
+    pub fn validate(&self, payload_len: u64) -> Result<(), String> {
+        if self.version != UTH2_VERSION {
+            return Err(format!("unsupported UTH2 version {}", self.version));
+        }
+        if self.d_model == 0 || self.d_ff == 0 {
+            return Err("UTH2 d_model and d_ff must be non-zero".to_string());
+        }
+        let ranges = [("gate", self.gate), ("up", self.up), ("down", self.down)];
+        for (name, r) in ranges {
+            if r.dtype == UthDtypeId::Mixed {
+                return Err(format!("UTH2 {name} projection cannot use mixed dtype id"));
+            }
+            if r.len == 0 {
+                return Err(format!("UTH2 {name} projection has zero length"));
+            }
+            let end = r
+                .end()
+                .ok_or_else(|| format!("UTH2 {name} range overflows u64"))?;
+            if end > payload_len {
+                return Err(format!(
+                    "UTH2 {name} range {}..{} exceeds payload length {}",
+                    r.offset, end, payload_len
+                ));
+            }
+        }
+        let mut sorted = [
+            (
+                "gate",
+                self.gate.offset,
+                self.gate.end().unwrap_or(u64::MAX),
+            ),
+            ("up", self.up.offset, self.up.end().unwrap_or(u64::MAX)),
+            (
+                "down",
+                self.down.offset,
+                self.down.end().unwrap_or(u64::MAX),
+            ),
+        ];
+        sorted.sort_by_key(|(_, start, _)| *start);
+        for pair in sorted.windows(2) {
+            let (left_name, _left_start, left_end) = pair[0];
+            let (right_name, right_start, _right_end) = pair[1];
+            if left_end > right_start {
+                return Err(format!(
+                    "UTH2 projection ranges overlap: {left_name} and {right_name}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn to_bytes(&self) -> [u8; UTH2_BYTES] {
+        let mut buf = [0u8; UTH2_BYTES];
+        buf[0..4].copy_from_slice(&UTH2_MAGIC);
+        buf[4..6].copy_from_slice(&self.version.to_le_bytes());
+        buf[6..8].copy_from_slice(&3u16.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.d_model.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.d_ff.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.flags.to_le_bytes());
+
+        for (i, (role, p)) in [(0u8, self.gate), (1u8, self.up), (2u8, self.down)]
+            .into_iter()
+            .enumerate()
+        {
+            let off = 24 + i * 24;
+            buf[off] = p.dtype as u8;
+            buf[off + 1] = role;
+            buf[off + 4..off + 12].copy_from_slice(&p.offset.to_le_bytes());
+            buf[off + 12..off + 20].copy_from_slice(&p.len.to_le_bytes());
+            buf[off + 20..off + 24].copy_from_slice(&p.weights.to_le_bytes());
+        }
+        buf
+    }
+
+    pub fn write_padded(&self, block_align: usize, dst: &mut Vec<u8>) {
+        let start = dst.len();
+        dst.extend_from_slice(&self.to_bytes());
+        let after = dst.len() - start;
+        let pad = if block_align > 0 {
+            (block_align - (after % block_align)) % block_align
+        } else {
+            0
+        };
+        dst.resize(dst.len() + pad, 0);
+    }
+
+    pub fn probe(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < UTH2_BYTES || bytes[0..4] != UTH2_MAGIC {
+            return None;
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != UTH2_VERSION {
+            return None;
+        }
+        let projection_count = u16::from_le_bytes([bytes[6], bytes[7]]);
+        if projection_count != 3 {
+            return None;
+        }
+        let d_model = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let d_ff = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let flags = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+
+        let read_projection = |idx: usize, expected_role: u8| -> Option<ProjectionRange> {
+            let off = 24 + idx * 24;
+            if bytes[off + 1] != expected_role {
+                return None;
+            }
+            let dtype = UthDtypeId::from_u8(bytes[off])?;
+            let offset = u64::from_le_bytes([
+                bytes[off + 4],
+                bytes[off + 5],
+                bytes[off + 6],
+                bytes[off + 7],
+                bytes[off + 8],
+                bytes[off + 9],
+                bytes[off + 10],
+                bytes[off + 11],
+            ]);
+            let len = u64::from_le_bytes([
+                bytes[off + 12],
+                bytes[off + 13],
+                bytes[off + 14],
+                bytes[off + 15],
+                bytes[off + 16],
+                bytes[off + 17],
+                bytes[off + 18],
+                bytes[off + 19],
+            ]);
+            let weights = u32::from_le_bytes([
+                bytes[off + 20],
+                bytes[off + 21],
+                bytes[off + 22],
+                bytes[off + 23],
+            ]);
+            Some(ProjectionRange {
+                dtype,
+                offset,
+                len,
+                weights,
+            })
+        };
+
+        Some(Self {
+            version,
+            d_model,
+            d_ff,
+            flags,
+            gate: read_projection(0, 0)?,
+            up: read_projection(1, 1)?,
+            down: read_projection(2, 2)?,
+        })
+    }
+
+    pub fn strip<'a>(bytes: &'a [u8], block_align: usize) -> Option<(Self, &'a [u8])> {
+        let h = Self::probe(bytes)?;
+        let prefix = if (h.flags & UTH_FLAG_PAGE_ALIGNED_PAYLOAD) != 0 && block_align > 0 {
+            let pad = (block_align - (UTH2_BYTES % block_align)) % block_align;
+            UTH2_BYTES + pad
+        } else {
+            UTH2_BYTES
+        };
+        if prefix > bytes.len() {
+            return None;
+        }
+        let payload = &bytes[prefix..];
+        h.validate(payload.len() as u64).ok()?;
+        Some((h, payload))
     }
 }
 
@@ -170,8 +417,11 @@ impl TensorHeader {
             | WeightDtype::Q4K
             | WeightDtype::Q4_0
             | WeightDtype::Q8_0
+            | WeightDtype::Q5K
+            | WeightDtype::Q6K
             | WeightDtype::BF16
-            | WeightDtype::MXFP4 => (0, 0),
+            | WeightDtype::MXFP4
+            | WeightDtype::Mixed => (0, 0),
         };
         Self {
             version: UTH_VERSION,
@@ -244,12 +494,8 @@ impl TensorHeader {
         let mut shape = [0u32; UTH_MAX_RANK];
         for i in 0..UTH_MAX_RANK {
             let off = 8 + i * 4;
-            shape[i] = u32::from_le_bytes([
-                bytes[off],
-                bytes[off + 1],
-                bytes[off + 2],
-                bytes[off + 3],
-            ]);
+            shape[i] =
+                u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         }
         let quant_scale_offset = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
         let quant_scale_count = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
@@ -331,6 +577,9 @@ mod tests {
             WeightDtype::Q4K,
             WeightDtype::Q4_0,
             WeightDtype::Q8_0,
+            WeightDtype::Q5K,
+            WeightDtype::Q6K,
+            WeightDtype::Mixed,
         ] {
             let h = TensorHeader::for_swiglu_expert(dtype, 512, 2048);
             let bytes = h.to_bytes();
@@ -358,6 +607,9 @@ mod tests {
             WeightDtype::Q4K,
             WeightDtype::Q4_0,
             WeightDtype::Q8_0,
+            WeightDtype::Q5K,
+            WeightDtype::Q6K,
+            WeightDtype::Mixed,
         ] {
             let h = TensorHeader::for_swiglu_expert(dtype, 512, 2048);
             assert_eq!(
@@ -399,6 +651,122 @@ mod tests {
         assert!(parsed.is_none());
         assert_eq!(payload.as_ptr(), buf.as_ptr());
         assert_eq!(payload.len(), buf.len());
+    }
+
+    #[test]
+    fn mixed_uth2_roundtrip_and_strip() {
+        let h = MixedExpertHeader::new(
+            64,
+            128,
+            ProjectionRange {
+                dtype: UthDtypeId::Q4_0,
+                offset: 0,
+                len: 18,
+                weights: 32,
+            },
+            ProjectionRange {
+                dtype: UthDtypeId::Q4K,
+                offset: 18,
+                len: 144,
+                weights: 256,
+            },
+            ProjectionRange {
+                dtype: UthDtypeId::Q5K,
+                offset: 162,
+                len: 176,
+                weights: 256,
+            },
+        );
+        let bytes = h.to_bytes();
+        assert_eq!(&bytes[..4], &UTH2_MAGIC);
+        assert_eq!(MixedExpertHeader::probe(&bytes), Some(h));
+
+        let mut file = Vec::new();
+        h.write_padded(4096, &mut file);
+        assert_eq!(file.len(), 4096);
+        file.extend_from_slice(&vec![0xA5; 338]);
+        file.extend_from_slice(&vec![0; 4096 - 338]);
+        let (parsed, payload) = MixedExpertHeader::strip(&file, 4096).expect("strip UTH2");
+        assert_eq!(parsed, h);
+        assert_eq!(payload[0], 0xA5);
+        assert_eq!(parsed.projection_payload_len(), Some(338));
+    }
+
+    #[test]
+    fn mixed_uth2_rejects_unknown_or_malformed_ranges() {
+        let h = MixedExpertHeader::new(
+            64,
+            128,
+            ProjectionRange {
+                dtype: UthDtypeId::Q4_0,
+                offset: 0,
+                len: 18,
+                weights: 32,
+            },
+            ProjectionRange {
+                dtype: UthDtypeId::Q4K,
+                offset: 18,
+                len: 144,
+                weights: 256,
+            },
+            ProjectionRange {
+                dtype: UthDtypeId::Q5K,
+                offset: 162,
+                len: 176,
+                weights: 256,
+            },
+        );
+        let mut future = h.to_bytes();
+        future[4..6].copy_from_slice(&3u16.to_le_bytes());
+        assert!(MixedExpertHeader::probe(&future).is_none());
+
+        let overlapping = MixedExpertHeader::new(
+            64,
+            128,
+            ProjectionRange {
+                dtype: UthDtypeId::Q4_0,
+                offset: 0,
+                len: 18,
+                weights: 32,
+            },
+            ProjectionRange {
+                dtype: UthDtypeId::Q4K,
+                offset: 8,
+                len: 144,
+                weights: 256,
+            },
+            ProjectionRange {
+                dtype: UthDtypeId::Q5K,
+                offset: 162,
+                len: 176,
+                weights: 256,
+            },
+        );
+        assert!(overlapping.validate(4096).is_err());
+
+        let past_end = MixedExpertHeader::new(
+            64,
+            128,
+            ProjectionRange {
+                dtype: UthDtypeId::Q4_0,
+                offset: 0,
+                len: 18,
+                weights: 32,
+            },
+            ProjectionRange {
+                dtype: UthDtypeId::Q4K,
+                offset: 18,
+                len: 144,
+                weights: 256,
+            },
+            ProjectionRange {
+                dtype: UthDtypeId::Q5K,
+                offset: 162,
+                len: 176,
+                weights: 256,
+            },
+        );
+        assert!(past_end.validate(200).is_err());
     }
 
     #[test]
@@ -452,7 +820,8 @@ mod tests {
         // 16 K iterations × up to 256 B input ≈ 4 MiB of work, well
         // under the test budget even in debug mode.
         for trial in 0..16384u64 {
-            let len = ((trial.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % (4 * UTH_BYTES as u64 + 1)) as usize;
+            let len =
+                ((trial.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % (4 * UTH_BYTES as u64 + 1)) as usize;
             let mut buf = vec![0u8; len];
             fill_random(&mut buf, trial.wrapping_mul(0x1234_5678) ^ 0xDEAD_BEEF);
             // Property: probe must return either `None` or a fully-
@@ -491,7 +860,8 @@ mod tests {
         // a panic here would crash the engine on a malformed
         // expert_<id>.bin.
         for trial in 0..4096u64 {
-            let len = ((trial.wrapping_mul(0x517C_C1B7_2722_0A95)) % (3 * UTH_BYTES as u64 + 1)) as usize;
+            let len =
+                ((trial.wrapping_mul(0x517C_C1B7_2722_0A95)) % (3 * UTH_BYTES as u64 + 1)) as usize;
             let mut buf = vec![0u8; len];
             fill_random(&mut buf, trial.wrapping_add(0x0123_4567_89AB_CDEF));
             for block in [16usize, 64, 512, 4096] {

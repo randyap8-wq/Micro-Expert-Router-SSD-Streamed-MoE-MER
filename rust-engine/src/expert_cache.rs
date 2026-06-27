@@ -14,7 +14,7 @@
 
 use crate::buffer_pool::PooledBuffer;
 use crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
-use crate::tensor_header::TensorHeader;
+use crate::tensor_header::{MixedExpertHeader, TensorHeader};
 use lru::LruCache;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
@@ -50,6 +50,8 @@ pub struct ExpertResident {
     /// begins. `0` for legacy blobs and synthetic fixtures (no UTH);
     /// `UTH_BYTES + page padding` for `gguf-convert` blobs.
     payload_offset: usize,
+    /// Parsed mixed-projection header, present only for UTH2 experts.
+    mixed_layout: Option<MixedExpertHeader>,
     /// Monotonic hit counter (Phase 2 — three-tier memory hierarchy).
     ///
     /// Bumped by [`GpuExpertCache::observe_ram_hit`] / engine routing
@@ -83,25 +85,38 @@ impl ExpertResident {
     /// payload offset once. Subsequent calls to [`Self::data`] do not
     /// re-probe the header.
     pub fn new(id: u32, buffer: PooledBuffer) -> Self {
-        let payload_offset = {
+        let (payload_offset, mixed_layout) = {
             let raw = buffer.as_slice();
-            let (_, payload) = TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN);
+            let (payload, mixed) =
+                if let Some((h, payload)) = MixedExpertHeader::strip(raw, DEFAULT_BLOCK_ALIGN) {
+                    (payload, Some(h))
+                } else {
+                    let (_, payload) = TensorHeader::strip(raw, DEFAULT_BLOCK_ALIGN);
+                    (payload, None)
+                };
             // `payload` is either `raw` unchanged (offset 0) or a suffix
             // subslice of it; derive the offset directly from the slice
             // lengths rather than via pointer arithmetic.
             let payload_offset = raw.len() - payload.len();
             debug_assert!(payload_offset <= raw.len());
-            payload_offset
+            (payload_offset, mixed)
         };
         Self {
             id,
             buffer,
             payload_offset,
+            mixed_layout,
             hits: AtomicU64::new(0),
             q4_0_padded: OnceCell::new(),
             heat_bits: AtomicU64::new(0.0f64.to_bits()),
             heat_last_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Parsed UTH2 layout for mixed-projection experts.
+    #[inline]
+    pub fn mixed_layout(&self) -> Option<MixedExpertHeader> {
+        self.mixed_layout
     }
 
     /// Increment the resident's monotonic hit counter and return the
@@ -492,7 +507,11 @@ pub struct GpuResident {
 
 impl GpuResident {
     pub fn new(id: u32, bytes: Vec<u8>) -> Self {
-        Self { id, bytes, dtype: crate::inference::WeightDtype::F32 }
+        Self {
+            id,
+            bytes,
+            dtype: crate::inference::WeightDtype::F32,
+        }
     }
 
     /// Like [`GpuResident::new`] but tagging the bytes with their
@@ -528,7 +547,7 @@ impl crate::backend::GpuStorage for GpuResident {
         self.bytes.len()
     }
     fn as_wgpu_buffer(&self) -> Option<&wgpu::Buffer> {
-        None   // GpuResident is host-side only; VRAM lives in VramExpertEntry
+        None // GpuResident is host-side only; VRAM lives in VramExpertEntry
     }
 }
 
@@ -821,8 +840,6 @@ impl GpuExpertCache {
         true
     }
 
-
-
     /// Number of Anchor Core entries.
     pub fn anchor_len(&self) -> usize {
         self.inner.lock().anchor.len()
@@ -856,8 +873,12 @@ mod tests {
         let pool = BufferPool::new(3, 4096, 4096);
         let cache = ExpertCache::new(2);
 
-        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
-        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(0, &pool))
+            .map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(1, &pool))
+            .map_err(|_| panic!("insert failed"));
         // 2 of 3 slots are occupied by cache entries; 1 is free.
         let scratch = pool.try_acquire().expect("third slot free");
         assert!(pool.try_acquire().is_none());
@@ -883,12 +904,18 @@ mod tests {
     fn hit_updates_recency() {
         let pool = BufferPool::new(3, 4096, 4096);
         let cache = ExpertCache::new(2);
-        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
-        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(0, &pool))
+            .map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(1, &pool))
+            .map_err(|_| panic!("insert failed"));
         // Touch expert 0 -> it is now most-recently used.
         let _ = cache.get(0);
         // Inserting expert 2 should evict 1, not 0.
-        let _ = cache.insert(make(2, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(2, &pool))
+            .map_err(|_| panic!("insert failed"));
         assert!(cache.contains(0));
         assert!(!cache.contains(1));
         assert!(cache.contains(2));
@@ -898,8 +925,12 @@ mod tests {
     fn pinned_entry_is_protected_from_eviction() {
         let pool = BufferPool::new(4, 4096, 4096);
         let cache = ExpertCache::new(2);
-        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
-        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(0, &pool))
+            .map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(1, &pool))
+            .map_err(|_| panic!("insert failed"));
         // Pin expert 0. Even though it's the LRU, expert 1 must be
         // evicted instead when expert 2 is inserted.
         cache.pin(0);
@@ -919,8 +950,12 @@ mod tests {
     fn evict_lru_returns_none_when_all_pinned() {
         let pool = BufferPool::new(4, 4096, 4096);
         let cache = ExpertCache::new(2);
-        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
-        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(0, &pool))
+            .map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(1, &pool))
+            .map_err(|_| panic!("insert failed"));
         cache.pin(0);
         cache.pin(1);
         assert!(cache.evict_lru().is_none());
@@ -936,13 +971,17 @@ mod tests {
         cache.set_cost_aware(true);
         // A (id 0) is loaded and then hit many times → high heat. The
         // hits make it most-recently-used for now.
-        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(0, &pool))
+            .map_err(|_| panic!("insert failed"));
         for _ in 0..10 {
             let _ = cache.get(0);
         }
         // B (id 1) is loaded cold. Now A is the LRU (B is MRU) but A is
         // far hotter than B.
-        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(1, &pool))
+            .map_err(|_| panic!("insert failed"));
         // Inserting C evicts a victim: cost-aware keeps hot A, drops cold B.
         let evicted = match cache.insert(make(2, &pool)) {
             Ok(Some(e)) => e,
@@ -964,17 +1003,24 @@ mod tests {
         // legacy strict-LRU outcome: the hot-but-LRU expert is evicted.
         let pool = BufferPool::new(4, 4096, 4096);
         let cache = ExpertCache::new(2);
-        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(0, &pool))
+            .map_err(|_| panic!("insert failed"));
         for _ in 0..10 {
             let _ = cache.get(0);
         }
-        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(1, &pool))
+            .map_err(|_| panic!("insert failed"));
         // 0 is MRU after the hits, then 1 is inserted → 1 MRU, 0 LRU.
         let evicted = match cache.insert(make(2, &pool)) {
             Ok(Some(e)) => e,
             other => panic!("expected an eviction, got ok={}", other.is_ok()),
         };
-        assert_eq!(evicted.id, 0, "pure LRU should evict the least-recently-used expert (0)");
+        assert_eq!(
+            evicted.id, 0,
+            "pure LRU should evict the least-recently-used expert (0)"
+        );
         assert!(!cache.contains(0));
         assert!(cache.contains(1));
         assert!(cache.contains(2));
@@ -989,7 +1035,9 @@ mod tests {
         let cache = ExpertCache::new(2);
         cache.set_cost_aware(true);
         // Make expert 0 very hot, then never touch it again.
-        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(0, &pool))
+            .map_err(|_| panic!("insert failed"));
         for _ in 0..20 {
             let _ = cache.get(0);
         }
@@ -1018,8 +1066,12 @@ mod tests {
         // `Err(resident)` rather than silently evicting a pinned slot.
         let pool = BufferPool::new(4, 4096, 4096);
         let cache = ExpertCache::new(2);
-        let _ = cache.insert(make(0, &pool)).map_err(|_| panic!("insert failed"));
-        let _ = cache.insert(make(1, &pool)).map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(0, &pool))
+            .map_err(|_| panic!("insert failed"));
+        let _ = cache
+            .insert(make(1, &pool))
+            .map_err(|_| panic!("insert failed"));
         cache.pin(0);
         cache.pin(1);
         let new_resident = make(2, &pool);

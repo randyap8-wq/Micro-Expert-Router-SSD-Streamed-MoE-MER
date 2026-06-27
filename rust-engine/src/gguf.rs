@@ -17,15 +17,13 @@
 //!   (the engine never opens GGUFs on the inference hot path).
 //!
 //! The dtype map covers the five GGUF types the engine cares about:
-//! `F32(0)`, `F16(1)`, `Q4_0(2)`, `Q4_K(12)`, `Q6_K(14)`. Of those,
-//! `F32`/`F16`/`Q4_0`/`Q4_K` map onto the engine's [`WeightDtype`]; `Q6_K`
-//! is recognised so [`GgufFile::open`] doesn't fail on a Q6_K-quantised
-//! source, but tensors of that dtype are surfaced as `None` from
-//! [`GgufFile::tensor_dtype`] (and the loader falls back to seeded init
-//! for those tensors).
+//! `F32(0)`, `F16(1)`, `Q4_0(2)`, `Q4_K(12)`, `Q5_K(13)`, `Q6_K(14)`.
+//! Expert projections in those supported formats can stay quantized
+//! through conversion and runtime execution.
 
 use crate::inference::{
     WeightDtype, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS,
+    Q5K_BLOCK_BYTES, Q5K_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS,
 };
 use std::collections::HashMap;
 use std::fs::File;
@@ -184,8 +182,7 @@ impl GgufFile {
     }
 
     /// Map this tensor's GGML dtype onto the engine's [`WeightDtype`].
-    /// `None` for dtypes the engine doesn't currently support (e.g.
-    /// Q6_K, Q5_*, Q8_*, the *_K variants other than Q4_K).
+    /// `None` for dtypes the engine doesn't currently support.
     pub fn tensor_dtype(&self, name: &str) -> Option<WeightDtype> {
         let info = self.tensors.get(name)?;
         ggml_to_weight_dtype(info.ggml_dtype)
@@ -194,7 +191,9 @@ impl GgufFile {
     /// Architecture string from `general.architecture` (e.g.
     /// `"llama"`, `"mixtral"`), if present.
     pub fn architecture(&self) -> Option<&str> {
-        self.metadata.get("general.architecture").and_then(|v| v.as_str())
+        self.metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
     }
 
     /// Whether the named tensor exists in this GGUF.
@@ -264,7 +263,13 @@ impl GgufFile {
             })?;
             tensors.insert(
                 name.clone(),
-                GgufTensorInfo { name, shape, ggml_dtype, offset, byte_len },
+                GgufTensorInfo {
+                    name,
+                    shape,
+                    ggml_dtype,
+                    offset,
+                    byte_len,
+                },
             );
         }
 
@@ -297,6 +302,8 @@ pub fn ggml_to_weight_dtype(code: u32) -> Option<WeightDtype> {
         ggml_dtype::BF16 => Some(WeightDtype::BF16),
         ggml_dtype::Q4_0 => Some(WeightDtype::Q4_0),
         ggml_dtype::Q4_K => Some(WeightDtype::Q4K),
+        ggml_dtype::Q5_K => Some(WeightDtype::Q5K),
+        ggml_dtype::Q6_K => Some(WeightDtype::Q6K),
         ggml_dtype::Q8_0 => Some(WeightDtype::Q8_0),
         _ => None,
     }
@@ -321,6 +328,11 @@ fn ggml_tensor_bytes(code: u32, shape: &[u64]) -> Option<u64> {
             let blocks = elems.div_ceil(Q4K_BLOCK_ELEMS as u64);
             blocks.checked_mul(Q4K_BLOCK_BYTES as u64)?
         }
+        ggml_dtype::Q5_K => {
+            // 256-element super-blocks of 176 bytes each.
+            let blocks = elems.div_ceil(Q5K_BLOCK_ELEMS as u64);
+            blocks.checked_mul(Q5K_BLOCK_BYTES as u64)?
+        }
         ggml_dtype::Q8_0 => {
             // 32-element blocks of 34 bytes each (1 f16 scale + 32 i8).
             let blocks = elems.div_ceil(32);
@@ -328,8 +340,8 @@ fn ggml_tensor_bytes(code: u32, shape: &[u64]) -> Option<u64> {
         }
         ggml_dtype::Q6_K => {
             // 256-element super-blocks of 210 bytes each.
-            let blocks = elems.div_ceil(256);
-            blocks.checked_mul(210)?
+            let blocks = elems.div_ceil(Q6K_BLOCK_ELEMS as u64);
+            blocks.checked_mul(Q6K_BLOCK_BYTES as u64)?
         }
         _ => return None,
     };
@@ -413,12 +425,8 @@ fn read_value_typed<'a>(cur: &mut Cursor<'a>, version: u32, ty: u32) -> io::Resu
         x if x == GgufType::INT32 as u32 => GgufValue::I32(cur.read_u32()? as i32),
         x if x == GgufType::UINT64 as u32 => GgufValue::U64(cur.read_u64()?),
         x if x == GgufType::INT64 as u32 => GgufValue::I64(cur.read_u64()? as i64),
-        x if x == GgufType::FLOAT32 as u32 => {
-            GgufValue::F32(f32::from_bits(cur.read_u32()?))
-        }
-        x if x == GgufType::FLOAT64 as u32 => {
-            GgufValue::F64(f64::from_bits(cur.read_u64()?))
-        }
+        x if x == GgufType::FLOAT32 as u32 => GgufValue::F32(f32::from_bits(cur.read_u32()?)),
+        x if x == GgufType::FLOAT64 as u32 => GgufValue::F64(f64::from_bits(cur.read_u64()?)),
         x if x == GgufType::BOOL as u32 => GgufValue::Bool(cur.read_u8()? != 0),
         x if x == GgufType::STRING as u32 => GgufValue::String(read_string(cur, version)?),
         x if x == GgufType::ARRAY as u32 => {
@@ -618,7 +626,9 @@ impl GgufStreamReader {
 
     /// `general.architecture`, if present.
     pub fn architecture(&self) -> Option<&str> {
-        self.metadata.get("general.architecture").and_then(|v| v.as_str())
+        self.metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
     }
 
     /// Try to parse the full header out of `bytes`. Returns `Ok(None)`
@@ -1018,7 +1028,9 @@ pub trait GgufSource {
         ggml_to_weight_dtype(info.ggml_dtype)
     }
     fn architecture(&self) -> Option<&str> {
-        self.metadata().get("general.architecture").and_then(|v| v.as_str())
+        self.metadata()
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
     }
     fn has_tensor(&self, name: &str) -> bool {
         self.tensor_info(name).is_some()
@@ -1285,20 +1297,42 @@ mod tests {
     #[test]
     fn rejects_non_gguf_magic() {
         let bytes = b"NOPE\0\0\0\0".to_vec();
-        let err = GgufFile::parse(bytes).err().expect("expected parse failure");
+        let err = GgufFile::parse(bytes)
+            .err()
+            .expect("expected parse failure");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn ggml_dtype_mapping_covers_supported_codes() {
-        assert_eq!(ggml_to_weight_dtype(ggml_dtype::F32), Some(WeightDtype::F32));
-        assert_eq!(ggml_to_weight_dtype(ggml_dtype::F16), Some(WeightDtype::F16));
-        assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q4_0), Some(WeightDtype::Q4_0));
-        assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q4_K), Some(WeightDtype::Q4K));
-        assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q8_0), Some(WeightDtype::Q8_0));
-        // Unsupported: Q6_K, Q5_K, etc. — surface as None so the loader
-        // can skip / fall back to seeded init.
-        assert_eq!(ggml_to_weight_dtype(ggml_dtype::Q6_K), None);
+        assert_eq!(
+            ggml_to_weight_dtype(ggml_dtype::F32),
+            Some(WeightDtype::F32)
+        );
+        assert_eq!(
+            ggml_to_weight_dtype(ggml_dtype::F16),
+            Some(WeightDtype::F16)
+        );
+        assert_eq!(
+            ggml_to_weight_dtype(ggml_dtype::Q4_0),
+            Some(WeightDtype::Q4_0)
+        );
+        assert_eq!(
+            ggml_to_weight_dtype(ggml_dtype::Q4_K),
+            Some(WeightDtype::Q4K)
+        );
+        assert_eq!(
+            ggml_to_weight_dtype(ggml_dtype::Q8_0),
+            Some(WeightDtype::Q8_0)
+        );
+        assert_eq!(
+            ggml_to_weight_dtype(ggml_dtype::Q5_K),
+            Some(WeightDtype::Q5K)
+        );
+        assert_eq!(
+            ggml_to_weight_dtype(ggml_dtype::Q6_K),
+            Some(WeightDtype::Q6K)
+        );
     }
 
     #[test]
@@ -1308,10 +1342,7 @@ mod tests {
         // surface the same metadata, tensor info, and body bytes
         // as the eager `GgufFile::parse` path.
         let bytes = synth_gguf();
-        let dir = std::env::temp_dir().join(format!(
-            "gguf-stream-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("gguf-stream-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("synth.gguf");
         std::fs::write(&path, &bytes).unwrap();
