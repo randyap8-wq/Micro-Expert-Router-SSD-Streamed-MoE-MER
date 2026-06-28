@@ -4379,10 +4379,13 @@ impl Engine {
         );
         if r.dtype == WeightDtype::Mixed {
             info!(
-                "mixed quant:   experts={}  projections={}  dequant_fallbacks={}  unsupported_dispatches={}",
+                "mixed quant:   experts={}  projections={}  q4k_opt={}  q5k_opt={}  q6k_opt={}  scalar_fallbacks={}  unsupported_dispatches={}",
                 crate::inference::mixed_expert_dispatches(),
                 crate::inference::quantized_projection_dispatches(),
-                crate::inference::mixed_dequant_fallbacks(),
+                crate::inference::mixed_q4k_optimized_projection_dispatches(),
+                crate::inference::mixed_q5k_optimized_projection_dispatches(),
+                crate::inference::mixed_q6k_optimized_projection_dispatches(),
+                crate::inference::mixed_scalar_fallbacks(),
                 crate::inference::unsupported_quant_dispatches()
             );
         }
