@@ -34,12 +34,12 @@
 //! without forcing a stub call site.
 #![allow(dead_code)]
 
-
 use crate::expert_cache::ExpertResident;
 use crate::inference::{forward_candle_tensors, ExpertWeights, HiddenState};
 use candle_core::{Device, Tensor};
 use half::f16;
 use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
 
 /// RMSNorm: `y = x * rsqrt(mean(x^2) + eps) * weight`.
 ///
@@ -158,8 +158,7 @@ impl YarnRope {
     /// "correction dim").
     fn correction_dim(num_rotations: f32, dim: usize, base: f32, max_pos: usize) -> f32 {
         let d = dim as f32;
-        d * (max_pos as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln()
-            / (2.0 * base.ln())
+        d * (max_pos as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln())
     }
 
     /// Build the blended inverse-frequency table + attention factor for
@@ -211,7 +210,140 @@ impl YarnRope {
         // the canonical YaRN `0.1*ln(factor)+1`.
         let attn_factor = yarn_get_mscale(scaling.factor, scaling.mscale)
             / yarn_get_mscale(scaling.factor, scaling.mscale_all_dim);
-        Some(Self { inv_freq, attn_factor })
+        Some(Self {
+            inv_freq,
+            attn_factor,
+        })
+    }
+}
+
+/// Default number of absolute positions backed by per-position RoPE rows.
+///
+/// Qwen3-Coder long-context checkpoints commonly advertise very large
+/// `rope_theta` values and production prompts can move well past the old
+/// 4K/8K window. The cache is lazy: this allocates `OnceLock` slots, not
+/// sin/cos rows, so the steady RSS scales with positions actually touched.
+pub const DEFAULT_ROPE_CACHE_POSITIONS: usize = 262_144;
+
+#[derive(Debug, Clone, Copy)]
+struct RopePair {
+    sin: f32,
+    cos: f32,
+}
+
+/// Shared rotary-embedding cache for one `(rope_dim, base, scaling)` shape.
+///
+/// The expensive inverse-frequency table is computed once. Sin/cos rows are
+/// materialised lazily by absolute position and then reused by every layer/head
+/// sharing this cache. `OnceLock` keeps already-materialised positions on a
+/// lock-free fast path; only the first use of a new position performs work.
+#[derive(Debug)]
+pub struct RopeCache {
+    rope_dim: usize,
+    base_bits: u32,
+    yarn: bool,
+    attn_factor_bits: u32,
+    inv_freq: Box<[f32]>,
+    rows: Box<[OnceLock<Box<[RopePair]>>]>,
+}
+
+impl RopeCache {
+    pub fn new(rope_dim: usize, base: f32, yarn: Option<&YarnRope>) -> Option<Self> {
+        Self::with_positions(rope_dim, base, yarn, DEFAULT_ROPE_CACHE_POSITIONS)
+    }
+
+    pub fn with_positions(
+        rope_dim: usize,
+        base: f32,
+        yarn: Option<&YarnRope>,
+        positions: usize,
+    ) -> Option<Self> {
+        if rope_dim == 0 || !rope_dim.is_multiple_of(2) {
+            return None;
+        }
+        let half = rope_dim / 2;
+        let (inv_freq, attn_factor, has_yarn) = match yarn {
+            Some(y) if y.inv_freq.len() == half => {
+                (y.inv_freq.clone().into_boxed_slice(), y.attn_factor, true)
+            }
+            Some(_) => return None,
+            None => {
+                let mut inv_freq = Vec::with_capacity(half);
+                for i in 0..half {
+                    inv_freq.push(1.0 / base.powf(2.0 * i as f32 / rope_dim as f32));
+                }
+                (inv_freq.into_boxed_slice(), 1.0, false)
+            }
+        };
+        let rows = std::iter::repeat_with(OnceLock::new)
+            .take(positions)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Some(Self {
+            rope_dim,
+            base_bits: base.to_bits(),
+            yarn: has_yarn,
+            attn_factor_bits: attn_factor.to_bits(),
+            inv_freq,
+            rows,
+        })
+    }
+
+    #[inline]
+    fn matches(&self, rope_dim: usize, base: f32, yarn: Option<&YarnRope>) -> bool {
+        self.rope_dim == rope_dim
+            && self.base_bits == base.to_bits()
+            && self.yarn == yarn.is_some()
+            && self.attn_factor_bits
+                == yarn
+                    .map(|y| y.attn_factor.to_bits())
+                    .unwrap_or(1.0f32.to_bits())
+    }
+
+    fn compute_row(&self, pos: usize) -> Box<[RopePair]> {
+        let pos_f = pos as f32;
+        let m = f32::from_bits(self.attn_factor_bits);
+        self.inv_freq
+            .iter()
+            .map(|&inv| {
+                let theta = pos_f * inv;
+                let (sin, cos) = theta.sin_cos();
+                RopePair {
+                    sin: sin * m,
+                    cos: cos * m,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    pub fn apply_inplace(&self, v: &mut [f32], pos: usize) {
+        debug_assert_eq!(v.len(), self.rope_dim);
+        if let Some(slot) = self.rows.get(pos) {
+            let row = slot.get_or_init(|| self.compute_row(pos));
+            apply_rope_pairs(v, row);
+        } else {
+            let row = self.compute_row(pos);
+            apply_rope_pairs(v, &row);
+        }
+    }
+
+    #[cfg(test)]
+    fn materialized_positions(&self) -> usize {
+        self.rows.iter().filter(|slot| slot.get().is_some()).count()
+    }
+}
+
+#[inline]
+fn apply_rope_pairs(v: &mut [f32], pairs: &[RopePair]) {
+    let half = v.len() / 2;
+    debug_assert_eq!(pairs.len(), half);
+    for i in 0..half {
+        let a = v[i];
+        let b = v[i + half];
+        let p = pairs[i];
+        v[i] = a * p.cos - b * p.sin;
+        v[i + half] = a * p.sin + b * p.cos;
     }
 }
 
@@ -223,7 +355,11 @@ pub fn apply_rope_scaled_inplace(v: &mut [f32], pos: usize, yarn: &YarnRope) {
     let head_dim = v.len();
     debug_assert!(head_dim % 2 == 0, "RoPE requires even head_dim");
     let half = head_dim / 2;
-    debug_assert_eq!(yarn.inv_freq.len(), half, "YarnRope built for a different head_dim");
+    debug_assert_eq!(
+        yarn.inv_freq.len(),
+        half,
+        "YarnRope built for a different head_dim"
+    );
     let pos_f = pos as f32;
     let m = yarn.attn_factor;
     for i in 0..half {
@@ -245,6 +381,26 @@ pub fn apply_rope_maybe_scaled(v: &mut [f32], pos: usize, base: f32, yarn: Optio
         Some(y) => apply_rope_scaled_inplace(v, pos, y),
         None => apply_rope_inplace(v, pos, base),
     }
+}
+
+/// Cached RoPE dispatcher for hot attention paths. Falls back to the
+/// compatibility implementation if a caller supplies no cache or a cache
+/// for a different rotary shape.
+#[inline]
+pub fn apply_rope_with_cache(
+    v: &mut [f32],
+    pos: usize,
+    base: f32,
+    yarn: Option<&YarnRope>,
+    cache: Option<&RopeCache>,
+) {
+    if let Some(cache) = cache {
+        if cache.matches(v.len(), base, yarn) {
+            cache.apply_inplace(v, pos);
+            return;
+        }
+    }
+    apply_rope_maybe_scaled(v, pos, base, yarn);
 }
 
 /// One layer's **paged** KV cache (per-layer). Stores keys and values
@@ -404,17 +560,17 @@ impl KvCache {
     ///
     /// No-op for `pos == 0` and for global-attention layers (which never
     /// call this), preserving the original full-history behaviour.
-pub fn evict_before(&mut self, pos: usize) {
-    let pos = pos.min(self.seq_len);
-    // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
-    // absolute positions `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully
-    // below `pos` iff `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`.
-    // So the number of logical blocks entirely below `pos` is
-    // `pos / BLOCK`.
-    let target_evicted = pos / PAGED_BLOCK_TOKENS;
-    if target_evicted <= self.evicted_blocks {
-        return;
-    }
+    pub fn evict_before(&mut self, pos: usize) {
+        let pos = pos.min(self.seq_len);
+        // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
+        // absolute positions `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully
+        // below `pos` iff `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`.
+        // So the number of logical blocks entirely below `pos` is
+        // `pos / BLOCK`.
+        let target_evicted = pos / PAGED_BLOCK_TOKENS;
+        if target_evicted <= self.evicted_blocks {
+            return;
+        }
         let blocks_to_drop = target_evicted - self.evicted_blocks;
         // Never drop more than what is physically resident (defensive;
         // `blocks_to_drop` is bounded by the resident block count in practice).
@@ -574,6 +730,10 @@ pub struct MultiHeadSelfAttention {
     /// `1/base^(2i/d)` schedule. Built from the checkpoint's
     /// `rope_scaling` block; `None` keeps the standard rotation.
     pub rope_yarn: Option<YarnRope>,
+    /// Shared model-level RoPE table for this `(rope_dim, base, scaling)`
+    /// shape. Manual tests may leave it `None`, in which case the
+    /// compatibility path computes sin/cos directly.
+    pub rope_cache: Option<Arc<RopeCache>>,
     /// Optional additive bias for the Q projection (`attention_bias = true`
     /// in config, e.g. GPT-OSS), length `num_heads * head_dim`. Added to the
     /// raw `wq · x` projection before QK-Norm and RoPE. `None` for every
@@ -616,6 +776,17 @@ impl MultiHeadSelfAttention {
     /// Equals [`Self::q_dim`] when `v_head_dim == head_dim`.
     pub fn attn_out_dim(&self) -> usize {
         self.num_heads * self.v_head_dim
+    }
+
+    #[inline]
+    fn apply_rope_to(&self, v: &mut [f32], pos: usize) {
+        apply_rope_with_cache(
+            v,
+            pos,
+            self.rope_base,
+            self.rope_yarn.as_ref(),
+            self.rope_cache.as_deref(),
+        );
     }
 
     /// Apply the optional post-attention output scale (MiMo-V2-Flash
@@ -668,13 +839,19 @@ impl MultiHeadSelfAttention {
     /// the bias is part of the linear layer.
     fn apply_qkv_bias(&self, q: &mut [f32], k: &mut [f32], v: &mut [f32]) {
         if let Some(bq) = self.bq.as_ref() {
-            for (qi, bi) in q.iter_mut().zip(bq.iter()) { *qi += bi; }
+            for (qi, bi) in q.iter_mut().zip(bq.iter()) {
+                *qi += bi;
+            }
         }
         if let Some(bk) = self.bk.as_ref() {
-            for (ki, bi) in k.iter_mut().zip(bk.iter()) { *ki += bi; }
+            for (ki, bi) in k.iter_mut().zip(bk.iter()) {
+                *ki += bi;
+            }
         }
         if let Some(bv) = self.bv.as_ref() {
-            for (vi, bi) in v.iter_mut().zip(bv.iter()) { *vi += bi; }
+            for (vi, bi) in v.iter_mut().zip(bv.iter()) {
+                *vi += bi;
+            }
         }
     }
 
@@ -682,7 +859,9 @@ impl MultiHeadSelfAttention {
     /// when `bo` is `None`.
     fn apply_o_bias(&self, out: &mut [f32]) {
         if let Some(bo) = self.bo.as_ref() {
-            for (oi, bi) in out.iter_mut().zip(bo.iter()) { *oi += bi; }
+            for (oi, bi) in out.iter_mut().zip(bo.iter()) {
+                *oi += bi;
+            }
         }
     }
 
@@ -699,15 +878,19 @@ impl MultiHeadSelfAttention {
         let mut k = matmul_row_major(&self.wk, x, self.kv_dim(), self.d_model);
         let mut v = matmul_row_major(&self.wv, x, self.v_proj_dim(), self.d_model);
         if let Some(bk) = self.bk.as_ref() {
-            for (ki, bi) in k.iter_mut().zip(bk.iter()) { *ki += bi; }
+            for (ki, bi) in k.iter_mut().zip(bk.iter()) {
+                *ki += bi;
+            }
         }
         if let Some(bv) = self.bv.as_ref() {
-            for (vi, bi) in v.iter_mut().zip(bv.iter()) { *vi += bi; }
+            for (vi, bi) in v.iter_mut().zip(bv.iter()) {
+                *vi += bi;
+            }
         }
         self.apply_k_norm(&mut k);
         for h in 0..self.num_kv_heads {
             let s = h * self.head_dim;
-            apply_rope_maybe_scaled(&mut k[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+            self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
         }
         (k, v)
     }
@@ -747,13 +930,13 @@ impl MultiHeadSelfAttention {
         debug_assert_eq!(kv.kv_dim, self.kv_dim());
         debug_assert_eq!(kv.v_dim, self.v_proj_dim());
 
-        let q_dim  = self.q_dim();
+        let q_dim = self.q_dim();
         let kv_dim = self.kv_dim();
         let v_head_dim = self.v_head_dim;
         let cpu_attend = |q: &[f32], kv: &KvCache| -> Vec<f32> {
             let mut attn_out = vec![0.0f32; self.attn_out_dim()];
-            let scale   = 1.0 / (self.head_dim as f32).sqrt();
-            let t_max   = kv.seq_len;
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+            let t_max = kv.seq_len;
             // Per-layer attention mode: Global attends to all past
             // positions; SlidingWindow restricts the sum to the last
             // `window` positions. Equivalent to the previous match on
@@ -770,15 +953,17 @@ impl MultiHeadSelfAttention {
 
             for h in 0..self.num_heads {
                 let kv_head = h * self.num_kv_heads / self.num_heads;
-                let q_head  = &q[h * self.head_dim..(h + 1) * self.head_dim];
-                let span    = t_max - t_start;
+                let q_head = &q[h * self.head_dim..(h + 1) * self.head_dim];
+                let span = t_max - t_start;
                 let mut scores = Vec::with_capacity(span);
 
                 for t in t_start..t_max {
                     let k_t = kv.key(t);
                     let k_h = &k_t[kv_head * self.head_dim..(kv_head + 1) * self.head_dim];
                     let mut s = 0.0f32;
-                    for j in 0..self.head_dim { s += q_head[j] * k_h[j]; }
+                    for j in 0..self.head_dim {
+                        s += q_head[j] * k_h[j];
+                    }
                     scores.push(s * scale);
                 }
                 // Attention sink bias (MiMo-V2-Flash `add_swa_attention_sink_bias`):
@@ -800,10 +985,12 @@ impl MultiHeadSelfAttention {
                 // MiMo-V2-Flash); the attention output head is the same width.
                 let out_h = &mut attn_out[h * v_head_dim..(h + 1) * v_head_dim];
                 for (idx, score) in scores.iter().enumerate() {
-                    let t   = t_start + idx;
+                    let t = t_start + idx;
                     let v_t = kv.value(t);
                     let v_h = &v_t[kv_head * v_head_dim..(kv_head + 1) * v_head_dim];
-                    for j in 0..v_head_dim { out_h[j] += score * v_h[j]; }
+                    for j in 0..v_head_dim {
+                        out_h[j] += score * v_h[j];
+                    }
                 }
             }
             attn_out
@@ -817,32 +1004,23 @@ impl MultiHeadSelfAttention {
             // Q bias (GPT-OSS `attention_bias`) before QK-Norm / RoPE; K and
             // V biases are applied inside `project_kv`.
             if let Some(bq) = self.bq.as_ref() {
-                for (qi, bi) in q.iter_mut().zip(bq.iter()) { *qi += bi; }
+                for (qi, bi) in q.iter_mut().zip(bq.iter()) {
+                    *qi += bi;
+                }
             }
             // QK-Norm (Qwen3): per-head RMSNorm on Q *before* RoPE.
-            crate::stage_timing::time_optional(
-                timings,
-                crate::stage_timing::RMS_NORM,
-                || self.apply_q_norm(&mut q),
-            );
+            crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                self.apply_q_norm(&mut q)
+            });
             // RoPE rotates only the first `rope_dim` dims of each head
             // (partial rotary on MiMo-V2-Flash; `rope_dim == head_dim`
             // elsewhere ⇒ full rotation).
-            crate::stage_timing::time_optional(
-                timings,
-                crate::stage_timing::ROPE,
-                || {
-                    for h in 0..self.num_heads {
-                        let s = h * self.head_dim;
-                        apply_rope_maybe_scaled(
-                            &mut q[s..s + self.rope_dim],
-                            pos,
-                            self.rope_base,
-                            self.rope_yarn.as_ref(),
-                        );
-                    }
-                },
-            );
+            crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
+                for h in 0..self.num_heads {
+                    let s = h * self.head_dim;
+                    self.apply_rope_to(&mut q[s..s + self.rope_dim], pos);
+                }
+            });
             // K/V projection (+ bias, QK-Norm, RoPE) is split here only
             // when benchmark stage timings are active; the untimed path
             // keeps using the shared helper that speculative KV preview
@@ -868,26 +1046,15 @@ impl MultiHeadSelfAttention {
                         *vi += bi;
                     }
                 }
-                crate::stage_timing::time_optional(
-                    timings,
-                    crate::stage_timing::RMS_NORM,
-                    || self.apply_k_norm(&mut k),
-                );
-                crate::stage_timing::time_optional(
-                    timings,
-                    crate::stage_timing::ROPE,
-                    || {
-                        for h in 0..self.num_kv_heads {
-                            let s = h * self.head_dim;
-                            apply_rope_maybe_scaled(
-                                &mut k[s..s + self.rope_dim],
-                                pos,
-                                self.rope_base,
-                                self.rope_yarn.as_ref(),
-                            );
-                        }
-                    },
-                );
+                crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                    self.apply_k_norm(&mut k)
+                });
+                crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
+                    for h in 0..self.num_kv_heads {
+                        let s = h * self.head_dim;
+                        self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
+                    }
+                });
                 (k, v)
             } else {
                 self.project_kv(x, pos)
@@ -901,16 +1068,12 @@ impl MultiHeadSelfAttention {
             // Post-attention output scale (MiMo-V2-Flash 0.707), applied
             // before the output projection.
             self.apply_value_scale(&mut attn_out);
-            crate::stage_timing::time_optional(
-                timings,
-                crate::stage_timing::O_PROJECTION,
-                || {
-                    let mut out =
-                        matmul_row_major(&self.wo, &attn_out, self.d_model, self.attn_out_dim());
-                    self.apply_o_bias(&mut out);
-                    out
-                },
-            )
+            crate::stage_timing::time_optional(timings, crate::stage_timing::O_PROJECTION, || {
+                let mut out =
+                    matmul_row_major(&self.wo, &attn_out, self.d_model, self.attn_out_dim());
+                self.apply_o_bias(&mut out);
+                out
+            })
         };
         if !backend.is_gpu() || self.v_head_dim != self.head_dim || self.sink_bias.is_some() {
             // The GPU attention kernels assume a symmetric K/V head dim, so
@@ -923,43 +1086,84 @@ impl MultiHeadSelfAttention {
         }
 
         // ── Helpers: f32 ↔ f16 conversion at the backend boundary ────────────
-        let to_f16 = |v: &[f32]| -> Vec<f16> {
-            v.iter().map(|&f| f16::from_f32(f)).collect()
-        };
-        let to_f32 = |v: &[f16]| -> Vec<f32> {
-            v.iter().map(|h| h.to_f32()).collect()
-        };
+        let to_f16 = |v: &[f32]| -> Vec<f16> { v.iter().map(|&f| f16::from_f32(f)).collect() };
+        let to_f32 = |v: &[f16]| -> Vec<f32> { v.iter().map(|h| h.to_f32()).collect() };
 
         let x_f16 = to_f16(x);
         let wq_f16 = to_f16(&self.wq);
         let wk_f16 = to_f16(&self.wk);
         let wv_f16 = to_f16(&self.wv);
 
-        let mut q_f16  = vec![f16::ZERO; q_dim];
-        let mut k_f16  = vec![f16::ZERO; kv_dim];
-        let mut v_f16  = vec![f16::ZERO; kv_dim];
+        let mut q_f16 = vec![f16::ZERO; q_dim];
+        let mut k_f16 = vec![f16::ZERO; kv_dim];
+        let mut v_f16 = vec![f16::ZERO; kv_dim];
 
-        if backend.matmul_into(
-            TensorView { data: &wq_f16, rows: q_dim,  cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut q_f16, rows: q_dim, cols: 1 },
-        ).is_err() {
+        if backend
+            .matmul_into(
+                TensorView {
+                    data: &wq_f16,
+                    rows: q_dim,
+                    cols: self.d_model,
+                },
+                TensorView {
+                    data: &x_f16,
+                    rows: self.d_model,
+                    cols: 1,
+                },
+                &mut TensorViewMut {
+                    data: &mut q_f16,
+                    rows: q_dim,
+                    cols: 1,
+                },
+            )
+            .is_err()
+        {
             return cpu_forward();
         }
 
-        if backend.matmul_into(
-            TensorView { data: &wk_f16, rows: kv_dim, cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut k_f16, rows: kv_dim, cols: 1 },
-        ).is_err() {
+        if backend
+            .matmul_into(
+                TensorView {
+                    data: &wk_f16,
+                    rows: kv_dim,
+                    cols: self.d_model,
+                },
+                TensorView {
+                    data: &x_f16,
+                    rows: self.d_model,
+                    cols: 1,
+                },
+                &mut TensorViewMut {
+                    data: &mut k_f16,
+                    rows: kv_dim,
+                    cols: 1,
+                },
+            )
+            .is_err()
+        {
             return cpu_forward();
         }
 
-        if backend.matmul_into(
-            TensorView { data: &wv_f16, rows: kv_dim, cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut v_f16, rows: kv_dim, cols: 1 },
-        ).is_err() {
+        if backend
+            .matmul_into(
+                TensorView {
+                    data: &wv_f16,
+                    rows: kv_dim,
+                    cols: self.d_model,
+                },
+                TensorView {
+                    data: &x_f16,
+                    rows: self.d_model,
+                    cols: 1,
+                },
+                &mut TensorViewMut {
+                    data: &mut v_f16,
+                    rows: kv_dim,
+                    cols: 1,
+                },
+            )
+            .is_err()
+        {
             return cpu_forward();
         }
 
@@ -980,11 +1184,11 @@ impl MultiHeadSelfAttention {
 
         for h in 0..self.num_heads {
             let s = h * self.head_dim;
-            apply_rope_maybe_scaled(&mut q[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+            self.apply_rope_to(&mut q[s..s + self.rope_dim], pos);
         }
         for h in 0..self.num_kv_heads {
             let s = h * self.head_dim;
-            apply_rope_maybe_scaled(&mut k[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+            self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
         }
 
         // ── 3) KV insert + attention ──────────────────────────────────────────
@@ -1000,12 +1204,23 @@ impl MultiHeadSelfAttention {
         kv.append(&k, &v);
         let seq_len = kv.seq_len;
 
-        if backend.kv_cache_insert(
-            layer_idx,
-            pos,
-            TensorView { data: &k_f16_rope, rows: 1, cols: kv_dim },
-            TensorView { data: &v_f16_rope, rows: 1, cols: kv_dim },
-        ).is_err() {
+        if backend
+            .kv_cache_insert(
+                layer_idx,
+                pos,
+                TensorView {
+                    data: &k_f16_rope,
+                    rows: 1,
+                    cols: kv_dim,
+                },
+                TensorView {
+                    data: &v_f16_rope,
+                    rows: 1,
+                    cols: kv_dim,
+                },
+            )
+            .is_err()
+        {
             let mut attn_out = cpu_attend(&q, kv);
             self.apply_value_scale(&mut attn_out);
             let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
@@ -1015,12 +1230,23 @@ impl MultiHeadSelfAttention {
 
         let q_f16_rope = to_f16(&q);
         let mut out_f16 = vec![f16::ZERO; q_dim];
-        let attn_out = if backend.kv_attend(
-            layer_idx,
-            TensorView { data: &q_f16_rope, rows: self.num_heads, cols: self.head_dim },
-            seq_len,
-            &mut TensorViewMut { data: &mut out_f16, rows: self.num_heads, cols: self.head_dim },
-        ).is_ok() {
+        let attn_out = if backend
+            .kv_attend(
+                layer_idx,
+                TensorView {
+                    data: &q_f16_rope,
+                    rows: self.num_heads,
+                    cols: self.head_dim,
+                },
+                seq_len,
+                &mut TensorViewMut {
+                    data: &mut out_f16,
+                    rows: self.num_heads,
+                    cols: self.head_dim,
+                },
+            )
+            .is_ok()
+        {
             to_f32(&out_f16)
         } else {
             cpu_attend(&q, kv)
@@ -1032,15 +1258,30 @@ impl MultiHeadSelfAttention {
         self.apply_value_scale(&mut attn_out);
 
         // ── 4) Output projection via backend ──────────────────────────────────
-        let wo_f16      = to_f16(&self.wo);
-        let attn_f16    = to_f16(&attn_out);
+        let wo_f16 = to_f16(&self.wo);
+        let attn_f16 = to_f16(&attn_out);
         let mut out_f16 = vec![f16::ZERO; self.d_model];
 
-        let mut out = if backend.matmul_into(
-            TensorView { data: &wo_f16,   rows: self.d_model, cols: q_dim },
-            TensorView { data: &attn_f16, rows: q_dim,        cols: 1 },
-            &mut TensorViewMut { data: &mut out_f16, rows: self.d_model, cols: 1 },
-        ).is_ok() {
+        let mut out = if backend
+            .matmul_into(
+                TensorView {
+                    data: &wo_f16,
+                    rows: self.d_model,
+                    cols: q_dim,
+                },
+                TensorView {
+                    data: &attn_f16,
+                    rows: q_dim,
+                    cols: 1,
+                },
+                &mut TensorViewMut {
+                    data: &mut out_f16,
+                    rows: self.d_model,
+                    cols: 1,
+                },
+            )
+            .is_ok()
+        {
             to_f32(&out_f16)
         } else {
             matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim)
@@ -1202,7 +1443,11 @@ impl LMHead {
             vocab_size * d_model,
             "lm_head weights must be [vocab_size, d_model]"
         );
-        Self { weights, vocab_size, d_model }
+        Self {
+            weights,
+            vocab_size,
+            d_model,
+        }
     }
 
     /// Compute logits = `W · hidden`.
@@ -1316,7 +1561,13 @@ impl SharedExpert {
         let tensors = ExpertWeights::from_floats(&weights, d_model, d_ff)
             .ok()
             .and_then(|w| w.to_candle_tensors(&Device::Cpu).ok());
-        Some(Self { d_model, d_ff, weights, gate_inp, tensors })
+        Some(Self {
+            d_model,
+            d_ff,
+            weights,
+            gate_inp,
+            tensors,
+        })
     }
 
     /// Run the dense SwiGLU forward over `x` (the MoE-normalised hidden
@@ -1448,11 +1699,10 @@ impl TransformerLayer {
         backend: &crate::backend::BackendBox,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> Vec<f32> {
-        let normed = crate::stage_timing::time_optional(
-            timings,
-            crate::stage_timing::RMS_NORM,
-            || self.rms_attn.forward(hidden),
-        );
+        let normed =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                self.rms_attn.forward(hidden)
+            });
         let attn_out = match self.mla.as_ref() {
             // DeepSeek-V3 multi-head latent attention runs on CPU against
             // the layer's compressed latent KV cache. The GPU attention
@@ -1503,16 +1753,14 @@ impl TransformerLayer {
         hidden: &[f32],
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> (Vec<f32>, crate::gating::RoutingDecision) {
-        let normed = crate::stage_timing::time_optional(
-            timings,
-            crate::stage_timing::RMS_NORM,
-            || self.rms_moe.forward(hidden),
-        );
-        let routing = crate::stage_timing::time_optional(
-            timings,
-            crate::stage_timing::ROUTER_GATE,
-            || self.gate.route(&normed),
-        );
+        let normed =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                self.rms_moe.forward(hidden)
+            });
+        let routing =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::ROUTER_GATE, || {
+                self.gate.route(&normed)
+            });
         (normed, routing)
     }
 
@@ -1562,11 +1810,9 @@ impl TransformerLayer {
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> Option<HiddenState> {
         self.shared_expert.as_ref().map(|se| {
-            crate::stage_timing::time_optional(
-                timings,
-                crate::stage_timing::EXPERT_COMPUTE,
-                || se.forward(normed),
-            )
+            crate::stage_timing::time_optional(timings, crate::stage_timing::EXPERT_COMPUTE, || {
+                se.forward(normed)
+            })
         })
     }
 
@@ -1593,11 +1839,10 @@ impl TransformerLayer {
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> Option<Vec<f32>> {
         let ffn = self.dense_ffn.as_ref()?;
-        let normed = crate::stage_timing::time_optional(
-            timings,
-            crate::stage_timing::RMS_NORM,
-            || self.rms_moe.forward(hidden),
-        );
+        let normed =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                self.rms_moe.forward(hidden)
+            });
         let out = crate::stage_timing::time_optional(
             timings,
             crate::stage_timing::EXPERT_COMPUTE,
@@ -1772,6 +2017,23 @@ mod tests {
         assert!((n_before - n_after).abs() < 1e-4);
     }
 
+    #[test]
+    fn rope_cache_matches_unscaled_reference_and_reuses_position() {
+        let cache = RopeCache::with_positions(16, 10_000.0, None, 32).expect("cache");
+        let original: Vec<f32> = (1..=16).map(|i| i as f32 * 0.125).collect();
+        let mut cached = original.clone();
+        let mut direct = original.clone();
+        cache.apply_inplace(&mut cached, 17);
+        apply_rope_inplace(&mut direct, 17, 10_000.0);
+        for (a, b) in cached.iter().zip(direct.iter()) {
+            assert!((a - b).abs() < 1e-6, "cached {a} direct {b}");
+        }
+        assert_eq!(cache.materialized_positions(), 1);
+        let mut cached_again = original;
+        cache.apply_inplace(&mut cached_again, 17);
+        assert_eq!(cache.materialized_positions(), 1);
+    }
+
     fn yarn_test_scaling(factor: f32) -> crate::architecture::RopeScaling {
         crate::architecture::RopeScaling {
             rope_type: "yarn".to_string(),
@@ -1822,6 +2084,21 @@ mod tests {
         // Default attention factor: 0.1 * ln(factor) + 1.
         let expected = 0.1 * 40.0f32.ln() + 1.0;
         assert!((yarn.attn_factor - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rope_cache_matches_yarn_reference() {
+        let s = yarn_test_scaling(8.0);
+        let yarn = YarnRope::from_scaling(16, 10_000.0, &s).expect("yarn config");
+        let cache = RopeCache::with_positions(16, 10_000.0, Some(&yarn), 32).expect("cache");
+        let original: Vec<f32> = (1..=16).map(|i| i as f32 * -0.075).collect();
+        let mut cached = original.clone();
+        let mut direct = original;
+        cache.apply_inplace(&mut cached, 19);
+        apply_rope_scaled_inplace(&mut direct, 19, &yarn);
+        for (a, b) in cached.iter().zip(direct.iter()) {
+            assert!((a - b).abs() < 1e-6, "cached {a} direct {b}");
+        }
     }
 
     #[test]
@@ -1911,7 +2188,10 @@ mod tests {
                 any_diff = true;
             }
         }
-        assert!(any_diff, "YaRN scaling must change attention outputs at pos > 0");
+        assert!(
+            any_diff,
+            "YaRN scaling must change attention outputs at pos > 0"
+        );
     }
 
     #[test]
@@ -1952,7 +2232,8 @@ mod tests {
         softmax_inplace(&mut v);
         let expected = 0.25;
         assert!(
-            v.iter().all(|&x| x.is_finite() && (x - expected).abs() < 1e-6),
+            v.iter()
+                .all(|&x| x.is_finite() && (x - expected).abs() < 1e-6),
             "got {v:?}"
         );
         let sum: f32 = v.iter().sum();
@@ -1969,7 +2250,9 @@ mod tests {
         let kv_dim = num_kv_heads * head_dim;
         // Use deterministic small weights so we exercise the math.
         let mk = |rows: usize, cols: usize| {
-            (0..rows * cols).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect()
+            (0..rows * cols)
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+                .collect()
         };
         let attn = MultiHeadSelfAttention {
             d_model,
@@ -1988,6 +2271,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            rope_cache: None,
             bq: None,
             bk: None,
             bv: None,
@@ -2018,7 +2302,9 @@ mod tests {
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let mk = |rows: usize, cols: usize| -> Vec<f32> {
-            (0..rows * cols).map(|i| ((i % 5) as f32 - 2.0) * 0.2).collect()
+            (0..rows * cols)
+                .map(|i| ((i % 5) as f32 - 2.0) * 0.2)
+                .collect()
         };
         let base = MultiHeadSelfAttention {
             d_model,
@@ -2037,6 +2323,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            rope_cache: None,
             bq: None,
             bk: None,
             bv: None,
@@ -2061,8 +2348,15 @@ mod tests {
         let y_plain = base.forward(&x1, 1, 0, &mut kv_a, &cpu_backend());
         let y_norm = normed.forward(&x1, 1, 0, &mut kv_b, &cpu_backend());
         assert!(y_norm.iter().all(|v| v.is_finite()));
-        let diff: f32 = y_plain.iter().zip(&y_norm).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 1e-4, "QK-Norm should change the output (diff={diff})");
+        let diff: f32 = y_plain
+            .iter()
+            .zip(&y_norm)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 1e-4,
+            "QK-Norm should change the output (diff={diff})"
+        );
     }
 
     #[test]
@@ -2139,6 +2433,7 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 rope_yarn: None,
+                rope_cache: None,
                 bq: None,
                 bk: None,
                 bv: None,
@@ -2235,6 +2530,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            rope_cache: None,
             bq: None,
             bk: None,
             bv: None,
@@ -2275,7 +2571,10 @@ mod tests {
         let _ = attn_full.forward(&small, 1, 0, &mut kv2, &cpu_backend());
         let _ = attn_full.forward(&small, 2, 0, &mut kv2, &cpu_backend());
         let y_full = attn_full.forward(&small, 3, 0, &mut kv2, &cpu_backend());
-        assert!(y_full[0] > 0.5, "full attention should see t=0 spike: {y_full:?}");
+        assert!(
+            y_full[0] > 0.5,
+            "full attention should see t=0 spike: {y_full:?}"
+        );
     }
 
     #[test]
@@ -2490,6 +2789,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            rope_cache: None,
             bq: None,
             bk: None,
             bv: None,
@@ -2500,7 +2800,11 @@ mod tests {
         // Walk past the first block boundary to exercise multi-block
         // indexing.
         let xs: Vec<Vec<f32>> = (0..(PAGED_BLOCK_TOKENS + 3))
-            .map(|t| (0..d_model).map(|j| 0.05 * (t as f32) + 0.01 * (j as f32)).collect())
+            .map(|t| {
+                (0..d_model)
+                    .map(|j| 0.05 * (t as f32) + 0.01 * (j as f32))
+                    .collect()
+            })
             .collect();
         let mut last = vec![0.0f32; d_model];
         for (pos, x) in xs.iter().enumerate() {

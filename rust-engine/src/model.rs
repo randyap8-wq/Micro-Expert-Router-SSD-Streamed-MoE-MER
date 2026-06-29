@@ -43,7 +43,8 @@ use crate::engine::Engine;
 use crate::gating::{LinearGate, ScoringFunc};
 use crate::mla::MultiHeadLatentAttention;
 use crate::transformer::{
-    KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, SharedExpert, TransformerLayer, YarnRope,
+    KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, RopeCache, SharedExpert, TransformerLayer,
+    YarnRope,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -616,6 +617,48 @@ pub struct RealModel {
     pub lm_head: LMHead,
 }
 
+type RopeCacheKey = (usize, u32, u8, u64);
+
+fn rope_cache_hash_yarn(yarn: Option<&YarnRope>) -> u64 {
+    let Some(yarn) = yarn else {
+        return 0;
+    };
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |bits: u32| {
+        h ^= bits as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(yarn.attn_factor.to_bits());
+    for &freq in &yarn.inv_freq {
+        mix(freq.to_bits());
+    }
+    h
+}
+
+fn rope_cache_key(rope_dim: usize, base: f32, yarn: Option<&YarnRope>) -> RopeCacheKey {
+    (
+        rope_dim,
+        base.to_bits(),
+        u8::from(yarn.is_some()),
+        rope_cache_hash_yarn(yarn),
+    )
+}
+
+fn shared_rope_cache(
+    caches: &mut BTreeMap<RopeCacheKey, Arc<RopeCache>>,
+    rope_dim: usize,
+    base: f32,
+    yarn: Option<&YarnRope>,
+) -> Option<Arc<RopeCache>> {
+    let key = rope_cache_key(rope_dim, base, yarn);
+    if let Some(cache) = caches.get(&key) {
+        return Some(cache.clone());
+    }
+    let cache = Arc::new(RopeCache::new(rope_dim, base, yarn)?);
+    caches.insert(key, cache.clone());
+    Some(cache)
+}
+
 impl RealModel {
     /// Build a model with deterministic, well-conditioned random weights
     /// from a seed. Used as the fallback when on-disk weights aren't
@@ -653,6 +696,7 @@ impl RealModel {
             }
         };
 
+        let mut rope_caches = BTreeMap::new();
         let layers: Vec<TransformerLayer> = (0..config.num_layers)
             .map(|layer_idx| {
                 let (q_norm, k_norm) = seed_qk_norm();
@@ -700,6 +744,12 @@ impl RealModel {
                     .rope_scaling
                     .as_ref()
                     .and_then(|s| YarnRope::from_scaling(rope_dim, layer_rope_base, s));
+                let rope_cache = shared_rope_cache(
+                    &mut rope_caches,
+                    rope_dim,
+                    layer_rope_base,
+                    rope_yarn.as_ref(),
+                );
                 TransformerLayer {
                     rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
                     attn: MultiHeadSelfAttention {
@@ -723,6 +773,7 @@ impl RealModel {
                         q_norm,
                         k_norm,
                         rope_yarn,
+                        rope_cache,
                         // Attention projection biases (GPT-OSS `attention_bias`)
                         // are seeded absent; the on-disk loader populates them
                         // when the checkpoint sets `attention_bias = true`.
@@ -4222,10 +4273,27 @@ mod tests {
             ..RealModelConfig::tiny()
         };
         let model = RealModel::new_seeded(cfg, 1);
+        let first_cache = model.layers[0]
+            .attn
+            .rope_cache
+            .as_ref()
+            .expect("standard path must carry a shared RoPE cache")
+            .clone();
         for layer in &model.layers {
             assert!(
                 layer.attn.rope_yarn.is_some(),
                 "standard path must carry YaRN"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &first_cache,
+                    layer
+                        .attn
+                        .rope_cache
+                        .as_ref()
+                        .expect("standard path must carry a shared RoPE cache")
+                ),
+                "identical layer RoPE configs should share one cache"
             );
             let mla = layer.mla.as_ref().expect("MLA seeded");
             assert!(mla.rope_yarn.is_some(), "MLA path must carry YaRN");
@@ -4239,8 +4307,19 @@ mod tests {
             );
         }
         // Without a rope_scaling block, nothing is wired.
-        let plain = RealModel::new_seeded(RealModelConfig::tiny(), 1);
+        let plain = RealModel::new_seeded(
+            RealModelConfig {
+                num_layers: 2,
+                ..RealModelConfig::tiny()
+            },
+            1,
+        );
         assert!(plain.layers.iter().all(|l| l.attn.rope_yarn.is_none()));
+        let plain_cache = plain.layers[0].attn.rope_cache.as_ref().unwrap();
+        assert!(Arc::ptr_eq(
+            plain_cache,
+            plain.layers[1].attn.rope_cache.as_ref().unwrap()
+        ));
     }
 
     /// `from_hf_config` maps a parsed Qwen3-MoE `config.json` (explicit
