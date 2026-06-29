@@ -60,8 +60,9 @@ mod transformer;
 mod tui;
 mod workload;
 
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -91,6 +92,22 @@ struct Cli {
 
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum BenchRealCacheReset {
+    /// Keep the same engine/cache across warmup and measured runs.
+    Keep,
+    /// Rebuild the runtime before every run, giving each run a cold cache.
+    FreshRuntime,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum BenchRealOutputFormat {
+    Human,
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -583,6 +600,44 @@ enum Cmd {
         #[arg(long)]
         config: PathBuf,
     },
+
+    /// Benchmark the real transformer path without starting HTTP.
+    ///
+    /// Uses the same TOML config surface as `serve`, requires
+    /// `[real_transformer] enabled = true`, and reports prompt/decode
+    /// timing separately from the legacy synthetic `run` sustained_tps
+    /// metric.
+    BenchReal {
+        /// Path to the TOML config file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Prompt text to encode and benchmark.
+        #[arg(long, conflicts_with = "request_json")]
+        prompt: Option<String>,
+        /// OpenAI-style request JSON containing `prompt`, or chat
+        /// `messages`, and optionally `max_tokens`.
+        #[arg(long, conflicts_with = "prompt")]
+        request_json: Option<PathBuf>,
+        /// Number of completion tokens to generate. Overrides
+        /// `max_tokens` from `--request-json` when both are supplied.
+        #[arg(long)]
+        output_tokens: Option<usize>,
+        /// Warmup runs to execute before measurements.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+        /// Measured runs to report.
+        #[arg(long, default_value_t = 1)]
+        measured_runs: usize,
+        /// Cache reset policy between runs.
+        #[arg(long, value_enum, default_value_t = BenchRealCacheReset::Keep)]
+        cache_reset: BenchRealCacheReset,
+        /// Force deterministic greedy decoding for benchmark parity.
+        #[arg(long)]
+        greedy: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = BenchRealOutputFormat::Human)]
+        format: BenchRealOutputFormat,
+    },
     /// Native terminal dashboard — Phase 4 of the three-tier memory
     /// hierarchy. Polls a running `serve` instance and renders a live
     /// ratatui view of the SSD → RAM → VRAM hit grid, current cache
@@ -886,6 +941,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             rt.block_on(cmd_serve(config))
         }
+        Cmd::BenchReal {
+            config,
+            prompt,
+            request_json,
+            output_tokens,
+            warmup_runs,
+            measured_runs,
+            cache_reset,
+            greedy,
+            format,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_bench_real(BenchRealArgs {
+                config,
+                prompt,
+                request_json,
+                output_tokens,
+                warmup_runs,
+                measured_runs,
+                cache_reset,
+                greedy,
+                format,
+            }))
+        }
         Cmd::GgufConvert {
             gguf_path,
             out_dir,
@@ -1037,6 +1118,896 @@ fn maybe_attach_packed_blob(
             "both packed_blob and packed_manifest must be set to enable the packed layout".into(),
         ),
         (None, None) => Ok(storage),
+    }
+}
+
+struct BenchRealArgs {
+    config: PathBuf,
+    prompt: Option<String>,
+    request_json: Option<PathBuf>,
+    output_tokens: Option<usize>,
+    warmup_runs: usize,
+    measured_runs: usize,
+    cache_reset: BenchRealCacheReset,
+    greedy: bool,
+    format: BenchRealOutputFormat,
+}
+
+struct BenchRealInput {
+    prompt: String,
+    output_tokens: usize,
+}
+
+struct BenchRealRuntime {
+    cfg: crate::config::Config,
+    engine: Arc<Engine>,
+    model: Arc<crate::model::RealModel>,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+}
+
+#[derive(Serialize)]
+struct BenchRealSuiteReport {
+    benchmark: &'static str,
+    config: String,
+    prompt: String,
+    warmup_runs: usize,
+    measured_runs: usize,
+    cache_reset: BenchRealCacheReset,
+    greedy: bool,
+    build: BenchRealBuildInfo,
+    aggregate: BenchRealAggregate,
+    runs: Vec<BenchRealRunReport>,
+}
+
+#[derive(Serialize)]
+struct BenchRealBuildInfo {
+    git_commit: String,
+    build_features: Vec<&'static str>,
+    threads: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealRunReport {
+    run_index: usize,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_api_tokens: usize,
+    model_forward_evaluations: usize,
+    lm_head_evaluations: usize,
+    prompt_seconds: f64,
+    prompt_tps: f64,
+    decode_seconds: f64,
+    decode_tps: f64,
+    time_to_first_token_seconds: f64,
+    total_seconds: f64,
+    decode_token_latency_p50_ms: f64,
+    decode_token_latency_p95_ms: f64,
+    decode_token_latency_p99_ms: f64,
+    decode_token_latency_max_ms: f64,
+    cache_hits: u64,
+    cache_misses: u64,
+    hit_rate: f64,
+    ssd_bytes: u64,
+    ssd_stall_seconds: f64,
+    rss_bytes: Option<u64>,
+    output_token_ids: Vec<u32>,
+    output_text: String,
+    stage_timings_seconds: std::collections::BTreeMap<String, f64>,
+}
+
+#[derive(Serialize)]
+struct BenchRealAggregate {
+    prompt_seconds_mean: f64,
+    prompt_tps_mean: f64,
+    decode_seconds_mean: f64,
+    decode_tps_mean: f64,
+    time_to_first_token_p50_seconds: f64,
+    total_seconds_mean: f64,
+    cache_hits_total: u64,
+    cache_misses_total: u64,
+    hit_rate: f64,
+    ssd_bytes_total: u64,
+    output_token_parity: bool,
+}
+
+async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let input = load_bench_real_input(&args)?;
+    if args.measured_runs == 0 {
+        return Err("bench-real requires --measured-runs > 0".into());
+    }
+
+    if args.cache_reset == BenchRealCacheReset::Keep {
+        let runtime = build_bench_real_runtime(&args.config).await?;
+        let params = bench_sampling_params(&runtime.cfg, args.greedy);
+        for i in 0..args.warmup_runs {
+            let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
+                .await?;
+        }
+        let mut runs = Vec::with_capacity(args.measured_runs);
+        for i in 0..args.measured_runs {
+            runs.push(
+                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
+                    .await?,
+            );
+        }
+        emit_bench_real_report(&args, input, runs)?;
+    } else {
+        for i in 0..args.warmup_runs {
+            let runtime = build_bench_real_runtime(&args.config).await?;
+            let params = bench_sampling_params(&runtime.cfg, args.greedy);
+            let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
+                .await?;
+        }
+        let mut runs = Vec::with_capacity(args.measured_runs);
+        for i in 0..args.measured_runs {
+            let runtime = build_bench_real_runtime(&args.config).await?;
+            let params = bench_sampling_params(&runtime.cfg, args.greedy);
+            runs.push(
+                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
+                    .await?,
+            );
+        }
+        emit_bench_real_report(&args, input, runs)?;
+    }
+    Ok(())
+}
+
+fn load_bench_real_input(
+    args: &BenchRealArgs,
+) -> Result<BenchRealInput, Box<dyn std::error::Error>> {
+    let mut json_max_tokens = None;
+    let prompt = if let Some(prompt) = args.prompt.as_ref() {
+        prompt.clone()
+    } else if let Some(path) = args.request_json.as_ref() {
+        let body = std::fs::read_to_string(path)?;
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+        json_max_tokens = value
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        if let Some(prompt) = value.get("prompt").and_then(|v| v.as_str()) {
+            prompt.to_string()
+        } else if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
+            flatten_bench_messages(messages)
+        } else {
+            return Err(
+                "--request-json must contain a string `prompt` or chat `messages` array".into(),
+            );
+        }
+    } else {
+        return Err("bench-real requires either --prompt or --request-json".into());
+    };
+    if prompt.is_empty() {
+        return Err("bench-real prompt must be non-empty".into());
+    }
+    let output_tokens = args.output_tokens.or(json_max_tokens).unwrap_or(16);
+    if output_tokens == 0 {
+        return Err("bench-real requires output token count > 0".into());
+    }
+    Ok(BenchRealInput {
+        prompt,
+        output_tokens,
+    })
+}
+
+fn flatten_bench_messages(messages: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user");
+        let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        out.push_str(role);
+        out.push_str(": ");
+        out.push_str(content);
+        out.push('\n');
+    }
+    out
+}
+
+fn bench_sampling_params(
+    cfg: &crate::config::Config,
+    greedy: bool,
+) -> crate::sampling::SamplingParams {
+    if greedy {
+        crate::sampling::SamplingParams::greedy()
+    } else {
+        cfg.sampling.to_params()
+    }
+}
+
+async fn build_bench_real_runtime(
+    config_path: &Path,
+) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
+    use crate::config::Config;
+    use crate::metrics::Metrics;
+    use crate::tokenizer::Tokenizer;
+
+    let mut cfg = Config::from_file(config_path)?;
+    if !cfg.real_transformer.enabled {
+        return Err("bench-real requires [real_transformer] enabled = true".into());
+    }
+    if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu
+        || cfg.gpu_cache.enabled
+    {
+        return Err(
+            "bench-real is CPU-only for this sprint; disable real_transformer.compute_offload = \"gpu\" and [gpu_cache].enabled"
+                .into(),
+        );
+    }
+    if cfg.distributed.enabled {
+        return Err(
+            "bench-real runs the local direct real-model path; disable distributed.enabled".into(),
+        );
+    }
+    if cfg.real_transformer.weights_dir.is_none() {
+        return Err("bench-real requires real_transformer.weights_dir; seeded fallback benchmarks are not production measurements".into());
+    }
+    if !cfg.real_transformer.strict_weights {
+        warn!(
+            "real_transformer.strict_weights is false; benchmark may include seeded fallback tensors"
+        );
+    }
+
+    let (resolved_architecture, resolved_first_k_dense_replace, resolved_advanced) =
+        reconcile_bench_real_config(&mut cfg)?;
+
+    crate::backend::install_default();
+    {
+        let b = crate::backend::current();
+        info!(
+            backend = b.device_name(),
+            compute_plane = b.compute_plane(),
+            "bench-real math backend installed"
+        );
+    }
+
+    if !cfg.model.data_dir.is_dir() {
+        return Err(format!(
+            "data dir {} does not exist; run `gen-data` or the extractor first",
+            cfg.model.data_dir.display()
+        )
+        .into());
+    }
+
+    let storage = NvmeStorage::new(StorageConfig {
+        base_path: cfg.model.data_dir.clone(),
+        expert_size: cfg.model.expert_size,
+        block_align: cfg.storage.block_align,
+        use_direct_io: !cfg.storage.no_direct,
+        num_experts_per_layer: if cfg.model.num_layers > 1 {
+            Some(cfg.model.num_experts)
+        } else {
+            None
+        },
+    })?;
+    let storage = maybe_attach_packed_blob(
+        storage,
+        cfg.storage.packed_blob.as_deref(),
+        cfg.storage.packed_manifest.as_deref(),
+        !cfg.storage.no_direct,
+        cfg.model.expert_size,
+    )?;
+    let storage = Arc::new(storage);
+    let total_experts_for_files =
+        (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts);
+    if !storage.is_packed() {
+        storage.warmup_fds(0..total_experts_for_files)?;
+    }
+
+    let pipeline_depth = cfg.storage.pipeline_depth.max(1) as usize;
+    let shadow_slots = cfg.storage.predict_fanout.saturating_mul(pipeline_depth);
+    let primary_slots = cfg.storage.cache_slots + 1;
+    let pool = if shadow_slots > 0 {
+        BufferPool::new_with_shadow(
+            primary_slots,
+            shadow_slots,
+            cfg.model.expert_size,
+            cfg.storage.block_align,
+        )
+    } else {
+        BufferPool::new(
+            primary_slots,
+            cfg.model.expert_size,
+            cfg.storage.block_align,
+        )
+    };
+    let cache = {
+        let num_layers = cfg.model.num_layers.max(1);
+        let per_layer = cfg.model.num_experts.max(1);
+        let total = cfg.storage.cache_slots.max(1);
+        let base = total / num_layers;
+        let extra = total % num_layers;
+        let caps: Vec<usize> = (0..num_layers)
+            .map(|i| base + if i < extra { 1 } else { 0 })
+            .collect();
+        if num_layers == 1 {
+            Arc::new(MultiLayerExpertCache::single_layer(total))
+        } else {
+            Arc::new(MultiLayerExpertCache::with_capacities(caps, per_layer))
+        }
+    };
+    let total_experts: u32 = (cfg.model.num_layers as u32)
+        .saturating_mul(cfg.model.num_experts)
+        .max(cfg.model.num_experts);
+    let predictor = Arc::new(PredictiveLoader::new(
+        total_experts,
+        cfg.storage.predict_fanout,
+        resolve_predict_min_prob(cfg.storage.predict_min_prob, total_experts),
+        0xC0FFEE,
+    ));
+
+    let rt = &cfg.real_transformer;
+    let head_dim = if rt.head_dim == 0 {
+        cfg.model.d_model / rt.num_heads
+    } else {
+        rt.head_dim
+    };
+    let num_kv_heads = if rt.num_kv_heads == 0 {
+        rt.num_heads
+    } else {
+        rt.num_kv_heads
+    };
+    let model_cfg = crate::model::RealModelConfig {
+        d_model: cfg.model.d_model,
+        d_ff: cfg.model.d_ff,
+        num_heads: rt.num_heads,
+        num_kv_heads,
+        head_dim,
+        vocab_size: rt.vocab_size,
+        num_layers: cfg.model.num_layers,
+        num_experts: cfg.model.num_experts as usize,
+        top_k: cfg.model.top_k,
+        rope_base: rt.rope_base,
+        rms_eps: rt.rms_eps,
+        window_size: if rt.window_size == 0 {
+            None
+        } else {
+            Some(rt.window_size)
+        },
+        architecture: resolved_architecture,
+        first_k_dense_replace: resolved_first_k_dense_replace,
+        advanced: resolved_advanced,
+    };
+    let model = Arc::new(crate::model::RealModel::from_dir_auto_with_options(
+        model_cfg,
+        rt.weights_dir.as_ref().expect("weights_dir checked above"),
+        rt.seed,
+        crate::model::RealModelLoadOptions {
+            strict_weights: rt.strict_weights,
+        },
+    )?);
+
+    info!(
+        num_experts = model.layers[0].gate.num_experts,
+        d_model = model.layers[0].gate.d_model,
+        top_k = model.layers[0].gate.top_k,
+        "bench-real routing: LinearGate wired from real model"
+    );
+    let router = crate::gating::Router::Linear(Arc::new(model.layers[0].gate.clone()));
+    let metrics = Metrics::new();
+    let mut engine_builder = Engine::with_options(
+        cache,
+        pool,
+        storage,
+        router,
+        predictor,
+        ModelShape {
+            d_model: cfg.model.d_model,
+            d_ff: cfg.model.d_ff,
+            hidden_seed: 0xC0FFEE,
+        },
+        EngineOptions {
+            io_only: false,
+            dtype: cfg.model.dtype,
+            partial_load_fraction: cfg.storage.partial_load_fraction,
+            pin_after_observations: cfg.storage.pin_after_observations,
+            use_qmm_for_q4: true,
+            max_concurrent_prefetches: cfg.real_transformer.max_concurrent_prefetches,
+            max_fetch_yields: cfg.real_transformer.max_fetch_yields,
+            prefetch_governor: cfg.predictive.prefetch_governor,
+            prefetch_precision_floor: cfg.predictive.prefetch_precision_floor,
+            prefetch_contention_weight: cfg.predictive.prefetch_contention_weight,
+            cost_aware_eviction: cfg.predictive.cost_aware_eviction,
+            pregate_enabled: cfg.predictive.pregate_enabled,
+            collect_route_profile: false,
+        },
+    );
+    engine_builder = engine_builder.with_pipeline_depth(cfg.storage.pipeline_depth);
+    if cfg.predictive.locality_enabled {
+        let window = cfg
+            .predictive
+            .locality_window
+            .saturating_mul(cfg.model.num_layers.max(1));
+        let monitor = Arc::new(LocalityMonitor::new(total_experts, window));
+        engine_builder =
+            engine_builder.with_locality_monitor(monitor, cfg.predictive.locality_threshold_pct);
+    }
+    if cfg.predictive.speculator_enabled {
+        let top_k = if cfg.predictive.speculator_top_k == 0 {
+            cfg.model.top_k
+        } else {
+            cfg.predictive.speculator_top_k
+        };
+        let spec = Arc::new(NeuralSpeculator::new(
+            cfg.model.d_model,
+            cfg.predictive.speculator_hidden_dim,
+            total_experts,
+            0xC0FFEE,
+        ));
+        engine_builder = engine_builder.with_speculator(spec, top_k);
+    }
+    if cfg.predictive.affinity_enabled {
+        let affinity = Arc::new(LayeredExpertAffinity::new(
+            cfg.model.num_layers.max(1),
+            cfg.model.num_experts,
+        ));
+        engine_builder = engine_builder.with_affinity(
+            affinity,
+            cfg.predictive.affinity_neighbors_k,
+            cfg.predictive.affinity_decay_epoch,
+        );
+    }
+    if cfg.predictive.static_residency_fraction > 0.0 {
+        let profile = match cfg.predictive.static_residency_profile.as_ref() {
+            Some(path) => Some(crate::residency::ResidencyProfile::load_json(
+                std::path::Path::new(path),
+            )?),
+            None => None,
+        };
+        engine_builder = engine_builder.with_static_residency(
+            cfg.predictive.static_residency_fraction,
+            cfg.predictive.static_residency_warmup_tokens,
+            profile,
+        );
+    }
+    if cfg.predictive.pregate_enabled {
+        let pregate = Arc::new(crate::pregate::PerLayerPreGate::new(
+            cfg.model.num_layers.max(1),
+            cfg.model.top_k,
+        ));
+        engine_builder = engine_builder.with_pregate(pregate);
+    }
+    let engine = Arc::new(engine_builder.with_metrics(metrics));
+
+    let tokenizer = match cfg.tokenizer.path.as_ref() {
+        Some(p) => match Tokenizer::from_file(p) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                warn!(path = %p.display(), error = %e, "tokenizer load failed; falling back to byte tokenizer");
+                Arc::new(Tokenizer::bytes())
+            }
+        },
+        None => {
+            info!("no tokenizer.json configured; using byte-level fallback tokenizer");
+            Arc::new(Tokenizer::bytes())
+        }
+    };
+
+    Ok(BenchRealRuntime {
+        cfg,
+        engine,
+        model,
+        tokenizer,
+    })
+}
+
+fn reconcile_bench_real_config(
+    cfg: &mut crate::config::Config,
+) -> Result<
+    (
+        crate::architecture::Architecture,
+        usize,
+        crate::model::AdvancedConfig,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let mut resolved_architecture = crate::architecture::Architecture::Mixtral;
+    let mut resolved_first_k_dense_replace = 0usize;
+    let mut resolved_advanced = crate::model::AdvancedConfig::default();
+    if let Some(arch_str) = cfg.real_transformer.architecture.clone() {
+        resolved_architecture = crate::architecture::Architecture::from_model_type(&arch_str)
+            .ok_or_else(|| {
+                format!(
+                    "[real_transformer] architecture = \"{arch_str}\" is not a recognised model_type"
+                )
+            })?;
+    } else if let Some(dir) = cfg.real_transformer.weights_dir.clone() {
+        match crate::architecture::HfConfig::from_dir(&dir) {
+            Ok(Some(hf)) => {
+                info!(
+                    architecture = ?hf.architecture,
+                    "config.json detected; reconciling bench-real hyperparameters from checkpoint"
+                );
+                resolved_architecture = hf.architecture;
+                resolved_first_k_dense_replace = hf.first_k_dense_replace.unwrap_or(0);
+                resolved_advanced = crate::model::RealModelConfig::from_hf_config(&hf).advanced;
+                crate::inference::set_swiglu_limit(resolved_advanced.swiglu_limit);
+                cfg.model.d_model = hf.hidden_size;
+                cfg.model.d_ff = hf.resolved_d_ff();
+                cfg.model.num_layers = hf.num_hidden_layers;
+                cfg.model.num_experts = hf.num_routed_experts.unwrap_or(1).max(1) as u32;
+                cfg.model.top_k = hf
+                    .num_experts_per_tok
+                    .unwrap_or(1)
+                    .clamp(1, cfg.model.num_experts.max(1) as usize);
+                cfg.real_transformer.vocab_size = hf.vocab_size;
+                cfg.real_transformer.num_heads = hf.num_attention_heads;
+                cfg.real_transformer.num_kv_heads = if hf.num_key_value_heads == 0 {
+                    hf.num_attention_heads
+                } else {
+                    hf.num_key_value_heads
+                };
+                cfg.real_transformer.head_dim = hf.resolved_head_dim();
+                cfg.real_transformer.rope_base = hf.rope_theta;
+                cfg.real_transformer.rms_eps = hf.rms_norm_eps;
+                cfg.real_transformer.window_size = hf.sliding_window.unwrap_or(0);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(
+                    format!("failed to read config.json from {}: {e}", dir.display()).into(),
+                );
+            }
+        }
+    }
+    Ok((
+        resolved_architecture,
+        resolved_first_k_dense_replace,
+        resolved_advanced,
+    ))
+}
+
+async fn run_bench_real_once(
+    runtime: &BenchRealRuntime,
+    prompt: &str,
+    output_tokens: usize,
+    params: crate::sampling::SamplingParams,
+    run_index: usize,
+) -> Result<BenchRealRunReport, Box<dyn std::error::Error>> {
+    let prompt_ids = runtime.tokenizer.encode(prompt)?;
+    if prompt_ids.is_empty() {
+        return Err("bench-real prompt encoded to zero tokens".into());
+    }
+    let mut kv = runtime.model.fresh_kv_caches();
+    let pre = runtime.engine.report();
+    let total_started = Instant::now();
+    let prompt_started = Instant::now();
+    let mut pos = 0usize;
+    let mut forward_evaluations = 0usize;
+    let mut lm_head_evaluations = 0usize;
+    let mut completion_ids = Vec::with_capacity(output_tokens);
+    let mut decode_latencies_us = Vec::with_capacity(output_tokens.saturating_sub(1));
+
+    for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
+        let _ = runtime
+            .model
+            .forward_token_hidden(&runtime.engine, tid, pos, &mut kv)
+            .await;
+        forward_evaluations += 1;
+        pos += 1;
+    }
+
+    let final_prompt = *prompt_ids.last().expect("prompt_ids checked non-empty");
+    let final_prompt_pos = pos;
+    let first_started = Instant::now();
+    let final_hidden = runtime
+        .model
+        .forward_token_hidden(&runtime.engine, final_prompt, final_prompt_pos, &mut kv)
+        .await;
+    forward_evaluations += 1;
+    pos += 1;
+    let prompt_seconds = prompt_started.elapsed().as_secs_f64();
+    let first = runtime
+        .model
+        .sample_hidden(&final_hidden, &params, final_prompt_pos);
+    lm_head_evaluations += 1;
+    let _first_token_latency_us = first_started.elapsed().as_micros() as u64;
+    let time_to_first_token_seconds = total_started.elapsed().as_secs_f64();
+    completion_ids.push(first);
+
+    let decode_started = Instant::now();
+    let mut last = first;
+    while completion_ids.len() < output_tokens {
+        let step_started = Instant::now();
+        let next = runtime
+            .model
+            .decode_step(&runtime.engine, last, pos, &mut kv, &params)
+            .await;
+        forward_evaluations += 1;
+        lm_head_evaluations += 1;
+        decode_latencies_us.push(step_started.elapsed().as_micros() as u64);
+        completion_ids.push(next);
+        last = next;
+        pos += 1;
+    }
+    let decode_seconds = decode_started.elapsed().as_secs_f64();
+    let total_seconds = total_started.elapsed().as_secs_f64();
+    debug_assert_eq!(
+        forward_evaluations,
+        bench_real_expected_forward_evaluations(prompt_ids.len(), output_tokens)
+    );
+    debug_assert_eq!(lm_head_evaluations, output_tokens);
+
+    let post = runtime.engine.report();
+    let cache_hits = post.hits.saturating_sub(pre.hits);
+    let cache_misses = post.misses.saturating_sub(pre.misses);
+    let total_lookups = cache_hits + cache_misses;
+    let hit_rate = if total_lookups == 0 {
+        0.0
+    } else {
+        cache_hits as f64 / total_lookups as f64
+    };
+    let ssd_bytes = post.bytes_read.saturating_sub(pre.bytes_read);
+    let ssd_stall_us = post
+        .predictive
+        .ssd_stall_us
+        .saturating_sub(pre.predictive.ssd_stall_us);
+    decode_latencies_us.sort_unstable();
+    let output_text = runtime.tokenizer.decode(&completion_ids)?;
+
+    Ok(BenchRealRunReport {
+        run_index,
+        prompt_tokens: prompt_ids.len(),
+        completion_tokens: output_tokens,
+        total_api_tokens: prompt_ids.len() + output_tokens,
+        model_forward_evaluations: forward_evaluations,
+        lm_head_evaluations,
+        prompt_seconds,
+        prompt_tps: rate_per_second(prompt_ids.len(), prompt_seconds),
+        decode_seconds,
+        decode_tps: rate_per_second(output_tokens.saturating_sub(1), decode_seconds),
+        time_to_first_token_seconds,
+        total_seconds,
+        decode_token_latency_p50_ms: percentile_us_to_ms(&decode_latencies_us, 0.50),
+        decode_token_latency_p95_ms: percentile_us_to_ms(&decode_latencies_us, 0.95),
+        decode_token_latency_p99_ms: percentile_us_to_ms(&decode_latencies_us, 0.99),
+        decode_token_latency_max_ms: decode_latencies_us.last().copied().unwrap_or(0) as f64
+            / 1000.0,
+        cache_hits,
+        cache_misses,
+        hit_rate,
+        ssd_bytes,
+        ssd_stall_seconds: ssd_stall_us as f64 / 1_000_000.0,
+        rss_bytes: current_rss_bytes(),
+        output_token_ids: completion_ids,
+        output_text,
+        stage_timings_seconds: std::collections::BTreeMap::new(),
+    })
+}
+
+fn emit_bench_real_report(
+    args: &BenchRealArgs,
+    input: BenchRealInput,
+    runs: Vec<BenchRealRunReport>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let suite = BenchRealSuiteReport {
+        benchmark: "bench-real",
+        config: args.config.display().to_string(),
+        prompt: input.prompt,
+        warmup_runs: args.warmup_runs,
+        measured_runs: args.measured_runs,
+        cache_reset: args.cache_reset,
+        greedy: args.greedy,
+        build: BenchRealBuildInfo {
+            git_commit: git_commit_short(),
+            build_features: build_features(),
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        },
+        aggregate: aggregate_bench_real(&runs),
+        runs,
+    };
+    match args.format {
+        BenchRealOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&suite)?);
+        }
+        BenchRealOutputFormat::Human => print_bench_real_human(&suite),
+    }
+    Ok(())
+}
+
+fn print_bench_real_human(suite: &BenchRealSuiteReport) {
+    println!("bench-real");
+    println!("  config: {}", suite.config);
+    println!(
+        "  warmup_runs={} measured_runs={} cache_reset={:?} greedy={}",
+        suite.warmup_runs, suite.measured_runs, suite.cache_reset, suite.greedy
+    );
+    println!(
+        "  build: git={} threads={} features={}",
+        suite.build.git_commit,
+        suite.build.threads,
+        suite.build.build_features.join(",")
+    );
+    for run in &suite.runs {
+        println!(
+            "  run {}: prompt_tokens={} completion_tokens={} forwards={} lm_heads={}",
+            run.run_index,
+            run.prompt_tokens,
+            run.completion_tokens,
+            run.model_forward_evaluations,
+            run.lm_head_evaluations
+        );
+        println!(
+            "    prompt={:.3}s ({:.3} tok/s) ttft={:.3}s decode={:.3}s ({:.3} tok/s) total={:.3}s",
+            run.prompt_seconds,
+            run.prompt_tps,
+            run.time_to_first_token_seconds,
+            run.decode_seconds,
+            run.decode_tps,
+            run.total_seconds
+        );
+        println!(
+            "    decode latency: p50={:.3}ms p95={:.3}ms p99={:.3}ms max={:.3}ms",
+            run.decode_token_latency_p50_ms,
+            run.decode_token_latency_p95_ms,
+            run.decode_token_latency_p99_ms,
+            run.decode_token_latency_max_ms
+        );
+        println!(
+            "    cache: hits={} misses={} hit_rate={:.2}% ssd_bytes={} ssd_stall={:.3}s rss={}",
+            run.cache_hits,
+            run.cache_misses,
+            run.hit_rate * 100.0,
+            run.ssd_bytes,
+            run.ssd_stall_seconds,
+            run.rss_bytes
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        if run.stage_timings_seconds.is_empty() {
+            println!("    stage timing: unavailable until stage-level timers are enabled");
+        }
+    }
+    println!(
+        "  aggregate: prompt_tps_mean={:.3} decode_tps_mean={:.3} ttft_p50={:.3}s total_mean={:.3}s parity={}",
+        suite.aggregate.prompt_tps_mean,
+        suite.aggregate.decode_tps_mean,
+        suite.aggregate.time_to_first_token_p50_seconds,
+        suite.aggregate.total_seconds_mean,
+        suite.aggregate.output_token_parity
+    );
+}
+
+fn aggregate_bench_real(runs: &[BenchRealRunReport]) -> BenchRealAggregate {
+    let n = runs.len().max(1) as f64;
+    let cache_hits_total = runs.iter().map(|r| r.cache_hits).sum();
+    let cache_misses_total = runs.iter().map(|r| r.cache_misses).sum();
+    let total_lookups = cache_hits_total + cache_misses_total;
+    let hit_rate = if total_lookups == 0 {
+        0.0
+    } else {
+        cache_hits_total as f64 / total_lookups as f64
+    };
+    let mut ttft_us: Vec<u64> = runs
+        .iter()
+        .map(|r| (r.time_to_first_token_seconds * 1_000_000.0).round() as u64)
+        .collect();
+    ttft_us.sort_unstable();
+    let output_token_parity = runs
+        .windows(2)
+        .all(|pair| pair[0].output_token_ids == pair[1].output_token_ids);
+    BenchRealAggregate {
+        prompt_seconds_mean: runs.iter().map(|r| r.prompt_seconds).sum::<f64>() / n,
+        prompt_tps_mean: runs.iter().map(|r| r.prompt_tps).sum::<f64>() / n,
+        decode_seconds_mean: runs.iter().map(|r| r.decode_seconds).sum::<f64>() / n,
+        decode_tps_mean: runs.iter().map(|r| r.decode_tps).sum::<f64>() / n,
+        time_to_first_token_p50_seconds: percentile_us(&ttft_us, 0.50) as f64 / 1_000_000.0,
+        total_seconds_mean: runs.iter().map(|r| r.total_seconds).sum::<f64>() / n,
+        cache_hits_total,
+        cache_misses_total,
+        hit_rate,
+        ssd_bytes_total: runs.iter().map(|r| r.ssd_bytes).sum(),
+        output_token_parity,
+    }
+}
+
+fn bench_real_expected_forward_evaluations(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> usize {
+    if prompt_tokens == 0 || completion_tokens == 0 {
+        0
+    } else {
+        prompt_tokens + completion_tokens - 1
+    }
+}
+
+fn rate_per_second(count: usize, seconds: f64) -> f64 {
+    if count == 0 || seconds <= 0.0 {
+        0.0
+    } else {
+        count as f64 / seconds
+    }
+}
+
+fn percentile_us_to_ms(sorted_us: &[u64], q: f64) -> f64 {
+    percentile_us(sorted_us, q) as f64 / 1000.0
+}
+
+fn percentile_us(sorted_us: &[u64], q: f64) -> u64 {
+    if sorted_us.is_empty() {
+        return 0;
+    }
+    let q = q.clamp(0.0, 1.0);
+    let idx = ((sorted_us.len() - 1) as f64 * q).round() as usize;
+    sorted_us[idx]
+}
+
+fn build_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if cfg!(feature = "tokenizer") {
+        features.push("tokenizer");
+    }
+    if cfg!(feature = "io_uring") {
+        features.push("io_uring");
+    }
+    if cfg!(feature = "blas") {
+        features.push("blas");
+    }
+    if cfg!(feature = "avx512") {
+        features.push("avx512");
+    }
+    if cfg!(feature = "amx") {
+        features.push("amx");
+    }
+    if cfg!(feature = "nightly-amx") {
+        features.push("nightly-amx");
+    }
+    if cfg!(feature = "cuda") {
+        features.push("cuda");
+    }
+    if cfg!(feature = "tui") {
+        features.push("tui");
+    }
+    if cfg!(feature = "grpc") {
+        features.push("grpc");
+    }
+    features
+}
+
+fn git_commit_short() -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn current_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let body = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kib.saturating_mul(1024));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let kib: u64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .ok()?;
+        Some(kib.saturating_mul(1024))
     }
 }
 
@@ -3764,6 +4735,79 @@ mod tests {
             "unexpected error: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bench_real_forward_count_matches_prompt_decode_contract() {
+        assert_eq!(bench_real_expected_forward_evaluations(15, 16), 30);
+        assert_eq!(bench_real_expected_forward_evaluations(1, 1), 1);
+        assert_eq!(bench_real_expected_forward_evaluations(1, 4), 4);
+        assert_eq!(bench_real_expected_forward_evaluations(4, 1), 4);
+        assert_eq!(bench_real_expected_forward_evaluations(0, 4), 0);
+        assert_eq!(bench_real_expected_forward_evaluations(4, 0), 0);
+    }
+
+    #[test]
+    fn bench_real_percentile_reads_sorted_microseconds() {
+        let values = vec![100, 200, 300, 400, 500];
+        assert_eq!(percentile_us(&values, 0.0), 100);
+        assert_eq!(percentile_us(&values, 0.50), 300);
+        assert_eq!(percentile_us(&values, 0.95), 500);
+        assert_eq!(percentile_us(&values, 1.0), 500);
+        assert_eq!(percentile_us_to_ms(&values, 0.50), 0.3);
+    }
+
+    #[test]
+    fn bench_real_request_json_supports_chat_messages_and_max_tokens() {
+        let path = tempdir_unique("bench-real-request.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "messages": [
+                    { "role": "system", "content": "Be brief." },
+                    { "role": "user", "content": "Explain caches." }
+                ],
+                "max_tokens": 7
+            }"#,
+        )
+        .unwrap();
+        let args = BenchRealArgs {
+            config: PathBuf::from("config.toml"),
+            prompt: None,
+            request_json: Some(path.clone()),
+            output_tokens: None,
+            warmup_runs: 0,
+            measured_runs: 1,
+            cache_reset: BenchRealCacheReset::Keep,
+            greedy: true,
+            format: BenchRealOutputFormat::Json,
+        };
+        let input = load_bench_real_input(&args).unwrap();
+        assert_eq!(input.output_tokens, 7);
+        assert!(input.prompt.contains("system: Be brief."));
+        assert!(input.prompt.contains("user: Explain caches."));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bench_real_cli_output_tokens_override_request_json() {
+        let path = tempdir_unique("bench-real-request-override.json");
+        std::fs::write(&path, r#"{ "prompt": "hello", "max_tokens": 7 }"#).unwrap();
+        let args = BenchRealArgs {
+            config: PathBuf::from("config.toml"),
+            prompt: None,
+            request_json: Some(path.clone()),
+            output_tokens: Some(3),
+            warmup_runs: 0,
+            measured_runs: 1,
+            cache_reset: BenchRealCacheReset::Keep,
+            greedy: true,
+            format: BenchRealOutputFormat::Json,
+        };
+        let input = load_bench_real_input(&args).unwrap();
+        assert_eq!(input.prompt, "hello");
+        assert_eq!(input.output_tokens, 3);
+        let _ = std::fs::remove_file(path);
     }
 
     /// Tiny unique temp-dir helper (avoids pulling a dev-dependency for
