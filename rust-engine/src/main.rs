@@ -1397,8 +1397,19 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             first_k_dense_replace: resolved_first_k_dense_replace,
             advanced: resolved_advanced,
         };
+        let load_options = crate::model::RealModelLoadOptions {
+            strict_weights: rt.strict_weights,
+        };
         let m = match rt.weights_dir.as_ref() {
-            Some(dir) => crate::model::RealModel::from_dir_auto(model_cfg, dir, rt.seed)?,
+            Some(dir) => crate::model::RealModel::from_dir_auto_with_options(
+                model_cfg,
+                dir,
+                rt.seed,
+                load_options,
+            )?,
+            None if rt.strict_weights => {
+                return Err("real_transformer.strict_weights = true requires weights_dir".into());
+            }
             None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),
         };
         Some(Arc::new(m))

@@ -277,6 +277,13 @@ pub struct RealTransformerConfig {
     /// `crate::model::RealModel::from_dir` for the file-name schema.
     #[serde(default)]
     pub weights_dir: Option<PathBuf>,
+    /// Require a complete, shape-compatible resident checkpoint when
+    /// `weights_dir` is configured. When `true`, startup fails with one
+    /// aggregate error listing every missing, malformed, unsupported or
+    /// shape-mismatched required dense tensor instead of retaining seeded
+    /// fallback values. Optional architecture sidecars remain optional.
+    #[serde(default)]
+    pub strict_weights: bool,
     /// Vocab size. Must match the tokenizer when one is configured (for
     /// the byte fallback this should be 256).
     #[serde(default = "default_vocab_size")]
