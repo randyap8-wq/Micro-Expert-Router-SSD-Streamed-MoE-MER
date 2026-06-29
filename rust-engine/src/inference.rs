@@ -1977,6 +1977,7 @@ impl OwnedExpertWeights {
         header
             .validate(bytes.len() as u64)
             .map_err(ExpertWeightsError::InvalidLayout)?;
+        MIXED_DEQUANT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         let expected = d_model.saturating_mul(d_ff);
         let gate = decode_mixed_projection(bytes, header.gate, expected, d_model, d_ff, "gate")?;
         let up = decode_mixed_projection(bytes, header.up, expected, d_model, d_ff, "up")?;
@@ -2459,6 +2460,7 @@ fn decode_mixed_projection(
 static QUANTIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_EXPERT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_DEQUANT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static MIXED_SCALAR_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static UNSUPPORTED_QUANT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_Q4K_OPTIMIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_Q5K_OPTIMIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
@@ -2477,7 +2479,7 @@ pub fn mixed_dequant_fallbacks() -> u64 {
 }
 
 pub fn mixed_scalar_fallbacks() -> u64 {
-    MIXED_DEQUANT_FALLBACKS.load(Ordering::Relaxed)
+    MIXED_SCALAR_FALLBACKS.load(Ordering::Relaxed)
 }
 
 pub fn mixed_q4k_optimized_projection_dispatches() -> u64 {
@@ -2494,6 +2496,13 @@ pub fn mixed_q6k_optimized_projection_dispatches() -> u64 {
 
 pub fn unsupported_quant_dispatches() -> u64 {
     UNSUPPORTED_QUANT_DISPATCHES.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectionDispatchKind {
+    Dense,
+    QMatMul,
+    ScalarReference,
 }
 
 pub struct QuantProjectionView<'a> {
@@ -2598,7 +2607,7 @@ fn quantized_matvec_into(
     view: &QuantProjectionView<'_>,
     x: &[f32],
     y: &mut [f32],
-) -> Result<(), ExpertWeightsError> {
+) -> Result<ProjectionDispatchKind, ExpertWeightsError> {
     if x.len() != view.cols {
         return Err(ExpertWeightsError::InvalidLayout(format!(
             "{} projection input length {} does not match cols {}",
@@ -2617,10 +2626,19 @@ fn quantized_matvec_into(
     }
     QUANTIZED_PROJECTION_DISPATCHES.fetch_add(1, Ordering::Relaxed);
     y.fill(0.0);
-    match view.dtype {
-        WeightDtype::F32 => dense_matvec_f32(view, x, y)?,
-        WeightDtype::F16 => dense_matvec_f16(view, x, y)?,
-        WeightDtype::BF16 => dense_matvec_bf16(view, x, y)?,
+    let kind = match view.dtype {
+        WeightDtype::F32 => {
+            dense_matvec_f32(view, x, y)?;
+            ProjectionDispatchKind::Dense
+        }
+        WeightDtype::F16 => {
+            dense_matvec_f16(view, x, y)?;
+            ProjectionDispatchKind::Dense
+        }
+        WeightDtype::BF16 => {
+            dense_matvec_bf16(view, x, y)?;
+            ProjectionDispatchKind::Dense
+        }
         WeightDtype::Q4_0
         | WeightDtype::Q4K
         | WeightDtype::Q5K
@@ -2634,8 +2652,8 @@ fn quantized_matvec_into(
                 view.dtype.as_str()
             )));
         }
-    }
-    Ok(())
+    };
+    Ok(kind)
 }
 
 fn dense_matvec_f32(
@@ -2729,7 +2747,7 @@ fn quantized_matvec_qmm_or_reference(
     view: &QuantProjectionView<'_>,
     x: &[f32],
     y: &mut [f32],
-) -> Result<(), ExpertWeightsError> {
+) -> Result<ProjectionDispatchKind, ExpertWeightsError> {
     let Some(dtype) = ggml_dtype_for_optimized_projection(view.dtype) else {
         return scalar_reference_quantized_matvec(view, x, y, "dtype has no QMatMul mapping");
     };
@@ -2751,7 +2769,7 @@ fn quantized_matvec_qmm_or_reference(
         WeightDtype::Q4_0 | WeightDtype::Q8_0 => {}
         _ => unreachable!("validated optimized projection dtype"),
     }
-    Ok(())
+    Ok(ProjectionDispatchKind::QMatMul)
 }
 
 fn ggml_dtype_for_optimized_projection(dtype: WeightDtype) -> Option<GgmlDType> {
@@ -2832,8 +2850,8 @@ fn scalar_reference_quantized_matvec(
     x: &[f32],
     y: &mut [f32],
     reason: &'static str,
-) -> Result<(), ExpertWeightsError> {
-    MIXED_DEQUANT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+) -> Result<ProjectionDispatchKind, ExpertWeightsError> {
+    MIXED_SCALAR_FALLBACKS.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
         projection = view.name,
         dtype = view.dtype.as_str(),
@@ -2893,7 +2911,8 @@ fn scalar_reference_quantized_matvec(
                 view.dtype.as_str()
             )))
         }
-    }
+    }?;
+    Ok(ProjectionDispatchKind::ScalarReference)
 }
 
 fn matvec_block_stream_reference(
@@ -3240,8 +3259,8 @@ fn forward_mixed_quant_from_payload(
     let view = MixedQuantExpertView::from_payload(payload, header, d_model, d_ff)?;
     let mut gate = vec![0.0f32; d_ff];
     let mut up = vec![0.0f32; d_ff];
-    quantized_matvec_into(&view.gate, x, &mut gate)?;
-    quantized_matvec_into(&view.up, x, &mut up)?;
+    let _ = quantized_matvec_into(&view.gate, x, &mut gate)?;
+    let _ = quantized_matvec_into(&view.up, x, &mut up)?;
     let limit = swiglu_limit();
     let mut hidden = vec![0.0f32; d_ff];
     for i in 0..d_ff {
@@ -3253,7 +3272,7 @@ fn forward_mixed_quant_from_payload(
         hidden[i] = silu(g) * up[i];
     }
     let mut y = vec![0.0f32; d_model];
-    quantized_matvec_into(&view.down, &hidden, &mut y)?;
+    let _ = quantized_matvec_into(&view.down, &hidden, &mut y)?;
     Ok(y)
 }
 
@@ -4268,6 +4287,88 @@ mod tests {
         blk
     }
 
+    fn make_q5k_golden_block() -> ([u8; Q5K_BLOCK_BYTES], [f32; Q5K_BLOCK_ELEMS]) {
+        let d = half::f16::from_f32(0.125);
+        let dmin = half::f16::from_f32(0.03125);
+        let d_decoded = d.to_f32();
+        let dmin_decoded = dmin.to_f32();
+        let pairs: [(u8, u8); Q4K_SUBBLOCKS] = [
+            (1, 0),
+            (7, 3),
+            (15, 9),
+            (23, 17),
+            (31, 5),
+            (39, 21),
+            (47, 33),
+            (55, 45),
+        ];
+
+        let mut blk = [0u8; Q5K_BLOCK_BYTES];
+        blk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+        blk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
+        blk[4..16].copy_from_slice(&q4k_pack_scales(&pairs));
+
+        for l in 0..32 {
+            let mut h = 0u8;
+            if l % 2 == 0 {
+                h |= 1 << 0;
+            }
+            if l % 3 == 0 {
+                h |= 1 << 1;
+            }
+            if l % 4 == 0 {
+                h |= 1 << 2;
+            }
+            if l % 5 == 0 {
+                h |= 1 << 3;
+            }
+            if l % 2 == 1 {
+                h |= 1 << 4;
+            }
+            if l % 3 == 1 {
+                h |= 1 << 5;
+            }
+            if l % 4 == 1 {
+                h |= 1 << 6;
+            }
+            if l % 5 == 1 {
+                h |= 1 << 7;
+            }
+            blk[16 + l] = h;
+        }
+
+        for group in 0..4 {
+            for l in 0..32 {
+                let lo = ((l + group * 3) & 0x0F) as u8;
+                let hi = ((15usize + group * 5).wrapping_sub(l) & 0x0F) as u8;
+                blk[48 + group * 32 + l] = lo | (hi << 4);
+            }
+        }
+
+        let qh = &blk[16..48];
+        let qs = &blk[48..176];
+        let mut expected = [0.0f32; Q5K_BLOCK_ELEMS];
+        for group in 0..4 {
+            let low_sub = group * 2;
+            let high_sub = low_sub + 1;
+            let (low_scale, low_min) = pairs[low_sub];
+            let (high_scale, high_min) = pairs[high_sub];
+            let low_mask = 1u8 << (group * 2);
+            let high_mask = 1u8 << (group * 2 + 1);
+            for l in 0..32 {
+                let packed = qs[group * 32 + l];
+                let low_q = (packed & 0x0F) as f32 + if qh[l] & low_mask != 0 { 16.0 } else { 0.0 };
+                let high_q = (packed >> 4) as f32 + if qh[l] & high_mask != 0 { 16.0 } else { 0.0 };
+                expected[low_sub * 32 + l] =
+                    d_decoded * low_scale as f32 * low_q - dmin_decoded * low_min as f32;
+                expected[high_sub * 32 + l] =
+                    d_decoded * high_scale as f32 * high_q - dmin_decoded * high_min as f32;
+            }
+        }
+
+        (blk, expected)
+    }
+
     fn mixed_projection_bytes(dtype: WeightDtype, weights: usize) -> Vec<u8> {
         match dtype {
             WeightDtype::Q4K => {
@@ -4336,6 +4437,95 @@ mod tests {
         (payload, header)
     }
 
+    fn mixed_payload_and_header_with_padding(
+        d_model: usize,
+        d_ff: usize,
+        gate_dtype: WeightDtype,
+        up_dtype: WeightDtype,
+        down_dtype: WeightDtype,
+    ) -> (
+        Vec<u8>,
+        crate::tensor_header::MixedExpertHeader,
+        Vec<(usize, usize)>,
+    ) {
+        let gate_weights = d_model * d_ff;
+        let up_weights = d_model * d_ff;
+        let down_weights = d_model * d_ff;
+        let gate = mixed_projection_bytes(gate_dtype, gate_weights);
+        let up = mixed_projection_bytes(up_dtype, up_weights);
+        let down = mixed_projection_bytes(down_dtype, down_weights);
+
+        let mut payload = Vec::new();
+        let mut padding_ranges = Vec::new();
+        let push_padding =
+            |payload: &mut Vec<u8>, padding_ranges: &mut Vec<(usize, usize)>, len, byte| {
+                let start = payload.len();
+                payload.resize(start + len, byte);
+                padding_ranges.push((start, len));
+            };
+
+        push_padding(&mut payload, &mut padding_ranges, 64, 0xA5);
+        let gate_offset = payload.len();
+        payload.extend_from_slice(&gate);
+        push_padding(&mut payload, &mut padding_ranges, 32, 0x5A);
+        let up_offset = payload.len();
+        payload.extend_from_slice(&up);
+        push_padding(&mut payload, &mut padding_ranges, 96, 0xC3);
+        let down_offset = payload.len();
+        payload.extend_from_slice(&down);
+
+        let gate_range = crate::tensor_header::ProjectionRange {
+            dtype: crate::tensor_header::UthDtypeId::from_weight(gate_dtype),
+            offset: gate_offset as u64,
+            len: gate.len() as u64,
+            weights: gate_weights.try_into().expect("test weight count fits u32"),
+        };
+        let up_range = crate::tensor_header::ProjectionRange {
+            dtype: crate::tensor_header::UthDtypeId::from_weight(up_dtype),
+            offset: up_offset as u64,
+            len: up.len() as u64,
+            weights: up_weights.try_into().expect("test weight count fits u32"),
+        };
+        let down_range = crate::tensor_header::ProjectionRange {
+            dtype: crate::tensor_header::UthDtypeId::from_weight(down_dtype),
+            offset: down_offset as u64,
+            len: down.len() as u64,
+            weights: down_weights.try_into().expect("test weight count fits u32"),
+        };
+        let header = crate::tensor_header::MixedExpertHeader::new(
+            d_model, d_ff, gate_range, up_range, down_range,
+        );
+
+        (payload, header, padding_ranges)
+    }
+
+    fn forward_mixed_quant_with_dispatch_kinds(
+        payload: &[u8],
+        header: crate::tensor_header::MixedExpertHeader,
+        x: &[f32],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<(HiddenState, [ProjectionDispatchKind; 3]), ExpertWeightsError> {
+        let view = MixedQuantExpertView::from_payload(payload, header, d_model, d_ff)?;
+        let mut gate = vec![0.0f32; d_ff];
+        let mut up = vec![0.0f32; d_ff];
+        let gate_kind = quantized_matvec_into(&view.gate, x, &mut gate)?;
+        let up_kind = quantized_matvec_into(&view.up, x, &mut up)?;
+        let limit = swiglu_limit();
+        let mut hidden = vec![0.0f32; d_ff];
+        for i in 0..d_ff {
+            let g = if let Some(limit) = limit {
+                gate[i].clamp(-limit, limit)
+            } else {
+                gate[i]
+            };
+            hidden[i] = silu(g) * up[i];
+        }
+        let mut y = vec![0.0f32; d_model];
+        let down_kind = quantized_matvec_into(&view.down, &hidden, &mut y)?;
+        Ok((y, [gate_kind, up_kind, down_kind]))
+    }
+
     fn assert_close_vecs(label: &str, baseline: &[f32], got: &[f32]) {
         assert_eq!(baseline.len(), got.len(), "{label} length mismatch");
         for (i, (&a, &b)) in baseline.iter().zip(got.iter()).enumerate() {
@@ -4390,6 +4580,39 @@ mod tests {
                 "Q4K dequant diverged: got {a}, expected {b}"
             );
         }
+    }
+
+    #[test]
+    fn q5k_golden_block_matches_reference_formula_and_qmatmul() {
+        let (blk, expected) = make_q5k_golden_block();
+        assert!(
+            blk[16..48].iter().any(|&b| b != 0),
+            "golden Q5_K block must exercise nonzero qh fifth bits"
+        );
+
+        let mut decoded = [0.0f32; Q5K_BLOCK_ELEMS];
+        dequantize_q5k_block(&blk, &mut decoded);
+        assert_close_vecs("q5k reference decoder", &expected, &decoded);
+
+        let qmatmul = QMatMul::from_arc(StdArc::new(
+            cpu_qtensor_from_blocks(&blk, 1, Q5K_BLOCK_ELEMS, GgmlDType::Q5K)
+                .expect("Q5_K golden QTensor"),
+        ))
+        .expect("Q5_K golden QMatMul");
+        let mut eye = vec![0.0f32; Q5K_BLOCK_ELEMS * Q5K_BLOCK_ELEMS];
+        for i in 0..Q5K_BLOCK_ELEMS {
+            eye[i * Q5K_BLOCK_ELEMS + i] = 1.0;
+        }
+        let x_t = Tensor::from_slice(&eye, (Q5K_BLOCK_ELEMS, Q5K_BLOCK_ELEMS), &Device::Cpu)
+            .expect("identity tensor");
+        let got = qmatmul
+            .forward(&x_t)
+            .expect("Q5_K identity QMatMul")
+            .squeeze(1)
+            .expect("squeeze Q5_K output")
+            .to_vec1::<f32>()
+            .expect("Q5_K output vector");
+        assert_close_vecs("q5k QMatMul", &expected, &got);
     }
 
     #[test]
@@ -4474,13 +4697,18 @@ mod tests {
         let baseline = OwnedExpertWeights::from_bytes_mixed_quant(&payload, header, d_model, d_ff)
             .expect("baseline mixed decode")
             .forward(&x);
-        let q4_before = mixed_q4k_optimized_projection_dispatches();
-        let got = forward_mixed_quant_from_payload(&payload, header, &x, d_model, d_ff)
-            .expect("optimized mixed forward");
+        let (got, kinds) =
+            forward_mixed_quant_with_dispatch_kinds(&payload, header, &x, d_model, d_ff)
+                .expect("optimized mixed forward");
 
         assert_close_vecs("mixed q4k/q4k/q4k", &baseline, &got);
-        assert!(
-            mixed_q4k_optimized_projection_dispatches() >= q4_before + 3,
+        assert_eq!(
+            kinds,
+            [
+                ProjectionDispatchKind::QMatMul,
+                ProjectionDispatchKind::QMatMul,
+                ProjectionDispatchKind::QMatMul,
+            ],
             "all three Q4_K projections should use optimized QMatMul"
         );
     }
@@ -4501,20 +4729,64 @@ mod tests {
         let baseline = OwnedExpertWeights::from_bytes_mixed_quant(&payload, header, d_model, d_ff)
             .expect("baseline mixed decode")
             .forward(&x);
-        let q4_before = mixed_q4k_optimized_projection_dispatches();
-        let q5_before = mixed_q5k_optimized_projection_dispatches();
-        let got = forward_mixed_quant_from_payload(&payload, header, &x, d_model, d_ff)
-            .expect("optimized mixed forward");
+        let (got, kinds) =
+            forward_mixed_quant_with_dispatch_kinds(&payload, header, &x, d_model, d_ff)
+                .expect("optimized mixed forward");
 
         assert_close_vecs("mixed q4k/q4k/q5k", &baseline, &got);
-        assert!(
-            mixed_q4k_optimized_projection_dispatches() >= q4_before + 2,
-            "gate/up Q4_K projections should use optimized QMatMul"
+        assert_eq!(
+            kinds,
+            [
+                ProjectionDispatchKind::QMatMul,
+                ProjectionDispatchKind::QMatMul,
+                ProjectionDispatchKind::QMatMul,
+            ],
+            "gate/up Q4_K and down Q5_K projections should use optimized QMatMul"
         );
-        assert!(
-            mixed_q5k_optimized_projection_dispatches() >= q5_before + 1,
-            "down Q5_K projection should use optimized QMatMul"
+    }
+
+    #[test]
+    fn mixed_uth2_padded_projection_offsets_ignore_sentinel_bytes() {
+        let d_model = Q4K_BLOCK_ELEMS;
+        let d_ff = Q4K_BLOCK_ELEMS;
+        let (payload, header, padding_ranges) = mixed_payload_and_header_with_padding(
+            d_model,
+            d_ff,
+            WeightDtype::Q4K,
+            WeightDtype::Q4K,
+            WeightDtype::Q5K,
         );
+        let x = synth_hidden_state(14, d_model, 29);
+
+        let baseline = OwnedExpertWeights::from_bytes_mixed_quant(&payload, header, d_model, d_ff)
+            .expect("baseline mixed decode")
+            .forward(&x);
+        let (got, kinds) =
+            forward_mixed_quant_with_dispatch_kinds(&payload, header, &x, d_model, d_ff)
+                .expect("optimized mixed forward with padded offsets");
+
+        assert_close_vecs("mixed padded offsets", &baseline, &got);
+        assert_eq!(
+            kinds,
+            [
+                ProjectionDispatchKind::QMatMul,
+                ProjectionDispatchKind::QMatMul,
+                ProjectionDispatchKind::QMatMul,
+            ],
+            "padded Q4_K/Q4_K/Q5_K projections should use optimized QMatMul"
+        );
+
+        let mut mutated = payload.clone();
+        for (start, len) in padding_ranges {
+            for byte in &mut mutated[start..start + len] {
+                *byte = byte.wrapping_add(0x37);
+            }
+        }
+        let (mutated_got, mutated_kinds) =
+            forward_mixed_quant_with_dispatch_kinds(&mutated, header, &x, d_model, d_ff)
+                .expect("optimized mixed forward ignores mutated padding");
+        assert_close_vecs("mixed mutated padding", &got, &mutated_got);
+        assert_eq!(mutated_kinds, kinds);
     }
 
     #[test]
@@ -4535,11 +4807,11 @@ mod tests {
         };
         let x = synth_hidden_state(13, cols, 23);
         let mut y = vec![0.0f32; rows];
-        let fallbacks_before = mixed_scalar_fallbacks();
-        quantized_matvec_into(&view, &x, &mut y).expect("reference fallback");
+        let kind = quantized_matvec_into(&view, &x, &mut y).expect("reference fallback");
         assert!(y.iter().all(|v| v.is_finite()));
-        assert!(
-            mixed_scalar_fallbacks() >= fallbacks_before + 1,
+        assert_eq!(
+            kind,
+            ProjectionDispatchKind::ScalarReference,
             "unaligned Q4_K projection should use the counted reference fallback"
         );
     }

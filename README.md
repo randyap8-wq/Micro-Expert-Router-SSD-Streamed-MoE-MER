@@ -2484,11 +2484,14 @@ when `EngineOptions::use_qmm_for_q4 = false`.
 **Mixed quantized path.** For `mixed`, UTH2 is parsed when the expert
 becomes resident using the dataset's configured `block_align`; the hot
 path reuses those projection ranges and dispatches each projection by
-its own dtype. Block-aligned Q4_K/Q5_K/Q6_K projections run through
-Candle `QMatMul` over the packed block stream, while the scalar decoder
-is kept as a counted reference fallback for unsupported shapes. Normal
-mixed execution should report optimized projection counters and leave
-`scalar_fallbacks` at zero.
+its own dtype. Block-aligned Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 projections run
+through Candle `QMatMul` over the packed block stream; `QStorage::from_data`
+temporarily copies one packed projection and drops that copy after the
+projection call. Unsupported or misaligned quantized shapes use the
+counted scalar reference fallback, while full-matrix dequantization is
+tracked separately. Normal mixed execution should report optimized
+projection counters and leave `scalar_fallbacks` and
+`full_dequant_fallbacks` at zero.
 
 **How this saves energy.** Every cache miss reads
 `3 · d_model · d_ff` weights off the SSD. Going from `f32` → `f16`
