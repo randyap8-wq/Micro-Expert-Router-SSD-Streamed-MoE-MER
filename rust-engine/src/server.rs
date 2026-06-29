@@ -51,7 +51,7 @@ use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Shared handler state. Cheap to clone — everything is `Arc`.
 #[derive(Clone)]
@@ -512,6 +512,65 @@ impl std::fmt::Display for GenerateError {
     }
 }
 
+struct StageTimingPublisher {
+    metrics: Metrics,
+    timings: Arc<crate::stage_timing::StageTimings>,
+    context: &'static str,
+    published: bool,
+}
+
+impl StageTimingPublisher {
+    fn new(
+        metrics: Metrics,
+        timings: Arc<crate::stage_timing::StageTimings>,
+        context: &'static str,
+    ) -> Self {
+        Self {
+            metrics,
+            timings,
+            context,
+            published: false,
+        }
+    }
+
+    fn publish(&mut self) {
+        if self.published {
+            return;
+        }
+        let snapshot = self.timings.snapshot();
+        self.metrics.record_stage_timings(&snapshot);
+        log_stage_timing_summary(self.context, &snapshot);
+        self.published = true;
+    }
+}
+
+impl Drop for StageTimingPublisher {
+    fn drop(&mut self) {
+        self.publish();
+    }
+}
+
+fn log_stage_timing_summary(
+    context: &'static str,
+    snapshot: &std::collections::BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
+) {
+    if snapshot.is_empty() {
+        return;
+    }
+    let mut stages = Vec::with_capacity(snapshot.len());
+    for (stage, timing) in snapshot {
+        stages.push(format!(
+            "{}={:.6}s/{}",
+            stage, timing.total_seconds, timing.count
+        ));
+    }
+    debug!(
+        context,
+        stage_timings = %stages.join(", "),
+        "real request stage timing summary"
+    );
+}
+
 /// Resolve per-request sampling parameters from the request fields,
 /// falling back to the server-wide defaults pulled from the
 /// atomically-swappable [`crate::config::RuntimeConfig`]. OpenAI's API
@@ -600,10 +659,14 @@ async fn generate(
         // is fully stateless (legacy behaviour).
         let (kv, mut start_pos, pending_token, checkout) =
             load_session_kv(state, model, session_id.as_deref());
-        let mut request = RealRequestState::new(state, model, kv);
+        let stage_timings = Arc::new(crate::stage_timing::StageTimings::default());
+        let mut stage_publisher =
+            StageTimingPublisher::new(state.metrics.clone(), stage_timings.clone(), "completion");
+        let mut request = RealRequestState::new(state, model, kv, stage_timings.clone());
         let pre_hits = state.engine.report().hits;
         let pre_misses = state.engine.report().misses;
 
+        let prompt_started = Instant::now();
         // If the previous request ended after emitting a token that has not
         // yet been ingested into KV, ingest it first without evaluating the
         // LM head. This preserves P + C - 1 forward evaluations for the
@@ -627,6 +690,7 @@ async fn generate(
             .forward_token_hidden(final_prompt, final_prompt_pos)
             .await;
         start_pos += 1;
+        stage_timings.record(crate::stage_timing::TOTAL_PROMPT, prompt_started.elapsed());
         let first = request.sample_hidden(&final_hidden, &params, final_prompt_pos);
         completion_ids.push(first);
 
@@ -646,6 +710,7 @@ async fn generate(
         // `params` end-to-end.
         let mut last = first;
         let k = state.speculation_k;
+        let decode_started = Instant::now();
         if k > 1 && state.draft_engine.is_some() && params.is_greedy() {
             let draft = state
                 .draft_engine
@@ -676,6 +741,7 @@ async fn generate(
                 start_pos += 1;
             }
         }
+        stage_timings.record(crate::stage_timing::TOTAL_DECODE, decode_started.elapsed());
         let pending_token = completion_ids.last().copied();
         let kv = request.finish();
         save_session_kv(
@@ -689,6 +755,7 @@ async fn generate(
         let post = state.engine.report();
         hits_total = post.hits.saturating_sub(pre_hits);
         misses_total = post.misses.saturating_sub(pre_misses);
+        stage_publisher.publish();
     } else {
         // Legacy benchmark path — sampling params are unused (no real
         // logits) but we still respect `seed` for the deterministic
@@ -757,18 +824,27 @@ struct RealRequestState {
     scheduler: Option<Arc<BatchScheduler>>,
     request_id: Option<RequestId>,
     kv: Option<Vec<crate::transformer::KvCache>>,
+    stage_timings: Arc<crate::stage_timing::StageTimings>,
 }
 
 impl RealRequestState {
-    fn new(state: &AppState, model: &Arc<RealModel>, kv: Vec<crate::transformer::KvCache>) -> Self {
+    fn new(
+        state: &AppState,
+        model: &Arc<RealModel>,
+        kv: Vec<crate::transformer::KvCache>,
+        stage_timings: Arc<crate::stage_timing::StageTimings>,
+    ) -> Self {
         if let Some(scheduler) = state.batch_scheduler.as_ref() {
+            let started = Instant::now();
             let request_id = scheduler.register(kv);
+            stage_timings.record(crate::stage_timing::SCHEDULER_OVERHEAD, started.elapsed());
             Self {
                 engine: state.engine.clone(),
                 model: model.clone(),
                 scheduler: Some(scheduler.clone()),
                 request_id: Some(request_id),
                 kv: None,
+                stage_timings,
             }
         } else {
             Self {
@@ -777,13 +853,18 @@ impl RealRequestState {
                 scheduler: None,
                 request_id: None,
                 kv: Some(kv),
+                stage_timings,
             }
         }
     }
 
     async fn forward_token_hidden(&mut self, token_id: u32, pos: usize) -> Vec<f32> {
         if let (Some(scheduler), Some(id)) = (self.scheduler.as_ref(), self.request_id) {
-            match scheduler.forward_registered(id, token_id, pos).await {
+            let started = Instant::now();
+            let result = scheduler.forward_registered(id, token_id, pos).await;
+            self.stage_timings
+                .record(crate::stage_timing::SCHEDULER_OVERHEAD, started.elapsed());
+            match result {
                 Ok(hidden) => return hidden,
                 Err(e) => {
                     tracing::warn!(error = %e, "batch scheduler forward failed; falling back to direct model path");
@@ -792,8 +873,17 @@ impl RealRequestState {
         }
         let engine = self.engine.clone();
         let model = self.model.clone();
+        let stage_timings = self.stage_timings.clone();
         let kv = self.direct_kv();
-        model.forward_token_hidden(&engine, token_id, pos, kv).await
+        model
+            .forward_token_hidden_with_timing(
+                &engine,
+                token_id,
+                pos,
+                kv,
+                Some(stage_timings.as_ref()),
+            )
+            .await
     }
 
     fn sample_hidden(
@@ -802,7 +892,8 @@ impl RealRequestState {
         params: &crate::sampling::SamplingParams,
         pos: usize,
     ) -> u32 {
-        self.model.sample_hidden(hidden, params, pos)
+        self.model
+            .sample_hidden_with_timing(hidden, params, pos, Some(self.stage_timings.as_ref()))
     }
 
     async fn decode_step(
@@ -812,7 +903,11 @@ impl RealRequestState {
         params: &crate::sampling::SamplingParams,
     ) -> u32 {
         if let (Some(scheduler), Some(id)) = (self.scheduler.as_ref(), self.request_id) {
-            match scheduler.step_registered(id, token_id, pos, *params).await {
+            let started = Instant::now();
+            let result = scheduler.step_registered(id, token_id, pos, *params).await;
+            self.stage_timings
+                .record(crate::stage_timing::SCHEDULER_OVERHEAD, started.elapsed());
+            match result {
                 Ok(next) => return next,
                 Err(e) => {
                     tracing::warn!(error = %e, "batch scheduler decode failed; falling back to direct model path");
@@ -821,8 +916,18 @@ impl RealRequestState {
         }
         let engine = self.engine.clone();
         let model = self.model.clone();
+        let stage_timings = self.stage_timings.clone();
         let kv = self.direct_kv();
-        model.decode_step(&engine, token_id, pos, kv, params).await
+        model
+            .decode_step_with_timing(
+                &engine,
+                token_id,
+                pos,
+                kv,
+                params,
+                Some(stage_timings.as_ref()),
+            )
+            .await
     }
 
     fn direct_kv(&mut self) -> &mut Vec<crate::transformer::KvCache> {
@@ -836,9 +941,13 @@ impl RealRequestState {
 
     fn release_scheduler_to_local(&mut self) {
         if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
-            self.kv = scheduler
-                .release(id)
-                .or_else(|| Some(self.model.fresh_kv_caches()));
+            let started = Instant::now();
+            self.kv = scheduler.release(id);
+            self.stage_timings
+                .record(crate::stage_timing::SCHEDULER_OVERHEAD, started.elapsed());
+            if self.kv.is_none() {
+                self.kv = Some(self.model.fresh_kv_caches());
+            }
         }
     }
 
@@ -857,7 +966,10 @@ impl RealRequestState {
 impl Drop for RealRequestState {
     fn drop(&mut self) {
         if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
+            let started = Instant::now();
             let _ = scheduler.release(id);
+            self.stage_timings
+                .record(crate::stage_timing::SCHEDULER_OVERHEAD, started.elapsed());
         }
     }
 }
@@ -1137,12 +1249,16 @@ async fn stream_tokens(
             i: u64,
         },
     }
+    let stage_timings = Arc::new(crate::stage_timing::StageTimings::default());
+    let stage_publisher =
+        StageTimingPublisher::new(state.metrics.clone(), stage_timings.clone(), "stream");
     let mode = if let Some(model) = state.real_model.as_ref() {
         // Resume from session state if configured — otherwise start
         // fresh, matching the non-streaming `generate` path.
         let (kv, mut pos, pending_token, checkout) =
             load_session_kv(&state, model, session_id.as_deref());
-        let mut request = RealRequestState::new(&state, model, kv);
+        let mut request = RealRequestState::new(&state, model, kv, stage_timings.clone());
+        let prompt_started = Instant::now();
         if let Some(tid) = pending_token {
             let _ = request.forward_token_hidden(tid, pos).await;
             pos += 1;
@@ -1157,6 +1273,7 @@ async fn stream_tokens(
             .forward_token_hidden(final_prompt, final_prompt_pos)
             .await;
         pos += 1;
+        stage_timings.record(crate::stage_timing::TOTAL_PROMPT, prompt_started.elapsed());
         let first = request.sample_hidden(&hidden, &params, final_prompt_pos);
         GenMode::Real {
             request,
@@ -1190,6 +1307,7 @@ async fn stream_tokens(
         finished_emitted: bool,
         params: SamplingParams,
         session_id: Option<String>,
+        stage_publisher: StageTimingPublisher,
     }
 
     let st = St {
@@ -1202,6 +1320,7 @@ async fn stream_tokens(
         finished_emitted: false,
         params,
         session_id,
+        stage_publisher,
     };
 
     Ok(Box::pin(stream::unfold(st, move |mut st| async move {
@@ -1230,6 +1349,7 @@ async fn stream_tokens(
                     checkout.take(),
                 );
             }
+            st.stage_publisher.publish();
             st.finished_emitted = true;
             return Some((
                 StreamChunk {
@@ -1254,9 +1374,13 @@ async fn stream_tokens(
                 if let Some(n) = pending_emit.take() {
                     n
                 } else {
+                    let decode_started = Instant::now();
                     let n = request
                         .decode_step(*last_token, *position, &st.params)
                         .await;
+                    st.stage_publisher
+                        .timings
+                        .record(crate::stage_timing::TOTAL_DECODE, decode_started.elapsed());
                     *position += 1;
                     n
                 }
@@ -2478,6 +2602,16 @@ mod tests {
         assert_eq!(scheduler.registrations_total(), 1);
         assert_eq!(scheduler.releases_total(), 1);
         assert_eq!(scheduler.active_requests(), 0);
+
+        let metrics = String::from_utf8(state.metrics.render().unwrap()).unwrap();
+        for stage in [
+            crate::stage_timing::SCHEDULER_OVERHEAD,
+            crate::stage_timing::TOTAL_PROMPT,
+            crate::stage_timing::TOTAL_DECODE,
+        ] {
+            let needle = format!(r#"mer_stage_events_total{{stage="{stage}"}}"#);
+            assert!(metrics.contains(&needle), "missing {needle} in:\n{metrics}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

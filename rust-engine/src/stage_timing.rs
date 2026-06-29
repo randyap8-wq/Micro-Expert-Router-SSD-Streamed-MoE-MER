@@ -14,11 +14,14 @@ pub const O_PROJECTION: &str = "o_projection";
 pub const ROUTER_GATE: &str = "router_gate";
 pub const EXPERT_CACHE_LOOKUP: &str = "expert_cache_lookup";
 pub const FOREGROUND_EXPERT_IO_WAIT: &str = "foreground_expert_io_wait";
+#[allow(dead_code)]
+pub const EXPERT_PREPARATION: &str = "expert_preparation";
 pub const EXPERT_COMPUTE: &str = "expert_compute";
 pub const MOE_WEIGHTED_COMBINATION: &str = "moe_weighted_combination";
 pub const FINAL_RMS_NORM: &str = "final_rms_norm";
 pub const LM_HEAD: &str = "lm_head";
 pub const SAMPLING: &str = "sampling";
+pub const SCHEDULER_OVERHEAD: &str = "scheduler_overhead";
 pub const TOTAL_PROMPT: &str = "total_prompt";
 pub const TOTAL_DECODE: &str = "total_decode";
 
