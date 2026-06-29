@@ -16,10 +16,13 @@
 //!    files (one per tensor) and falls back to a deterministic seeded
 //!    initialisation when files are missing, so the engine always has an
 //!    end-to-end runnable path even without real model files.
-//! 4. [`RealModel::step`] — the per-token forward driver. Produces the
-//!    next-token id by running embedding → stacked layers (each calling
-//!    `attn_block`, `moe_pre`, awaiting the engine's SSD-streamed
-//!    `moe_step`, then `moe_combine`) → final RMSNorm → LM head → argmax.
+//! 4. [`RealModel::forward_token_hidden`] / [`RealModel::sample_hidden`]
+//!    — the split per-token API. Prompt ingestion runs embedding →
+//!    stacked layers (each calling `attn_block`, `moe_pre`, awaiting
+//!    the engine's SSD-streamed `moe_step`, then `moe_combine`) → final
+//!    RMSNorm and returns the final hidden state. Decode then samples
+//!    that hidden state through the LM head only when a next-token
+//!    prediction is actually needed.
 //!
 //! Multi-layer expert addressing: when `num_layers > 1`, expert ids on
 //! disk are encoded as `global_id = layer * num_experts_per_layer +
@@ -33,10 +36,10 @@
 //! is the default because it lets the existing engine instrumentation
 //! and prefetcher keep working without per-layer sharding.
 
-use crate::engine::Engine;
 use crate::architecture::{
     Architecture, ComputeSupport, FfnKind, MlaDims, RopeScaling, TensorNaming,
 };
+use crate::engine::Engine;
 use crate::gating::{LinearGate, ScoringFunc};
 use crate::mla::MultiHeadLatentAttention;
 use crate::transformer::{
@@ -425,7 +428,9 @@ impl RealModelConfig {
             // `default_swa_window()` returns `None` for every non-hybrid
             // family, so this fallback only ever activates for MiMo-V2 and
             // GPT-OSS — legacy families keep their explicit window (or none).
-            window_size: hf.sliding_window.or_else(|| hf.architecture.default_swa_window()),
+            window_size: hf
+                .sliding_window
+                .or_else(|| hf.architecture.default_swa_window()),
             architecture: hf.architecture,
             first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
             advanced,
@@ -513,13 +518,11 @@ impl RealModel {
                 // `num_kv_heads` (4); `num_heads` is the same for both. All
                 // other architectures leave `swa_num_key_value_heads = None`,
                 // so every layer uses `num_kv_heads` (zero behaviour change).
-                let layer_num_kv_heads = match (
-                    layer_window,
-                    config.advanced.swa_num_key_value_heads,
-                ) {
-                    (Some(_), Some(swa_kv)) => swa_kv, // SWA layer
-                    _ => config.num_kv_heads,          // global layer / no override
-                };
+                let layer_num_kv_heads =
+                    match (layer_window, config.advanced.swa_num_key_value_heads) {
+                        (Some(_), Some(swa_kv)) => swa_kv, // SWA layer
+                        _ => config.num_kv_heads,          // global layer / no override
+                    };
                 let layer_kv_dim = layer_num_kv_heads * config.head_dim;
                 let layer_v_proj_dim = layer_num_kv_heads * v_head_dim;
                 // YaRN long-context RoPE scaling for the standard
@@ -531,56 +534,64 @@ impl RealModel {
                     .as_ref()
                     .and_then(|s| YarnRope::from_scaling(rope_dim, layer_rope_base, s));
                 TransformerLayer {
-                rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
-                attn: MultiHeadSelfAttention {
-                    d_model: config.d_model,
-                    num_heads: config.num_heads,
-                    num_kv_heads: layer_num_kv_heads,
-                    head_dim: config.head_dim,
-                    rope_dim,
-                    v_head_dim,
-                    attention_value_scale: config.advanced.attention_value_scale,
-                    rope_base: layer_rope_base,
-                    wq: sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
-                    wk: sample_uniform_vec(&mut rng, layer_kv_dim * config.d_model, proj_scale),
-                    wv: sample_uniform_vec(&mut rng, layer_v_proj_dim * config.d_model, proj_scale),
-                    wo: sample_uniform_vec(&mut rng, config.d_model * attn_out_dim, proj_scale),
-                    window_size: layer_window,
-                    q_norm,
-                    k_norm,
-                    rope_yarn,
-                    // Attention projection biases (GPT-OSS `attention_bias`)
-                    // are seeded absent; the on-disk loader populates them
-                    // when the checkpoint sets `attention_bias = true`.
-                    bq: None,
-                    bk: None,
-                    bv: None,
-                    bo: None,
-                    // Attention sink bias (MiMo-V2-Flash) is seeded absent;
-                    // the on-disk loader populates it on SWA layers when the
-                    // checkpoint sets `add_swa_attention_sink_bias = true`.
-                    sink_bias: None,
-                },
-                mla,
-                rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
-                gate: LinearGate::new(
-                    sample_uniform_vec(&mut rng, config.num_experts * config.d_model, proj_scale),
-                    config.num_experts,
-                    config.d_model,
-                    config.top_k,
-                ),
-                // Shared experts are an optional, architecture-specific
-                // tensor (Qwen2-MoE / DeepSeek-MoE). The seeded fallback
-                // leaves them absent so non-shared-expert models and the
-                // synthetic smoke path behave identically to before; real
-                // shared experts are populated by the on-disk loaders.
-                shared_expert: None,
-                // Dense FFN (Mistral Small 3 / Phi-4 / DeepSeek dense
-                // prefix). Populated by the on-disk loaders for dense
-                // layers; `None` means this layer routes to streamed
-                // experts (Mixtral / Qwen3-MoE / DeepSeek sparse layers).
-                dense_ffn: None,
-            }
+                    rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
+                    attn: MultiHeadSelfAttention {
+                        d_model: config.d_model,
+                        num_heads: config.num_heads,
+                        num_kv_heads: layer_num_kv_heads,
+                        head_dim: config.head_dim,
+                        rope_dim,
+                        v_head_dim,
+                        attention_value_scale: config.advanced.attention_value_scale,
+                        rope_base: layer_rope_base,
+                        wq: sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
+                        wk: sample_uniform_vec(&mut rng, layer_kv_dim * config.d_model, proj_scale),
+                        wv: sample_uniform_vec(
+                            &mut rng,
+                            layer_v_proj_dim * config.d_model,
+                            proj_scale,
+                        ),
+                        wo: sample_uniform_vec(&mut rng, config.d_model * attn_out_dim, proj_scale),
+                        window_size: layer_window,
+                        q_norm,
+                        k_norm,
+                        rope_yarn,
+                        // Attention projection biases (GPT-OSS `attention_bias`)
+                        // are seeded absent; the on-disk loader populates them
+                        // when the checkpoint sets `attention_bias = true`.
+                        bq: None,
+                        bk: None,
+                        bv: None,
+                        bo: None,
+                        // Attention sink bias (MiMo-V2-Flash) is seeded absent;
+                        // the on-disk loader populates it on SWA layers when the
+                        // checkpoint sets `add_swa_attention_sink_bias = true`.
+                        sink_bias: None,
+                    },
+                    mla,
+                    rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
+                    gate: LinearGate::new(
+                        sample_uniform_vec(
+                            &mut rng,
+                            config.num_experts * config.d_model,
+                            proj_scale,
+                        ),
+                        config.num_experts,
+                        config.d_model,
+                        config.top_k,
+                    ),
+                    // Shared experts are an optional, architecture-specific
+                    // tensor (Qwen2-MoE / DeepSeek-MoE). The seeded fallback
+                    // leaves them absent so non-shared-expert models and the
+                    // synthetic smoke path behave identically to before; real
+                    // shared experts are populated by the on-disk loaders.
+                    shared_expert: None,
+                    // Dense FFN (Mistral Small 3 / Phi-4 / DeepSeek dense
+                    // prefix). Populated by the on-disk loaders for dense
+                    // layers; `None` means this layer routes to streamed
+                    // experts (Mixtral / Qwen3-MoE / DeepSeek sparse layers).
+                    dense_ffn: None,
+                }
             })
             .collect();
         let final_rms = RmsNorm::new(vec![1.0; config.d_model], config.rms_eps);
@@ -589,7 +600,13 @@ impl RealModel {
             config.vocab_size,
             config.d_model,
         );
-        Self { config, embedding, layers, final_rms, lm_head }
+        Self {
+            config,
+            embedding,
+            layers,
+            final_rms,
+            lm_head,
+        }
     }
 
     /// Try to load weights from `dir`, populating any tensor present in
@@ -660,7 +677,9 @@ impl RealModel {
         let d_model = config.d_model;
         let q_dim = config.num_heads * config.head_dim;
 
-        maybe!("embed.bin", config.vocab_size * d_model, |v| model.embedding = v);
+        maybe!("embed.bin", config.vocab_size * d_model, |v| model
+            .embedding =
+            v);
         maybe!("final_rms.bin", d_model, |v| {
             model.final_rms = RmsNorm::new(v, config.rms_eps);
         });
@@ -692,14 +711,14 @@ impl RealModel {
             maybe!(&format!("attn_{l}_o.bin"), d_model * q_dim, |v| {
                 model.layers[l].attn.wo = v;
             });
-            maybe!(&format!("gate_{l}.bin"), config.num_experts * d_model, |v| {
-                model.layers[l].gate = LinearGate::new(
-                    v,
-                    config.num_experts,
-                    d_model,
-                    config.top_k,
-                );
-            });
+            maybe!(
+                &format!("gate_{l}.bin"),
+                config.num_experts * d_model,
+                |v| {
+                    model.layers[l].gate =
+                        LinearGate::new(v, config.num_experts, d_model, config.top_k);
+                }
+            );
             // Optional Qwen2-MoE / DeepSeek-MoE shared expert. The shared
             // expert's intermediate size is independent of the routed
             // `d_ff`, so we infer it from the on-disk tensor length
@@ -997,9 +1016,7 @@ impl RealModel {
                 let ignored = ignored.as_str();
                 name.match_indices(ignored).any(|(idx, _)| {
                     let after = &name[idx + ignored.len()..];
-                    after.is_empty()
-                        || after.starts_with('.')
-                        || after.starts_with('_')
+                    after.is_empty() || after.starts_with('.') || after.starts_with('_')
                 })
             })
         };
@@ -1029,7 +1046,10 @@ impl RealModel {
                                         .collect(),
                                 );
                             }
-                            warn!(tensor = name, "FP8-ignored tensor did not look like BF16 payload");
+                            warn!(
+                                tensor = name,
+                                "FP8-ignored tensor did not look like BF16 payload"
+                            );
                             return None;
                         }
                         let shape = view.shape();
@@ -1096,12 +1116,8 @@ impl RealModel {
                                     );
                                     return None;
                                 };
-                                let out = crate::dequant::dequant_mxfp4(
-                                    view.data(),
-                                    &scales,
-                                    rows,
-                                    cols,
-                                );
+                                let out =
+                                    crate::dequant::dequant_mxfp4(view.data(), &scales, rows, cols);
                                 if out.is_empty() {
                                     warn!(
                                         tensor = name,
@@ -1116,8 +1132,7 @@ impl RealModel {
                             // falls back to seeded init without log spam.
                             debug!(
                                 tensor = name,
-                                n_elem,
-                                "skipping non-weight U8 safetensors tensor"
+                                n_elem, "skipping non-weight U8 safetensors tensor"
                             );
                             return None;
                         }
@@ -1137,19 +1152,19 @@ impl RealModel {
                             let scale_name = format!("{name}_scale");
                             let scale = (|| {
                                 for s in &parsed {
-if let Ok(sv) = s.tensor(&scale_name) {
-    let v = decode_safetensor_to_f32(&sv, &scale_name);
-    if v.len() == 1 {
-        return Some(v[0]);
-    }
-    warn!(
-        tensor = name,
-        scale = %scale_name,
-        len = v.len(),
-        "INT8 companion scale tensor is not a scalar; ignoring"
-    );
-    return None;
-}
+                                    if let Ok(sv) = s.tensor(&scale_name) {
+                                        let v = decode_safetensor_to_f32(&sv, &scale_name);
+                                        if v.len() == 1 {
+                                            return Some(v[0]);
+                                        }
+                                        warn!(
+                                            tensor = name,
+                                            scale = %scale_name,
+                                            len = v.len(),
+                                            "INT8 companion scale tensor is not a scalar; ignoring"
+                                        );
+                                        return None;
+                                    }
                                 }
                                 None
                             })();
@@ -1179,7 +1194,9 @@ if let Ok(sv) = s.tensor(&scale_name) {
                                 if raw.len() % 2 == 0 {
                                     return Some(
                                         raw.chunks_exact(2)
-                                            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                                            .map(|c| {
+                                                half::bf16::from_le_bytes([c[0], c[1]]).to_f32()
+                                            })
                                             .collect(),
                                     );
                                 }
@@ -1412,15 +1429,11 @@ if let Ok(sv) = s.tensor(&scale_name) {
                     let down = find_f32_any(&[naming.mlp_down(l)]);
                     match (gate_up, down) {
                         (Some(gu), Some(down))
-                            if d_model != 0
-                                && gu.len() % (2 * d_model) == 0
-                                && !gu.is_empty() =>
+                            if d_model != 0 && gu.len() % (2 * d_model) == 0 && !gu.is_empty() =>
                         {
                             let ffn_d = gu.len() / (2 * d_model);
                             let (gate, up) = gu.split_at(ffn_d * d_model);
-                            SharedExpert::from_projections(
-                                d_model, ffn_d, gate, up, &down, None,
-                            )
+                            SharedExpert::from_projections(d_model, ffn_d, gate, up, &down, None)
                         }
                         _ => None,
                     }
@@ -1430,14 +1443,10 @@ if let Ok(sv) = s.tensor(&scale_name) {
                     let down = find_f32_any(&[naming.mlp_down(l)]);
                     match (gate, up, down) {
                         (Some(gate), Some(up), Some(down))
-                            if d_model != 0
-                                && gate.len() % d_model == 0
-                                && !gate.is_empty() =>
+                            if d_model != 0 && gate.len() % d_model == 0 && !gate.is_empty() =>
                         {
                             let ffn_d = gate.len() / d_model;
-                            SharedExpert::from_projections(
-                                d_model, ffn_d, &gate, &up, &down, None,
-                            )
+                            SharedExpert::from_projections(d_model, ffn_d, &gate, &up, &down, None)
                         }
                         _ => None,
                     }
@@ -1469,16 +1478,16 @@ if let Ok(sv) = s.tensor(&scale_name) {
                 // honoured when its length matches the configured shape;
                 // otherwise we fall back to the inline `moe_gate` tensor.
                 tried += 1;
-let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
-    .and_then(|mut v| {
-        if v.len() < expected {
-            None
-        } else {
-            v.truncate(expected);
-            Some(v)
-        }
-    })
-    .or_else(|| find_f32(&naming.moe_gate(l), expected));
+                let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
+                    .and_then(|mut v| {
+                        if v.len() < expected {
+                            None
+                        } else {
+                            v.truncate(expected);
+                            Some(v)
+                        }
+                    })
+                    .or_else(|| find_f32(&naming.moe_gate(l), expected));
                 if let Some(v) = gate_vec {
                     model.layers[l].gate = LinearGate::with_routing(
                         v,
@@ -1566,9 +1575,8 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     ) -> Result<Self, std::io::Error> {
         let has_safetensors = std::fs::read_dir(dir)
             .map(|it| {
-                it.flatten().any(|e| {
-                    e.path().extension().and_then(|s| s.to_str()) == Some("safetensors")
-                })
+                it.flatten()
+                    .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("safetensors"))
             })
             .unwrap_or(false);
         if has_safetensors {
@@ -1625,12 +1633,7 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     /// The returned vector is **not** deduplicated; the caller is
     /// expected to fold it into a [`HashSet`] before calling
     /// [`Engine::warm_with`].
-    pub fn peek_experts(
-        &self,
-        token_id: u32,
-        pos: usize,
-        kv: &[KvCache],
-    ) -> Vec<u32> {
+    pub fn peek_experts(&self, token_id: u32, pos: usize, kv: &[KvCache]) -> Vec<u32> {
         assert_eq!(
             kv.len(),
             self.config.num_layers,
@@ -1671,7 +1674,8 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
         out
     }
 
-    /// Run one decoder step. Returns the sampled next-token id.
+    /// Ingest one token, update all per-layer KV caches, and return the
+    /// final RMS-normalised hidden state without evaluating the LM head.
     ///
     /// This is the realisation of the gist's pseudocode:
     ///
@@ -1682,24 +1686,21 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     ///       (normed, routing) = layer.moe_pre(x)
     ///       experts_y = engine.moe_step(normed, routing.experts)  // SSD-streamed
     ///       x = layer.moe_combine(x, experts_y, routing.weights)
-    ///   x = final_rms(x)
-    ///   logits = lm_head(x)
-    ///   return sample(logits, params, pos)
+    ///   return final_rms(x)
     /// ```
     ///
     /// `engine.moe_step` is what reads expert weights from SSD via the
     /// LRU cache — that's the whole point of the substrate.
-    /// Sampling is delegated to [`crate::sampling::sample`], so
-    /// `temperature == 0.0` reproduces the original deterministic
-    /// `argmax` behaviour bit-for-bit.
-    pub async fn step(
+    /// This is the prompt-ingestion half of the real transformer path:
+    /// it performs every model/layer side effect required for future
+    /// attention, but deliberately does not pay for the LM head.
+    pub async fn forward_token_hidden(
         &self,
         engine: &Arc<Engine>,
         token_id: u32,
         pos: usize,
         kv: &mut [KvCache],
-        params: &crate::sampling::SamplingParams,
-    ) -> u32 {
+    ) -> Vec<f32> {
         assert_eq!(
             kv.len(),
             self.config.num_layers,
@@ -1737,8 +1738,8 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
                 .collect();
             // `token_idx` here is just a digest seed; positional info is
             // already baked into RoPE inside `attn_block`.
-            let token_idx = (pos as u64).wrapping_mul(self.config.num_layers as u64)
-                + layer_idx as u64;
+            let token_idx =
+                (pos as u64).wrapping_mul(self.config.num_layers as u64) + layer_idx as u64;
             let expert_outs = engine
                 .moe_step(token_idx, layer_idx as u32, &normed, &global_ids)
                 .await;
@@ -1752,8 +1753,49 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
                 x = crate::transformer::add_residual(&x, &shared);
             }
         }
-        let normed = self.final_rms.forward(&x);
-        self.lm_head.sample(&normed, params, pos as u64)
+        self.final_rms.forward(&x)
+    }
+
+    /// Sample a next-token id from an already-computed final hidden state.
+    ///
+    /// Sampling is delegated to [`crate::sampling::sample`], so
+    /// `temperature == 0.0` reproduces the original deterministic
+    /// `argmax` behaviour bit-for-bit.
+    pub fn sample_hidden(
+        &self,
+        hidden: &[f32],
+        params: &crate::sampling::SamplingParams,
+        pos: usize,
+    ) -> u32 {
+        self.lm_head.sample(hidden, params, pos as u64)
+    }
+
+    /// Ingest one token and sample the following token. This is the
+    /// decode-step half of the split API and is equivalent to the old
+    /// `step` behavior.
+    pub async fn decode_step(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        params: &crate::sampling::SamplingParams,
+    ) -> u32 {
+        let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await;
+        self.sample_hidden(&hidden, params, pos)
+    }
+
+    /// Backwards-compatible alias for callers that still express a full
+    /// decoder step as "ingest one token and return the next token".
+    pub async fn step(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        params: &crate::sampling::SamplingParams,
+    ) -> u32 {
+        self.decode_step(engine, token_id, pos, kv, params).await
     }
 }
 
@@ -1765,7 +1807,9 @@ struct SplitMix64 {
 
 impl SplitMix64 {
     fn new(seed: u64) -> Self {
-        Self { state: seed.wrapping_add(0x9E3779B97F4A7C15) }
+        Self {
+            state: seed.wrapping_add(0x9E3779B97F4A7C15),
+        }
     }
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
@@ -1841,9 +1885,11 @@ fn seed_mla(
         // YaRN long-context scaling (DeepSeek-V3 ships `rope_scaling`
         // of type "yarn"): blended inverse frequencies over the rotary
         // portion plus the `mscale` attention-magnitude corrections.
-        rope_yarn: config.advanced.rope_scaling.as_ref().and_then(|s| {
-            YarnRope::from_scaling(dims.qk_rope_head_dim, config.rope_base, s)
-        }),
+        rope_yarn: config
+            .advanced
+            .rope_scaling
+            .as_ref()
+            .and_then(|s| YarnRope::from_scaling(dims.qk_rope_head_dim, config.rope_base, s)),
         softmax_scale: MultiHeadLatentAttention::yarn_softmax_scale(
             dims.qk_nope_head_dim,
             dims.qk_rope_head_dim,
@@ -1879,7 +1925,9 @@ fn load_mla_layer<F>(
 ) where
     F: Fn(&str, usize) -> Option<Vec<f32>>,
 {
-    let Some(mla) = layer.mla.as_mut() else { return };
+    let Some(mla) = layer.mla.as_mut() else {
+        return;
+    };
     let d_model = config.d_model;
     let n_h = mla.num_heads;
     let qk_head = mla.qk_nope_head_dim + mla.qk_rope_head_dim;
@@ -2071,8 +2119,8 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
     use crate::engine::{Engine, EngineOptions, ModelShape};
-    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
+    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::router::{PredictiveLoader, TopKRouter};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2089,10 +2137,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!(
-                "mer-model-{label}-{}-{n}-{ts}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("mer-model-{label}-{}-{n}-{ts}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             Self { path }
         }
@@ -2309,9 +2355,16 @@ mod tests {
         let m = RealModel::new_seeded(cfg, 3);
         for (l, layer) in m.layers.iter().enumerate() {
             if l % 2 == 0 {
-                assert_eq!(layer.attn.window_size, Some(128), "even layer {l} should be SWA");
+                assert_eq!(
+                    layer.attn.window_size,
+                    Some(128),
+                    "even layer {l} should be SWA"
+                );
             } else {
-                assert_eq!(layer.attn.window_size, None, "odd layer {l} should be global");
+                assert_eq!(
+                    layer.attn.window_size, None,
+                    "odd layer {l} should be global"
+                );
             }
         }
 
@@ -2340,10 +2393,7 @@ mod tests {
         assert_eq!(m.global_expert_id(2, 5), 21);
     }
 
-    fn build_engine_for_model(
-        dir: &Path,
-        cfg: &RealModelConfig,
-    ) -> Arc<Engine> {
+    fn build_engine_for_model(dir: &Path, cfg: &RealModelConfig) -> Arc<Engine> {
         // Total experts across all layers, addressed flat as
         // layer * num_experts + local.
         let total = cfg.num_layers as u32 * cfg.num_experts as u32;
@@ -2376,7 +2426,11 @@ mod tests {
             storage,
             router,
             predictor,
-            ModelShape { d_model: cfg.d_model, d_ff: cfg.d_ff, hidden_seed: 1 },
+            ModelShape {
+                d_model: cfg.d_model,
+                d_ff: cfg.d_ff,
+                hidden_seed: 1,
+            },
             EngineOptions::default(),
         ))
     }
@@ -2388,7 +2442,15 @@ mod tests {
         let engine = build_engine_for_model(&dir.path, &cfg);
         let model = RealModel::new_seeded(cfg.clone(), 0xDEAD);
         let mut kv = model.fresh_kv_caches();
-        let next = model.step(&engine, 42, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+        let next = model
+            .step(
+                &engine,
+                42,
+                0,
+                &mut kv,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
         assert!((next as usize) < cfg.vocab_size);
         // KV caches grew by exactly one position.
         for c in &kv {
@@ -2398,7 +2460,10 @@ mod tests {
         // misses).
         let r = engine.report();
         assert!(r.misses > 0, "first step should miss the cache");
-        assert!(r.bytes_read > 0, "engine should have read expert bytes from disk");
+        assert!(
+            r.bytes_read > 0,
+            "engine should have read expert bytes from disk"
+        );
     }
 
     /// Regression test for MLA KV-cache sizing. `fresh_kv_caches` must
@@ -2428,7 +2493,10 @@ mod tests {
         };
         let engine = build_engine_for_model(&dir.path, &cfg);
         let model = RealModel::new_seeded(cfg.clone(), 0x5EED);
-        assert!(model.layers.iter().all(|l| l.mla.is_some()), "all layers MLA");
+        assert!(
+            model.layers.iter().all(|l| l.mla.is_some()),
+            "all layers MLA"
+        );
 
         let mut kv = model.fresh_kv_caches();
         let latent = 16 + 4; // kv_lora_rank + qk_rope_head_dim
@@ -2437,8 +2505,24 @@ mod tests {
             assert_eq!(c.v_dim, latent, "MLA V cache must be latent-width");
         }
 
-        let t1 = model.step(&engine, 7, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
-        let t2 = model.step(&engine, t1, 1, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+        let t1 = model
+            .step(
+                &engine,
+                7,
+                0,
+                &mut kv,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
+        let t2 = model
+            .step(
+                &engine,
+                t1,
+                1,
+                &mut kv,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
         assert!((t1 as usize) < cfg.vocab_size);
         assert!((t2 as usize) < cfg.vocab_size);
         for c in &kv {
@@ -2454,12 +2538,44 @@ mod tests {
         let model = RealModel::new_seeded(cfg.clone(), 1);
 
         let mut kv1 = model.fresh_kv_caches();
-        let t1 = model.step(&engine, 7, 0, &mut kv1, &crate::sampling::SamplingParams::greedy()).await;
-        let t2 = model.step(&engine, t1, 1, &mut kv1, &crate::sampling::SamplingParams::greedy()).await;
+        let t1 = model
+            .step(
+                &engine,
+                7,
+                0,
+                &mut kv1,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
+        let t2 = model
+            .step(
+                &engine,
+                t1,
+                1,
+                &mut kv1,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
 
         let mut kv2 = model.fresh_kv_caches();
-        let u1 = model.step(&engine, 7, 0, &mut kv2, &crate::sampling::SamplingParams::greedy()).await;
-        let u2 = model.step(&engine, u1, 1, &mut kv2, &crate::sampling::SamplingParams::greedy()).await;
+        let u1 = model
+            .step(
+                &engine,
+                7,
+                0,
+                &mut kv2,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
+        let u2 = model
+            .step(
+                &engine,
+                u1,
+                1,
+                &mut kv2,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
 
         assert_eq!((t1, t2), (u1, u2));
     }
@@ -2476,7 +2592,15 @@ mod tests {
         let engine = build_engine_for_model(&dir.path, &cfg);
         let model = RealModel::new_seeded(cfg.clone(), 9);
         let mut kv = model.fresh_kv_caches();
-        let _ = model.step(&engine, 5, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+        let _ = model
+            .step(
+                &engine,
+                5,
+                0,
+                &mut kv,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
         // Both layers contributed to KV cache growth.
         assert_eq!(kv.len(), 2);
         for c in &kv {
@@ -2490,8 +2614,8 @@ mod tests {
     /// minimal shard by hand and compare specific weights.
     #[test]
     fn from_safetensors_loads_dense_tensors() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let cfg = RealModelConfig {
             vocab_size: 8,
             d_model: 4,
@@ -2523,7 +2647,9 @@ mod tests {
         // HF Python pipeline emits.
         let to_bytes = |v: &[f32]| -> Vec<u8> {
             let mut out = Vec::with_capacity(v.len() * 4);
-            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
             out
         };
         let embed_bytes = to_bytes(&embed);
@@ -2532,7 +2658,8 @@ mod tests {
         let tensors: Vec<(String, TensorView)> = vec![
             (
                 "model.embed_tokens.weight".to_string(),
-                TensorView::new(Dtype::F32, vec![cfg.vocab_size, cfg.d_model], &embed_bytes).unwrap(),
+                TensorView::new(Dtype::F32, vec![cfg.vocab_size, cfg.d_model], &embed_bytes)
+                    .unwrap(),
             ),
             (
                 "model.layers.0.self_attn.q_proj.weight".to_string(),
@@ -2557,7 +2684,10 @@ mod tests {
         // happen if our find-tensor logic spuriously matched).
         let lm = &model.lm_head.weights;
         let first = lm[0];
-        assert!(lm.iter().any(|&x| x != first), "lm_head should remain seeded, not constant");
+        assert!(
+            lm.iter().any(|&x| x != first),
+            "lm_head should remain seeded, not constant"
+        );
     }
 
     /// Regression: a checkpoint with `attention_bias = true` AND an
@@ -2569,8 +2699,8 @@ mod tests {
     /// lost.
     #[test]
     fn from_safetensors_loads_asymmetric_v_proj_bias() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let mut adv = AdvancedConfig::default();
         adv.attention_bias = true;
         adv.v_head_dim = Some(2); // V uses 2 while Q/K use head_dim = 4
@@ -2627,8 +2757,8 @@ mod tests {
     /// the `[q_dim | kv_dim | kv_dim]` row boundaries, in that order.
     #[test]
     fn from_safetensors_splits_phi4_fused_qkv() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let cfg = RealModelConfig {
             vocab_size: 8,
             d_model: 4,
@@ -2658,7 +2788,9 @@ mod tests {
         fused.extend(std::iter::repeat(0.3f32).take(kv_dim * cfg.d_model));
         let to_bytes = |v: &[f32]| -> Vec<u8> {
             let mut out = Vec::with_capacity(v.len() * 4);
-            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
             out
         };
         let fused_bytes = to_bytes(&fused);
@@ -2689,8 +2821,8 @@ mod tests {
     /// that prefix before looking tensors up.
     #[test]
     fn from_safetensors_handles_mistral_language_model_prefix() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let cfg = RealModelConfig {
             vocab_size: 8,
             d_model: 4,
@@ -2712,7 +2844,9 @@ mod tests {
         let embed = vec![0.7f32; cfg.vocab_size * cfg.d_model];
         let to_bytes = |v: &[f32]| -> Vec<u8> {
             let mut out = Vec::with_capacity(v.len() * 4);
-            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
             out
         };
         let embed_bytes = to_bytes(&embed);
@@ -2802,14 +2936,14 @@ mod tests {
         };
         let model = RealModel::new_seeded(cfg, 1);
         for layer in &model.layers {
-            assert!(layer.attn.rope_yarn.is_some(), "standard path must carry YaRN");
+            assert!(
+                layer.attn.rope_yarn.is_some(),
+                "standard path must carry YaRN"
+            );
             let mla = layer.mla.as_ref().expect("MLA seeded");
             assert!(mla.rope_yarn.is_some(), "MLA path must carry YaRN");
-            let expected = crate::mla::MultiHeadLatentAttention::yarn_softmax_scale(
-                4,
-                4,
-                Some(&scaling),
-            );
+            let expected =
+                crate::mla::MultiHeadLatentAttention::yarn_softmax_scale(4, 4, Some(&scaling));
             assert!((mla.softmax_scale - expected).abs() < 1e-7);
             assert!(
                 mla.softmax_scale
@@ -2861,8 +2995,8 @@ mod tests {
     /// `from_dir_auto`-adjacent dispatch test.
     #[test]
     fn from_dir_auto_dispatches_on_safetensors_presence() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let cfg = RealModelConfig {
             vocab_size: 4,
             d_model: 4,
@@ -2891,13 +3025,10 @@ mod tests {
         let st_dir = TempDir::new("auto_st");
         let embed = vec![0.75f32; cfg.vocab_size * cfg.d_model];
         let mut bytes = Vec::with_capacity(embed.len() * 4);
-        for &x in &embed { bytes.extend_from_slice(&x.to_le_bytes()); }
-        let view = TensorView::new(
-            Dtype::F32,
-            vec![cfg.vocab_size, cfg.d_model],
-            &bytes,
-        )
-        .unwrap();
+        for &x in &embed {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        let view = TensorView::new(Dtype::F32, vec![cfg.vocab_size, cfg.d_model], &bytes).unwrap();
         serialize_to_file(
             [("model.embed_tokens.weight".to_string(), view)],
             &None,
@@ -2950,7 +3081,10 @@ mod tests {
             .shared_expert
             .as_ref()
             .expect("shared expert should be loaded");
-        assert_eq!(se.d_ff, shared_d_ff, "d_ff inferred from gate tensor length");
+        assert_eq!(
+            se.d_ff, shared_d_ff,
+            "d_ff inferred from gate tensor length"
+        );
         assert_eq!(se.d_model, d_model);
         assert!(se.gate_inp.is_some(), "sigmoid gate present");
         // forward produces a finite, d_model-length vector.
@@ -3032,7 +3166,10 @@ mod tests {
         .unwrap();
         let y_gated = gated.forward(&x);
         for (a, b) in y_ungated.iter().zip(y_gated.iter()) {
-            assert!((a * 0.5 - b).abs() < 1e-6, "gate=0 must halve output: {a} {b}");
+            assert!(
+                (a * 0.5 - b).abs() < 1e-6,
+                "gate=0 must halve output: {a} {b}"
+            );
         }
     }
 }

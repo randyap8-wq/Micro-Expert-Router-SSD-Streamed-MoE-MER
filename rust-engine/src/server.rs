@@ -25,8 +25,8 @@
 //! pieces), this loop swaps to producing real next-token logits — the
 //! HTTP shape doesn't change.
 
-use crate::batch_scheduler::BatchScheduler;
 use crate::backend::Backend;
+use crate::batch_scheduler::{BatchScheduler, RequestId};
 use crate::config::LiveConfig;
 use crate::engine::Engine;
 use crate::metrics::Metrics;
@@ -170,18 +170,59 @@ async fn health() -> Json<HealthResponse> {
 
 async fn metrics(State(state): State<AppState>) -> Response {
     match state.metrics.render() {
-        Ok(body) => (
-            StatusCode::OK,
-            [("content-type", "text/plain; version=0.0.4")],
-            body,
-        )
-            .into_response(),
+        Ok(mut body) => {
+            if let Some(scheduler) = state.batch_scheduler.as_ref() {
+                append_scheduler_metrics(&mut body, scheduler);
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain; version=0.0.4")],
+                body,
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("metrics render error: {e}"),
         )
             .into_response(),
     }
+}
+
+fn append_scheduler_metrics(body: &mut Vec<u8>, scheduler: &BatchScheduler) {
+    let stats = scheduler.prepass_stats();
+    let precision = stats.prefetch_precision();
+    let metrics = format!(
+        "\n# HELP mer_scheduler_prepass_runs_total Scheduler pre-pass batches with effective batch size greater than one.\n\
+         # TYPE mer_scheduler_prepass_runs_total counter\n\
+         mer_scheduler_prepass_runs_total {}\n\
+         # HELP mer_scheduler_prepass_singleton_skips_total Scheduler batches that skipped the pre-pass because effective batch size was one.\n\
+         # TYPE mer_scheduler_prepass_singleton_skips_total counter\n\
+         mer_scheduler_prepass_singleton_skips_total {}\n\
+         # HELP mer_scheduler_prepass_time_seconds_total Total scheduler pre-pass wall time in seconds.\n\
+         # TYPE mer_scheduler_prepass_time_seconds_total counter\n\
+         mer_scheduler_prepass_time_seconds_total {:.9}\n\
+         # HELP mer_scheduler_prepass_predicted_experts_total Raw expert prediction slots emitted by scheduler pre-pass peeks.\n\
+         # TYPE mer_scheduler_prepass_predicted_experts_total counter\n\
+         mer_scheduler_prepass_predicted_experts_total {}\n\
+         # HELP mer_scheduler_prepass_requested_experts_total Unique expert warm/fetch requests issued by the scheduler pre-pass after dedupe and placement.\n\
+         # TYPE mer_scheduler_prepass_requested_experts_total counter\n\
+         mer_scheduler_prepass_requested_experts_total {}\n\
+         # HELP mer_scheduler_prepass_prefetch_precision Unique warm/fetch requests divided by raw predicted expert slots.\n\
+         # TYPE mer_scheduler_prepass_prefetch_precision gauge\n\
+         mer_scheduler_prepass_prefetch_precision {:.9}\n\
+         # HELP mer_scheduler_prepass_local_warm_failures_total Local warm_with calls that failed during scheduler pre-pass.\n\
+         # TYPE mer_scheduler_prepass_local_warm_failures_total counter\n\
+         mer_scheduler_prepass_local_warm_failures_total {}\n",
+        stats.runs_total,
+        stats.singleton_skips_total,
+        stats.time_ns_total as f64 / 1_000_000_000.0,
+        stats.predicted_experts_total,
+        stats.requested_experts_total,
+        precision,
+        stats.local_warm_failures_total,
+    );
+    body.extend_from_slice(metrics.as_bytes());
 }
 
 // ------------------------ /v1/completions ----------------------------
@@ -216,8 +257,12 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
 }
 
-fn default_max_tokens() -> usize { 64 }
-fn default_model() -> String { "micro-expert-router".to_string() }
+fn default_max_tokens() -> usize {
+    64
+}
+fn default_model() -> String {
+    "micro-expert-router".to_string()
+}
 
 #[derive(Serialize, Debug)]
 pub struct CompletionChoice {
@@ -268,9 +313,7 @@ async fn completions(
                 state
                     .metrics
                     .record_request("/v1/completions", started.elapsed().as_secs_f64());
-                return Sse::new(s)
-                    .keep_alive(KeepAlive::default())
-                    .into_response();
+                return Sse::new(s).keep_alive(KeepAlive::default()).into_response();
             }
             Err(e) => {
                 state
@@ -280,13 +323,26 @@ async fn completions(
             }
         }
     }
-    match generate(&state, &req.prompt, req.max_tokens, &req.model, params, session_id).await {
+    match generate(
+        &state,
+        &req.prompt,
+        req.max_tokens,
+        &req.model,
+        params,
+        session_id,
+    )
+    .await
+    {
         Ok(resp) => {
-            state.metrics.record_request("/v1/completions", started.elapsed().as_secs_f64());
+            state
+                .metrics
+                .record_request("/v1/completions", started.elapsed().as_secs_f64());
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
-            state.metrics.record_request("/v1/completions", started.elapsed().as_secs_f64());
+            state
+                .metrics
+                .record_request("/v1/completions", started.elapsed().as_secs_f64());
             error_response(e)
         }
     }
@@ -366,9 +422,7 @@ async fn chat_completions(
                 state
                     .metrics
                     .record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
-                return Sse::new(s)
-                    .keep_alive(KeepAlive::default())
-                    .into_response();
+                return Sse::new(s).keep_alive(KeepAlive::default()).into_response();
             }
             Err(e) => {
                 state
@@ -381,7 +435,16 @@ async fn chat_completions(
     // Flatten messages into a single prompt — exactly the same shape
     // simple OpenAI-compatible servers (vLLM, llama.cpp's HTTP) do when
     // no chat template is configured.
-    match generate(&state, &prompt, req.max_tokens, &req.model, params, session_id).await {
+    match generate(
+        &state,
+        &prompt,
+        req.max_tokens,
+        &req.model,
+        params,
+        session_id,
+    )
+    .await
+    {
         Ok(comp) => {
             let resp = ChatCompletionResponse {
                 id: comp.id,
@@ -391,17 +454,26 @@ async fn chat_completions(
                     index: 0,
                     message: ChatResponseMessage {
                         role: "assistant",
-                        content: comp.choices.into_iter().next().map(|c| c.text).unwrap_or_default(),
+                        content: comp
+                            .choices
+                            .into_iter()
+                            .next()
+                            .map(|c| c.text)
+                            .unwrap_or_default(),
                     },
                     finish_reason: "length",
                 }],
                 usage: comp.usage,
             };
-            state.metrics.record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
+            state
+                .metrics
+                .record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
-            state.metrics.record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
+            state
+                .metrics
+                .record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
             error_response(e)
         }
     }
@@ -481,7 +553,9 @@ async fn generate(
     session_id: Option<String>,
 ) -> Result<CompletionResponse, GenerateError> {
     if prompt.is_empty() {
-        return Err(GenerateError::InvalidRequest("prompt must be non-empty".into()));
+        return Err(GenerateError::InvalidRequest(
+            "prompt must be non-empty".into(),
+        ));
     }
     let max_tokens = requested_max
         .min(state.runtime.snapshot().max_tokens_cap)
@@ -494,6 +568,11 @@ async fn generate(
         .encode(prompt)
         .map_err(|e| GenerateError::Tokenizer(e.to_string()))?;
     let prompt_tokens = prompt_ids.len();
+    if prompt_ids.is_empty() {
+        return Err(GenerateError::InvalidRequest(
+            "prompt must encode to at least one token".into(),
+        ));
+    }
 
     // 2) Drive next-token generation. Two paths:
     //
@@ -519,27 +598,43 @@ async fn generate(
         // Resolve session: take any existing KV state, then put it
         // back at the end. When no session is configured the request
         // is fully stateless (legacy behaviour).
-        let (mut kv, mut start_pos, checkout) = load_session_kv(state, model, session_id.as_deref());
+        let (kv, mut start_pos, pending_token, checkout) =
+            load_session_kv(state, model, session_id.as_deref());
+        let mut request = RealRequestState::new(state, model, kv);
         let pre_hits = state.engine.report().hits;
         let pre_misses = state.engine.report().misses;
 
-        // Prime the KV cache with the prompt tokens so the first
-        // generated token actually attends over the prompt. We discard
-        // the sampled ids during the prompt sweep — those would be the
-        // model's predictions of the *next* prompt token, not part of
-        // the completion. When a session is active and `start_pos > 0`
-        // the prompt continues from where the previous request left
-        // off (multi-turn chat).
-        for &tid in prompt_ids.iter() {
-            let _ = step_through_scheduler(state, model, tid, start_pos, &mut kv, &params).await;
+        // If the previous request ended after emitting a token that has not
+        // yet been ingested into KV, ingest it first without evaluating the
+        // LM head. This preserves P + C - 1 forward evaluations for the
+        // request that produced it.
+        if let Some(tid) = pending_token {
+            let _ = request.forward_token_hidden(tid, start_pos).await;
             start_pos += 1;
         }
 
-        // Now generate `max_tokens` real tokens.
+        // Prime the KV cache with the prompt tokens so the first generated
+        // token attends over the prompt, but do not run the LM head for
+        // prompt tokens except the final hidden state that seeds completion
+        // token 0.
+        for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
+            let _ = request.forward_token_hidden(tid, start_pos).await;
+            start_pos += 1;
+        }
+        let final_prompt_pos = start_pos;
+        let final_prompt = *prompt_ids.last().expect("prompt_ids checked non-empty");
+        let final_hidden = request
+            .forward_token_hidden(final_prompt, final_prompt_pos)
+            .await;
+        start_pos += 1;
+        let first = request.sample_hidden(&final_hidden, &params, final_prompt_pos);
+        completion_ids.push(first);
+
+        // Now generate the remaining real tokens.
         // When a draft engine is configured and speculation_k > 1, use
         // `step_speculative` which verifies k draft tokens per call with a
         // single batched SSD prefetch (gist Phase 2). Falls back to the
-        // sequential `step_through_scheduler` path otherwise.
+        // sequential scheduler/direct path otherwise.
         //
         // **Sampling-correctness gate.** `step_speculative` verifies and
         // emits tokens with `SamplingParams::greedy()` internally (see
@@ -549,22 +644,20 @@ async fn generate(
         // decoding. Restrict the fast path to greedy requests; everything
         // else falls through to the sequential sampler that honours
         // `params` end-to-end.
-        let mut last = *prompt_ids.last().unwrap_or(&0u32);
+        let mut last = first;
         let k = state.speculation_k;
         if k > 1 && state.draft_engine.is_some() && params.is_greedy() {
-            let draft = state.draft_engine.as_ref().expect("draft_engine is_some checked above").clone();
+            let draft = state
+                .draft_engine
+                .as_ref()
+                .expect("draft_engine is_some checked above")
+                .clone();
             while completion_ids.len() < max_tokens {
                 let remaining = max_tokens - completion_ids.len();
                 let step_k = k.min(remaining);
+                let kv = request.direct_kv();
                 let result = model
-                    .step_speculative(
-                        &state.engine,
-                        draft.as_ref(),
-                        last,
-                        start_pos,
-                        &mut kv,
-                        step_k,
-                    )
+                    .step_speculative(&state.engine, draft.as_ref(), last, start_pos, kv, step_k)
                     .await;
                 for &tok in &result.accepted {
                     if completion_ids.len() >= max_tokens {
@@ -576,14 +669,23 @@ async fn generate(
                 last = *result.accepted.last().unwrap_or(&last);
             }
         } else {
-            for _ in 0..max_tokens {
-                let next = step_through_scheduler(state, model, last, start_pos, &mut kv, &params).await;
+            while completion_ids.len() < max_tokens {
+                let next = request.decode_step(last, start_pos, &params).await;
                 completion_ids.push(next);
                 last = next;
                 start_pos += 1;
             }
         }
-        save_session_kv(state, session_id.as_deref(), kv, start_pos, checkout);
+        let pending_token = completion_ids.last().copied();
+        let kv = request.finish();
+        save_session_kv(
+            state,
+            session_id.as_deref(),
+            kv,
+            start_pos,
+            pending_token,
+            checkout,
+        );
         let post = state.engine.report();
         hits_total = post.hits.saturating_sub(pre_hits);
         misses_total = post.misses.saturating_sub(pre_misses);
@@ -606,7 +708,8 @@ async fn generate(
             misses_total += stats.misses;
             // Map engine cycle stats to a deterministic next-token id.
             let vocab = state.tokenizer.vocab_size().max(1) as u64;
-            let next = ((base.wrapping_add(i as u64).wrapping_mul(0x9E3779B97F4A7C15)) % vocab) as u32;
+            let next =
+                ((base.wrapping_add(i as u64).wrapping_mul(0x9E3779B97F4A7C15)) % vocab) as u32;
             completion_ids.push(next);
         }
     }
@@ -644,43 +747,118 @@ async fn generate(
 
 // ------------------------ scheduler helper --------------------------
 
-/// Drive one decoder step for a single request, routing through the
-/// [`BatchScheduler`] when one is configured and falling back to a
-/// direct `RealModel::step` otherwise. The KV cache is moved into the
-/// scheduler and back so attention state stays strictly per-request
-/// even though many requests share the underlying scheduler task.
-async fn step_through_scheduler(
-    state: &AppState,
-    model: &Arc<RealModel>,
-    token_id: u32,
-    pos: usize,
-    kv: &mut Vec<crate::transformer::KvCache>,
-    params: &crate::sampling::SamplingParams,
-) -> u32 {
-    if let Some(sched) = state.batch_scheduler.as_ref() {
-        // Hand the KV caches to the scheduler's registry for the
-        // duration of one step; the scheduler returns the next
-        // token (the cache stays owned by the registry across the
-        // mpsc channel, so no `Vec<KvCache>` clone happens on the
-        // hot path). When the scheduler has shut down (server
-        // teardown) we fall back to a direct call against a freshly
-        // allocated KV cache so the request can finish — losing
-        // history is the price of a clean shutdown path here.
-        let owned = std::mem::take(kv);
-        let id = sched.register(owned);
-        let result = sched.step_registered(id, token_id, pos, *params).await;
-        // Always reclaim the cache, even on error, so the registry
-        // doesn't leak entries.
-        match sched.release(id) {
-            Some(returned) => *kv = returned,
-            None => *kv = model.fresh_kv_caches(),
+/// Request-scoped real-model execution state. When a scheduler is present,
+/// the KV cache is registered exactly once and every prompt/decode operation
+/// carries only the small [`RequestId`]. If the scheduler shuts down, the
+/// handle releases the registry entry and falls back to direct model calls.
+struct RealRequestState {
+    engine: Arc<Engine>,
+    model: Arc<RealModel>,
+    scheduler: Option<Arc<BatchScheduler>>,
+    request_id: Option<RequestId>,
+    kv: Option<Vec<crate::transformer::KvCache>>,
+}
+
+impl RealRequestState {
+    fn new(state: &AppState, model: &Arc<RealModel>, kv: Vec<crate::transformer::KvCache>) -> Self {
+        if let Some(scheduler) = state.batch_scheduler.as_ref() {
+            let request_id = scheduler.register(kv);
+            Self {
+                engine: state.engine.clone(),
+                model: model.clone(),
+                scheduler: Some(scheduler.clone()),
+                request_id: Some(request_id),
+                kv: None,
+            }
+        } else {
+            Self {
+                engine: state.engine.clone(),
+                model: model.clone(),
+                scheduler: None,
+                request_id: None,
+                kv: Some(kv),
+            }
         }
-        match result {
-            Ok(next_token) => next_token,
-            Err(_) => model.step(&state.engine, token_id, pos, kv, params).await,
+    }
+
+    async fn forward_token_hidden(&mut self, token_id: u32, pos: usize) -> Vec<f32> {
+        if let (Some(scheduler), Some(id)) = (self.scheduler.as_ref(), self.request_id) {
+            match scheduler.forward_registered(id, token_id, pos).await {
+                Ok(hidden) => return hidden,
+                Err(e) => {
+                    tracing::warn!(error = %e, "batch scheduler forward failed; falling back to direct model path");
+                }
+            }
         }
-    } else {
-        model.step(&state.engine, token_id, pos, kv, params).await
+        let engine = self.engine.clone();
+        let model = self.model.clone();
+        let kv = self.direct_kv();
+        model.forward_token_hidden(&engine, token_id, pos, kv).await
+    }
+
+    fn sample_hidden(
+        &self,
+        hidden: &[f32],
+        params: &crate::sampling::SamplingParams,
+        pos: usize,
+    ) -> u32 {
+        self.model.sample_hidden(hidden, params, pos)
+    }
+
+    async fn decode_step(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        params: &crate::sampling::SamplingParams,
+    ) -> u32 {
+        if let (Some(scheduler), Some(id)) = (self.scheduler.as_ref(), self.request_id) {
+            match scheduler.step_registered(id, token_id, pos, *params).await {
+                Ok(next) => return next,
+                Err(e) => {
+                    tracing::warn!(error = %e, "batch scheduler decode failed; falling back to direct model path");
+                }
+            }
+        }
+        let engine = self.engine.clone();
+        let model = self.model.clone();
+        let kv = self.direct_kv();
+        model.decode_step(&engine, token_id, pos, kv, params).await
+    }
+
+    fn direct_kv(&mut self) -> &mut Vec<crate::transformer::KvCache> {
+        if self.kv.is_none() {
+            self.release_scheduler_to_local();
+        }
+        self.kv
+            .as_mut()
+            .expect("RealRequestState must hold local KV after release")
+    }
+
+    fn release_scheduler_to_local(&mut self) {
+        if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
+            self.kv = scheduler
+                .release(id)
+                .or_else(|| Some(self.model.fresh_kv_caches()));
+        }
+    }
+
+    fn take_kv(&mut self) -> Vec<crate::transformer::KvCache> {
+        self.release_scheduler_to_local();
+        self.kv
+            .take()
+            .unwrap_or_else(|| self.model.fresh_kv_caches())
+    }
+
+    fn finish(mut self) -> Vec<crate::transformer::KvCache> {
+        self.take_kv()
+    }
+}
+
+impl Drop for RealRequestState {
+    fn drop(&mut self) {
+        if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
+            let _ = scheduler.release(id);
+        }
     }
 }
 
@@ -696,6 +874,7 @@ fn load_session_kv(
 ) -> (
     Vec<crate::transformer::KvCache>,
     usize,
+    Option<u32>,
     Option<SessionCheckout>,
 ) {
     if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
@@ -704,11 +883,11 @@ fn load_session_kv(
             // Mismatches happen if the server is restarted with a
             // different config; treat as a fresh session.
             if prev.kv.len() == model.config.num_layers {
-                return (prev.kv, prev.position, Some(checkout));
+                return (prev.kv, prev.position, prev.pending_token, Some(checkout));
             }
         }
     }
-    (model.fresh_kv_caches(), 0, None)
+    (model.fresh_kv_caches(), 0, None, None)
 }
 
 /// Persist KV state back to the store at request completion. No-op
@@ -718,6 +897,7 @@ fn save_session_kv(
     session_id: Option<&str>,
     kv: Vec<crate::transformer::KvCache>,
     position: usize,
+    pending_token: Option<u32>,
     checkout: Option<SessionCheckout>,
 ) {
     if let (Some(id), Some(store)) = (session_id, state.sessions.as_ref()) {
@@ -726,6 +906,7 @@ fn save_session_kv(
             SessionState {
                 kv,
                 position,
+                pending_token,
                 last_used: Instant::now(),
             },
             checkout,
@@ -739,18 +920,11 @@ struct SessionDeleteResponse {
     deleted: bool,
 }
 
-async fn delete_session(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
+async fn delete_session(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
     match state.sessions.as_ref() {
         Some(store) => {
             let deleted = store.delete(&id);
-            (
-                StatusCode::OK,
-                Json(SessionDeleteResponse { id, deleted }),
-            )
-                .into_response()
+            (StatusCode::OK, Json(SessionDeleteResponse { id, deleted })).into_response()
         }
         None => (
             StatusCode::NOT_FOUND,
@@ -931,7 +1105,9 @@ async fn stream_tokens(
     session_id: Option<String>,
 ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>, GenerateError> {
     if prompt.is_empty() {
-        return Err(GenerateError::InvalidRequest("prompt must be non-empty".into()));
+        return Err(GenerateError::InvalidRequest(
+            "prompt must be non-empty".into(),
+        ));
     }
     let max_tokens = requested_max
         .min(state.runtime.snapshot().max_tokens_cap)
@@ -940,15 +1116,21 @@ async fn stream_tokens(
         .tokenizer
         .encode(&prompt)
         .map_err(|e| GenerateError::Tokenizer(e.to_string()))?;
+    if prompt_ids.is_empty() {
+        return Err(GenerateError::InvalidRequest(
+            "prompt must encode to at least one token".into(),
+        ));
+    }
 
     // Generator state passed through `stream::unfold`. Holds everything a
     // single-stream generator needs across `await` points.
     enum GenMode {
         Real {
-            kv: Vec<crate::transformer::KvCache>,
+            request: RealRequestState,
             last_token: u32,
             position: usize,
             checkout: Option<SessionCheckout>,
+            pending_emit: Option<u32>,
         },
         Legacy {
             base: u64,
@@ -958,16 +1140,30 @@ async fn stream_tokens(
     let mode = if let Some(model) = state.real_model.as_ref() {
         // Resume from session state if configured — otherwise start
         // fresh, matching the non-streaming `generate` path.
-        let (mut kv, mut pos, checkout) = load_session_kv(&state, model, session_id.as_deref());
-        for &tid in prompt_ids.iter() {
-            let _ = step_through_scheduler(&state, model, tid, pos, &mut kv, &params).await;
+        let (kv, mut pos, pending_token, checkout) =
+            load_session_kv(&state, model, session_id.as_deref());
+        let mut request = RealRequestState::new(&state, model, kv);
+        if let Some(tid) = pending_token {
+            let _ = request.forward_token_hidden(tid, pos).await;
             pos += 1;
         }
+        for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
+            let _ = request.forward_token_hidden(tid, pos).await;
+            pos += 1;
+        }
+        let final_prompt_pos = pos;
+        let final_prompt = *prompt_ids.last().expect("prompt_ids checked non-empty");
+        let hidden = request
+            .forward_token_hidden(final_prompt, final_prompt_pos)
+            .await;
+        pos += 1;
+        let first = request.sample_hidden(&hidden, &params, final_prompt_pos);
         GenMode::Real {
-            kv,
-            last_token: *prompt_ids.last().unwrap_or(&0u32),
+            request,
+            last_token: first,
             position: pos,
             checkout,
+            pending_emit: Some(first),
         }
     } else {
         GenMode::Legacy {
@@ -1016,35 +1212,54 @@ async fn stream_tokens(
             // Final chunk carries `finish_reason: length` and no new text.
             // Persist KV-cache state back to the session store so a
             // follow-up request can pick up where we stopped.
-            if let GenMode::Real { kv, last_token: _, position, checkout } = &mut st.mode {
-                let kv_take = std::mem::take(kv);
+            if let GenMode::Real {
+                request,
+                position,
+                checkout,
+                ..
+            } = &mut st.mode
+            {
+                let kv_take = request.take_kv();
+                let pending_token = st.completion_ids.last().copied();
                 save_session_kv(
                     &st.state,
                     st.session_id.as_deref(),
                     kv_take,
                     *position,
+                    pending_token,
                     checkout.take(),
                 );
             }
             st.finished_emitted = true;
             return Some((
-                StreamChunk { text: String::new(), finished: true, hits: 0, misses: 0 },
+                StreamChunk {
+                    text: String::new(),
+                    finished: true,
+                    hits: 0,
+                    misses: 0,
+                },
                 st,
             ));
         }
         let pre_hits = st.state.engine.report().hits;
         let pre_misses = st.state.engine.report().misses;
         let next: u32 = match &mut st.mode {
-            GenMode::Real { kv, last_token, position, checkout: _ } => {
-                let model = st
-                    .state
-                    .real_model
-                    .as_ref()
-                    .expect("Real mode requires real_model");
-                let n = step_through_scheduler(&st.state, model, *last_token, *position, kv, &st.params).await;
-                *last_token = n;
-                *position += 1;
-                n
+            GenMode::Real {
+                request,
+                last_token,
+                position,
+                pending_emit,
+                ..
+            } => {
+                if let Some(n) = pending_emit.take() {
+                    n
+                } else {
+                    let n = request
+                        .decode_step(*last_token, *position, &st.params)
+                        .await;
+                    *position += 1;
+                    n
+                }
             }
             GenMode::Legacy { base, i } => {
                 match st.state.engine.generate(base.wrapping_add(*i)).await {
@@ -1059,7 +1274,12 @@ async fn stream_tokens(
                         tracing::warn!(error = %e, "legacy stream: expert read failed; ending stream");
                         st.finished_emitted = true;
                         return Some((
-                            StreamChunk { text: String::new(), finished: true, hits: 0, misses: 0 },
+                            StreamChunk {
+                                text: String::new(),
+                                finished: true,
+                                hits: 0,
+                                misses: 0,
+                            },
                             st,
                         ));
                     }
@@ -1070,6 +1290,9 @@ async fn stream_tokens(
                 id
             }
         };
+        if let GenMode::Real { last_token, .. } = &mut st.mode {
+            *last_token = next;
+        }
         let post = st.state.engine.report();
         let hits = post.hits.saturating_sub(pre_hits);
         let misses = post.misses.saturating_sub(pre_misses);
@@ -1096,7 +1319,12 @@ async fn stream_tokens(
         st.decoded_so_far = new_decoded;
 
         Some((
-            StreamChunk { text: delta, finished: false, hits, misses },
+            StreamChunk {
+                text: delta,
+                finished: false,
+                hits,
+                misses,
+            },
             st,
         ))
     })))
@@ -1112,10 +1340,26 @@ async fn build_completion_stream(
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, GenerateError> {
     let id = format!("cmpl-{:x}", rand_request_id());
     let metrics = state.metrics.clone();
-    let inner = stream_tokens(state.clone(), prompt.to_string(), requested_max, params, session_id).await?;
+    let inner = stream_tokens(
+        state.clone(),
+        prompt.to_string(),
+        requested_max,
+        params,
+        session_id,
+    )
+    .await?;
     let s = stream::unfold(
         (inner, id, model_name, metrics, 0u64, 0u64, 0u64, false),
-        |(mut inner, id, model_name, metrics, mut hits, mut misses, mut tokens_done, terminated)| async move {
+        |(
+            mut inner,
+            id,
+            model_name,
+            metrics,
+            mut hits,
+            mut misses,
+            mut tokens_done,
+            terminated,
+        )| async move {
             if terminated {
                 return None;
             }
@@ -1127,7 +1371,19 @@ async fn build_completion_stream(
                     metrics.record_tokens(tokens_done);
                     metrics.record_cache(hits, misses);
                     let ev = Event::default().data("[DONE]");
-                    Some((Ok(ev), (inner, id, model_name, metrics, hits, misses, tokens_done, true)))
+                    Some((
+                        Ok(ev),
+                        (
+                            inner,
+                            id,
+                            model_name,
+                            metrics,
+                            hits,
+                            misses,
+                            tokens_done,
+                            true,
+                        ),
+                    ))
                 }
                 Some(chunk) => {
                     hits += chunk.hits;
@@ -1147,7 +1403,19 @@ async fn build_completion_stream(
                             cache_misses = misses,
                             "streamed completion finished"
                         );
-                        Some((Ok(done), (inner, id, model_name, metrics, hits, misses, tokens_done, true)))
+                        Some((
+                            Ok(done),
+                            (
+                                inner,
+                                id,
+                                model_name,
+                                metrics,
+                                hits,
+                                misses,
+                                tokens_done,
+                                true,
+                            ),
+                        ))
                     } else {
                         tokens_done += 1;
                         let payload = CompletionChunk {
@@ -1164,7 +1432,16 @@ async fn build_completion_stream(
                             .data(serde_json::to_string(&payload).unwrap_or_default());
                         Some((
                             Ok(ev),
-                            (inner, id, model_name, metrics, hits, misses, tokens_done, false),
+                            (
+                                inner,
+                                id,
+                                model_name,
+                                metrics,
+                                hits,
+                                misses,
+                                tokens_done,
+                                false,
+                            ),
                         ))
                     }
                 }
@@ -1184,7 +1461,14 @@ async fn build_chat_stream(
 ) -> Result<impl Stream<Item = Result<Event, Infallible>>, GenerateError> {
     let id = format!("chatcmpl-{:x}", rand_request_id());
     let metrics = state.metrics.clone();
-    let inner = stream_tokens(state.clone(), prompt.to_string(), requested_max, params, session_id).await?;
+    let inner = stream_tokens(
+        state.clone(),
+        prompt.to_string(),
+        requested_max,
+        params,
+        session_id,
+    )
+    .await?;
 
     // OpenAI emits a first "delta: { role: assistant }" event before any
     // content tokens. We do the same so streaming chat clients see the
@@ -1195,21 +1479,53 @@ async fn build_chat_stream(
         model: model_name.clone(),
         choices: vec![ChatChunkChoice {
             index: 0,
-            delta: ChatDelta { role: Some("assistant"), content: None },
+            delta: ChatDelta {
+                role: Some("assistant"),
+                content: None,
+            },
             finish_reason: None,
         }],
     };
-    let role_event =
-        Event::default().data(serde_json::to_string(&role_chunk).unwrap_or_default());
+    let role_event = Event::default().data(serde_json::to_string(&role_chunk).unwrap_or_default());
 
     let s = stream::unfold(
-        (Some(role_event), inner, id, model_name, metrics, 0u64, 0u64, 0u64, false),
-        |(role_ev, mut inner, id, model_name, metrics, mut hits, mut misses, mut tokens_done, terminated)| async move {
+        (
+            Some(role_event),
+            inner,
+            id,
+            model_name,
+            metrics,
+            0u64,
+            0u64,
+            0u64,
+            false,
+        ),
+        |(
+            role_ev,
+            mut inner,
+            id,
+            model_name,
+            metrics,
+            mut hits,
+            mut misses,
+            mut tokens_done,
+            terminated,
+        )| async move {
             if let Some(ev) = role_ev {
                 // Emit the role event first.
                 return Some((
                     Ok(ev),
-                    (None, inner, id, model_name, metrics, hits, misses, tokens_done, terminated),
+                    (
+                        None,
+                        inner,
+                        id,
+                        model_name,
+                        metrics,
+                        hits,
+                        misses,
+                        tokens_done,
+                        terminated,
+                    ),
                 ));
             }
             if terminated {
@@ -1223,7 +1539,17 @@ async fn build_chat_stream(
                     let ev = Event::default().data("[DONE]");
                     Some((
                         Ok(ev),
-                        (None, inner, id, model_name, metrics, hits, misses, tokens_done, true),
+                        (
+                            None,
+                            inner,
+                            id,
+                            model_name,
+                            metrics,
+                            hits,
+                            misses,
+                            tokens_done,
+                            true,
+                        ),
                     ))
                 }
                 Some(chunk) => {
@@ -1247,7 +1573,17 @@ async fn build_chat_stream(
                         );
                         Some((
                             Ok(done),
-                            (None, inner, id, model_name, metrics, hits, misses, tokens_done, true),
+                            (
+                                None,
+                                inner,
+                                id,
+                                model_name,
+                                metrics,
+                                hits,
+                                misses,
+                                tokens_done,
+                                true,
+                            ),
                         ))
                     } else {
                         tokens_done += 1;
@@ -1268,7 +1604,17 @@ async fn build_chat_stream(
                             .data(serde_json::to_string(&payload).unwrap_or_default());
                         Some((
                             Ok(ev),
-                            (None, inner, id, model_name, metrics, hits, misses, tokens_done, false),
+                            (
+                                None,
+                                inner,
+                                id,
+                                model_name,
+                                metrics,
+                                hits,
+                                misses,
+                                tokens_done,
+                                false,
+                            ),
                         ))
                     }
                 }
@@ -1317,7 +1663,10 @@ fn error_response(e: GenerateError) -> Response {
     (
         status,
         Json(ErrorBody {
-            error: ErrorBodyInner { message: e.to_string(), kind },
+            error: ErrorBodyInner {
+                message: e.to_string(),
+                kind,
+            },
         }),
     )
         .into_response()
@@ -1369,7 +1718,9 @@ pub async fn run_engine_warmup(state: &AppState) {
 
     let mut result: Result<&'static str, String> = Ok("noop");
 
-    if let (Some(model), Some(scheduler)) = (state.real_model.as_ref(), state.batch_scheduler.as_ref()) {
+    if let (Some(model), Some(scheduler)) =
+        (state.real_model.as_ref(), state.batch_scheduler.as_ref())
+    {
         // Full path: drive a synthetic decoder step through the
         // batch scheduler. Bypasses HTTP/auth/admission by design.
         match tokio::time::timeout(
@@ -1407,9 +1758,21 @@ pub async fn run_engine_warmup(state: &AppState) {
         let gate_f16 = vec![half::f16::from_f32(0.1); 16];
         let up_f16 = vec![half::f16::from_f32(0.2); 16];
         let mut out_f16 = vec![half::f16::ZERO; 16];
-        let gate_view = crate::backend::TensorView { data: &gate_f16, rows: 4, cols: 4 };
-        let up_view = crate::backend::TensorView { data: &up_f16, rows: 4, cols: 4 };
-        let mut out_view = crate::backend::TensorViewMut { data: &mut out_f16, rows: 4, cols: 4 };
+        let gate_view = crate::backend::TensorView {
+            data: &gate_f16,
+            rows: 4,
+            cols: 4,
+        };
+        let up_view = crate::backend::TensorView {
+            data: &up_f16,
+            rows: 4,
+            cols: 4,
+        };
+        let mut out_view = crate::backend::TensorViewMut {
+            data: &mut out_f16,
+            rows: 4,
+            cols: 4,
+        };
         let _ = backend.swiglu_into(gate_view, up_view, &mut out_view);
     }
 
@@ -1457,11 +1820,12 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
     use crate::engine::{Engine, EngineOptions, ModelShape};
-    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
+    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::router::{PredictiveLoader, TopKRouter};
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use futures::StreamExt;
     use std::sync::Arc;
     use tempdir::TempDir;
     use tower::ServiceExt;
@@ -1515,7 +1879,9 @@ mod tests {
     // test; reuse `std::env::temp_dir()` with a unique subpath.
     mod tempdir {
         use std::path::PathBuf;
-        pub struct TempDir { path: PathBuf }
+        pub struct TempDir {
+            path: PathBuf,
+        }
         impl TempDir {
             pub fn new(tag: &str) -> std::io::Result<Self> {
                 let mut path = std::env::temp_dir();
@@ -1523,11 +1889,16 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
-                path.push(format!("mer-server-test-{tag}-{}-{nanos}", std::process::id()));
+                path.push(format!(
+                    "mer-server-test-{tag}-{}-{nanos}",
+                    std::process::id()
+                ));
                 std::fs::create_dir_all(&path)?;
                 Ok(Self { path })
             }
-            pub fn path(&self) -> &std::path::Path { &self.path }
+            pub fn path(&self) -> &std::path::Path {
+                &self.path
+            }
         }
         impl Drop for TempDir {
             fn drop(&mut self) {
@@ -1558,11 +1929,25 @@ mod tests {
         );
         let cache = Arc::new(MultiLayerExpertCache::single_layer(2));
         let pool = BufferPool::new(3, expert_size, block);
-        let router = crate::gating::Router::Markov(Arc::new(TopKRouter::clustered(num_experts, 2, 2, 0.9, 1)));
+        let router = crate::gating::Router::Markov(Arc::new(TopKRouter::clustered(
+            num_experts,
+            2,
+            2,
+            0.9,
+            1,
+        )));
         let predictor = Arc::new(PredictiveLoader::new(num_experts, 1, 0.05, 1));
         let engine = Arc::new(Engine::with_options(
-            cache, pool, storage, router, predictor,
-            ModelShape { d_model, d_ff, hidden_seed: 1 },
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape {
+                d_model,
+                d_ff,
+                hidden_seed: 1,
+            },
             EngineOptions::default(),
         ));
         let state = AppState {
@@ -1593,7 +1978,12 @@ mod tests {
         let (state, _tmp) = make_state().await;
         let app = build_router(state);
         let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1649,7 +2039,12 @@ mod tests {
             .await
             .unwrap();
         let resp = app
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1670,14 +2065,18 @@ mod tests {
         let (mut state, _tmp) = make_state().await;
         // Enable the API-key gate with a single key the test will
         // (deliberately) not present on the protected request.
-        state.middleware.api_keys =
-            crate::middleware::ApiKeyGate::new(&["sekret".to_string()]);
+        state.middleware.api_keys = crate::middleware::ApiKeyGate::new(&["sekret".to_string()]);
         let app = build_router(state);
 
         // /health: no auth header, must succeed.
         let resp = app
             .clone()
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1689,7 +2088,12 @@ mod tests {
         // /metrics: no auth header, must succeed.
         let resp = app
             .clone()
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1822,7 +2226,10 @@ mod tests {
         let s = String::from_utf8(body.to_vec()).unwrap();
         // Should contain at least one data: line with text_completion shape and a [DONE] terminator.
         assert!(s.contains("data: "), "expected SSE data: lines, got {s}");
-        assert!(s.contains("text_completion"), "expected event payload to be a text_completion chunk; got {s}");
+        assert!(
+            s.contains("text_completion"),
+            "expected event payload to be a text_completion chunk; got {s}"
+        );
         assert!(s.contains("[DONE]"), "expected [DONE] terminator; got {s}");
     }
 
@@ -1855,16 +2262,17 @@ mod tests {
             s.contains("\"role\":\"assistant\""),
             "expected leading role event; got {s}"
         );
-        assert!(s.contains("chat.completion.chunk"), "expected chunk objects; got {s}");
+        assert!(
+            s.contains("chat.completion.chunk"),
+            "expected chunk objects; got {s}"
+        );
         assert!(s.contains("[DONE]"));
     }
 
     /// Build an `AppState` whose engine + storage are sized for a real
     /// transformer with the given config. Returns the state plus the
     /// temp dir that holds the synthesised expert weight files.
-    async fn make_state_with_real_model(
-        cfg: crate::model::RealModelConfig,
-    ) -> (AppState, TempDir) {
+    async fn make_state_with_real_model(cfg: crate::model::RealModelConfig) -> (AppState, TempDir) {
         let dir = TempDir::new("server-real").unwrap();
         let total = cfg.num_layers as u32 * cfg.num_experts as u32;
         let weight_bytes = crate::inference::expert_weight_bytes(cfg.d_model, cfg.d_ff);
@@ -1898,7 +2306,11 @@ mod tests {
             storage,
             router,
             predictor,
-            ModelShape { d_model: cfg.d_model, d_ff: cfg.d_ff, hidden_seed: 1 },
+            ModelShape {
+                d_model: cfg.d_model,
+                d_ff: cfg.d_ff,
+                hidden_seed: 1,
+            },
             EngineOptions::default(),
         ));
         let model = Arc::new(crate::model::RealModel::new_seeded(cfg.clone(), 0xBEEF));
@@ -1924,7 +2336,9 @@ mod tests {
                 c.server.max_tokens = 16;
                 c
             }),
-            sessions: Some(crate::session::SessionStore::new(std::time::Duration::from_secs(60))),
+            sessions: Some(crate::session::SessionStore::new(
+                std::time::Duration::from_secs(60),
+            )),
             middleware: MiddlewareState {
                 api_keys: crate::middleware::ApiKeyGate::default(),
                 rate_limit: crate::middleware::RateLimiter::new(0, 0),
@@ -1932,6 +2346,26 @@ mod tests {
             },
         };
         (state, dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_endpoint_exposes_scheduler_prepass_metrics_when_enabled() {
+        let (state, _tmp) = make_state_with_real_model(tiny_real_cfg()).await;
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 32 * 1024).await.unwrap();
+        let s = String::from_utf8(body.to_vec()).unwrap();
+        assert!(s.contains("mer_scheduler_prepass_runs_total"));
+        assert!(s.contains("mer_scheduler_prepass_prefetch_precision"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1984,6 +2418,184 @@ mod tests {
             r.misses + r.hits > 0,
             "engine cache should be touched by real transformer path"
         );
-        assert!(r.bytes_read > 0, "engine should have read expert bytes from SSD");
+        assert!(
+            r.bytes_read > 0,
+            "engine should have read expert bytes from SSD"
+        );
+    }
+
+    fn tiny_real_cfg() -> crate::model::RealModelConfig {
+        crate::model::RealModelConfig {
+            vocab_size: 256,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_generation_uses_expected_forward_count_and_one_scheduler_registration() {
+        let cfg = tiny_real_cfg();
+        let layers = cfg.num_layers as u64;
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let scheduler = state.batch_scheduler.as_ref().unwrap().clone();
+        let before_forwards = state.engine.report().tokens_processed;
+
+        let resp = generate(
+            &state,
+            "Hi",
+            3,
+            "test-model",
+            crate::sampling::SamplingParams::greedy(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.usage.prompt_tokens, 2);
+        assert_eq!(resp.usage.completion_tokens, 3);
+        let routed_layer_calls = state
+            .engine
+            .report()
+            .tokens_processed
+            .saturating_sub(before_forwards);
+        assert_eq!(
+            routed_layer_calls,
+            (resp.usage.prompt_tokens as u64 + resp.usage.completion_tokens as u64 - 1) * layers,
+            "real request must perform P + C - 1 model forwards"
+        );
+        assert_eq!(scheduler.registrations_total(), 1);
+        assert_eq!(scheduler.releases_total(), 1);
+        assert_eq!(scheduler.active_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_token_prompt_and_one_completion_runs_one_model_forward() {
+        let cfg = tiny_real_cfg();
+        let layers = cfg.num_layers as u64;
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let before_forwards = state.engine.report().tokens_processed;
+
+        let resp = generate(
+            &state,
+            "A",
+            1,
+            "test-model",
+            crate::sampling::SamplingParams::greedy(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.usage.prompt_tokens, 1);
+        assert_eq!(resp.usage.completion_tokens, 1);
+        let routed_layer_calls = state
+            .engine
+            .report()
+            .tokens_processed
+            .saturating_sub(before_forwards);
+        assert_eq!(routed_layer_calls, layers);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_persists_pending_generated_token_for_next_turn() {
+        let cfg = tiny_real_cfg();
+        let layers = cfg.num_layers as u64;
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let store = state.sessions.as_ref().unwrap().clone();
+
+        let before_first = state.engine.report().tokens_processed;
+        let _ = generate(
+            &state,
+            "Hi",
+            1,
+            "test-model",
+            crate::sampling::SamplingParams::greedy(),
+            Some("chat".to_string()),
+        )
+        .await
+        .unwrap();
+        let first_delta = state
+            .engine
+            .report()
+            .tokens_processed
+            .saturating_sub(before_first);
+        assert_eq!(
+            first_delta,
+            2 * layers,
+            "P=2,C=1 should forward only prompt tokens"
+        );
+
+        let (saved, checkout) = store.take("chat").expect("session must be saved");
+        assert_eq!(saved.position, 2);
+        assert!(
+            saved.pending_token.is_some(),
+            "last emitted token should be pending"
+        );
+        store.put("chat".to_string(), saved, Some(checkout));
+
+        let before_second = state.engine.report().tokens_processed;
+        let _ = generate(
+            &state,
+            "!",
+            1,
+            "test-model",
+            crate::sampling::SamplingParams::greedy(),
+            Some("chat".to_string()),
+        )
+        .await
+        .unwrap();
+        let second_delta = state
+            .engine
+            .report()
+            .tokens_processed
+            .saturating_sub(before_second);
+        assert_eq!(
+            second_delta,
+            2 * layers,
+            "continuation should ingest the pending token plus the one-token prompt"
+        );
+
+        let (saved, _checkout) = store.take("chat").expect("session must be saved again");
+        assert_eq!(saved.position, 4);
+        assert!(saved.pending_token.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_and_non_streaming_real_model_outputs_match() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let params = crate::sampling::SamplingParams::greedy();
+        let non_stream = generate(&state, "Hi", 3, "test-model", params, None)
+            .await
+            .unwrap()
+            .choices
+            .into_iter()
+            .next()
+            .unwrap()
+            .text;
+
+        let mut stream = stream_tokens(state.clone(), "Hi".to_string(), 3, params, None)
+            .await
+            .unwrap();
+        let mut streamed = String::new();
+        while let Some(chunk) = stream.next().await {
+            if chunk.finished {
+                break;
+            }
+            streamed.push_str(&chunk.text);
+        }
+        assert_eq!(streamed, non_stream);
     }
 }
