@@ -53,6 +53,7 @@ mod rpc;
 mod sampling;
 mod server;
 mod session;
+mod stage_timing;
 mod tensor_header;
 mod tokenizer;
 mod transformer;
@@ -1192,7 +1193,7 @@ struct BenchRealRunReport {
     rss_bytes: Option<u64>,
     output_token_ids: Vec<u32>,
     output_text: String,
-    stage_timings_seconds: std::collections::BTreeMap<String, f64>,
+    stage_timings: std::collections::BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
 }
 
 #[derive(Serialize)]
@@ -1673,6 +1674,7 @@ async fn run_bench_real_once(
     if prompt_ids.is_empty() {
         return Err("bench-real prompt encoded to zero tokens".into());
     }
+    let stage_timings = crate::stage_timing::StageTimings::default();
     let mut kv = runtime.model.fresh_kv_caches();
     let pre = runtime.engine.report();
     let total_started = Instant::now();
@@ -1686,7 +1688,13 @@ async fn run_bench_real_once(
     for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
         let _ = runtime
             .model
-            .forward_token_hidden(&runtime.engine, tid, pos, &mut kv)
+            .forward_token_hidden_with_timing(
+                &runtime.engine,
+                tid,
+                pos,
+                &mut kv,
+                Some(&stage_timings),
+            )
             .await;
         forward_evaluations += 1;
         pos += 1;
@@ -1697,14 +1705,25 @@ async fn run_bench_real_once(
     let first_started = Instant::now();
     let final_hidden = runtime
         .model
-        .forward_token_hidden(&runtime.engine, final_prompt, final_prompt_pos, &mut kv)
+        .forward_token_hidden_with_timing(
+            &runtime.engine,
+            final_prompt,
+            final_prompt_pos,
+            &mut kv,
+            Some(&stage_timings),
+        )
         .await;
     forward_evaluations += 1;
     pos += 1;
-    let prompt_seconds = prompt_started.elapsed().as_secs_f64();
-    let first = runtime
-        .model
-        .sample_hidden(&final_hidden, &params, final_prompt_pos);
+    let prompt_elapsed = prompt_started.elapsed();
+    stage_timings.record(crate::stage_timing::TOTAL_PROMPT, prompt_elapsed);
+    let prompt_seconds = prompt_elapsed.as_secs_f64();
+    let first = runtime.model.sample_hidden_with_timing(
+        &final_hidden,
+        &params,
+        final_prompt_pos,
+        Some(&stage_timings),
+    );
     lm_head_evaluations += 1;
     let _first_token_latency_us = first_started.elapsed().as_micros() as u64;
     let time_to_first_token_seconds = total_started.elapsed().as_secs_f64();
@@ -1716,7 +1735,14 @@ async fn run_bench_real_once(
         let step_started = Instant::now();
         let next = runtime
             .model
-            .decode_step(&runtime.engine, last, pos, &mut kv, &params)
+            .decode_step_with_timing(
+                &runtime.engine,
+                last,
+                pos,
+                &mut kv,
+                &params,
+                Some(&stage_timings),
+            )
             .await;
         forward_evaluations += 1;
         lm_head_evaluations += 1;
@@ -1725,7 +1751,9 @@ async fn run_bench_real_once(
         last = next;
         pos += 1;
     }
-    let decode_seconds = decode_started.elapsed().as_secs_f64();
+    let decode_elapsed = decode_started.elapsed();
+    stage_timings.record(crate::stage_timing::TOTAL_DECODE, decode_elapsed);
+    let decode_seconds = decode_elapsed.as_secs_f64();
     let total_seconds = total_started.elapsed().as_secs_f64();
     debug_assert_eq!(
         forward_evaluations,
@@ -1749,6 +1777,7 @@ async fn run_bench_real_once(
         .saturating_sub(pre.predictive.ssd_stall_us);
     decode_latencies_us.sort_unstable();
     let output_text = runtime.tokenizer.decode(&completion_ids)?;
+    let stage_timings = stage_timings.snapshot();
 
     Ok(BenchRealRunReport {
         run_index,
@@ -1776,7 +1805,7 @@ async fn run_bench_real_once(
         rss_bytes: current_rss_bytes(),
         output_token_ids: completion_ids,
         output_text,
-        stage_timings_seconds: std::collections::BTreeMap::new(),
+        stage_timings,
     })
 }
 
@@ -1861,8 +1890,20 @@ fn print_bench_real_human(suite: &BenchRealSuiteReport) {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         );
-        if run.stage_timings_seconds.is_empty() {
+        if run.stage_timings.is_empty() {
             println!("    stage timing: unavailable until stage-level timers are enabled");
+        } else {
+            println!("    stage timing:");
+            for (stage, timing) in &run.stage_timings {
+                println!(
+                    "      {:<32} total={:.6}s count={} mean={:.6}s max={:.6}s",
+                    stage,
+                    timing.total_seconds,
+                    timing.count,
+                    timing.mean_seconds,
+                    timing.max_seconds
+                );
+            }
         }
     }
     println!(

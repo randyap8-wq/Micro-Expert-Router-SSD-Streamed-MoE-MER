@@ -2095,16 +2095,38 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
     ) -> Vec<f32> {
+        self.forward_token_hidden_with_timing(engine, token_id, pos, kv, None)
+            .await
+    }
+
+    pub async fn forward_token_hidden_with_timing(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<f32> {
         assert_eq!(
             kv.len(),
             self.config.num_layers,
             "kv cache slice must have one entry per layer"
         );
-        let mut x = self.embed(token_id);
+        let mut x =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::EMBEDDING, || {
+                self.embed(token_id)
+            });
         let backend = crate::backend::current();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
-            x = layer.attn_block(&x, pos, layer_idx, &mut kv[layer_idx], &*backend);
+            x = layer.attn_block_with_timing(
+                &x,
+                pos,
+                layer_idx,
+                &mut kv[layer_idx],
+                &*backend,
+                timings,
+            );
             // Sliding-Window-Attention layers (MiMo-V2 SWA layers, GPT-OSS
             // banded layers, Mixtral's uniform window) only ever attend to
             // the last `window` positions, so KV entries older than that are
@@ -2119,12 +2141,12 @@ impl RealModel {
             // Dense FFN layers (Mistral Small 3, Phi-4, DeepSeek dense
             // prefix) bypass the SSD-streamed expert path entirely: run the
             // resident SwiGLU FFN and skip routing.
-            if let Some(dense_out) = layer.dense_forward(&x) {
+            if let Some(dense_out) = layer.dense_forward_with_timing(&x, timings) {
                 x = dense_out;
                 continue;
             }
             // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
-            let (normed, routing) = layer.moe_pre(&x);
+            let (normed, routing) = layer.moe_pre_with_timing(&x, timings);
             let global_ids: Vec<u32> = routing
                 .experts
                 .iter()
@@ -2135,19 +2157,21 @@ impl RealModel {
             let token_idx =
                 (pos as u64).wrapping_mul(self.config.num_layers as u64) + layer_idx as u64;
             let expert_outs = engine
-                .moe_step(token_idx, layer_idx as u32, &normed, &global_ids)
+                .moe_step_with_timing(token_idx, layer_idx as u32, &normed, &global_ids, timings)
                 .await;
             debug_assert_eq!(expert_outs.len(), routing.weights.len());
-            x = layer.moe_combine(&x, &expert_outs, &routing.weights);
+            x = layer.moe_combine_with_timing(&x, &expert_outs, &routing.weights, timings);
             // Qwen2-MoE / DeepSeek-MoE shared expert: a dense always-on
             // FFN over the same MoE-normalised hidden, added to the
             // residual alongside the routed experts. `None` for Mixtral
             // (no-op), keeping the engine MoE-architecture-agnostic.
-            if let Some(shared) = layer.shared_expert_forward(&normed) {
+            if let Some(shared) = layer.shared_expert_forward_with_timing(&normed, timings) {
                 x = crate::transformer::add_residual(&x, &shared);
             }
         }
-        self.final_rms.forward(&x)
+        crate::stage_timing::time_optional(timings, crate::stage_timing::FINAL_RMS_NORM, || {
+            self.final_rms.forward(&x)
+        })
     }
 
     /// Sample a next-token id from an already-computed final hidden state.
@@ -2164,6 +2188,22 @@ impl RealModel {
         self.lm_head.sample(hidden, params, pos as u64)
     }
 
+    pub fn sample_hidden_with_timing(
+        &self,
+        hidden: &[f32],
+        params: &crate::sampling::SamplingParams,
+        pos: usize,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> u32 {
+        let logits =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::LM_HEAD, || {
+                self.lm_head.forward(hidden)
+            });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::SAMPLING, || {
+            crate::sampling::sample(&logits, params, pos as u64)
+        })
+    }
+
     /// Ingest one token and sample the following token. This is the
     /// decode-step half of the split API and is equivalent to the old
     /// `step` behavior.
@@ -2177,6 +2217,21 @@ impl RealModel {
     ) -> u32 {
         let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await;
         self.sample_hidden(&hidden, params, pos)
+    }
+
+    pub async fn decode_step_with_timing(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        params: &crate::sampling::SamplingParams,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> u32 {
+        let hidden = self
+            .forward_token_hidden_with_timing(engine, token_id, pos, kv, timings)
+            .await;
+        self.sample_hidden_with_timing(&hidden, params, pos, timings)
     }
 
     /// Backwards-compatible alias for callers that still express a full

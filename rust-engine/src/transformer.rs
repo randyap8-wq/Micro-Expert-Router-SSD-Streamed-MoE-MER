@@ -729,6 +729,18 @@ impl MultiHeadSelfAttention {
         kv: &mut KvCache,
         backend: &crate::backend::BackendBox,
     ) -> Vec<f32> {
+        self.forward_with_timing(x, pos, layer_idx, kv, backend, None)
+    }
+
+    pub fn forward_with_timing(
+        &self,
+        x: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<f32> {
         use crate::backend::{Backend, TensorView, TensorViewMut};
 
         debug_assert_eq!(x.len(), self.d_model);
@@ -797,32 +809,108 @@ impl MultiHeadSelfAttention {
             attn_out
         };
         let mut cpu_forward = || {
-            let mut q = matmul_row_major(&self.wq, x, q_dim, self.d_model);
+            let mut q = crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::Q_PROJECTION,
+                || matmul_row_major(&self.wq, x, q_dim, self.d_model),
+            );
             // Q bias (GPT-OSS `attention_bias`) before QK-Norm / RoPE; K and
             // V biases are applied inside `project_kv`.
             if let Some(bq) = self.bq.as_ref() {
                 for (qi, bi) in q.iter_mut().zip(bq.iter()) { *qi += bi; }
             }
             // QK-Norm (Qwen3): per-head RMSNorm on Q *before* RoPE.
-            self.apply_q_norm(&mut q);
+            crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::RMS_NORM,
+                || self.apply_q_norm(&mut q),
+            );
             // RoPE rotates only the first `rope_dim` dims of each head
             // (partial rotary on MiMo-V2-Flash; `rope_dim == head_dim`
             // elsewhere ⇒ full rotation).
-            for h in 0..self.num_heads {
-                let s = h * self.head_dim;
-                apply_rope_maybe_scaled(&mut q[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
-            }
-            // K/V projection (+ bias, QK-Norm, RoPE) is shared with the
-            // speculative KV preview via `project_kv`.
-            let (k, v) = self.project_kv(x, pos);
+            crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::ROPE,
+                || {
+                    for h in 0..self.num_heads {
+                        let s = h * self.head_dim;
+                        apply_rope_maybe_scaled(
+                            &mut q[s..s + self.rope_dim],
+                            pos,
+                            self.rope_base,
+                            self.rope_yarn.as_ref(),
+                        );
+                    }
+                },
+            );
+            // K/V projection (+ bias, QK-Norm, RoPE) is split here only
+            // when benchmark stage timings are active; the untimed path
+            // keeps using the shared helper that speculative KV preview
+            // also calls.
+            let (k, v) = if timings.is_some() {
+                let mut k = crate::stage_timing::time_optional(
+                    timings,
+                    crate::stage_timing::K_PROJECTION,
+                    || matmul_row_major(&self.wk, x, self.kv_dim(), self.d_model),
+                );
+                let mut v = crate::stage_timing::time_optional(
+                    timings,
+                    crate::stage_timing::V_PROJECTION,
+                    || matmul_row_major(&self.wv, x, self.v_proj_dim(), self.d_model),
+                );
+                if let Some(bk) = self.bk.as_ref() {
+                    for (ki, bi) in k.iter_mut().zip(bk.iter()) {
+                        *ki += bi;
+                    }
+                }
+                if let Some(bv) = self.bv.as_ref() {
+                    for (vi, bi) in v.iter_mut().zip(bv.iter()) {
+                        *vi += bi;
+                    }
+                }
+                crate::stage_timing::time_optional(
+                    timings,
+                    crate::stage_timing::RMS_NORM,
+                    || self.apply_k_norm(&mut k),
+                );
+                crate::stage_timing::time_optional(
+                    timings,
+                    crate::stage_timing::ROPE,
+                    || {
+                        for h in 0..self.num_kv_heads {
+                            let s = h * self.head_dim;
+                            apply_rope_maybe_scaled(
+                                &mut k[s..s + self.rope_dim],
+                                pos,
+                                self.rope_base,
+                                self.rope_yarn.as_ref(),
+                            );
+                        }
+                    },
+                );
+                (k, v)
+            } else {
+                self.project_kv(x, pos)
+            };
             kv.append(&k, &v);
-            let mut attn_out = cpu_attend(&q, kv);
+            let mut attn_out = crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::ATTENTION_SCORE_VALUE,
+                || cpu_attend(&q, kv),
+            );
             // Post-attention output scale (MiMo-V2-Flash 0.707), applied
             // before the output projection.
             self.apply_value_scale(&mut attn_out);
-            let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, self.attn_out_dim());
-            self.apply_o_bias(&mut out);
-            out
+            crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::O_PROJECTION,
+                || {
+                    let mut out =
+                        matmul_row_major(&self.wo, &attn_out, self.d_model, self.attn_out_dim());
+                    self.apply_o_bias(&mut out);
+                    out
+                },
+            )
         };
         if !backend.is_gpu() || self.v_head_dim != self.head_dim || self.sink_bias.is_some() {
             // The GPU attention kernels assume a symmetric K/V head dim, so
@@ -1348,15 +1436,37 @@ impl TransformerLayer {
         kv: &mut KvCache,
         backend: &crate::backend::BackendBox,
     ) -> Vec<f32> {
-        let normed = self.rms_attn.forward(hidden);
+        self.attn_block_with_timing(hidden, pos, layer_idx, kv, backend, None)
+    }
+
+    pub fn attn_block_with_timing(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<f32> {
+        let normed = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::RMS_NORM,
+            || self.rms_attn.forward(hidden),
+        );
         let attn_out = match self.mla.as_ref() {
             // DeepSeek-V3 multi-head latent attention runs on CPU against
             // the layer's compressed latent KV cache. The GPU attention
             // kernels are shaped for standard MHA (uniform K/V head dim),
             // so MLA stays on the reference path; `backend` is unused
             // here but kept in the signature for the standard path below.
-            Some(mla) => mla.forward(&normed, pos, kv),
-            None => self.attn.forward(&normed, pos, layer_idx, kv, backend),
+            Some(mla) => crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::ATTENTION_SCORE_VALUE,
+                || mla.forward(&normed, pos, kv),
+            ),
+            None => self
+                .attn
+                .forward_with_timing(&normed, pos, layer_idx, kv, backend, timings),
         };
         add_residual(hidden, &attn_out)
     }
@@ -1385,8 +1495,24 @@ impl TransformerLayer {
     /// hidden state (which is what every expert FFN should consume) and
     /// the routing decision.
     pub fn moe_pre(&self, hidden: &[f32]) -> (Vec<f32>, crate::gating::RoutingDecision) {
-        let normed = self.rms_moe.forward(hidden);
-        let routing = self.gate.route(&normed);
+        self.moe_pre_with_timing(hidden, None)
+    }
+
+    pub fn moe_pre_with_timing(
+        &self,
+        hidden: &[f32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> (Vec<f32>, crate::gating::RoutingDecision) {
+        let normed = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::RMS_NORM,
+            || self.rms_moe.forward(hidden),
+        );
+        let routing = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::ROUTER_GATE,
+            || self.gate.route(&normed),
+        );
         (normed, routing)
     }
 
@@ -1402,8 +1528,24 @@ impl TransformerLayer {
         expert_outputs: &[HiddenState],
         weights: &[f32],
     ) -> Vec<f32> {
-        let moe = combine_moe_outputs(expert_outputs, weights, self.attn.d_model);
-        add_residual(hidden, &moe)
+        self.moe_combine_with_timing(hidden, expert_outputs, weights, None)
+    }
+
+    pub fn moe_combine_with_timing(
+        &self,
+        hidden: &[f32],
+        expert_outputs: &[HiddenState],
+        weights: &[f32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<f32> {
+        crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::MOE_WEIGHTED_COMBINATION,
+            || {
+                let moe = combine_moe_outputs(expert_outputs, weights, self.attn.d_model);
+                add_residual(hidden, &moe)
+            },
+        )
     }
 
     /// Run the layer's optional shared expert over the MoE-normalised
@@ -1411,7 +1553,21 @@ impl TransformerLayer {
     /// Returns `None` when the layer has no shared expert (Mixtral), so
     /// the caller can skip the residual add entirely.
     pub fn shared_expert_forward(&self, normed: &[f32]) -> Option<HiddenState> {
-        self.shared_expert.as_ref().map(|se| se.forward(normed))
+        self.shared_expert_forward_with_timing(normed, None)
+    }
+
+    pub fn shared_expert_forward_with_timing(
+        &self,
+        normed: &[f32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Option<HiddenState> {
+        self.shared_expert.as_ref().map(|se| {
+            crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::EXPERT_COMPUTE,
+                || se.forward(normed),
+            )
+        })
     }
 
     /// `true` if this layer is a **dense** FFN layer (Mistral Small 3,
@@ -1428,9 +1584,25 @@ impl TransformerLayer {
     /// they do not exercise SSD streaming (by design — they have no experts
     /// to stream).
     pub fn dense_forward(&self, hidden: &[f32]) -> Option<Vec<f32>> {
+        self.dense_forward_with_timing(hidden, None)
+    }
+
+    pub fn dense_forward_with_timing(
+        &self,
+        hidden: &[f32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Option<Vec<f32>> {
         let ffn = self.dense_ffn.as_ref()?;
-        let normed = self.rms_moe.forward(hidden);
-        let out = ffn.forward(&normed);
+        let normed = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::RMS_NORM,
+            || self.rms_moe.forward(hidden),
+        );
+        let out = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::EXPERT_COMPUTE,
+            || ffn.forward(&normed),
+        );
         Some(add_residual(hidden, &out))
     }
 }

@@ -3696,6 +3696,18 @@ impl Engine {
         x: &HiddenState,
         experts: &[u32],
     ) -> Vec<HiddenState> {
+        self.moe_step_with_timing(token_idx, layer, x, experts, None)
+            .await
+    }
+
+    pub async fn moe_step_with_timing(
+        self: &Arc<Self>,
+        token_idx: u64,
+        layer: u32,
+        x: &HiddenState,
+        experts: &[u32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<HiddenState> {
         let cycle_start = Instant::now();
         // Tier 4: fold the previous step's prefetch precision window into
         // the governor's EWMA before issuing this step's speculation.
@@ -3814,6 +3826,7 @@ impl Engine {
         // counters per activation on the hot path.
         let mut gpu_hits_acc: u64 = 0;
         let mut gpu_misses_acc: u64 = 0;
+        let cache_lookup_start = Instant::now();
         for (i, &id) in target.iter().enumerate() {
             if let Some(gpu) = self.core.gpu_cache.as_ref() {
                 let lookup = gpu.get(id);
@@ -3862,6 +3875,11 @@ impl Engine {
                 cache_hits_per_expert.push(false);
             }
         }
+        crate::stage_timing::record_optional(
+            timings,
+            crate::stage_timing::EXPERT_CACHE_LOOKUP,
+            cache_lookup_start.elapsed(),
+        );
         // Aggregate VRAM-tier outcome for this routing decision.
         if let Some(p) = self.metrics.prom.as_ref() {
             if gpu_hits_acc > 0 || gpu_misses_acc > 0 {
@@ -3927,11 +3945,17 @@ impl Engine {
                 }
             }
         }
-        let io_wait_us = if had_misses {
-            io_wait_start.elapsed().as_micros() as u64
+        let io_wait_elapsed = if had_misses {
+            io_wait_start.elapsed()
         } else {
-            0
+            std::time::Duration::ZERO
         };
+        crate::stage_timing::record_optional(
+            timings,
+            crate::stage_timing::FOREGROUND_EXPERT_IO_WAIT,
+            io_wait_elapsed,
+        );
+        let io_wait_us = io_wait_elapsed.as_micros() as u64;
         // Drop the failed expert slots from the parallel arrays so the
         // downstream FFN loop only ever sees Some(_). To preserve the
         // alignment with the caller's mixing weights array, we emit a
@@ -3950,114 +3974,124 @@ impl Engine {
         // it inline would starve the speculative prefetch tasks spawned
         // above of a worker right when they must overlap this compute.
         let compute_start = Instant::now();
-        let per_expert_y: Vec<HiddenState> = run_compute_donated(|| {
-            let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
-            for r_opt in &residents {
-                let r = match r_opt {
-                    Some(r) => r,
-                    None => {
-                        // Failed fetch: push a zero vector so the caller's
-                        // weights[] alignment stays valid (combining with
-                        // weight `w_i * 0 = 0` is equivalent to dropping
-                        // this expert from the mixture).
-                        per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
-                        continue;
-                    }
-                };
-                // ── Phase 3: GPU fast path ────────────────────────────────────
-                // If the backend is GPU and the expert is VRAM-resident, dispatch
-                // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
-                // unconditionally, so we always guard behind is_gpu(). A VRAM
-                // miss returns Err and we fall through to the CPU path below.
-                // Both F32 and (block-aligned) Q4_0 experts are eligible —
-                // see `Engine::gpu_eligible_dtype`.
-                let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype() {
-                    let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
-                    let x_f16: Vec<half::f16> = x.iter().map(|&f| half::f16::from_f32(f)).collect();
-                    let x_view = crate::backend::TensorView {
-                        data: &x_f16,
-                        rows: 1,
-                        cols: self.core.shape.d_model,
-                    };
-                    let mut out_view = crate::backend::TensorViewMut {
-                        data: &mut out_f16,
-                        rows: 1,
-                        cols: self.core.shape.d_model,
-                    };
-                    let matmul_res = self.core.backend.expert_matmul(
-                        layer as usize,
-                        r.id,
-                        x_view,
-                        self.core.shape.d_model,
-                        self.core.shape.d_ff,
-                        &mut out_view,
-                    );
-                    match matmul_res {
-                        Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
-                        Err(e) => {
-                            // VRAM miss — fall through to CPU. Count it:
-                            // invisible mixed GPU/CPU execution (one CPU
-                            // expert dominating an otherwise-GPU token)
-                            // is a major source of inconsistent TPS.
-                            let prev = self
-                                .metrics
-                                .counters
-                                .gpu_cpu_fallbacks
-                                .fetch_add(1, Ordering::Relaxed);
-                            if let Some(p) = self.metrics.prom.as_ref() {
-                                p.record_gpu_cpu_fallback(1);
+        let per_expert_y: Vec<HiddenState> = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::EXPERT_COMPUTE,
+            || {
+                run_compute_donated(|| {
+                    let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
+                    for r_opt in &residents {
+                        let r = match r_opt {
+                            Some(r) => r,
+                            None => {
+                                // Failed fetch: push a zero vector so the caller's
+                                // weights[] alignment stays valid (combining with
+                                // weight `w_i * 0 = 0` is equivalent to dropping
+                                // this expert from the mixture).
+                                per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
+                                continue;
                             }
-                            if prev == 0 {
+                        };
+                        // ── Phase 3: GPU fast path ────────────────────────────────────
+                        // If the backend is GPU and the expert is VRAM-resident, dispatch
+                        // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
+                        // unconditionally, so we always guard behind is_gpu(). A VRAM
+                        // miss returns Err and we fall through to the CPU path below.
+                        // Both F32 and (block-aligned) Q4_0 experts are eligible —
+                        // see `Engine::gpu_eligible_dtype`.
+                        let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype()
+                        {
+                            let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
+                            let x_f16: Vec<half::f16> =
+                                x.iter().map(|&f| half::f16::from_f32(f)).collect();
+                            let x_view = crate::backend::TensorView {
+                                data: &x_f16,
+                                rows: 1,
+                                cols: self.core.shape.d_model,
+                            };
+                            let mut out_view = crate::backend::TensorViewMut {
+                                data: &mut out_f16,
+                                rows: 1,
+                                cols: self.core.shape.d_model,
+                            };
+                            let matmul_res = self.core.backend.expert_matmul(
+                                layer as usize,
+                                r.id,
+                                x_view,
+                                self.core.shape.d_model,
+                                self.core.shape.d_ff,
+                                &mut out_view,
+                            );
+                            match matmul_res {
+                                Ok(()) => {
+                                    Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>())
+                                }
+                                Err(e) => {
+                                    // VRAM miss — fall through to CPU. Count it:
+                                    // invisible mixed GPU/CPU execution (one CPU
+                                    // expert dominating an otherwise-GPU token)
+                                    // is a major source of inconsistent TPS.
+                                    let prev = self
+                                        .metrics
+                                        .counters
+                                        .gpu_cpu_fallbacks
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if let Some(p) = self.metrics.prom.as_ref() {
+                                        p.record_gpu_cpu_fallback(1);
+                                    }
+                                    if prev == 0 {
+                                        warn!(
+                                            expert = r.id,
+                                            error = %e,
+                                            "GPU expert dispatch fell back to CPU \
+                                             (further fallbacks counted in mer_gpu_cpu_fallbacks_total)"
+                                        );
+                                    }
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        let res = if let Some(gpu_out) = gpu_result {
+                            // Synthesize an InferenceOutput so downstream logging stays
+                            // shape-compatible with the CPU path.
+                            Ok((
+                                summarise_output_like_cpu(token_idx, r.id, &gpu_out),
+                                gpu_out,
+                            ))
+                        } else {
+                            dispatch_expert_forward(
+                                self.core.options.dtype,
+                                self.core.options.use_qmm_for_q4,
+                                token_idx,
+                                r,
+                                x,
+                                self.core.shape.d_model,
+                                self.core.shape.d_ff,
+                            )
+                        };
+                        match res {
+                            Ok((_out, y)) => per_expert_y.push(y),
+                            Err(e) => {
                                 warn!(
+                                    token = token_idx,
                                     expert = r.id,
                                     error = %e,
-                                    "GPU expert dispatch fell back to CPU \
-                                     (further fallbacks counted in mer_gpu_cpu_fallbacks_total)"
+                                    "skipping expert: failed to reinterpret buffer as SwiGLU weights"
                                 );
+                                // Push a zero vector so the caller's weights[] alignment
+                                // stays valid; combining with weight `w_i * 0 = 0` is
+                                // the same as if this expert were never picked.
+                                per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
                             }
-                            None
                         }
                     }
-                } else {
-                    None
-                };
-
-                let res = if let Some(gpu_out) = gpu_result {
-                    // Synthesize an InferenceOutput so downstream logging stays
-                    // shape-compatible with the CPU path.
-                    Ok((
-                        summarise_output_like_cpu(token_idx, r.id, &gpu_out),
-                        gpu_out,
-                    ))
-                } else {
-                    dispatch_expert_forward(
-                        self.core.options.dtype,
-                        self.core.options.use_qmm_for_q4,
-                        token_idx,
-                        r,
-                        x,
-                        self.core.shape.d_model,
-                        self.core.shape.d_ff,
-                    )
-                };
-                match res {
-                    Ok((_out, y)) => per_expert_y.push(y),
-                    Err(e) => {
-                        warn!(
-                            token = token_idx,
-                            expert = r.id,
-                            error = %e,
-                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
-                        );
-                        // Push a zero vector so the caller's weights[] alignment
-                        // stays valid; combining with weight `w_i * 0 = 0` is
-                        // the same as if this expert were never picked.
-                        per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
-                    }
-                }
-            }
-            per_expert_y
-        });
+                    per_expert_y
+                })
+            },
+        );
         let compute_us = compute_start.elapsed().as_micros() as u64;
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
         self.metrics
