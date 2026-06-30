@@ -2178,6 +2178,23 @@ impl TransformerLayer {
         )
     }
 
+    pub fn moe_accumulated_into_with_timing(
+        &self,
+        hidden: &[f32],
+        moe_accum: &[f32],
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::MOE_WEIGHTED_COMBINATION,
+            || {
+                debug_assert_eq!(moe_accum.len(), self.attn.d_model);
+                add_residual_into(hidden, moe_accum, out);
+            },
+        )
+    }
+
     /// Run the layer's optional shared expert over the MoE-normalised
     /// hidden state `normed` (the same input the routed experts consume).
     /// Returns `None` when the layer has no shared expert (Mixtral), so

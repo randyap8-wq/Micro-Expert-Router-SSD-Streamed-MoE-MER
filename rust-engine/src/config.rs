@@ -422,6 +422,15 @@ pub struct RealTransformerConfig {
     #[serde(default)]
     pub dense_matvec_backend: crate::parallel::DenseMatvecBackend,
 
+    /// Routed expert execution policy. `"auto"` picks between
+    /// expert-level and row-level parallelism from the current shape and
+    /// thread count; `"sequential-experts-row-parallel"` is the most
+    /// conservative CPU production setting; `"parallel-experts-single-thread"`
+    /// fans selected experts across the shared Rayon pool and leaves each
+    /// expert's inner kernels single-threaded.
+    #[serde(default)]
+    pub expert_execution_policy: crate::engine::ExpertExecutionPolicy,
+
     /// **Bounded speculative prefetches** (gist Part 1, fix #3).
     /// Maximum number of in-flight `Engine::spawn_prefetch` I/Os
     /// allowed at any one time. Each spawn acquires an owned permit

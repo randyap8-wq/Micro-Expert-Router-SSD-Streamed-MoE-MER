@@ -2218,21 +2218,20 @@ impl RealModel {
             // already baked into RoPE inside `attn_block`.
             let token_idx =
                 (pos as u64).wrapping_mul(self.config.num_layers as u64) + layer_idx as u64;
-            let expert_outs = engine
-                .moe_step_with_timing(
+            engine
+                .moe_step_weighted_into_with_timing(
                     token_idx,
                     layer_idx as u32,
                     normed,
                     &layer_scratch.global_expert_ids,
+                    &routing.weights,
+                    &mut layer_scratch.moe_accum,
                     timings,
                 )
                 .await;
-            debug_assert_eq!(expert_outs.len(), routing.weights.len());
-            layer.moe_combine_into_with_timing(
+            layer.moe_accumulated_into_with_timing(
                 &x,
-                &expert_outs,
-                &routing.weights,
-                &mut layer_scratch.moe_accum,
+                &layer_scratch.moe_accum,
                 &mut next_x,
                 timings,
             );
