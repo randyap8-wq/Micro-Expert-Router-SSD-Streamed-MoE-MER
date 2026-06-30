@@ -1961,6 +1961,7 @@ pub struct TransformerLayerScratch {
     pub(crate) moe_normed: Vec<f32>,
     pub(crate) moe_accum: Vec<f32>,
     pub(crate) routing: crate::gating::RoutingScratch,
+    pub(crate) global_expert_ids: Vec<u32>,
 }
 
 impl TransformerLayerScratch {

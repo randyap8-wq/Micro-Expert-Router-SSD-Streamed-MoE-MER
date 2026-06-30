@@ -1866,6 +1866,7 @@ fn run_synthetic_decode_step(
             scratch.moe_accum = moe_accum;
             std::mem::swap(hidden, next_hidden);
             next_hidden.clear();
+            scratch.routing.recycle_decision(routing);
         }
     }
 }

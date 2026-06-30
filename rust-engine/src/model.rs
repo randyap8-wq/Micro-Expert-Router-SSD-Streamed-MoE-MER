@@ -2204,18 +2204,28 @@ impl RealModel {
             }
             // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
             let routing = layer.moe_pre_into_with_timing(&x, &mut layer_scratch, timings);
+            layer_scratch.global_expert_ids.clear();
+            layer_scratch
+                .global_expert_ids
+                .extend(
+                    routing
+                        .experts
+                        .iter()
+                        .map(|&local| self.global_expert_id(layer_idx, local)),
+                );
             let normed = &layer_scratch.moe_normed;
-            let global_ids: Vec<u32> = routing
-                .experts
-                .iter()
-                .map(|&local| self.global_expert_id(layer_idx, local))
-                .collect();
             // `token_idx` here is just a digest seed; positional info is
             // already baked into RoPE inside `attn_block`.
             let token_idx =
                 (pos as u64).wrapping_mul(self.config.num_layers as u64) + layer_idx as u64;
             let expert_outs = engine
-                .moe_step_with_timing(token_idx, layer_idx as u32, &normed, &global_ids, timings)
+                .moe_step_with_timing(
+                    token_idx,
+                    layer_idx as u32,
+                    normed,
+                    &layer_scratch.global_expert_ids,
+                    timings,
+                )
                 .await;
             debug_assert_eq!(expert_outs.len(), routing.weights.len());
             layer.moe_combine_into_with_timing(
@@ -2228,11 +2238,12 @@ impl RealModel {
             );
             std::mem::swap(&mut x, &mut next_x);
             next_x.clear();
+            layer_scratch.routing.recycle_decision(routing);
             // Qwen2-MoE / DeepSeek-MoE shared expert: a dense always-on
             // FFN over the same MoE-normalised hidden, added to the
             // residual alongside the routed experts. `None` for Mixtral
             // (no-op), keeping the engine MoE-architecture-agnostic.
-            if let Some(shared) = layer.shared_expert_forward_with_timing(&normed, timings) {
+            if let Some(shared) = layer.shared_expert_forward_with_timing(normed, timings) {
                 crate::transformer::add_residual_into(&x, &shared, &mut next_x);
                 std::mem::swap(&mut x, &mut next_x);
                 next_x.clear();

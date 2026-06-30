@@ -57,6 +57,8 @@ pub struct RoutingScratch {
     selection: Vec<f32>,
     top_groups: Vec<(usize, f32)>,
     top_experts: Vec<(u32, f32)>,
+    decision_experts: Vec<u32>,
+    decision_weights: Vec<f32>,
 }
 
 impl RoutingScratch {
@@ -69,6 +71,13 @@ impl RoutingScratch {
         self.selection.resize(num_experts, 0.0);
         self.top_groups.clear();
         self.top_experts.clear();
+    }
+
+    pub fn recycle_decision(&mut self, mut decision: RoutingDecision) {
+        decision.experts.clear();
+        decision.weights.clear();
+        self.decision_experts = decision.experts;
+        self.decision_weights = decision.weights;
     }
 }
 
@@ -373,8 +382,13 @@ impl LinearGate {
         }
 
         // Mixing weights are the *original* scores at the chosen experts.
-        let mut experts = Vec::with_capacity(scratch.top_experts.len());
-        let mut weights = Vec::with_capacity(scratch.top_experts.len());
+        // The decision remains owned because real expert execution awaits on
+        // I/O, but callers can recycle it back into the same scratch after
+        // the combine step to avoid steady-state top-k Vec allocations.
+        let mut experts = std::mem::take(&mut scratch.decision_experts);
+        let mut weights = std::mem::take(&mut scratch.decision_weights);
+        experts.clear();
+        weights.clear();
         for &(expert, _) in &scratch.top_experts {
             experts.push(expert);
             weights.push(scratch.logits[expert as usize]);
@@ -804,6 +818,31 @@ mod tests {
                 scratch.top_experts.capacity(),
             )
         );
+    }
+
+    #[test]
+    fn routing_decision_recycles_owned_buffers() {
+        let n = 8;
+        let gate = LinearGate::new(identity_gate(n), n, n, 3);
+        let x = vec![0.5, 2.0, 2.0, -1.0, 3.0, 0.0, 3.0, -2.0];
+        let mut scratch = RoutingScratch::new();
+
+        let first = gate.route_with_scratch(&x, &mut scratch);
+        let expected = first.clone();
+        let capacities = (first.experts.capacity(), first.weights.capacity());
+        scratch.recycle_decision(first);
+        assert_eq!(
+            capacities,
+            (
+                scratch.decision_experts.capacity(),
+                scratch.decision_weights.capacity(),
+            )
+        );
+
+        let second = gate.route_with_scratch(&x, &mut scratch);
+        assert_routing_close(&second, &expected);
+        assert_eq!(second.experts.capacity(), capacities.0);
+        assert_eq!(second.weights.capacity(), capacities.1);
     }
 
     #[test]
