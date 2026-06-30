@@ -20,7 +20,7 @@ Implemented and committed:
 | Strict real checkpoint loading | Complete. Production strict mode aggregates missing, malformed, unsupported, and shape-mismatched tensors instead of silently retaining seeded fallback weights. |
 | Prompt/decode semantics | Complete. Real-model prompt ingestion evaluates the model `P + C - 1` times and evaluates the LM head only for completion tokens. |
 | Real benchmark harness | Complete. `bench-real` reports prompt/decode TPS, forward counts, cache stats, SSD bytes/stall, stage timing snapshots, RSS, thread count, build features, and git commit. |
-| Stage timing metrics | Complete. Request-local stage timings publish to logs and `/metrics` without scalar-loop atomics. |
+| Stage timing metrics | Complete. HTTP serving now keeps detailed stage timing opt-in, while `bench-real` continues to collect detailed stage timings for benchmark runs. |
 | Scheduler request lifetime | Complete. Real requests register scheduler KV state once, release on completion/error/drop, and skip unhelpful singleton pre-pass work. |
 | CPU hot-path cleanup | Complete for the scoped sprint items: runtime dense matvec backend selection, shared RoPE cache, request scratch buffers, router top-k cleanup, and allocation-count smoke benchmark. |
 | Native quantized dense backbone | Complete for Q8_0/F32. GGUF conversion preserves native Q8_0 resident dense tensors through `dense_manifest.json`; legacy F32 converted directories remain supported. |
@@ -29,52 +29,42 @@ Implemented and committed:
 | Optional real prefill | Deferred. The sprint brief says not to begin prefill until optimized single-stream decode is benchmarked. |
 | Acceptance benchmarks | Blocked by missing local Qwen checkpoint/converted weights. |
 
-Latest implementation commit at the time this report was written:
+Validation commit for this corrective pass:
 
 ```text
-04ce69e628c7444d1fcadbcfc572b5849da9abe6 parallelize quantized lm head candidate scans
+a93317cb184569fbd2172b0ff5b69d349fd2c96e fix: gate stage timing and protect q8 gpu fallback
 ```
+
+This is the code/test commit on which the local validation commands
+below were run. The documentation-only commit that updates this report is
+not itself claimed as a code validation run.
 
 ## Validation Run Locally
 
-The following checks were run during the sprint in this workspace:
+The following checks were run against validation commit
+`a93317cb184569fbd2172b0ff5b69d349fd2c96e` in this workspace:
 
 ```bash
+rustfmt --edition 2021 src/config.rs src/server.rs src/transformer.rs
 cargo test dense_tensor -- --nocapture
-cargo test dense_manifest -- --nocapture
-cargo test from_dir_loads_native_q8_dense_manifest_without_alias_files -- --nocapture
-cargo test lm_head_top_k_sampling_matches_full_logits_sampler -- --nocapture
-cargo clippy --tests --message-format short
+cargo test stage_timing -- --nocapture
+cargo test config -- --nocapture
 cargo test
 cargo build --release
-RUSTFLAGS=-Awarnings cargo run --quiet --features alloc-count -- \
-  scratch-alloc-microbench --warmup-tokens 4 --measured-tokens 8 --json
 cargo build --release --features "avx512,blas,tokenizer"
+git diff --check
 ```
 
 Notes:
 
-- `cargo clippy --tests` exits successfully but the repository still has
-  a broad existing warning backlog.
-- `rustfmt --check src/dense_tensor.rs`, `jq empty` for the blocked JSON
-  manifest, and `git diff --check` passed for the final touched files.
-- Full `cargo fmt --check` fails on unrelated pre-existing formatting in
-  files such as `src/block_pool.rs`, `src/router.rs`, `src/sampling.rs`,
-  `src/tokenizer.rs`, `src/transformer.rs`, `src/tui.rs`, and
-  `src/workload.rs`. A global format pass was intentionally not applied
-  in this sprint PR.
-- The Linux acceptance command
-  `cargo clippy --release --features "avx512,tokenizer,io_uring" -- -D warnings`
-  cannot run on this macOS workspace: the upstream `io-uring` crate fails
-  to compile because macOS `libc` does not expose Linux `io_uring`
-  syscalls/constants.
-- The requested CUDA feature build cannot run on this macOS workspace:
-  `cudarc` fails before this crate is checked because `nvcc` is not
-  installed. The closest local feature build,
-  `cargo build --release --features "avx512,blas,tokenizer"`, passed.
-- The allocation smoke benchmark preserved the scratch-buffer result:
-  `0.0` allocation calls per measured token for the scratch path, with
-  checksum parity against the compatibility path.
+- Release builds still report the repository's existing warning backlog.
+  No new warning from this corrective pass was left in the build output.
+- A repository-wide formatting rewrite was intentionally not applied; only
+  the Rust files touched by the corrective pass were formatted.
+- CUDA, Linux `io_uring`, and real checkpoint benchmark commands were not
+  run in this macOS workspace.
+- The real Qwen checkpoint benchmark remains blocked, so this document is
+  not a performance result and claims no TPS improvement.
 
 ## Mandatory Benchmark Blocker
 

@@ -3,7 +3,7 @@
   "status": "blocked",
   "date": "2026-06-30",
   "branch": "cpu-production-sprint",
-  "implementation_commit": "04ce69e628c7444d1fcadbcfc572b5849da9abe6",
+  "validation_commit": "a93317cb184569fbd2172b0ff5b69d349fd2c96e",
   "required_model": {
     "name": "Qwen3-Coder-30B-A3B-Instruct",
     "quantization": "Q8_0",
@@ -29,20 +29,20 @@
     "/Users/r/model-configs/qwen3-moe/model.safetensors.index.json"
   ],
   "validation_without_checkpoint": [
+    "rustfmt --edition 2021 src/config.rs src/server.rs src/transformer.rs",
     "cargo test dense_tensor -- --nocapture",
-    "cargo test dense_manifest -- --nocapture",
-    "cargo test from_dir_loads_native_q8_dense_manifest_without_alias_files -- --nocapture",
-    "cargo test lm_head_top_k_sampling_matches_full_logits_sampler -- --nocapture",
-    "cargo clippy --tests --message-format short",
+    "cargo test stage_timing -- --nocapture",
+    "cargo test config -- --nocapture",
     "cargo test",
     "cargo build --release",
-    "RUSTFLAGS=-Awarnings cargo run --quiet --features alloc-count -- scratch-alloc-microbench --warmup-tokens 4 --measured-tokens 8 --json",
-    "cargo build --release --features \"avx512,blas,tokenizer\""
+    "cargo build --release --features \"avx512,blas,tokenizer\"",
+    "git diff --check"
   ],
   "local_check_limitations": [
-    "cargo fmt --check fails on unrelated pre-existing formatting across the repository; only touched Rust files were formatted/checked.",
-    "cargo clippy --release --features \"avx512,tokenizer,io_uring\" -- -D warnings fails on macOS before this crate is checked because io-uring is Linux-only.",
-    "cargo build --release --features \"cuda,avx512,blas,tokenizer\" fails on this machine because cudarc requires nvcc and CUDA is not installed."
+    "The real Qwen checkpoint or converted MER dense/expert weights were not present, so bench-real real-checkpoint TPS benchmarks remain blocked.",
+    "The release builds still report the repository's existing warning backlog; this corrective pass did not add a new warning.",
+    "CUDA, Linux io_uring, and real checkpoint benchmark commands were intentionally not run in this macOS workspace."
   ],
-  "not_a_performance_result": true
+  "not_a_performance_result": true,
+  "no_tps_improvement_claimed": true
 }
