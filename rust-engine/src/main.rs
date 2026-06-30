@@ -639,6 +639,32 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = BenchRealOutputFormat::Human)]
         format: BenchRealOutputFormat,
     },
+
+    /// Benchmark dense matvec backends on the target Qwen3-Coder CPU shapes.
+    ///
+    /// This is intentionally separate from `bench-real`: it isolates Q/K/V/O,
+    /// router gate, and LM-head projection kernels so operators can choose a
+    /// production `[real_transformer].dense_matvec_backend` without running a
+    /// full checkpoint. The LM-head shape allocates about 1.2 GiB of weights;
+    /// use `--skip-lm-head` for quick local smoke runs.
+    MatvecMicrobench {
+        /// Backend(s) to benchmark. Repeat or pass comma-separated values.
+        /// Defaults to matrixmultiply, rayon, and rayon-matrixmultiply.
+        #[arg(long = "backend", value_delimiter = ',')]
+        backend: Vec<crate::parallel::DenseMatvecBackend>,
+        /// Warmup iterations per shape/backend.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+        /// Measured iterations per shape/backend.
+        #[arg(long, default_value_t = 3)]
+        measured_runs: usize,
+        /// Skip the 151936 × 2048 LM-head shape.
+        #[arg(long)]
+        skip_lm_head: bool,
+        /// Emit JSON instead of human-readable rows.
+        #[arg(long)]
+        json: bool,
+    },
     /// Native terminal dashboard — Phase 4 of the three-tier memory
     /// hierarchy. Polls a running `serve` instance and renders a live
     /// ratatui view of the SSD → RAM → VRAM hit grid, current cache
@@ -968,6 +994,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format,
             }))
         }
+        Cmd::MatvecMicrobench {
+            backend,
+            warmup_runs,
+            measured_runs,
+            skip_lm_head,
+            json,
+        } => cmd_matvec_microbench(MatvecMicrobenchArgs {
+            backends: backend,
+            warmup_runs,
+            measured_runs,
+            skip_lm_head,
+            json,
+        }),
         Cmd::GgufConvert {
             gguf_path,
             out_dir,
@@ -1134,6 +1173,49 @@ struct BenchRealArgs {
     format: BenchRealOutputFormat,
 }
 
+struct MatvecMicrobenchArgs {
+    backends: Vec<crate::parallel::DenseMatvecBackend>,
+    warmup_runs: usize,
+    measured_runs: usize,
+    skip_lm_head: bool,
+    json: bool,
+}
+
+#[derive(Serialize)]
+struct MatvecMicrobenchReport {
+    benchmark: &'static str,
+    model: &'static str,
+    d_model: usize,
+    d_ff: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    vocab_size: usize,
+    warmup_runs: usize,
+    measured_runs: usize,
+    build: BenchRealBuildInfo,
+    results: Vec<MatvecMicrobenchResult>,
+}
+
+#[derive(Serialize)]
+struct MatvecMicrobenchResult {
+    shape: &'static str,
+    backend: String,
+    rows: usize,
+    cols: usize,
+    multiply_accumulates: usize,
+    best_ms: f64,
+    mean_ms: f64,
+    checksum: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MatvecShape {
+    name: &'static str,
+    rows: usize,
+    cols: usize,
+}
+
 struct BenchRealInput {
     prompt: String,
     output_tokens: usize,
@@ -1165,6 +1247,7 @@ struct BenchRealBuildInfo {
     git_commit: String,
     build_features: Vec<&'static str>,
     threads: usize,
+    dense_matvec_backend: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -1253,6 +1336,186 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+fn cmd_matvec_microbench(args: MatvecMicrobenchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.measured_runs == 0 {
+        return Err("matvec-microbench requires --measured-runs > 0".into());
+    }
+    let backends = if args.backends.is_empty() {
+        vec![
+            crate::parallel::DenseMatvecBackend::Matrixmultiply,
+            crate::parallel::DenseMatvecBackend::Rayon,
+            crate::parallel::DenseMatvecBackend::RayonMatrixmultiply,
+        ]
+    } else {
+        args.backends.clone()
+    };
+    let mut shapes = vec![
+        MatvecShape {
+            name: "q-projection",
+            rows: 32 * 128,
+            cols: 2048,
+        },
+        MatvecShape {
+            name: "k-projection",
+            rows: 4 * 128,
+            cols: 2048,
+        },
+        MatvecShape {
+            name: "v-projection",
+            rows: 4 * 128,
+            cols: 2048,
+        },
+        MatvecShape {
+            name: "o-projection",
+            rows: 2048,
+            cols: 32 * 128,
+        },
+        MatvecShape {
+            name: "router-gate",
+            rows: 128,
+            cols: 2048,
+        },
+    ];
+    if !args.skip_lm_head {
+        shapes.push(MatvecShape {
+            name: "lm-head",
+            rows: 151_936,
+            cols: 2048,
+        });
+    }
+
+    let mut results = Vec::with_capacity(shapes.len() * backends.len());
+    for (shape_idx, shape) in shapes.iter().enumerate() {
+        let x = deterministic_f32_vec(shape.cols, 0x9e37_79b9 ^ shape_idx as u64);
+        let w = deterministic_f32_vec(
+            shape.rows * shape.cols,
+            0xd1b5_4a32_d192_ed03u64 ^ shape_idx as u64,
+        );
+        for &backend in &backends {
+            for _ in 0..args.warmup_runs {
+                let y = crate::transformer::matmul_row_major_with_backend(
+                    std::hint::black_box(&w),
+                    std::hint::black_box(&x),
+                    shape.rows,
+                    shape.cols,
+                    backend,
+                );
+                std::hint::black_box(&y);
+            }
+            let mut total = Duration::ZERO;
+            let mut best = Duration::MAX;
+            let mut checksum = 0u64;
+            for _ in 0..args.measured_runs {
+                let started = Instant::now();
+                let y = crate::transformer::matmul_row_major_with_backend(
+                    std::hint::black_box(&w),
+                    std::hint::black_box(&x),
+                    shape.rows,
+                    shape.cols,
+                    backend,
+                );
+                let elapsed = started.elapsed();
+                std::hint::black_box(&y);
+                checksum = checksum_f32_bits(&y);
+                total += elapsed;
+                best = best.min(elapsed);
+            }
+            results.push(MatvecMicrobenchResult {
+                shape: shape.name,
+                backend: backend.to_string(),
+                rows: shape.rows,
+                cols: shape.cols,
+                multiply_accumulates: shape.rows.saturating_mul(shape.cols),
+                best_ms: best.as_secs_f64() * 1_000.0,
+                mean_ms: (total.as_secs_f64() * 1_000.0) / args.measured_runs as f64,
+                checksum,
+            });
+        }
+    }
+
+    let report = MatvecMicrobenchReport {
+        benchmark: "matvec-microbench",
+        model: "Qwen3-Coder-30B-A3B-Instruct Q8_0",
+        d_model: 2048,
+        d_ff: 768,
+        num_heads: 32,
+        num_kv_heads: 4,
+        head_dim: 128,
+        vocab_size: 151_936,
+        warmup_runs: args.warmup_runs,
+        measured_runs: args.measured_runs,
+        build: BenchRealBuildInfo {
+            git_commit: git_commit_short(),
+            build_features: build_features(),
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            dense_matvec_backend: crate::parallel::dense_matvec_backend().to_string(),
+        },
+        results,
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_matvec_microbench_human(&report);
+    }
+    Ok(())
+}
+
+fn deterministic_f32_vec(len: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let bits = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        let v = ((bits >> 40) as u32 & 0xffff) as f32 / 32768.0 - 1.0;
+        out.push(v);
+    }
+    out
+}
+
+fn checksum_f32_bits(values: &[f32]) -> u64 {
+    values.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+        (h ^ v.to_bits() as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn print_matvec_microbench_human(report: &MatvecMicrobenchReport) {
+    println!("matvec-microbench");
+    println!(
+        "  model={} d_model={} d_ff={} heads={} kv_heads={} head_dim={} vocab={}",
+        report.model,
+        report.d_model,
+        report.d_ff,
+        report.num_heads,
+        report.num_kv_heads,
+        report.head_dim,
+        report.vocab_size
+    );
+    println!(
+        "  warmup_runs={} measured_runs={} git={} threads={} features={}",
+        report.warmup_runs,
+        report.measured_runs,
+        report.build.git_commit,
+        report.build.threads,
+        report.build.build_features.join(",")
+    );
+    for result in &report.results {
+        println!(
+            "  {:<13} {:<22} rows={:<6} cols={:<5} best={:>9.3}ms mean={:>9.3}ms checksum={:#016x}",
+            result.shape,
+            result.backend,
+            result.rows,
+            result.cols,
+            result.best_ms,
+            result.mean_ms,
+            result.checksum
+        );
+    }
+}
+
 fn load_bench_real_input(
     args: &BenchRealArgs,
 ) -> Result<BenchRealInput, Box<dyn std::error::Error>> {
@@ -1329,6 +1592,7 @@ async fn build_bench_real_runtime(
     use crate::tokenizer::Tokenizer;
 
     let mut cfg = Config::from_file(config_path)?;
+    crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
     if !cfg.real_transformer.enabled {
         return Err("bench-real requires [real_transformer] enabled = true".into());
     }
@@ -1828,6 +2092,7 @@ fn emit_bench_real_report(
             threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
+            dense_matvec_backend: crate::parallel::dense_matvec_backend().to_string(),
         },
         aggregate: aggregate_bench_real(&runs),
         runs,
@@ -1849,9 +2114,10 @@ fn print_bench_real_human(suite: &BenchRealSuiteReport) {
         suite.warmup_runs, suite.measured_runs, suite.cache_reset, suite.greedy
     );
     println!(
-        "  build: git={} threads={} features={}",
+        "  build: git={} threads={} dense_matvec_backend={} features={}",
         suite.build.git_commit,
         suite.build.threads,
+        suite.build.dense_matvec_backend,
         suite.build.build_features.join(",")
     );
     for run in &suite.runs {
@@ -2066,6 +2332,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // code (gist feedback #2.3).
 
     let mut cfg = Config::from_file(&config_path)?;
+    crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
 
     // ---- Architecture resolution & hyperparameter reconciliation ----
     //
@@ -2869,6 +3136,13 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                         // invalid file.
                         continue;
                     }
+                }
+                if prev.real_transformer.dense_matvec_backend
+                    != new.real_transformer.dense_matvec_backend
+                {
+                    crate::parallel::set_dense_matvec_backend(
+                        new.real_transformer.dense_matvec_backend,
+                    );
                 }
                 // Restart-required diff: surface changes that the live
                 // swap does **not** cover so operators know which fields

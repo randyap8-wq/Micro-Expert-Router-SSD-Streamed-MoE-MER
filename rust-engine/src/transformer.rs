@@ -1325,73 +1325,87 @@ pub fn run_expert_forward(
 /// Row-major matrix-vector multiply: `y = W · x` where `W` is
 /// `[rows, cols]` row-major. Returns a fresh `Vec<f32>` of length `rows`.
 ///
-/// **Auto-escalation (gist Task 1).** Dispatch, in order:
-///
-/// 1. `--features blas` → BLAS-shaped `matrixmultiply` SGEMV
-///    microkernel (the `ndarray`-style tuned path).
-/// 2. Otherwise, always delegate to `matmul_row_major_parallel`, which
-///    uses `parallel::par_row_chunks` to fork-join disjoint output-row
-///    chunks on the shared, process-wide `rayon` pool (resident workers,
-///    not per-call OS-thread spawning). Its inline fast path runs on the
-///    caller for a single row, a single-threaded pool, or `rows*cols <
-///    parallel::MIN_TOTAL_FOR_PARALLEL`; otherwise fan-out is bounded by
-///    `parallel::MIN_ELEMS_PER_TASK`. This folds the scalar fallback into
-///    the same helper and preserves per-row, bit-identical dot products.
-///    This path is now always compiled — the `--features simd` flag is
-///    no longer required and is retained only for backwards
-///    compatibility (it is a no-op).
+/// The implementation is selected at runtime via
+/// [`crate::parallel::DenseMatvecBackend`]. `Auto` preserves the previous
+/// build defaults (`blas` builds use one tuned matrixmultiply SGEMM call;
+/// other builds use the Rayon row-parallel dot-product path), while
+/// production configs can force serial matrixmultiply, Rayon reference/SIMD,
+/// or Rayon-chunked matrixmultiply without rebuilding.
 pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    matmul_row_major_with_backend(w, x, rows, cols, crate::parallel::dense_matvec_backend())
+}
+
+pub fn matmul_row_major_with_backend(
+    w: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    backend: crate::parallel::DenseMatvecBackend,
+) -> Vec<f32> {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
-    // Note: the historic `simd`/`blas` mutual-exclusion `compile_error!`
-    // is no longer needed — `simd` is now a deprecated no-op feature
-    // (the runtime row-parallel path is always compiled). The `blas`
-    // branch still wins when present.
-    #[cfg(feature = "blas")]
-    {
-        // BLAS-equivalent SGEMV via `matrixmultiply::sgemm`: treat the
-        // matrix-vector product as a `(rows × cols) × (cols × 1)`
-        // SGEMM. The crate's tuned microkernel (the same one used by
-        // `ndarray`'s `dot`) gives ~order-of-magnitude speedups over
-        // the scalar loop on AVX2 / NEON for the dense projections in
-        // `TransformerLayer`.
-        let mut y = vec![0.0f32; rows];
-        // SAFETY: matrixmultiply::sgemm is defined as taking pointers
-        // to row-major (m × k) and (k × n) matrices and writing into a
-        // row-major (m × n) output. We satisfy all aliasing and bounds
-        // requirements: `w` is a borrowed slice of exactly `rows*cols`
-        // floats, `x` is `cols` floats, and `y` is a fresh `rows`-
-        // length buffer that doesn't alias either input. `rsa` / `csa`
-        // etc. are the row/col strides for the three matrices; `1`
-        // everywhere selects row-major.
-        unsafe {
-            matrixmultiply::sgemm(
-                rows,
-                cols,
-                1,
-                1.0,
-                w.as_ptr(),
-                cols as isize,
-                1,
-                x.as_ptr(),
-                1,
-                1,
-                0.0,
-                y.as_mut_ptr(),
-                1,
-                1,
-            );
+
+    let backend = match backend {
+        crate::parallel::DenseMatvecBackend::Auto => {
+            crate::parallel::default_dense_matvec_backend()
         }
-        y
+        other => other,
+    };
+    match backend {
+        crate::parallel::DenseMatvecBackend::Auto => unreachable!("auto resolves before dispatch"),
+        crate::parallel::DenseMatvecBackend::Matrixmultiply => {
+            matmul_row_major_matrixmultiply(w, x, rows, cols)
+        }
+        crate::parallel::DenseMatvecBackend::Rayon => matmul_row_major_parallel(w, x, rows, cols),
+        crate::parallel::DenseMatvecBackend::RayonMatrixmultiply => {
+            matmul_row_major_parallel_matrixmultiply(w, x, rows, cols)
+        }
     }
-    // Runtime row-parallel path. Always compiled (no `#[cfg(feature =
-    // "simd")]` gate) so a single binary auto-escalates on any host
-    // with enough cores. The serial-vs-parallel decision now lives in
-    // `par_row_chunks` (it runs small matmuls inline), so we delegate
-    // unconditionally instead of duplicating a threshold here.
-    #[cfg(not(feature = "blas"))]
-    {
-        matmul_row_major_parallel(w, x, rows, cols)
+}
+
+/// Serial tuned SGEMV via `matrixmultiply::sgemm`.
+fn matmul_row_major_matrixmultiply(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; rows];
+    matmul_row_major_matrixmultiply_into(w, x, &mut y, rows, cols);
+    y
+}
+
+#[inline]
+fn matmul_row_major_matrixmultiply_into(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    if rows == 0 || cols == 0 {
+        y.fill(0.0);
+        return;
+    }
+    // SAFETY: matrixmultiply::sgemm is defined for row-major (m × k) and
+    // (k × n) matrices writing into row-major (m × n) output. `w` is
+    // exactly `rows * cols`, `x` is exactly `cols`, and `y` is a disjoint
+    // mutable output slice of `rows` elements.
+    unsafe {
+        matrixmultiply::sgemm(
+            rows,
+            cols,
+            1,
+            1.0,
+            w.as_ptr(),
+            cols as isize,
+            1,
+            x.as_ptr(),
+            1,
+            1,
+            0.0,
+            y.as_mut_ptr(),
+            1,
+            1,
+        );
     }
 }
 
@@ -1408,18 +1422,36 @@ pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f
 /// batching) share one bounded pool instead of each oversubscribing the
 /// machine. The arithmetic — one `f32` dot product per output row — is
 /// unchanged, so the result is identical to the scalar path.
-#[cfg(not(feature = "blas"))]
 fn matmul_row_major_parallel(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; rows];
     crate::parallel::par_row_chunks(&mut y, cols, |row_start, out| {
         for (i, slot) in out.iter_mut().enumerate() {
             let row = &w[(row_start + i) * cols..(row_start + i + 1) * cols];
-            let mut acc = 0.0f32;
-            for j in 0..cols {
-                acc += row[j] * x[j];
-            }
-            *slot = acc;
+            *slot = crate::kernels::dot_f32(row, x);
         }
+    });
+    y
+}
+
+/// Rayon-chunked matrixmultiply. Output rows are split into contiguous
+/// chunks on the existing global Rayon pool; each task invokes one tuned
+/// SGEMM over its chunk. If already running inside a Rayon worker, fall
+/// back to the serial matrixmultiply path to avoid nested pool fan-out.
+fn matmul_row_major_parallel_matrixmultiply(
+    w: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
+    if crate::parallel::in_rayon_worker() {
+        return matmul_row_major_matrixmultiply(w, x, rows, cols);
+    }
+    let mut y = vec![0.0f32; rows];
+    crate::parallel::par_row_chunks(&mut y, cols, |row_start, out| {
+        let row_count = out.len();
+        let w_start = row_start * cols;
+        let w_end = w_start + row_count * cols;
+        matmul_row_major_matrixmultiply_into(&w[w_start..w_end], x, out, row_count, cols);
     });
     y
 }
@@ -1984,6 +2016,45 @@ mod tests {
 
     fn cpu_backend() -> crate::backend::BackendBox {
         crate::backend::BackendBox::Cpu(crate::backend::CandleBackend::new())
+    }
+
+    fn reference_matmul(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        (0..rows)
+            .map(|r| {
+                let row = &w[r * cols..(r + 1) * cols];
+                row.iter().zip(x).map(|(a, b)| a * b).sum()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dense_matvec_backends_match_reference() {
+        use crate::parallel::DenseMatvecBackend;
+
+        for &(rows, cols) in &[(1usize, 1usize), (7, 13), (128, 64), (257, 129)] {
+            let w: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i % 31) as f32 - 15.0) * 0.0075)
+                .collect();
+            let x: Vec<f32> = (0..cols)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.03125)
+                .collect();
+            let want = reference_matmul(&w, &x, rows, cols);
+            for backend in [
+                DenseMatvecBackend::Matrixmultiply,
+                DenseMatvecBackend::Rayon,
+                DenseMatvecBackend::RayonMatrixmultiply,
+                DenseMatvecBackend::Auto,
+            ] {
+                let got = matmul_row_major_with_backend(&w, &x, rows, cols, backend);
+                assert_eq!(got.len(), want.len());
+                for (idx, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (g - e).abs() <= 1e-4,
+                        "backend={backend:?} rows={rows} cols={cols} idx={idx}: {g} vs {e}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
