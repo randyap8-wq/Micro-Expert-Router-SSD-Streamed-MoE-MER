@@ -2168,6 +2168,7 @@ impl RealModel {
                 self.embed(token_id)
             });
         let backend = crate::backend::current();
+        let mut routing_scratch = crate::gating::RoutingScratch::new();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
             x = layer.attn_block_with_timing(
@@ -2197,7 +2198,8 @@ impl RealModel {
                 continue;
             }
             // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
-            let (normed, routing) = layer.moe_pre_with_timing(&x, timings);
+            let (normed, routing) =
+                layer.moe_pre_with_scratch_and_timing(&x, &mut routing_scratch, timings);
             let global_ids: Vec<u32> = routing
                 .experts
                 .iter()

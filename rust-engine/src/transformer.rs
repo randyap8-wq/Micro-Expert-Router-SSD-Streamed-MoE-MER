@@ -1332,7 +1332,9 @@ pub fn run_expert_forward(
 /// production configs can force serial matrixmultiply, Rayon reference/SIMD,
 /// or Rayon-chunked matrixmultiply without rebuilding.
 pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    matmul_row_major_with_backend(w, x, rows, cols, crate::parallel::dense_matvec_backend())
+    let mut y = vec![0.0f32; rows];
+    matmul_row_major_into(w, x, &mut y, rows, cols);
+    y
 }
 
 pub fn matmul_row_major_with_backend(
@@ -1342,8 +1344,27 @@ pub fn matmul_row_major_with_backend(
     cols: usize,
     backend: crate::parallel::DenseMatvecBackend,
 ) -> Vec<f32> {
+    let mut y = vec![0.0f32; rows];
+    matmul_row_major_into_with_backend(w, x, &mut y, rows, cols, backend);
+    y
+}
+
+/// In-place row-major matrix-vector multiply: `y = W · x`.
+pub fn matmul_row_major_into(w: &[f32], x: &[f32], y: &mut [f32], rows: usize, cols: usize) {
+    matmul_row_major_into_with_backend(w, x, y, rows, cols, crate::parallel::dense_matvec_backend())
+}
+
+pub fn matmul_row_major_into_with_backend(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    cols: usize,
+    backend: crate::parallel::DenseMatvecBackend,
+) {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
 
     let backend = match backend {
         crate::parallel::DenseMatvecBackend::Auto => {
@@ -1354,11 +1375,13 @@ pub fn matmul_row_major_with_backend(
     match backend {
         crate::parallel::DenseMatvecBackend::Auto => unreachable!("auto resolves before dispatch"),
         crate::parallel::DenseMatvecBackend::Matrixmultiply => {
-            matmul_row_major_matrixmultiply(w, x, rows, cols)
+            matmul_row_major_matrixmultiply_into(w, x, y, rows, cols);
         }
-        crate::parallel::DenseMatvecBackend::Rayon => matmul_row_major_parallel(w, x, rows, cols),
+        crate::parallel::DenseMatvecBackend::Rayon => {
+            matmul_row_major_parallel_into(w, x, y, rows, cols);
+        }
         crate::parallel::DenseMatvecBackend::RayonMatrixmultiply => {
-            matmul_row_major_parallel_matrixmultiply(w, x, rows, cols)
+            matmul_row_major_parallel_matrixmultiply_into(w, x, y, rows, cols);
         }
     }
 }
@@ -1424,13 +1447,20 @@ fn matmul_row_major_matrixmultiply_into(
 /// unchanged, so the result is identical to the scalar path.
 fn matmul_row_major_parallel(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; rows];
-    crate::parallel::par_row_chunks(&mut y, cols, |row_start, out| {
+    matmul_row_major_parallel_into(w, x, &mut y, rows, cols);
+    y
+}
+
+fn matmul_row_major_parallel_into(w: &[f32], x: &[f32], y: &mut [f32], rows: usize, cols: usize) {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    crate::parallel::par_row_chunks(y, cols, |row_start, out| {
         for (i, slot) in out.iter_mut().enumerate() {
             let row = &w[(row_start + i) * cols..(row_start + i + 1) * cols];
             *slot = crate::kernels::dot_f32(row, x);
         }
     });
-    y
 }
 
 /// Rayon-chunked matrixmultiply. Output rows are split into contiguous
@@ -1443,17 +1473,31 @@ fn matmul_row_major_parallel_matrixmultiply(
     rows: usize,
     cols: usize,
 ) -> Vec<f32> {
-    if crate::parallel::in_rayon_worker() {
-        return matmul_row_major_matrixmultiply(w, x, rows, cols);
-    }
     let mut y = vec![0.0f32; rows];
-    crate::parallel::par_row_chunks(&mut y, cols, |row_start, out| {
+    matmul_row_major_parallel_matrixmultiply_into(w, x, &mut y, rows, cols);
+    y
+}
+
+fn matmul_row_major_parallel_matrixmultiply_into(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    if crate::parallel::in_rayon_worker() {
+        matmul_row_major_matrixmultiply_into(w, x, y, rows, cols);
+        return;
+    }
+    crate::parallel::par_row_chunks(y, cols, |row_start, out| {
         let row_count = out.len();
         let w_start = row_start * cols;
         let w_end = w_start + row_count * cols;
         matmul_row_major_matrixmultiply_into(&w[w_start..w_end], x, out, row_count, cols);
     });
-    y
 }
 
 /// Final language-modelling head: a linear projection from the residual
@@ -1785,13 +1829,23 @@ impl TransformerLayer {
         hidden: &[f32],
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> (Vec<f32>, crate::gating::RoutingDecision) {
+        let mut scratch = crate::gating::RoutingScratch::new();
+        self.moe_pre_with_scratch_and_timing(hidden, &mut scratch, timings)
+    }
+
+    pub fn moe_pre_with_scratch_and_timing(
+        &self,
+        hidden: &[f32],
+        routing_scratch: &mut crate::gating::RoutingScratch,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> (Vec<f32>, crate::gating::RoutingDecision) {
         let normed =
             crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
                 self.rms_moe.forward(hidden)
             });
         let routing =
             crate::stage_timing::time_optional(timings, crate::stage_timing::ROUTER_GATE, || {
-                self.gate.route(&normed)
+                self.gate.route_with_scratch(&normed, routing_scratch)
             });
         (normed, routing)
     }

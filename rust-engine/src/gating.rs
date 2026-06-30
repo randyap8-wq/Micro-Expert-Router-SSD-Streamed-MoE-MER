@@ -30,7 +30,8 @@
 //! benchmark / `--io-only` path that has no real gating network.
 
 use crate::router::TopKRouter;
-use crate::transformer::{matmul_row_major, softmax_inplace};
+use crate::transformer::{matmul_row_major_into, softmax_inplace};
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// Output of a routing decision for a single token at a single layer.
@@ -42,6 +43,33 @@ pub struct RoutingDecision {
     /// re-normalisation. The MoE block computes
     /// `y = sum_i weights[i] * expert_i(x)`.
     pub weights: Vec<f32>,
+}
+
+/// Reusable per-call routing buffers.
+///
+/// A request path can keep one scratch value and pass it through each layer
+/// so router logits, selection scores, and small top-K work buffers retain
+/// their allocation capacity across layers. The returned [`RoutingDecision`]
+/// remains owned because downstream engine calls may await on I/O.
+#[derive(Debug, Default)]
+pub struct RoutingScratch {
+    logits: Vec<f32>,
+    selection: Vec<f32>,
+    top_groups: Vec<(usize, f32)>,
+    top_experts: Vec<(u32, f32)>,
+}
+
+impl RoutingScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn resize_for(&mut self, num_experts: usize) {
+        self.logits.resize(num_experts, 0.0);
+        self.selection.resize(num_experts, 0.0);
+        self.top_groups.clear();
+        self.top_experts.clear();
+    }
 }
 
 /// How the router turns raw gate logits into per-expert scores.
@@ -109,7 +137,10 @@ impl LinearGate {
     /// no correction bias, no grouping, unit scaling. Preserves the
     /// original behaviour for every existing call site.
     pub fn new(weights: Vec<f32>, num_experts: usize, d_model: usize, top_k: usize) -> Self {
-        assert!(top_k > 0 && top_k <= num_experts, "top_k must be in 1..=num_experts");
+        assert!(
+            top_k > 0 && top_k <= num_experts,
+            "top_k must be in 1..=num_experts"
+        );
         assert_eq!(
             weights.len(),
             num_experts * d_model,
@@ -174,90 +205,180 @@ impl LinearGate {
         }
     }
 
-    /// Group-limited expert mask (DeepSeek `n_group` / `topk_group`).
-    /// Returns a boolean per expert: `true` means the expert lives in one
-    /// of the `topk_group` highest-scoring groups and may be selected.
-    /// Each group's score is the sum of its top-2 selection scores, exactly
-    /// as in the reference DeepSeek-V3 implementation.
-    fn group_mask(&self, selection: &[f32]) -> Vec<bool> {
+    #[inline]
+    fn score_id_is_better(
+        candidate_score: f32,
+        candidate_id: usize,
+        incumbent_score: f32,
+        incumbent_id: usize,
+    ) -> bool {
+        match candidate_score.total_cmp(&incumbent_score) {
+            Ordering::Greater => true,
+            Ordering::Equal => candidate_id < incumbent_id,
+            Ordering::Less => false,
+        }
+    }
+
+    fn insert_top_group(groups: &mut Vec<(usize, f32)>, group: usize, score: f32, limit: usize) {
+        if limit == 0 {
+            return;
+        }
+        let pos = groups
+            .iter()
+            .position(|&(g, s)| Self::score_id_is_better(score, group, s, g));
+        match pos {
+            Some(pos) => {
+                groups.insert(pos, (group, score));
+                if groups.len() > limit {
+                    groups.pop();
+                }
+            }
+            None if groups.len() < limit => groups.push((group, score)),
+            None => {}
+        }
+    }
+
+    fn insert_top_expert(experts: &mut Vec<(u32, f32)>, expert: usize, score: f32, limit: usize) {
+        if limit == 0 || !score.is_finite() {
+            return;
+        }
+        let pos = experts
+            .iter()
+            .position(|&(id, s)| Self::score_id_is_better(score, expert, s, id as usize));
+        let entry = (expert as u32, score);
+        match pos {
+            Some(pos) => {
+                experts.insert(pos, entry);
+                if experts.len() > limit {
+                    experts.pop();
+                }
+            }
+            None if experts.len() < limit => experts.push(entry),
+            None => {}
+        }
+    }
+
+    fn group_filter_shape(&self) -> Option<(usize, usize)> {
         let n_group = self.n_group.max(1);
         if n_group <= 1
             || self.topk_group == 0
             || self.topk_group >= n_group
             || self.num_experts % n_group != 0
         {
-            // Grouping disabled or degenerate → every expert eligible.
-            return vec![true; self.num_experts];
+            return None;
         }
-        let group_size = self.num_experts / n_group;
+        Some((n_group, self.num_experts / n_group))
+    }
+
+    /// Group-limited expert pre-selection (DeepSeek `n_group` /
+    /// `topk_group`). `scratch_groups` receives the top group ids in
+    /// deterministic score/id order and its capacity is reused across calls.
+    /// Each group's score is the sum of its top-2 selection scores, exactly
+    /// as in the reference DeepSeek-V3 implementation.
+    fn select_top_groups(
+        &self,
+        selection: &[f32],
+        scratch_groups: &mut Vec<(usize, f32)>,
+    ) -> Option<usize> {
+        let (n_group, group_size) = self.group_filter_shape()?;
+        scratch_groups.clear();
         // Score each group by the sum of its two best selection scores.
-        let mut group_scores: Vec<(usize, f32)> = (0..n_group)
-            .map(|g| {
-                let slice = &selection[g * group_size..(g + 1) * group_size];
-                let mut top1 = f32::NEG_INFINITY;
-                let mut top2 = f32::NEG_INFINITY;
-                for &s in slice {
-                    if s > top1 {
-                        top2 = top1;
-                        top1 = s;
-                    } else if s > top2 {
-                        top2 = s;
-                    }
+        for g in 0..n_group {
+            let slice = &selection[g * group_size..(g + 1) * group_size];
+            let mut top1 = f32::NEG_INFINITY;
+            let mut top2 = f32::NEG_INFINITY;
+            for &s in slice {
+                if s > top1 {
+                    top2 = top1;
+                    top1 = s;
+                } else if s > top2 {
+                    top2 = s;
                 }
-                let sum = top1 + if top2.is_finite() { top2 } else { 0.0 };
-                (g, sum)
-            })
-            .collect();
-        group_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let mut mask = vec![false; self.num_experts];
-        for &(g, _) in group_scores.iter().take(self.topk_group) {
-            for e in g * group_size..(g + 1) * group_size {
-                mask[e] = true;
             }
+            let sum = top1 + if top2.is_finite() { top2 } else { 0.0 };
+            Self::insert_top_group(scratch_groups, g, sum, self.topk_group);
         }
-        mask
+        Some(group_size)
+    }
+
+    #[inline]
+    fn expert_group_allowed(
+        expert: usize,
+        group_size: usize,
+        selected_groups: &[(usize, f32)],
+    ) -> bool {
+        let group = expert / group_size;
+        selected_groups.iter().any(|&(g, _)| g == group)
     }
 
     /// Compute the routing decision for a single token's hidden state.
     pub fn route(&self, x: &[f32]) -> RoutingDecision {
+        let mut scratch = RoutingScratch::new();
+        self.route_with_scratch(x, &mut scratch)
+    }
+
+    /// Compute the routing decision using caller-owned reusable scratch.
+    pub fn route_with_scratch(&self, x: &[f32], scratch: &mut RoutingScratch) -> RoutingDecision {
         debug_assert_eq!(x.len(), self.d_model);
+        scratch.resize_for(self.num_experts);
         // logits = W_gate · x  (length: num_experts)
-        let mut logits = matmul_row_major(&self.weights, x, self.num_experts, self.d_model);
+        matmul_row_major_into(
+            &self.weights,
+            x,
+            &mut scratch.logits,
+            self.num_experts,
+            self.d_model,
+        );
         // scores: the values that become mixing weights (no bias folded in).
-        self.score(&mut logits);
-        let scores = logits;
+        self.score(&mut scratch.logits);
 
         // selection scores: scores (+ correction bias) used only to choose
-        // experts, never to weight them.
-        let mut selection = scores.clone();
-        if let Some(bias) = self.correction_bias.as_ref() {
-            for (s, b) in selection.iter_mut().zip(bias.iter()) {
-                *s += *b;
+        // experts, never to weight them. Kept separate so DeepSeek's
+        // correction bias cannot leak into the MoE mixing weights.
+        match self.correction_bias.as_ref() {
+            Some(bias) => {
+                for ((selection, &score), &bias) in scratch
+                    .selection
+                    .iter_mut()
+                    .zip(scratch.logits.iter())
+                    .zip(bias.iter())
+                {
+                    *selection = score + bias;
+                }
+            }
+            None => {
+                scratch.selection.copy_from_slice(&scratch.logits);
             }
         }
 
-        // Group-limited pre-selection: experts outside the surviving groups
-        // are made ineligible by driving their selection score to -inf.
-        let mask = self.group_mask(&selection);
-        for (s, &keep) in selection.iter_mut().zip(mask.iter()) {
-            if !keep {
-                *s = f32::NEG_INFINITY;
-            }
-        }
+        let selected_group_size =
+            self.select_top_groups(&scratch.selection, &mut scratch.top_groups);
 
-        // Top-K selection over the (masked) selection scores. For typical
-        // MoE sizes (8, 16, 64, 256 experts) a simple `O(N log N)` sort is
-        // fine — the cost is dwarfed by the expert FFN matmul, never mind
-        // by the SSD read.
-        let mut idx: Vec<u32> = (0..self.num_experts as u32).collect();
-        idx.sort_by(|&a, &b| {
-            selection[b as usize].total_cmp(&selection[a as usize])
-        });
-        idx.retain(|&i| selection[i as usize].is_finite());
-        idx.truncate(self.top_k);
+        // Top-K selection over the (optionally grouped) selection scores.
+        // This is O(num_experts * top_k) with top_k small (8 for Qwen3-MoE),
+        // avoids allocating/sorting every expert id, and has explicit
+        // deterministic tie handling: higher score first, then lower id.
+        for expert in 0..self.num_experts {
+            if let Some(group_size) = selected_group_size {
+                if !Self::expert_group_allowed(expert, group_size, &scratch.top_groups) {
+                    continue;
+                }
+            }
+            Self::insert_top_expert(
+                &mut scratch.top_experts,
+                expert,
+                scratch.selection[expert],
+                self.top_k,
+            );
+        }
 
         // Mixing weights are the *original* scores at the chosen experts.
-        let mut weights: Vec<f32> = idx.iter().map(|&i| scores[i as usize]).collect();
+        let mut experts = Vec::with_capacity(scratch.top_experts.len());
+        let mut weights = Vec::with_capacity(scratch.top_experts.len());
+        for &(expert, _) in &scratch.top_experts {
+            experts.push(expert);
+            weights.push(scratch.logits[expert as usize]);
+        }
         if self.normalise_topk {
             let sum: f32 = weights.iter().sum();
             // Guard against `0.0`, negatives (impossible post-softmax but
@@ -278,7 +399,7 @@ impl LinearGate {
                 *w *= self.routed_scaling_factor;
             }
         }
-        RoutingDecision { experts: idx, weights }
+        RoutingDecision { experts, weights }
     }
 }
 
@@ -300,7 +421,11 @@ impl Router {
             Router::Markov(r) => {
                 let experts = r.route(token_idx);
                 let n = experts.len() as f32;
-                let weights = if n > 0.0 { vec![1.0 / n; experts.len()] } else { Vec::new() };
+                let weights = if n > 0.0 {
+                    vec![1.0 / n; experts.len()]
+                } else {
+                    Vec::new()
+                };
                 RoutingDecision { experts, weights }
             }
         }
@@ -393,8 +518,16 @@ mod tests {
         let dec = gate.route(&[2.0, 1.0, -5.0, -5.0]);
         assert_eq!(dec.experts, vec![0, 1]);
         // sigmoid(2) ≈ 0.8808, sigmoid(1) ≈ 0.7311 — kept un-normalised.
-        assert!((dec.weights[0] - 0.880_797).abs() < 1e-4, "{:?}", dec.weights);
-        assert!((dec.weights[1] - 0.731_058).abs() < 1e-4, "{:?}", dec.weights);
+        assert!(
+            (dec.weights[0] - 0.880_797).abs() < 1e-4,
+            "{:?}",
+            dec.weights
+        );
+        assert!(
+            (dec.weights[1] - 0.731_058).abs() < 1e-4,
+            "{:?}",
+            dec.weights
+        );
     }
 
     #[test]
@@ -419,7 +552,11 @@ mod tests {
         let dec = gate.route(&[3.0, 0.0, 0.0, 1.0]);
         assert_eq!(dec.experts, vec![3], "bias should pull expert 3 to the top");
         // Weight is sigmoid(logit[3]) = sigmoid(1.0), NOT sigmoid(1.0 + 10).
-        assert!((dec.weights[0] - 0.731_058).abs() < 1e-4, "{:?}", dec.weights);
+        assert!(
+            (dec.weights[0] - 0.731_058).abs() < 1e-4,
+            "{:?}",
+            dec.weights
+        );
     }
 
     #[test]
@@ -469,6 +606,204 @@ mod tests {
         // Normalised weights sum to 1, then scaled by 2.5 → sum ≈ 2.5.
         let sum: f32 = dec.weights.iter().sum();
         assert!((sum - 2.5).abs() < 1e-4, "sum={sum}");
+    }
+
+    fn reference_route_stable(gate: &LinearGate, x: &[f32]) -> RoutingDecision {
+        let mut scores = vec![0.0f32; gate.num_experts];
+        matmul_row_major_into(
+            &gate.weights,
+            x,
+            &mut scores,
+            gate.num_experts,
+            gate.d_model,
+        );
+        gate.score(&mut scores);
+
+        let mut selection = scores.clone();
+        if let Some(bias) = gate.correction_bias.as_ref() {
+            for (s, b) in selection.iter_mut().zip(bias.iter()) {
+                *s += *b;
+            }
+        }
+
+        if let Some((n_group, group_size)) = gate.group_filter_shape() {
+            let mut group_scores: Vec<(usize, f32)> = (0..n_group)
+                .map(|g| {
+                    let slice = &selection[g * group_size..(g + 1) * group_size];
+                    let mut top1 = f32::NEG_INFINITY;
+                    let mut top2 = f32::NEG_INFINITY;
+                    for &s in slice {
+                        if s > top1 {
+                            top2 = top1;
+                            top1 = s;
+                        } else if s > top2 {
+                            top2 = s;
+                        }
+                    }
+                    (g, top1 + if top2.is_finite() { top2 } else { 0.0 })
+                })
+                .collect();
+            group_scores.sort_by(|a, b| {
+                let by_score = b.1.total_cmp(&a.1);
+                if by_score == Ordering::Equal {
+                    a.0.cmp(&b.0)
+                } else {
+                    by_score
+                }
+            });
+            let selected_groups: Vec<usize> = group_scores
+                .iter()
+                .take(gate.topk_group)
+                .map(|&(g, _)| g)
+                .collect();
+            for (expert, s) in selection.iter_mut().enumerate() {
+                let group = expert / group_size;
+                if !selected_groups.contains(&group) {
+                    *s = f32::NEG_INFINITY;
+                }
+            }
+        }
+
+        let mut idx: Vec<u32> = (0..gate.num_experts as u32).collect();
+        idx.sort_by(|&a, &b| {
+            let by_score = selection[b as usize].total_cmp(&selection[a as usize]);
+            if by_score == Ordering::Equal {
+                a.cmp(&b)
+            } else {
+                by_score
+            }
+        });
+        idx.retain(|&i| selection[i as usize].is_finite());
+        idx.truncate(gate.top_k);
+
+        let mut weights: Vec<f32> = idx.iter().map(|&i| scores[i as usize]).collect();
+        if gate.normalise_topk {
+            let sum: f32 = weights.iter().sum();
+            if sum.is_finite() && sum > 0.0 {
+                for w in &mut weights {
+                    *w /= sum;
+                }
+            }
+        }
+        if gate.routed_scaling_factor != 1.0 && gate.routed_scaling_factor.is_finite() {
+            for w in &mut weights {
+                *w *= gate.routed_scaling_factor;
+            }
+        }
+        RoutingDecision {
+            experts: idx,
+            weights,
+        }
+    }
+
+    fn assert_routing_close(actual: &RoutingDecision, expected: &RoutingDecision) {
+        assert_eq!(actual.experts, expected.experts);
+        assert_eq!(actual.weights.len(), expected.weights.len());
+        for (a, e) in actual.weights.iter().zip(expected.weights.iter()) {
+            assert!(
+                (a - e).abs() < 1e-6,
+                "actual={actual:?} expected={expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn topk_ties_are_deterministic_by_lower_expert_id() {
+        let gate = LinearGate::new(vec![0.0; 6 * 2], 6, 2, 4);
+        let dec = gate.route(&[1.0, -1.0]);
+        assert_eq!(dec.experts, vec![0, 1, 2, 3]);
+        for w in dec.weights {
+            assert!((w - 0.25).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn scratch_route_matches_stable_reference_across_routing_modes() {
+        let n = 8;
+        let softmax_gate = LinearGate::new(identity_gate(n), n, n, 3);
+        let biased_group_gate = LinearGate::with_routing(
+            identity_gate(n),
+            n,
+            n,
+            3,
+            ScoringFunc::Sigmoid,
+            true,
+            Some(vec![0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 1.25, 0.0]),
+            /*n_group=*/ 2,
+            /*topk_group=*/ 1,
+            /*routed_scaling_factor=*/ 1.5,
+        );
+        let sigmoid_gate = LinearGate::with_routing(
+            identity_gate(n),
+            n,
+            n,
+            4,
+            ScoringFunc::Sigmoid,
+            false,
+            None,
+            1,
+            1,
+            1.0,
+        );
+        let cases = [
+            (
+                &softmax_gate,
+                vec![0.5, 2.0, 2.0, -1.0, 3.0, 0.0, 3.0, -2.0],
+            ),
+            (
+                &biased_group_gate,
+                vec![3.0, -1.0, 1.0, 2.0, 4.0, 5.0, 0.5, -9.0],
+            ),
+            (
+                &sigmoid_gate,
+                vec![-2.0, 4.0, 1.0, 4.0, 0.5, -3.0, 0.0, 2.0],
+            ),
+        ];
+
+        let mut scratch = RoutingScratch::new();
+        for (gate, x) in cases {
+            let expected = reference_route_stable(gate, &x);
+            let actual = gate.route_with_scratch(&x, &mut scratch);
+            assert_routing_close(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn routing_scratch_reuses_internal_capacity() {
+        let n = 8;
+        let gate = LinearGate::with_routing(
+            identity_gate(n),
+            n,
+            n,
+            2,
+            ScoringFunc::Sigmoid,
+            true,
+            None,
+            /*n_group=*/ 2,
+            /*topk_group=*/ 1,
+            1.0,
+        );
+        let x = vec![3.0, -1.0, 1.0, 2.0, 4.0, 5.0, 0.5, -9.0];
+        let mut scratch = RoutingScratch::new();
+        let first = gate.route_with_scratch(&x, &mut scratch);
+        assert_eq!(first.experts.len(), 2);
+        let capacities = (
+            scratch.logits.capacity(),
+            scratch.selection.capacity(),
+            scratch.top_groups.capacity(),
+            scratch.top_experts.capacity(),
+        );
+        let second = gate.route_with_scratch(&x, &mut scratch);
+        assert_routing_close(&second, &first);
+        assert_eq!(
+            capacities,
+            (
+                scratch.logits.capacity(),
+                scratch.selection.capacity(),
+                scratch.top_groups.capacity(),
+                scratch.top_experts.capacity(),
+            )
+        );
     }
 
     #[test]
