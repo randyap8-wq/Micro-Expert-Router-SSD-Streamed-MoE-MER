@@ -22,9 +22,9 @@ use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
     run_inference_mixed_quant, run_inference_mxfp4, run_inference_q4_0, run_inference_q4_0_qmm,
     run_inference_q4k, run_inference_q4k_qmm, run_inference_q5k, run_inference_q6k,
-    run_inference_q8_0, run_inference_q8_0_qmm, synth_hidden_state, uniform_scores,
-    ExpertWeightsError, HiddenState, InferenceOutput, WeightDtype, Q4K_BLOCK_ELEMS,
-    Q4_0_BLOCK_ELEMS, Q8_0_BLOCK_ELEMS,
+    run_inference_q8_0, run_inference_q8_0_qmm_with_timing, synth_hidden_state, uniform_scores,
+    ExpertWeightsError, HiddenState, InferenceOutput, WeightDtype, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_ELEMS,
+    Q8_0_BLOCK_ELEMS,
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
@@ -1465,6 +1465,7 @@ fn run_compute_donated<R>(f: impl FnOnce() -> R) -> R {
 /// corrupt block stream where dequant has more lenient bounds
 /// checks). For every other dtype the legacy entry point is called
 /// directly.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_expert_forward(
     dtype: WeightDtype,
     use_qmm: bool,
@@ -1473,6 +1474,7 @@ fn dispatch_expert_forward(
     x: &[f32],
     d_model: usize,
     d_ff: usize,
+    timings: Option<&crate::stage_timing::StageTimings>,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     // One-time diagnostic: log the actual resident buffer size against
     // the size the engine expects for this dtype/shape on the very
@@ -1539,7 +1541,7 @@ fn dispatch_expert_forward(
         WeightDtype::Q8_0
             if use_qmm && d_model % Q8_0_BLOCK_ELEMS == 0 && d_ff % Q8_0_BLOCK_ELEMS == 0 =>
         {
-            match run_inference_q8_0_qmm(token_idx, r, x, d_model, d_ff) {
+            match run_inference_q8_0_qmm_with_timing(token_idx, r, x, d_model, d_ff, timings) {
                 Ok(v) => Ok(v),
                 Err(e) => {
                     debug!(error = %e, "QMatMul Q8_0 path failed; falling back to dequant");
@@ -2456,6 +2458,7 @@ impl Engine {
                             x,
                             self.core.shape.d_model,
                             self.core.shape.d_ff,
+                            None,
                         )
                     };
                     match res {
@@ -4070,6 +4073,7 @@ impl Engine {
                                 x,
                                 self.core.shape.d_model,
                                 self.core.shape.d_ff,
+                                timings,
                             )
                         };
                         match res {

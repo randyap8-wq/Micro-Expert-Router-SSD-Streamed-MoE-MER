@@ -66,6 +66,12 @@ pub struct ExpertResident {
     /// on-disk bytes are slightly short (≤ one block/page) of the
     /// derived expected size.
     q4_0_padded: OnceCell<(usize, Arc<[u8]>)>,
+    /// Cached once-per-resident Q8_0 QMatMul preparation. The cell stores
+    /// the first error as well as the prepared bundle so malformed resident
+    /// payloads are not re-prepared on every activation.
+    q8_0_qmm: OnceCell<
+        Result<crate::inference::PreparedQ8_0Expert, crate::inference::ExpertWeightsError>,
+    >,
     /// **Tier 4 cost-aware eviction.** Decaying heat score: bumped by
     /// `+1` on every cache hit and exponentially decayed by the number
     /// of intervening insertions (cache-pressure events). Only
@@ -116,6 +122,7 @@ impl ExpertResident {
             mixed_layout,
             hits: AtomicU64::new(0),
             q4_0_padded: OnceCell::new(),
+            q8_0_qmm: OnceCell::new(),
             heat_bits: AtomicU64::new(0.0f64.to_bits()),
             heat_last_epoch: AtomicU64::new(0),
         }
@@ -205,6 +212,31 @@ impl ExpertResident {
             (need, Arc::from(padded.into_boxed_slice()))
         });
         (*cached_need == need).then(|| cached.clone())
+    }
+
+    pub(crate) fn prepared_q8_0_qmm<F>(
+        &self,
+        prepare: F,
+    ) -> (
+        Result<&crate::inference::PreparedQ8_0Expert, crate::inference::ExpertWeightsError>,
+        bool,
+    )
+    where
+        F: FnOnce(&[u8]) -> Result<
+            crate::inference::PreparedQ8_0Expert,
+            crate::inference::ExpertWeightsError,
+        >,
+    {
+        let mut prepared_now = false;
+        let result = self.q8_0_qmm.get_or_init(|| {
+            prepared_now = true;
+            prepare(self.data())
+        });
+        let result = match result {
+            Ok(prepared) => Ok(prepared),
+            Err(err) => Err(err.clone()),
+        };
+        (result, prepared_now)
     }
 }
 
