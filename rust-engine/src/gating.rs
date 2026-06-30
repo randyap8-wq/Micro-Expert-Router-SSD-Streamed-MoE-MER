@@ -30,7 +30,8 @@
 //! benchmark / `--io-only` path that has no real gating network.
 
 use crate::router::TopKRouter;
-use crate::transformer::{matmul_row_major_into, softmax_inplace};
+use crate::dense_tensor::DenseWeight;
+use crate::transformer::softmax_inplace;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -115,7 +116,7 @@ impl Default for ScoringFunc {
 /// [`LinearGate::with_routing`].
 #[derive(Debug, Clone)]
 pub struct LinearGate {
-    pub weights: Vec<f32>,
+    pub weights: DenseWeight,
     pub num_experts: usize,
     pub d_model: usize,
     pub top_k: usize,
@@ -156,6 +157,40 @@ impl LinearGate {
             "gate weight matrix must be [num_experts, d_model]"
         );
         Self {
+            weights: DenseWeight::from_f32(weights, num_experts, d_model),
+            num_experts,
+            d_model,
+            top_k,
+            normalise_topk: true,
+            scoring_func: ScoringFunc::Softmax,
+            correction_bias: None,
+            n_group: 1,
+            topk_group: 1,
+            routed_scaling_factor: 1.0,
+        }
+    }
+
+    pub fn from_dense(
+        weights: DenseWeight,
+        num_experts: usize,
+        d_model: usize,
+        top_k: usize,
+    ) -> Self {
+        assert!(
+            top_k > 0 && top_k <= num_experts,
+            "top_k must be in 1..=num_experts"
+        );
+        assert_eq!(
+            weights.rows(),
+            num_experts,
+            "gate weight row count must equal num_experts"
+        );
+        assert_eq!(
+            weights.cols(),
+            d_model,
+            "gate weight column count must equal d_model"
+        );
+        Self {
             weights,
             num_experts,
             d_model,
@@ -186,6 +221,36 @@ impl LinearGate {
         routed_scaling_factor: f32,
     ) -> Self {
         let mut gate = Self::new(weights, num_experts, d_model, top_k);
+        gate.scoring_func = scoring_func;
+        gate.normalise_topk = normalise_topk;
+        if let Some(bias) = correction_bias.as_ref() {
+            assert_eq!(
+                bias.len(),
+                num_experts,
+                "correction_bias must have length num_experts"
+            );
+        }
+        gate.correction_bias = correction_bias;
+        gate.n_group = n_group.max(1);
+        gate.topk_group = topk_group;
+        gate.routed_scaling_factor = routed_scaling_factor;
+        gate
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_dense_routing(
+        weights: DenseWeight,
+        num_experts: usize,
+        d_model: usize,
+        top_k: usize,
+        scoring_func: ScoringFunc,
+        normalise_topk: bool,
+        correction_bias: Option<Vec<f32>>,
+        n_group: usize,
+        topk_group: usize,
+        routed_scaling_factor: f32,
+    ) -> Self {
+        let mut gate = Self::from_dense(weights, num_experts, d_model, top_k);
         gate.scoring_func = scoring_func;
         gate.normalise_topk = normalise_topk;
         if let Some(bias) = correction_bias.as_ref() {
@@ -331,13 +396,7 @@ impl LinearGate {
         debug_assert_eq!(x.len(), self.d_model);
         scratch.resize_for(self.num_experts);
         // logits = W_gate · x  (length: num_experts)
-        matmul_row_major_into(
-            &self.weights,
-            x,
-            &mut scratch.logits,
-            self.num_experts,
-            self.d_model,
-        );
+        self.weights.matvec_into(x, &mut scratch.logits);
         // scores: the values that become mixing weights (no bias folded in).
         self.score(&mut scratch.logits);
 
@@ -624,13 +683,7 @@ mod tests {
 
     fn reference_route_stable(gate: &LinearGate, x: &[f32]) -> RoutingDecision {
         let mut scores = vec![0.0f32; gate.num_experts];
-        matmul_row_major_into(
-            &gate.weights,
-            x,
-            &mut scores,
-            gate.num_experts,
-            gate.d_model,
-        );
+        gate.weights.matvec_into(x, &mut scores);
         gate.score(&mut scores);
 
         let mut selection = scores.clone();

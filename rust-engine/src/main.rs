@@ -131,6 +131,7 @@ mod block_pool;
 mod buffer_pool;
 mod config;
 mod dequant;
+mod dense_tensor;
 mod distributed;
 mod draft;
 mod engine;
@@ -1898,10 +1899,26 @@ fn make_synthetic_transformer_layer(
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: mk(q_dim, d_model, 0.05),
-            wk: mk(kv_dim, d_model, 0.05),
-            wv: mk(kv_dim, d_model, 0.05),
-            wo: mk(d_model, q_dim, 0.05),
+            wq: crate::dense_tensor::DenseWeight::from_f32(
+                mk(q_dim, d_model, 0.05),
+                q_dim,
+                d_model,
+            ),
+            wk: crate::dense_tensor::DenseWeight::from_f32(
+                mk(kv_dim, d_model, 0.05),
+                kv_dim,
+                d_model,
+            ),
+            wv: crate::dense_tensor::DenseWeight::from_f32(
+                mk(kv_dim, d_model, 0.05),
+                kv_dim,
+                d_model,
+            ),
+            wo: crate::dense_tensor::DenseWeight::from_f32(
+                mk(d_model, q_dim, 0.05),
+                d_model,
+                q_dim,
+            ),
             window_size: None,
             q_norm: None,
             k_norm: None,

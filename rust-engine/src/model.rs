@@ -39,6 +39,7 @@
 use crate::architecture::{
     Architecture, ComputeSupport, FfnKind, MlaDims, RopeScaling, TensorNaming,
 };
+use crate::dense_tensor::{dense_checksum, DenseDType, DenseTensorManifest, DenseWeight};
 use crate::engine::Engine;
 use crate::gating::{LinearGate, ScoringFunc};
 use crate::mla::MultiHeadLatentAttention;
@@ -611,7 +612,7 @@ impl RealModelConfig {
 /// stays resident in RAM.
 pub struct RealModel {
     pub config: RealModelConfig,
-    pub embedding: Vec<f32>, // [vocab_size, d_model]
+    pub embedding: DenseWeight, // [vocab_size, d_model]
     pub layers: Vec<TransformerLayer>,
     pub final_rms: RmsNorm,
     pub lm_head: LMHead,
@@ -667,7 +668,11 @@ impl RealModel {
     pub fn new_seeded(config: RealModelConfig, seed: u64) -> Self {
         config.validate().expect("invalid RealModelConfig");
         let mut rng = SplitMix64::new(seed);
-        let embedding = sample_uniform_vec(&mut rng, config.vocab_size * config.d_model, 0.04);
+        let embedding = DenseWeight::from_f32(
+            sample_uniform_vec(&mut rng, config.vocab_size * config.d_model, 0.04),
+            config.vocab_size,
+            config.d_model,
+        );
 
         let q_dim = config.num_heads * config.head_dim;
         // V projection / output-projection widths use `v_head_dim`, which
@@ -761,14 +766,38 @@ impl RealModel {
                         v_head_dim,
                         attention_value_scale: config.advanced.attention_value_scale,
                         rope_base: layer_rope_base,
-                        wq: sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
-                        wk: sample_uniform_vec(&mut rng, layer_kv_dim * config.d_model, proj_scale),
-                        wv: sample_uniform_vec(
-                            &mut rng,
-                            layer_v_proj_dim * config.d_model,
-                            proj_scale,
+                        wq: DenseWeight::from_f32(
+                            sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
+                            q_dim,
+                            config.d_model,
                         ),
-                        wo: sample_uniform_vec(&mut rng, config.d_model * attn_out_dim, proj_scale),
+                        wk: DenseWeight::from_f32(
+                            sample_uniform_vec(
+                                &mut rng,
+                                layer_kv_dim * config.d_model,
+                                proj_scale,
+                            ),
+                            layer_kv_dim,
+                            config.d_model,
+                        ),
+                        wv: DenseWeight::from_f32(
+                            sample_uniform_vec(
+                                &mut rng,
+                                layer_v_proj_dim * config.d_model,
+                                proj_scale,
+                            ),
+                            layer_v_proj_dim,
+                            config.d_model,
+                        ),
+                        wo: DenseWeight::from_f32(
+                            sample_uniform_vec(
+                                &mut rng,
+                                config.d_model * attn_out_dim,
+                                proj_scale,
+                            ),
+                            config.d_model,
+                            attn_out_dim,
+                        ),
                         window_size: layer_window,
                         q_norm,
                         k_norm,
@@ -865,14 +894,35 @@ impl RealModel {
         let mut tried = 0usize;
         let mut summary = WeightLoadSummary::default();
         let mut failures = Vec::new();
+        let dense_manifest = load_dense_manifest(dir);
 
         macro_rules! maybe {
             ($group:expr, $name:expr, $expected:expr, $assign:expr) => {{
                 tried += 1;
-                if let Some(v) = try_load_f32_bin(
+                if let Some(v) = try_load_resident_f32(
                     dir,
+                    dense_manifest.as_ref(),
                     $name,
                     $expected,
+                    $group,
+                    options.strict_weights,
+                    &mut failures,
+                    &mut summary,
+                ) {
+                    $assign(v);
+                    loaded += 1;
+                }
+            }};
+        }
+        macro_rules! maybe_dense {
+            ($group:expr, $name:expr, $rows:expr, $cols:expr, $assign:expr) => {{
+                tried += 1;
+                if let Some(v) = try_load_dense_weight(
+                    dir,
+                    dense_manifest.as_ref(),
+                    $name,
+                    $rows,
+                    $cols,
                     $group,
                     options.strict_weights,
                     &mut failures,
@@ -887,21 +937,23 @@ impl RealModel {
         let d_model = config.d_model;
         let q_dim = config.num_heads * config.head_dim;
 
-        maybe!(
+        maybe_dense!(
             GROUP_EMBEDDING,
             "embed.bin",
-            config.vocab_size * d_model,
+            config.vocab_size,
+            d_model,
             |v| model.embedding = v
         );
         maybe!(GROUP_NORMS, "final_rms.bin", d_model, |v| {
             model.final_rms = RmsNorm::new(v, config.rms_eps);
         });
-        maybe!(
+        maybe_dense!(
             GROUP_LM_HEAD,
             "lm_head.bin",
-            config.vocab_size * d_model,
+            config.vocab_size,
+            d_model,
             |v| {
-                model.lm_head = LMHead::new(v, config.vocab_size, d_model);
+                model.lm_head = LMHead::from_dense(v, config.vocab_size, d_model);
             }
         );
         for l in 0..config.num_layers {
@@ -917,34 +969,38 @@ impl RealModel {
             maybe!(GROUP_NORMS, &format!("rms_moe_{l}.bin"), d_model, |v| {
                 model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps);
             });
-            maybe!(
+            maybe_dense!(
                 GROUP_ATTENTION,
                 &format!("attn_{l}_q.bin"),
-                q_dim * d_model,
+                q_dim,
+                d_model,
                 |v| {
                     model.layers[l].attn.wq = v;
                 }
             );
-            maybe!(
+            maybe_dense!(
                 GROUP_ATTENTION,
                 &format!("attn_{l}_k.bin"),
-                kv_dim * d_model,
+                kv_dim,
+                d_model,
                 |v| {
                     model.layers[l].attn.wk = v;
                 }
             );
-            maybe!(
+            maybe_dense!(
                 GROUP_ATTENTION,
                 &format!("attn_{l}_v.bin"),
-                v_proj_dim * d_model,
+                v_proj_dim,
+                d_model,
                 |v| {
                     model.layers[l].attn.wv = v;
                 }
             );
-            maybe!(
+            maybe_dense!(
                 GROUP_ATTENTION,
                 &format!("attn_{l}_o.bin"),
-                d_model * q_dim,
+                d_model,
+                q_dim,
                 |v| {
                     model.layers[l].attn.wo = v;
                 }
@@ -972,13 +1028,14 @@ impl RealModel {
                 ));
             }
             if naming.ffn_kind(l) == FfnKind::Moe {
-                maybe!(
+                maybe_dense!(
                     GROUP_ROUTING_GATES,
                     &format!("gate_{l}.bin"),
-                    config.num_experts * d_model,
+                    config.num_experts,
+                    d_model,
                     |v| {
                         model.layers[l].gate =
-                            LinearGate::new(v, config.num_experts, d_model, config.top_k);
+                            LinearGate::from_dense(v, config.num_experts, d_model, config.top_k);
                     }
                 );
             } else if options.strict_weights {
@@ -1612,7 +1669,7 @@ impl RealModel {
             &naming.embed(),
             config.vocab_size * d_model,
             |v| {
-                model.embedding = v;
+                model.embedding = DenseWeight::from_f32(v, config.vocab_size, d_model);
             }
         );
         maybe!(GROUP_NORMS, &naming.final_norm(), d_model, |v| {
@@ -1681,27 +1738,30 @@ impl RealModel {
                     );
                     let (q_part, rest) = v.split_at(q_dim * d_model);
                     let (k_part, v_part) = rest.split_at(kv_dim * d_model);
-                    model.layers[l].attn.wq = q_part.to_vec();
-                    model.layers[l].attn.wk = k_part.to_vec();
-                    model.layers[l].attn.wv = v_part.to_vec();
+                    model.layers[l].attn.wq =
+                        DenseWeight::from_f32(q_part.to_vec(), q_dim, d_model);
+                    model.layers[l].attn.wk =
+                        DenseWeight::from_f32(k_part.to_vec(), kv_dim, d_model);
+                    model.layers[l].attn.wv =
+                        DenseWeight::from_f32(v_part.to_vec(), kv_dim, d_model);
                     loaded += 1;
                 }
                 maybe!(GROUP_ATTENTION, &naming.attn_o(l), d_model * q_dim, |v| {
-                    model.layers[l].attn.wo = v;
+                    model.layers[l].attn.wo = DenseWeight::from_f32(v, d_model, q_dim);
                 });
             } else {
                 maybe!(GROUP_ATTENTION, &naming.attn_q(l), q_dim * d_model, |v| {
-                    model.layers[l].attn.wq = v;
+                    model.layers[l].attn.wq = DenseWeight::from_f32(v, q_dim, d_model);
                 });
                 maybe!(GROUP_ATTENTION, &naming.attn_k(l), kv_dim * d_model, |v| {
-                    model.layers[l].attn.wk = v;
+                    model.layers[l].attn.wk = DenseWeight::from_f32(v, kv_dim, d_model);
                 });
                 maybe!(
                     GROUP_ATTENTION,
                     &naming.attn_v(l),
                     v_proj_dim * d_model,
                     |v| {
-                        model.layers[l].attn.wv = v;
+                        model.layers[l].attn.wv = DenseWeight::from_f32(v, v_proj_dim, d_model);
                     }
                 );
                 maybe!(
@@ -1709,7 +1769,8 @@ impl RealModel {
                     &naming.attn_o(l),
                     d_model * attn_out_dim,
                     |v| {
-                        model.layers[l].attn.wo = v;
+                        model.layers[l].attn.wo =
+                            DenseWeight::from_f32(v, d_model, attn_out_dim);
                     }
                 );
             }
@@ -2042,8 +2103,9 @@ impl RealModel {
     /// Look up the embedding row for a token id.
     pub fn embed(&self, token_id: u32) -> Vec<f32> {
         let id = (token_id as usize) % self.config.vocab_size;
-        let d = self.config.d_model;
-        self.embedding[id * d..(id + 1) * d].to_vec()
+        let mut out = Vec::with_capacity(self.config.d_model);
+        self.embedding.row_dequant_into(id, &mut out);
+        out
     }
 
     /// Translate a `(layer, local_expert_id)` pair into the global flat
@@ -2436,6 +2498,218 @@ fn seed_mla(
 /// DeepSeek-V3 FP8 block-quantisation edge (`weight_scale_inv` is laid
 /// out over a 128x128 block grid).
 const FP8_BLOCK: usize = 128;
+
+fn load_dense_manifest(dir: &Path) -> Option<DenseTensorManifest> {
+    let path = dir.join("dense_manifest.json");
+    if !path.is_file() {
+        return None;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(body) => match serde_json::from_str::<DenseTensorManifest>(&body) {
+            Ok(manifest) => Some(manifest),
+            Err(err) => {
+                warn!(file = %path.display(), error = %err, "dense manifest parse failed");
+                None
+            }
+        },
+        Err(err) => {
+            warn!(file = %path.display(), error = %err, "dense manifest read failed");
+            None
+        }
+    }
+}
+
+fn try_load_resident_f32(
+    dir: &Path,
+    manifest: Option<&DenseTensorManifest>,
+    name: &str,
+    expected: usize,
+    group: &'static str,
+    strict_weights: bool,
+    failures: &mut Vec<WeightLoadFailure>,
+    summary: &mut WeightLoadSummary,
+) -> Option<Vec<f32>> {
+    try_load_dense_weight(
+        dir,
+        manifest,
+        name,
+        expected,
+        1,
+        group,
+        strict_weights,
+        failures,
+        summary,
+    )
+    .map(|weight| weight.to_f32_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_load_dense_weight(
+    dir: &Path,
+    manifest: Option<&DenseTensorManifest>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    group: &'static str,
+    strict_weights: bool,
+    failures: &mut Vec<WeightLoadFailure>,
+    summary: &mut WeightLoadSummary,
+) -> Option<DenseWeight> {
+    let expected = rows.saturating_mul(cols);
+    let Some(entry) = manifest.and_then(|m| m.find_alias(name)) else {
+        return try_load_f32_bin(
+            dir,
+            name,
+            expected,
+            group,
+            strict_weights,
+            failures,
+            summary,
+        )
+        .map(|v| DenseWeight::from_f32(v, rows, cols));
+    };
+
+    if entry.dims.iter().product::<usize>() != expected {
+        if strict_weights {
+            failures.push(WeightLoadFailure {
+                tensor: name.to_string(),
+                group,
+                kind: WeightLoadFailureKind::ShapeMismatch,
+                expected: format!("{rows}x{cols} ({expected} elements)"),
+                actual: Some(format!("{:?}", entry.dims)),
+                detail: Some(format!(
+                    "dense manifest entry {} has incompatible dims",
+                    entry.canonical_name
+                )),
+            });
+        }
+        warn!(
+            tensor = name,
+            canonical = %entry.canonical_name,
+            dims = ?entry.dims,
+            rows,
+            cols,
+            "dense manifest shape mismatch; falling back to seeded init"
+        );
+        return None;
+    }
+
+    let path = dir.join(&entry.file);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            if strict_weights {
+                failures.push(WeightLoadFailure {
+                    tensor: name.to_string(),
+                    group,
+                    kind: WeightLoadFailureKind::Unreadable,
+                    expected: format!("dense manifest file {}", entry.file),
+                    actual: None,
+                    detail: Some(err.to_string()),
+                });
+            }
+            warn!(file = %path.display(), error = %err, "dense manifest file read failed");
+            return None;
+        }
+    };
+    if bytes.len() != entry.byte_len {
+        if strict_weights {
+            failures.push(WeightLoadFailure {
+                tensor: name.to_string(),
+                group,
+                kind: WeightLoadFailureKind::ShapeMismatch,
+                expected: format!("{} bytes", entry.byte_len),
+                actual: Some(format!("{} bytes", bytes.len())),
+                detail: Some(format!(
+                    "dense manifest entry {} byte_len mismatch",
+                    entry.canonical_name
+                )),
+            });
+        }
+        warn!(
+            file = %path.display(),
+            have = bytes.len(),
+            need = entry.byte_len,
+            "dense manifest byte length mismatch; falling back to seeded init"
+        );
+        return None;
+    }
+    if let Some(expected_checksum) = entry.checksum.as_ref() {
+        let actual = dense_checksum(&bytes);
+        if &actual != expected_checksum {
+            if strict_weights {
+                failures.push(WeightLoadFailure {
+                    tensor: name.to_string(),
+                    group,
+                    kind: WeightLoadFailureKind::Malformed,
+                    expected: expected_checksum.clone(),
+                    actual: Some(actual.clone()),
+                    detail: Some(format!(
+                        "dense manifest entry {} checksum mismatch",
+                        entry.canonical_name
+                    )),
+                });
+            }
+            warn!(
+                file = %path.display(),
+                expected = %expected_checksum,
+                actual = %actual,
+                "dense manifest checksum mismatch; falling back to seeded init"
+            );
+            return None;
+        }
+    }
+
+    match entry.dtype {
+        DenseDType::F32 => {
+            if bytes.len() != expected.saturating_mul(4) || bytes.len() % 4 != 0 {
+                if strict_weights {
+                    failures.push(WeightLoadFailure {
+                        tensor: name.to_string(),
+                        group,
+                        kind: WeightLoadFailureKind::ShapeMismatch,
+                        expected: format!("{expected} f32 elements"),
+                        actual: Some(format!("{} bytes", bytes.len())),
+                        detail: Some(format!(
+                            "dense manifest entry {} f32 payload size mismatch",
+                            entry.canonical_name
+                        )),
+                    });
+                }
+                return None;
+            }
+            let mut values = Vec::with_capacity(expected);
+            for chunk in bytes.chunks_exact(4) {
+                values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            summary.record(group, entry.dtype.as_str(), values.len() * 4);
+            Some(DenseWeight::from_f32(values, rows, cols))
+        }
+        DenseDType::Q8_0 => match DenseWeight::from_q8_0_bytes(bytes, rows, cols) {
+            Ok(weight) => {
+                summary.record(group, entry.dtype.as_str(), weight.resident_bytes());
+                Some(weight)
+            }
+            Err(err) => {
+                if strict_weights {
+                    failures.push(WeightLoadFailure {
+                        tensor: name.to_string(),
+                        group,
+                        kind: WeightLoadFailureKind::ShapeMismatch,
+                        expected: format!("{rows}x{cols} q8_0 payload"),
+                        actual: Some(err.to_string()),
+                        detail: Some(format!(
+                            "dense manifest entry {} q8_0 payload mismatch",
+                            entry.canonical_name
+                        )),
+                    });
+                }
+                warn!(file = %path.display(), error = %err, "dense Q8_0 load failed");
+                None
+            }
+        },
+    }
+}
 
 fn try_load_f32_bin(
     dir: &Path,
@@ -4041,17 +4315,17 @@ mod tests {
 
         let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
         // Loaded tensors carry their sentinel values verbatim.
-        assert!(model.embedding.iter().all(|&x| x == 0.25));
-        assert!(model.layers[0].attn.wq.iter().all(|&x| x == 0.5));
+        assert!(model.embedding.iter().all(|x| x == 0.25));
+        assert!(model.layers[0].attn.wq.iter().all(|x| x == 0.5));
         // Anything else is still the seeded init (gate, k/v/o, MoE
         // gate, lm_head, rms_attn / rms_moe, etc.). Sanity: lm_head
         // wasn't provided, so its weights stayed at whatever the seed
         // produced — they must not be all-equal (which would only
         // happen if our find-tensor logic spuriously matched).
         let lm = &model.lm_head.weights;
-        let first = lm[0];
+        let first = lm.iter().next().unwrap();
         assert!(
-            lm.iter().any(|&x| x != first),
+            lm.iter().any(|x| x != first),
             "lm_head should remain seeded, not constant"
         );
     }
@@ -4177,9 +4451,9 @@ mod tests {
         assert_eq!(attn.wq.len(), q_dim * cfg.d_model);
         assert_eq!(attn.wk.len(), kv_dim * cfg.d_model);
         assert_eq!(attn.wv.len(), kv_dim * cfg.d_model);
-        assert!(attn.wq.iter().all(|&x| x == 0.1), "wq region");
-        assert!(attn.wk.iter().all(|&x| x == 0.2), "wk region");
-        assert!(attn.wv.iter().all(|&x| x == 0.3), "wv region");
+        assert!(attn.wq.iter().all(|x| x == 0.1), "wq region");
+        assert!(attn.wk.iter().all(|x| x == 0.2), "wk region");
+        assert!(attn.wv.iter().all(|x| x == 0.3), "wv region");
     }
 
     /// Mistral Small 3 (`mistral3`) is multimodal; its language-model
@@ -4236,7 +4510,7 @@ mod tests {
 
         let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
         assert!(
-            model.embedding.iter().all(|&x| x == 0.7),
+            model.embedding.iter().all(|x| x == 0.7),
             "prefixed embed_tokens must load via language_model. prefix"
         );
     }
@@ -4430,7 +4704,7 @@ mod tests {
         )
         .unwrap();
         let model = RealModel::from_dir_auto(cfg, &st_dir.path, 7).unwrap();
-        assert!(model.embedding.iter().all(|&x| x == 0.75));
+        assert!(model.embedding.iter().all(|x| x == 0.75));
     }
 
     /// Helper: write a slice of f32 as a little-endian `.bin` file.
@@ -4440,6 +4714,21 @@ mod tests {
             bytes.extend_from_slice(&x.to_le_bytes());
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn q8_bytes(values: &[f32]) -> Vec<u8> {
+        use crate::inference::{quantize_q8_0_block, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
+        let blocks = values.len().div_ceil(Q8_0_BLOCK_ELEMS);
+        let mut out = vec![0u8; blocks * Q8_0_BLOCK_BYTES];
+        for block in 0..blocks {
+            let start = block * Q8_0_BLOCK_ELEMS;
+            let end = (start + Q8_0_BLOCK_ELEMS).min(values.len());
+            quantize_q8_0_block(
+                &values[start..end],
+                &mut out[block * Q8_0_BLOCK_BYTES..(block + 1) * Q8_0_BLOCK_BYTES],
+            );
+        }
+        out
     }
 
     fn tiny_mixtral_loader_cfg() -> RealModelConfig {
@@ -4518,6 +4807,143 @@ mod tests {
         err.get_ref()
             .and_then(|e| e.downcast_ref::<StrictWeightLoadError>())
             .expect("loader error should carry StrictWeightLoadError")
+    }
+
+    #[test]
+    fn from_dir_loads_native_q8_dense_manifest_without_alias_files() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let dir = TempDir::new("dense_manifest_q8");
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let mut tensors = Vec::new();
+        let mut add = |canonical: &str,
+                       file: &str,
+                       aliases: Vec<String>,
+                       dtype: &str,
+                       dims: Vec<usize>,
+                       bytes: Vec<u8>| {
+            std::fs::write(dir.path.join(file), &bytes).unwrap();
+            tensors.push(serde_json::json!({
+                "canonical_name": canonical,
+                "file": file,
+                "aliases": aliases,
+                "dtype": dtype,
+                "dims": dims,
+                "byte_len": bytes.len(),
+                "checksum": crate::dense_tensor::dense_checksum(&bytes),
+            }));
+        };
+        let q8_values = |len: usize, offset: f32| {
+            (0..len)
+                .map(|i| ((i % 11) as f32 - 5.0) / 7.0 + offset)
+                .collect::<Vec<f32>>()
+        };
+        let f32_manifest_bytes = |value: f32, len: usize| {
+            let mut bytes = Vec::with_capacity(len * 4);
+            for _ in 0..len {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes
+        };
+        let embed_values = q8_values(cfg.vocab_size * cfg.d_model, 0.0);
+        let embed_bytes = q8_bytes(&embed_values);
+        add(
+            "token_embd.weight",
+            "dense_token_embd_weight.q8_0.bin",
+            vec!["embed.bin".to_string()],
+            "q8_0",
+            vec![cfg.vocab_size, cfg.d_model],
+            embed_bytes.clone(),
+        );
+        add(
+            "output_norm.weight",
+            "dense_output_norm_weight.f32.bin",
+            vec!["final_rms.bin".to_string()],
+            "f32",
+            vec![cfg.d_model, 1],
+            f32_manifest_bytes(1.0, cfg.d_model),
+        );
+        add(
+            "output.weight",
+            "dense_output_weight.q8_0.bin",
+            vec!["lm_head.bin".to_string()],
+            "q8_0",
+            vec![cfg.vocab_size, cfg.d_model],
+            q8_bytes(&q8_values(cfg.vocab_size * cfg.d_model, 0.1)),
+        );
+        for (canonical, alias, rows, cols, offset) in [
+            ("blk.0.attn_q.weight", "attn_0_q.bin", q_dim, cfg.d_model, 0.2),
+            ("blk.0.attn_k.weight", "attn_0_k.bin", kv_dim, cfg.d_model, 0.3),
+            ("blk.0.attn_v.weight", "attn_0_v.bin", kv_dim, cfg.d_model, 0.4),
+            ("blk.0.attn_output.weight", "attn_0_o.bin", cfg.d_model, q_dim, 0.5),
+        ] {
+            add(
+                canonical,
+                &format!("{canonical}.q8_0.bin").replace('.', "_"),
+                vec![alias.to_string()],
+                "q8_0",
+                vec![rows, cols],
+                q8_bytes(&q8_values(rows * cols, offset)),
+            );
+        }
+        add(
+            "blk.0.attn_norm.weight",
+            "dense_blk_0_attn_norm_weight.f32.bin",
+            vec!["rms_attn_0.bin".to_string()],
+            "f32",
+            vec![cfg.d_model, 1],
+            f32_manifest_bytes(1.0, cfg.d_model),
+        );
+        add(
+            "blk.0.ffn_norm.weight",
+            "dense_blk_0_ffn_norm_weight.f32.bin",
+            vec!["rms_moe_0.bin".to_string()],
+            "f32",
+            vec![cfg.d_model, 1],
+            f32_manifest_bytes(1.0, cfg.d_model),
+        );
+        add(
+            "blk.0.ffn_gate_inp.weight",
+            "dense_blk_0_ffn_gate_inp_weight.q8_0.bin",
+            vec!["gate_0.bin".to_string()],
+            "q8_0",
+            vec![cfg.num_experts, cfg.d_model],
+            q8_bytes(&q8_values(cfg.num_experts * cfg.d_model, 0.6)),
+        );
+        std::fs::write(
+            dir.path.join("dense_manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "format_version": 1,
+                "tensors": tensors,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let model = RealModel::from_dir_with_options(
+            cfg.clone(),
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .unwrap();
+        assert!(!dir.path.join("embed.bin").exists());
+        assert_eq!(model.embedding.dtype(), crate::dense_tensor::DenseDType::Q8_0);
+        assert_eq!(
+            model.layers[0].attn.wq.dtype(),
+            crate::dense_tensor::DenseDType::Q8_0
+        );
+        assert_eq!(
+            model.layers[0].gate.weights.dtype(),
+            crate::dense_tensor::DenseDType::Q8_0
+        );
+        let expected_embedding =
+            DenseWeight::from_q8_0_bytes(embed_bytes, cfg.vocab_size, cfg.d_model).unwrap();
+        let mut expected_row = Vec::new();
+        expected_embedding.row_dequant_into(1, &mut expected_row);
+        assert_eq!(model.embed(1), expected_row);
     }
 
     #[test]
@@ -4618,9 +5044,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(model.embedding.iter().all(|&x| x == 0.11));
-        assert!(model.lm_head.weights.iter().all(|&x| x == 0.12));
-        assert!(model.layers[0].attn.wq.iter().all(|&x| x == 0.21));
+        assert!(model.embedding.iter().all(|x| x == 0.11));
+        assert!(model.lm_head.weights.iter().all(|x| x == 0.12));
+        assert!(model.layers[0].attn.wq.iter().all(|x| x == 0.21));
         assert_eq!(model.layers[0].gate.num_experts, cfg.num_experts);
     }
 

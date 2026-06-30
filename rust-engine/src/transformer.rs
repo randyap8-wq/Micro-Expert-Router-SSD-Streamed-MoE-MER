@@ -35,6 +35,7 @@
 #![allow(dead_code)]
 
 use crate::backend::Backend;
+use crate::dense_tensor::DenseWeight;
 use crate::expert_cache::ExpertResident;
 use crate::inference::{forward_candle_tensors, ExpertWeights, HiddenState};
 use candle_core::{Device, Tensor};
@@ -704,10 +705,10 @@ pub struct MultiHeadSelfAttention {
     /// `None` (every other architecture) means no scaling (factor 1.0).
     pub attention_value_scale: Option<f32>,
     pub rope_base: f32,
-    pub wq: Vec<f32>,
-    pub wk: Vec<f32>,
-    pub wv: Vec<f32>,
-    pub wo: Vec<f32>,
+    pub wq: DenseWeight,
+    pub wk: DenseWeight,
+    pub wv: DenseWeight,
+    pub wo: DenseWeight,
     /// Sliding-window attention span. When `Some(w)`, each query position
     /// `pos` only attends to KV positions in `[pos.saturating_sub(w - 1) ..=
     /// pos]`; `None` recovers full causal attention (the backward-compatible
@@ -914,10 +915,10 @@ impl MultiHeadSelfAttention {
         k.resize(self.kv_dim(), 0.0);
         v.resize(self.v_proj_dim(), 0.0);
         crate::stage_timing::time_optional(timings, crate::stage_timing::K_PROJECTION, || {
-            matmul_row_major_into(&self.wk, x, k, self.kv_dim(), self.d_model)
+            self.wk.matvec_into(x, k)
         });
         crate::stage_timing::time_optional(timings, crate::stage_timing::V_PROJECTION, || {
-            matmul_row_major_into(&self.wv, x, v, self.v_proj_dim(), self.d_model)
+            self.wv.matvec_into(x, v)
         });
         if let Some(bk) = self.bk.as_ref() {
             for (ki, bi) in k.iter_mut().zip(bk.iter()) {
@@ -1044,7 +1045,7 @@ impl MultiHeadSelfAttention {
             let mut q = crate::stage_timing::time_optional(
                 timings,
                 crate::stage_timing::Q_PROJECTION,
-                || matmul_row_major(&self.wq, x, q_dim, self.d_model),
+                || self.wq.matvec(x),
             );
             // Q bias (GPT-OSS `attention_bias`) before QK-Norm / RoPE; K and
             // V biases are applied inside `project_kv`.
@@ -1074,12 +1075,12 @@ impl MultiHeadSelfAttention {
                 let mut k = crate::stage_timing::time_optional(
                     timings,
                     crate::stage_timing::K_PROJECTION,
-                    || matmul_row_major(&self.wk, x, self.kv_dim(), self.d_model),
+                    || self.wk.matvec(x),
                 );
                 let mut v = crate::stage_timing::time_optional(
                     timings,
                     crate::stage_timing::V_PROJECTION,
-                    || matmul_row_major(&self.wv, x, self.v_proj_dim(), self.d_model),
+                    || self.wv.matvec(x),
                 );
                 if let Some(bk) = self.bk.as_ref() {
                     for (ki, bi) in k.iter_mut().zip(bk.iter()) {
@@ -1114,8 +1115,7 @@ impl MultiHeadSelfAttention {
             // before the output projection.
             self.apply_value_scale(&mut attn_out);
             crate::stage_timing::time_optional(timings, crate::stage_timing::O_PROJECTION, || {
-                let mut out =
-                    matmul_row_major(&self.wo, &attn_out, self.d_model, self.attn_out_dim());
+                let mut out = self.wo.matvec(&attn_out);
                 self.apply_o_bias(&mut out);
                 out
             })
@@ -1135,9 +1135,12 @@ impl MultiHeadSelfAttention {
         let to_f32 = |v: &[f16]| -> Vec<f32> { v.iter().map(|h| h.to_f32()).collect() };
 
         let x_f16 = to_f16(x);
-        let wq_f16 = to_f16(&self.wq);
-        let wk_f16 = to_f16(&self.wk);
-        let wv_f16 = to_f16(&self.wv);
+        let wq_f32 = self.wq.to_f32_vec();
+        let wk_f32 = self.wk.to_f32_vec();
+        let wv_f32 = self.wv.to_f32_vec();
+        let wq_f16 = to_f16(&wq_f32);
+        let wk_f16 = to_f16(&wk_f32);
+        let wv_f16 = to_f16(&wv_f32);
 
         let mut q_f16 = vec![f16::ZERO; q_dim];
         let mut k_f16 = vec![f16::ZERO; kv_dim];
@@ -1268,7 +1271,7 @@ impl MultiHeadSelfAttention {
         {
             let mut attn_out = cpu_attend(&q, kv);
             self.apply_value_scale(&mut attn_out);
-            let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
+            let mut out = self.wo.matvec(&attn_out);
             self.apply_o_bias(&mut out);
             return out;
         }
@@ -1303,7 +1306,8 @@ impl MultiHeadSelfAttention {
         self.apply_value_scale(&mut attn_out);
 
         // ── 4) Output projection via backend ──────────────────────────────────
-        let wo_f16 = to_f16(&self.wo);
+        let wo_f32 = self.wo.to_f32_vec();
+        let wo_f16 = to_f16(&wo_f32);
         let attn_f16 = to_f16(&attn_out);
         let mut out_f16 = vec![f16::ZERO; self.d_model];
 
@@ -1329,7 +1333,7 @@ impl MultiHeadSelfAttention {
         {
             to_f32(&out_f16)
         } else {
-            matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim)
+            self.wo.matvec(&attn_out)
         };
         self.apply_o_bias(&mut out);
         out
@@ -1364,7 +1368,7 @@ impl MultiHeadSelfAttention {
         let q_dim = self.q_dim();
         scratch.q.resize(q_dim, 0.0);
         crate::stage_timing::time_optional(timings, crate::stage_timing::Q_PROJECTION, || {
-            matmul_row_major_into(&self.wq, x, &mut scratch.q, q_dim, self.d_model)
+            self.wq.matvec_into(x, &mut scratch.q)
         });
         if let Some(bq) = self.bq.as_ref() {
             for (qi, bi) in scratch.q.iter_mut().zip(bq.iter()) {
@@ -1407,13 +1411,7 @@ impl MultiHeadSelfAttention {
 
         out.resize(self.d_model, 0.0);
         crate::stage_timing::time_optional(timings, crate::stage_timing::O_PROJECTION, || {
-            matmul_row_major_into(
-                &self.wo,
-                &scratch.attn_out,
-                out,
-                self.d_model,
-                self.attn_out_dim(),
-            );
+            self.wo.matvec_into(&scratch.attn_out, out);
             self.apply_o_bias(out);
         });
     }
@@ -1702,7 +1700,7 @@ fn matmul_row_major_parallel_matrixmultiply_into(
 /// matrix.
 #[derive(Debug, Clone)]
 pub struct LMHead {
-    pub weights: Vec<f32>,
+    pub weights: DenseWeight,
     pub vocab_size: usize,
     pub d_model: usize,
 }
@@ -1715,6 +1713,16 @@ impl LMHead {
             "lm_head weights must be [vocab_size, d_model]"
         );
         Self {
+            weights: DenseWeight::from_f32(weights, vocab_size, d_model),
+            vocab_size,
+            d_model,
+        }
+    }
+
+    pub fn from_dense(weights: DenseWeight, vocab_size: usize, d_model: usize) -> Self {
+        assert_eq!(weights.rows(), vocab_size, "lm_head row count mismatch");
+        assert_eq!(weights.cols(), d_model, "lm_head column count mismatch");
+        Self {
             weights,
             vocab_size,
             d_model,
@@ -1723,7 +1731,7 @@ impl LMHead {
 
     /// Compute logits = `W · hidden`.
     pub fn forward(&self, hidden: &[f32]) -> Vec<f32> {
-        matmul_row_major(&self.weights, hidden, self.vocab_size, self.d_model)
+        self.weights.matvec(hidden)
     }
 
     /// One-shot: project `hidden` to logits and sample a next-token id
@@ -1737,8 +1745,71 @@ impl LMHead {
         params: &crate::sampling::SamplingParams,
         position: u64,
     ) -> u32 {
+        if params.is_greedy() {
+            return self.weights.greedy_argmax(hidden);
+        }
+        if params.top_k > 0 && !(params.top_p > 0.0 && params.top_p < 1.0) {
+            return self.sample_top_k(hidden, params, position);
+        }
         let logits = self.forward(hidden);
         crate::sampling::sample(&logits, params, position)
+    }
+
+    fn sample_top_k(
+        &self,
+        hidden: &[f32],
+        params: &crate::sampling::SamplingParams,
+        position: u64,
+    ) -> u32 {
+        let candidates = self.weights.top_k_logits(hidden, params.top_k);
+        if candidates.is_empty() {
+            return 0;
+        }
+        let t = params.temperature.max(1e-6);
+        let max = candidates
+            .iter()
+            .map(|&(_, logit)| logit / t)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = candidates
+            .iter()
+            .map(|&(_, logit)| ((logit / t) - max).exp())
+            .collect();
+        let sum: f32 = probs.iter().sum();
+        if !(sum > 0.0) {
+            return candidates[0].0 as u32;
+        }
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+        let p_cut = if !(params.top_p > 0.0 && params.top_p < 1.0) {
+            candidates.len()
+        } else {
+            let target = params.top_p.clamp(1e-6, 1.0);
+            let mut cum = 0.0f32;
+            let mut idx = 0usize;
+            for (i, p) in probs.iter().enumerate() {
+                cum += *p;
+                idx = i + 1;
+                if cum >= target {
+                    break;
+                }
+            }
+            idx.min(candidates.len()).max(1)
+        };
+        let kept_sum: f32 = probs.iter().take(p_cut).sum();
+        if !(kept_sum > 0.0) {
+            return candidates[0].0 as u32;
+        }
+        let bits = params.step_seed(position);
+        let u = ((bits >> 40) as u32) as f32 / ((1u32 << 24) as f32) * kept_sum;
+        let mut acc = 0.0f32;
+        for (i, p) in probs.iter().take(p_cut).enumerate() {
+            acc += *p;
+            if u <= acc {
+                return candidates[i].0 as u32;
+            }
+        }
+        candidates[p_cut - 1].0 as u32
     }
 }
 
@@ -2714,10 +2785,10 @@ mod tests {
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: mk(q_dim, d_model),
-            wk: mk(kv_dim, d_model),
-            wv: mk(kv_dim, d_model),
-            wo: mk(d_model, q_dim),
+            wq: DenseWeight::from_f32(mk(q_dim, d_model), q_dim, d_model),
+            wk: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wv: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wo: DenseWeight::from_f32(mk(d_model, q_dim), d_model, q_dim),
             window_size: None,
             q_norm: None,
             k_norm: None,
@@ -2766,10 +2837,10 @@ mod tests {
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: mk(q_dim, d_model),
-            wk: mk(kv_dim, d_model),
-            wv: mk(kv_dim, d_model),
-            wo: mk(d_model, q_dim),
+            wq: DenseWeight::from_f32(mk(q_dim, d_model), q_dim, d_model),
+            wk: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wv: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wo: DenseWeight::from_f32(mk(d_model, q_dim), d_model, q_dim),
             window_size: None,
             q_norm: None,
             k_norm: None,
@@ -2850,6 +2921,29 @@ mod tests {
     }
 
     #[test]
+    fn lm_head_top_k_sampling_matches_full_logits_sampler() {
+        let d_model = 3;
+        let vocab = 7;
+        let weights: Vec<f32> = (0..vocab * d_model)
+            .map(|i| ((i % 9) as f32 - 4.0) / 5.0)
+            .collect();
+        let hidden = [0.25, -0.75, 1.25];
+        let params = crate::sampling::SamplingParams {
+            temperature: 0.8,
+            top_p: 1.0,
+            top_k: 3,
+            seed: 1234,
+        };
+        let head = LMHead::new(weights, vocab, d_model);
+        let logits = head.forward(&hidden);
+        for pos in 0..16 {
+            let expected = crate::sampling::sample(&logits, &params, pos);
+            let got = head.sample(&hidden, &params, pos);
+            assert_eq!(got, expected, "position {pos}");
+        }
+    }
+
+    #[test]
     fn add_residual_is_elementwise() {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![10.0, 20.0, 30.0];
@@ -2888,10 +2982,10 @@ mod tests {
                 v_head_dim: head_dim,
                 attention_value_scale: None,
                 rope_base: 10000.0,
-                wq: mk(q_dim, d_model, 0.05),
-                wk: mk(kv_dim, d_model, 0.05),
-                wv: mk(kv_dim, d_model, 0.05),
-                wo: mk(d_model, q_dim, 0.05),
+                wq: DenseWeight::from_f32(mk(q_dim, d_model, 0.05), q_dim, d_model),
+                wk: DenseWeight::from_f32(mk(kv_dim, d_model, 0.05), kv_dim, d_model),
+                wv: DenseWeight::from_f32(mk(kv_dim, d_model, 0.05), kv_dim, d_model),
+                wo: DenseWeight::from_f32(mk(d_model, q_dim, 0.05), d_model, q_dim),
                 window_size: None,
                 q_norm: None,
                 k_norm: None,
@@ -3042,10 +3136,10 @@ mod tests {
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: identity(d_model),
-            wk: identity(d_model),
-            wv: identity(d_model),
-            wo: identity(d_model),
+            wq: DenseWeight::from_f32(identity(d_model), d_model, d_model),
+            wk: DenseWeight::from_f32(identity(d_model), d_model, d_model),
+            wv: DenseWeight::from_f32(identity(d_model), d_model, d_model),
+            wo: DenseWeight::from_f32(identity(d_model), d_model, d_model),
             window_size: window,
             q_norm: None,
             k_norm: None,
@@ -3301,10 +3395,10 @@ mod tests {
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: mk(q_dim, d_model),
-            wk: mk(kv_dim, d_model),
-            wv: mk(kv_dim, d_model),
-            wo: mk(d_model, q_dim),
+            wq: DenseWeight::from_f32(mk(q_dim, d_model), q_dim, d_model),
+            wk: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wv: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wo: DenseWeight::from_f32(mk(d_model, q_dim), d_model, q_dim),
             window_size: None,
             q_norm: None,
             k_norm: None,
