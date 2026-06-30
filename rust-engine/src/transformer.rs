@@ -77,6 +77,13 @@ impl RmsNorm {
         self.forward_inplace(&mut y);
         y
     }
+
+    pub fn forward_into(&self, x: &[f32], y: &mut Vec<f32>) {
+        debug_assert_eq!(x.len(), self.weight.len(), "RMSNorm dim mismatch");
+        y.clear();
+        y.extend_from_slice(x);
+        self.forward_inplace(y);
+    }
 }
 
 /// Apply rotary positional embedding to a single head's `(q or k)` vector
@@ -1299,12 +1306,23 @@ impl MultiHeadSelfAttention {
 /// MoE combiner) that ignores the redundant `d_model` argument; kept for
 /// backwards compatibility with `TransformerLayer::moe_combine`.
 pub fn combine_moe_outputs(outputs: &[HiddenState], scores: &[f32], d_model: usize) -> HiddenState {
+    let mut out = Vec::new();
+    combine_moe_outputs_into(outputs, scores, d_model, &mut out);
+    out
+}
+
+pub fn combine_moe_outputs_into(
+    outputs: &[HiddenState],
+    scores: &[f32],
+    d_model: usize,
+    out: &mut Vec<f32>,
+) {
     debug_assert!(
         outputs.iter().all(|o| o.len() == d_model),
         "every expert output must have length d_model"
     );
     let _ = d_model;
-    crate::inference::combine_outputs(outputs, scores)
+    crate::inference::combine_outputs_into(outputs, scores, out);
 }
 
 /// Run one expert FFN by reinterpreting its on-disk bytes (already loaded
@@ -1550,8 +1568,17 @@ impl LMHead {
 /// Element-wise residual add: `y = a + b`.
 #[inline]
 pub fn add_residual(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let mut out = Vec::new();
+    add_residual_into(a, b, &mut out);
+    out
+}
+
+#[inline]
+pub fn add_residual_into(a: &[f32], b: &[f32], out: &mut Vec<f32>) {
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
+    out.clear();
+    out.reserve(a.len());
+    out.extend(a.iter().zip(b.iter()).map(|(x, y)| x + y));
 }
 
 /// A dense ("shared") expert FFN that is applied to **every** token in a
@@ -1750,6 +1777,20 @@ pub struct TransformerLayer {
     pub dense_ffn: Option<SharedExpert>,
 }
 
+#[derive(Debug, Default)]
+pub struct TransformerLayerScratch {
+    pub(crate) attn_normed: Vec<f32>,
+    pub(crate) moe_normed: Vec<f32>,
+    pub(crate) moe_accum: Vec<f32>,
+    pub(crate) routing: crate::gating::RoutingScratch,
+}
+
+impl TransformerLayerScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 impl TransformerLayer {
     /// `hidden -> rmsnorm -> attention -> residual`. Updates `kv` with
     /// the K/V for this token. `layer_idx` and `backend` are threaded
@@ -1775,10 +1816,37 @@ impl TransformerLayer {
         backend: &crate::backend::BackendBox,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> Vec<f32> {
-        let normed =
-            crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
-                self.rms_attn.forward(hidden)
-            });
+        let mut scratch = TransformerLayerScratch::new();
+        let mut out = Vec::new();
+        self.attn_block_into_with_timing(
+            hidden,
+            pos,
+            layer_idx,
+            kv,
+            backend,
+            &mut scratch,
+            &mut out,
+            timings,
+        );
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_block_into_with_timing(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut TransformerLayerScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+            self.rms_attn.forward_into(hidden, &mut scratch.attn_normed)
+        });
+        let normed = &scratch.attn_normed;
         let attn_out = match self.mla.as_ref() {
             // DeepSeek-V3 multi-head latent attention runs on CPU against
             // the layer's compressed latent KV cache. The GPU attention
@@ -1788,13 +1856,13 @@ impl TransformerLayer {
             Some(mla) => crate::stage_timing::time_optional(
                 timings,
                 crate::stage_timing::ATTENTION_SCORE_VALUE,
-                || mla.forward(&normed, pos, kv),
+                || mla.forward(normed, pos, kv),
             ),
             None => self
                 .attn
-                .forward_with_timing(&normed, pos, layer_idx, kv, backend, timings),
+                .forward_with_timing(normed, pos, layer_idx, kv, backend, timings),
         };
-        add_residual(hidden, &attn_out)
+        add_residual_into(hidden, &attn_out, out);
     }
 
     /// KV-cache width this layer needs: the MLA latent dim when latent
@@ -1850,6 +1918,21 @@ impl TransformerLayer {
         (normed, routing)
     }
 
+    pub fn moe_pre_into_with_timing(
+        &self,
+        hidden: &[f32],
+        scratch: &mut TransformerLayerScratch,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> crate::gating::RoutingDecision {
+        crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+            self.rms_moe.forward_into(hidden, &mut scratch.moe_normed)
+        });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::ROUTER_GATE, || {
+            self.gate
+                .route_with_scratch(&scratch.moe_normed, &mut scratch.routing)
+        })
+    }
+
     /// Fold the per-expert FFN outputs back into the residual stream:
     /// `hidden + sum_i weights[i] * expert_outputs[i]`. The lengths of
     /// `expert_outputs` and `weights` must match (one per chosen expert);
@@ -1878,6 +1961,25 @@ impl TransformerLayer {
             || {
                 let moe = combine_moe_outputs(expert_outputs, weights, self.attn.d_model);
                 add_residual(hidden, &moe)
+            },
+        )
+    }
+
+    pub fn moe_combine_into_with_timing(
+        &self,
+        hidden: &[f32],
+        expert_outputs: &[HiddenState],
+        weights: &[f32],
+        moe_accum: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::MOE_WEIGHTED_COMBINATION,
+            || {
+                combine_moe_outputs_into(expert_outputs, weights, self.attn.d_model, moe_accum);
+                add_residual_into(hidden, moe_accum, out);
             },
         )
     }
@@ -2121,6 +2223,19 @@ mod tests {
         let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
         // After RMSNorm with unit weight and tiny eps, mean(x^2) ≈ 1.
         assert!((mean_sq - 1.0).abs() < 1e-3, "mean_sq={mean_sq}");
+    }
+
+    #[test]
+    fn rmsnorm_forward_into_matches_forward_and_reuses_capacity() {
+        let n = 8;
+        let norm = RmsNorm::new((0..n).map(|i| 1.0 + i as f32 * 0.1).collect(), 1e-6);
+        let x: Vec<f32> = (0..n).map(|i| i as f32 - 3.5).collect();
+        let expected = norm.forward(&x);
+        let mut out = Vec::with_capacity(n * 2);
+        let capacity = out.capacity();
+        norm.forward_into(&x, &mut out);
+        assert_eq!(out, expected);
+        assert_eq!(out.capacity(), capacity);
     }
 
     #[test]
@@ -2491,9 +2606,15 @@ mod tests {
         let scores = vec![0.5, 0.25, 0.25];
         let y = combine_moe_outputs(&outs, &scores, d);
         // 0.5*1 + 0.25*2 + 0.25*4 = 2.0
-        for v in y {
+        for v in &y {
             assert!((v - 2.0).abs() < 1e-6);
         }
+
+        let mut into = Vec::with_capacity(d * 2);
+        let capacity = into.capacity();
+        combine_moe_outputs_into(&outs, &scores, d, &mut into);
+        assert_eq!(into, y);
+        assert_eq!(into.capacity(), capacity);
     }
 
     #[test]
@@ -2523,6 +2644,12 @@ mod tests {
         let b = vec![10.0, 20.0, 30.0];
         let y = add_residual(&a, &b);
         assert_eq!(y, vec![11.0, 22.0, 33.0]);
+
+        let mut into = Vec::with_capacity(8);
+        let capacity = into.capacity();
+        add_residual_into(&a, &b, &mut into);
+        assert_eq!(into, y);
+        assert_eq!(into.capacity(), capacity);
     }
 
     /// Build a tiny `TransformerLayer` with deterministic small weights

@@ -2168,17 +2168,22 @@ impl RealModel {
                 self.embed(token_id)
             });
         let backend = crate::backend::current();
-        let mut routing_scratch = crate::gating::RoutingScratch::new();
+        let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
+        let mut next_x = Vec::with_capacity(self.config.d_model);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
-            x = layer.attn_block_with_timing(
+            layer.attn_block_into_with_timing(
                 &x,
                 pos,
                 layer_idx,
                 &mut kv[layer_idx],
                 &*backend,
+                &mut layer_scratch,
+                &mut next_x,
                 timings,
             );
+            std::mem::swap(&mut x, &mut next_x);
+            next_x.clear();
             // Sliding-Window-Attention layers (MiMo-V2 SWA layers, GPT-OSS
             // banded layers, Mixtral's uniform window) only ever attend to
             // the last `window` positions, so KV entries older than that are
@@ -2198,8 +2203,8 @@ impl RealModel {
                 continue;
             }
             // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
-            let (normed, routing) =
-                layer.moe_pre_with_scratch_and_timing(&x, &mut routing_scratch, timings);
+            let routing = layer.moe_pre_into_with_timing(&x, &mut layer_scratch, timings);
+            let normed = &layer_scratch.moe_normed;
             let global_ids: Vec<u32> = routing
                 .experts
                 .iter()
@@ -2213,13 +2218,24 @@ impl RealModel {
                 .moe_step_with_timing(token_idx, layer_idx as u32, &normed, &global_ids, timings)
                 .await;
             debug_assert_eq!(expert_outs.len(), routing.weights.len());
-            x = layer.moe_combine_with_timing(&x, &expert_outs, &routing.weights, timings);
+            layer.moe_combine_into_with_timing(
+                &x,
+                &expert_outs,
+                &routing.weights,
+                &mut layer_scratch.moe_accum,
+                &mut next_x,
+                timings,
+            );
+            std::mem::swap(&mut x, &mut next_x);
+            next_x.clear();
             // Qwen2-MoE / DeepSeek-MoE shared expert: a dense always-on
             // FFN over the same MoE-normalised hidden, added to the
             // residual alongside the routed experts. `None` for Mixtral
             // (no-op), keeping the engine MoE-architecture-agnostic.
             if let Some(shared) = layer.shared_expert_forward_with_timing(&normed, timings) {
-                x = crate::transformer::add_residual(&x, &shared);
+                crate::transformer::add_residual_into(&x, &shared, &mut next_x);
+                std::mem::swap(&mut x, &mut next_x);
+                next_x.clear();
             }
         }
         crate::stage_timing::time_optional(timings, crate::stage_timing::FINAL_RMS_NORM, || {

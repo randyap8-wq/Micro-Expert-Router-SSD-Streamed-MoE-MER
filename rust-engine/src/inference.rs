@@ -3430,23 +3430,30 @@ pub fn run_inference_partial(
 /// materialise on disk *from both* slices upstream so the weighted sum
 /// stays well-defined).
 pub fn combine_outputs(outputs: &[HiddenState], scores: &[f32]) -> HiddenState {
+    let mut out = Vec::new();
+    combine_outputs_into(outputs, scores, &mut out);
+    out
+}
+
+pub fn combine_outputs_into(outputs: &[HiddenState], scores: &[f32], out: &mut Vec<f32>) {
     debug_assert_eq!(
         outputs.len(),
         scores.len(),
         "combine_outputs: outputs and scores must have the same length"
     );
     if outputs.is_empty() {
-        return Vec::new();
+        out.clear();
+        return;
     }
     let d = outputs[0].len();
-    let mut out = vec![0.0f32; d];
+    out.clear();
+    out.resize(d, 0.0);
     for (vec, &s) in outputs.iter().zip(scores.iter()) {
         debug_assert_eq!(vec.len(), d);
         for (o, v) in out.iter_mut().zip(vec.iter()) {
             *o += s * *v;
         }
     }
-    out
 }
 
 /// Helper: build a uniform `[1/k; k]` score vector for the synthetic /
