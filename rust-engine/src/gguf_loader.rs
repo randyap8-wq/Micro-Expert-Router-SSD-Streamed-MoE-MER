@@ -1172,8 +1172,6 @@ fn emit_legacy_f32_dense_tensor(
                 report.skipped += 1;
             }
         }
-    } else {
-        report.skipped += 1;
     }
     Ok(())
 }

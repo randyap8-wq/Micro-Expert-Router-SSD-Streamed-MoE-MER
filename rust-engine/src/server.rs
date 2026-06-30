@@ -866,9 +866,10 @@ async fn generate(
 // ------------------------ scheduler helper --------------------------
 
 /// Request-scoped real-model execution state. When a scheduler is present,
-/// the KV cache is registered exactly once and every prompt/decode operation
-/// carries only the small [`RequestId`]. If the scheduler shuts down, the
-/// handle releases the registry entry and falls back to direct model calls.
+/// prompt prefill mutates local KV directly, then decode lazily registers the
+/// KV cache once so scheduled decode operations carry only the small
+/// [`RequestId`]. If the scheduler shuts down, the handle releases the registry
+/// entry and falls back to direct model calls.
 struct RealRequestState {
     engine: Arc<Engine>,
     model: Arc<RealModel>,
@@ -885,31 +886,13 @@ impl RealRequestState {
         kv: Vec<crate::transformer::KvCache>,
         stage_timings: Option<Arc<crate::stage_timing::StageTimings>>,
     ) -> Self {
-        if let Some(scheduler) = state.batch_scheduler.as_ref() {
-            let started = RequestStageTiming::start_optional(stage_timings.as_deref());
-            let request_id = scheduler.register(kv);
-            RequestStageTiming::record_optional_since(
-                stage_timings.as_deref(),
-                crate::stage_timing::SCHEDULER_OVERHEAD,
-                started,
-            );
-            Self {
-                engine: state.engine.clone(),
-                model: model.clone(),
-                scheduler: Some(scheduler.clone()),
-                request_id: Some(request_id),
-                kv: None,
-                stage_timings,
-            }
-        } else {
-            Self {
-                engine: state.engine.clone(),
-                model: model.clone(),
-                scheduler: None,
-                request_id: None,
-                kv: Some(kv),
-                stage_timings,
-            }
+        Self {
+            engine: state.engine.clone(),
+            model: model.clone(),
+            scheduler: state.batch_scheduler.clone(),
+            request_id: None,
+            kv: Some(kv),
+            stage_timings,
         }
     }
 
@@ -938,6 +921,22 @@ impl RealRequestState {
             .await
     }
 
+    fn ensure_scheduler_registered(&mut self) -> Option<(Arc<BatchScheduler>, RequestId)> {
+        let scheduler = self.scheduler.as_ref()?.clone();
+        if self.request_id.is_none() {
+            let kv = self.kv.take()?;
+            let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
+            let id = scheduler.register(kv);
+            RequestStageTiming::record_optional_since(
+                self.stage_timings.as_deref(),
+                crate::stage_timing::SCHEDULER_OVERHEAD,
+                started,
+            );
+            self.request_id = Some(id);
+        }
+        self.request_id.map(|id| (scheduler, id))
+    }
+
     fn sample_hidden(
         &self,
         hidden: &[f32],
@@ -954,7 +953,7 @@ impl RealRequestState {
         pos: usize,
         params: &crate::sampling::SamplingParams,
     ) -> u32 {
-        if let (Some(scheduler), Some(id)) = (self.scheduler.as_ref(), self.request_id) {
+        if let Some((scheduler, id)) = self.ensure_scheduler_registered() {
             let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             let result = scheduler.step_registered(id, token_id, pos, *params).await;
             RequestStageTiming::record_optional_since(

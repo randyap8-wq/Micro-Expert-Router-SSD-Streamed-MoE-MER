@@ -7,7 +7,7 @@ No throughput gain is claimed here. The mandatory real
 `Qwen3-Coder-30B-A3B-Instruct Q8_0` checkpoint benchmark is blocked in
 this workspace because the full checkpoint or converted dense/expert
 directory is not present locally. The only Qwen-related local path found
-was `/Users/r/model-configs/qwen3-moe`, which contains `config.json` and
+was `<local model-configs>/qwen3-moe`, which contains `config.json` and
 `model.safetensors.index.json` metadata stubs, not weight shards or
 converted MER expert blobs.
 
@@ -75,14 +75,18 @@ measurements:
 bench-real requires real_transformer.weights_dir; seeded fallback benchmarks are not production measurements
 ```
 
-To complete Milestone 6, provide or mount one of:
+To complete Milestone 6, provide or mount a converted MER dataset for
+`[model].data_dir`:
 
 - a converted MER directory containing `config.json`, `metadata.json`,
   layer-qualified `expert_<layer>_<expert>.bin` or packed expert files,
-  `dense_manifest.json`, and any canonical dense tensor payloads; or
-- the full original checkpoint directory with `config.json`,
-  tokenizer files, and all safetensors/GGUF shards needed by the loader
-  and converter.
+  `dense_manifest.json`, and any canonical dense tensor payloads.
+
+If starting from the full original checkpoint directory, first run the
+explicit GGUF/safetensors conversion or extraction step with `config.json`,
+tokenizer files, and all required weight shards, then point both
+`[model].data_dir` and `[real_transformer].weights_dir` at the converted
+dataset before running `bench-real`.
 
 ## Reproduction Commands Once Weights Exist
 

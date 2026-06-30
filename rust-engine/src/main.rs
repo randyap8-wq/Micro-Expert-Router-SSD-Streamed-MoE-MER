@@ -2399,13 +2399,18 @@ async fn build_bench_real_runtime(
         Some(p) => match Tokenizer::from_file(p) {
             Ok(t) => Arc::new(t),
             Err(e) => {
-                warn!(path = %p.display(), error = %e, "tokenizer load failed; falling back to byte tokenizer");
-                Arc::new(Tokenizer::bytes())
+                return Err(format!(
+                    "bench-real failed to load tokenizer {}: {e}",
+                    p.display()
+                )
+                .into());
             }
         },
         None => {
-            info!("no tokenizer.json configured; using byte-level fallback tokenizer");
-            Arc::new(Tokenizer::bytes())
+            return Err(
+                "bench-real requires tokenizer.path; byte tokenizer fallback is not a production benchmark"
+                    .into(),
+            );
         }
     };
 
@@ -3727,6 +3732,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                         "real_transformer.speculation_base_depth",
                         prev.real_transformer.speculation_base_depth.to_string(),
                         new.real_transformer.speculation_base_depth.to_string(),
+                    ),
+                    (
+                        "real_transformer.expert_execution_policy",
+                        format!("{:?}", prev.real_transformer.expert_execution_policy),
+                        format!("{:?}", new.real_transformer.expert_execution_policy),
                     ),
                     (
                         "storage.predict_min_prob",

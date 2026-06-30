@@ -20,13 +20,13 @@
   },
   "reason": "Full checkpoint shards or converted MER dense/expert weights were not present in this workspace, so mandatory real-checkpoint prompt/decode benchmarks were not run.",
   "local_paths_checked": [
-    "/Users/r/model-configs/qwen3-moe",
-    "/Users/r/Documents/Codex/2026-06-27/randyap8-wq-micro-expert-router-ssd-3/Micro-Expert-Router-SSD-Streamed-MoE-MER",
-    "/Users/r/Micro-Expert-Router-SSD-Streamed-MoE-MER"
+    "<local model-configs>/qwen3-moe",
+    "<workspace checkout>/Micro-Expert-Router-SSD-Streamed-MoE-MER",
+    "<local checkout>/Micro-Expert-Router-SSD-Streamed-MoE-MER"
   ],
   "local_qwen_files_found": [
-    "/Users/r/model-configs/qwen3-moe/config.json",
-    "/Users/r/model-configs/qwen3-moe/model.safetensors.index.json"
+    "<local model-configs>/qwen3-moe/config.json",
+    "<local model-configs>/qwen3-moe/model.safetensors.index.json"
   ],
   "validation_without_checkpoint": [
     "rustfmt --edition 2021 src/config.rs src/server.rs src/transformer.rs",
