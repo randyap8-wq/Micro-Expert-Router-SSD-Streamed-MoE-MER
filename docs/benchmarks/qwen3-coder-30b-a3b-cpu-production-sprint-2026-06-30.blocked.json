@@ -1,0 +1,48 @@
+{
+  "benchmark": "bench-real",
+  "status": "blocked",
+  "date": "2026-06-30",
+  "branch": "cpu-production-sprint",
+  "implementation_commit": "04ce69e628c7444d1fcadbcfc572b5849da9abe6",
+  "required_model": {
+    "name": "Qwen3-Coder-30B-A3B-Instruct",
+    "quantization": "Q8_0",
+    "architecture": "Qwen3Moe",
+    "d_model": 2048,
+    "d_ff": 768,
+    "layers": 48,
+    "experts_per_layer": 128,
+    "top_k": 8,
+    "attention_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 128,
+    "vocabulary": 151936
+  },
+  "reason": "Full checkpoint shards or converted MER dense/expert weights were not present in this workspace, so mandatory real-checkpoint prompt/decode benchmarks were not run.",
+  "local_paths_checked": [
+    "/Users/r/model-configs/qwen3-moe",
+    "/Users/r/Documents/Codex/2026-06-27/randyap8-wq-micro-expert-router-ssd-3/Micro-Expert-Router-SSD-Streamed-MoE-MER",
+    "/Users/r/Micro-Expert-Router-SSD-Streamed-MoE-MER"
+  ],
+  "local_qwen_files_found": [
+    "/Users/r/model-configs/qwen3-moe/config.json",
+    "/Users/r/model-configs/qwen3-moe/model.safetensors.index.json"
+  ],
+  "validation_without_checkpoint": [
+    "cargo test dense_tensor -- --nocapture",
+    "cargo test dense_manifest -- --nocapture",
+    "cargo test from_dir_loads_native_q8_dense_manifest_without_alias_files -- --nocapture",
+    "cargo test lm_head_top_k_sampling_matches_full_logits_sampler -- --nocapture",
+    "cargo clippy --tests --message-format short",
+    "cargo test",
+    "cargo build --release",
+    "RUSTFLAGS=-Awarnings cargo run --quiet --features alloc-count -- scratch-alloc-microbench --warmup-tokens 4 --measured-tokens 8 --json",
+    "cargo build --release --features \"avx512,blas,tokenizer\""
+  ],
+  "local_check_limitations": [
+    "cargo fmt --check fails on unrelated pre-existing formatting across the repository; only touched Rust files were formatted/checked.",
+    "cargo clippy --release --features \"avx512,tokenizer,io_uring\" -- -D warnings fails on macOS before this crate is checked because io-uring is Linux-only.",
+    "cargo build --release --features \"cuda,avx512,blas,tokenizer\" fails on this machine because cudarc requires nvcc and CUDA is not installed."
+  ],
+  "not_a_performance_result": true
+}
