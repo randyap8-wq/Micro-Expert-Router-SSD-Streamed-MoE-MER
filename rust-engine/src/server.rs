@@ -572,8 +572,26 @@ impl RequestStageTiming {
         }
     }
 
-    fn record(&self, stage: &'static str, duration: Duration) {
-        crate::stage_timing::record_optional(self.timings.as_deref(), stage, duration);
+    fn start(&self) -> Option<Instant> {
+        Self::start_optional(self.timings.as_deref())
+    }
+
+    fn start_optional(timings: Option<&crate::stage_timing::StageTimings>) -> Option<Instant> {
+        timings.map(|_| Instant::now())
+    }
+
+    fn record_since(&self, stage: &'static str, started: Option<Instant>) {
+        Self::record_optional_since(self.timings.as_deref(), stage, started);
+    }
+
+    fn record_optional_since(
+        timings: Option<&crate::stage_timing::StageTimings>,
+        stage: &'static str,
+        started: Option<Instant>,
+    ) {
+        if let (Some(timings), Some(started)) = (timings, started) {
+            timings.record(stage, started.elapsed());
+        }
     }
 
     fn publish(&mut self) {
@@ -699,7 +717,7 @@ async fn generate(
         let pre_hits = state.engine.report().hits;
         let pre_misses = state.engine.report().misses;
 
-        let prompt_started = Instant::now();
+        let prompt_started = stage_timing.start();
         // If the previous request ended after emitting a token that has not
         // yet been ingested into KV, ingest it first without evaluating the
         // LM head. This preserves P + C - 1 forward evaluations for the
@@ -723,7 +741,7 @@ async fn generate(
             .forward_token_hidden(final_prompt, final_prompt_pos)
             .await;
         start_pos += 1;
-        stage_timing.record(crate::stage_timing::TOTAL_PROMPT, prompt_started.elapsed());
+        stage_timing.record_since(crate::stage_timing::TOTAL_PROMPT, prompt_started);
         let first = request.sample_hidden(&final_hidden, &params, final_prompt_pos);
         completion_ids.push(first);
 
@@ -743,7 +761,7 @@ async fn generate(
         // `params` end-to-end.
         let mut last = first;
         let k = state.speculation_k;
-        let decode_started = Instant::now();
+        let decode_started = stage_timing.start();
         if k > 1 && state.draft_engine.is_some() && params.is_greedy() {
             let draft = state
                 .draft_engine
@@ -774,7 +792,7 @@ async fn generate(
                 start_pos += 1;
             }
         }
-        stage_timing.record(crate::stage_timing::TOTAL_DECODE, decode_started.elapsed());
+        stage_timing.record_since(crate::stage_timing::TOTAL_DECODE, decode_started);
         let pending_token = completion_ids.last().copied();
         let kv = request.finish();
         save_session_kv(
@@ -868,12 +886,12 @@ impl RealRequestState {
         stage_timings: Option<Arc<crate::stage_timing::StageTimings>>,
     ) -> Self {
         if let Some(scheduler) = state.batch_scheduler.as_ref() {
-            let started = Instant::now();
+            let started = RequestStageTiming::start_optional(stage_timings.as_deref());
             let request_id = scheduler.register(kv);
-            crate::stage_timing::record_optional(
+            RequestStageTiming::record_optional_since(
                 stage_timings.as_deref(),
                 crate::stage_timing::SCHEDULER_OVERHEAD,
-                started.elapsed(),
+                started,
             );
             Self {
                 engine: state.engine.clone(),
@@ -897,12 +915,12 @@ impl RealRequestState {
 
     async fn forward_token_hidden(&mut self, token_id: u32, pos: usize) -> Vec<f32> {
         if let (Some(scheduler), Some(id)) = (self.scheduler.as_ref(), self.request_id) {
-            let started = Instant::now();
+            let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             let result = scheduler.forward_registered(id, token_id, pos).await;
-            crate::stage_timing::record_optional(
+            RequestStageTiming::record_optional_since(
                 self.stage_timings.as_deref(),
                 crate::stage_timing::SCHEDULER_OVERHEAD,
-                started.elapsed(),
+                started,
             );
             match result {
                 Ok(hidden) => return hidden,
@@ -937,12 +955,12 @@ impl RealRequestState {
         params: &crate::sampling::SamplingParams,
     ) -> u32 {
         if let (Some(scheduler), Some(id)) = (self.scheduler.as_ref(), self.request_id) {
-            let started = Instant::now();
+            let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             let result = scheduler.step_registered(id, token_id, pos, *params).await;
-            crate::stage_timing::record_optional(
+            RequestStageTiming::record_optional_since(
                 self.stage_timings.as_deref(),
                 crate::stage_timing::SCHEDULER_OVERHEAD,
-                started.elapsed(),
+                started,
             );
             match result {
                 Ok(next) => return next,
@@ -971,12 +989,12 @@ impl RealRequestState {
 
     fn release_scheduler_to_local(&mut self) {
         if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
-            let started = Instant::now();
+            let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             self.kv = scheduler.release(id);
-            crate::stage_timing::record_optional(
+            RequestStageTiming::record_optional_since(
                 self.stage_timings.as_deref(),
                 crate::stage_timing::SCHEDULER_OVERHEAD,
-                started.elapsed(),
+                started,
             );
             if self.kv.is_none() {
                 self.kv = Some(self.model.fresh_kv_caches());
@@ -999,12 +1017,12 @@ impl RealRequestState {
 impl Drop for RealRequestState {
     fn drop(&mut self) {
         if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
-            let started = Instant::now();
+            let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             let _ = scheduler.release(id);
-            crate::stage_timing::record_optional(
+            RequestStageTiming::record_optional_since(
                 self.stage_timings.as_deref(),
                 crate::stage_timing::SCHEDULER_OVERHEAD,
-                started.elapsed(),
+                started,
             );
         }
     }
@@ -1293,7 +1311,7 @@ async fn stream_tokens(
         let (kv, mut pos, pending_token, checkout) =
             load_session_kv(&state, model, session_id.as_deref());
         let mut request = RealRequestState::new(&state, model, kv, stage_timing.timings.clone());
-        let prompt_started = Instant::now();
+        let prompt_started = stage_timing.start();
         if let Some(tid) = pending_token {
             let _ = request.forward_token_hidden(tid, pos).await;
             pos += 1;
@@ -1308,7 +1326,7 @@ async fn stream_tokens(
             .forward_token_hidden(final_prompt, final_prompt_pos)
             .await;
         pos += 1;
-        stage_timing.record(crate::stage_timing::TOTAL_PROMPT, prompt_started.elapsed());
+        stage_timing.record_since(crate::stage_timing::TOTAL_PROMPT, prompt_started);
         let first = request.sample_hidden(&hidden, &params, final_prompt_pos);
         GenMode::Real {
             request,
@@ -1409,12 +1427,12 @@ async fn stream_tokens(
                 if let Some(n) = pending_emit.take() {
                     n
                 } else {
-                    let decode_started = Instant::now();
+                    let decode_started = st.stage_timing.start();
                     let n = request
                         .decode_step(*last_token, *position, &st.params)
                         .await;
                     st.stage_timing
-                        .record(crate::stage_timing::TOTAL_DECODE, decode_started.elapsed());
+                        .record_since(crate::stage_timing::TOTAL_DECODE, decode_started);
                     *position += 1;
                     n
                 }
@@ -2533,7 +2551,9 @@ mod tests {
         assert!(timing.timings.is_none());
         assert!(timing.publisher.is_none());
 
-        timing.record(crate::stage_timing::TOTAL_PROMPT, Duration::from_millis(1));
+        let started = timing.start();
+        assert!(started.is_none());
+        timing.record_since(crate::stage_timing::TOTAL_PROMPT, started);
         timing.publish();
         drop(timing);
 
@@ -2549,7 +2569,9 @@ mod tests {
         assert!(timing.timings.is_some());
         assert!(timing.publisher.is_some());
 
-        timing.record(crate::stage_timing::TOTAL_PROMPT, Duration::from_millis(1));
+        let started = timing.start();
+        assert!(started.is_some());
+        timing.record_since(crate::stage_timing::TOTAL_PROMPT, started);
         timing.publish();
 
         let body = String::from_utf8(metrics.render().unwrap()).unwrap();
