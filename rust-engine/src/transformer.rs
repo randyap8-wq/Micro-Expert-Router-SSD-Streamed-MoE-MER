@@ -34,6 +34,7 @@
 //! without forcing a stub call site.
 #![allow(dead_code)]
 
+use crate::backend::Backend;
 use crate::expert_cache::ExpertResident;
 use crate::inference::{forward_candle_tensors, ExpertWeights, HiddenState};
 use candle_core::{Device, Tensor};
@@ -763,6 +764,20 @@ pub struct MultiHeadSelfAttention {
     pub sink_bias: Option<Vec<f32>>,
 }
 
+/// Reusable buffers for one standard attention block.
+///
+/// Kept inside [`TransformerLayerScratch`] so the real decode loop can carry
+/// Q/K/V projections, attention scores, and projection outputs across tokens
+/// without repeatedly allocating the same per-layer temporaries.
+#[derive(Debug, Default)]
+pub(crate) struct MultiHeadSelfAttentionScratch {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    scores: Vec<f32>,
+    attn_out: Vec<f32>,
+}
+
 impl MultiHeadSelfAttention {
     pub fn q_dim(&self) -> usize {
         self.num_heads * self.head_dim
@@ -882,8 +897,28 @@ impl MultiHeadSelfAttention {
     /// verifier forward and the speculative KV preview so the two can
     /// never drift out of sync.
     pub fn project_kv(&self, x: &[f32], pos: usize) -> (Vec<f32>, Vec<f32>) {
-        let mut k = matmul_row_major(&self.wk, x, self.kv_dim(), self.d_model);
-        let mut v = matmul_row_major(&self.wv, x, self.v_proj_dim(), self.d_model);
+        let mut k = Vec::new();
+        let mut v = Vec::new();
+        self.project_kv_into_with_timing(x, pos, &mut k, &mut v, None);
+        (k, v)
+    }
+
+    pub fn project_kv_into_with_timing(
+        &self,
+        x: &[f32],
+        pos: usize,
+        k: &mut Vec<f32>,
+        v: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        k.resize(self.kv_dim(), 0.0);
+        v.resize(self.v_proj_dim(), 0.0);
+        crate::stage_timing::time_optional(timings, crate::stage_timing::K_PROJECTION, || {
+            matmul_row_major_into(&self.wk, x, k, self.kv_dim(), self.d_model)
+        });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::V_PROJECTION, || {
+            matmul_row_major_into(&self.wv, x, v, self.v_proj_dim(), self.d_model)
+        });
         if let Some(bk) = self.bk.as_ref() {
             for (ki, bi) in k.iter_mut().zip(bk.iter()) {
                 *ki += bi;
@@ -894,12 +929,15 @@ impl MultiHeadSelfAttention {
                 *vi += bi;
             }
         }
-        self.apply_k_norm(&mut k);
-        for h in 0..self.num_kv_heads {
-            let s = h * self.head_dim;
-            self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
-        }
-        (k, v)
+        crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+            self.apply_k_norm(k.as_mut_slice())
+        });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
+            for h in 0..self.num_kv_heads {
+                let s = h * self.head_dim;
+                self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
+            }
+        });
     }
 
     /// Forward one token at absolute position `pos`. Updates `kv` with
@@ -1295,6 +1333,145 @@ impl MultiHeadSelfAttention {
         };
         self.apply_o_bias(&mut out);
         out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_into_with_timing(
+        &self,
+        x: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut MultiHeadSelfAttentionScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        // The scratch path is the CPU-production path. Keep GPU behaviour
+        // byte-for-byte by delegating to the existing allocating path when a
+        // GPU backend is active.
+        if backend.is_gpu() {
+            let y = self.forward_with_timing(x, pos, layer_idx, kv, backend, timings);
+            out.clear();
+            out.extend_from_slice(&y);
+            return;
+        }
+
+        debug_assert_eq!(x.len(), self.d_model);
+        debug_assert_eq!(kv.kv_dim, self.kv_dim());
+        debug_assert_eq!(kv.v_dim, self.v_proj_dim());
+
+        let q_dim = self.q_dim();
+        scratch.q.resize(q_dim, 0.0);
+        crate::stage_timing::time_optional(timings, crate::stage_timing::Q_PROJECTION, || {
+            matmul_row_major_into(&self.wq, x, &mut scratch.q, q_dim, self.d_model)
+        });
+        if let Some(bq) = self.bq.as_ref() {
+            for (qi, bi) in scratch.q.iter_mut().zip(bq.iter()) {
+                *qi += bi;
+            }
+        }
+        crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+            self.apply_q_norm(&mut scratch.q)
+        });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
+            for h in 0..self.num_heads {
+                let s = h * self.head_dim;
+                self.apply_rope_to(&mut scratch.q[s..s + self.rope_dim], pos);
+            }
+        });
+
+        self.project_kv_into_with_timing(
+            x,
+            pos,
+            &mut scratch.k,
+            &mut scratch.v,
+            timings,
+        );
+        debug_assert_eq!(pos, kv.seq_len);
+        kv.append(&scratch.k, &scratch.v);
+
+        crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::ATTENTION_SCORE_VALUE,
+            || {
+                self.cpu_attend_into(
+                    &scratch.q,
+                    kv,
+                    &mut scratch.scores,
+                    &mut scratch.attn_out,
+                )
+            },
+        );
+        self.apply_value_scale(&mut scratch.attn_out);
+
+        out.resize(self.d_model, 0.0);
+        crate::stage_timing::time_optional(timings, crate::stage_timing::O_PROJECTION, || {
+            matmul_row_major_into(
+                &self.wo,
+                &scratch.attn_out,
+                out,
+                self.d_model,
+                self.attn_out_dim(),
+            );
+            self.apply_o_bias(out);
+        });
+    }
+
+    fn cpu_attend_into(
+        &self,
+        q: &[f32],
+        kv: &KvCache,
+        scores: &mut Vec<f32>,
+        attn_out: &mut Vec<f32>,
+    ) {
+        attn_out.clear();
+        attn_out.resize(self.attn_out_dim(), 0.0);
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let t_max = kv.seq_len;
+        let t_start = match self.attention_mode() {
+            crate::architecture::AttentionMode::SlidingWindow { window } => {
+                t_max.saturating_sub(window)
+            }
+            crate::architecture::AttentionMode::Global => 0,
+        };
+        let span = t_max - t_start;
+
+        for h in 0..self.num_heads {
+            let kv_head = h * self.num_kv_heads / self.num_heads;
+            let q_head = &q[h * self.head_dim..(h + 1) * self.head_dim];
+            scores.resize(span, 0.0);
+
+            for (idx, score) in scores.iter_mut().enumerate() {
+                let t = t_start + idx;
+                let k_t = kv.key(t);
+                let k_h = &k_t[kv_head * self.head_dim..(kv_head + 1) * self.head_dim];
+                let mut s = 0.0f32;
+                for j in 0..self.head_dim {
+                    s += q_head[j] * k_h[j];
+                }
+                *score = s * scale;
+            }
+            if let Some(bias) = self.sink_bias.as_ref() {
+                if t_start == 0 && !scores.is_empty() {
+                    if let Some(b) = bias.get(h) {
+                        scores[0] += *b;
+                    }
+                }
+            }
+            softmax_inplace(scores);
+
+            let out_h = &mut attn_out[h * self.v_head_dim..(h + 1) * self.v_head_dim];
+            for (idx, score) in scores.iter().enumerate() {
+                let t = t_start + idx;
+                let v_t = kv.value(t);
+                let v_h =
+                    &v_t[kv_head * self.v_head_dim..(kv_head + 1) * self.v_head_dim];
+                for j in 0..self.v_head_dim {
+                    out_h[j] += score * v_h[j];
+                }
+            }
+        }
     }
 }
 
@@ -1780,6 +1957,7 @@ pub struct TransformerLayer {
 #[derive(Debug, Default)]
 pub struct TransformerLayerScratch {
     pub(crate) attn_normed: Vec<f32>,
+    pub(crate) attn: MultiHeadSelfAttentionScratch,
     pub(crate) moe_normed: Vec<f32>,
     pub(crate) moe_accum: Vec<f32>,
     pub(crate) routing: crate::gating::RoutingScratch,
@@ -1847,22 +2025,37 @@ impl TransformerLayer {
             self.rms_attn.forward_into(hidden, &mut scratch.attn_normed)
         });
         let normed = &scratch.attn_normed;
-        let attn_out = match self.mla.as_ref() {
+        match self.mla.as_ref() {
             // DeepSeek-V3 multi-head latent attention runs on CPU against
             // the layer's compressed latent KV cache. The GPU attention
             // kernels are shaped for standard MHA (uniform K/V head dim),
             // so MLA stays on the reference path; `backend` is unused
             // here but kept in the signature for the standard path below.
-            Some(mla) => crate::stage_timing::time_optional(
-                timings,
-                crate::stage_timing::ATTENTION_SCORE_VALUE,
-                || mla.forward(normed, pos, kv),
-            ),
-            None => self
-                .attn
-                .forward_with_timing(normed, pos, layer_idx, kv, backend, timings),
-        };
-        add_residual_into(hidden, &attn_out, out);
+            Some(mla) => {
+                let attn_out = crate::stage_timing::time_optional(
+                    timings,
+                    crate::stage_timing::ATTENTION_SCORE_VALUE,
+                    || mla.forward(normed, pos, kv),
+                );
+                add_residual_into(hidden, &attn_out, out);
+            }
+            None => {
+                self.attn.forward_into_with_timing(
+                    normed,
+                    pos,
+                    layer_idx,
+                    kv,
+                    backend,
+                    &mut scratch.attn,
+                    out,
+                    timings,
+                );
+                debug_assert_eq!(hidden.len(), out.len());
+                for (oi, hi) in out.iter_mut().zip(hidden.iter()) {
+                    *oi += hi;
+                }
+            }
+        }
     }
 
     /// KV-cache width this layer needs: the MLA latent dim when latent
@@ -2718,6 +2911,63 @@ mod tests {
         let y1 = layer.attn_block(&y0, 1, 0, &mut kv, &cpu_backend());
         assert_eq!(kv.seq_len, 2);
         assert!(y1.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn attention_forward_into_matches_forward_and_reuses_capacity() {
+        let d_model = 16;
+        let layer = make_layer(d_model, 4, 2);
+        let x0: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32 - 0.5).collect();
+        let x1: Vec<f32> = (0..d_model).map(|i| 0.07 * i as f32 - 0.25).collect();
+        let backend = cpu_backend();
+
+        let mut kv_ref = KvCache::new(layer.attn.kv_dim());
+        let mut kv_into = KvCache::new(layer.attn.kv_dim());
+        let y0_ref = layer.attn.forward(&x0, 0, 0, &mut kv_ref, &backend);
+        let y1_ref = layer.attn.forward(&x1, 1, 0, &mut kv_ref, &backend);
+
+        let mut scratch = MultiHeadSelfAttentionScratch::default();
+        let mut y0_into = Vec::with_capacity(d_model * 2);
+        let out_capacity = y0_into.capacity();
+        layer.attn.forward_into_with_timing(
+            &x0,
+            0,
+            0,
+            &mut kv_into,
+            &backend,
+            &mut scratch,
+            &mut y0_into,
+            None,
+        );
+        assert_eq!(y0_into.capacity(), out_capacity);
+        assert_eq!(y0_into.len(), d_model);
+        for (a, b) in y0_ref.iter().zip(y0_into.iter()) {
+            assert!((a - b).abs() < 1e-5, "forward_into mismatch: {a} vs {b}");
+        }
+
+        let q_capacity = scratch.q.capacity();
+        let k_capacity = scratch.k.capacity();
+        let v_capacity = scratch.v.capacity();
+        let attn_capacity = scratch.attn_out.capacity();
+        let mut y1_into = Vec::with_capacity(d_model * 2);
+        layer.attn.forward_into_with_timing(
+            &x1,
+            1,
+            0,
+            &mut kv_into,
+            &backend,
+            &mut scratch,
+            &mut y1_into,
+            None,
+        );
+        assert_eq!(scratch.q.capacity(), q_capacity);
+        assert_eq!(scratch.k.capacity(), k_capacity);
+        assert_eq!(scratch.v.capacity(), v_capacity);
+        assert_eq!(scratch.attn_out.capacity(), attn_capacity);
+        for (a, b) in y1_ref.iter().zip(y1_into.iter()) {
+            assert!((a - b).abs() < 1e-5, "forward_into mismatch: {a} vs {b}");
+        }
+        assert_eq!(kv_into.seq_len, kv_ref.seq_len);
     }
 
     #[test]

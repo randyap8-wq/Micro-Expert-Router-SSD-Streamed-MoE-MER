@@ -1685,10 +1685,10 @@ fn cmd_scratch_alloc_microbench(
     #[cfg(not(feature = "alloc-count"))]
     {
         let _ = args;
-        return Err(
+        Err(
             "scratch-alloc-microbench requires `--features alloc-count` so the binary installs the counting allocator"
                 .into(),
-        );
+        )
     }
 
     #[cfg(feature = "alloc-count")]
