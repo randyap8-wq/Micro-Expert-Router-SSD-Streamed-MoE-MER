@@ -12,6 +12,117 @@
 // enabled, the AMX dispatch path falls back to AVX-512.
 #![cfg_attr(feature = "nightly-amx", feature(stdarch_x86_amx))]
 
+#[cfg(feature = "alloc-count")]
+mod alloc_count {
+    use super::AllocationSnapshot;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub struct CountingAllocator;
+
+    static ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+    static DEALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+    static REALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+    static BYTES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+    static BYTES_DEALLOCATED: AtomicU64 = AtomicU64::new(0);
+    static CURRENT_BYTES: AtomicU64 = AtomicU64::new(0);
+    static PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: this allocator only observes the operation, then forwards
+            // the exact layout to the platform allocator.
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+                record_allocation(layout.size() as u64);
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            DEALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+            record_deallocation(layout.size() as u64);
+            // SAFETY: `ptr`/`layout` are the exact pair passed to this global
+            // allocator by the standard library, so forwarding them is valid.
+            unsafe { System.dealloc(ptr, layout) };
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: forwards the original pointer/layout and requested size
+            // unchanged to the platform allocator.
+            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+            if !new_ptr.is_null() {
+                REALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+                let old_size = layout.size() as u64;
+                let new_size = new_size as u64;
+                if new_size >= old_size {
+                    record_allocation(new_size - old_size);
+                } else {
+                    record_deallocation(old_size - new_size);
+                }
+            }
+            new_ptr
+        }
+    }
+
+    pub fn reset() {
+        ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+        DEALLOCATION_CALLS.store(0, Ordering::Relaxed);
+        REALLOCATION_CALLS.store(0, Ordering::Relaxed);
+        BYTES_ALLOCATED.store(0, Ordering::Relaxed);
+        BYTES_DEALLOCATED.store(0, Ordering::Relaxed);
+        CURRENT_BYTES.store(0, Ordering::Relaxed);
+        PEAK_BYTES.store(0, Ordering::Relaxed);
+    }
+
+    pub fn snapshot() -> AllocationSnapshot {
+        AllocationSnapshot {
+            allocation_calls: ALLOCATION_CALLS.load(Ordering::Relaxed),
+            deallocation_calls: DEALLOCATION_CALLS.load(Ordering::Relaxed),
+            reallocation_calls: REALLOCATION_CALLS.load(Ordering::Relaxed),
+            bytes_allocated: BYTES_ALLOCATED.load(Ordering::Relaxed),
+            bytes_deallocated: BYTES_DEALLOCATED.load(Ordering::Relaxed),
+            current_bytes: CURRENT_BYTES.load(Ordering::Relaxed),
+            peak_bytes: PEAK_BYTES.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_allocation(bytes: u64) {
+        BYTES_ALLOCATED.fetch_add(bytes, Ordering::Relaxed);
+        let current = CURRENT_BYTES
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        update_peak(current);
+    }
+
+    fn record_deallocation(bytes: u64) {
+        BYTES_DEALLOCATED.fetch_add(bytes, Ordering::Relaxed);
+        let _ = CURRENT_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(bytes))
+        });
+    }
+
+    fn update_peak(current: u64) {
+        let mut peak = PEAK_BYTES.load(Ordering::Relaxed);
+        while current > peak {
+            match PEAK_BYTES.compare_exchange_weak(
+                peak,
+                current,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => peak = observed,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: alloc_count::CountingAllocator = alloc_count::CountingAllocator;
+
 mod aligned_buffer;
 mod architecture;
 mod backend;
@@ -665,6 +776,33 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+
+    /// Count heap allocations for the old transformer wrappers vs request scratch buffers.
+    ///
+    /// Requires `--features alloc-count`. The synthetic layer keeps this
+    /// benchmark independent of checkpoint files while exercising the same
+    /// attention, RMSNorm, router, residual, and MoE-combine methods used by
+    /// the real decode loop.
+    ScratchAllocMicrobench {
+        /// Hidden size for the synthetic transformer layer. Must be a multiple of 4.
+        #[arg(long, default_value_t = 32)]
+        d_model: usize,
+        /// Number of routed experts in the synthetic gate.
+        #[arg(long, default_value_t = 8)]
+        num_experts: usize,
+        /// Experts selected per token.
+        #[arg(long, default_value_t = 2)]
+        top_k: usize,
+        /// Tokens to run before resetting allocation counters.
+        #[arg(long, default_value_t = 1)]
+        warmup_tokens: usize,
+        /// Tokens measured after warmup. Defaults below the 16-token KV page size.
+        #[arg(long, default_value_t = 8)]
+        measured_tokens: usize,
+        /// Emit JSON instead of human-readable rows.
+        #[arg(long)]
+        json: bool,
+    },
     /// Native terminal dashboard — Phase 4 of the three-tier memory
     /// hierarchy. Polls a running `serve` instance and renders a live
     /// ratatui view of the SSD → RAM → VRAM hit grid, current cache
@@ -1007,6 +1145,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             skip_lm_head,
             json,
         }),
+        Cmd::ScratchAllocMicrobench {
+            d_model,
+            num_experts,
+            top_k,
+            warmup_tokens,
+            measured_tokens,
+            json,
+        } => cmd_scratch_alloc_microbench(ScratchAllocMicrobenchArgs {
+            d_model,
+            num_experts,
+            top_k,
+            warmup_tokens,
+            measured_tokens,
+            json,
+        }),
         Cmd::GgufConvert {
             gguf_path,
             out_dir,
@@ -1181,6 +1334,16 @@ struct MatvecMicrobenchArgs {
     json: bool,
 }
 
+#[cfg_attr(not(feature = "alloc-count"), allow(dead_code))]
+struct ScratchAllocMicrobenchArgs {
+    d_model: usize,
+    num_experts: usize,
+    top_k: usize,
+    warmup_tokens: usize,
+    measured_tokens: usize,
+    json: bool,
+}
+
 #[derive(Serialize)]
 struct MatvecMicrobenchReport {
     benchmark: &'static str,
@@ -1207,6 +1370,60 @@ struct MatvecMicrobenchResult {
     best_ms: f64,
     mean_ms: f64,
     checksum: u64,
+}
+
+#[cfg(feature = "alloc-count")]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct AllocationSnapshot {
+    allocation_calls: u64,
+    deallocation_calls: u64,
+    reallocation_calls: u64,
+    bytes_allocated: u64,
+    bytes_deallocated: u64,
+    current_bytes: u64,
+    peak_bytes: u64,
+}
+
+#[cfg(feature = "alloc-count")]
+#[derive(Serialize)]
+struct ScratchAllocMicrobenchReport {
+    benchmark: &'static str,
+    model: &'static str,
+    d_model: usize,
+    num_experts: usize,
+    top_k: usize,
+    warmup_tokens: usize,
+    measured_tokens: usize,
+    build: BenchRealBuildInfo,
+    results: Vec<ScratchAllocMicrobenchResult>,
+}
+
+#[cfg(feature = "alloc-count")]
+#[derive(Serialize)]
+struct ScratchAllocMicrobenchResult {
+    variant: &'static str,
+    elapsed_ms: f64,
+    allocations: AllocationSnapshot,
+    allocation_calls_per_token: f64,
+    bytes_allocated_per_token: f64,
+    checksum: u64,
+}
+
+#[cfg(feature = "alloc-count")]
+#[derive(Clone, Copy)]
+enum ScratchAllocVariant {
+    CompatibilityWrappers,
+    ScratchBuffers,
+}
+
+#[cfg(feature = "alloc-count")]
+impl ScratchAllocVariant {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CompatibilityWrappers => "compatibility-wrappers",
+            Self::ScratchBuffers => "scratch-buffers",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1460,6 +1677,326 @@ fn cmd_matvec_microbench(args: MatvecMicrobenchArgs) -> Result<(), Box<dyn std::
         print_matvec_microbench_human(&report);
     }
     Ok(())
+}
+
+fn cmd_scratch_alloc_microbench(
+    args: ScratchAllocMicrobenchArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(feature = "alloc-count"))]
+    {
+        let _ = args;
+        return Err(
+            "scratch-alloc-microbench requires `--features alloc-count` so the binary installs the counting allocator"
+                .into(),
+        );
+    }
+
+    #[cfg(feature = "alloc-count")]
+    {
+        if args.measured_tokens == 0 {
+            return Err("scratch-alloc-microbench requires --measured-tokens > 0".into());
+        }
+        if args.d_model == 0 || !args.d_model.is_multiple_of(4) {
+            return Err(
+                "scratch-alloc-microbench requires --d-model to be a positive multiple of 4".into(),
+            );
+        }
+        if args.num_experts == 0 {
+            return Err("scratch-alloc-microbench requires --num-experts > 0".into());
+        }
+        if args.top_k == 0 || args.top_k > args.num_experts {
+            return Err("scratch-alloc-microbench requires 0 < --top-k <= --num-experts".into());
+        }
+
+        let backend = crate::backend::current();
+        let results = vec![
+            run_scratch_alloc_variant(
+                &args,
+                ScratchAllocVariant::CompatibilityWrappers,
+                &backend,
+            ),
+            run_scratch_alloc_variant(
+                &args,
+                ScratchAllocVariant::ScratchBuffers,
+                &backend,
+            ),
+        ];
+
+        let report = ScratchAllocMicrobenchReport {
+            benchmark: "scratch-alloc-microbench",
+            model: "synthetic-transformer-layer",
+            d_model: args.d_model,
+            num_experts: args.num_experts,
+            top_k: args.top_k,
+            warmup_tokens: args.warmup_tokens,
+            measured_tokens: args.measured_tokens,
+            build: BenchRealBuildInfo {
+                git_commit: git_commit_short(),
+                build_features: build_features(),
+                threads: std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+                dense_matvec_backend: crate::parallel::dense_matvec_backend().to_string(),
+            },
+            results,
+        };
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_scratch_alloc_microbench_human(&report);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "alloc-count")]
+fn run_scratch_alloc_variant(
+    args: &ScratchAllocMicrobenchArgs,
+    variant: ScratchAllocVariant,
+    backend: &crate::backend::BackendBox,
+) -> ScratchAllocMicrobenchResult {
+    let layer = make_synthetic_transformer_layer(args.d_model, args.num_experts, args.top_k);
+    let expert_bank = make_synthetic_expert_bank(args.d_model, args.num_experts);
+    let mut selected_outputs = vec![vec![0.0f32; args.d_model]; args.top_k];
+    let mut hidden = deterministic_f32_vec(args.d_model, 0x7a11_0ca7_ed15_ea5e);
+    let mut kv = crate::transformer::KvCache::new_kv(layer.kv_dim(), layer.v_dim());
+    let mut pos = 0usize;
+
+    let mut scratch = crate::transformer::TransformerLayerScratch::new();
+    let mut next_hidden = Vec::with_capacity(args.d_model);
+
+    for _ in 0..args.warmup_tokens {
+        run_synthetic_decode_step(
+            &layer,
+            variant,
+            &mut hidden,
+            pos,
+            &mut kv,
+            backend,
+            &expert_bank,
+            &mut selected_outputs,
+            &mut scratch,
+            &mut next_hidden,
+        );
+        pos += 1;
+    }
+
+    alloc_count::reset();
+    let started = Instant::now();
+    for _ in 0..args.measured_tokens {
+        run_synthetic_decode_step(
+            &layer,
+            variant,
+            &mut hidden,
+            pos,
+            &mut kv,
+            backend,
+            &expert_bank,
+            &mut selected_outputs,
+            &mut scratch,
+            &mut next_hidden,
+        );
+        pos += 1;
+        std::hint::black_box(&hidden);
+    }
+    let elapsed = started.elapsed();
+    let allocations = alloc_count::snapshot();
+    ScratchAllocMicrobenchResult {
+        variant: variant.label(),
+        elapsed_ms: elapsed.as_secs_f64() * 1_000.0,
+        allocations,
+        allocation_calls_per_token: allocations.allocation_calls as f64
+            / args.measured_tokens as f64,
+        bytes_allocated_per_token: allocations.bytes_allocated as f64 / args.measured_tokens as f64,
+        checksum: checksum_f32_bits(&hidden),
+    }
+}
+
+#[cfg(feature = "alloc-count")]
+#[allow(clippy::too_many_arguments)]
+fn run_synthetic_decode_step(
+    layer: &crate::transformer::TransformerLayer,
+    variant: ScratchAllocVariant,
+    hidden: &mut Vec<f32>,
+    pos: usize,
+    kv: &mut crate::transformer::KvCache,
+    backend: &crate::backend::BackendBox,
+    expert_bank: &[Vec<f32>],
+    selected_outputs: &mut [Vec<f32>],
+    scratch: &mut crate::transformer::TransformerLayerScratch,
+    next_hidden: &mut Vec<f32>,
+) {
+    match variant {
+        ScratchAllocVariant::CompatibilityWrappers => {
+            let after_attn = layer.attn_block_with_timing(hidden, pos, 0, kv, backend, None);
+            let (_normed, routing) = layer.moe_pre_with_timing(&after_attn, None);
+            copy_selected_expert_outputs(&routing, expert_bank, selected_outputs);
+            *hidden = layer.moe_combine_with_timing(
+                &after_attn,
+                &selected_outputs[..routing.experts.len()],
+                &routing.weights,
+                None,
+            );
+        }
+        ScratchAllocVariant::ScratchBuffers => {
+            layer.attn_block_into_with_timing(
+                hidden,
+                pos,
+                0,
+                kv,
+                backend,
+                scratch,
+                next_hidden,
+                None,
+            );
+            std::mem::swap(hidden, next_hidden);
+            next_hidden.clear();
+
+            let routing = layer.moe_pre_into_with_timing(hidden, scratch, None);
+            copy_selected_expert_outputs(&routing, expert_bank, selected_outputs);
+            let mut moe_accum = std::mem::take(&mut scratch.moe_accum);
+            layer.moe_combine_into_with_timing(
+                hidden,
+                &selected_outputs[..routing.experts.len()],
+                &routing.weights,
+                &mut moe_accum,
+                next_hidden,
+                None,
+            );
+            scratch.moe_accum = moe_accum;
+            std::mem::swap(hidden, next_hidden);
+            next_hidden.clear();
+        }
+    }
+}
+
+#[cfg(feature = "alloc-count")]
+fn make_synthetic_transformer_layer(
+    d_model: usize,
+    num_experts: usize,
+    top_k: usize,
+) -> crate::transformer::TransformerLayer {
+    let head_dim = 4;
+    let num_heads = d_model / head_dim;
+    let num_kv_heads = num_heads;
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let mk = |rows: usize, cols: usize, scale: f32| {
+        (0..rows * cols)
+            .map(|i| ((i % 7) as f32 - 3.0) * scale)
+            .collect::<Vec<f32>>()
+    };
+    crate::transformer::TransformerLayer {
+        rms_attn: crate::transformer::RmsNorm::new(vec![1.0; d_model], 1e-6),
+        attn: crate::transformer::MultiHeadSelfAttention {
+            d_model,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim: head_dim,
+            v_head_dim: head_dim,
+            attention_value_scale: None,
+            rope_base: 10000.0,
+            wq: mk(q_dim, d_model, 0.05),
+            wk: mk(kv_dim, d_model, 0.05),
+            wv: mk(kv_dim, d_model, 0.05),
+            wo: mk(d_model, q_dim, 0.05),
+            window_size: None,
+            q_norm: None,
+            k_norm: None,
+            rope_yarn: None,
+            rope_cache: None,
+            bq: None,
+            bk: None,
+            bv: None,
+            bo: None,
+            sink_bias: None,
+        },
+        mla: None,
+        rms_moe: crate::transformer::RmsNorm::new(vec![1.0; d_model], 1e-6),
+        gate: crate::gating::LinearGate::new(
+            mk(num_experts, d_model, 0.1),
+            num_experts,
+            d_model,
+            top_k,
+        ),
+        shared_expert: None,
+        dense_ffn: None,
+    }
+}
+
+#[cfg(feature = "alloc-count")]
+fn make_synthetic_expert_bank(d_model: usize, num_experts: usize) -> Vec<Vec<f32>> {
+    (0..num_experts)
+        .map(|expert| deterministic_f32_vec(d_model, 0x5eed_0000_u64 | expert as u64))
+        .collect()
+}
+
+#[cfg(feature = "alloc-count")]
+fn copy_selected_expert_outputs(
+    routing: &crate::gating::RoutingDecision,
+    expert_bank: &[Vec<f32>],
+    selected_outputs: &mut [Vec<f32>],
+) {
+    debug_assert!(routing.experts.len() <= selected_outputs.len());
+    for (idx, &expert_id) in routing.experts.iter().enumerate() {
+        let source = &expert_bank[expert_id as usize % expert_bank.len()];
+        selected_outputs[idx].clear();
+        selected_outputs[idx].extend_from_slice(source);
+    }
+}
+
+#[cfg(feature = "alloc-count")]
+fn print_scratch_alloc_microbench_human(report: &ScratchAllocMicrobenchReport) {
+    println!("scratch-alloc-microbench");
+    println!(
+        "  model={} d_model={} num_experts={} top_k={}",
+        report.model, report.d_model, report.num_experts, report.top_k
+    );
+    println!(
+        "  warmup_tokens={} measured_tokens={} git={} threads={} features={}",
+        report.warmup_tokens,
+        report.measured_tokens,
+        report.build.git_commit,
+        report.build.threads,
+        report.build.build_features.join(",")
+    );
+    for result in &report.results {
+        println!(
+            "  {:<23} tokens={:<4} elapsed={:>8.3}ms allocs={:<7} reallocs={:<5} bytes={:<10} peak={:<10} allocs/token={:>7.2} bytes/token={:>9.1} checksum={:#016x}",
+            result.variant,
+            report.measured_tokens,
+            result.elapsed_ms,
+            result.allocations.allocation_calls,
+            result.allocations.reallocation_calls,
+            result.allocations.bytes_allocated,
+            result.allocations.peak_bytes,
+            result.allocation_calls_per_token,
+            result.bytes_allocated_per_token,
+            result.checksum
+        );
+    }
+    if let [baseline, scratch] = report.results.as_slice() {
+        println!(
+            "  reduction vs wrappers: alloc_calls={:>6.2}% bytes_allocated={:>6.2}%",
+            percent_reduction(
+                baseline.allocations.allocation_calls,
+                scratch.allocations.allocation_calls
+            ),
+            percent_reduction(
+                baseline.allocations.bytes_allocated,
+                scratch.allocations.bytes_allocated
+            )
+        );
+    }
+}
+
+#[cfg(feature = "alloc-count")]
+fn percent_reduction(baseline: u64, measured: u64) -> f64 {
+    if baseline == 0 {
+        return 0.0;
+    }
+    ((baseline as f64 - measured as f64) / baseline as f64) * 100.0
 }
 
 fn deterministic_f32_vec(len: usize, seed: u64) -> Vec<f32> {
@@ -2257,6 +2794,9 @@ fn build_features() -> Vec<&'static str> {
     }
     if cfg!(feature = "blas") {
         features.push("blas");
+    }
+    if cfg!(feature = "alloc-count") {
+        features.push("alloc-count");
     }
     if cfg!(feature = "avx512") {
         features.push("avx512");

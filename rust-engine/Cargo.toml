@@ -185,6 +185,13 @@ simd = []
 # between serial matrixmultiply, Rayon row-parallel dot products, and
 # Rayon-chunked matrixmultiply at runtime inside one binary.
 blas = []
+# Opt-in allocation instrumentation for CPU hot-path microbenchmarks.
+#
+# This installs a process-wide counting allocator in the binary, so it is
+# deliberately off by default: production builds should not pay even atomic
+# counter traffic on every heap operation unless an operator is collecting a
+# focused allocation profile.
+alloc-count = []
 # Build the AVX-512 dispatcher in `kernels/avx512.rs`. Stable on
 # x86_64; the actual code is `#[target_feature]`-gated and only
 # executed when the runtime probe in `kernels::detect()` confirms the
