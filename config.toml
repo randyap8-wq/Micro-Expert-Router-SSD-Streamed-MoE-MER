@@ -200,6 +200,10 @@ rms_eps = 1e-6
 # `default_seed()` constant in `src/config.rs` (TOML doesn't accept
 # hex literals).
 seed = 12648430
+# Detailed per-request stage timing for real-transformer HTTP serving.
+# Disabled by default to avoid per-stage clock, mutex, and map-update work
+# in the normal inference hot path. Benchmarks still collect stage timings.
+stage_timing_enabled = false
 # Continuous batching: maximum number of concurrent in-flight requests
 # fused into a single decoder step. The scheduler waits up to
 # `batch_timeout_ms` for additional requests before flushing the

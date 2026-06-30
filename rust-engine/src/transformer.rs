@@ -35,7 +35,7 @@
 #![allow(dead_code)]
 
 use crate::backend::Backend;
-use crate::dense_tensor::DenseWeight;
+use crate::dense_tensor::{DenseDType, DenseWeight};
 use crate::expert_cache::ExpertResident;
 use crate::inference::{forward_candle_tensors, ExpertWeights, HiddenState};
 use candle_core::{Device, Tensor};
@@ -801,6 +801,15 @@ impl MultiHeadSelfAttention {
         self.num_heads * self.v_head_dim
     }
 
+    pub(crate) fn gpu_dense_path_supported(&self) -> bool {
+        self.v_head_dim == self.head_dim
+            && self.sink_bias.is_none()
+            && self.wq.dtype() == DenseDType::F32
+            && self.wk.dtype() == DenseDType::F32
+            && self.wv.dtype() == DenseDType::F32
+            && self.wo.dtype() == DenseDType::F32
+    }
+
     #[inline]
     fn apply_rope_to(&self, v: &mut [f32], pos: usize) {
         apply_rope_with_cache(
@@ -945,10 +954,10 @@ impl MultiHeadSelfAttention {
     /// the new K/V for this position. Returns a new hidden state of
     /// length `d_model`.
     ///
-    /// The GPU path (selected when `backend.is_gpu()`) dispatches the Q/K/V
-    /// and output projections through `backend.matmul_into`, writes K/V
-    /// straight into VRAM via `backend.kv_cache_insert`, and runs attention
-    /// via `backend.kv_attend` — no PCIe round-trip back to system RAM.
+    /// The GPU path (selected when `backend.is_gpu()`) currently converts
+    /// resident F32 projection weights and activations to F16 on the CPU,
+    /// uploads them through backend calls, writes K/V via
+    /// `backend.kv_cache_insert`, and runs attention via `backend.kv_attend`.
     /// The CPU path is the original paged-attention loop, byte-for-byte.
     pub fn forward(
         &self,
@@ -1120,12 +1129,12 @@ impl MultiHeadSelfAttention {
                 out
             })
         };
-        if !backend.is_gpu() || self.v_head_dim != self.head_dim || self.sink_bias.is_some() {
-            // The GPU attention kernels assume a symmetric K/V head dim, so
-            // MiMo-V2-Flash's asymmetric V (`v_head_dim != head_dim`) always
-            // takes the CPU path. The per-head attention sink bias
-            // (`add_swa_attention_sink_bias`) is likewise only implemented on
-            // the CPU softmax path, so force CPU when it is present.
+        if !backend.is_gpu() || !self.gpu_dense_path_supported() {
+            // The current GPU dense path copies full projection matrices to
+            // F16 per token, so it is only safe for resident F32 weights. Q8
+            // projections must stay on the CPU path to avoid full per-token
+            // dequantization. The GPU kernels also assume symmetric K/V head
+            // dims and do not apply attention sink bias yet.
             // TODO: apply attention_sink_bias on GPU path (kv_attend kernel).
             return cpu_forward();
         }
@@ -2465,6 +2474,67 @@ mod tests {
             .collect()
     }
 
+    fn q8_zero_weight(rows: usize, cols: usize) -> DenseWeight {
+        let blocks = rows
+            .saturating_mul(cols)
+            .div_ceil(crate::inference::Q8_0_BLOCK_ELEMS);
+        DenseWeight::from_q8_0_bytes(
+            vec![0u8; blocks * crate::inference::Q8_0_BLOCK_BYTES],
+            rows,
+            cols,
+        )
+        .unwrap()
+    }
+
+    fn gpu_dense_path_test_attention(q8_projection: Option<&str>) -> MultiHeadSelfAttention {
+        let d_model = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let num_kv_heads = 2;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mk = |rows: usize, cols: usize| {
+            DenseWeight::from_f32(
+                (0..rows * cols)
+                    .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+                    .collect(),
+                rows,
+                cols,
+            )
+        };
+        let projection = |name: &str, rows: usize, cols: usize| {
+            if q8_projection == Some(name) {
+                q8_zero_weight(rows, cols)
+            } else {
+                mk(rows, cols)
+            }
+        };
+        MultiHeadSelfAttention {
+            d_model,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim: head_dim,
+            v_head_dim: head_dim,
+            attention_value_scale: None,
+            rope_base: 10000.0,
+            wq: projection("wq", q_dim, d_model),
+            wk: projection("wk", kv_dim, d_model),
+            wv: projection("wv", kv_dim, d_model),
+            wo: projection("wo", d_model, q_dim),
+            window_size: None,
+            q_norm: None,
+            k_norm: None,
+            rope_yarn: None,
+            rope_cache: None,
+            bq: None,
+            bk: None,
+            bv: None,
+            bo: None,
+            sink_bias: None,
+        }
+    }
+
     #[test]
     fn dense_matvec_backends_match_reference() {
         use crate::parallel::DenseMatvecBackend;
@@ -2493,6 +2563,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dense_tensor_gpu_dense_path_supported_for_all_f32_attention_projections() {
+        let attn = gpu_dense_path_test_attention(None);
+        assert!(attn.gpu_dense_path_supported());
+    }
+
+    #[test]
+    fn dense_tensor_gpu_dense_path_rejects_any_q8_attention_projection() {
+        for projection in ["wq", "wk", "wv", "wo"] {
+            let attn = gpu_dense_path_test_attention(Some(projection));
+            assert!(
+                !attn.gpu_dense_path_supported(),
+                "{projection} Q8_0 must force the CPU dense attention path"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_tensor_gpu_dense_path_check_leaves_q8_projection_storage_unchanged() {
+        let attn = gpu_dense_path_test_attention(Some("wq"));
+        let (before_ptr, before_len, before_resident_bytes) = match &attn.wq {
+            DenseWeight::Q8_0 { bytes, .. } => {
+                (bytes.as_ptr(), bytes.len(), attn.wq.resident_bytes())
+            }
+            other => panic!("expected Q8_0 wq, got {}", other.dtype()),
+        };
+
+        assert!(!attn.gpu_dense_path_supported());
+
+        let (after_ptr, after_len) = match &attn.wq {
+            DenseWeight::Q8_0 { bytes, .. } => (bytes.as_ptr(), bytes.len()),
+            other => panic!("expected Q8_0 wq after check, got {}", other.dtype()),
+        };
+        assert_eq!(after_ptr, before_ptr);
+        assert_eq!(after_len, before_len);
+        assert_eq!(attn.wq.resident_bytes(), before_resident_bytes);
+        assert_eq!(attn.wq.dtype(), DenseDType::Q8_0);
     }
 
     #[test]

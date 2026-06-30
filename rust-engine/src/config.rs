@@ -337,6 +337,12 @@ pub struct RealTransformerConfig {
     #[serde(default = "default_seed")]
     pub seed: u64,
 
+    /// Detailed per-request real-transformer stage timing. Disabled by
+    /// default because the HTTP hot path records each stage through a
+    /// mutex-protected request-local map.
+    #[serde(default)]
+    pub stage_timing_enabled: bool,
+
     /// Continuous-batching: maximum number of in-flight requests fused
     /// into a single decoder step. The background scheduler waits up to
     /// [`Self::batch_timeout_ms`] for additional requests to arrive
@@ -1191,6 +1197,10 @@ pub struct RuntimeConfig {
     /// `Config` rewrite once the access-log path is wired.
     #[allow(dead_code)]
     pub access_log_enabled: bool,
+    /// Enables request-local detailed stage timing for real-transformer
+    /// HTTP serving. When `false`, handlers do not allocate a
+    /// [`crate::stage_timing::StageTimings`] or publish stage metrics.
+    pub stage_timing_enabled: bool,
 }
 
 impl RuntimeConfig {
@@ -1202,6 +1212,7 @@ impl RuntimeConfig {
             // Default `true` matches the pre-refactor behaviour where
             // the request handlers unconditionally emitted an info log.
             access_log_enabled: true,
+            stage_timing_enabled: cfg.real_transformer.stage_timing_enabled,
         }
     }
 }
@@ -1399,6 +1410,28 @@ mod tests {
             rt.dense_matvec_backend,
             crate::parallel::DenseMatvecBackend::RayonMatrixmultiply
         );
+    }
+
+    #[test]
+    fn real_transformer_stage_timing_defaults_to_disabled() {
+        let cfg = minimal_cfg();
+        assert!(!cfg.real_transformer.stage_timing_enabled);
+        assert!(!RuntimeConfig::from_config(&cfg).stage_timing_enabled);
+    }
+
+    #[test]
+    fn real_transformer_stage_timing_can_be_enabled_from_toml() {
+        let rt: RealTransformerConfig = toml::from_str(
+            r#"
+            stage_timing_enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(rt.stage_timing_enabled);
+
+        let mut cfg = minimal_cfg();
+        cfg.real_transformer = rt;
+        assert!(RuntimeConfig::from_config(&cfg).stage_timing_enabled);
     }
 
     /// `config.toml` documents weight dtypes using lowercase strings
