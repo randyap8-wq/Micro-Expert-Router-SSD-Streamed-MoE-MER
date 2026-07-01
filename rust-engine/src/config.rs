@@ -325,6 +325,16 @@ pub struct RealTransformerConfig {
     /// inference. `bench-real` always rejects this flag.
     #[serde(default)]
     pub allow_seeded_fallback: bool,
+    /// Development-only opt-in that lets the engine substitute a zero
+    /// contribution for a routed/shared expert whose load or compute
+    /// failed, instead of failing the request (hardening pass, Part
+    /// A1). **Defaults to `false`** — strict production mode fails
+    /// closed. When set, every substitution emits a prominent warning
+    /// and bumps the `degraded_expert_substitutions` counter, marking
+    /// the run's output non-authoritative. `bench-real` rejects this
+    /// flag.
+    #[serde(default)]
+    pub allow_degraded_experts: bool,
     /// Vocab size. Must match the tokenizer when one is configured (for
     /// the byte fallback this should be 256).
     #[serde(default = "default_vocab_size")]

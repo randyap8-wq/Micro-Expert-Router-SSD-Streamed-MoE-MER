@@ -41,6 +41,7 @@ use crate::architecture::{
 };
 use crate::dense_tensor::{dense_checksum, DenseDType, DenseTensorManifest, DenseWeight};
 use crate::engine::Engine;
+use crate::engine::MoeStepError;
 use crate::gating::{LinearGate, ScoringFunc};
 use crate::mla::MultiHeadLatentAttention;
 use crate::transformer::{
@@ -650,6 +651,62 @@ impl RealModelConfig {
             first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
             advanced,
         }
+    }
+}
+
+/// Request-level error for the real-model inference path (hardening
+/// pass, Part A). Real-model methods fail closed: a corrupted or
+/// mathematically invalid step returns one of these instead of
+/// silently continuing with incomplete inference. Callers map it to an
+/// HTTP 500 (server) or a CLI error (bench) — never a panic.
+#[derive(Debug)]
+pub enum RealInferenceError {
+    /// A token id outside `[0, vocab_size)` reached real-model
+    /// embedding lookup (tokenizer/model vocabulary mismatch or caller
+    /// bug). Real inference never wraps ids with modulo.
+    InvalidTokenId { token_id: u32, vocab_size: usize },
+    /// A required routed or shared expert failed to load or execute.
+    MoeStep(MoeStepError),
+    /// An active attention/softmax row produced unexpected NaN or
+    /// infinity — numerical corruption, not a valid masked row.
+    NonFiniteSoftmax { layer: usize, pos: usize },
+    /// A scheduler-registered KV state could not be recovered; the
+    /// request must fail rather than continue on a fresh KV cache.
+    KvStateLost(String),
+}
+
+impl std::fmt::Display for RealInferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RealInferenceError::InvalidTokenId {
+                token_id,
+                vocab_size,
+            } => write!(
+                f,
+                "invalid token id {token_id}: model vocab_size is {vocab_size}"
+            ),
+            RealInferenceError::MoeStep(e) => write!(f, "moe step failed: {e}"),
+            RealInferenceError::NonFiniteSoftmax { layer, pos } => write!(
+                f,
+                "non-finite attention/softmax detected at layer {layer}, position {pos}"
+            ),
+            RealInferenceError::KvStateLost(m) => write!(f, "kv state lost: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for RealInferenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RealInferenceError::MoeStep(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<MoeStepError> for RealInferenceError {
+    fn from(e: MoeStepError) -> Self {
+        RealInferenceError::MoeStep(e)
     }
 }
 
@@ -2381,7 +2438,7 @@ impl RealModel {
         token_id: u32,
         pos: usize,
         kv: &mut [KvCache],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, RealInferenceError> {
         self.forward_token_hidden_with_timing(engine, token_id, pos, kv, None)
             .await
     }
@@ -2393,7 +2450,7 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, RealInferenceError> {
         assert_eq!(
             kv.len(),
             self.config.num_layers,
@@ -2464,7 +2521,7 @@ impl RealModel {
                     &mut layer_scratch.moe_accum,
                     timings,
                 )
-                .await;
+                .await?;
             layer.moe_accumulated_into_with_timing(
                 &x,
                 &layer_scratch.moe_accum,
@@ -2484,9 +2541,11 @@ impl RealModel {
                 next_x.clear();
             }
         }
-        crate::stage_timing::time_optional(timings, crate::stage_timing::FINAL_RMS_NORM, || {
-            self.final_rms.forward(&x)
-        })
+        Ok(crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::FINAL_RMS_NORM,
+            || self.final_rms.forward(&x),
+        ))
     }
 
     /// Sample a next-token id from an already-computed final hidden state.
@@ -2529,9 +2588,9 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
-    ) -> u32 {
-        let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await;
-        self.sample_hidden(&hidden, params, pos)
+    ) -> Result<u32, RealInferenceError> {
+        let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await?;
+        Ok(self.sample_hidden(&hidden, params, pos))
     }
 
     pub async fn decode_step_with_timing(
@@ -2542,11 +2601,11 @@ impl RealModel {
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> u32 {
+    ) -> Result<u32, RealInferenceError> {
         let hidden = self
             .forward_token_hidden_with_timing(engine, token_id, pos, kv, timings)
-            .await;
-        self.sample_hidden_with_timing(&hidden, params, pos, timings)
+            .await?;
+        Ok(self.sample_hidden_with_timing(&hidden, params, pos, timings))
     }
 
     /// Backwards-compatible alias for callers that still express a full
@@ -2558,7 +2617,7 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
-    ) -> u32 {
+    ) -> Result<u32, RealInferenceError> {
         self.decode_step(engine, token_id, pos, kv, params).await
     }
 }
@@ -4479,7 +4538,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         assert!((next as usize) < cfg.vocab_size);
         // KV caches grew by exactly one position.
         for c in &kv {
@@ -4542,7 +4602,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let t2 = model
             .step(
                 &engine,
@@ -4551,7 +4612,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         assert!((t1 as usize) < cfg.vocab_size);
         assert!((t2 as usize) < cfg.vocab_size);
         for c in &kv {
@@ -4575,7 +4637,8 @@ mod tests {
                 &mut kv1,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let t2 = model
             .step(
                 &engine,
@@ -4584,7 +4647,8 @@ mod tests {
                 &mut kv1,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
 
         let mut kv2 = model.fresh_kv_caches();
         let u1 = model
@@ -4595,7 +4659,8 @@ mod tests {
                 &mut kv2,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let u2 = model
             .step(
                 &engine,
@@ -4604,7 +4669,8 @@ mod tests {
                 &mut kv2,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
 
         assert_eq!((t1, t2), (u1, u2));
     }
@@ -4629,7 +4695,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         // Both layers contributed to KV cache growth.
         assert_eq!(kv.len(), 2);
         for c in &kv {

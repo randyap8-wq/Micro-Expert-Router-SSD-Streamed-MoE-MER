@@ -325,7 +325,7 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         k: usize,
-    ) -> SpeculativeStepResult {
+    ) -> Result<SpeculativeStepResult, crate::model::RealInferenceError> {
         let drafts = draft.draft(seed_token, k);
 
         // Phase A: warm union of expert ids predicted by the peek
@@ -382,7 +382,7 @@ impl RealModel {
         let mut cur = seed_token;
         let mut accepted_len = 0usize;
         for (i, &draft_tok) in drafts.iter().enumerate() {
-            let next = self.step(engine, cur, pos + i, kv, &greedy).await;
+            let next = self.step(engine, cur, pos + i, kv, &greedy).await?;
             accepted.push(next);
             if next != draft_tok {
                 break;
@@ -394,10 +394,10 @@ impl RealModel {
             // k == 0: still emit one verifier-produced token so
             // callers can treat `step_speculative` as a strict
             // generalisation of `step`.
-            let next = self.step(engine, seed_token, pos, kv, &greedy).await;
+            let next = self.step(engine, seed_token, pos, kv, &greedy).await?;
             accepted.push(next);
         }
-        SpeculativeStepResult { accepted, accepted_len, warmed_experts }
+        Ok(SpeculativeStepResult { accepted, accepted_len, warmed_experts })
     }
 
     /// Advance the layer-0 KV preview by one position using the draft
@@ -530,7 +530,10 @@ mod tests {
         let mut expected = Vec::new();
         let mut cur = 5u32;
         for i in 0..4 {
-            cur = main.step(&engine, cur, i, &mut kv_ref, &greedy).await;
+            cur = main
+                .step(&engine, cur, i, &mut kv_ref, &greedy)
+                .await
+                .expect("verifier step");
             expected.push(cur);
         }
 
@@ -540,7 +543,8 @@ mod tests {
         let mut kv_spec = main.fresh_kv_caches();
         let result = main
             .step_speculative(&engine, &draft, 5u32, 0, &mut kv_spec, 4)
-            .await;
+            .await
+            .expect("speculative step");
         assert!(!result.accepted.is_empty(), "must emit at least one token");
         assert!(result.accepted.len() <= 4);
         for (i, t) in result.accepted.iter().enumerate() {

@@ -895,6 +895,12 @@ pub enum BatchError {
     /// registered it, called `release` already, or the scheduler was
     /// restarted between calls.
     NotRegistered,
+    /// The model step itself failed (fail-closed real inference,
+    /// hardening pass Part A1). Unlike the scheduler-infrastructure
+    /// variants above, callers must NOT retry this on a direct path:
+    /// the failure is deterministic model/storage corruption and the
+    /// request must surface it.
+    Inference(String),
 }
 
 impl std::fmt::Display for BatchError {
@@ -904,6 +910,7 @@ impl std::fmt::Display for BatchError {
             BatchError::NotRegistered => {
                 write!(f, "request id is not registered with the scheduler")
             }
+            BatchError::Inference(m) => write!(f, "inference failed: {m}"),
         }
     }
 }
@@ -1257,17 +1264,16 @@ async fn scheduler_loop(
                 let next = {
                     let mut kv = entry.lock().await;
                     match mode {
-                        StepMode::Decode => ScheduledResponse::NextToken(
-                            model
-                                .decode_step(&engine, token_id, pos, &mut kv, &params)
-                                .await,
-                        ),
-                        StepMode::ForwardHidden => ScheduledResponse::Hidden(
-                            model
-                                .forward_token_hidden(&engine, token_id, pos, &mut kv)
-                                .await,
-                        ),
+                        StepMode::Decode => model
+                            .decode_step(&engine, token_id, pos, &mut kv, &params)
+                            .await
+                            .map(ScheduledResponse::NextToken),
+                        StepMode::ForwardHidden => model
+                            .forward_token_hidden(&engine, token_id, pos, &mut kv)
+                            .await
+                            .map(ScheduledResponse::Hidden),
                     }
+                    .map_err(|e| BatchError::Inference(e.to_string()))
                 };
                 // Drop our Arc clone *before* signalling completion
                 // so the caller's subsequent `release(id)` sees the
@@ -1278,7 +1284,7 @@ async fn scheduler_loop(
                 // step_registered → release back-to-back) could race
                 // the spawned task's natural Arc drop at end-of-task.
                 drop(entry);
-                let _ = resp.send(Ok(next));
+                let _ = resp.send(next);
             }));
         }
         for h in handles {
@@ -1450,7 +1456,8 @@ mod tests {
                 &mut kv_a,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("direct step");
 
         let kv_b = model.fresh_kv_caches();
         let resp = sched
@@ -1506,7 +1513,8 @@ mod tests {
                 &mut kv_a,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("direct step");
 
         let id = sched.register(model.fresh_kv_caches());
         assert_eq!(sched.active_requests(), 1);
@@ -1666,7 +1674,8 @@ mod tests {
                         &mut kv,
                         &crate::sampling::SamplingParams::greedy(),
                     )
-                    .await;
+                    .await
+                    .expect("sequential step");
             }
         }
         let sequential = seq_start.elapsed();
@@ -1809,7 +1818,8 @@ mod tests {
                 &mut kv_a,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("direct step");
 
         // Tag every odd global expert id remote.
         let total = (cfg.num_layers * cfg.num_experts) as u32;
