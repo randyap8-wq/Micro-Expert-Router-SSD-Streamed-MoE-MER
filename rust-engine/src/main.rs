@@ -1238,6 +1238,7 @@ fn install_run_gpu_backend(
         1, // num_heads
         1, // num_kv_heads
         1, // head_dim
+        1, // v_head_dim
         gpu_expert_cache.clone(),
     );
     if !backend_box.is_gpu() {
@@ -3404,6 +3405,12 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             num_heads,
             num_kv_heads,
             head_dim,
+            // Finding 12: the run path does not surface an asymmetric
+            // `v_head_dim` here; pass 0 (auto → head_dim). Asymmetric-V
+            // models force the CPU attention path via the eligibility guard
+            // in transformer.rs, so the symmetric GPU sizing is never used
+            // for them.
+            0,
             gpu_expert_cache.clone(),
         );
         let has_device = backend_box.is_gpu();
