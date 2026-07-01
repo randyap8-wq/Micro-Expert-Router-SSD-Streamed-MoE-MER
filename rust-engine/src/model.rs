@@ -2613,6 +2613,13 @@ impl RealModel {
         self.lm_head.sample(hidden, params, pos as u64)
     }
 
+    /// Timed variant of [`Self::sample_hidden`] (hardening pass, D3):
+    /// delegates to [`crate::transformer::LMHead::sample_with_timing`],
+    /// which is the *same* code path as the untimed sampler with
+    /// per-stage timing recorded inside each fast path. Timing on/off
+    /// therefore selects the same algorithm and returns the same
+    /// token, and timed greedy / top-K-only sampling never allocates
+    /// full logits.
     pub fn sample_hidden_with_timing(
         &self,
         hidden: &[f32],
@@ -2620,13 +2627,8 @@ impl RealModel {
         pos: usize,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> u32 {
-        let logits =
-            crate::stage_timing::time_optional(timings, crate::stage_timing::LM_HEAD, || {
-                self.lm_head.forward(hidden)
-            });
-        crate::stage_timing::time_optional(timings, crate::stage_timing::SAMPLING, || {
-            crate::sampling::sample(&logits, params, pos as u64)
-        })
+        self.lm_head
+            .sample_with_timing(hidden, params, pos as u64, timings)
     }
 
     /// Ingest one token and sample the following token. This is the

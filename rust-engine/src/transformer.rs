@@ -1754,23 +1754,55 @@ impl LMHead {
         params: &crate::sampling::SamplingParams,
         position: u64,
     ) -> u32 {
-        if params.is_greedy() {
-            return self.weights.greedy_argmax(hidden);
-        }
-        if params.top_k > 0 && !(params.top_p > 0.0 && params.top_p < 1.0) {
-            return self.sample_top_k(hidden, params, position);
-        }
-        let logits = self.forward(hidden);
-        crate::sampling::sample(&logits, params, position)
+        self.sample_with_timing(hidden, params, position, None)
     }
 
-    fn sample_top_k(
+    /// Timed variant of [`Self::sample`] (hardening pass, D3).
+    ///
+    /// Timing instrumentation lives *inside* each existing fast path,
+    /// so enabling timing never changes which sampling algorithm runs
+    /// or which token is returned:
+    ///
+    /// * greedy → fused projection+argmax (`greedy_argmax`; no full
+    ///   logits allocation), recorded under `LM_HEAD`;
+    /// * top-K without nucleus top-p → partial `top_k_logits`
+    ///   selection recorded under `LM_HEAD` (no full logits
+    ///   allocation), candidate sampling recorded under `SAMPLING`;
+    /// * everything else → full logits + generic sampler, recorded
+    ///   under `LM_HEAD` / `SAMPLING` respectively.
+    ///
+    /// `sample` is literally this function with `timings = None`, so
+    /// the timed and untimed paths cannot drift apart.
+    pub fn sample_with_timing(
         &self,
         hidden: &[f32],
         params: &crate::sampling::SamplingParams,
         position: u64,
+        timings: Option<&crate::stage_timing::StageTimings>,
     ) -> u32 {
-        let candidates = self.weights.top_k_logits(hidden, params.top_k);
+        use crate::stage_timing::{time_optional, LM_HEAD, SAMPLING};
+        if params.is_greedy() {
+            return time_optional(timings, LM_HEAD, || self.weights.greedy_argmax(hidden));
+        }
+        if params.top_k > 0 && !(params.top_p > 0.0 && params.top_p < 1.0) {
+            let candidates = time_optional(timings, LM_HEAD, || {
+                self.weights.top_k_logits(hidden, params.top_k)
+            });
+            return time_optional(timings, SAMPLING, || {
+                Self::sample_from_top_k_candidates(&candidates, params, position)
+            });
+        }
+        let logits = time_optional(timings, LM_HEAD, || self.forward(hidden));
+        time_optional(timings, SAMPLING, || {
+            crate::sampling::sample(&logits, params, position)
+        })
+    }
+
+    fn sample_from_top_k_candidates(
+        candidates: &[(usize, f32)],
+        params: &crate::sampling::SamplingParams,
+        position: u64,
+    ) -> u32 {
         if candidates.is_empty() {
             return 0;
         }
@@ -3157,6 +3189,71 @@ mod tests {
             let expected = crate::sampling::sample(&logits, &params, pos);
             let got = head.sample(&hidden, &params, pos);
             assert_eq!(got, expected, "position {pos}");
+        }
+    }
+
+    /// D3: enabling stage timing must not change algorithm selection,
+    /// the returned token, or numerical behaviour — for greedy, top-K
+    /// only, top-K + top-p (nucleus), and full-distribution sampling.
+    /// Greedy and top-K-only timed paths must record `lm_head` timing
+    /// without going through the full-logits sampler.
+    #[test]
+    fn lm_head_sample_with_timing_selects_same_algorithm_and_token() {
+        let d_model = 3;
+        let vocab = 11;
+        let weights: Vec<f32> = (0..vocab * d_model)
+            .map(|i| ((i % 13) as f32 - 6.0) / 4.0)
+            .collect();
+        let head = LMHead::new(weights, vocab, d_model);
+        let hidden = [0.4, -1.1, 0.9];
+        let param_sets = [
+            // greedy (fused argmax fast path)
+            crate::sampling::SamplingParams::greedy(),
+            // top-K only (partial-selection fast path)
+            crate::sampling::SamplingParams {
+                temperature: 0.7,
+                top_p: 1.0,
+                top_k: 4,
+                seed: 99,
+            },
+            // top-K + nucleus top-p (generic full-logits path)
+            crate::sampling::SamplingParams {
+                temperature: 0.9,
+                top_p: 0.6,
+                top_k: 4,
+                seed: 7,
+            },
+            // pure temperature sampling (generic full-logits path)
+            crate::sampling::SamplingParams {
+                temperature: 1.3,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 3,
+            },
+        ];
+        for params in &param_sets {
+            let timings = crate::stage_timing::StageTimings::default();
+            for pos in 0..32u64 {
+                let untimed = head.sample(&hidden, params, pos);
+                let timed = head.sample_with_timing(&hidden, params, pos, Some(&timings));
+                assert_eq!(
+                    timed, untimed,
+                    "timed/untimed token mismatch for params {params:?} at pos {pos}"
+                );
+            }
+            let snap = timings.snapshot();
+            let lm_head = snap.get("lm_head").expect("lm_head stage recorded");
+            assert_eq!(lm_head.count, 32, "one lm_head sample per position");
+            if params.is_greedy() {
+                // Fused argmax path: no separate sampling stage.
+                assert!(
+                    !snap.contains_key("sampling"),
+                    "greedy fast path must not record a sampling stage"
+                );
+            } else {
+                let sampling = snap.get("sampling").expect("sampling stage recorded");
+                assert_eq!(sampling.count, 32);
+            }
         }
     }
 
