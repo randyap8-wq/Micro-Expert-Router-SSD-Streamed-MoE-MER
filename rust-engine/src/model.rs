@@ -1990,22 +1990,38 @@ impl RealModel {
                 // otherwise we fall back to the inline `moe_gate` tensor.
                 tried += 1;
                 let gate_bin = format!("gate_{l}.bin");
-                let (gate_vec, gate_dtype) =
-                    if let Some(mut v) = Self::read_full_f32(&dir.join(&gate_bin)) {
-                        if v.len() < expected {
-                            (None, None)
-                        } else {
-                            v.truncate(expected);
-                            (Some(v), Some("bin_f32".to_string()))
-                        }
-                    } else {
+                let sidecar = Self::read_full_f32(&dir.join(&gate_bin));
+                let (gate_vec, gate_dtype) = match sidecar {
+                    // Accept the extracted sidecar only when its length is
+                    // *exactly* `num_experts * d_model`. Never truncate an
+                    // oversized file (Finding 8): a wrong-sized sidecar is a
+                    // corruption/mismatch signal, so warn and fall back to the
+                    // canonical inline `moe_gate` tensor instead.
+                    Some(v) if v.len() == expected => (Some(v), Some("bin_f32".to_string())),
+                    Some(v) => {
+                        warn!(
+                            file = %dir.join(&gate_bin).display(),
+                            got = v.len(),
+                            expected,
+                            "gate sidecar has wrong length; not truncating — \
+                             falling back to canonical gate tensor"
+                        );
+                        let gate_name = naming.moe_gate(l);
+                        let cv = find_f32(&gate_name, expected);
+                        let dtype = cv
+                            .as_ref()
+                            .map(|_| safetensor_source_dtype(&parsed, &gate_name));
+                        (cv, dtype)
+                    }
+                    None => {
                         let gate_name = naming.moe_gate(l);
                         let v = find_f32(&gate_name, expected);
                         let dtype = v
                             .as_ref()
                             .map(|_| safetensor_source_dtype(&parsed, &gate_name));
                         (v, dtype)
-                    };
+                    }
+                };
                 if let Some(v) = gate_vec {
                     summary.record(
                         GROUP_ROUTING_GATES,
@@ -3338,31 +3354,24 @@ fn validate_moe_gate_strict(
                 let len = meta.len() as usize;
                 let expected_bytes = expected.saturating_mul(4);
                 if len == expected_bytes {
+                    // Exact-sized extracted gate sidecar is a valid source.
                     return;
                 }
-                failures.push(WeightLoadFailure {
-                    tensor: bin_name.to_string(),
-                    group: GROUP_ROUTING_GATES,
-                    kind: if len % 4 == 0 {
-                        WeightLoadFailureKind::ShapeMismatch
-                    } else {
-                        WeightLoadFailureKind::Malformed
-                    },
-                    expected: format!("{expected} f32 elements ({expected_bytes} bytes)"),
-                    actual: Some(format!("{len} bytes")),
-                    detail: Some(
-                        "extracted gate override is present but not shape-compatible".to_string(),
-                    ),
-                });
+                // A wrong-sized sidecar is never truncated. Warn and fall
+                // through to validate the canonical safetensors gate; strict
+                // loading still succeeds if that canonical source is valid.
+                warn!(
+                    "ignoring extracted gate override {bin_name}: {len} bytes is not the \
+                     expected {expected} f32 elements ({expected_bytes} bytes); \
+                     falling back to canonical {safetensor_name}"
+                );
             }
-            Err(e) => failures.push(WeightLoadFailure {
-                tensor: bin_name.to_string(),
-                group: GROUP_ROUTING_GATES,
-                kind: WeightLoadFailureKind::Unreadable,
-                expected: format!("{expected} f32 elements"),
-                actual: None,
-                detail: Some(e.to_string()),
-            }),
+            Err(e) => {
+                warn!(
+                    "ignoring unreadable extracted gate override {bin_name}: {e}; \
+                     falling back to canonical {safetensor_name}"
+                );
+            }
         }
     }
 
@@ -5352,6 +5361,101 @@ mod tests {
         assert!(model.lm_head.weights.iter().all(|x| x == 0.12));
         assert!(model.layers[0].attn.wq.iter().all(|x| x == 0.21));
         assert_eq!(model.layers[0].gate.num_experts, cfg.num_experts);
+    }
+
+    // ---- Finding 8: gate sidecar must never be truncated ----
+
+    /// Load a complete tiny-Mixtral safetensors checkpoint plus a
+    /// `gate_0.bin` sidecar of the given length/value and return the
+    /// resolved router-gate weights so tests can prove which source was used.
+    /// The canonical safetensors gate has value 0.31; a sidecar written here
+    /// uses a distinct value.
+    fn load_with_gate_sidecar(sidecar_len: usize, sidecar_val: f32) -> Vec<f32> {
+        let cfg = tiny_mixtral_loader_cfg();
+        let dir = TempDir::new("gate_sidecar");
+        write_safetensors_f32(&dir, complete_tiny_mixtral_specs(&cfg));
+        write_bin(&dir.path.join("gate_0.bin"), &vec![sidecar_val; sidecar_len]);
+        let model = RealModel::from_safetensors_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .unwrap();
+        model.layers[0].gate.weights.iter().collect()
+    }
+
+    #[test]
+    fn exact_sized_gate_sidecar_is_preferred() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let expected = cfg.num_experts * cfg.d_model;
+        let gate = load_with_gate_sidecar(expected, 0.77);
+        assert!(
+            gate.iter().all(|&x| (x - 0.77).abs() < 1e-6),
+            "exact-sized sidecar (0.77) must be preferred over the canonical gate (0.31)"
+        );
+    }
+
+    #[test]
+    fn oversized_gate_sidecar_is_not_truncated_and_falls_back_to_canonical() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let expected = cfg.num_experts * cfg.d_model;
+        // One extra expert-row worth of data: must NOT be truncated to fit.
+        let gate = load_with_gate_sidecar(expected + cfg.d_model, 0.77);
+        assert!(
+            gate.iter().all(|&x| (x - 0.31).abs() < 1e-6),
+            "oversized sidecar must be rejected (not truncated); canonical gate (0.31) is used"
+        );
+    }
+
+    #[test]
+    fn undersized_gate_sidecar_falls_back_to_canonical() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let expected = cfg.num_experts * cfg.d_model;
+        let gate = load_with_gate_sidecar(expected - 1, 0.77);
+        assert!(
+            gate.iter().all(|&x| (x - 0.31).abs() < 1e-6),
+            "undersized sidecar must fall back to the canonical gate (0.31)"
+        );
+    }
+
+    #[test]
+    fn wrong_gate_sidecar_without_canonical_fails_strict_loading() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let expected = cfg.num_experts * cfg.d_model;
+        let dir = TempDir::new("gate_sidecar_no_canonical");
+        // Complete checkpoint minus the canonical MoE gate tensor.
+        let specs: Vec<_> = complete_tiny_mixtral_specs(&cfg)
+            .into_iter()
+            .filter(|(name, _, _)| *name != cfg.tensor_naming().moe_gate(0))
+            .collect();
+        write_safetensors_f32(&dir, specs);
+        // Oversized sidecar — must not be truncated to satisfy the gate.
+        write_bin(
+            &dir.path.join("gate_0.bin"),
+            &vec![0.77f32; expected + cfg.d_model],
+        );
+        let err = match RealModel::from_safetensors_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        ) {
+            Ok(_) => panic!("wrong-sized sidecar with no canonical gate must fail strict loading"),
+            Err(err) => err,
+        };
+        let strict = strict_error(&err);
+        assert!(
+            strict
+                .failures()
+                .iter()
+                .any(|f| f.group == GROUP_ROUTING_GATES),
+            "missing valid router gate must be reported under strict loading"
+        );
     }
 
     /// `from_dir` must pick up the GGUF-extractor shared-expert `.bin`
