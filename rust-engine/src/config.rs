@@ -335,6 +335,17 @@ pub struct RealTransformerConfig {
     /// flag.
     #[serde(default)]
     pub allow_degraded_experts: bool,
+    /// Development-only opt-in that re-enables the legacy tolerance for
+    /// quantised expert payloads that arrive up to one block alignment
+    /// (page) short of the exact logical size, zero-filling the missing
+    /// tail (hardening pass, Part A2). **Defaults to `false`** — strict
+    /// production mode requires the exact logical payload size and
+    /// never synthesizes missing weight bytes as zeros. The historical
+    /// root cause (a `model.expert_size` excluding the converter's UTH
+    /// page) is now rejected at startup, so this flag exists only for
+    /// legacy development datasets. `bench-real` rejects this flag.
+    #[serde(default)]
+    pub allow_truncated_expert_payloads: bool,
     /// Vocab size. Must match the tokenizer when one is configured (for
     /// the byte fallback this should be 256).
     #[serde(default = "default_vocab_size")]

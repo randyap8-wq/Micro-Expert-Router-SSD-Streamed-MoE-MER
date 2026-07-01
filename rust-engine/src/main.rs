@@ -2203,6 +2203,13 @@ async fn build_bench_real_runtime(
                 .into(),
         );
     }
+    if cfg.real_transformer.allow_truncated_expert_payloads {
+        return Err(
+            "bench-real rejects real_transformer.allow_truncated_expert_payloads = true; \
+             zero-filled truncated expert payloads are not production measurements"
+                .into(),
+        );
+    }
     if !cfg.real_transformer.strict_weights {
         return Err(
             "bench-real requires real_transformer.strict_weights = true; a benchmark that may \
@@ -2264,6 +2271,10 @@ async fn build_bench_real_runtime(
     if !storage.is_packed() {
         storage.warmup_fds(0..total_experts_for_files)?;
     }
+    // Root-cause guard (hardening pass, Part A2): reject an
+    // `expert_size` that disagrees with the on-disk file layout before
+    // any truncated payload can be read.
+    storage.validate_expert_file_layout(0..total_experts_for_files.min(8))?;
 
     let pipeline_depth = cfg.storage.pipeline_depth.max(1) as usize;
     let shadow_slots = cfg.storage.predict_fanout.saturating_mul(pipeline_depth);
@@ -3495,6 +3506,10 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     if !storage.is_packed() {
         storage.warmup_fds(0..total_experts)?;
     }
+    // Root-cause guard (hardening pass, Part A2): reject an
+    // `expert_size` that disagrees with the on-disk file layout before
+    // any truncated payload can be read.
+    storage.validate_expert_file_layout(0..total_experts.min(8))?;
 
     // Double-buffered pool (Parts 1–2): split the RAM buffers into a
     // **primary** (Buffer A) half that backs the resident LRU plus one
@@ -3589,6 +3604,15 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                  NON-AUTHORITATIVE (see degraded_expert_substitutions)."
             );
         }
+        if rt.allow_truncated_expert_payloads {
+            warn!(
+                "TRUNCATED-PAYLOAD TOLERANCE ENABLED: \
+                 real_transformer.allow_truncated_expert_payloads = true — quantised expert \
+                 payloads up to one page short are zero-filled instead of failing the \
+                 request. Output is NON-AUTHORITATIVE."
+            );
+        }
+        crate::inference::set_allow_truncated_expert_payloads(rt.allow_truncated_expert_payloads);
         let head_dim = if rt.head_dim == 0 {
             cfg.model.d_model / rt.num_heads
         } else {
