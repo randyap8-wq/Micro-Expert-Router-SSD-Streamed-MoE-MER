@@ -3493,6 +3493,25 @@ mod tests {
         (n_heads * head_dim, n_kv_heads * head_dim)
     }
 
+    /// Dense-tensor emission knobs for the synthetic GGUF builder. Defaults
+    /// reproduce the historical fixture (independent `output.weight`, no tie
+    /// metadata); tests toggle these to exercise the tied-output contract and
+    /// the fail-closed untied path (Finding 5).
+    #[derive(Clone, Copy)]
+    struct SynthDenseKnobs {
+        emit_output: bool,
+        tie_word_embeddings: bool,
+    }
+
+    impl Default for SynthDenseKnobs {
+        fn default() -> Self {
+            Self {
+                emit_output: true,
+                tie_word_embeddings: false,
+            }
+        }
+    }
+
     fn build_synth_gguf(d_model: usize, d_ff: usize, num_experts: usize) -> Vec<u8> {
         build_synth_gguf_arch(d_model, d_ff, num_experts, "llama")
     }
@@ -3507,7 +3526,7 @@ mod tests {
         num_experts: usize,
         arch: &str,
     ) -> Vec<u8> {
-        build_synth_gguf_arch_ext(d_model, d_ff, num_experts, arch, None)
+        build_synth_gguf_arch_ext(d_model, d_ff, num_experts, arch, None, SynthDenseKnobs::default())
     }
 
     /// Like [`build_synth_gguf_arch`] but, when `dense_ffl` is `Some`,
@@ -3521,17 +3540,26 @@ mod tests {
         num_experts: usize,
         arch: &str,
         dense_ffl: Option<usize>,
+        knobs: SynthDenseKnobs,
     ) -> Vec<u8> {
         let d_ff = expert_d_ff;
         use crate::gguf::GGUF_MAGIC;
+        // Architectures on the QK-Norm contract (Qwen3 / Qwen3-MoE) additionally
+        // require per-head `attn_q_norm`/`attn_k_norm` tensors and the head-count
+        // metadata used to validate their length.
+        let uses_qk_norm = resolve_conversion_profile(Some(arch)).uses_qk_norm;
+        let qk_head_dim = if d_model % 2 == 0 { 2 } else { 1 };
+        let head_count = (d_model / qk_head_dim).max(1);
         let mut out = Vec::new();
         out.extend_from_slice(GGUF_MAGIC);
         out.extend_from_slice(&3u32.to_le_bytes()); // version
                                                     // tensor_count: per layer we emit the attention projections
                                                     // (q,k,v,o), attn_norm, ffn_norm and the routed gate (7 dense)
-                                                    // plus 3*num_experts FFN, and 3 model-global tensors.
-        let per_layer_tensors = 7 + 3 * num_experts;
-        let total_tensors = 3 /* token_embd, output_norm, output */ + per_layer_tensors;
+                                                    // plus 3*num_experts FFN, and 2-3 model-global tensors. QK-Norm
+                                                    // architectures add attn_q_norm/attn_k_norm (2 more) per layer.
+        let per_layer_tensors = 7 + 3 * num_experts + if uses_qk_norm { 2 } else { 0 };
+        let dense_global = if knobs.emit_output { 3 } else { 2 };
+        let total_tensors = dense_global /* token_embd, output_norm, [output] */ + per_layer_tensors;
         out.extend_from_slice(&(total_tensors as u64).to_le_bytes());
         // metadata
         let kvs: Vec<(&str, u32, Vec<u8>)> = vec![
@@ -3572,6 +3600,20 @@ mod tests {
                     leak_str(format!("{arch}.expert_feed_forward_length")),
                     4,
                     (expert_d_ff as u32).to_le_bytes().to_vec(),
+                ));
+            }
+            if knobs.tie_word_embeddings {
+                // GGUF bool metadata (type 7): single byte payload. The
+                // converter reads the `general.tie_word_embeddings` flag.
+                kvs.push(("general.tie_word_embeddings", 7, vec![1u8]));
+            }
+            if uses_qk_norm {
+                // Head count lets the converter derive head_dim (d_model /
+                // head_count) to validate QK-Norm vector length.
+                kvs.push((
+                    leak_str(format!("{arch}.attention.head_count")),
+                    4,
+                    (head_count as u32).to_le_bytes().to_vec(),
                 ));
             }
             kvs
@@ -3654,16 +3696,18 @@ mod tests {
             ggml_dtype::F32,
             vec![1.0; d_model],
         );
-        push_tensor(
-            &mut out,
-            &mut tensor_data_blobs,
-            &mut tensor_offsets,
-            &mut cur_off,
-            "output.weight",
-            &[d_model as u64, vocab as u64],
-            ggml_dtype::F32,
-            vec![0.06; vocab * d_model],
-        );
+        if knobs.emit_output {
+            push_tensor(
+                &mut out,
+                &mut tensor_data_blobs,
+                &mut tensor_offsets,
+                &mut cur_off,
+                "output.weight",
+                &[d_model as u64, vocab as u64],
+                ggml_dtype::F32,
+                vec![0.06; vocab * d_model],
+            );
+        }
         // Attention projections with logically-consistent GQA shapes.
         let (q_dim, kv_dim) = synth_qkv_dims(d_model);
         push_tensor(
@@ -3716,6 +3760,29 @@ mod tests {
             ggml_dtype::F32,
             vec![1.0; d_model],
         );
+        if uses_qk_norm {
+            // Per-head QK-Norm vectors: exactly `head_dim` elements each.
+            push_tensor(
+                &mut out,
+                &mut tensor_data_blobs,
+                &mut tensor_offsets,
+                &mut cur_off,
+                "blk.0.attn_q_norm.weight",
+                &[qk_head_dim as u64],
+                ggml_dtype::F32,
+                vec![1.0; qk_head_dim],
+            );
+            push_tensor(
+                &mut out,
+                &mut tensor_data_blobs,
+                &mut tensor_offsets,
+                &mut cur_off,
+                "blk.0.attn_k_norm.weight",
+                &[qk_head_dim as u64],
+                ggml_dtype::F32,
+                vec![1.0; qk_head_dim],
+            );
+        }
         // Routed gate: logical `[num_experts, d_model]` (GGUF shape [d_model, E]).
         push_tensor(
             &mut out,
@@ -3858,6 +3925,7 @@ mod tests {
             num_experts,
             "qwen2moe",
             Some(dense_ffl),
+            SynthDenseKnobs::default(),
         );
         let tmp = tempfile_dir();
         let gguf_path = tmp.join("synth.gguf");
@@ -3876,6 +3944,197 @@ mod tests {
             meta["d_ff"], expert_d_ff,
             "MoE conversion must use expert_feed_forward_length"
         );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Finding 6: an unknown `general.architecture` is not on the conversion
+    /// allowlist and must fail closed instead of being silently treated as a
+    /// generic separate-QKV llama-like checkpoint.
+    #[test]
+    fn convert_unknown_architecture_fails_closed() {
+        let bytes = build_synth_gguf_arch_ext(
+            4,
+            8,
+            2,
+            "totally_unknown_arch",
+            None,
+            SynthDenseKnobs::default(),
+        );
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+        let out = tmp.join("unknown");
+        let err = extract_experts_from_source(&gguf, &out, 1, 2, ExtractOptions::default())
+            .expect_err("unknown architecture must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        assert!(
+            err.to_string().contains("not a recognised convertible architecture"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Finding 6: an explicit safe separate-QKV `arch_override` rescues an
+    /// otherwise-unrecognised checkpoint, letting the operator convert a
+    /// llama-like export whose `general.architecture` is not on the allowlist.
+    #[test]
+    fn convert_unknown_architecture_rescued_by_override() {
+        let bytes = build_synth_gguf_arch_ext(
+            4,
+            8,
+            2,
+            "totally_unknown_arch",
+            None,
+            SynthDenseKnobs::default(),
+        );
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+        let out = tmp.join("override");
+        let report = extract_experts_from_source(
+            &gguf,
+            &out,
+            1,
+            2,
+            ExtractOptions {
+                arch_override: Some("llama".to_string()),
+                ..ExtractOptions::default()
+            },
+        )
+        .expect("safe separate-QKV override converts");
+        assert_eq!(report.experts_written, 2);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Finding 6: recognised fused-QKV families (Phi) use an attention tensor
+    /// set the expert extractor cannot satisfy, so conversion fails with an
+    /// architecture-specific error rather than demanding nonexistent separate
+    /// Q/K/V tensors.
+    #[test]
+    fn convert_fused_qkv_architecture_is_unsupported() {
+        let bytes = build_synth_gguf_arch_ext(4, 8, 2, "phi3", None, SynthDenseKnobs::default());
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+        let out = tmp.join("phi3");
+        let err = extract_experts_from_source(&gguf, &out, 1, 2, ExtractOptions::default())
+            .expect_err("fused-QKV architecture is unsupported");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        assert!(err.to_string().contains("fused QKV"), "{err}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Finding 5: Qwen3-MoE ships no `output.weight` and duplicates the token
+    /// embedding — tying is established by the architecture GGUF contract even
+    /// with no `tie_word_embeddings` metadata flag. Conversion must succeed and
+    /// record a tied LM-head manifest entry pointing at `token_embd.weight`.
+    #[test]
+    fn convert_qwen3_moe_ties_output_by_contract() {
+        let bytes = build_synth_gguf_arch_ext(
+            4,
+            8,
+            2,
+            "qwen3moe",
+            None,
+            SynthDenseKnobs {
+                emit_output: false,
+                tie_word_embeddings: false,
+            },
+        );
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+        let out = tmp.join("qwen3moe");
+        extract_experts_from_source(&gguf, &out, 1, 2, ExtractOptions::default())
+            .expect("qwen3-moe tied-by-contract conversion succeeds");
+        let manifest: DenseTensorManifest = serde_json::from_slice(
+            &fs::read(out.join("dense_manifest.json")).expect("manifest written"),
+        )
+        .expect("manifest parses");
+        let head = manifest
+            .tensors
+            .iter()
+            .find(|t| t.canonical_name == "output.weight")
+            .expect("output.weight manifest entry present");
+        assert_eq!(
+            head.tied_to.as_deref(),
+            Some("token_embd.weight"),
+            "LM head must be tied to token embedding by architecture contract"
+        );
+        assert_eq!(head.byte_len, 0, "tied head writes no weight bytes");
+        assert!(
+            !out.join("lm_head.bin").exists(),
+            "tied head must not materialise a weight file"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Finding 5: a recognised *untied* architecture (Mixtral) that is missing
+    /// `output.weight` with no tie metadata is a fatal partial conversion —
+    /// tying is never inferred from absence alone.
+    #[test]
+    fn convert_untied_architecture_missing_output_fails() {
+        let bytes = build_synth_gguf_arch_ext(
+            4,
+            8,
+            2,
+            "mixtral",
+            None,
+            SynthDenseKnobs {
+                emit_output: false,
+                tie_word_embeddings: false,
+            },
+        );
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+        let out = tmp.join("mixtral-untied");
+        let err = extract_experts_from_source(&gguf, &out, 1, 2, ExtractOptions::default())
+            .expect_err("untied architecture missing output.weight must fail");
+        assert!(
+            err.to_string().contains("embedding tying is not established"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Finding 5: an untied architecture missing `output.weight` but carrying an
+    /// explicit `tie_word_embeddings = true` metadata flag ties by metadata.
+    #[test]
+    fn convert_untied_architecture_ties_by_metadata_flag() {
+        let bytes = build_synth_gguf_arch_ext(
+            4,
+            8,
+            2,
+            "mixtral",
+            None,
+            SynthDenseKnobs {
+                emit_output: false,
+                tie_word_embeddings: true,
+            },
+        );
+        let tmp = tempfile_dir();
+        let gguf_path = tmp.join("synth.gguf");
+        fs::write(&gguf_path, &bytes).unwrap();
+        let gguf = GgufFile::open(&gguf_path).expect("parse");
+        let out = tmp.join("mixtral-tied-meta");
+        extract_experts_from_source(&gguf, &out, 1, 2, ExtractOptions::default())
+            .expect("tie_word_embeddings metadata establishes tying");
+        let manifest: DenseTensorManifest = serde_json::from_slice(
+            &fs::read(out.join("dense_manifest.json")).expect("manifest written"),
+        )
+        .expect("manifest parses");
+        let head = manifest
+            .tensors
+            .iter()
+            .find(|t| t.canonical_name == "output.weight")
+            .expect("output.weight manifest entry present");
+        assert_eq!(head.tied_to.as_deref(), Some("token_embd.weight"));
         let _ = fs::remove_dir_all(&tmp);
     }
 
