@@ -6,6 +6,8 @@
 //! * `mer_tokens_generated_total` — total tokens generated server-wide
 //! * `mer_cache_hits_total`, `mer_cache_misses_total` — expert cache stats
 //! * `mer_io_wait_seconds` — histogram of per-token critical-path I/O wait
+//! * `mer_nonfinite_softmax_fallbacks` — attention-softmax non-finite fallbacks
+//!   (gauge, mirrored from a process-wide atomic)
 //!
 //! All counters are mirrored from the engine's existing atomic counters
 //! (so the Prometheus snapshot is always consistent with `engine.report()`).
@@ -100,6 +102,14 @@ struct MetricsInner {
     /// Expert activations that fell back from the GPU fast path to the
     /// CPU path because the VRAM dispatch errored.
     pub gpu_cpu_fallbacks_total: Counter,
+    /// **Gauge** mirroring the process-wide cumulative count of
+    /// attention-softmax non-finite fallbacks
+    /// ([`crate::transformer::nonfinite_softmax_fallbacks`]). Refreshed from
+    /// the global atomic at scrape time. Distinct from router filtering of
+    /// non-finite gate scores. A nonzero (or increasing) value indicates the
+    /// attention path substituted a uniform distribution for a
+    /// `NaN`/`±inf`/fully-masked row.
+    pub nonfinite_softmax_fallbacks: IntGauge,
 }
 
 impl Default for Metrics {
@@ -279,6 +289,12 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_gpu_cpu_fallbacks_total");
+        let nonfinite_softmax_fallbacks = register_int_gauge_with_registry!(
+            "mer_nonfinite_softmax_fallbacks",
+            "Cumulative attention-softmax non-finite (NaN/inf/fully-masked) fallbacks to a uniform distribution. Distinct from router non-finite score filtering.",
+            registry
+        )
+        .expect("metric registration: mer_nonfinite_softmax_fallbacks");
         Self {
             inner: Arc::new(MetricsInner {
                 registry,
@@ -306,6 +322,7 @@ impl Metrics {
                 prefetch_dropped_pool_starved_total,
                 speculator_disabled_total,
                 gpu_cpu_fallbacks_total,
+                nonfinite_softmax_fallbacks,
             }),
         }
     }
@@ -464,6 +481,10 @@ impl Metrics {
     /// Render the registry to a Prometheus text-format payload (the body
     /// of `GET /metrics`).
     pub fn render(&self) -> Result<Vec<u8>, prometheus::Error> {
+        // Refresh gauges mirrored from process-wide atomics at scrape time.
+        self.inner
+            .nonfinite_softmax_fallbacks
+            .set(crate::transformer::nonfinite_softmax_fallbacks() as i64);
         let metric_families = self.inner.registry.gather();
         let mut buf = Vec::new();
         TextEncoder::new().encode(&metric_families, &mut buf)?;
@@ -531,6 +552,7 @@ mod tests {
             "mer_prefetch_dropped_pool_starved_total",
             "mer_speculator_disabled_total",
             "mer_gpu_cpu_fallbacks_total",
+            "mer_nonfinite_softmax_fallbacks",
         ] {
             assert!(
                 body.contains(name),

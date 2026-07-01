@@ -1525,6 +1525,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
             let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
                 .await?;
         }
+        let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
         for i in 0..args.measured_runs {
             runs.push(
@@ -1532,6 +1533,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
                     .await?,
             );
         }
+        assert_no_softmax_fallbacks(softmax_before)?;
         emit_bench_real_report(&args, input, runs)?;
     } else {
         for i in 0..args.warmup_runs {
@@ -1540,6 +1542,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
             let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
                 .await?;
         }
+        let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
         for i in 0..args.measured_runs {
             let runtime = build_bench_real_runtime(&args.config).await?;
@@ -1549,7 +1552,25 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
                     .await?,
             );
         }
+        assert_no_softmax_fallbacks(softmax_before)?;
         emit_bench_real_report(&args, input, runs)?;
+    }
+    Ok(())
+}
+
+/// Strict real-model benchmarks must not emit attention-softmax non-finite
+/// fallbacks: any increase over the measured window signals a numerically
+/// invalid run (a `NaN`/`inf` propagated into attention), so the benchmark is
+/// rejected rather than reporting a valid-looking throughput (gist Finding 9).
+fn assert_no_softmax_fallbacks(before: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let delta = crate::transformer::nonfinite_softmax_fallbacks().saturating_sub(before);
+    if delta > 0 {
+        return Err(format!(
+            "bench-real INVALID: {delta} attention-softmax non-finite fallback(s) occurred during \
+             the measured window; the run produced NaN/inf attention scores and is not a valid \
+             measurement"
+        )
+        .into());
     }
     Ok(())
 }
@@ -5609,6 +5630,20 @@ fn json_get_u32_array(line: &str, key: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bench_real_validity_detects_softmax_fallback_delta() {
+        // Snapshot then force a fallback: the current count only grows, so a
+        // check against the pre-snapshot baseline must report the run invalid.
+        // This is robust under concurrent tests because the counter is
+        // monotonic.
+        let snapshot = crate::transformer::nonfinite_softmax_fallbacks();
+        crate::transformer::record_nonfinite_softmax_fallback();
+        assert!(
+            assert_no_softmax_fallbacks(snapshot).is_err(),
+            "a nonzero softmax-fallback delta must invalidate the benchmark"
+        );
+    }
 
     #[test]
     fn parses_basic_json_numbers() {
