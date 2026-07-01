@@ -957,6 +957,36 @@ fn extract_experts_from_source_inner(
                     format!("rms_moe_{layer}.bin"),
                 ],
             )?;
+            // Qwen3 / Qwen3-MoE per-head QK-Norm: learned `head_dim` RMSNorm
+            // weights applied to Q and K before RoPE. Emitted under the
+            // engine-friendly `q_norm_{layer}.bin` / `k_norm_{layer}.bin`
+            // aliases consumed by the converted-directory loader. Absent for
+            // architectures without QK-Norm (e.g. Mixtral); only attempt
+            // extraction when at least one of the Q/K norm tensors is present
+            // for this layer so non-QK-Norm conversions don't inflate the
+            // reported `skipped` count.
+            let q_norm_name = format!("blk.{layer}.attn_q_norm.weight");
+            let k_norm_name = format!("blk.{layer}.attn_k_norm.weight");
+            if gguf.tensor_info(&q_norm_name).is_some()
+                || gguf.tensor_info(&k_norm_name).is_some()
+            {
+                emit_dense_manifest_tensor(
+                    gguf,
+                    out_dir,
+                    &mut report,
+                    &mut dense_manifest,
+                    &q_norm_name,
+                    vec![format!("q_norm_{layer}.bin")],
+                )?;
+                emit_dense_manifest_tensor(
+                    gguf,
+                    out_dir,
+                    &mut report,
+                    &mut dense_manifest,
+                    &k_norm_name,
+                    vec![format!("k_norm_{layer}.bin")],
+                )?;
+            }
             emit_dense_manifest_tensor(
                 gguf,
                 out_dir,
@@ -2627,6 +2657,97 @@ mod tests {
         assert_eq!(entry.checksum.as_ref().unwrap(), &dense_checksum(&q8));
         assert_eq!(fs::read(tmp.join(&entry.file)).unwrap(), q8);
         assert!(!tmp.join("embed.bin").exists());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The GGUF converter must extract Qwen QK-Norm tensors
+    /// (`blk.{L}.attn_q_norm.weight` / `attn_k_norm.weight`) into the dense
+    /// manifest under the engine aliases `q_norm_{L}.bin` / `k_norm_{L}.bin`.
+    #[test]
+    fn dense_manifest_emits_qk_norm_engine_aliases() {
+        struct FakeSource {
+            tensors: std::collections::HashMap<String, GgufTensorInfo>,
+            data: std::collections::HashMap<String, Vec<u8>>,
+            metadata: std::collections::HashMap<String, GgufValue>,
+        }
+        impl GgufSource for FakeSource {
+            fn metadata(&self) -> &std::collections::HashMap<String, GgufValue> {
+                &self.metadata
+            }
+            fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
+                self.tensors.get(name)
+            }
+            fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+                Ok(self.data.get(name).cloned())
+            }
+        }
+
+        let head_dim = 4usize;
+        let canonical = "blk.0.attn_q_norm.weight".to_string();
+        let values: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 * 0.1).collect();
+        let bytes = f32_vec_to_le_bytes(&values);
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert(
+            canonical.clone(),
+            GgufTensorInfo {
+                name: canonical.clone(),
+                shape: vec![head_dim as u64],
+                ggml_dtype: ggml_dtype::F32,
+                offset: 0,
+                byte_len: bytes.len() as u64,
+            },
+        );
+        let mut data = std::collections::HashMap::new();
+        data.insert(canonical.clone(), bytes.clone());
+        let source = FakeSource {
+            tensors,
+            data,
+            metadata: std::collections::HashMap::new(),
+        };
+        let tmp = tempfile_dir();
+        let mut report = ExtractionReport {
+            experts_written: 0,
+            dense_written: 0,
+            skipped: 0,
+            total_bytes: 0,
+            expert_dtype: WeightDtype::F32,
+            d_model: head_dim,
+            d_ff: 0,
+            num_experts_per_layer: 0,
+            num_layers: 0,
+        };
+        let mut manifest = DenseTensorManifest {
+            format_version: 1,
+            tensors: Vec::new(),
+        };
+        emit_dense_manifest_tensor(
+            &source,
+            &tmp,
+            &mut report,
+            &mut manifest,
+            &canonical,
+            vec!["q_norm_0.bin".to_string()],
+        )
+        .unwrap();
+        // A missing K-Norm (absent from the source) is skipped, not fatal.
+        emit_dense_manifest_tensor(
+            &source,
+            &tmp,
+            &mut report,
+            &mut manifest,
+            "blk.0.attn_k_norm.weight",
+            vec!["k_norm_0.bin".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(manifest.tensors.len(), 1, "only q_norm should be emitted");
+        let entry = &manifest.tensors[0];
+        assert_eq!(entry.canonical_name, canonical);
+        assert_eq!(entry.aliases, vec!["q_norm_0.bin".to_string()]);
+        assert_eq!(entry.dtype, DenseDType::F32);
+        assert_eq!(entry.dims, vec![head_dim, 1]);
+        assert_eq!(entry.checksum.as_ref().unwrap(), &dense_checksum(&bytes));
+        assert_eq!(fs::read(tmp.join(&entry.file)).unwrap(), bytes);
         let _ = fs::remove_dir_all(&tmp);
     }
 

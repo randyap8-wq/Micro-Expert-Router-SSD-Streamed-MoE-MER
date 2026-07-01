@@ -18,6 +18,8 @@ Implemented and committed:
 | Area | Status |
 |---|---|
 | Strict real checkpoint loading | Complete. Production strict mode aggregates missing, malformed, unsupported, and shape-mismatched tensors instead of silently retaining seeded fallback weights. |
+| Converted Qwen3 QK-Norm | Complete. GGUF conversion now extracts the per-head `blk.{L}.attn_q_norm.weight` / `attn_k_norm.weight` tensors into `dense_manifest.json` under the `q_norm_{L}.bin` / `k_norm_{L}.bin` engine aliases, and the converted-directory loader strict-loads them for architectures where `uses_qk_norm()` is true. Missing/malformed/wrong-shape QK-Norm is reported (not silently seeded); non-QK-Norm families such as Mixtral are unaffected. |
+| Checkpoint config reconciliation | Complete. An explicit `[real_transformer].architecture` no longer prevents reading `config.json`: when present it is always parsed so checkpoint-specific advanced fields (`norm_topk_prob`, `scoring_func`, `routed_scaling_factor`, `n_group`, `topk_group`, `num_shared_experts`, `rope_scaling`, …) and model dimensions are reconciled from the checkpoint. A TOML architecture that disagrees with the checkpoint is now a hard configuration error rather than a silent override. |
 | Prompt/decode semantics | Complete. Real-model prompt ingestion evaluates the model `P + C - 1` times and evaluates the LM head only for completion tokens. |
 | Real benchmark harness | Complete. `bench-real` reports prompt/decode TPS, forward counts, cache stats, SSD bytes/stall, stage timing snapshots, RSS, thread count, build features, and git commit. |
 | Stage timing metrics | Complete. HTTP serving now keeps detailed stage timing opt-in, while `bench-real` continues to collect detailed stage timings for benchmark runs. |
