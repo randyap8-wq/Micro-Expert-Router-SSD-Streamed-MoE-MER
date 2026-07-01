@@ -1414,6 +1414,42 @@ impl RealModel {
             None
         };
 
+        // Finding 3: like `find_f32`, but additionally rejects a 2-D tensor
+        // whose stored shape is the transpose of the expected `[rows, cols]`
+        // orientation (detectable for non-square matrices even when the
+        // element count matches). 1-D vectors remain accepted for documented
+        // vector compatibility.
+        let find_f32_2d = |name: &str, rows: usize, cols: usize| -> Option<Vec<f32>> {
+            for st in &parsed {
+                if let Ok(view) = st.tensor(name) {
+                    let shape = view.shape();
+                    let n_elem: usize = shape.iter().product();
+                    let expected = rows.saturating_mul(cols);
+                    if n_elem != expected {
+                        warn!(
+                            tensor = name,
+                            have = n_elem,
+                            need = expected,
+                            "safetensors shape mismatch; falling back to seeded init"
+                        );
+                        return None;
+                    }
+                    if !safetensor_orientation_ok(shape, rows, cols) {
+                        warn!(
+                            tensor = name,
+                            shape = ?shape,
+                            rows,
+                            cols,
+                            "safetensors tensor is transposed/misshaped; falling back to seeded init"
+                        );
+                        return None;
+                    }
+                    return Some(decode_safetensor_to_f32(&view, name));
+                }
+            }
+            None
+        };
+
         // FP8 `ignored_layers` (MiMo-V2-Flash): tensors listed in
         // `quantization_config.ignored_layers` (all `self_attn.o_proj`) are
         // stored as BF16, not FP8. The block-dequant closures below must
@@ -1715,6 +1751,19 @@ impl RealModel {
                 }
             }};
         }
+        // Finding 3: 2-D matrix variant that enforces `[rows, cols]`
+        // orientation in addition to the element-count check.
+        macro_rules! maybe2d {
+            ($group:expr, $name:expr, $rows:expr, $cols:expr, $assign:expr) => {{
+                tried += 1;
+                let name = $name;
+                if let Some(v) = find_f32_2d(name, $rows, $cols) {
+                    summary.record($group, safetensor_source_dtype(&parsed, name), v.len() * 4);
+                    $assign(v);
+                    loaded += 1;
+                }
+            }};
+        }
         // FP8 dequant happens via `find_f32_dequant` / `find_f32_any`
         // directly (e.g. in `load_mla_layer`); no extra macro needed.
 
@@ -1727,10 +1776,11 @@ impl RealModel {
         // count); the output width is `num_heads * v_head_dim` for all layers.
         let attn_out_dim = config.num_heads * config.v_head_dim();
 
-        maybe!(
+        maybe2d!(
             GROUP_EMBEDDING,
             &naming.embed(),
-            config.vocab_size * d_model,
+            config.vocab_size,
+            d_model,
             |v| {
                 model.embedding = DenseWeight::from_f32(v, config.vocab_size, d_model);
             }
@@ -1738,10 +1788,11 @@ impl RealModel {
         maybe!(GROUP_NORMS, &naming.final_norm(), d_model, |v| {
             model.final_rms = RmsNorm::new(v, config.rms_eps);
         });
-        maybe!(
+        maybe2d!(
             GROUP_LM_HEAD,
             &naming.lm_head(),
-            config.vocab_size * d_model,
+            config.vocab_size,
+            d_model,
             |v| {
                 model.lm_head = LMHead::new(v, config.vocab_size, d_model);
             }
@@ -1793,7 +1844,7 @@ impl RealModel {
                 // row-major) that we split into separate Q/K/V weights.
                 tried += 1;
                 let qkv_name = naming.attn_qkv(l);
-                if let Some(v) = find_f32(&qkv_name, (q_dim + 2 * kv_dim) * d_model) {
+                if let Some(v) = find_f32_2d(&qkv_name, q_dim + 2 * kv_dim, d_model) {
                     summary.record(
                         GROUP_ATTENTION,
                         safetensor_source_dtype(&parsed, &qkv_name),
@@ -1809,28 +1860,30 @@ impl RealModel {
                         DenseWeight::from_f32(v_part.to_vec(), kv_dim, d_model);
                     loaded += 1;
                 }
-                maybe!(GROUP_ATTENTION, &naming.attn_o(l), d_model * q_dim, |v| {
+                maybe2d!(GROUP_ATTENTION, &naming.attn_o(l), d_model, q_dim, |v| {
                     model.layers[l].attn.wo = DenseWeight::from_f32(v, d_model, q_dim);
                 });
             } else {
-                maybe!(GROUP_ATTENTION, &naming.attn_q(l), q_dim * d_model, |v| {
+                maybe2d!(GROUP_ATTENTION, &naming.attn_q(l), q_dim, d_model, |v| {
                     model.layers[l].attn.wq = DenseWeight::from_f32(v, q_dim, d_model);
                 });
-                maybe!(GROUP_ATTENTION, &naming.attn_k(l), kv_dim * d_model, |v| {
+                maybe2d!(GROUP_ATTENTION, &naming.attn_k(l), kv_dim, d_model, |v| {
                     model.layers[l].attn.wk = DenseWeight::from_f32(v, kv_dim, d_model);
                 });
-                maybe!(
+                maybe2d!(
                     GROUP_ATTENTION,
                     &naming.attn_v(l),
-                    v_proj_dim * d_model,
+                    v_proj_dim,
+                    d_model,
                     |v| {
                         model.layers[l].attn.wv = DenseWeight::from_f32(v, v_proj_dim, d_model);
                     }
                 );
-                maybe!(
+                maybe2d!(
                     GROUP_ATTENTION,
                     &naming.attn_o(l),
-                    d_model * attn_out_dim,
+                    d_model,
+                    attn_out_dim,
                     |v| {
                         model.layers[l].attn.wo =
                             DenseWeight::from_f32(v, d_model, attn_out_dim);
@@ -2588,7 +2641,6 @@ const FP8_BLOCK: usize = 128;
 
 /// True when a dense manifest entry's recorded `dims` describe exactly the
 /// `[rows, cols]` orientation the loader is about to impose (Finding 3).
-///
 /// The converter records 2-D tensors as `[rows, cols]` and 1-D tensors as
 /// `[n, 1]`; the loader always constructs the `DenseWeight` from the
 /// caller's `(rows, cols)`. Requiring an exact match rejects a transposed
@@ -2601,6 +2653,51 @@ fn dense_dims_match_orientation(dims: &[usize], rows: usize, cols: usize) -> boo
         [n] => *n == rows && cols == 1,
         _ => false,
     }
+}
+
+/// True when a safetensors tensor's stored `shape` is compatible with the
+/// expected `[rows, cols]` matrix orientation (Finding 3).
+///
+/// HF stores Linear weights as `[out_features, in_features]`, matching the
+/// engine's `[rows, cols]`. A `[cols, rows]` tensor has the same element
+/// count but is the transpose; loading it as `[rows, cols]` silently
+/// corrupts the projection. For non-square matrices this is detectable and
+/// rejected. 1-D tensors are accepted as flat vectors when their length
+/// matches (documented vector compatibility); tensors of rank > 2 fall back
+/// to an element-count check.
+fn safetensor_orientation_ok(shape: &[usize], rows: usize, cols: usize) -> bool {
+    let expected = rows.saturating_mul(cols);
+    match shape {
+        [a, b] => *a == rows && *b == cols,
+        [n] => *n == expected,
+        _ => shape.iter().product::<usize>() == expected,
+    }
+}
+
+/// Locate `name` across shards and, when found as a 2-D tensor, verify its
+/// stored orientation matches `[rows, cols]`. Returns `Some(reason)` when the
+/// tensor exists but is transposed/misshaped, `None` when it is orientation-
+/// compatible or absent (absence is handled by the normal missing-tensor
+/// path).
+fn safetensor_orientation_problem(
+    parsed: &[safetensors::SafeTensors<'_>],
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Option<String> {
+    for st in parsed {
+        if let Ok(view) = st.tensor(name) {
+            let shape = view.shape();
+            if !safetensor_orientation_ok(shape, rows, cols) {
+                return Some(format!(
+                    "tensor {name} has shape {shape:?}, expected [rows, cols] = [{rows}, {cols}] \
+                     (transposed or misshaped)"
+                ));
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Outcome of attempting to load the optional `dense_manifest.json`.
@@ -3040,20 +3137,50 @@ fn strict_safetensors_failures(
         );
     };
 
+    // 2-D matrix requirement: element-count check *plus* the Finding 3
+    // orientation guard, so a transposed non-square projection is rejected
+    // under strict loading instead of loading silently corrupted.
+    let require_2d =
+        |name: String, rows: usize, cols: usize, group: &'static str, failures: &mut Vec<_>| {
+            let ok = strict_validate_safetensor(
+                parsed,
+                &name,
+                rows.saturating_mul(cols),
+                group,
+                fp8_block,
+                fp8_ignored,
+                failures,
+            );
+            if ok {
+                if let Some(reason) = safetensor_orientation_problem(parsed, &name, rows, cols) {
+                    failures.push(WeightLoadFailure {
+                        tensor: name,
+                        group,
+                        kind: WeightLoadFailureKind::ShapeMismatch,
+                        expected: format!("[rows, cols] = [{rows}, {cols}]"),
+                        actual: None,
+                        detail: Some(reason),
+                    });
+                }
+            }
+        };
+
     let d_model = config.d_model;
     let q_dim = config.num_heads * config.head_dim;
     let attn_out_dim = config.num_heads * config.v_head_dim();
 
-    require(
+    require_2d(
         naming.embed(),
-        config.vocab_size * d_model,
+        config.vocab_size,
+        d_model,
         GROUP_EMBEDDING,
         &mut failures,
     );
     require(naming.final_norm(), d_model, GROUP_NORMS, &mut failures);
-    require(
+    require_2d(
         naming.lm_head(),
-        config.vocab_size * d_model,
+        config.vocab_size,
+        d_model,
         GROUP_LM_HEAD,
         &mut failures,
     );
@@ -3131,40 +3258,46 @@ fn strict_safetensors_failures(
                 &mut failures,
             );
         } else if naming.attn_qkv_fused() {
-            require(
+            require_2d(
                 naming.attn_qkv(l),
-                (q_dim + 2 * kv_dim) * d_model,
+                q_dim + 2 * kv_dim,
+                d_model,
                 GROUP_ATTENTION,
                 &mut failures,
             );
-            require(
+            require_2d(
                 naming.attn_o(l),
-                d_model * q_dim,
+                d_model,
+                q_dim,
                 GROUP_ATTENTION,
                 &mut failures,
             );
         } else {
-            require(
+            require_2d(
                 naming.attn_q(l),
-                q_dim * d_model,
+                q_dim,
+                d_model,
                 GROUP_ATTENTION,
                 &mut failures,
             );
-            require(
+            require_2d(
                 naming.attn_k(l),
-                kv_dim * d_model,
+                kv_dim,
+                d_model,
                 GROUP_ATTENTION,
                 &mut failures,
             );
-            require(
+            require_2d(
                 naming.attn_v(l),
-                v_proj_dim * d_model,
+                v_proj_dim,
+                d_model,
                 GROUP_ATTENTION,
                 &mut failures,
             );
-            require(
+            require_2d(
                 naming.attn_o(l),
-                d_model * attn_out_dim,
+                d_model,
+                attn_out_dim,
                 GROUP_ATTENTION,
                 &mut failures,
             );
@@ -5695,5 +5828,40 @@ mod tests {
                 "gate=0 must halve output: {a} {b}"
             );
         }
+    }
+
+    // ---- Finding 3: safetensors / manifest orientation validation ----
+
+    #[test]
+    fn safetensor_orientation_accepts_exact_and_vectors() {
+        // Exact [rows, cols].
+        assert!(safetensor_orientation_ok(&[8, 4], 8, 4));
+        // Square matrix (orientation-free) always accepted.
+        assert!(safetensor_orientation_ok(&[4, 4], 4, 4));
+        // 1-D flat vector with matching element count (documented compat).
+        assert!(safetensor_orientation_ok(&[32], 8, 4));
+        // Bare row/col vectors.
+        assert!(safetensor_orientation_ok(&[8], 8, 1));
+    }
+
+    #[test]
+    fn safetensor_orientation_rejects_transposed_nonsquare() {
+        // Transposed [cols, rows]: same element count, wrong orientation.
+        assert!(!safetensor_orientation_ok(&[4, 8], 8, 4));
+        // Wrong shape entirely.
+        assert!(!safetensor_orientation_ok(&[2, 16], 8, 4));
+        // 1-D with wrong length.
+        assert!(!safetensor_orientation_ok(&[31], 8, 4));
+    }
+
+    #[test]
+    fn manifest_orientation_rejects_transposed_nonsquare() {
+        // Recorded [rows, cols] accepted; transpose rejected; square ok.
+        assert!(dense_dims_match_orientation(&[8, 4], 8, 4));
+        assert!(!dense_dims_match_orientation(&[4, 8], 8, 4));
+        assert!(dense_dims_match_orientation(&[4, 4], 4, 4));
+        // 1-D column vector compatibility only.
+        assert!(dense_dims_match_orientation(&[8], 8, 1));
+        assert!(!dense_dims_match_orientation(&[8], 8, 4));
     }
 }
