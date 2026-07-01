@@ -2205,6 +2205,14 @@ async fn build_bench_real_runtime(
 
     let (resolved_architecture, resolved_first_k_dense_replace, resolved_advanced) =
         reconcile_bench_real_config(&mut cfg)?;
+    // Finding 7: validate the fully-resolved configuration before any weights
+    // are loaded or backends installed.
+    validate_resolved_bench_real_config(
+        &cfg,
+        resolved_architecture,
+        resolved_first_k_dense_replace,
+        &resolved_advanced,
+    )?;
 
     crate::backend::install_default();
     {
@@ -2574,6 +2582,201 @@ fn reconcile_bench_real_config(
         resolved_first_k_dense_replace,
         resolved_advanced,
     ))
+}
+
+/// Finding 7: post-reconciliation, architecture-aware validation of the
+/// fully-resolved bench-real configuration.
+///
+/// This runs *after* [`reconcile_bench_real_config`] has merged the TOML and
+/// checkpoint `config.json` into `cfg`. It validates the final resolved
+/// architecture, model shape, routing configuration, storage/cache
+/// relationships, and the integer conversions the loader will subsequently
+/// perform.
+///
+/// It deliberately does **not** reuse the generic [`crate::config::Config`]
+/// validation's universal `num_heads * head_dim == d_model` rule: that
+/// identity is invalid for several supported architectures (MLA decomposes
+/// Q/K/V through low-rank latents, and MiMo-V2-Flash uses an asymmetric
+/// `v_head_dim != head_dim` with a partial-rotary Q/K width), so applying it
+/// would reject valid checkpoints.
+fn validate_resolved_bench_real_config(
+    cfg: &crate::config::Config,
+    arch: crate::architecture::Architecture,
+    first_k_dense_replace: usize,
+    advanced: &crate::model::AdvancedConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut errs: Vec<String> = Vec::new();
+
+    let d_model = cfg.model.d_model;
+    let d_ff = cfg.model.d_ff;
+    let num_layers = cfg.model.num_layers;
+    let num_experts = cfg.model.num_experts as usize;
+    let top_k = cfg.model.top_k;
+    let vocab_size = cfg.real_transformer.vocab_size;
+    let num_heads = cfg.real_transformer.num_heads;
+    let num_kv_heads = cfg.real_transformer.num_kv_heads;
+    let head_dim = cfg.real_transformer.head_dim;
+    let v_head_dim = advanced.v_head_dim.unwrap_or(head_dim);
+
+    // ---- Resolved model shape ----
+    if d_model == 0 {
+        errs.push("resolved d_model is 0".to_string());
+    }
+    if d_ff == 0 {
+        errs.push("resolved d_ff is 0".to_string());
+    }
+    if num_layers == 0 {
+        errs.push("resolved num_layers is 0".to_string());
+    }
+    if vocab_size == 0 {
+        errs.push("resolved vocab_size is 0".to_string());
+    }
+    if num_heads == 0 {
+        errs.push("resolved num_heads is 0".to_string());
+    }
+    if head_dim == 0 {
+        errs.push("resolved head_dim is 0".to_string());
+    }
+    if v_head_dim == 0 {
+        errs.push("resolved v_head_dim is 0".to_string());
+    }
+
+    // ---- Architecture-aware attention head geometry ----
+    // MLA carries its own low-rank projection dims and does not obey the
+    // dense GQA head arithmetic; validate the GQA invariants only for the
+    // standard dense-attention families.
+    if advanced.mla.is_none() {
+        if num_kv_heads == 0 {
+            errs.push("resolved num_kv_heads is 0".to_string());
+        } else if num_heads % num_kv_heads != 0 {
+            errs.push(format!(
+                "grouped-query attention requires num_heads ({num_heads}) to be a multiple of \
+                 num_kv_heads ({num_kv_heads})"
+            ));
+        }
+        // A separate SWA KV-head count (MiMo-V2-Flash) must divide num_heads too.
+        if let Some(swa_kv) = advanced.swa_num_key_value_heads {
+            if swa_kv == 0 || num_heads % swa_kv != 0 {
+                errs.push(format!(
+                    "swa_num_key_value_heads ({swa_kv}) must be a non-zero divisor of num_heads \
+                     ({num_heads})"
+                ));
+            }
+        }
+    }
+
+    // ---- Routing configuration ----
+    if num_experts == 0 {
+        errs.push("resolved num_experts is 0".to_string());
+    }
+    if top_k == 0 {
+        errs.push("resolved top_k is 0".to_string());
+    }
+    if top_k > num_experts {
+        errs.push(format!(
+            "top_k ({top_k}) exceeds num_experts ({num_experts})"
+        ));
+    }
+    if first_k_dense_replace > num_layers {
+        errs.push(format!(
+            "first_k_dense_replace ({first_k_dense_replace}) exceeds num_layers ({num_layers})"
+        ));
+    }
+    // Group-limited routing (DeepSeek-V3 `n_group`/`topk_group`).
+    if advanced.n_group > 1 {
+        if num_experts % advanced.n_group != 0 {
+            errs.push(format!(
+                "group-limited routing requires num_experts ({num_experts}) to be a multiple of \
+                 n_group ({})",
+                advanced.n_group
+            ));
+        }
+        if advanced.topk_group == 0 || advanced.topk_group > advanced.n_group {
+            errs.push(format!(
+                "topk_group ({}) must be in 1..=n_group ({})",
+                advanced.topk_group, advanced.n_group
+            ));
+        }
+    }
+
+    // ---- Storage / cache relationships ----
+    let cache_slots = cfg.storage.cache_slots;
+    let block_align = cfg.storage.block_align;
+    let expert_size = cfg.model.expert_size;
+    // The per-layer LRU must be able to hold every expert activated for a
+    // single token (the routed top-K plus the always-on shared experts);
+    // otherwise a single decode step thrashes and cannot make progress.
+    let activated_per_layer = top_k.saturating_add(advanced.num_shared_experts);
+    if cache_slots < activated_per_layer {
+        errs.push(format!(
+            "storage.cache_slots ({cache_slots}) is smaller than the experts activated per layer \
+             (top_k {top_k} + shared {} = {activated_per_layer}); the cache cannot hold one \
+             layer's working set",
+            advanced.num_shared_experts
+        ));
+    }
+    if expert_size == 0 {
+        errs.push("model.expert_size is 0".to_string());
+    }
+    if !cfg.storage.no_direct {
+        if block_align == 0 {
+            errs.push("storage.block_align is 0 while O_DIRECT is enabled".to_string());
+        } else if expert_size % block_align != 0 {
+            errs.push(format!(
+                "model.expert_size ({expert_size}) must be a multiple of storage.block_align \
+                 ({block_align}) for O_DIRECT reads (set storage.no_direct = true to relax)"
+            ));
+        }
+    }
+
+    // ---- Integer conversions the loader will perform ----
+    // These products index/allocate resident tensors; a usize overflow here
+    // would silently wrap during loading. Validate they are representable.
+    let q_dim = num_heads.checked_mul(head_dim);
+    if q_dim.is_none() {
+        errs.push(format!(
+            "num_heads ({num_heads}) * head_dim ({head_dim}) overflows usize"
+        ));
+    }
+    if d_model.checked_mul(vocab_size).is_none() {
+        errs.push(format!(
+            "d_model ({d_model}) * vocab_size ({vocab_size}) overflows usize (embedding size)"
+        ));
+    }
+    if let Some(q) = q_dim {
+        if q.checked_mul(d_model).is_none() {
+            errs.push("q_proj element count overflows usize".to_string());
+        }
+    }
+    if d_model.checked_mul(d_ff).is_none() {
+        errs.push(format!(
+            "d_model ({d_model}) * d_ff ({d_ff}) overflows usize (dense FFN size)"
+        ));
+    }
+    if num_experts > u32::MAX as usize {
+        errs.push(format!(
+            "num_experts ({num_experts}) does not fit in u32"
+        ));
+    }
+
+    if errs.is_empty() {
+        info!(
+            architecture = %arch.model_type(),
+            d_model,
+            num_layers,
+            num_experts,
+            top_k,
+            "bench-real resolved configuration passed architecture-aware validation"
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "resolved bench-real configuration for architecture \"{}\" failed validation:\n  - {}",
+            arch.model_type(),
+            errs.join("\n  - ")
+        )
+        .into())
+    }
 }
 
 async fn run_bench_real_once(
@@ -6077,5 +6280,107 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Finding 7: resolved-config architecture-aware validation ----
+
+    #[test]
+    fn resolved_config_validation_accepts_reconciled_checkpoint() {
+        let dir = tempdir_unique("bench-real-f7-ok");
+        write_qwen3_moe_config_json(&dir);
+        let mut cfg = minimal_bench_cfg();
+        cfg.real_transformer.weights_dir = Some(dir.clone());
+        let (arch, first_k, advanced) =
+            reconcile_bench_real_config(&mut cfg).expect("reconcile should succeed");
+        validate_resolved_bench_real_config(&cfg, arch, first_k, &advanced)
+            .expect("a well-formed reconciled checkpoint must pass validation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_config_validation_rejects_top_k_over_num_experts() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.model.num_experts = 4;
+        cfg.model.top_k = 8; // impossible: more activated than available
+        let advanced = crate::model::AdvancedConfig::default();
+        let err = validate_resolved_bench_real_config(
+            &cfg,
+            crate::architecture::Architecture::Mixtral,
+            0,
+            &advanced,
+        )
+        .expect_err("top_k > num_experts must fail");
+        assert!(err.to_string().contains("top_k"), "{err}");
+    }
+
+    #[test]
+    fn resolved_config_validation_rejects_gqa_head_indivisibility() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.real_transformer.num_heads = 6;
+        cfg.real_transformer.num_kv_heads = 4; // 6 % 4 != 0
+        cfg.real_transformer.head_dim = 8;
+        let advanced = crate::model::AdvancedConfig::default();
+        let err = validate_resolved_bench_real_config(
+            &cfg,
+            crate::architecture::Architecture::Mixtral,
+            0,
+            &advanced,
+        )
+        .expect_err("non-divisible GQA head counts must fail");
+        assert!(err.to_string().contains("num_kv_heads"), "{err}");
+    }
+
+    #[test]
+    fn resolved_config_validation_allows_asymmetric_v_head_dim() {
+        // MiMo-V2-Flash style: v_head_dim != head_dim must NOT be rejected,
+        // and the invalid universal num_heads*head_dim==d_model rule must not
+        // be applied.
+        let mut cfg = minimal_bench_cfg();
+        cfg.model.d_model = 64;
+        cfg.real_transformer.num_heads = 4;
+        cfg.real_transformer.num_kv_heads = 2;
+        cfg.real_transformer.head_dim = 24; // 4*24 = 96 != d_model 64
+        let mut advanced = crate::model::AdvancedConfig::default();
+        advanced.v_head_dim = Some(16);
+        validate_resolved_bench_real_config(
+            &cfg,
+            crate::architecture::Architecture::MiMoV2,
+            0,
+            &advanced,
+        )
+        .expect("asymmetric V geometry must be accepted");
+    }
+
+    #[test]
+    fn resolved_config_validation_rejects_undersized_cache() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.model.top_k = 4;
+        cfg.storage.cache_slots = 2; // smaller than activated per layer
+        let advanced = crate::model::AdvancedConfig::default();
+        let err = validate_resolved_bench_real_config(
+            &cfg,
+            crate::architecture::Architecture::Mixtral,
+            0,
+            &advanced,
+        )
+        .expect_err("cache smaller than the per-layer working set must fail");
+        assert!(err.to_string().contains("cache_slots"), "{err}");
+    }
+
+    #[test]
+    fn resolved_config_validation_rejects_odirect_misaligned_expert_size() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.storage.no_direct = false;
+        cfg.storage.block_align = 4096;
+        cfg.model.expert_size = 4097; // not a multiple of block_align
+        let advanced = crate::model::AdvancedConfig::default();
+        let err = validate_resolved_bench_real_config(
+            &cfg,
+            crate::architecture::Architecture::Mixtral,
+            0,
+            &advanced,
+        )
+        .expect_err("O_DIRECT misaligned expert_size must fail");
+        assert!(err.to_string().contains("block_align"), "{err}");
     }
 }
