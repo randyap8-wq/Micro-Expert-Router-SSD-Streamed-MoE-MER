@@ -439,8 +439,18 @@ experts when the GPU cache is enabled:
   the dense transformer body, matmul, SwiGLU, softmax, and attention,
   runs through those shaders via the
   [`transformer::DenseBackbone`](rust-engine/src/transformer.rs) trait
-  (`attn_block`, `RmsNorm`, `LMHead`). When no GPU device can be
-  acquired at startup the backend transparently falls back to the CPU
+  (`attn_block`, `RmsNorm`, `LMHead`). **Runtime-dispatch caveat
+  (Finding 12):** the GPU attention kernel is only eligible for
+  architectures whose value head dimension equals the query/key head
+  dimension. Asymmetric-V families (e.g. MiMo-V2-Flash with
+  `v_head_dim != head_dim`) keep an explicit eligibility guard in
+  [`transformer::MultiHeadSelfAttention`](rust-engine/src/transformer.rs)
+  that forces the CPU attention path even when `compute_offload = "gpu"`;
+  the latent GPU KV-cache/attention shader now carries the corrected
+  asymmetric value width (`v_proj_dim`), attention-output width
+  (`attn_out_dim`), and independent K/V cache strides so the guard can be
+  lifted once end-to-end asymmetric execution is proven. When no GPU device
+  can be acquired at startup the backend transparently falls back to the CPU
   `CandleBackend` (`BackendBox::init` logs `GPU init failed — activating
   CPU fallback`). SSD-streamed MoE experts use the CPU fallback unless
   they are promoted into the VRAM tier and dispatched through the
@@ -489,6 +499,10 @@ For projects that want to swap candle for a different math library
 new [`backend`](rust-engine/src/backend/mod.rs) module defines a
 plugin-system `Backend` trait, see
 [Decoupled math backend](#decoupled-math-backend) below.
+
+The complete cargo feature-build matrix, the runtime-dispatch rules, and the
+model-loading/validation audit disposition (findings F1–F12) are documented in
+[`docs/audit-findings.md`](docs/audit-findings.md).
 
 ---
 
