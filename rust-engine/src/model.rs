@@ -216,6 +216,7 @@ const GROUP_ROUTING_GATES: &str = "routing_gates";
 const GROUP_LM_HEAD: &str = "lm_head";
 const GROUP_SHARED_FFN: &str = "shared_ffn";
 const GROUP_DENSE_FFN: &str = "dense_ffn";
+const GROUP_DENSE_MANIFEST: &str = "dense_manifest";
 
 #[derive(Debug, Clone, Default)]
 struct WeightLoadSummary {
@@ -935,7 +936,7 @@ impl RealModel {
         let mut tried = 0usize;
         let mut summary = WeightLoadSummary::default();
         let mut failures = Vec::new();
-        let dense_manifest = load_dense_manifest(dir);
+        let dense_manifest = resolve_dense_manifest(dir, options.strict_weights, &mut failures);
 
         macro_rules! maybe {
             ($group:expr, $name:expr, $expected:expr, $assign:expr) => {{
@@ -2585,21 +2586,100 @@ fn seed_mla(
 /// out over a 128x128 block grid).
 const FP8_BLOCK: usize = 128;
 
-fn load_dense_manifest(dir: &Path) -> Option<DenseTensorManifest> {
+/// True when a dense manifest entry's recorded `dims` describe exactly the
+/// `[rows, cols]` orientation the loader is about to impose (Finding 3).
+///
+/// The converter records 2-D tensors as `[rows, cols]` and 1-D tensors as
+/// `[n, 1]`; the loader always constructs the `DenseWeight` from the
+/// caller's `(rows, cols)`. Requiring an exact match rejects a transposed
+/// `[cols, rows]` entry whose element count coincidentally matches.
+fn dense_dims_match_orientation(dims: &[usize], rows: usize, cols: usize) -> bool {
+    match dims {
+        [r, c] => *r == rows && *c == cols,
+        // A bare `[n]` entry is orientation-free; accept it when the single
+        // dimension is the row count and the caller expects a column vector.
+        [n] => *n == rows && cols == 1,
+        _ => false,
+    }
+}
+
+/// Outcome of attempting to load the optional `dense_manifest.json`.
+enum DenseManifestLoad {
+    /// No manifest file present — legacy per-file layout. Not an error.
+    Absent,
+    /// The manifest exists but could not be read or parsed. Under strict
+    /// loading this is a hard failure (Finding 6): a corrupt manifest must
+    /// not silently degrade to seeded weights.
+    Malformed(String),
+    /// Successfully parsed manifest (structural integrity not yet checked).
+    Loaded(DenseTensorManifest),
+}
+
+fn load_dense_manifest(dir: &Path) -> DenseManifestLoad {
     let path = dir.join("dense_manifest.json");
     if !path.is_file() {
-        return None;
+        return DenseManifestLoad::Absent;
     }
     match std::fs::read_to_string(&path) {
         Ok(body) => match serde_json::from_str::<DenseTensorManifest>(&body) {
-            Ok(manifest) => Some(manifest),
+            Ok(manifest) => DenseManifestLoad::Loaded(manifest),
             Err(err) => {
                 warn!(file = %path.display(), error = %err, "dense manifest parse failed");
-                None
+                DenseManifestLoad::Malformed(format!("parse error: {err}"))
             }
         },
         Err(err) => {
             warn!(file = %path.display(), error = %err, "dense manifest read failed");
+            DenseManifestLoad::Malformed(format!("read error: {err}"))
+        }
+    }
+}
+
+/// Resolve the dense manifest for a checkpoint directory, applying the
+/// Finding 6 integrity policy. Returns the manifest only when it is present
+/// and passes validation; any structural problem is recorded in `failures`
+/// (fatal under strict loading) and the manifest is dropped so the loader
+/// falls back to the per-file / seeded paths.
+fn resolve_dense_manifest(
+    dir: &Path,
+    strict_weights: bool,
+    failures: &mut Vec<WeightLoadFailure>,
+) -> Option<DenseTensorManifest> {
+    let push_problem = |failures: &mut Vec<WeightLoadFailure>, detail: String| {
+        failures.push(WeightLoadFailure {
+            tensor: "dense_manifest.json".to_string(),
+            group: GROUP_DENSE_MANIFEST,
+            kind: WeightLoadFailureKind::Malformed,
+            expected: "valid dense manifest".to_string(),
+            actual: None,
+            detail: Some(detail),
+        });
+    };
+
+    match load_dense_manifest(dir) {
+        DenseManifestLoad::Absent => None,
+        DenseManifestLoad::Malformed(err) => {
+            if strict_weights {
+                push_problem(failures, err);
+            }
+            None
+        }
+        DenseManifestLoad::Loaded(manifest) => {
+            let problems = manifest.validate_integrity(strict_weights);
+            if problems.is_empty() {
+                return Some(manifest);
+            }
+            for problem in &problems {
+                warn!(dir = %dir.display(), problem = %problem, "dense manifest integrity problem");
+            }
+            if strict_weights {
+                for problem in problems {
+                    push_problem(failures, problem);
+                }
+            }
+            // Never consult a structurally invalid manifest, even in
+            // non-strict mode: an ambiguous alias or a bad byte_len could
+            // load the wrong tensor. Fall back to per-file / seeded init.
             None
         }
     }
@@ -2676,6 +2756,40 @@ fn try_load_dense_weight(
             rows,
             cols,
             "dense manifest shape mismatch; falling back to seeded init"
+        );
+        return None;
+    }
+
+    // Orientation check (Finding 3). The element count matching is *not*
+    // sufficient: a `[cols, rows]` entry has the same product as the
+    // expected `[rows, cols]`, but its row-major bytes decode to the
+    // transpose of the weight the engine expects. Because the loader
+    // constructs the `DenseWeight` from the caller's `(rows, cols)` and
+    // never consults the manifest dims for layout, a transposed entry
+    // would load silently corrupted. Require the recorded dims to match
+    // the expected orientation exactly.
+    if !dense_dims_match_orientation(&entry.dims, rows, cols) {
+        if strict_weights {
+            failures.push(WeightLoadFailure {
+                tensor: name.to_string(),
+                group,
+                kind: WeightLoadFailureKind::ShapeMismatch,
+                expected: format!("dims [{rows}, {cols}] (row-major)"),
+                actual: Some(format!("{:?}", entry.dims)),
+                detail: Some(format!(
+                    "dense manifest entry {} shape orientation mismatch; \
+                     expected [rows, cols] = [{rows}, {cols}]",
+                    entry.canonical_name
+                )),
+            });
+        }
+        warn!(
+            tensor = name,
+            canonical = %entry.canonical_name,
+            dims = ?entry.dims,
+            rows,
+            cols,
+            "dense manifest shape orientation mismatch; falling back to seeded init"
         );
         return None;
     }

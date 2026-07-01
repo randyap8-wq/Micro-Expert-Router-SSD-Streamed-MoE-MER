@@ -50,11 +50,159 @@ pub struct DenseTensorManifest {
     pub tensors: Vec<DenseTensorManifestEntry>,
 }
 
+/// Dense-manifest `format_version` values this build can safely load.
+/// The GGUF converter emits version 1; unknown versions may reorder or
+/// reinterpret fields, so they are rejected rather than misread.
+pub const SUPPORTED_DENSE_MANIFEST_VERSIONS: &[u32] = &[1];
+
 impl DenseTensorManifest {
     pub fn find_alias(&self, name: &str) -> Option<&DenseTensorManifestEntry> {
         self.tensors.iter().find(|entry| {
             entry.canonical_name == name || entry.aliases.iter().any(|alias| alias == name)
         })
+    }
+
+    /// Validate structural integrity of the manifest independent of the
+    /// weight files it points at (Finding 6). This catches manifests that
+    /// are *parseable* but semantically dangerous before any tensor bytes
+    /// are read.
+    ///
+    /// Checks performed:
+    /// * `format_version` is a supported version.
+    /// * every `file` reference is a plain relative filename — no absolute
+    ///   paths, no `..`, and no directory separators (path-traversal guard).
+    /// * canonical names, aliases, and target files are unique across the
+    ///   whole manifest (duplicate aliases would make lookup ambiguous, and
+    ///   two entries writing/reading the same file usually means a bug).
+    /// * `dims` are non-degenerate and consistent with `byte_len` for the
+    ///   declared `dtype`.
+    /// * when `require_checksums` is set (strict loads), every entry carries
+    ///   a `checksum` so tampering can be detected.
+    ///
+    /// Returns the list of human-readable problems; an empty vector means
+    /// the manifest passed.
+    pub fn validate_integrity(&self, require_checksums: bool) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        if !SUPPORTED_DENSE_MANIFEST_VERSIONS.contains(&self.format_version) {
+            problems.push(format!(
+                "unsupported dense manifest format_version {} (supported: {:?})",
+                self.format_version, SUPPORTED_DENSE_MANIFEST_VERSIONS
+            ));
+        }
+
+        // Track every name we hand out for lookup (canonical + aliases) and
+        // every file we reference, so collisions are reported once.
+        let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        for entry in &self.tensors {
+            let who = if entry.canonical_name.is_empty() {
+                "<empty canonical_name>"
+            } else {
+                entry.canonical_name.as_str()
+            };
+
+            if entry.canonical_name.is_empty() {
+                problems.push("dense manifest entry has empty canonical_name".to_string());
+            } else if !seen_names.insert(entry.canonical_name.as_str()) {
+                problems.push(format!("duplicate dense manifest name {who}"));
+            }
+
+            for alias in &entry.aliases {
+                if alias.is_empty() {
+                    problems.push(format!("dense manifest entry {who} has an empty alias"));
+                } else if !seen_names.insert(alias.as_str()) {
+                    problems.push(format!(
+                        "duplicate dense manifest alias {alias} (entry {who})"
+                    ));
+                }
+            }
+
+            if let Some(reason) = unsafe_manifest_file_name(&entry.file) {
+                problems.push(format!(
+                    "dense manifest entry {who} has unsafe file {:?}: {reason}",
+                    entry.file
+                ));
+            } else if !seen_files.insert(entry.file.as_str()) {
+                problems.push(format!(
+                    "duplicate dense manifest file {} (entry {who})",
+                    entry.file
+                ));
+            }
+
+            if entry.dims.is_empty() || entry.dims.iter().any(|&d| d == 0) {
+                problems.push(format!(
+                    "dense manifest entry {who} has degenerate dims {:?}",
+                    entry.dims
+                ));
+            } else {
+                let elems: usize = entry.dims.iter().product();
+                match entry.dtype {
+                    DenseDType::F32 => {
+                        if entry.byte_len != elems.saturating_mul(4) {
+                            problems.push(format!(
+                                "dense manifest entry {who} byte_len {} != {} for {} f32 elements",
+                                entry.byte_len,
+                                elems.saturating_mul(4),
+                                elems
+                            ));
+                        }
+                    }
+                    DenseDType::Q8_0 => {
+                        if elems % Q8_0_BLOCK_ELEMS != 0 {
+                            problems.push(format!(
+                                "dense manifest entry {who} q8_0 element count {elems} is not a \
+                                 multiple of the {Q8_0_BLOCK_ELEMS}-element block size"
+                            ));
+                        } else {
+                            let expect = elems / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES;
+                            if entry.byte_len != expect {
+                                problems.push(format!(
+                                    "dense manifest entry {who} byte_len {} != {expect} for {elems} \
+                                     q8_0 elements",
+                                    entry.byte_len
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if require_checksums && entry.checksum.is_none() {
+                problems.push(format!(
+                    "dense manifest entry {who} is missing a checksum (required under strict load)"
+                ));
+            }
+        }
+
+        problems
+    }
+}
+
+/// Return `Some(reason)` when a manifest `file` field is not a safe, plain
+/// relative filename. Rejects absolute paths, parent-directory escapes, and
+/// any embedded path separators so a malicious manifest cannot redirect a
+/// read outside the checkpoint directory.
+fn unsafe_manifest_file_name(file: &str) -> Option<&'static str> {
+    if file.is_empty() {
+        return Some("empty file name");
+    }
+    let path = std::path::Path::new(file);
+    if path.is_absolute() {
+        return Some("absolute path");
+    }
+    // A safe reference is a single normal path component. Anything with a
+    // parent (`..`), root, prefix (Windows `C:`), or nested directory is
+    // rejected. Backslashes are treated as separators defensively even on
+    // Unix, where they would otherwise be a legal filename character.
+    if file.contains('\\') {
+        return Some("contains backslash separator");
+    }
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => None,
+        _ => Some("not a plain relative filename"),
     }
 }
 
@@ -626,5 +774,106 @@ mod tests {
     fn q8_rejects_malformed_byte_len() {
         let err = DenseWeight::from_q8_0_bytes(vec![0u8; Q8_0_BLOCK_BYTES - 1], 1, 32).unwrap_err();
         assert!(matches!(err, DenseWeightError::ByteLength { .. }));
+    }
+
+    // ---- Finding 6: dense manifest integrity validation ----
+
+    fn f32_entry(name: &str, rows: usize, cols: usize) -> DenseTensorManifestEntry {
+        DenseTensorManifestEntry {
+            canonical_name: name.to_string(),
+            file: format!("dense_{name}.f32.bin"),
+            aliases: Vec::new(),
+            dtype: DenseDType::F32,
+            dims: vec![rows, cols],
+            byte_len: rows * cols * 4,
+            checksum: Some("fnv1a64:0000000000000000".to_string()),
+            tied_to: None,
+        }
+    }
+
+    #[test]
+    fn manifest_integrity_accepts_well_formed() {
+        let m = DenseTensorManifest {
+            format_version: 1,
+            tensors: vec![f32_entry("embed", 4, 8), f32_entry("lm_head", 4, 8)],
+        };
+        assert!(m.validate_integrity(true).is_empty());
+    }
+
+    #[test]
+    fn manifest_integrity_rejects_unsupported_version() {
+        let m = DenseTensorManifest {
+            format_version: 999,
+            tensors: vec![f32_entry("embed", 2, 2)],
+        };
+        let problems = m.validate_integrity(false);
+        assert!(problems.iter().any(|p| p.contains("format_version")));
+    }
+
+    #[test]
+    fn manifest_integrity_rejects_duplicate_alias() {
+        let mut a = f32_entry("embed", 2, 2);
+        a.aliases = vec!["tok_embeddings.weight".to_string()];
+        let mut b = f32_entry("lm_head", 2, 2);
+        b.aliases = vec!["tok_embeddings.weight".to_string()];
+        let m = DenseTensorManifest {
+            format_version: 1,
+            tensors: vec![a, b],
+        };
+        let problems = m.validate_integrity(false);
+        assert!(problems.iter().any(|p| p.contains("duplicate")));
+    }
+
+    #[test]
+    fn manifest_integrity_rejects_path_traversal() {
+        for bad in ["../escape.bin", "/etc/passwd", "sub/dir.bin", "a\\b.bin"] {
+            let mut e = f32_entry("embed", 2, 2);
+            e.file = bad.to_string();
+            let m = DenseTensorManifest {
+                format_version: 1,
+                tensors: vec![e],
+            };
+            let problems = m.validate_integrity(false);
+            assert!(
+                problems.iter().any(|p| p.contains("unsafe file")),
+                "expected path-traversal rejection for {bad:?}, got {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_integrity_requires_checksum_only_under_strict() {
+        let mut e = f32_entry("embed", 2, 2);
+        e.checksum = None;
+        let m = DenseTensorManifest {
+            format_version: 1,
+            tensors: vec![e],
+        };
+        assert!(m.validate_integrity(false).is_empty());
+        let strict = m.validate_integrity(true);
+        assert!(strict.iter().any(|p| p.contains("missing a checksum")));
+    }
+
+    #[test]
+    fn manifest_integrity_rejects_bytelen_mismatch() {
+        let mut e = f32_entry("embed", 2, 2);
+        e.byte_len = 999;
+        let m = DenseTensorManifest {
+            format_version: 1,
+            tensors: vec![e],
+        };
+        assert!(m.validate_integrity(false).iter().any(|p| p.contains("byte_len")));
+    }
+
+    #[test]
+    fn manifest_integrity_rejects_degenerate_dims() {
+        let mut e = f32_entry("embed", 2, 2);
+        e.dims = vec![0, 4];
+        e.byte_len = 0;
+        let m = DenseTensorManifest {
+            format_version: 1,
+            tensors: vec![e],
+        };
+        assert!(m.validate_integrity(false).iter().any(|p| p.contains("degenerate")));
     }
 }

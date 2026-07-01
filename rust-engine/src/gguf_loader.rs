@@ -17,8 +17,9 @@
 //! Both are handled. The output expert file has the layout the engine
 //! already consumes: `gate_proj || up_proj || down_proj` row-major, with
 //! gate / up shape `[d_ff, d_model]` and down shape `[d_model, d_ff]`.
-//! For F32 and F16 source dtypes the bytes are repacked into that layout
-//! directly; for Q4_0 / Q4_K we currently dequantise to F32 because the
+//! For F32, F16 and BF16 source dtypes the bytes are repacked into that
+//! layout directly (BF16 and F16 are decoded to F32); for Q4_0 / Q4_K we
+//! currently dequantise to F32 because the
 //! GGUF stores each (gate, up, down) tensor as a single block stream
 //! that doesn't slice cleanly along the expert axis at the byte level.
 //! This preserves the **engine's** on-disk format invariants
@@ -30,7 +31,8 @@ use crate::dense_tensor::{
 };
 use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo, GgufValue};
 use crate::inference::{
-    dequantize_f16_to_f32, expert_weight_bytes_for, projection_weight_bytes_for, WeightDtype,
+    dequantize_bf16_to_f32, dequantize_f16_to_f32, expert_weight_bytes_for,
+    projection_weight_bytes_for, WeightDtype,
     Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q5K_BLOCK_BYTES,
     Q5K_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
 };
@@ -1538,6 +1540,17 @@ fn bytes_to_f32(data: &[u8], dtype: u32, elems: usize, name: &str) -> io::Result
             dequantize_f16_to_f32(&data[..elems * 2], &mut out);
             Ok(out)
         }
+        ggml_dtype::BF16 => {
+            if data.len() < elems * 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("tensor {name}: short BF16 buffer"),
+                ));
+            }
+            let mut out = Vec::with_capacity(elems);
+            dequantize_bf16_to_f32(&data[..elems * 2], &mut out);
+            Ok(out)
+        }
         ggml_dtype::Q4_0 => {
             let mut out = Vec::with_capacity(elems);
             crate::inference::dequantize_q4_0_to_f32(data, elems, &mut out);
@@ -2572,6 +2585,30 @@ mod tests {
         }
         let got = bytes_to_f32(&bytes, ggml_dtype::F16, 3, "t").unwrap();
         assert_eq!(got, v);
+    }
+
+    #[test]
+    fn bytes_to_f32_decodes_bf16() {
+        // BF16 values are exactly representable when their f32 mantissa fits
+        // in 7 bits, so these round-trip losslessly.
+        let v = vec![1.0f32, -2.0, 0.5, 3.5];
+        let mut bytes = Vec::new();
+        for f in &v {
+            bytes.extend_from_slice(&half::bf16::from_f32(*f).to_le_bytes());
+        }
+        let got = bytes_to_f32(&bytes, ggml_dtype::BF16, v.len(), "t").unwrap();
+        assert_eq!(got, v);
+
+        // A BF16 buffer must not be decoded as F16: the same bytes read as
+        // F16 produce different values, proving the arms are distinct.
+        let as_f16 = bytes_to_f32(&bytes, ggml_dtype::F16, v.len(), "t").unwrap();
+        assert_ne!(as_f16, v);
+    }
+
+    #[test]
+    fn bytes_to_f32_rejects_short_bf16_buffer() {
+        let err = bytes_to_f32(&[0u8; 2], ggml_dtype::BF16, 4, "t").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
