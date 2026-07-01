@@ -778,7 +778,7 @@ async fn generate(
             while completion_ids.len() < max_tokens {
                 let remaining = max_tokens - completion_ids.len();
                 let step_k = k.min(remaining);
-                let kv = request.direct_kv();
+                let kv = request.direct_kv()?;
                 let result = model
                     .step_speculative(&state.engine, draft.as_ref(), last, start_pos, kv, step_k)
                     .await
@@ -802,15 +802,16 @@ async fn generate(
         }
         stage_timing.record_since(crate::stage_timing::TOTAL_DECODE, decode_started);
         let pending_token = completion_ids.last().copied();
-        let kv = request.finish();
-        save_session_kv(
-            state,
-            session_id.as_deref(),
-            kv,
-            start_pos,
-            pending_token,
-            checkout,
-        );
+        if let Some(kv) = request.finish() {
+            save_session_kv(
+                state,
+                session_id.as_deref(),
+                kv,
+                start_pos,
+                pending_token,
+                checkout,
+            );
+        }
         let post = state.engine.report();
         hits_total = post.hits.saturating_sub(pre_hits);
         misses_total = post.misses.saturating_sub(pre_misses);
@@ -942,7 +943,7 @@ impl RealRequestState {
         let engine = self.engine.clone();
         let model = self.model.clone();
         let stage_timings = self.stage_timings.clone();
-        let kv = self.direct_kv();
+        let kv = self.direct_kv()?;
         model
             .forward_token_hidden_with_timing(&engine, token_id, pos, kv, stage_timings.as_deref())
             .await
@@ -1004,23 +1005,39 @@ impl RealRequestState {
         let engine = self.engine.clone();
         let model = self.model.clone();
         let stage_timings = self.stage_timings.clone();
-        let kv = self.direct_kv();
+        let kv = self.direct_kv()?;
         model
             .decode_step_with_timing(&engine, token_id, pos, kv, params, stage_timings.as_deref())
             .await
             .map_err(|e| GenerateError::Inference(e.to_string()))
     }
 
-    fn direct_kv(&mut self) -> &mut Vec<crate::transformer::KvCache> {
-        if self.kv.is_none() {
-            self.release_scheduler_to_local();
+    /// Borrow the request's local KV caches, recovering them from the
+    /// scheduler first if the request is registered. **Never fabricates
+    /// fresh KV state** (hardening pass, Part A7): once a sequence has
+    /// KV history, continuing it on empty caches would silently reset
+    /// the context and produce mathematically wrong output — if the
+    /// exact state cannot be recovered the request fails.
+    fn direct_kv(&mut self) -> Result<&mut Vec<crate::transformer::KvCache>, GenerateError> {
+        if self.kv.is_none() && !self.release_scheduler_to_local() {
+            return Err(GenerateError::Inference(
+                "scheduler could not return this request's KV state;                  refusing to continue the sequence on a fresh KV cache"
+                    .into(),
+            ));
         }
-        self.kv
-            .as_mut()
-            .expect("RealRequestState must hold local KV after release")
+        self.kv.as_mut().ok_or_else(|| {
+            GenerateError::Inference(
+                "request holds no KV state and none is registered with the scheduler".into(),
+            )
+        })
     }
 
-    fn release_scheduler_to_local(&mut self) {
+    /// Recover the registered KV state from the scheduler into
+    /// `self.kv`. Returns `false` when the request was registered but
+    /// the scheduler could not return the exact state (Part A7: the
+    /// caller must fail, never continue on fresh KV). Returns `true`
+    /// when nothing was registered or the state was recovered.
+    fn release_scheduler_to_local(&mut self) -> bool {
         if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
             let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             self.kv = scheduler.release(id);
@@ -1030,19 +1047,28 @@ impl RealRequestState {
                 started,
             );
             if self.kv.is_none() {
-                self.kv = Some(self.model.fresh_kv_caches());
+                tracing::error!(
+                    request_id = id.0,
+                    "scheduler lost this request's KV state; failing the request instead of                      resetting context"
+                );
+                return false;
             }
         }
+        true
     }
 
-    fn take_kv(&mut self) -> Vec<crate::transformer::KvCache> {
-        self.release_scheduler_to_local();
-        self.kv
-            .take()
-            .unwrap_or_else(|| self.model.fresh_kv_caches())
+    /// Take ownership of the request's KV state for session
+    /// persistence. Returns `None` when the state was lost (Part A7):
+    /// callers must skip persisting rather than store an empty cache
+    /// under a session cursor that claims history.
+    fn take_kv(&mut self) -> Option<Vec<crate::transformer::KvCache>> {
+        if !self.release_scheduler_to_local() {
+            return None;
+        }
+        self.kv.take()
     }
 
-    fn finish(mut self) -> Vec<crate::transformer::KvCache> {
+    fn finish(mut self) -> Option<Vec<crate::transformer::KvCache>> {
         self.take_kv()
     }
 }
@@ -1424,16 +1450,17 @@ async fn stream_tokens(
                 ..
             } = &mut st.mode
             {
-                let kv_take = request.take_kv();
-                let pending_token = st.completion_ids.last().copied();
-                save_session_kv(
-                    &st.state,
-                    st.session_id.as_deref(),
-                    kv_take,
-                    *position,
-                    pending_token,
-                    checkout.take(),
-                );
+                if let Some(kv_take) = request.take_kv() {
+                    let pending_token = st.completion_ids.last().copied();
+                    save_session_kv(
+                        &st.state,
+                        st.session_id.as_deref(),
+                        kv_take,
+                        *position,
+                        pending_token,
+                        checkout.take(),
+                    );
+                }
             }
             st.stage_timing.publish();
             st.finished_emitted = true;
@@ -2828,6 +2855,48 @@ mod tests {
             let needle = format!(r#"mer_stage_events_total{{stage="{stage}"}}"#);
             assert!(metrics.contains(&needle), "missing {needle} in:\n{metrics}");
         }
+    }
+
+    /// Part A7 (KV correctness): once a request has registered KV state
+    /// with the scheduler, losing that state must fail the request —
+    /// the direct fallback must never fabricate fresh KV caches for an
+    /// in-progress sequence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_kv_loss_fails_request_instead_of_resetting_context() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let model = state.real_model.as_ref().unwrap().clone();
+        let kv = model.fresh_kv_caches();
+        let mut request = RealRequestState::new(&state, &model, kv, None);
+
+        // First decode registers the request's KV with the scheduler.
+        request
+            .decode_step(1, 0, &crate::sampling::SamplingParams::greedy())
+            .await
+            .expect("first decode succeeds");
+        let scheduler = state.batch_scheduler.as_ref().unwrap().clone();
+        let id = request.request_id.expect("request registered");
+
+        // Simulate the scheduler losing the request's KV ownership
+        // (registry lookup failure / worker crash): release it out from
+        // under the request state.
+        let stolen = scheduler.release(id);
+        assert!(stolen.is_some(), "state was registered");
+
+        // The next decode hits NotRegistered, falls back to the direct
+        // path, cannot recover the exact KV state — and must fail
+        // rather than continue on a fresh cache.
+        let err = request
+            .decode_step(2, 1, &crate::sampling::SamplingParams::greedy())
+            .await
+            .expect_err("KV loss must fail the request");
+        assert!(
+            matches!(err, GenerateError::Inference(_)),
+            "expected Inference error, got: {err}"
+        );
+        // And the request's terminal KV take must not fabricate state
+        // either: the session store must skip persisting.
+        assert!(request.finish().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

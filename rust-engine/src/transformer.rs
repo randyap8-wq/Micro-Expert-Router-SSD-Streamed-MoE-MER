@@ -2356,6 +2356,26 @@ pub fn nonfinite_softmax_fallbacks() -> u64 {
 #[inline]
 pub(crate) fn record_nonfinite_softmax_fallback() {
     NONFINITE_SOFTMAX_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    NONFINITE_SOFTMAX_TL.with(|c| c.set(c.get() + 1));
+}
+
+thread_local! {
+    /// Per-thread count of non-finite softmax fallback events
+    /// (hardening pass, Part A3). The CPU attention and router softmax
+    /// loops always run on the thread driving the model forward pass,
+    /// so the real-model layer loop can snapshot this before a layer
+    /// and fail the request when the layer produced numerical
+    /// corruption — without racing concurrent requests the way the
+    /// process-global counter would.
+    static NONFINITE_SOFTMAX_TL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Current per-thread count of non-finite softmax fallback events. See
+/// [`NONFINITE_SOFTMAX_TL`]; used by the fail-closed real-model forward
+/// pass to attribute numerical corruption to a specific layer.
+#[inline]
+pub fn thread_nonfinite_softmax_events() -> u64 {
+    NONFINITE_SOFTMAX_TL.with(|c| c.get())
 }
 
 /// Serialises every test that reads or mutates the process-wide non-finite

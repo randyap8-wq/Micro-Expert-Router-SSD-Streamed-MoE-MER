@@ -2494,7 +2494,24 @@ impl RealModel {
         let backend = crate::backend::current();
         let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
         let mut next_x = Vec::with_capacity(self.config.d_model);
+        // Fail-closed numerical check (hardening pass, Part A3): the CPU
+        // attention and router softmax loops run synchronously on this
+        // thread between awaits, so a per-thread event counter snapshot
+        // taken at the top of each layer attributes any non-finite
+        // softmax fallback (NaN / ±inf in an active row) to that layer.
+        // Strict production mode fails the request instead of serving
+        // output built on a fabricated uniform attention distribution.
+        // The development-only `allow_degraded_experts` mode keeps the
+        // legacy uniform-fallback behaviour (the process-global
+        // `nonfinite_softmax_fallbacks` counter still records it).
+        // Note: no supported architecture produces an intentionally
+        // fully-masked *active* row here — the attention span always
+        // includes the current position — so any non-finite row is
+        // numerical corruption. GPU-offloaded attention performs its
+        // softmax on-device and is not covered by this check.
+        let strict_numerics = !engine.allow_degraded_experts();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let nonfinite_before = crate::transformer::thread_nonfinite_softmax_events();
             // Attention sub-block.
             layer.attn_block_into_with_timing(
                 &x,
@@ -2523,6 +2540,14 @@ impl RealModel {
             // prefix) bypass the SSD-streamed expert path entirely: run the
             // resident SwiGLU FFN and skip routing.
             if let Some(dense_out) = layer.dense_forward_with_timing(&x, timings) {
+                if strict_numerics
+                    && crate::transformer::thread_nonfinite_softmax_events() != nonfinite_before
+                {
+                    return Err(RealInferenceError::NonFiniteSoftmax {
+                        layer: layer_idx,
+                        pos,
+                    });
+                }
                 x = dense_out;
                 continue;
             }
@@ -2542,6 +2567,17 @@ impl RealModel {
             // already baked into RoPE inside `attn_block`.
             let token_idx =
                 (pos as u64).wrapping_mul(self.config.num_layers as u64) + layer_idx as u64;
+            // Check before the await: attention and the router softmax
+            // both ran synchronously on this thread above, while the
+            // task may resume on a different thread afterwards.
+            if strict_numerics
+                && crate::transformer::thread_nonfinite_softmax_events() != nonfinite_before
+            {
+                return Err(RealInferenceError::NonFiniteSoftmax {
+                    layer: layer_idx,
+                    pos,
+                });
+            }
             engine
                 .moe_step_weighted_into_with_timing(
                     token_idx,
@@ -4694,6 +4730,57 @@ mod tests {
         // try_embed mirrors the same contract directly.
         assert!(model.try_embed(vocab - 1).is_ok());
         assert!(model.try_embed(vocab).is_err());
+    }
+
+    /// Part A3 (fail-closed inference): unexpected NaN in an active
+    /// attention row must fail the request in strict mode instead of
+    /// fabricating a uniform attention distribution. Poisoning the
+    /// layer-1 Q projection makes every layer-1 attention row NaN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_fails_closed_on_non_finite_attention() {
+        let dir = TempDir::new("nanattn");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("NaN attention must fail the request in strict mode");
+        match err {
+            RealInferenceError::NonFiniteSoftmax { layer, pos } => {
+                assert_eq!(layer, 0);
+                assert_eq!(pos, 0);
+            }
+            other => panic!("expected NonFiniteSoftmax, got: {other}"),
+        }
+    }
+
+    /// Part A3: a finite forward pass does not trip the non-finite
+    /// check (guards against false positives from the thread-local
+    /// counter snapshotting).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_finite_forward_passes_strict_numeric_check() {
+        let dir = TempDir::new("finiteattn");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let model = RealModel::new_seeded(cfg.clone(), 1);
+        let mut kv = model.fresh_kv_caches();
+        for pos in 0..3 {
+            model
+                .forward_token_hidden(&engine, (pos as u32) + 1, pos, &mut kv)
+                .await
+                .expect("finite forward must pass");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

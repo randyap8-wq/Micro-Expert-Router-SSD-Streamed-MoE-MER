@@ -3812,6 +3812,15 @@ impl Engine {
     ///
     /// `token_idx` is used only as a digest seed for `InferenceOutput`;
     /// it has no effect on the activation produced.
+    /// Whether the development-only degraded mode
+    /// (`[real_transformer] allow_degraded_experts`) is active. The
+    /// real-model forward pass consults this for its fail-closed
+    /// numerical checks (Part A3) in addition to the engine's own
+    /// expert-failure handling (Part A1).
+    pub fn allow_degraded_experts(&self) -> bool {
+        self.core.options.allow_degraded_experts
+    }
+
     pub async fn moe_step(
         self: &Arc<Self>,
         token_idx: u64,
