@@ -891,7 +891,7 @@ fn extract_experts_from_source_inner(
         // error rather than emitting a partial checkpoint.
         let effective_arch = opts.arch_override.as_deref().or(arch);
         let profile = resolve_conversion_profile(effective_arch);
-        if !profile.recognized {
+        if !profile.recognised {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
@@ -1296,7 +1296,7 @@ struct ConvArchProfile {
     /// unknown or missing architecture is *not* recognised and must fail
     /// closed rather than being silently treated as generic separate-QKV
     /// (Finding 6).
-    recognized: bool,
+    recognised: bool,
     /// The architecture's upstream GGUF contract permits `output.weight` to be
     /// absent and duplicate `token_embd.weight` (embedding tying) even when no
     /// explicit `tie_word_embeddings` metadata flag is present (Finding 5).
@@ -1316,14 +1316,14 @@ fn resolve_conversion_profile(arch: Option<&str>) -> ConvArchProfile {
         "deepseek2" | "deepseek_v3" | "deepseek3" => ConvArchProfile {
             attention: ConvAttention::Mla,
             uses_qk_norm: false,
-            recognized: true,
+            recognised: true,
             tied_output_by_contract: false,
         },
         // Phi-3/Phi-4 fused `qkv_proj` (recognised, unsupported).
         "phi2" | "phi3" | "phi4" => ConvArchProfile {
             attention: ConvAttention::FusedQkv,
             uses_qk_norm: false,
-            recognized: true,
+            recognised: true,
             tied_output_by_contract: false,
         },
         // Qwen3 / Qwen3-MoE: separate QKV *with* per-head QK-Norm. Upstream
@@ -1332,7 +1332,7 @@ fn resolve_conversion_profile(arch: Option<&str>) -> ConvArchProfile {
         "qwen3" | "qwen3moe" | "qwen3_moe" => ConvArchProfile {
             attention: ConvAttention::SeparateQkv,
             uses_qk_norm: true,
-            recognized: true,
+            recognised: true,
             tied_output_by_contract: true,
         },
         // Recognised separate-QKV llama-like families without QK-Norm. These
@@ -1341,14 +1341,14 @@ fn resolve_conversion_profile(arch: Option<&str>) -> ConvArchProfile {
         | "gpt-oss" => ConvArchProfile {
             attention: ConvAttention::SeparateQkv,
             uses_qk_norm: false,
-            recognized: true,
+            recognised: true,
             tied_output_by_contract: false,
         },
         // Unknown or missing architecture: not on the allowlist (Finding 6).
         _ => ConvArchProfile {
             attention: ConvAttention::SeparateQkv,
             uses_qk_norm: false,
-            recognized: false,
+            recognised: false,
             tied_output_by_contract: false,
         },
     }
