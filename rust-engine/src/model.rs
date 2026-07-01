@@ -4801,6 +4801,13 @@ mod tests {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
             std::fs::write(dir.join(file), &bytes).unwrap();
+            // Match the GGUF converter's `dense_manifest_dims`, which normalizes
+            // 1D tensors to `[n, 1]`, so fixtures exercise the same shape
+            // encoding the loader sees for real manifests.
+            let dims: Vec<usize> = match dims.as_slice() {
+                [n] => vec![*n, 1],
+                other => other.to_vec(),
+            };
             tensors.push(serde_json::json!({
                 "canonical_name": canonical,
                 "file": file,
