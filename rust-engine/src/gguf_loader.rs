@@ -869,31 +869,42 @@ fn extract_experts_from_source_inner(
         // canonical filename and exposed to legacy engine names through
         // `dense_manifest.json` aliases. Q8_0 tensors keep their native
         // bytes; other supported GGUF dense dtypes are materialised as f32.
-        let dense_specs: Vec<(&str, Vec<String>)> = vec![
+        let dense_specs: Vec<(&str, Vec<String>, bool)> = vec![
             (
                 "token_embd.weight",
                 vec!["embedding.bin".to_string(), "embed.bin".to_string()],
+                // Token embedding is always an architecture-required resident.
+                true,
             ),
             (
                 "output_norm.weight",
                 vec!["final_norm.bin".to_string(), "final_rms.bin".to_string()],
+                // Final norm is always required.
+                true,
             ),
-            ("output.weight", vec!["lm_head.bin".to_string()]),
+            (
+                "output.weight",
+                vec!["lm_head.bin".to_string()],
+                // `output.weight` is optional: many GGUF exports tie the LM head
+                // to `token_embd` and omit it.
+                false,
+            ),
         ];
-        for (gname, aliases) in dense_specs {
-            emit_dense_manifest_tensor(
+        for (gname, aliases, required) in dense_specs {
+            emit_dense_manifest_tensor_req(
                 gguf,
                 out_dir,
                 &mut report,
                 &mut dense_manifest,
                 gname,
                 aliases,
+                required,
             )?;
         }
 
         // Per-layer dense tensors.
         for layer in 0..num_layers {
-            emit_dense_manifest_tensor(
+            emit_dense_manifest_tensor_req(
                 gguf,
                 out_dir,
                 &mut report,
@@ -903,8 +914,9 @@ fn extract_experts_from_source_inner(
                     format!("layer_{layer}_q.bin"),
                     format!("attn_{layer}_q.bin"),
                 ],
+                true,
             )?;
-            emit_dense_manifest_tensor(
+            emit_dense_manifest_tensor_req(
                 gguf,
                 out_dir,
                 &mut report,
@@ -914,8 +926,9 @@ fn extract_experts_from_source_inner(
                     format!("layer_{layer}_k.bin"),
                     format!("attn_{layer}_k.bin"),
                 ],
+                true,
             )?;
-            emit_dense_manifest_tensor(
+            emit_dense_manifest_tensor_req(
                 gguf,
                 out_dir,
                 &mut report,
@@ -925,8 +938,9 @@ fn extract_experts_from_source_inner(
                     format!("layer_{layer}_v.bin"),
                     format!("attn_{layer}_v.bin"),
                 ],
+                true,
             )?;
-            emit_dense_manifest_tensor(
+            emit_dense_manifest_tensor_req(
                 gguf,
                 out_dir,
                 &mut report,
@@ -936,8 +950,9 @@ fn extract_experts_from_source_inner(
                     format!("layer_{layer}_o.bin"),
                     format!("attn_{layer}_o.bin"),
                 ],
+                true,
             )?;
-            emit_dense_manifest_tensor(
+            emit_dense_manifest_tensor_req(
                 gguf,
                 out_dir,
                 &mut report,
@@ -947,8 +962,9 @@ fn extract_experts_from_source_inner(
                     format!("layer_{layer}_attn_norm.bin"),
                     format!("rms_attn_{layer}.bin"),
                 ],
+                true,
             )?;
-            emit_dense_manifest_tensor(
+            emit_dense_manifest_tensor_req(
                 gguf,
                 out_dir,
                 &mut report,
@@ -958,6 +974,7 @@ fn extract_experts_from_source_inner(
                     format!("layer_{layer}_ffn_norm.bin"),
                     format!("rms_moe_{layer}.bin"),
                 ],
+                true,
             )?;
             // Qwen3 / Qwen3-MoE per-head QK-Norm: learned `head_dim` RMSNorm
             // weights applied to Q and K before RoPE. Emitted under the
@@ -1132,11 +1149,48 @@ fn emit_dense_manifest_tensor(
     canonical: &str,
     aliases: Vec<String>,
 ) -> io::Result<()> {
+    emit_dense_manifest_tensor_req(gguf, out_dir, report, manifest, canonical, aliases, false)
+}
+
+/// Emit a dense tensor into the converted directory and record its manifest
+/// entry.
+///
+/// Finding 2: when `required` is set, a successful conversion must guarantee
+/// the tensor was actually emitted. A missing tensor, an unsupported rank, or
+/// an unsupported/failed quantization decode is therefore promoted to a hard
+/// error instead of being silently counted as `skipped`. Optional tensors
+/// retain the lenient skip-on-absence behaviour.
+fn emit_dense_manifest_tensor_req(
+    gguf: &dyn GgufSource,
+    out_dir: &Path,
+    report: &mut ExtractionReport,
+    manifest: &mut DenseTensorManifest,
+    canonical: &str,
+    aliases: Vec<String>,
+    required: bool,
+) -> io::Result<()> {
     let Some(info) = gguf.tensor_info(canonical).cloned() else {
+        if required {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "architecture-required dense tensor {canonical} is absent from the GGUF source"
+                ),
+            ));
+        }
         report.skipped += 1;
         return Ok(());
     };
     let Some(dims) = dense_manifest_dims(&info) else {
+        if required {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "architecture-required dense tensor {canonical} has unsupported rank {:?}",
+                    info.shape
+                ),
+            ));
+        }
         warn!(
             name = canonical,
             shape = ?info.shape,
@@ -1157,6 +1211,14 @@ fn emit_dense_manifest_tensor(
         match dense_tensor_to_f32(gguf, &info) {
             Ok(f32s) => (DenseDType::F32, f32_vec_to_le_bytes(&f32s)),
             Err(err) => {
+                if required {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!(
+                            "architecture-required dense tensor {canonical} could not be decoded: {err}"
+                        ),
+                    ));
+                }
                 warn!(name = canonical, error = %err, "skipping dense tensor");
                 report.skipped += 1;
                 return Ok(());
@@ -2694,6 +2756,123 @@ mod tests {
         assert_eq!(entry.checksum.as_ref().unwrap(), &dense_checksum(&q8));
         assert_eq!(fs::read(tmp.join(&entry.file)).unwrap(), q8);
         assert!(!tmp.join("embed.bin").exists());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ---- Finding 2: architecture-required tensor emission guarantee ----
+
+    struct F2FakeSource {
+        tensors: std::collections::HashMap<String, GgufTensorInfo>,
+        data: std::collections::HashMap<String, Vec<u8>>,
+        metadata: std::collections::HashMap<String, GgufValue>,
+    }
+    impl GgufSource for F2FakeSource {
+        fn metadata(&self) -> &std::collections::HashMap<String, GgufValue> {
+            &self.metadata
+        }
+        fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
+            self.tensors.get(name)
+        }
+        fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+            Ok(self.data.get(name).cloned())
+        }
+    }
+
+    fn f2_empty_report() -> ExtractionReport {
+        ExtractionReport {
+            experts_written: 0,
+            dense_written: 0,
+            skipped: 0,
+            total_bytes: 0,
+            expert_dtype: WeightDtype::F32,
+            d_model: 4,
+            d_ff: 0,
+            num_experts_per_layer: 0,
+            num_layers: 0,
+        }
+    }
+
+    #[test]
+    fn required_dense_tensor_absence_is_fatal() {
+        let source = F2FakeSource {
+            tensors: std::collections::HashMap::new(),
+            data: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+        };
+        let tmp = tempfile_dir();
+        let mut report = f2_empty_report();
+        let mut manifest = DenseTensorManifest {
+            format_version: 1,
+            tensors: Vec::new(),
+        };
+        // Optional: absence is tolerated (counted as skipped).
+        emit_dense_manifest_tensor_req(
+            &source,
+            &tmp,
+            &mut report,
+            &mut manifest,
+            "token_embd.weight",
+            vec!["embed.bin".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.skipped, 1);
+        // Required: absence is a hard error.
+        let err = emit_dense_manifest_tensor_req(
+            &source,
+            &tmp,
+            &mut report,
+            &mut manifest,
+            "token_embd.weight",
+            vec!["embed.bin".to_string()],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn required_dense_tensor_unsupported_quant_is_fatal() {
+        // A required tensor stored in an unsupported GGML dtype must fail the
+        // conversion rather than being silently skipped.
+        let name = "token_embd.weight".to_string();
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert(
+            name.clone(),
+            GgufTensorInfo {
+                name: name.clone(),
+                shape: vec![4, 2],
+                // Q2_K is not decoded by the converter.
+                ggml_dtype: ggml_dtype::Q2_K,
+                offset: 0,
+                byte_len: 64,
+            },
+        );
+        let mut data = std::collections::HashMap::new();
+        data.insert(name.clone(), vec![0u8; 64]);
+        let source = F2FakeSource {
+            tensors,
+            data,
+            metadata: std::collections::HashMap::new(),
+        };
+        let tmp = tempfile_dir();
+        let mut report = f2_empty_report();
+        let mut manifest = DenseTensorManifest {
+            format_version: 1,
+            tensors: Vec::new(),
+        };
+        let err = emit_dense_manifest_tensor_req(
+            &source,
+            &tmp,
+            &mut report,
+            &mut manifest,
+            &name,
+            vec!["embed.bin".to_string()],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         let _ = fs::remove_dir_all(&tmp);
     }
 
