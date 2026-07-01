@@ -2459,6 +2459,13 @@ async fn build_bench_real_runtime(
             );
         }
     };
+    // The tokenizer must be addressable by the reconciled model vocabulary
+    // (Finding 4): every emittable token id must be < model.vocab_size.
+    tokenizer
+        .validate_vocab_compat(model.config.vocab_size)
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("bench-real tokenizer is incompatible with the model: {e}").into()
+        })?;
 
     Ok(BenchRealRuntime {
         cfg,
@@ -2963,11 +2970,71 @@ fn current_rss_bytes() -> Option<u64> {
     }
 }
 
+/// Resolve the serving tokenizer, enforcing the real-vs-synthetic policy
+/// (Finding 4).
+///
+/// * `real_enabled` — `real_transformer.enabled`.
+/// * `tokenizer_path` — configured `tokenizer.path`, if any.
+/// * `model_vocab_size` — reconciled model vocabulary, when a real model
+///   is present, used to validate tokenizer/model compatibility.
+///
+/// When a real transformer is enabled, a real tokenizer is mandatory: a
+/// missing path or a load failure is fatal, the byte fallback is never
+/// used, and every emittable token id must be `< model_vocab_size`. When
+/// the real transformer is disabled, the byte-level fallback is preserved
+/// for the synthetic/legacy path.
+fn resolve_serving_tokenizer(
+    real_enabled: bool,
+    tokenizer_path: Option<&std::path::Path>,
+    model_vocab_size: Option<usize>,
+) -> Result<Arc<crate::tokenizer::Tokenizer>, crate::config::ConfigError> {
+    use crate::config::ConfigError;
+    use crate::tokenizer::Tokenizer;
+
+    if real_enabled {
+        let path = tokenizer_path.ok_or_else(|| {
+            ConfigError::Invalid(
+                "real_transformer.enabled requires tokenizer.path; the byte-level fallback \
+                 tokenizer is not valid for real-checkpoint inference"
+                    .to_string(),
+            )
+        })?;
+        let tok = Tokenizer::from_file(path).map_err(|e| {
+            ConfigError::Invalid(format!(
+                "failed to load tokenizer {} for real-transformer serving: {e}",
+                path.display()
+            ))
+        })?;
+        if let Some(vocab) = model_vocab_size {
+            tok.validate_vocab_compat(vocab).map_err(|e| {
+                ConfigError::Invalid(format!(
+                    "tokenizer {} is incompatible with the model: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        Ok(Arc::new(tok))
+    } else {
+        match tokenizer_path {
+            Some(p) => match Tokenizer::from_file(p) {
+                Ok(t) => Ok(Arc::new(t)),
+                Err(e) => {
+                    warn!(path = %p.display(), error = %e, "tokenizer load failed; falling back to byte tokenizer");
+                    Ok(Arc::new(Tokenizer::bytes()))
+                }
+            },
+            None => {
+                info!("no tokenizer.json configured; using byte-level fallback tokenizer");
+                Ok(Arc::new(Tokenizer::bytes()))
+            }
+        }
+    }
+}
+
 async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     use crate::config::Config;
     use crate::metrics::Metrics;
     use crate::server::{serve, AppState};
-    use crate::tokenizer::Tokenizer;
 
     // NUMA-local pinning via `MER_PIN_CORES` is consumed centrally
     // at process start in `main()` (see `numa::apply_mer_pin_cores_env`)
@@ -3572,19 +3639,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     }
     let engine = Arc::new(engine_builder.with_metrics(metrics.clone()));
 
-    let tokenizer = match cfg.tokenizer.path.as_ref() {
-        Some(p) => match Tokenizer::from_file(p) {
-            Ok(t) => Arc::new(t),
-            Err(e) => {
-                warn!(path = %p.display(), error = %e, "tokenizer load failed; falling back to byte tokenizer");
-                Arc::new(Tokenizer::bytes())
-            }
-        },
-        None => {
-            info!("no tokenizer.json configured; using byte-level fallback tokenizer");
-            Arc::new(Tokenizer::bytes())
-        }
-    };
+    let tokenizer = resolve_serving_tokenizer(
+        cfg.real_transformer.enabled,
+        cfg.tokenizer.path.as_deref(),
+        real_model.as_ref().map(|m| m.config.vocab_size),
+    )?;
 
     // Optional real-transformer pipeline. When enabled, every request
     // runs `embedding -> stacked layers (each with SSD-streamed MoE) ->
@@ -5643,6 +5702,34 @@ mod tests {
             assert_no_softmax_fallbacks(snapshot).is_err(),
             "a nonzero softmax-fallback delta must invalidate the benchmark"
         );
+    }
+
+    // ---- Finding 4: real serving requires a real tokenizer ----
+
+    #[test]
+    fn real_serving_without_tokenizer_path_fails() {
+        match resolve_serving_tokenizer(true, None, Some(1000)) {
+            Err(crate::config::ConfigError::Invalid(_)) => {}
+            _ => panic!("real serving must reject a missing tokenizer path"),
+        }
+    }
+
+    #[test]
+    fn real_serving_with_unloadable_tokenizer_fails() {
+        let path = std::path::PathBuf::from("/nonexistent/does-not-exist/tokenizer.json");
+        match resolve_serving_tokenizer(true, Some(&path), Some(1000)) {
+            Err(crate::config::ConfigError::Invalid(_)) => {}
+            _ => panic!("real serving must reject an unloadable tokenizer"),
+        }
+    }
+
+    #[test]
+    fn synthetic_serving_without_tokenizer_uses_byte_fallback() {
+        let tok = match resolve_serving_tokenizer(false, None, None) {
+            Ok(t) => t,
+            Err(_) => panic!("synthetic mode must keep the byte-tokenizer fallback"),
+        };
+        assert_eq!(tok.vocab_size(), 256, "byte tokenizer expected in synthetic mode");
     }
 
     #[test]
