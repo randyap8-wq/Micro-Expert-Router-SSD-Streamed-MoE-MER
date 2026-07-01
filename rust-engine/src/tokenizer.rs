@@ -86,6 +86,39 @@ impl Tokenizer {
         }
     }
 
+    /// Largest token id this tokenizer can emit, including added and
+    /// special tokens. For the byte fallback this is always 255. For a
+    /// HuggingFace tokenizer it is the maximum id over the full vocabulary
+    /// (`with_added_tokens = true`), which covers reserved/special ids that
+    /// may sit above the base-vocabulary count.
+    pub fn max_token_id(&self) -> u32 {
+        match self {
+            Tokenizer::Bytes => 255,
+            #[cfg(feature = "tokenizer")]
+            Tokenizer::Hf(t) => t.get_vocab(true).values().copied().max().unwrap_or(0),
+        }
+    }
+
+    /// Validate that every token id this tokenizer can emit is addressable
+    /// by a model whose output/embedding vocabulary is `model_vocab_size`.
+    ///
+    /// The invariant is `max_token_id < model_vocab_size` (ids are
+    /// zero-based). This deliberately checks the maximum *emittable* id —
+    /// including added and special tokens — rather than requiring the raw
+    /// base-vocabulary count to equal `model_vocab_size`, because real
+    /// checkpoints routinely pad the embedding table beyond the tokenizer's
+    /// base vocab and reserve high ids for special tokens.
+    pub fn validate_vocab_compat(&self, model_vocab_size: usize) -> Result<(), TokenizerError> {
+        let max_id = self.max_token_id() as usize;
+        if max_id >= model_vocab_size {
+            return Err(TokenizerError::Backend(format!(
+                "tokenizer can emit token id {max_id} but model vocab_size is \
+                 {model_vocab_size}; every token id must be < model vocab_size"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn encode(&self, input: &str) -> Result<Vec<u32>, TokenizerError> {
         match self {
             Tokenizer::Bytes => Ok(input.bytes().map(|b| b as u32).collect()),
@@ -150,5 +183,30 @@ mod tests {
             other => panic!("expected Backend error about disabled feature, got {}",
                 match other { Ok(_) => "Ok(_)".to_string(), Err(e) => format!("Err({e})") }),
         }
+    }
+
+    #[test]
+    fn byte_tokenizer_max_token_id_is_255() {
+        assert_eq!(Tokenizer::bytes().max_token_id(), 255);
+    }
+
+    #[test]
+    fn vocab_compat_accepts_model_larger_than_max_token_id() {
+        // Byte tokenizer emits ids 0..=255; a model with vocab_size 256
+        // addresses all of them.
+        assert!(Tokenizer::bytes().validate_vocab_compat(256).is_ok());
+        assert!(Tokenizer::bytes().validate_vocab_compat(100_000).is_ok());
+    }
+
+    #[test]
+    fn vocab_compat_rejects_max_token_id_at_or_above_vocab_size() {
+        // vocab_size == max_id fails (ids are zero-based, so 255 needs
+        // vocab_size >= 256); anything smaller also fails.
+        let err = Tokenizer::bytes().validate_vocab_compat(255).unwrap_err();
+        match err {
+            TokenizerError::Backend(m) => assert!(m.contains("255") && m.contains("vocab_size")),
+            other => panic!("expected Backend error, got {other}"),
+        }
+        assert!(Tokenizer::bytes().validate_vocab_compat(10).is_err());
     }
 }

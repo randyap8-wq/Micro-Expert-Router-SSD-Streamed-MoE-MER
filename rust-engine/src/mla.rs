@@ -65,6 +65,7 @@ fn softmax_inplace(scores: &mut [f32]) {
     // distribution, so emit a uniform distribution rather than letting NaN
     // propagate downstream.
     if saw_nan || !max.is_finite() {
+        crate::transformer::record_nonfinite_softmax_fallback();
         let uniform = 1.0 / scores.len() as f32;
         scores.iter_mut().for_each(|s| *s = uniform);
         return;

@@ -896,14 +896,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The `run` subcommand grows one extra wrinkle: when invoked with
     // `--gpu` it must initialise the GPU compute backend *before* the
     // default CPU backend claims the `OnceLock` (gist Fix 2), mirroring
-    // `cmd_serve`. A failed GPU init falls back to `install_default`.
+    // `cmd_serve`. `--gpu` is an explicit request, so a failed GPU init is
+    // fatal (fail closed) — it never silently falls back to CPU.
     let run_gpu_cache = if let Cmd::Run {
         gpu: true,
         gpu_cache_mb,
         ..
     } = &cli.cmd
     {
-        install_run_gpu_backend(*gpu_cache_mb)
+        install_run_gpu_backend(*gpu_cache_mb)?
     } else if !matches!(cli.cmd, Cmd::Serve { .. }) {
         crate::backend::install_default();
         let b = crate::backend::current();
@@ -1216,9 +1217,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `set_backend` race — it falls back to
 /// [`install_default`](crate::backend::install_default) with a
 /// warning so the benchmark still runs on CPU.
+/// Install the GPU compute backend for an explicit `run --gpu` request.
+///
+/// Finding 5 (fail-closed GPU): `--gpu` is an explicit request, so both GPU
+/// initialisation failure and backend-installation failure are fatal. We never
+/// silently continue on CPU — that would produce a "GPU" benchmark measuring
+/// the CPU path. Operators who want best-effort GPU with CPU fallback use the
+/// serving `compute_offload = "auto"` path instead.
 fn install_run_gpu_backend(
     gpu_cache_mb: usize,
-) -> Option<Arc<crate::expert_cache::GpuExpertCache>> {
+) -> Result<Option<Arc<crate::expert_cache::GpuExpertCache>>, Box<dyn std::error::Error>> {
     // The KV-cache geometry below only sizes the dense-backbone cache,
     // which the synthetic `run` benchmark does not exercise — it routes
     // everything through `expert_matmul`.
@@ -1238,41 +1246,32 @@ fn install_run_gpu_backend(
         1, // num_heads
         1, // num_kv_heads
         1, // head_dim
+        1, // v_head_dim
         gpu_expert_cache.clone(),
     );
     if !backend_box.is_gpu() {
-        warn!("GPU REQUEST FAILED — RUNNING ON CPU");
-        crate::backend::install_default();
-        let b = crate::backend::current();
-        info!(
-            backend = b.device_name(),
-            compute_plane = b.compute_plane(),
-            "math backend installed"
-        );
-        return None;
+        return Err("explicit --gpu request failed: GPU backend initialization did not \
+                    produce a GPU device; refusing to run on CPU (use serving \
+                    compute_offload = \"auto\" for best-effort GPU with CPU fallback)"
+            .into());
     }
     let device_name = backend_box.device_name().to_string();
     let compute_plane = backend_box.compute_plane().to_string();
     let gpu = std::sync::Arc::new(backend_box);
     if let Err(e) = crate::backend::set_backend(gpu) {
-        warn!(error = e, "GPU REQUEST FAILED — RUNNING ON CPU");
-        crate::backend::install_default();
-        let b = crate::backend::current();
-        info!(
-            backend = b.device_name(),
-            compute_plane = b.compute_plane(),
-            "math backend installed"
-        );
-        None
-    } else {
-        info!(
-            device = device_name,
-            compute_plane,
-            vram_capacity_mb = gpu_cache_mb,
-            "GpuBackend installed for run benchmark"
-        );
-        Some(gpu_expert_cache)
+        return Err(format!(
+            "explicit --gpu request failed: GPU backend installation failed ({e}); \
+             refusing to run on CPU"
+        )
+        .into());
     }
+    info!(
+        device = device_name,
+        compute_plane,
+        vram_capacity_mb = gpu_cache_mb,
+        "GpuBackend installed for run benchmark"
+    );
+    Ok(Some(gpu_expert_cache))
 }
 
 /// **Tier 2.** Attach a packed expert blob to `storage` when both the blob
@@ -1525,6 +1524,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
             let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
                 .await?;
         }
+        let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
         for i in 0..args.measured_runs {
             runs.push(
@@ -1532,6 +1532,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
                     .await?,
             );
         }
+        assert_no_softmax_fallbacks(softmax_before)?;
         emit_bench_real_report(&args, input, runs)?;
     } else {
         for i in 0..args.warmup_runs {
@@ -1540,6 +1541,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
             let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
                 .await?;
         }
+        let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
         for i in 0..args.measured_runs {
             let runtime = build_bench_real_runtime(&args.config).await?;
@@ -1549,7 +1551,25 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
                     .await?,
             );
         }
+        assert_no_softmax_fallbacks(softmax_before)?;
         emit_bench_real_report(&args, input, runs)?;
+    }
+    Ok(())
+}
+
+/// Strict real-model benchmarks must not emit attention-softmax non-finite
+/// fallbacks: any increase over the measured window signals a numerically
+/// invalid run (a `NaN`/`inf` propagated into attention), so the benchmark is
+/// rejected rather than reporting a valid-looking throughput (gist Finding 9).
+fn assert_no_softmax_fallbacks(before: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let delta = crate::transformer::nonfinite_softmax_fallbacks().saturating_sub(before);
+    if delta > 0 {
+        return Err(format!(
+            "bench-real INVALID: {delta} attention-softmax non-finite fallback(s) occurred during \
+             the measured window; the run produced NaN/inf attention scores and is not a valid \
+             measurement"
+        )
+        .into());
     }
     Ok(())
 }
@@ -2151,11 +2171,13 @@ async fn build_bench_real_runtime(
     if !cfg.real_transformer.enabled {
         return Err("bench-real requires [real_transformer] enabled = true".into());
     }
-    if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu
-        || cfg.gpu_cache.enabled
+    if matches!(
+        cfg.real_transformer.compute_offload,
+        crate::backend::ComputeOffload::Gpu | crate::backend::ComputeOffload::Auto
+    ) || cfg.gpu_cache.enabled
     {
         return Err(
-            "bench-real is CPU-only for this sprint; disable real_transformer.compute_offload = \"gpu\" and [gpu_cache].enabled"
+            "bench-real is CPU-only for this sprint; set real_transformer.compute_offload = \"cpu\" (\"gpu\" and \"auto\" are rejected) and disable [gpu_cache].enabled"
                 .into(),
         );
     }
@@ -2167,14 +2189,31 @@ async fn build_bench_real_runtime(
     if cfg.real_transformer.weights_dir.is_none() {
         return Err("bench-real requires real_transformer.weights_dir; seeded fallback benchmarks are not production measurements".into());
     }
+    if cfg.real_transformer.allow_seeded_fallback {
+        return Err(
+            "bench-real rejects real_transformer.allow_seeded_fallback = true; seeded fallback \
+             benchmarks are not production measurements"
+                .into(),
+        );
+    }
     if !cfg.real_transformer.strict_weights {
-        warn!(
-            "real_transformer.strict_weights is false; benchmark may include seeded fallback tensors"
+        return Err(
+            "bench-real requires real_transformer.strict_weights = true; a benchmark that may \
+             include seeded fallback tensors is not a production measurement"
+                .into(),
         );
     }
 
     let (resolved_architecture, resolved_first_k_dense_replace, resolved_advanced) =
-        reconcile_bench_real_config(&mut cfg)?;
+        reconcile_real_model_config(&mut cfg)?;
+    // Finding 7: validate the fully-resolved configuration before any weights
+    // are loaded or backends installed.
+    validate_resolved_real_model_config(
+        &cfg,
+        resolved_architecture,
+        resolved_first_k_dense_replace,
+        &resolved_advanced,
+    )?;
 
     crate::backend::install_default();
     {
@@ -2301,6 +2340,22 @@ async fn build_bench_real_runtime(
             strict_weights: rt.strict_weights,
         },
     )?);
+    if model.load_status.seeded_fallback_remained {
+        return Err(format!(
+            "bench-real loaded an incomplete checkpoint: {} of {} required tensors loaded, \
+             seeded fallback remained; not a production measurement",
+            model.load_status.loaded_tensors, model.load_status.required_tensors
+        )
+        .into());
+    }
+    info!(
+        strict = model.load_status.strict,
+        loader = model.load_status.loader,
+        loaded_tensors = model.load_status.loaded_tensors,
+        required_tensors = model.load_status.required_tensors,
+        seeded_fallback_remained = model.load_status.seeded_fallback_remained,
+        "bench-real model-loading status"
+    );
 
     info!(
         num_experts = model.layers[0].gate.num_experts,
@@ -2413,6 +2468,13 @@ async fn build_bench_real_runtime(
             );
         }
     };
+    // The tokenizer must be addressable by the reconciled model vocabulary
+    // (Finding 4): every emittable token id must be < model.vocab_size.
+    tokenizer
+        .validate_vocab_compat(model.config.vocab_size)
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("bench-real tokenizer is incompatible with the model: {e}").into()
+        })?;
 
     Ok(BenchRealRuntime {
         cfg,
@@ -2422,7 +2484,16 @@ async fn build_bench_real_runtime(
     })
 }
 
-fn reconcile_bench_real_config(
+/// Reconcile the resolved real-model configuration from the TOML config and,
+/// when present, the checkpoint `config.json`. Shared by `build_bench_real_runtime`
+/// and `cmd_serve` (Finding 2) so serving and bench-real resolve identically.
+///
+/// The checkpoint `config.json` is always parsed when `weights_dir` points at a
+/// directory containing one, regardless of whether the TOML pins an
+/// architecture. An explicit TOML architecture never suppresses checkpoint
+/// reconciliation; if both are present they must agree or reconciliation fails
+/// naming both.
+fn reconcile_real_model_config(
     cfg: &mut crate::config::Config,
 ) -> Result<
     (
@@ -2521,6 +2592,202 @@ fn reconcile_bench_real_config(
         resolved_first_k_dense_replace,
         resolved_advanced,
     ))
+}
+
+/// Finding 7: post-reconciliation, architecture-aware validation of the
+/// fully-resolved real-model configuration. Shared by `build_bench_real_runtime`
+/// and `cmd_serve` (Finding 2) so both paths reject the same invalid configs.
+///
+/// This runs *after* [`reconcile_real_model_config`] has merged the TOML and
+/// checkpoint `config.json` into `cfg`. It validates the final resolved
+/// architecture, model shape, routing configuration, storage/cache
+/// relationships, and the integer conversions the loader will subsequently
+/// perform.
+///
+/// It deliberately does **not** reuse the generic [`crate::config::Config`]
+/// validation's universal `num_heads * head_dim == d_model` rule: that
+/// identity is invalid for several supported architectures (MLA decomposes
+/// Q/K/V through low-rank latents, and MiMo-V2-Flash uses an asymmetric
+/// `v_head_dim != head_dim` with a partial-rotary Q/K width), so applying it
+/// would reject valid checkpoints.
+fn validate_resolved_real_model_config(
+    cfg: &crate::config::Config,
+    arch: crate::architecture::Architecture,
+    first_k_dense_replace: usize,
+    advanced: &crate::model::AdvancedConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut errs: Vec<String> = Vec::new();
+
+    let d_model = cfg.model.d_model;
+    let d_ff = cfg.model.d_ff;
+    let num_layers = cfg.model.num_layers;
+    let num_experts = cfg.model.num_experts as usize;
+    let top_k = cfg.model.top_k;
+    let vocab_size = cfg.real_transformer.vocab_size;
+    let num_heads = cfg.real_transformer.num_heads;
+    let num_kv_heads = cfg.real_transformer.num_kv_heads;
+    let head_dim = cfg.real_transformer.head_dim;
+    let v_head_dim = advanced.v_head_dim.unwrap_or(head_dim);
+
+    // ---- Resolved model shape ----
+    if d_model == 0 {
+        errs.push("resolved d_model is 0".to_string());
+    }
+    if d_ff == 0 {
+        errs.push("resolved d_ff is 0".to_string());
+    }
+    if num_layers == 0 {
+        errs.push("resolved num_layers is 0".to_string());
+    }
+    if vocab_size == 0 {
+        errs.push("resolved vocab_size is 0".to_string());
+    }
+    if num_heads == 0 {
+        errs.push("resolved num_heads is 0".to_string());
+    }
+    if head_dim == 0 {
+        errs.push("resolved head_dim is 0".to_string());
+    }
+    if v_head_dim == 0 {
+        errs.push("resolved v_head_dim is 0".to_string());
+    }
+
+    // ---- Architecture-aware attention head geometry ----
+    // MLA carries its own low-rank projection dims and does not obey the
+    // dense GQA head arithmetic; validate the GQA invariants only for the
+    // standard dense-attention families.
+    if advanced.mla.is_none() {
+        if num_kv_heads == 0 {
+            errs.push("resolved num_kv_heads is 0".to_string());
+        } else if num_heads % num_kv_heads != 0 {
+            errs.push(format!(
+                "grouped-query attention requires num_heads ({num_heads}) to be a multiple of \
+                 num_kv_heads ({num_kv_heads})"
+            ));
+        }
+        // A separate SWA KV-head count (MiMo-V2-Flash) must divide num_heads too.
+        if let Some(swa_kv) = advanced.swa_num_key_value_heads {
+            if swa_kv == 0 || num_heads % swa_kv != 0 {
+                errs.push(format!(
+                    "swa_num_key_value_heads ({swa_kv}) must be a non-zero divisor of num_heads \
+                     ({num_heads})"
+                ));
+            }
+        }
+    }
+
+    // ---- Routing configuration ----
+    if num_experts == 0 {
+        errs.push("resolved num_experts is 0".to_string());
+    }
+    if top_k == 0 {
+        errs.push("resolved top_k is 0".to_string());
+    }
+    if top_k > num_experts {
+        errs.push(format!(
+            "top_k ({top_k}) exceeds num_experts ({num_experts})"
+        ));
+    }
+    if first_k_dense_replace > num_layers {
+        errs.push(format!(
+            "first_k_dense_replace ({first_k_dense_replace}) exceeds num_layers ({num_layers})"
+        ));
+    }
+    // Group-limited routing (DeepSeek-V3 `n_group`/`topk_group`).
+    if advanced.n_group > 1 {
+        if num_experts % advanced.n_group != 0 {
+            errs.push(format!(
+                "group-limited routing requires num_experts ({num_experts}) to be a multiple of \
+                 n_group ({})",
+                advanced.n_group
+            ));
+        }
+        if advanced.topk_group == 0 || advanced.topk_group > advanced.n_group {
+            errs.push(format!(
+                "topk_group ({}) must be in 1..=n_group ({})",
+                advanced.topk_group, advanced.n_group
+            ));
+        }
+    }
+
+    // ---- Storage / cache relationships ----
+    let cache_slots = cfg.storage.cache_slots;
+    let block_align = cfg.storage.block_align;
+    let expert_size = cfg.model.expert_size;
+    // The per-layer routed-expert LRU must be able to hold every *routed*
+    // expert activated for a single token (the top-K). Finding 7: always-on
+    // shared experts are loaded resident in the model (`layers[l].shared_expert`)
+    // and computed directly — they are never streamed through the routed
+    // SSD/expert cache, so they must NOT be added to this working-set
+    // requirement. Doing so would reject an otherwise-adequate `cache_slots`.
+    if cache_slots < top_k {
+        errs.push(format!(
+            "storage.cache_slots ({cache_slots}) is smaller than the routed experts activated \
+             per layer (top_k {top_k}); the cache cannot hold one layer's routed working set"
+        ));
+    }
+    if expert_size == 0 {
+        errs.push("model.expert_size is 0".to_string());
+    }
+    if !cfg.storage.no_direct {
+        if block_align == 0 {
+            errs.push("storage.block_align is 0 while O_DIRECT is enabled".to_string());
+        } else if expert_size % block_align != 0 {
+            errs.push(format!(
+                "model.expert_size ({expert_size}) must be a multiple of storage.block_align \
+                 ({block_align}) for O_DIRECT reads (set storage.no_direct = true to relax)"
+            ));
+        }
+    }
+
+    // ---- Integer conversions the loader will perform ----
+    // These products index/allocate resident tensors; a usize overflow here
+    // would silently wrap during loading. Validate they are representable.
+    let q_dim = num_heads.checked_mul(head_dim);
+    if q_dim.is_none() {
+        errs.push(format!(
+            "num_heads ({num_heads}) * head_dim ({head_dim}) overflows usize"
+        ));
+    }
+    if d_model.checked_mul(vocab_size).is_none() {
+        errs.push(format!(
+            "d_model ({d_model}) * vocab_size ({vocab_size}) overflows usize (embedding size)"
+        ));
+    }
+    if let Some(q) = q_dim {
+        if q.checked_mul(d_model).is_none() {
+            errs.push("q_proj element count overflows usize".to_string());
+        }
+    }
+    if d_model.checked_mul(d_ff).is_none() {
+        errs.push(format!(
+            "d_model ({d_model}) * d_ff ({d_ff}) overflows usize (dense FFN size)"
+        ));
+    }
+    if num_experts > u32::MAX as usize {
+        errs.push(format!(
+            "num_experts ({num_experts}) does not fit in u32"
+        ));
+    }
+
+    if errs.is_empty() {
+        info!(
+            architecture = %arch.model_type(),
+            d_model,
+            num_layers,
+            num_experts,
+            top_k,
+            "bench-real resolved configuration passed architecture-aware validation"
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "resolved bench-real configuration for architecture \"{}\" failed validation:\n  - {}",
+            arch.model_type(),
+            errs.join("\n  - ")
+        )
+        .into())
+    }
 }
 
 async fn run_bench_real_once(
@@ -2917,11 +3184,71 @@ fn current_rss_bytes() -> Option<u64> {
     }
 }
 
+/// Resolve the serving tokenizer, enforcing the real-vs-synthetic policy
+/// (Finding 4).
+///
+/// * `real_enabled` — `real_transformer.enabled`.
+/// * `tokenizer_path` — configured `tokenizer.path`, if any.
+/// * `model_vocab_size` — reconciled model vocabulary, when a real model
+///   is present, used to validate tokenizer/model compatibility.
+///
+/// When a real transformer is enabled, a real tokenizer is mandatory: a
+/// missing path or a load failure is fatal, the byte fallback is never
+/// used, and every emittable token id must be `< model_vocab_size`. When
+/// the real transformer is disabled, the byte-level fallback is preserved
+/// for the synthetic/legacy path.
+fn resolve_serving_tokenizer(
+    real_enabled: bool,
+    tokenizer_path: Option<&std::path::Path>,
+    model_vocab_size: Option<usize>,
+) -> Result<Arc<crate::tokenizer::Tokenizer>, crate::config::ConfigError> {
+    use crate::config::ConfigError;
+    use crate::tokenizer::Tokenizer;
+
+    if real_enabled {
+        let path = tokenizer_path.ok_or_else(|| {
+            ConfigError::Invalid(
+                "real_transformer.enabled requires tokenizer.path; the byte-level fallback \
+                 tokenizer is not valid for real-checkpoint inference"
+                    .to_string(),
+            )
+        })?;
+        let tok = Tokenizer::from_file(path).map_err(|e| {
+            ConfigError::Invalid(format!(
+                "failed to load tokenizer {} for real-transformer serving: {e}",
+                path.display()
+            ))
+        })?;
+        if let Some(vocab) = model_vocab_size {
+            tok.validate_vocab_compat(vocab).map_err(|e| {
+                ConfigError::Invalid(format!(
+                    "tokenizer {} is incompatible with the model: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        Ok(Arc::new(tok))
+    } else {
+        match tokenizer_path {
+            Some(p) => match Tokenizer::from_file(p) {
+                Ok(t) => Ok(Arc::new(t)),
+                Err(e) => {
+                    warn!(path = %p.display(), error = %e, "tokenizer load failed; falling back to byte tokenizer");
+                    Ok(Arc::new(Tokenizer::bytes()))
+                }
+            },
+            None => {
+                info!("no tokenizer.json configured; using byte-level fallback tokenizer");
+                Ok(Arc::new(Tokenizer::bytes()))
+            }
+        }
+    }
+}
+
 async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     use crate::config::Config;
     use crate::metrics::Metrics;
     use crate::server::{serve, AppState};
-    use crate::tokenizer::Tokenizer;
 
     // NUMA-local pinning via `MER_PIN_CORES` is consumed centrally
     // at process start in `main()` (see `numa::apply_mer_pin_cores_env`)
@@ -2948,75 +3275,32 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // (exact HF `model_type`) wins; otherwise auto-detect from
     // `config.json`; otherwise default to Mixtral. An unrecognised
     // architecture is a hard error — we never silently mislabel a model.
+    // Precedence: the checkpoint `config.json` (when present under
+    // `weights_dir`) is always parsed and reconciled; an explicit
+    // `[real_transformer] architecture = "…"` override never suppresses that
+    // reconciliation and must agree with the checkpoint if both are present
+    // (Finding 2). Serving and bench-real share the exact same reconciliation
+    // and resolved-validation helpers so they can never disagree on the
+    // resolved architecture/dims or accept a config the other rejects.
     let mut resolved_architecture = crate::architecture::Architecture::Mixtral;
     let mut resolved_first_k_dense_replace = 0usize;
-    // Advanced routing surface (DeepSeek-V3 aux-loss-free balancing:
-    // sigmoid scoring, group-limited top-K, routed scaling, plus
-    // `norm_topk_prob`). Reconciled from `config.json` alongside the
-    // dims below so the real model's per-layer `LinearGate` is built via
-    // `with_routing` with the checkpoint's actual scoring function — not
-    // silently defaulted to Mixtral-style softmax. Mixtral / Qwen3-MoE
-    // checkpoints map to the same values `AdvancedConfig::default()`
-    // already carries, so this is behaviour-preserving for them.
     let mut resolved_advanced = crate::model::AdvancedConfig::default();
     if cfg.real_transformer.enabled {
-        if let Some(arch_str) = cfg.real_transformer.architecture.clone() {
-            resolved_architecture = crate::architecture::Architecture::from_model_type(&arch_str)
-                .ok_or_else(|| {
-                format!(
-                    "[real_transformer] architecture = \"{arch_str}\" is not a recognised \
-                         model_type (expected one of: mixtral, qwen3, qwen3_moe, deepseek_v3, \
-                         mistral3, phi3)"
-                )
-            })?;
-        } else if let Some(dir) = cfg.real_transformer.weights_dir.clone() {
-            match crate::architecture::HfConfig::from_dir(&dir) {
-                Ok(Some(hf)) => {
-                    info!(
-                        architecture = ?hf.architecture,
-                        "config.json detected; reconciling [model] hyperparameters from checkpoint"
-                    );
-                    resolved_architecture = hf.architecture;
-                    resolved_first_k_dense_replace = hf.first_k_dense_replace.unwrap_or(0);
-                    // Map the checkpoint's routing hyperparameters (scoring
-                    // function, group-limited top-K, routed scaling factor,
-                    // `norm_topk_prob`) so they reach the per-layer gate.
-                    resolved_advanced = crate::model::RealModelConfig::from_hf_config(&hf).advanced;
-                    // GPT-OSS SwiGLU gate clamp: install the process-global
-                    // limit so the expert-FFN hot path applies it (no-op for
-                    // every architecture that leaves `swiglu_limit` unset).
-                    crate::inference::set_swiglu_limit(resolved_advanced.swiglu_limit);
-                    // Engine-visible dims (cache + expert namespace + router).
-                    cfg.model.d_model = hf.hidden_size;
-                    cfg.model.d_ff = hf.resolved_d_ff();
-                    cfg.model.num_layers = hf.num_hidden_layers;
-                    cfg.model.num_experts = hf.num_routed_experts.unwrap_or(1).max(1) as u32;
-                    cfg.model.top_k = hf
-                        .num_experts_per_tok
-                        .unwrap_or(1)
-                        .clamp(1, cfg.model.num_experts.max(1) as usize);
-                    // Attention / norm hyperparameters consumed when the
-                    // `RealModelConfig` is built further below.
-                    cfg.real_transformer.vocab_size = hf.vocab_size;
-                    cfg.real_transformer.num_heads = hf.num_attention_heads;
-                    cfg.real_transformer.num_kv_heads = if hf.num_key_value_heads == 0 {
-                        hf.num_attention_heads
-                    } else {
-                        hf.num_key_value_heads
-                    };
-                    cfg.real_transformer.head_dim = hf.resolved_head_dim();
-                    cfg.real_transformer.rope_base = hf.rope_theta;
-                    cfg.real_transformer.rms_eps = hf.rms_norm_eps;
-                    cfg.real_transformer.window_size = hf.sliding_window.unwrap_or(0);
-                }
-                Ok(None) => {} // no config.json — keep TOML-derived config
-                Err(e) => {
-                    return Err(
-                        format!("failed to read config.json from {}: {e}", dir.display()).into(),
-                    );
-                }
-            }
-        }
+        let (arch, first_k, advanced) = reconcile_real_model_config(&mut cfg)?;
+        resolved_architecture = arch;
+        resolved_first_k_dense_replace = first_k;
+        resolved_advanced = advanced;
+        // GPT-OSS SwiGLU gate clamp: install the process-global limit so the
+        // expert-FFN hot path applies it (no-op when `swiglu_limit` is unset).
+        crate::inference::set_swiglu_limit(resolved_advanced.swiglu_limit);
+        // Architecture-aware validation of the fully-resolved config, identical
+        // to the bench-real path (Finding 2/7).
+        validate_resolved_real_model_config(
+            &cfg,
+            resolved_architecture,
+            resolved_first_k_dense_replace,
+            &resolved_advanced,
+        )?;
     }
 
     info!(
@@ -3056,7 +3340,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cfg.gpu_cache.promote_after_hits,
         ))
     };
-    if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu {
+    let mut backend_fallback_occurred = false;
+    if matches!(
+        cfg.real_transformer.compute_offload,
+        crate::backend::ComputeOffload::Gpu | crate::backend::ComputeOffload::Auto
+    ) {
         let num_layers = cfg.model.num_layers;
         let max_seq_len = if cfg.real_transformer.window_size == 0 {
             4096
@@ -3084,21 +3372,68 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             num_heads,
             num_kv_heads,
             head_dim,
+            // Finding 12: the run path does not surface an asymmetric
+            // `v_head_dim` here; pass 0 (auto → head_dim). Asymmetric-V
+            // models force the CPU attention path via the eligibility guard
+            // in transformer.rs, so the symmetric GPU sizing is never used
+            // for them.
+            0,
             gpu_expert_cache.clone(),
         );
         let has_device = backend_box.is_gpu();
+        // Reconcile the operator's request with the observed init result
+        // (Finding 5). An explicit `gpu` request fails closed; `auto`
+        // demotes to CPU and records a fallback. `is_gpu()` is the signal
+        // because `init_blocking` internally swallows GPU errors and returns
+        // a CPU backend.
+        let resolution = crate::backend::resolve_backend_selection(
+            cfg.real_transformer.compute_offload,
+            || {
+                if has_device {
+                    Ok(())
+                } else {
+                    Err("GPU backend initialization did not produce a GPU device".to_string())
+                }
+            },
+        )?;
+        backend_fallback_occurred = resolution.fallback_occurred;
         let device_name = backend_box.device_name().to_string();
         let compute_plane = backend_box.compute_plane().to_string();
+        if resolution.fallback_occurred {
+            warn!(
+                requested = ?resolution.requested,
+                resolved = ?resolution.resolved,
+                "compute_offload = \"auto\": GPU initialization failed; resolved to CPU"
+            );
+        }
         let gpu = std::sync::Arc::new(backend_box);
         if let Err(e) = crate::backend::set_backend(gpu) {
+            // Finding 5 (fail-closed GPU): installation failure is fatal for an
+            // explicit `gpu` request — we must never silently continue on CPU.
+            // Under `auto` it is a recorded fallback instead.
+            if matches!(
+                resolution.requested,
+                crate::backend::ComputeOffload::Gpu
+            ) {
+                return Err(format!(
+                    "explicit compute_offload = \"gpu\": GpuBackend installation failed ({e}); \
+                     refusing to fall back to CPU"
+                )
+                .into());
+            }
+            backend_fallback_occurred = true;
             warn!(
                 error = e,
-                "failed to install GpuBackend; falling back to default"
+                "compute_offload = \"auto\": GpuBackend installation failed; falling back to CPU"
             );
         } else {
             info!(
                 device = device_name,
-                compute_plane, has_device, "GpuBackend installed for dense backbone"
+                compute_plane,
+                has_device,
+                requested = ?resolution.requested,
+                resolved = ?resolution.resolved,
+                "math backend installed for dense backbone"
             );
         }
     }
@@ -3278,18 +3613,50 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let load_options = crate::model::RealModelLoadOptions {
             strict_weights: rt.strict_weights,
         };
-        let m = match rt.weights_dir.as_ref() {
-            Some(dir) => crate::model::RealModel::from_dir_auto_with_options(
-                model_cfg,
-                dir,
-                rt.seed,
-                load_options,
-            )?,
-            None if rt.strict_weights => {
-                return Err("real_transformer.strict_weights = true requires weights_dir".into());
+        // Fail-closed real-model weight policy (gist Finding 1). A missing
+        // `weights_dir` or `strict_weights = false` is rejected unless the
+        // operator explicitly opts into the development seeded fallback.
+        let weight_policy = rt.resolve_weight_policy()?;
+        let m = match (rt.weights_dir.as_ref(), weight_policy) {
+            (Some(dir), _) => {
+                let loaded = crate::model::RealModel::from_dir_auto_with_options(
+                    model_cfg,
+                    dir,
+                    rt.seed,
+                    load_options,
+                )?;
+                if loaded.load_status.seeded_fallback_remained {
+                    warn!(
+                        loader = loaded.load_status.loader,
+                        loaded_tensors = loaded.load_status.loaded_tensors,
+                        required_tensors = loaded.load_status.required_tensors,
+                        "DEVELOPMENT FALLBACK: real_transformer served with seeded weights \
+                         remaining — output is NOT real-checkpoint inference"
+                    );
+                }
+                loaded
             }
-            None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),
+            (None, crate::config::RealWeightPolicy::SeededDev) => {
+                warn!(
+                    "DEVELOPMENT FALLBACK: real_transformer.enabled with no weights_dir and \
+                     allow_seeded_fallback = true — serving deterministic SEEDED weights, \
+                     output is NOT real-checkpoint inference"
+                );
+                crate::model::RealModel::new_seeded(model_cfg, rt.seed)
+            }
+            // resolve_weight_policy already rejects (None, StrictReal).
+            (None, crate::config::RealWeightPolicy::StrictReal) => unreachable!(
+                "resolve_weight_policy rejects a missing weights_dir without seeded fallback"
+            ),
         };
+        info!(
+            strict = m.load_status.strict,
+            loader = m.load_status.loader,
+            loaded_tensors = m.load_status.loaded_tensors,
+            required_tensors = m.load_status.required_tensors,
+            seeded_fallback_remained = m.load_status.seeded_fallback_remained,
+            "real transformer model-loading status"
+        );
         Some(Arc::new(m))
     } else {
         None
@@ -3351,6 +3718,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     };
 
     let metrics = Metrics::new();
+    // Surface any auto GPU->CPU demotion decided above now that metrics
+    // exist (Finding 5).
+    if backend_fallback_occurred {
+        metrics.record_gpu_cpu_fallback(1);
+    }
     let mut engine_builder = Engine::with_options(
         cache,
         pool,
@@ -3494,19 +3866,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     }
     let engine = Arc::new(engine_builder.with_metrics(metrics.clone()));
 
-    let tokenizer = match cfg.tokenizer.path.as_ref() {
-        Some(p) => match Tokenizer::from_file(p) {
-            Ok(t) => Arc::new(t),
-            Err(e) => {
-                warn!(path = %p.display(), error = %e, "tokenizer load failed; falling back to byte tokenizer");
-                Arc::new(Tokenizer::bytes())
-            }
-        },
-        None => {
-            info!("no tokenizer.json configured; using byte-level fallback tokenizer");
-            Arc::new(Tokenizer::bytes())
-        }
-    };
+    let tokenizer = resolve_serving_tokenizer(
+        cfg.real_transformer.enabled,
+        cfg.tokenizer.path.as_deref(),
+        real_model.as_ref().map(|m| m.config.vocab_size),
+    )?;
 
     // Optional real-transformer pipeline. When enabled, every request
     // runs `embedding -> stacked layers (each with SSD-streamed MoE) ->
@@ -5327,6 +5691,7 @@ fn cmd_gguf_convert(
         emit_uth,
         native_quant,
         experts_only,
+        arch_override: None,
     };
     let source = crate::gguf::open_gguf_source(gguf_path, legacy_eager)?;
     if let Some(arch) = source.architecture() {
@@ -5554,6 +5919,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bench_real_validity_detects_softmax_fallback_delta() {
+        // Snapshot then force a fallback: the current count only grows, so a
+        // check against the pre-snapshot baseline must report the run invalid.
+        // Share the transformer softmax-fallback test lock so this mutation of
+        // the process-wide counter cannot race with the transformer tests that
+        // assert exact before/after deltas.
+        let _g = crate::transformer::SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
+        let snapshot = crate::transformer::nonfinite_softmax_fallbacks();
+        crate::transformer::record_nonfinite_softmax_fallback();
+        assert!(
+            assert_no_softmax_fallbacks(snapshot).is_err(),
+            "a nonzero softmax-fallback delta must invalidate the benchmark"
+        );
+    }
+
+    // ---- Finding 4: real serving requires a real tokenizer ----
+
+    #[test]
+    fn real_serving_without_tokenizer_path_fails() {
+        match resolve_serving_tokenizer(true, None, Some(1000)) {
+            Err(crate::config::ConfigError::Invalid(_)) => {}
+            _ => panic!("real serving must reject a missing tokenizer path"),
+        }
+    }
+
+    #[test]
+    fn real_serving_with_unloadable_tokenizer_fails() {
+        let path = std::path::PathBuf::from("/nonexistent/does-not-exist/tokenizer.json");
+        match resolve_serving_tokenizer(true, Some(&path), Some(1000)) {
+            Err(crate::config::ConfigError::Invalid(_)) => {}
+            _ => panic!("real serving must reject an unloadable tokenizer"),
+        }
+    }
+
+    #[test]
+    fn synthetic_serving_without_tokenizer_uses_byte_fallback() {
+        let tok = match resolve_serving_tokenizer(false, None, None) {
+            Ok(t) => t,
+            Err(_) => panic!("synthetic mode must keep the byte-tokenizer fallback"),
+        };
+        assert_eq!(tok.vocab_size(), 256, "byte tokenizer expected in synthetic mode");
+    }
+
+    #[test]
     fn parses_basic_json_numbers() {
         let body = r#"{ "num_experts": 8, "d_model": 4096, "d_ff": 14336, "top_k": 2, "expert_size": 92274688 }"#;
         assert_eq!(parse_json_number(body, "num_experts"), Some(8));
@@ -5741,7 +6150,7 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 
-    /// Minimal `Config` for exercising [`reconcile_bench_real_config`]. The
+    /// Minimal `Config` for exercising [`reconcile_real_model_config`]. The
     /// non-`real_transformer` sections carry placeholder values; the tests
     /// only inspect fields the reconciler overwrites.
     fn minimal_bench_cfg() -> crate::config::Config {
@@ -5824,7 +6233,7 @@ mod tests {
         cfg.real_transformer.architecture = Some("qwen3_moe".to_string());
 
         let (arch, _first_k, advanced) =
-            reconcile_bench_real_config(&mut cfg).expect("reconcile should succeed");
+            reconcile_real_model_config(&mut cfg).expect("reconcile should succeed");
 
         assert_eq!(arch, crate::architecture::Architecture::Qwen3Moe);
         assert!(
@@ -5852,7 +6261,7 @@ mod tests {
         cfg.real_transformer.weights_dir = Some(dir.clone());
         cfg.real_transformer.architecture = Some("mixtral".to_string());
 
-        let err = reconcile_bench_real_config(&mut cfg)
+        let err = reconcile_real_model_config(&mut cfg)
             .expect_err("mismatched architecture must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("mixtral"), "error must name TOML arch: {msg}");
@@ -5860,6 +6269,181 @@ mod tests {
             msg.contains("qwen3_moe"),
             "error must name checkpoint arch: {msg}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Finding 7: resolved-config architecture-aware validation ----
+
+    #[test]
+    fn resolved_config_validation_accepts_reconciled_checkpoint() {
+        let dir = tempdir_unique("bench-real-f7-ok");
+        write_qwen3_moe_config_json(&dir);
+        let mut cfg = minimal_bench_cfg();
+        cfg.real_transformer.weights_dir = Some(dir.clone());
+        let (arch, first_k, advanced) =
+            reconcile_real_model_config(&mut cfg).expect("reconcile should succeed");
+        validate_resolved_real_model_config(&cfg, arch, first_k, &advanced)
+            .expect("a well-formed reconciled checkpoint must pass validation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_config_validation_rejects_top_k_over_num_experts() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.model.num_experts = 4;
+        cfg.model.top_k = 8; // impossible: more activated than available
+        let advanced = crate::model::AdvancedConfig::default();
+        let err = validate_resolved_real_model_config(
+            &cfg,
+            crate::architecture::Architecture::Mixtral,
+            0,
+            &advanced,
+        )
+        .expect_err("top_k > num_experts must fail");
+        assert!(err.to_string().contains("top_k"), "{err}");
+    }
+
+    #[test]
+    fn resolved_config_validation_rejects_gqa_head_indivisibility() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.real_transformer.num_heads = 6;
+        cfg.real_transformer.num_kv_heads = 4; // 6 % 4 != 0
+        cfg.real_transformer.head_dim = 8;
+        let advanced = crate::model::AdvancedConfig::default();
+        let err = validate_resolved_real_model_config(
+            &cfg,
+            crate::architecture::Architecture::Mixtral,
+            0,
+            &advanced,
+        )
+        .expect_err("non-divisible GQA head counts must fail");
+        assert!(err.to_string().contains("num_kv_heads"), "{err}");
+    }
+
+    #[test]
+    fn resolved_config_validation_allows_asymmetric_v_head_dim() {
+        // MiMo-V2-Flash style: v_head_dim != head_dim must NOT be rejected,
+        // and the invalid universal num_heads*head_dim==d_model rule must not
+        // be applied.
+        let mut cfg = minimal_bench_cfg();
+        cfg.model.d_model = 64;
+        cfg.real_transformer.num_heads = 4;
+        cfg.real_transformer.num_kv_heads = 2;
+        cfg.real_transformer.head_dim = 24; // 4*24 = 96 != d_model 64
+        let mut advanced = crate::model::AdvancedConfig::default();
+        advanced.v_head_dim = Some(16);
+        validate_resolved_real_model_config(
+            &cfg,
+            crate::architecture::Architecture::MiMoV2,
+            0,
+            &advanced,
+        )
+        .expect("asymmetric V geometry must be accepted");
+    }
+
+    #[test]
+    fn resolved_config_validation_rejects_undersized_cache() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.model.top_k = 4;
+        cfg.storage.cache_slots = 2; // smaller than activated per layer
+        let advanced = crate::model::AdvancedConfig::default();
+        let err = validate_resolved_real_model_config(
+            &cfg,
+            crate::architecture::Architecture::Mixtral,
+            0,
+            &advanced,
+        )
+        .expect_err("cache smaller than the per-layer working set must fail");
+        assert!(err.to_string().contains("cache_slots"), "{err}");
+    }
+
+    #[test]
+    fn resolved_config_validation_rejects_odirect_misaligned_expert_size() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.storage.no_direct = false;
+        cfg.storage.block_align = 4096;
+        cfg.model.expert_size = 4097; // not a multiple of block_align
+        let advanced = crate::model::AdvancedConfig::default();
+        let err = validate_resolved_real_model_config(
+            &cfg,
+            crate::architecture::Architecture::Mixtral,
+            0,
+            &advanced,
+        )
+        .expect_err("O_DIRECT misaligned expert_size must fail");
+        assert!(err.to_string().contains("block_align"), "{err}");
+    }
+
+    /// Finding 2: serving and bench-real share a single reconcile + validation
+    /// path, so both resolve an identical config from the same checkpoint and
+    /// reject the same invalid config. Guards against the two call sites
+    /// drifting apart (e.g. one reconciling advanced routing fields the other
+    /// misses, or the two applying different validation rules).
+    #[test]
+    fn serve_and_bench_real_share_reconcile_and_validation() {
+        let dir = tempdir_unique("f2-shared-reconcile");
+        write_qwen3_moe_config_json(&dir);
+
+        // Two independently-constructed configs standing in for the serving and
+        // bench-real entry points; both point at the same checkpoint.
+        let mut serve_cfg = minimal_bench_cfg();
+        serve_cfg.real_transformer.enabled = true;
+        serve_cfg.real_transformer.weights_dir = Some(dir.clone());
+        let mut bench_cfg = minimal_bench_cfg();
+        bench_cfg.real_transformer.enabled = true;
+        bench_cfg.real_transformer.weights_dir = Some(dir.clone());
+
+        let (serve_arch, serve_fk, serve_adv) =
+            reconcile_real_model_config(&mut serve_cfg).expect("serve reconcile");
+        let (bench_arch, bench_fk, bench_adv) =
+            reconcile_real_model_config(&mut bench_cfg).expect("bench reconcile");
+
+        // Identical architecture / dims / routing resolution across both paths.
+        assert_eq!(serve_arch, bench_arch);
+        assert_eq!(serve_fk, bench_fk);
+        assert_eq!(serve_adv.norm_topk_prob, bench_adv.norm_topk_prob);
+        assert_eq!(serve_cfg.model.d_model, bench_cfg.model.d_model);
+        assert_eq!(serve_cfg.model.num_layers, bench_cfg.model.num_layers);
+        assert_eq!(serve_cfg.model.num_experts, bench_cfg.model.num_experts);
+        assert_eq!(serve_cfg.model.top_k, bench_cfg.model.top_k);
+        assert_eq!(
+            serve_cfg.real_transformer.num_heads,
+            bench_cfg.real_transformer.num_heads
+        );
+        assert_eq!(
+            serve_cfg.real_transformer.num_kv_heads,
+            bench_cfg.real_transformer.num_kv_heads
+        );
+        assert_eq!(
+            serve_cfg.real_transformer.head_dim,
+            bench_cfg.real_transformer.head_dim
+        );
+        assert_eq!(
+            serve_cfg.real_transformer.vocab_size,
+            bench_cfg.real_transformer.vocab_size
+        );
+
+        // Both resolved configs pass the shared validation.
+        validate_resolved_real_model_config(&serve_cfg, serve_arch, serve_fk, &serve_adv)
+            .expect("serve validation");
+        validate_resolved_real_model_config(&bench_cfg, bench_arch, bench_fk, &bench_adv)
+            .expect("bench validation");
+
+        // An identical invalid mutation is rejected identically by both paths.
+        let mut serve_bad = serve_cfg.clone();
+        serve_bad.storage.cache_slots = 1;
+        serve_bad.model.top_k = serve_bad.model.num_experts as usize;
+        let mut bench_bad = bench_cfg.clone();
+        bench_bad.storage.cache_slots = 1;
+        bench_bad.model.top_k = bench_bad.model.num_experts as usize;
+        let serve_err =
+            validate_resolved_real_model_config(&serve_bad, serve_arch, serve_fk, &serve_adv)
+                .expect_err("serve must reject undersized cache");
+        let bench_err =
+            validate_resolved_real_model_config(&bench_bad, bench_arch, bench_fk, &bench_adv)
+                .expect_err("bench must reject undersized cache");
+        assert_eq!(serve_err.to_string(), bench_err.to_string());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

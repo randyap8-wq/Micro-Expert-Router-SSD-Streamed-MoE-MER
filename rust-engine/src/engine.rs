@@ -1802,7 +1802,7 @@ impl Engine {
         // panics.
         let backend = crate::backend::BackendBox::init_blocking(
             /* num_layers   = */ 1, /* max_seq_len  = */ 1, /* num_heads    = */ 1,
-            /* num_kv_heads = */ 1, /* head_dim     = */ 1, gpu,
+            /* num_kv_heads = */ 1, /* head_dim     = */ 1, /* v_head_dim   = */ 1, gpu,
         );
         self.core.backend = Arc::new(backend);
     }

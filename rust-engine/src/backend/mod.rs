@@ -305,22 +305,86 @@ struct AttentionPushConstants {
     /// elements** (not bytes — a byte offset would overflow u32 for
     /// deep models with large KV slices).
     layer_offset: u32,
+    /// Value head dimension (Finding 12). Equal to `head_dim` for symmetric
+    /// architectures; differs for asymmetric-V models. Drives the V slice
+    /// stride (`num_kv_heads * v_head_dim`) and the attention-output width
+    /// (`num_heads * v_head_dim`) independently of the Q/K `head_dim`.
+    v_head_dim: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 // =====================================================================
 // GPU VRAM KV Cache
 // =====================================================================
 
+/// Number of f32 elements occupied by one layer's `[K | V]` region in the
+/// packed KV buffer: `max_seq_len * (k_dim + v_dim)`. Pure arithmetic split
+/// out from [`GpuKvCache`] so the asymmetric-V layout (Finding 12) can be
+/// unit-tested without a live `wgpu::Buffer`.
+#[inline]
+pub fn kv_layer_stride_elems(max_seq_len: usize, k_dim: usize, v_dim: usize) -> usize {
+    max_seq_len * (k_dim + v_dim)
+}
+
+/// f32-element index of a `(layer, kv, seq_pos)` slot within the packed KV
+/// buffer. `kv == 0` selects the K region (stride `k_dim`); any other value
+/// selects the V region (stride `v_dim`), which begins after the whole K
+/// region of the same layer. The K and V widths are addressed independently
+/// so asymmetric value widths (`v_dim != k_dim`, Finding 12) stay correct.
+#[inline]
+pub fn kv_offset_elems(
+    layer: usize,
+    kv: usize,
+    seq_pos: usize,
+    max_seq_len: usize,
+    k_dim: usize,
+    v_dim: usize,
+) -> usize {
+    let layer_base = layer * kv_layer_stride_elems(max_seq_len, k_dim, v_dim);
+    if kv == 0 {
+        layer_base + seq_pos * k_dim
+    } else {
+        layer_base + max_seq_len * k_dim + seq_pos * v_dim
+    }
+}
+
 pub struct GpuKvCache {
     pub buffer: wgpu::Buffer,
     pub num_layers: usize,
     pub max_seq_len: usize,
-    pub kv_dim: usize,
+    /// K slice width per position: `num_kv_heads * head_dim`.
+    pub k_dim: usize,
+    /// V slice width per position: `num_kv_heads * v_head_dim`. Equal to
+    /// `k_dim` for every symmetric architecture; larger or smaller when the
+    /// value head dimension differs from the query/key head dimension
+    /// (Finding 12, e.g. MiMo-V2-Flash `v_head_dim != head_dim`).
+    pub v_dim: usize,
 }
 
 impl GpuKvCache {
+    /// Number of f32 elements occupied by one layer's `[K | V]` region:
+    /// `max_seq_len * (k_dim + v_dim)`. The K sub-region occupies the first
+    /// `max_seq_len * k_dim` elements and the V sub-region follows it.
+    #[inline]
+    pub fn layer_stride_elems(&self) -> usize {
+        kv_layer_stride_elems(self.max_seq_len, self.k_dim, self.v_dim)
+    }
+
+    /// Byte offset of a `(layer, kv, seq_pos)` slot within the KV buffer.
+    /// `kv == 0` selects the K region (stride `k_dim`); `kv == 1` selects the
+    /// V region (stride `v_dim`), which begins after the whole K region. The
+    /// asymmetric K/V widths make a single shared stride incorrect, so the
+    /// two regions are addressed independently (Finding 12).
     pub fn offset_bytes(&self, layer: usize, kv: usize, seq_pos: usize) -> u64 {
-        let idx = ((layer * 2 + kv) * self.max_seq_len + seq_pos) * self.kv_dim;
+        let idx = kv_offset_elems(
+            layer,
+            kv,
+            seq_pos,
+            self.max_seq_len,
+            self.k_dim,
+            self.v_dim,
+        );
         (idx * 4) as u64
     }
 }
@@ -474,6 +538,9 @@ pub struct GpuBackend {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    /// Value head dimension (Finding 12). Equal to `head_dim` for symmetric
+    /// architectures; drives the V slice / attention-output geometry.
+    v_head_dim: usize,
 
     /// VRAM buffers for hot experts. Keyed by expert_id. Populated lazily
     /// on first access after GpuExpertCache promotes an expert. Entries
@@ -502,10 +569,14 @@ impl GpuBackend {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     ) -> Result<Self> {
         // GQA models have num_kv_heads < num_heads; 0 means MHA.
         let num_kv_heads = if num_kv_heads == 0 { num_heads } else { num_kv_heads };
+        // Finding 12: `v_head_dim == 0` means "symmetric" (V uses the query
+        // head dim). Asymmetric-V models pass their true value head dim.
+        let v_head_dim = if v_head_dim == 0 { head_dim } else { v_head_dim };
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -703,13 +774,18 @@ impl GpuBackend {
             source: wgpu::ShaderSource::Wgsl(SOFTMAX_SHADER.into()),
         });
 
-        // Compile attention shader, injecting dynamic MAX_SEQ_LEN
+        // Compile attention shader, injecting dynamic MAX_SEQ_LEN, MAX_HEAD_DIM
+        // and MAX_V_HEAD_DIM (Finding 12: the V accumulator / output width is
+        // sized by the value head dim, which may differ from head_dim).
         let attention_src = ATTENTION_SHADER.replace(
             "const MAX_SEQ_LEN: u32 = 4096u;",
             &format!("const MAX_SEQ_LEN: u32 = {}u;", max_seq_len),
         ).replace(
             "const MAX_HEAD_DIM: u32 = 256u;",
             &format!("const MAX_HEAD_DIM: u32 = {}u;", head_dim),
+        ).replace(
+            "const MAX_V_HEAD_DIM: u32 = 256u;",
+            &format!("const MAX_V_HEAD_DIM: u32 = {}u;", v_head_dim),
         );
         let attention_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("attention_shader"),
@@ -801,8 +877,8 @@ impl GpuBackend {
             bind_group_layouts: &[&layout_3_buffers],
             push_constant_ranges: &[wgpu::PushConstantRange {
                 stages: wgpu::ShaderStages::COMPUTE,
-                // 5 × u32 = 20 bytes; padded to the 32-byte limit
-                // requested in `required_limits`.
+                // 6 × u32 + 2 × u32 padding = 32 bytes, matching the
+                // 32-byte limit requested in `required_limits`.
                 range: 0..32,
             }],
         });
@@ -929,12 +1005,16 @@ impl GpuBackend {
             mapped_at_creation: false,
         });
 
-        // KV cache — stride is the *KV* width (num_kv_heads × head_dim),
-        // which is narrower than the query width for GQA models.
-        let kv_dim = num_kv_heads * head_dim;
+        // KV cache — asymmetric K/V widths (Finding 12). K uses the query
+        // head dim (`num_kv_heads × head_dim`); V uses the value head dim
+        // (`num_kv_heads × v_head_dim`). They coincide for every symmetric
+        // architecture. Each layer stores `[K | V]` = `max_seq_len × (k_dim
+        // + v_dim)` f32 elements.
+        let k_dim = num_kv_heads * head_dim;
+        let v_dim = num_kv_heads * v_head_dim;
         let kv_cache_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_cache"),
-            size: (num_layers * 2 * max_seq_len * kv_dim * 4) as u64,
+            size: (num_layers * max_seq_len * (k_dim + v_dim) * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -943,7 +1023,8 @@ impl GpuBackend {
             buffer: kv_cache_buffer,
             num_layers,
             max_seq_len,
-            kv_dim,
+            k_dim,
+            v_dim,
         };
 
         // Pre-build bind groups
@@ -1012,6 +1093,7 @@ impl GpuBackend {
             num_heads,
             num_kv_heads,
             head_dim,
+            v_head_dim,
             vram_expert_bufs: ParkingMutex::new(std::collections::HashMap::new()),
             gpu_expert_cache,
             expert_workspaces: ParkingMutex::new(expert_workspaces),
@@ -1789,6 +1871,9 @@ impl Backend for GpuBackend {
             head_dim: self.head_dim as u32,
             seq_len: seq_len as u32,
             layer_offset: layer_off_elems as u32,
+            v_head_dim: self.v_head_dim as u32,
+            _pad0: 0,
+            _pad1: 0,
         };
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2056,9 +2141,10 @@ impl BackendBox {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     ) -> Self {
-        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, num_kv_heads, head_dim, gpu_expert_cache).await {
+        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, num_kv_heads, head_dim, v_head_dim, gpu_expert_cache).await {
             Ok(gpu) => BackendBox::Gpu(gpu),
             Err(e) => {
                 tracing::warn!(
@@ -2077,6 +2163,7 @@ impl BackendBox {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     ) -> Self {
         pollster::block_on(Self::init(
@@ -2085,6 +2172,7 @@ impl BackendBox {
             num_heads,
             num_kv_heads,
             head_dim,
+            v_head_dim,
             gpu_expert_cache,
         ))
     }
@@ -2212,11 +2300,102 @@ pub fn current() -> Arc<BackendBox> {
 pub enum ComputeOffload {
     Cpu,
     Gpu,
+    /// Prefer GPU but fall back to CPU if GPU initialization fails. Unlike
+    /// an explicit `Gpu` request (which fails closed), `Auto` treats GPU as
+    /// best-effort and records a fallback event when it lands on CPU.
+    Auto,
 }
 
 impl Default for ComputeOffload {
     fn default() -> Self {
         Self::Cpu
+    }
+}
+
+/// Backend the runtime actually resolved to after (optionally) attempting
+/// GPU initialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedBackend {
+    Cpu,
+    Gpu,
+}
+
+/// Outcome of reconciling an operator's requested [`ComputeOffload`] with
+/// the result of GPU initialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendResolution {
+    pub requested: ComputeOffload,
+    pub resolved: ResolvedBackend,
+    /// True only when GPU was attempted, failed, and `Auto` demoted the run
+    /// to CPU. An explicit `Gpu` request never produces a silent fallback —
+    /// it errors instead.
+    pub fallback_occurred: bool,
+}
+
+/// Error returned when an explicit GPU request cannot be honored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitGpuUnavailable {
+    pub detail: String,
+}
+
+impl std::fmt::Display for ExplicitGpuUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "compute_offload = \"gpu\" was requested but GPU initialization failed: {}; \
+             set compute_offload = \"auto\" to allow CPU fallback, or \"cpu\" to run on CPU",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for ExplicitGpuUnavailable {}
+
+/// Reconcile a requested compute backend with the observed GPU
+/// initialization result (Finding 5).
+///
+/// * `Cpu` — resolves to CPU without attempting GPU; never a fallback.
+/// * `Gpu` — explicit request: GPU success resolves to GPU; GPU failure is
+///   a hard error (fail closed) so the operator is never silently downgraded.
+/// * `Auto` — best effort: GPU success resolves to GPU; GPU failure resolves
+///   to CPU and marks `fallback_occurred`.
+///
+/// `gpu_init` is only consulted when GPU is requested (`Gpu`/`Auto`), and is
+/// expressed as a closure so tests can inject success/failure without a real
+/// device.
+pub fn resolve_backend_selection<F>(
+    requested: ComputeOffload,
+    gpu_init: F,
+) -> Result<BackendResolution, ExplicitGpuUnavailable>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    match requested {
+        ComputeOffload::Cpu => Ok(BackendResolution {
+            requested,
+            resolved: ResolvedBackend::Cpu,
+            fallback_occurred: false,
+        }),
+        ComputeOffload::Gpu => match gpu_init() {
+            Ok(()) => Ok(BackendResolution {
+                requested,
+                resolved: ResolvedBackend::Gpu,
+                fallback_occurred: false,
+            }),
+            Err(detail) => Err(ExplicitGpuUnavailable { detail }),
+        },
+        ComputeOffload::Auto => match gpu_init() {
+            Ok(()) => Ok(BackendResolution {
+                requested,
+                resolved: ResolvedBackend::Gpu,
+                fallback_occurred: false,
+            }),
+            Err(_) => Ok(BackendResolution {
+                requested,
+                resolved: ResolvedBackend::Cpu,
+                fallback_occurred: true,
+            }),
+        },
     }
 }
 
@@ -2227,6 +2406,69 @@ impl Default for ComputeOffload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_offset_symmetric_matches_shared_stride() {
+        // Symmetric case: k_dim == v_dim. Layout is a single contiguous
+        // [K|V] block per layer; every V slot sits exactly one K region
+        // (max_seq_len * k_dim) past the same-position K slot.
+        let (max_seq, k_dim, v_dim) = (8usize, 4usize, 4usize);
+        assert_eq!(kv_layer_stride_elems(max_seq, k_dim, v_dim), 8 * 8);
+        // layer 0, K, pos 0
+        assert_eq!(kv_offset_elems(0, 0, 0, max_seq, k_dim, v_dim), 0);
+        // layer 0, K, pos 3
+        assert_eq!(kv_offset_elems(0, 0, 3, max_seq, k_dim, v_dim), 3 * 4);
+        // layer 0, V, pos 3 = K region (8*4) + 3*4
+        assert_eq!(
+            kv_offset_elems(0, 1, 3, max_seq, k_dim, v_dim),
+            8 * 4 + 3 * 4
+        );
+        // layer 1 starts after one full [K|V] stride
+        assert_eq!(
+            kv_offset_elems(1, 0, 0, max_seq, k_dim, v_dim),
+            8 * (4 + 4)
+        );
+    }
+
+    #[test]
+    fn kv_offset_asymmetric_v_uses_independent_strides() {
+        // Finding 12: v_dim != k_dim. K positions must stride by k_dim,
+        // V positions by v_dim, and the V region base must skip the full
+        // K region (max_seq_len * k_dim), not max_seq_len * v_dim.
+        let (max_seq, k_dim, v_dim) = (16usize, 8usize, 12usize);
+        assert_eq!(kv_layer_stride_elems(max_seq, k_dim, v_dim), 16 * (8 + 12));
+        // K strides by k_dim
+        assert_eq!(kv_offset_elems(0, 0, 2, max_seq, k_dim, v_dim), 2 * 8);
+        // V region begins at max_seq_len * k_dim (NOT * v_dim)
+        assert_eq!(kv_offset_elems(0, 1, 0, max_seq, k_dim, v_dim), 16 * 8);
+        // V strides by v_dim
+        assert_eq!(
+            kv_offset_elems(0, 1, 2, max_seq, k_dim, v_dim),
+            16 * 8 + 2 * 12
+        );
+        // layer 2 offset = 2 * (max_seq * (k_dim + v_dim))
+        assert_eq!(
+            kv_offset_elems(2, 0, 0, max_seq, k_dim, v_dim),
+            2 * 16 * (8 + 12)
+        );
+        // V slot in layer 2 also correct
+        assert_eq!(
+            kv_offset_elems(2, 1, 1, max_seq, k_dim, v_dim),
+            2 * 16 * (8 + 12) + 16 * 8 + 1 * 12
+        );
+    }
+
+    #[test]
+    fn kv_offset_bytes_are_elems_times_four() {
+        // The byte-offset accessor must scale the element index by 4 and
+        // never overflow for a realistically deep asymmetric model.
+        let idx = kv_offset_elems(40, 1, 4000, 4096, 1024, 1536);
+        assert_eq!((idx as u64) * 4, kv_offset_bytes_reference(idx));
+    }
+
+    fn kv_offset_bytes_reference(idx: usize) -> u64 {
+        (idx as u64) * 4
+    }
 
     fn adapter(
         name: &str,
@@ -2242,6 +2484,56 @@ mod tests {
             driver_info: "test-driver-info".to_string(),
             backend,
         }
+    }
+
+    // ---- Finding 5: explicit GPU requests fail closed ----
+
+    #[test]
+    fn explicit_gpu_request_with_init_failure_errors() {
+        let out = resolve_backend_selection(ComputeOffload::Gpu, || Err("no device".to_string()));
+        assert!(
+            out.is_err(),
+            "explicit GPU request must fail closed when init fails"
+        );
+    }
+
+    #[test]
+    fn explicit_gpu_request_with_success_resolves_to_gpu() {
+        let out =
+            resolve_backend_selection(ComputeOffload::Gpu, || Ok(())).expect("gpu init succeeded");
+        assert_eq!(out.resolved, ResolvedBackend::Gpu);
+        assert!(!out.fallback_occurred);
+    }
+
+    #[test]
+    fn auto_selection_with_init_failure_falls_back_to_cpu_and_marks_it() {
+        let out = resolve_backend_selection(ComputeOffload::Auto, || Err("no device".to_string()))
+            .expect("auto must not fail closed");
+        assert_eq!(out.resolved, ResolvedBackend::Cpu);
+        assert!(
+            out.fallback_occurred,
+            "auto GPU->CPU demotion must be recorded as a fallback"
+        );
+    }
+
+    #[test]
+    fn auto_selection_with_success_resolves_to_gpu_without_fallback() {
+        let out = resolve_backend_selection(ComputeOffload::Auto, || Ok(())).unwrap();
+        assert_eq!(out.resolved, ResolvedBackend::Gpu);
+        assert!(!out.fallback_occurred);
+    }
+
+    #[test]
+    fn explicit_cpu_resolves_to_cpu_without_attempting_gpu() {
+        let mut attempted = false;
+        let out = resolve_backend_selection(ComputeOffload::Cpu, || {
+            attempted = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(out.resolved, ResolvedBackend::Cpu);
+        assert!(!out.fallback_occurred);
+        assert!(!attempted, "CPU request must not attempt GPU initialization");
     }
 
     #[test]

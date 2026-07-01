@@ -2332,6 +2332,39 @@ impl TransformerLayer {
 }
 
 /// Numerically-stable softmax, in place.
+/// Process-wide count of attention-softmax non-finite fallbacks.
+///
+/// Incremented (cold path only) whenever [`softmax_inplace`] — or the MLA
+/// attention softmax — encounters a `NaN`/`±inf`/fully-masked row and
+/// substitutes a uniform distribution to preserve numerical safety. This is
+/// deliberately a low-overhead global atomic so the hot attention path never
+/// takes a lock or logs per token; observers sample it via
+/// [`nonfinite_softmax_fallbacks`].
+///
+/// This counts **attention** numerical fallbacks specifically and is distinct
+/// from the router's filtering of non-finite gate scores.
+pub static NONFINITE_SOFTMAX_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Current cumulative count of attention-softmax non-finite fallbacks.
+#[inline]
+pub fn nonfinite_softmax_fallbacks() -> u64 {
+    NONFINITE_SOFTMAX_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record a single attention-softmax non-finite fallback event.
+#[inline]
+pub(crate) fn record_nonfinite_softmax_fallback() {
+    NONFINITE_SOFTMAX_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Serialises every test that reads or mutates the process-wide non-finite
+/// softmax fallback counter, so their before/after deltas stay deterministic
+/// even though the counter is a global atomic. Shared crate-wide (e.g. with
+/// the `bench-real` validity test in `main.rs`) so those tests cannot race.
+#[cfg(test)]
+pub(crate) static SOFTMAX_FALLBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn softmax_inplace(v: &mut [f32]) {
     if v.is_empty() {
         return;
@@ -2350,6 +2383,7 @@ pub fn softmax_inplace(v: &mut [f32]) {
     // distribution, so emit a uniform distribution rather than letting the
     // `x - max` subtraction produce `NaN`s that propagate downstream.
     if saw_nan || !max.is_finite() {
+        record_nonfinite_softmax_fallback();
         let uniform = 1.0 / v.len() as f32;
         v.iter_mut().for_each(|x| *x = uniform);
         return;
@@ -2844,6 +2878,7 @@ mod tests {
 
     #[test]
     fn softmax_all_neg_inf_is_uniform() {
+        let _g = SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
         // A fully-masked attention row (every score `-inf`) must not
         // produce NaNs: `(-inf) - (-inf)` is NaN and would poison the
         // whole distribution. We fall back to a uniform distribution.
@@ -2856,6 +2891,7 @@ mod tests {
 
     #[test]
     fn softmax_mixed_nan_is_uniform() {
+        let _g = SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
         // A stray NaN that is NOT at index 0 must not poison the row. The
         // previous `!max.is_finite()` guard missed this because the running
         // max ignores NaN, leaving a finite max.
@@ -2869,6 +2905,58 @@ mod tests {
         );
         let sum: f32 = v.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6, "softmax sum={sum}");
+    }
+
+    /// Serialises the tests that assert on the process-wide non-finite
+    /// softmax fallback counter, so their before/after deltas are
+    /// deterministic even though the counter is a global atomic. Aliased to
+    /// the crate-wide lock so cross-module tests (e.g. `main.rs`) share it.
+    use super::SOFTMAX_FALLBACK_TEST_LOCK;
+
+    #[test]
+    fn softmax_nan_increments_fallback_counter_once() {
+        let _g = SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
+        let before = nonfinite_softmax_fallbacks();
+        let mut v = vec![0.0, f32::NAN, 1.0];
+        softmax_inplace(&mut v);
+        assert_eq!(nonfinite_softmax_fallbacks() - before, 1);
+    }
+
+    #[test]
+    fn softmax_inf_increments_fallback_counter() {
+        let _g = SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
+        let before = nonfinite_softmax_fallbacks();
+        // +inf leaves a non-finite max → uniform fallback.
+        let mut v = vec![f32::INFINITY, 1.0, 2.0];
+        softmax_inplace(&mut v);
+        assert_eq!(nonfinite_softmax_fallbacks() - before, 1);
+    }
+
+    #[test]
+    fn softmax_finite_does_not_increment_fallback_counter() {
+        let _g = SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
+        let before = nonfinite_softmax_fallbacks();
+        let mut v = vec![0.0, 1.0, 2.0, -1.0];
+        softmax_inplace(&mut v);
+        assert_eq!(nonfinite_softmax_fallbacks() - before, 0);
+    }
+
+    #[test]
+    fn softmax_fallback_counter_concurrent_increments_are_safe() {
+        let _g = SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
+        let before = nonfinite_softmax_fallbacks();
+        const THREADS: u64 = 8;
+        const PER: u64 = 1000;
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    for _ in 0..PER {
+                        record_nonfinite_softmax_fallback();
+                    }
+                });
+            }
+        });
+        assert_eq!(nonfinite_softmax_fallbacks() - before, THREADS * PER);
     }
 
     #[test]

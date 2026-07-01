@@ -216,6 +216,7 @@ const GROUP_ROUTING_GATES: &str = "routing_gates";
 const GROUP_LM_HEAD: &str = "lm_head";
 const GROUP_SHARED_FFN: &str = "shared_ffn";
 const GROUP_DENSE_FFN: &str = "dense_ffn";
+const GROUP_DENSE_MANIFEST: &str = "dense_manifest";
 
 #[derive(Debug, Clone, Default)]
 struct WeightLoadSummary {
@@ -239,6 +240,51 @@ impl WeightLoadSummary {
         let dtype_bucket = self.by_dtype.entry(dtype.into()).or_default();
         dtype_bucket.tensors += 1;
         dtype_bucket.resident_bytes += resident_bytes;
+    }
+}
+
+/// Structured summary of how a [`RealModel`]'s weights were resolved.
+///
+/// This is deliberately observable metadata (as opposed to an unstructured
+/// log line) so that startup and benchmark code can report — and, on
+/// production paths, *reject* — models that retained deterministic seeded
+/// fallback weights instead of a complete real checkpoint.
+#[derive(Debug, Clone)]
+pub struct WeightLoadStatus {
+    /// Whether the load ran under strict validation.
+    pub strict: bool,
+    /// Which loader produced the model: `"seeded"`, `"converted_dir"`, or
+    /// `"safetensors"`.
+    pub loader: &'static str,
+    /// Number of required resident tensors successfully loaded from disk.
+    pub loaded_tensors: usize,
+    /// Number of required resident tensors the loader attempted.
+    pub required_tensors: usize,
+    /// Number of optional tensors (e.g. shared-expert sidecars) the loader
+    /// probed for. Optional probes never contribute to
+    /// [`Self::seeded_fallback_remained`]: an architecture without shared
+    /// experts is complete even though these files are absent.
+    pub optional_probed: usize,
+    /// Number of optional tensors successfully loaded from disk.
+    pub optional_loaded: usize,
+    /// `true` when at least one *required* tensor kept its seeded fallback
+    /// value (only possible outside strict mode, or for a purely seeded
+    /// model). Optional tensors are deliberately excluded.
+    pub seeded_fallback_remained: bool,
+}
+
+impl Default for WeightLoadStatus {
+    fn default() -> Self {
+        // A freshly seeded model: no real tensors loaded, everything seeded.
+        Self {
+            strict: false,
+            loader: "seeded",
+            loaded_tensors: 0,
+            required_tensors: 0,
+            optional_probed: 0,
+            optional_loaded: 0,
+            seeded_fallback_remained: true,
+        }
     }
 }
 
@@ -616,6 +662,10 @@ pub struct RealModel {
     pub layers: Vec<TransformerLayer>,
     pub final_rms: RmsNorm,
     pub lm_head: LMHead,
+    /// How this model's weights were resolved (seeded vs a real checkpoint).
+    /// Startup and benchmark paths inspect this to fail closed on seeded
+    /// fallback in production.
+    pub load_status: WeightLoadStatus,
 }
 
 type RopeCacheKey = (usize, u32, u8, u64);
@@ -853,6 +903,7 @@ impl RealModel {
             layers,
             final_rms,
             lm_head,
+            load_status: WeightLoadStatus::default(),
         }
     }
 
@@ -892,9 +943,15 @@ impl RealModel {
         let naming = config.tensor_naming();
         let mut loaded = 0usize;
         let mut tried = 0usize;
+        // The converted-directory (`.bin`) layout has no optional tensors: every
+        // probed tensor is architecture-required (shared experts are required
+        // when declared). These counters are reported for parity with the
+        // safetensors loader.
+        let optional_probed = 0usize;
+        let optional_loaded = 0usize;
         let mut summary = WeightLoadSummary::default();
         let mut failures = Vec::new();
-        let dense_manifest = load_dense_manifest(dir);
+        let dense_manifest = resolve_dense_manifest(dir, options.strict_weights, &mut failures);
 
         macro_rules! maybe {
             ($group:expr, $name:expr, $expected:expr, $assign:expr) => {{
@@ -1059,19 +1116,30 @@ impl RealModel {
                     "raw .bin loader does not define dense FFN tensor files; use .safetensors",
                 ));
             }
-            // Optional Qwen2-MoE / DeepSeek-MoE shared expert. The shared
-            // expert's intermediate size is independent of the routed
-            // `d_ff`, so we infer it from the on-disk tensor length
-            // (`gate floats / d_model`) rather than the model config.
-            // Files are emitted by the GGUF extractor under the
-            // `layer_{l}_shexp_*` names; absence (Mixtral) is a no-op.
-            tried += 1;
-            if let Some(se) = Self::load_shared_expert_bin(dir, l, d_model) {
-                let resident_bytes =
-                    (se.weights.len() + se.gate_inp.as_ref().map(|g| g.len()).unwrap_or(0)) * 4;
-                model.layers[l].shared_expert = Some(se);
-                summary.record(GROUP_SHARED_FFN, "f32", resident_bytes);
-                loaded += 1;
+            // Shared expert (Qwen2-MoE / DeepSeek-MoE). Only architectures that
+            // declare always-on shared experts (`num_shared_experts > 0`) own
+            // these tensors; for those the shared-expert stack is *required* and
+            // a missing/malformed set fails strict loading. Architectures without
+            // shared experts (Mixtral, Qwen3-MoE) must not probe or count these
+            // files, otherwise a complete checkpoint would report a lingering
+            // seeded fallback. The shared expert's intermediate size is inferred
+            // from the on-disk tensor length (`gate floats / d_model`).
+            if config.advanced.num_shared_experts > 0 && naming.ffn_kind(l) == FfnKind::Moe {
+                tried += 1;
+                if let Some(se) = Self::load_shared_expert_bin(dir, l, d_model) {
+                    let resident_bytes = (se.weights.len()
+                        + se.gate_inp.as_ref().map(|g| g.len()).unwrap_or(0))
+                        * 4;
+                    model.layers[l].shared_expert = Some(se);
+                    summary.record(GROUP_SHARED_FFN, "f32", resident_bytes);
+                    loaded += 1;
+                } else if options.strict_weights {
+                    failures.push(WeightLoadFailure::missing(
+                        format!("layer_{l}_shexp_*"),
+                        GROUP_SHARED_FFN,
+                        "resident shared-expert gate/up/down projections",
+                    ));
+                }
             }
         }
         if options.strict_weights && !failures.is_empty() {
@@ -1080,12 +1148,24 @@ impl RealModel {
                 StrictWeightLoadError::new(dir, failures),
             ));
         }
+        model.load_status = WeightLoadStatus {
+            strict: options.strict_weights,
+            loader: "converted_dir",
+            loaded_tensors: loaded,
+            required_tensors: tried,
+            optional_probed,
+            optional_loaded,
+            seeded_fallback_remained: loaded < tried,
+        };
         info!(
             dir = %dir.display(),
             loaded,
             tried,
+            optional_probed,
+            optional_loaded,
             strict_weights = options.strict_weights,
             fallback_seeded = !options.strict_weights,
+            seeded_fallback_remained = model.load_status.seeded_fallback_remained,
             weight_groups = ?summary.by_group,
             weight_dtypes = ?summary.by_dtype,
             "real transformer weights loaded"
@@ -1355,6 +1435,41 @@ impl RealModel {
                             have = n_elem,
                             need = expected,
                             "safetensors shape mismatch; falling back to seeded init"
+                        );
+                        return None;
+                    }
+                    return Some(decode_safetensor_to_f32(&view, name));
+                }
+            }
+            None
+        };
+
+        // Finding 3/4: like `find_f32`, but requires an exact rank-2
+        // `[rows, cols]` tensor. A transpose, a flattened rank-1 tensor, or
+        // any rank > 2 tensor is rejected (never accepted on an element-count
+        // coincidence). Rank-1 vector compatibility lives only in `find_f32`.
+        let find_f32_2d = |name: &str, rows: usize, cols: usize| -> Option<Vec<f32>> {
+            for st in &parsed {
+                if let Ok(view) = st.tensor(name) {
+                    let shape = view.shape();
+                    let n_elem: usize = shape.iter().product();
+                    let expected = rows.saturating_mul(cols);
+                    if n_elem != expected {
+                        warn!(
+                            tensor = name,
+                            have = n_elem,
+                            need = expected,
+                            "safetensors shape mismatch; falling back to seeded init"
+                        );
+                        return None;
+                    }
+                    if !safetensor_orientation_ok(shape, rows, cols) {
+                        warn!(
+                            tensor = name,
+                            shape = ?shape,
+                            rows,
+                            cols,
+                            "safetensors tensor is transposed/misshaped; falling back to seeded init"
                         );
                         return None;
                     }
@@ -1665,6 +1780,19 @@ impl RealModel {
                 }
             }};
         }
+        // Finding 3: 2-D matrix variant that enforces `[rows, cols]`
+        // orientation in addition to the element-count check.
+        macro_rules! maybe2d {
+            ($group:expr, $name:expr, $rows:expr, $cols:expr, $assign:expr) => {{
+                tried += 1;
+                let name = $name;
+                if let Some(v) = find_f32_2d(name, $rows, $cols) {
+                    summary.record($group, safetensor_source_dtype(&parsed, name), v.len() * 4);
+                    $assign(v);
+                    loaded += 1;
+                }
+            }};
+        }
         // FP8 dequant happens via `find_f32_dequant` / `find_f32_any`
         // directly (e.g. in `load_mla_layer`); no extra macro needed.
 
@@ -1677,10 +1805,11 @@ impl RealModel {
         // count); the output width is `num_heads * v_head_dim` for all layers.
         let attn_out_dim = config.num_heads * config.v_head_dim();
 
-        maybe!(
+        maybe2d!(
             GROUP_EMBEDDING,
             &naming.embed(),
-            config.vocab_size * d_model,
+            config.vocab_size,
+            d_model,
             |v| {
                 model.embedding = DenseWeight::from_f32(v, config.vocab_size, d_model);
             }
@@ -1688,10 +1817,11 @@ impl RealModel {
         maybe!(GROUP_NORMS, &naming.final_norm(), d_model, |v| {
             model.final_rms = RmsNorm::new(v, config.rms_eps);
         });
-        maybe!(
+        maybe2d!(
             GROUP_LM_HEAD,
             &naming.lm_head(),
-            config.vocab_size * d_model,
+            config.vocab_size,
+            d_model,
             |v| {
                 model.lm_head = LMHead::new(v, config.vocab_size, d_model);
             }
@@ -1743,7 +1873,7 @@ impl RealModel {
                 // row-major) that we split into separate Q/K/V weights.
                 tried += 1;
                 let qkv_name = naming.attn_qkv(l);
-                if let Some(v) = find_f32(&qkv_name, (q_dim + 2 * kv_dim) * d_model) {
+                if let Some(v) = find_f32_2d(&qkv_name, q_dim + 2 * kv_dim, d_model) {
                     summary.record(
                         GROUP_ATTENTION,
                         safetensor_source_dtype(&parsed, &qkv_name),
@@ -1759,28 +1889,30 @@ impl RealModel {
                         DenseWeight::from_f32(v_part.to_vec(), kv_dim, d_model);
                     loaded += 1;
                 }
-                maybe!(GROUP_ATTENTION, &naming.attn_o(l), d_model * q_dim, |v| {
+                maybe2d!(GROUP_ATTENTION, &naming.attn_o(l), d_model, q_dim, |v| {
                     model.layers[l].attn.wo = DenseWeight::from_f32(v, d_model, q_dim);
                 });
             } else {
-                maybe!(GROUP_ATTENTION, &naming.attn_q(l), q_dim * d_model, |v| {
+                maybe2d!(GROUP_ATTENTION, &naming.attn_q(l), q_dim, d_model, |v| {
                     model.layers[l].attn.wq = DenseWeight::from_f32(v, q_dim, d_model);
                 });
-                maybe!(GROUP_ATTENTION, &naming.attn_k(l), kv_dim * d_model, |v| {
+                maybe2d!(GROUP_ATTENTION, &naming.attn_k(l), kv_dim, d_model, |v| {
                     model.layers[l].attn.wk = DenseWeight::from_f32(v, kv_dim, d_model);
                 });
-                maybe!(
+                maybe2d!(
                     GROUP_ATTENTION,
                     &naming.attn_v(l),
-                    v_proj_dim * d_model,
+                    v_proj_dim,
+                    d_model,
                     |v| {
                         model.layers[l].attn.wv = DenseWeight::from_f32(v, v_proj_dim, d_model);
                     }
                 );
-                maybe!(
+                maybe2d!(
                     GROUP_ATTENTION,
                     &naming.attn_o(l),
-                    d_model * attn_out_dim,
+                    d_model,
+                    attn_out_dim,
                     |v| {
                         model.layers[l].attn.wo =
                             DenseWeight::from_f32(v, d_model, attn_out_dim);
@@ -1941,22 +2073,38 @@ impl RealModel {
                 // otherwise we fall back to the inline `moe_gate` tensor.
                 tried += 1;
                 let gate_bin = format!("gate_{l}.bin");
-                let (gate_vec, gate_dtype) =
-                    if let Some(mut v) = Self::read_full_f32(&dir.join(&gate_bin)) {
-                        if v.len() < expected {
-                            (None, None)
-                        } else {
-                            v.truncate(expected);
-                            (Some(v), Some("bin_f32".to_string()))
-                        }
-                    } else {
+                let sidecar = Self::read_full_f32(&dir.join(&gate_bin));
+                let (gate_vec, gate_dtype) = match sidecar {
+                    // Accept the extracted sidecar only when its length is
+                    // *exactly* `num_experts * d_model`. Never truncate an
+                    // oversized file (Finding 8): a wrong-sized sidecar is a
+                    // corruption/mismatch signal, so warn and fall back to the
+                    // canonical inline `moe_gate` tensor instead.
+                    Some(v) if v.len() == expected => (Some(v), Some("bin_f32".to_string())),
+                    Some(v) => {
+                        warn!(
+                            file = %dir.join(&gate_bin).display(),
+                            got = v.len(),
+                            expected,
+                            "gate sidecar has wrong length; not truncating — \
+                             falling back to canonical gate tensor"
+                        );
+                        let gate_name = naming.moe_gate(l);
+                        let cv = find_f32(&gate_name, expected);
+                        let dtype = cv
+                            .as_ref()
+                            .map(|_| safetensor_source_dtype(&parsed, &gate_name));
+                        (cv, dtype)
+                    }
+                    None => {
                         let gate_name = naming.moe_gate(l);
                         let v = find_f32(&gate_name, expected);
                         let dtype = v
                             .as_ref()
                             .map(|_| safetensor_source_dtype(&parsed, &gate_name));
                         (v, dtype)
-                    };
+                    }
+                };
                 if let Some(v) = gate_vec {
                     summary.record(
                         GROUP_ROUTING_GATES,
@@ -2059,6 +2207,18 @@ impl RealModel {
                 }
             }
         }
+        model.load_status = WeightLoadStatus {
+            strict: options.strict_weights,
+            loader: "safetensors",
+            loaded_tensors: loaded,
+            required_tensors: tried,
+            // Every safetensors tensor counted above is architecture-required:
+            // dense FFN is only probed on dense layers, and shared experts only
+            // when the checkpoint declares them. There are no optional probes.
+            optional_probed: 0,
+            optional_loaded: 0,
+            seeded_fallback_remained: loaded < tried,
+        };
         info!(
             dir = %dir.display(),
             shards = shards.len(),
@@ -2066,6 +2226,7 @@ impl RealModel {
             tried,
             strict_weights = options.strict_weights,
             fallback_seeded = !options.strict_weights,
+            seeded_fallback_remained = model.load_status.seeded_fallback_remained,
             weight_groups = ?summary.by_group,
             weight_dtypes = ?summary.by_dtype,
             "loaded dense weights from .safetensors"
@@ -2512,21 +2673,139 @@ fn seed_mla(
 /// out over a 128x128 block grid).
 const FP8_BLOCK: usize = 128;
 
-fn load_dense_manifest(dir: &Path) -> Option<DenseTensorManifest> {
+/// True when a dense manifest entry's recorded `dims` describe exactly the
+/// `[rows, cols]` orientation the loader is about to impose (Finding 3).
+/// The converter records 2-D tensors as `[rows, cols]` and 1-D tensors as
+/// `[n, 1]`; the loader always constructs the `DenseWeight` from the
+/// caller's `(rows, cols)`. Requiring an exact match rejects a transposed
+/// `[cols, rows]` entry whose element count coincidentally matches.
+fn dense_dims_match_orientation(dims: &[usize], rows: usize, cols: usize) -> bool {
+    match dims {
+        [r, c] => *r == rows && *c == cols,
+        // A bare `[n]` entry is orientation-free; accept it when the single
+        // dimension is the row count and the caller expects a column vector.
+        [n] => *n == rows && cols == 1,
+        _ => false,
+    }
+}
+
+/// True when a safetensors tensor's stored `shape` is compatible with the
+/// expected `[rows, cols]` matrix orientation (Finding 3 / Finding 4).
+///
+/// HF stores Linear weights as `[out_features, in_features]`, matching the
+/// engine's `[rows, cols]`. A matrix load must therefore be exactly rank-2
+/// with the expected orientation: a `[cols, rows]` transpose, a flattened
+/// rank-1 `[rows*cols]` tensor, or any rank > 2 tensor is rejected outright
+/// rather than being accepted on an element-count coincidence. Rank-1
+/// compatibility lives only in the vector-specific loaders (`find_f32`),
+/// never in matrix loaders.
+fn safetensor_orientation_ok(shape: &[usize], rows: usize, cols: usize) -> bool {
+    matches!(shape, [a, b] if *a == rows && *b == cols)
+}
+
+/// Locate `name` across shards and, when found as a 2-D tensor, verify its
+/// stored orientation matches `[rows, cols]`. Returns `Some(reason)` when the
+/// tensor exists but is transposed/misshaped, `None` when it is orientation-
+/// compatible or absent (absence is handled by the normal missing-tensor
+/// path).
+fn safetensor_orientation_problem(
+    parsed: &[safetensors::SafeTensors<'_>],
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Option<String> {
+    for st in parsed {
+        if let Ok(view) = st.tensor(name) {
+            let shape = view.shape();
+            if !safetensor_orientation_ok(shape, rows, cols) {
+                return Some(format!(
+                    "tensor {name} has shape {shape:?}, expected [rows, cols] = [{rows}, {cols}] \
+                     (transposed or misshaped)"
+                ));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Outcome of attempting to load the optional `dense_manifest.json`.
+enum DenseManifestLoad {
+    /// No manifest file present — legacy per-file layout. Not an error.
+    Absent,
+    /// The manifest exists but could not be read or parsed. Under strict
+    /// loading this is a hard failure (Finding 6): a corrupt manifest must
+    /// not silently degrade to seeded weights.
+    Malformed(String),
+    /// Successfully parsed manifest (structural integrity not yet checked).
+    Loaded(DenseTensorManifest),
+}
+
+fn load_dense_manifest(dir: &Path) -> DenseManifestLoad {
     let path = dir.join("dense_manifest.json");
     if !path.is_file() {
-        return None;
+        return DenseManifestLoad::Absent;
     }
     match std::fs::read_to_string(&path) {
         Ok(body) => match serde_json::from_str::<DenseTensorManifest>(&body) {
-            Ok(manifest) => Some(manifest),
+            Ok(manifest) => DenseManifestLoad::Loaded(manifest),
             Err(err) => {
                 warn!(file = %path.display(), error = %err, "dense manifest parse failed");
-                None
+                DenseManifestLoad::Malformed(format!("parse error: {err}"))
             }
         },
         Err(err) => {
             warn!(file = %path.display(), error = %err, "dense manifest read failed");
+            DenseManifestLoad::Malformed(format!("read error: {err}"))
+        }
+    }
+}
+
+/// Resolve the dense manifest for a checkpoint directory, applying the
+/// Finding 6 integrity policy. Returns the manifest only when it is present
+/// and passes validation; any structural problem is recorded in `failures`
+/// (fatal under strict loading) and the manifest is dropped so the loader
+/// falls back to the per-file / seeded paths.
+fn resolve_dense_manifest(
+    dir: &Path,
+    strict_weights: bool,
+    failures: &mut Vec<WeightLoadFailure>,
+) -> Option<DenseTensorManifest> {
+    let push_problem = |failures: &mut Vec<WeightLoadFailure>, detail: String| {
+        failures.push(WeightLoadFailure {
+            tensor: "dense_manifest.json".to_string(),
+            group: GROUP_DENSE_MANIFEST,
+            kind: WeightLoadFailureKind::Malformed,
+            expected: "valid dense manifest".to_string(),
+            actual: None,
+            detail: Some(detail),
+        });
+    };
+
+    match load_dense_manifest(dir) {
+        DenseManifestLoad::Absent => None,
+        DenseManifestLoad::Malformed(err) => {
+            if strict_weights {
+                push_problem(failures, err);
+            }
+            None
+        }
+        DenseManifestLoad::Loaded(manifest) => {
+            let problems = manifest.validate_integrity(strict_weights);
+            if problems.is_empty() {
+                return Some(manifest);
+            }
+            for problem in &problems {
+                warn!(dir = %dir.display(), problem = %problem, "dense manifest integrity problem");
+            }
+            if strict_weights {
+                for problem in problems {
+                    push_problem(failures, problem);
+                }
+            }
+            // Never consult a structurally invalid manifest, even in
+            // non-strict mode: an ambiguous alias or a bad byte_len could
+            // load the wrong tensor. Fall back to per-file / seeded init.
             None
         }
     }
@@ -2582,6 +2861,40 @@ fn try_load_dense_weight(
         .map(|v| DenseWeight::from_f32(v, rows, cols));
     };
 
+    // Tied entry (Finding 2): an entry such as a tied LM head carries no file
+    // of its own — it is reconstructed from a referenced source tensor (the
+    // token embedding). Resolve `tied_to` to the target entry and load its
+    // bytes, validating the reconstructed weight against the caller's expected
+    // `(rows, cols)` exactly as for a normal entry.
+    let entry = if let Some(target) = entry.tied_to.as_deref() {
+        match manifest.and_then(|m| m.find_alias(target)) {
+            Some(source) => source,
+            None => {
+                if strict_weights {
+                    failures.push(WeightLoadFailure {
+                        tensor: name.to_string(),
+                        group,
+                        kind: WeightLoadFailureKind::Missing,
+                        expected: format!("tied source tensor {target}"),
+                        actual: None,
+                        detail: Some(format!(
+                            "dense manifest entry {} is tied to {target}, which is not in the manifest",
+                            entry.canonical_name
+                        )),
+                    });
+                }
+                warn!(
+                    tensor = name,
+                    tied_to = target,
+                    "tied dense manifest target not found; falling back to seeded init"
+                );
+                return None;
+            }
+        }
+    } else {
+        entry
+    };
+
     if entry.dims.iter().product::<usize>() != expected {
         if strict_weights {
             failures.push(WeightLoadFailure {
@@ -2603,6 +2916,40 @@ fn try_load_dense_weight(
             rows,
             cols,
             "dense manifest shape mismatch; falling back to seeded init"
+        );
+        return None;
+    }
+
+    // Orientation check (Finding 3). The element count matching is *not*
+    // sufficient: a `[cols, rows]` entry has the same product as the
+    // expected `[rows, cols]`, but its row-major bytes decode to the
+    // transpose of the weight the engine expects. Because the loader
+    // constructs the `DenseWeight` from the caller's `(rows, cols)` and
+    // never consults the manifest dims for layout, a transposed entry
+    // would load silently corrupted. Require the recorded dims to match
+    // the expected orientation exactly.
+    if !dense_dims_match_orientation(&entry.dims, rows, cols) {
+        if strict_weights {
+            failures.push(WeightLoadFailure {
+                tensor: name.to_string(),
+                group,
+                kind: WeightLoadFailureKind::ShapeMismatch,
+                expected: format!("dims [{rows}, {cols}] (row-major)"),
+                actual: Some(format!("{:?}", entry.dims)),
+                detail: Some(format!(
+                    "dense manifest entry {} shape orientation mismatch; \
+                     expected [rows, cols] = [{rows}, {cols}]",
+                    entry.canonical_name
+                )),
+            });
+        }
+        warn!(
+            tensor = name,
+            canonical = %entry.canonical_name,
+            dims = ?entry.dims,
+            rows,
+            cols,
+            "dense manifest shape orientation mismatch; falling back to seeded init"
         );
         return None;
     }
@@ -2853,20 +3200,50 @@ fn strict_safetensors_failures(
         );
     };
 
+    // 2-D matrix requirement: element-count check *plus* the Finding 3
+    // orientation guard, so a transposed non-square projection is rejected
+    // under strict loading instead of loading silently corrupted.
+    let require_2d =
+        |name: String, rows: usize, cols: usize, group: &'static str, failures: &mut Vec<_>| {
+            let ok = strict_validate_safetensor(
+                parsed,
+                &name,
+                rows.saturating_mul(cols),
+                group,
+                fp8_block,
+                fp8_ignored,
+                failures,
+            );
+            if ok {
+                if let Some(reason) = safetensor_orientation_problem(parsed, &name, rows, cols) {
+                    failures.push(WeightLoadFailure {
+                        tensor: name,
+                        group,
+                        kind: WeightLoadFailureKind::ShapeMismatch,
+                        expected: format!("[rows, cols] = [{rows}, {cols}]"),
+                        actual: None,
+                        detail: Some(reason),
+                    });
+                }
+            }
+        };
+
     let d_model = config.d_model;
     let q_dim = config.num_heads * config.head_dim;
     let attn_out_dim = config.num_heads * config.v_head_dim();
 
-    require(
+    require_2d(
         naming.embed(),
-        config.vocab_size * d_model,
+        config.vocab_size,
+        d_model,
         GROUP_EMBEDDING,
         &mut failures,
     );
     require(naming.final_norm(), d_model, GROUP_NORMS, &mut failures);
-    require(
+    require_2d(
         naming.lm_head(),
-        config.vocab_size * d_model,
+        config.vocab_size,
+        d_model,
         GROUP_LM_HEAD,
         &mut failures,
     );
@@ -2944,40 +3321,46 @@ fn strict_safetensors_failures(
                 &mut failures,
             );
         } else if naming.attn_qkv_fused() {
-            require(
+            require_2d(
                 naming.attn_qkv(l),
-                (q_dim + 2 * kv_dim) * d_model,
+                q_dim + 2 * kv_dim,
+                d_model,
                 GROUP_ATTENTION,
                 &mut failures,
             );
-            require(
+            require_2d(
                 naming.attn_o(l),
-                d_model * q_dim,
+                d_model,
+                q_dim,
                 GROUP_ATTENTION,
                 &mut failures,
             );
         } else {
-            require(
+            require_2d(
                 naming.attn_q(l),
-                q_dim * d_model,
+                q_dim,
+                d_model,
                 GROUP_ATTENTION,
                 &mut failures,
             );
-            require(
+            require_2d(
                 naming.attn_k(l),
-                kv_dim * d_model,
+                kv_dim,
+                d_model,
                 GROUP_ATTENTION,
                 &mut failures,
             );
-            require(
+            require_2d(
                 naming.attn_v(l),
-                v_proj_dim * d_model,
+                v_proj_dim,
+                d_model,
                 GROUP_ATTENTION,
                 &mut failures,
             );
-            require(
+            require_2d(
                 naming.attn_o(l),
-                d_model * attn_out_dim,
+                d_model,
+                attn_out_dim,
                 GROUP_ATTENTION,
                 &mut failures,
             );
@@ -3281,31 +3664,24 @@ fn validate_moe_gate_strict(
                 let len = meta.len() as usize;
                 let expected_bytes = expected.saturating_mul(4);
                 if len == expected_bytes {
+                    // Exact-sized extracted gate sidecar is a valid source.
                     return;
                 }
-                failures.push(WeightLoadFailure {
-                    tensor: bin_name.to_string(),
-                    group: GROUP_ROUTING_GATES,
-                    kind: if len % 4 == 0 {
-                        WeightLoadFailureKind::ShapeMismatch
-                    } else {
-                        WeightLoadFailureKind::Malformed
-                    },
-                    expected: format!("{expected} f32 elements ({expected_bytes} bytes)"),
-                    actual: Some(format!("{len} bytes")),
-                    detail: Some(
-                        "extracted gate override is present but not shape-compatible".to_string(),
-                    ),
-                });
+                // A wrong-sized sidecar is never truncated. Warn and fall
+                // through to validate the canonical safetensors gate; strict
+                // loading still succeeds if that canonical source is valid.
+                warn!(
+                    "ignoring extracted gate override {bin_name}: {len} bytes is not the \
+                     expected {expected} f32 elements ({expected_bytes} bytes); \
+                     falling back to canonical {safetensor_name}"
+                );
             }
-            Err(e) => failures.push(WeightLoadFailure {
-                tensor: bin_name.to_string(),
-                group: GROUP_ROUTING_GATES,
-                kind: WeightLoadFailureKind::Unreadable,
-                expected: format!("{expected} f32 elements"),
-                actual: None,
-                detail: Some(e.to_string()),
-            }),
+            Err(e) => {
+                warn!(
+                    "ignoring unreadable extracted gate override {bin_name}: {e}; \
+                     falling back to canonical {safetensor_name}"
+                );
+            }
         }
     }
 
@@ -5058,7 +5434,27 @@ mod tests {
 
     #[test]
     fn from_dir_loads_native_q8_dense_manifest_without_alias_files() {
-        let cfg = tiny_mixtral_loader_cfg();
+        // Q8_0 tensors must contain a whole number of 32-element blocks (F6).
+        // Size the fixture so every Q8_0 dense tensor's element count is a
+        // multiple of 32: d_model = 32 makes `k * d_model` a valid block
+        // multiple for any integer `k` (vocab, q/kv widths, num_experts).
+        let cfg = RealModelConfig {
+            vocab_size: 32,
+            d_model: 32,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 8,
+            num_layers: 1,
+            num_experts: 2,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
         let dir = TempDir::new("dense_manifest_q8");
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
@@ -5297,13 +5693,111 @@ mod tests {
         assert_eq!(model.layers[0].gate.num_experts, cfg.num_experts);
     }
 
+    // ---- Finding 8: gate sidecar must never be truncated ----
+
+    /// Load a complete tiny-Mixtral safetensors checkpoint plus a
+    /// `gate_0.bin` sidecar of the given length/value and return the
+    /// resolved router-gate weights so tests can prove which source was used.
+    /// The canonical safetensors gate has value 0.31; a sidecar written here
+    /// uses a distinct value.
+    fn load_with_gate_sidecar(sidecar_len: usize, sidecar_val: f32) -> Vec<f32> {
+        let cfg = tiny_mixtral_loader_cfg();
+        let dir = TempDir::new("gate_sidecar");
+        write_safetensors_f32(&dir, complete_tiny_mixtral_specs(&cfg));
+        write_bin(&dir.path.join("gate_0.bin"), &vec![sidecar_val; sidecar_len]);
+        let model = RealModel::from_safetensors_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .unwrap();
+        model.layers[0].gate.weights.iter().collect()
+    }
+
+    #[test]
+    fn exact_sized_gate_sidecar_is_preferred() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let expected = cfg.num_experts * cfg.d_model;
+        let gate = load_with_gate_sidecar(expected, 0.77);
+        assert!(
+            gate.iter().all(|&x| (x - 0.77).abs() < 1e-6),
+            "exact-sized sidecar (0.77) must be preferred over the canonical gate (0.31)"
+        );
+    }
+
+    #[test]
+    fn oversized_gate_sidecar_is_not_truncated_and_falls_back_to_canonical() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let expected = cfg.num_experts * cfg.d_model;
+        // One extra expert-row worth of data: must NOT be truncated to fit.
+        let gate = load_with_gate_sidecar(expected + cfg.d_model, 0.77);
+        assert!(
+            gate.iter().all(|&x| (x - 0.31).abs() < 1e-6),
+            "oversized sidecar must be rejected (not truncated); canonical gate (0.31) is used"
+        );
+    }
+
+    #[test]
+    fn undersized_gate_sidecar_falls_back_to_canonical() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let expected = cfg.num_experts * cfg.d_model;
+        let gate = load_with_gate_sidecar(expected - 1, 0.77);
+        assert!(
+            gate.iter().all(|&x| (x - 0.31).abs() < 1e-6),
+            "undersized sidecar must fall back to the canonical gate (0.31)"
+        );
+    }
+
+    #[test]
+    fn wrong_gate_sidecar_without_canonical_fails_strict_loading() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let expected = cfg.num_experts * cfg.d_model;
+        let dir = TempDir::new("gate_sidecar_no_canonical");
+        // Complete checkpoint minus the canonical MoE gate tensor.
+        let specs: Vec<_> = complete_tiny_mixtral_specs(&cfg)
+            .into_iter()
+            .filter(|(name, _, _)| *name != cfg.tensor_naming().moe_gate(0))
+            .collect();
+        write_safetensors_f32(&dir, specs);
+        // Oversized sidecar — must not be truncated to satisfy the gate.
+        write_bin(
+            &dir.path.join("gate_0.bin"),
+            &vec![0.77f32; expected + cfg.d_model],
+        );
+        let err = match RealModel::from_safetensors_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        ) {
+            Ok(_) => panic!("wrong-sized sidecar with no canonical gate must fail strict loading"),
+            Err(err) => err,
+        };
+        let strict = strict_error(&err);
+        assert!(
+            strict
+                .failures()
+                .iter()
+                .any(|f| f.group == GROUP_ROUTING_GATES),
+            "missing valid router gate must be reported under strict loading"
+        );
+    }
+
     /// `from_dir` must pick up the GGUF-extractor shared-expert `.bin`
     /// files, infer the shared intermediate size from the gate tensor
     /// length, and populate `TransformerLayer::shared_expert`. Models
     /// without those files (Mixtral) keep `shared_expert == None`.
     #[test]
     fn from_dir_loads_shared_expert_and_infers_d_ff() {
-        let cfg = RealModelConfig::tiny();
+        let mut cfg = RealModelConfig::tiny();
+        // Shared experts are only probed when the checkpoint declares them
+        // (Finding 1); tiny() is Mixtral (none), so opt in for this fixture.
+        cfg.advanced.num_shared_experts = 1;
         let d_model = cfg.d_model;
         let shared_d_ff = 5; // deliberately != routed d_ff (64)
         let dir = TempDir::new("shexp_bin");
@@ -5366,7 +5860,8 @@ mod tests {
     /// degrade to `None` rather than abort the load.
     #[test]
     fn from_dir_inconsistent_shared_expert_is_ignored() {
-        let cfg = RealModelConfig::tiny();
+        let mut cfg = RealModelConfig::tiny();
+        cfg.advanced.num_shared_experts = 1;
         let d_model = cfg.d_model;
         let shared_d_ff = 5;
         let dir = TempDir::new("shexp_bad");
@@ -5420,5 +5915,164 @@ mod tests {
                 "gate=0 must halve output: {a} {b}"
             );
         }
+    }
+
+    // ---- Finding 1: required-vs-optional load accounting ----
+
+    /// A complete strict Mixtral converted directory (no shared experts) loads
+    /// every required tensor, probes no optional tensors, and reports no
+    /// lingering seeded fallback — so `bench-real` accepts it.
+    #[test]
+    fn complete_strict_mixtral_converted_dir_reports_no_seeded_fallback() {
+        let cfg = RealModelConfig::tiny(); // Mixtral, num_shared_experts == 0
+        assert_eq!(cfg.advanced.num_shared_experts, 0);
+        let dir = TempDir::new("mixtral_complete_strict");
+        write_converted_moe_base_raw(&cfg, &dir.path);
+        let model = RealModel::from_dir_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .expect("complete strict Mixtral converted dir must load");
+        let st = &model.load_status;
+        assert_eq!(st.loaded_tensors, st.required_tensors);
+        assert!(st.required_tensors > 0);
+        assert_eq!(st.optional_probed, 0, "no shared experts to probe");
+        assert!(
+            !st.seeded_fallback_remained,
+            "a complete strict load must not retain a seeded fallback"
+        );
+    }
+
+    /// A complete strict Qwen3-MoE converted directory (QK-Norm required, no
+    /// shared experts) reports no seeded fallback.
+    #[test]
+    fn complete_strict_qwen3_moe_converted_dir_reports_no_seeded_fallback() {
+        let cfg = tiny_qwen3_moe_loader_cfg(); // Qwen3-MoE, no shared experts
+        assert_eq!(cfg.advanced.num_shared_experts, 0);
+        let dir = TempDir::new("qwen3_moe_complete_strict");
+        write_converted_moe_base_raw(&cfg, &dir.path);
+        write_qk_norm_manifest(
+            &dir.path,
+            &[
+                (
+                    "blk.0.attn_q_norm.weight",
+                    "dense_blk_0_attn_q_norm_weight.f32.bin",
+                    "q_norm_0.bin",
+                    vec![cfg.head_dim],
+                    vec![0.25f32, 0.75],
+                ),
+                (
+                    "blk.0.attn_k_norm.weight",
+                    "dense_blk_0_attn_k_norm_weight.f32.bin",
+                    "k_norm_0.bin",
+                    vec![cfg.head_dim],
+                    vec![0.5f32, 0.9],
+                ),
+            ],
+        );
+        let model = RealModel::from_dir_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .expect("complete strict Qwen3-MoE converted dir must load");
+        let st = &model.load_status;
+        assert_eq!(st.loaded_tensors, st.required_tensors);
+        assert_eq!(st.optional_probed, 0);
+        assert!(!st.seeded_fallback_remained);
+    }
+
+    /// When shared experts are declared (`num_shared_experts > 0`) their tensor
+    /// set is required: a converted directory missing the shared-expert files
+    /// fails strict loading.
+    #[test]
+    fn declared_shared_expert_missing_required_weights_fails_strict() {
+        let mut cfg = RealModelConfig::tiny();
+        cfg.advanced.num_shared_experts = 1;
+        let dir = TempDir::new("shared_required_missing");
+        // Complete base tensors, but deliberately no `layer_*_shexp_*` files.
+        write_converted_moe_base_raw(&cfg, &dir.path);
+        let err = match RealModel::from_dir_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        ) {
+            Ok(_) => panic!("declared-but-missing shared experts must fail strict loading"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("shexp") || msg.contains("shared"), "{msg}");
+    }
+
+    /// An architecture without shared experts is complete even though the
+    /// optional shared-expert sidecar files are absent: the absent sidecar
+    /// does not affect the required counts or the seeded-fallback signal.
+    #[test]
+    fn absent_optional_shared_sidecar_does_not_affect_required_counts() {
+        let cfg = RealModelConfig::tiny(); // no shared experts
+        let dir = TempDir::new("optional_absent");
+        write_converted_moe_base_raw(&cfg, &dir.path);
+        let with_probe = RealModel::from_dir_with_options(
+            cfg.clone(),
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .expect("complete strict load without shared experts");
+        assert!(!with_probe.load_status.seeded_fallback_remained);
+        assert_eq!(
+            with_probe.load_status.required_tensors,
+            with_probe.load_status.loaded_tensors
+        );
+    }
+
+    // ---- Finding 3: safetensors / manifest orientation validation ----
+
+    #[test]
+    fn safetensor_orientation_accepts_exact_rank2_only() {
+        // Exact [rows, cols].
+        assert!(safetensor_orientation_ok(&[8, 4], 8, 4));
+        // Square matrix accepted (exact rank-2 match).
+        assert!(safetensor_orientation_ok(&[4, 4], 4, 4));
+        // Finding 4: a flattened rank-1 tensor is NOT a valid matrix even
+        // when its element count matches; matrix loaders require rank-2.
+        assert!(!safetensor_orientation_ok(&[32], 8, 4));
+        // A bare rank-1 vector is rejected by the matrix helper; rank-1
+        // compatibility lives only in the vector-specific loaders.
+        assert!(!safetensor_orientation_ok(&[8], 8, 1));
+    }
+
+    #[test]
+    fn safetensor_orientation_rejects_transposed_and_higher_rank() {
+        // Transposed [cols, rows]: same element count, wrong orientation.
+        assert!(!safetensor_orientation_ok(&[4, 8], 8, 4));
+        // Wrong shape entirely.
+        assert!(!safetensor_orientation_ok(&[2, 16], 8, 4));
+        // Finding 4: rank > 2 is rejected outright, never element-product.
+        assert!(!safetensor_orientation_ok(&[8, 4, 1], 8, 4));
+        assert!(!safetensor_orientation_ok(&[2, 4, 4], 8, 4));
+    }
+
+    #[test]
+    fn manifest_orientation_rejects_transposed_nonsquare() {
+        // Recorded [rows, cols] accepted; transpose rejected; square ok.
+        assert!(dense_dims_match_orientation(&[8, 4], 8, 4));
+        assert!(!dense_dims_match_orientation(&[4, 8], 8, 4));
+        assert!(dense_dims_match_orientation(&[4, 4], 4, 4));
+        // 1-D column vector compatibility only.
+        assert!(dense_dims_match_orientation(&[8], 8, 1));
+        assert!(!dense_dims_match_orientation(&[8], 8, 4));
     }
 }

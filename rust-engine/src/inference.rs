@@ -394,6 +394,25 @@ pub fn dequantize_f16_to_f32(src: &[u8], dst: &mut Vec<f32>) {
     }
 }
 
+/// Decode a little-endian IEEE-754 `bfloat16` byte buffer into f32.
+///
+/// BF16 is a distinct 2-byte layout from F16 (8-bit exponent, 7-bit
+/// mantissa), so it must be decoded through `half::bf16` rather than
+/// `half::f16`; treating BF16 bytes as F16 silently corrupts every value.
+pub fn dequantize_bf16_to_f32(src: &[u8], dst: &mut Vec<f32>) {
+    assert!(
+        src.len() % 2 == 0,
+        "bf16 byte buffer length must be a multiple of 2, got {}",
+        src.len()
+    );
+    let n = src.len() / 2;
+    dst.clear();
+    dst.reserve(n);
+    for chunk in src.chunks_exact(2) {
+        dst.push(half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+    }
+}
+
 // ---------------------------------------------------------------------
 // Q4_K (GGUF Q4_K_M) block quantisation.
 // ---------------------------------------------------------------------

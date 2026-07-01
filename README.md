@@ -356,10 +356,19 @@ project's thesis is about **storage bandwidth**, not compute. The
 engine ships a **hardware auto-escalation** layer so a single binary
 picks the best available kernel on the host without recompilation,
 **and** an opt-in path that offloads the dense transformer body onto
-a **budget GPU** when one is available. Default execution has a CPU
-fallback; setting `[real_transformer].compute_offload = "gpu"` selects
-the wgpu-backed `GpuBackend` at runtime and can use VRAM-resident
-experts when the GPU cache is enabled:
+a **budget GPU** when one is available. The `compute_offload` mode
+controls how a GPU-selection or installation failure is handled — the
+three modes have **distinct, non-interchangeable** failure semantics:
+
+| `compute_offload` | Semantics |
+|---|---|
+| `gpu` | **Fail closed.** GPU initialization *or* backend-installation failure is fatal; the run aborts with an error and **never** silently continues on CPU. |
+| `auto` | **Observable GPU→CPU fallback.** Prefer the GPU; on initialization or installation failure fall back to CPU and record the fallback in logs, metrics, and runtime metadata. |
+| `cpu` | **CPU only.** No GPU initialization is attempted. |
+
+Setting `[real_transformer].compute_offload = "gpu"` selects the
+wgpu-backed `GpuBackend` at runtime and can use VRAM-resident experts
+when the GPU cache is enabled:
 
 * **Runtime row-parallel matmul**, always compiled. `matmul_row_major`
   and the per-expert `gate_up_swiglu` / `down_proj` paths fan their
@@ -439,13 +448,26 @@ experts when the GPU cache is enabled:
   the dense transformer body, matmul, SwiGLU, softmax, and attention,
   runs through those shaders via the
   [`transformer::DenseBackbone`](rust-engine/src/transformer.rs) trait
-  (`attn_block`, `RmsNorm`, `LMHead`). When no GPU device can be
-  acquired at startup the backend transparently falls back to the CPU
-  `CandleBackend` (`BackendBox::init` logs `GPU init failed — activating
-  CPU fallback`). SSD-streamed MoE experts use the CPU fallback unless
-  they are promoted into the VRAM tier and dispatched through the
-  wgpu expert path; `--features cuda` is a separate candle CUDA path, see
-  [Building with CUDA](#building-with-cuda). The
+  (`attn_block`, `RmsNorm`, `LMHead`). **Runtime-dispatch caveat
+  (Finding 12):** the GPU attention kernel is only eligible for
+  architectures whose value head dimension equals the query/key head
+  dimension. Asymmetric-V families (e.g. MiMo-V2-Flash with
+  `v_head_dim != head_dim`) keep an explicit eligibility guard in
+  [`transformer::MultiHeadSelfAttention`](rust-engine/src/transformer.rs)
+  that forces the CPU attention path even when `compute_offload = "gpu"`;
+  the latent GPU KV-cache/attention shader now carries the corrected
+  asymmetric value width (`v_proj_dim`), attention-output width
+  (`attn_out_dim`), and independent K/V cache strides so the guard can be
+  lifted once end-to-end asymmetric execution is proven. Startup GPU
+  acquisition follows the `compute_offload` failure semantics above:
+  under `compute_offload = "auto"` a GPU device that cannot be acquired
+  falls back to the CPU `CandleBackend` with the fallback recorded in
+  logs, metrics, and runtime metadata; under `compute_offload = "gpu"`
+  the same failure is **fatal and never continues on CPU** (explicit GPU
+  does not transparently fall back). SSD-streamed MoE experts use the CPU
+  path unless they are promoted into the VRAM tier and dispatched through
+  the wgpu expert path; `--features cuda` is a separate candle CUDA path,
+  see [Building with CUDA](#building-with-cuda). The
   backend logs the **actual device runtime** (`cpu-fallback`,
   `cuda-0`, `wgpu-vulkan` …) at startup, gist Part 2 retired the
   previous stale `gpu-fallback` label so the log faithfully reports
@@ -477,9 +499,11 @@ by default (no `candle-nn` or candle GPU feature required for the CPU
 fallback). When `compute_offload = "gpu"` selects the `wgpu`-backed
 `GpuBackend` at runtime (no cargo feature required), dense matmuls,
 SwiGLU rows, softmax, attention, and eligible VRAM-resident expert
-matmuls can dispatch through the wgpu compute pipeline. If GPU init
-fails or an expert is not GPU-eligible/resident, execution falls back to
-the CPU path. The
+matmuls can dispatch through the wgpu compute pipeline. Once a GPU
+backend is installed, an individual expert that is not
+GPU-eligible/resident executes on the CPU path; a GPU **initialization**
+failure at startup only falls back to CPU under `compute_offload =
+"auto"` (under `compute_offload = "gpu"` it is fatal). The
 proprietary I/O substrate (`expert_cache`, `buffer_pool`, `io_provider`,
 the O_DIRECT `pread(2)` path) is strictly preserved regardless of
 which backend the dense body uses.
@@ -489,6 +513,10 @@ For projects that want to swap candle for a different math library
 new [`backend`](rust-engine/src/backend/mod.rs) module defines a
 plugin-system `Backend` trait, see
 [Decoupled math backend](#decoupled-math-backend) below.
+
+The complete cargo feature-build matrix, the runtime-dispatch rules, and the
+model-loading/validation audit disposition (findings F1–F12) are documented in
+[`docs/audit-findings.md`](docs/audit-findings.md).
 
 ---
 

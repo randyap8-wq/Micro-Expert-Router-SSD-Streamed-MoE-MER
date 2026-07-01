@@ -833,7 +833,15 @@ async fn generate(
             completion_ids.push(next);
         }
     }
-    state.metrics.record_tokens(max_tokens as u64);
+    // Record the *actual* number of generated completion tokens, not the
+    // requested `max_tokens` cap. The generation loops above stop at
+    // `max_tokens`, but a future early-EOS stop, a cancellation, or an
+    // error-after-partial path would leave `completion_ids` shorter than the
+    // cap; the metric and usage accounting must follow the produced tokens
+    // (gist Finding 10). Errors before this point propagate via `?` and are
+    // never counted.
+    let generated_tokens = completion_ids.len();
+    state.metrics.record_tokens(generated_tokens as u64);
     state.metrics.record_cache(hits_total, misses_total);
 
     // 3) Decode and respond.
@@ -843,7 +851,7 @@ async fn generate(
         .map_err(|e| GenerateError::Tokenizer(e.to_string()))?;
     info!(
         prompt_tokens,
-        completion_tokens = max_tokens,
+        completion_tokens = generated_tokens,
         cache_hits = hits_total,
         cache_misses = misses_total,
         "completed request"
@@ -859,8 +867,8 @@ async fn generate(
         }],
         usage: UsageStats {
             prompt_tokens,
-            completion_tokens: max_tokens,
-            total_tokens: prompt_tokens + max_tokens,
+            completion_tokens: generated_tokens,
+            total_tokens: prompt_tokens + generated_tokens,
         },
     })
 }
@@ -2196,6 +2204,67 @@ mod tests {
         assert_eq!(v["choices"][0]["index"], 0);
         assert_eq!(v["usage"]["completion_tokens"], 4);
         assert!(v["choices"][0]["text"].is_string());
+    }
+
+    /// Finding 10: the server-wide `mer_tokens_generated_total` counter must
+    /// track the *actual* produced completion tokens (summed across requests,
+    /// no double counting), not the requested `max_tokens` cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokens_generated_metric_tracks_produced_completion_tokens() {
+        let (state, _tmp) = make_state().await;
+        let app = build_router(state);
+
+        async fn complete(app: &axum::Router, max_tokens: usize) -> u64 {
+            let body = serde_json::json!({ "prompt": "hi", "max_tokens": max_tokens }).to_string();
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["usage"]["completion_tokens"].as_u64().unwrap()
+        }
+
+        async fn scrape_generated(app: &axum::Router) -> u64 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = to_bytes(resp.into_body(), 32 * 1024).await.unwrap();
+            let s = String::from_utf8(bytes.to_vec()).unwrap();
+            s.lines()
+                .find_map(|l| {
+                    l.strip_prefix("mer_tokens_generated_total ")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                })
+                .map(|f| f as u64)
+                .unwrap_or(0)
+        }
+
+        let c1 = complete(&app, 4).await;
+        let c2 = complete(&app, 2).await;
+        let total = scrape_generated(&app).await;
+        assert_eq!(
+            total,
+            c1 + c2,
+            "generated-token counter ({total}) must equal produced completion tokens \
+             ({c1} + {c2}) with no double counting"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

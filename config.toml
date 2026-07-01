@@ -171,8 +171,18 @@ enabled = false
 # Optional directory of pre-extracted dense weight files. See
 # `RealModel::from_dir` in `src/model.rs` for the file-name schema
 # (`embed.bin`, `attn_<L>_q.bin`, `gate_<L>.bin`, …). Tensors not
-# present fall back to a deterministic seeded init.
+# present fall back to a deterministic seeded init (development-only; see
+# `strict_weights` / `allow_seeded_fallback` below).
 # weights_dir = "./data/dense"
+# Require a complete, shape-compatible resident checkpoint (fail closed).
+# Defaults to `true` so production real-model paths reject incomplete or
+# incompatible inputs instead of silently retaining seeded weights.
+# strict_weights = true
+# Development-only opt-in that permits deterministic seeded weights to
+# remain when a real checkpoint is missing or loaded non-strictly. Defaults
+# to `false`; when `enabled = true`, a missing `weights_dir` or
+# `strict_weights = false` is a hard startup error unless this is `true`.
+# allow_seeded_fallback = false
 # Optional model-family override (exact Hugging Face `model_type`):
 #   "mixtral" | "qwen3" | "qwen3_moe" | "deepseek_v3" | "mistral3" | "phi3"
 # When omitted, the architecture AND all hyperparameters (num_layers,

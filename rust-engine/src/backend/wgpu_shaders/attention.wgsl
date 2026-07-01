@@ -22,17 +22,22 @@
 //           there are no write conflicts in shared_out.
 //   Step 4: Thread 0 updates running (run_m, run_d).
 //
-// Push constants: {num_heads, num_kv_heads, head_dim, seq_len, layer_offset: u32}
-// layer_offset is in f32 *elements* (not bytes).
-// KV layout: [layer][kv=0(K)/kv=1(V)][seq_pos][kv_dim] stored as f32, where
-// kv_dim = num_kv_heads * head_dim (GQA: query head h reads kv head
-// kv_h = h * num_kv_heads / num_heads).
-//   K base for position t: f32_off + t * kv_dim + kv_h * head_dim
-//   V base for position t: f32_off + MAX_SEQ_LEN * kv_dim + t * kv_dim + kv_h * head_dim
+// Push constants: {num_heads, num_kv_heads, head_dim, seq_len, layer_offset,
+// v_head_dim: u32} (+2 u32 padding). layer_offset is in f32 *elements* (not
+// bytes).
+// KV layout: [layer][ K region | V region ] stored as f32. Per layer the K
+// region is `MAX_SEQ_LEN * k_dim` elements followed by the V region of
+// `MAX_SEQ_LEN * v_dim` elements, where
+//   k_dim = num_kv_heads * head_dim     (query/key head dim)
+//   v_dim = num_kv_heads * v_head_dim   (value head dim; Finding 12)
+// GQA: query head h reads kv head kv_h = h * num_kv_heads / num_heads.
+//   K base for position t: f32_off + t * k_dim + kv_h * head_dim
+//   V base for position t: f32_off + MAX_SEQ_LEN * k_dim + t * v_dim
+//                                  + kv_h * v_head_dim
 //
-// MAX_SEQ_LEN and MAX_HEAD_DIM are replaced by GpuBackend::try_new() before
-// shader compilation; the literals here are defaults that must not be used
-// at runtime without substitution.
+// MAX_SEQ_LEN, MAX_HEAD_DIM and MAX_V_HEAD_DIM are replaced by
+// GpuBackend::try_new() before shader compilation; the literals here are
+// defaults that must not be used at runtime without substitution.
 
 struct PushConstants {
     num_heads:    u32,
@@ -40,6 +45,7 @@ struct PushConstants {
     head_dim:     u32,
     seq_len:      u32,
     layer_offset: u32,
+    v_head_dim:   u32,
 }
 var<push_constant> pc: PushConstants;
 
@@ -48,11 +54,12 @@ var<push_constant> pc: PushConstants;
 @group(0) @binding(2) var<storage, read_write> OUT: array<f32>;
 
 // ── Runtime-substituted constants ─────────────────────────────────────────────
-// NOTE: these two lines are substituted verbatim by GpuBackend::try_new() via
+// NOTE: these three lines are substituted verbatim by GpuBackend::try_new() via
 // str::replace. Keep them on a single line with no trailing comments/spaces so
 // the literal-string match in `backend/mod.rs` continues to find them.
 const MAX_SEQ_LEN: u32 = 4096u;
 const MAX_HEAD_DIM: u32 = 256u;
+const MAX_V_HEAD_DIM: u32 = 256u;
 
 // ── Workgroup size ─────────────────────────────────────────────────────────────
 const WG: u32 = 32u;
@@ -71,8 +78,8 @@ var<workgroup> shared_m:       array<f32, 32u>;
 var<workgroup> shared_d:       array<f32, 32u>;
 var<workgroup> shared_weights: array<f32, 32u>;
 
-// Running weighted-V accumulator across all tiles [head_dim].
-var<workgroup> shared_out: array<f32, MAX_HEAD_DIM>;
+// Running weighted-V accumulator across all tiles [v_head_dim].
+var<workgroup> shared_out: array<f32, MAX_V_HEAD_DIM>;
 
 // ── Kernel ─────────────────────────────────────────────────────────────────────
 
@@ -91,12 +98,13 @@ fn attention_main(
         run_m = -3.402823e+38;
         run_d = 0.0;
     }
-    for (var j = tid; j < pc.head_dim; j += WG) {
+    for (var j = tid; j < pc.v_head_dim; j += WG) {
         shared_out[j] = 0.0;
     }
     workgroupBarrier();
 
-    let kv_dim    = pc.num_kv_heads * pc.head_dim;
+    let k_dim     = pc.num_kv_heads * pc.head_dim;
+    let v_dim     = pc.num_kv_heads * pc.v_head_dim;
     // GQA mapping: query head h attends through kv head kv_h.
     let kv_h      = h * pc.num_kv_heads / pc.num_heads;
     let f32_off   = pc.layer_offset;
@@ -117,7 +125,7 @@ fn attention_main(
         var s = -3.402823e+38;
         if valid {
             s = 0.0;
-            let key_off = f32_off + t * kv_dim + kv_h * pc.head_dim;
+            let key_off = f32_off + t * k_dim + kv_h * pc.head_dim;
             for (var j = 0u; j < pc.head_dim; j++) {
                 s += Q[h * pc.head_dim + j] * KV[key_off + j];
             }
@@ -171,15 +179,15 @@ fn attention_main(
         // For each j, loops over all t_count valid positions in the tile and
         // accumulates the weighted V contribution. Because each thread owns a
         // disjoint j-range, there are no write conflicts in shared_out.
-        for (var j = tid; j < pc.head_dim; j += WG) {
+        for (var j = tid; j < pc.v_head_dim; j += WG) {
             var v_acc = shared_out[j] * factor_old;
             for (var tl = 0u; tl < t_count; tl++) {
                 let w     = shared_weights[tl];
                 let t_abs = tile * WG + tl;
                 let v_off = f32_off
-                          + MAX_SEQ_LEN * kv_dim    // jump past K slice
-                          + t_abs * kv_dim           // seq position stride
-                          + kv_h * pc.head_dim       // kv-head offset (GQA)
+                          + MAX_SEQ_LEN * k_dim      // jump past K slice
+                          + t_abs * v_dim            // seq position stride (V)
+                          + kv_h * pc.v_head_dim     // kv-head offset (GQA, V)
                           + j;                       // element index
                 v_acc += w * KV[v_off];
             }
@@ -198,7 +206,7 @@ fn attention_main(
 
     // ── Final normalisation ────────────────────────────────────────────────────
     let inv_d = select(0.0, 1.0 / run_d, run_d > 0.0);
-    for (var j = tid; j < pc.head_dim; j += WG) {
-        OUT[h * pc.head_dim + j] = shared_out[j] * inv_d;
+    for (var j = tid; j < pc.v_head_dim; j += WG) {
+        OUT[h * pc.v_head_dim + j] = shared_out[j] * inv_d;
     }
 }
