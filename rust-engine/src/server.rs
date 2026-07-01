@@ -193,27 +193,29 @@ fn append_scheduler_metrics(body: &mut Vec<u8>, scheduler: &BatchScheduler) {
     let stats = scheduler.prepass_stats();
     let precision = stats.prefetch_precision();
     let metrics = format!(
-        "\n# HELP mer_scheduler_prepass_runs_total Scheduler pre-pass batches with effective batch size greater than one.\n\
-         # TYPE mer_scheduler_prepass_runs_total counter\n\
-         mer_scheduler_prepass_runs_total {}\n\
-         # HELP mer_scheduler_prepass_singleton_skips_total Scheduler batches that skipped the pre-pass because effective batch size was one.\n\
-         # TYPE mer_scheduler_prepass_singleton_skips_total counter\n\
-         mer_scheduler_prepass_singleton_skips_total {}\n\
-         # HELP mer_scheduler_prepass_time_seconds_total Total scheduler pre-pass wall time in seconds.\n\
-         # TYPE mer_scheduler_prepass_time_seconds_total counter\n\
-         mer_scheduler_prepass_time_seconds_total {:.9}\n\
-         # HELP mer_scheduler_prepass_predicted_experts_total Raw expert prediction slots emitted by scheduler pre-pass peeks.\n\
-         # TYPE mer_scheduler_prepass_predicted_experts_total counter\n\
-         mer_scheduler_prepass_predicted_experts_total {}\n\
-         # HELP mer_scheduler_prepass_requested_experts_total Unique expert warm/fetch requests issued by the scheduler pre-pass after dedupe and placement.\n\
-         # TYPE mer_scheduler_prepass_requested_experts_total counter\n\
-         mer_scheduler_prepass_requested_experts_total {}\n\
-         # HELP mer_scheduler_prepass_prefetch_precision Unique warm/fetch requests divided by raw predicted expert slots.\n\
-         # TYPE mer_scheduler_prepass_prefetch_precision gauge\n\
-         mer_scheduler_prepass_prefetch_precision {:.9}\n\
-         # HELP mer_scheduler_prepass_local_warm_failures_total Local warm_with calls that failed during scheduler pre-pass.\n\
-         # TYPE mer_scheduler_prepass_local_warm_failures_total counter\n\
-         mer_scheduler_prepass_local_warm_failures_total {}\n",
+        concat!(
+            "\n# HELP mer_scheduler_prepass_runs_total Scheduler pre-pass batches with effective batch size greater than one.\n",
+            "# TYPE mer_scheduler_prepass_runs_total counter\n",
+            "mer_scheduler_prepass_runs_total {}\n",
+            "# HELP mer_scheduler_prepass_singleton_skips_total Scheduler batches that skipped the pre-pass because effective batch size was one.\n",
+            "# TYPE mer_scheduler_prepass_singleton_skips_total counter\n",
+            "mer_scheduler_prepass_singleton_skips_total {}\n",
+            "# HELP mer_scheduler_prepass_time_seconds_total Total scheduler pre-pass wall time in seconds.\n",
+            "# TYPE mer_scheduler_prepass_time_seconds_total counter\n",
+            "mer_scheduler_prepass_time_seconds_total {:.9}\n",
+            "# HELP mer_scheduler_prepass_predicted_experts_total Raw expert prediction slots emitted by scheduler pre-pass peeks.\n",
+            "# TYPE mer_scheduler_prepass_predicted_experts_total counter\n",
+            "mer_scheduler_prepass_predicted_experts_total {}\n",
+            "# HELP mer_scheduler_prepass_requested_experts_total Unique expert warm/fetch requests issued by the scheduler pre-pass after dedupe and placement.\n",
+            "# TYPE mer_scheduler_prepass_requested_experts_total counter\n",
+            "mer_scheduler_prepass_requested_experts_total {}\n",
+            "# HELP mer_scheduler_prepass_prefetch_precision Unique warm/fetch requests divided by raw predicted expert slots.\n",
+            "# TYPE mer_scheduler_prepass_prefetch_precision gauge\n",
+            "mer_scheduler_prepass_prefetch_precision {:.9}\n",
+            "# HELP mer_scheduler_prepass_local_warm_failures_total Local warm_with calls that failed during scheduler pre-pass.\n",
+            "# TYPE mer_scheduler_prepass_local_warm_failures_total counter\n",
+            "mer_scheduler_prepass_local_warm_failures_total {}\n",
+        ),
         stats.runs_total,
         stats.singleton_skips_total,
         stats.time_ns_total as f64 / 1_000_000_000.0,
