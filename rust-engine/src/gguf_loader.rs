@@ -2675,22 +2675,36 @@ mod tests {
         }
 
         let head_dim = 4usize;
-        let canonical = "blk.0.attn_q_norm.weight".to_string();
-        let values: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 * 0.1).collect();
-        let bytes = f32_vec_to_le_bytes(&values);
+        let q_canonical = "blk.0.attn_q_norm.weight".to_string();
+        let k_canonical = "blk.0.attn_k_norm.weight".to_string();
+        let q_values: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 * 0.1).collect();
+        let k_values: Vec<f32> = (0..head_dim).map(|i| 0.2 + i as f32 * 0.3).collect();
+        let q_bytes = f32_vec_to_le_bytes(&q_values);
+        let k_bytes = f32_vec_to_le_bytes(&k_values);
         let mut tensors = std::collections::HashMap::new();
         tensors.insert(
-            canonical.clone(),
+            q_canonical.clone(),
             GgufTensorInfo {
-                name: canonical.clone(),
+                name: q_canonical.clone(),
                 shape: vec![head_dim as u64],
                 ggml_dtype: ggml_dtype::F32,
                 offset: 0,
-                byte_len: bytes.len() as u64,
+                byte_len: q_bytes.len() as u64,
+            },
+        );
+        tensors.insert(
+            k_canonical.clone(),
+            GgufTensorInfo {
+                name: k_canonical.clone(),
+                shape: vec![head_dim as u64],
+                ggml_dtype: ggml_dtype::F32,
+                offset: 0,
+                byte_len: k_bytes.len() as u64,
             },
         );
         let mut data = std::collections::HashMap::new();
-        data.insert(canonical.clone(), bytes.clone());
+        data.insert(q_canonical.clone(), q_bytes.clone());
+        data.insert(k_canonical.clone(), k_bytes.clone());
         let source = FakeSource {
             tensors,
             data,
@@ -2717,29 +2731,45 @@ mod tests {
             &tmp,
             &mut report,
             &mut manifest,
-            &canonical,
+            &q_canonical,
             vec!["q_norm_0.bin".to_string()],
         )
         .unwrap();
-        // A missing K-Norm (absent from the source) is skipped, not fatal.
         emit_dense_manifest_tensor(
             &source,
             &tmp,
             &mut report,
             &mut manifest,
-            "blk.0.attn_k_norm.weight",
+            &k_canonical,
             vec!["k_norm_0.bin".to_string()],
         )
         .unwrap();
 
-        assert_eq!(manifest.tensors.len(), 1, "only q_norm should be emitted");
-        let entry = &manifest.tensors[0];
-        assert_eq!(entry.canonical_name, canonical);
-        assert_eq!(entry.aliases, vec!["q_norm_0.bin".to_string()]);
-        assert_eq!(entry.dtype, DenseDType::F32);
-        assert_eq!(entry.dims, vec![head_dim, 1]);
-        assert_eq!(entry.checksum.as_ref().unwrap(), &dense_checksum(&bytes));
-        assert_eq!(fs::read(tmp.join(&entry.file)).unwrap(), bytes);
+        assert_eq!(
+            manifest.tensors.len(),
+            2,
+            "both q_norm and k_norm should be emitted"
+        );
+        let q_entry = manifest
+            .tensors
+            .iter()
+            .find(|t| t.canonical_name == q_canonical)
+            .expect("q_norm entry must be present");
+        assert_eq!(q_entry.aliases, vec!["q_norm_0.bin".to_string()]);
+        assert_eq!(q_entry.dtype, DenseDType::F32);
+        assert_eq!(q_entry.dims, vec![head_dim, 1]);
+        assert_eq!(q_entry.checksum.as_ref().unwrap(), &dense_checksum(&q_bytes));
+        assert_eq!(fs::read(tmp.join(&q_entry.file)).unwrap(), q_bytes);
+        let k_entry = manifest
+            .tensors
+            .iter()
+            .find(|t| t.canonical_name == k_canonical)
+            .expect("k_norm entry must be present");
+        assert_eq!(k_entry.aliases, vec!["k_norm_0.bin".to_string()]);
+        assert_eq!(k_entry.dtype, DenseDType::F32);
+        assert_eq!(k_entry.dims, vec![head_dim, 1]);
+        assert_eq!(k_entry.checksum.as_ref().unwrap(), &dense_checksum(&k_bytes));
+        assert_eq!(fs::read(tmp.join(&k_entry.file)).unwrap(), k_bytes);
         let _ = fs::remove_dir_all(&tmp);
     }
 
