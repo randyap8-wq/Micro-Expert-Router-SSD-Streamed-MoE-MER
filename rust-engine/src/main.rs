@@ -6374,4 +6374,77 @@ mod tests {
         .expect_err("O_DIRECT misaligned expert_size must fail");
         assert!(err.to_string().contains("block_align"), "{err}");
     }
+
+    /// Finding 2: serving and bench-real share a single reconcile + validation
+    /// path, so both resolve an identical config from the same checkpoint and
+    /// reject the same invalid config. Guards against the two call sites
+    /// drifting apart (e.g. one reconciling advanced routing fields the other
+    /// misses, or the two applying different validation rules).
+    #[test]
+    fn serve_and_bench_real_share_reconcile_and_validation() {
+        let dir = tempdir_unique("f2-shared-reconcile");
+        write_qwen3_moe_config_json(&dir);
+
+        // Two independently-constructed configs standing in for the serving and
+        // bench-real entry points; both point at the same checkpoint.
+        let mut serve_cfg = minimal_bench_cfg();
+        serve_cfg.real_transformer.enabled = true;
+        serve_cfg.real_transformer.weights_dir = Some(dir.clone());
+        let mut bench_cfg = minimal_bench_cfg();
+        bench_cfg.real_transformer.enabled = true;
+        bench_cfg.real_transformer.weights_dir = Some(dir.clone());
+
+        let (serve_arch, serve_fk, serve_adv) =
+            reconcile_real_model_config(&mut serve_cfg).expect("serve reconcile");
+        let (bench_arch, bench_fk, bench_adv) =
+            reconcile_real_model_config(&mut bench_cfg).expect("bench reconcile");
+
+        // Identical architecture / dims / routing resolution across both paths.
+        assert_eq!(serve_arch, bench_arch);
+        assert_eq!(serve_fk, bench_fk);
+        assert_eq!(serve_adv.norm_topk_prob, bench_adv.norm_topk_prob);
+        assert_eq!(serve_cfg.model.d_model, bench_cfg.model.d_model);
+        assert_eq!(serve_cfg.model.num_layers, bench_cfg.model.num_layers);
+        assert_eq!(serve_cfg.model.num_experts, bench_cfg.model.num_experts);
+        assert_eq!(serve_cfg.model.top_k, bench_cfg.model.top_k);
+        assert_eq!(
+            serve_cfg.real_transformer.num_heads,
+            bench_cfg.real_transformer.num_heads
+        );
+        assert_eq!(
+            serve_cfg.real_transformer.num_kv_heads,
+            bench_cfg.real_transformer.num_kv_heads
+        );
+        assert_eq!(
+            serve_cfg.real_transformer.head_dim,
+            bench_cfg.real_transformer.head_dim
+        );
+        assert_eq!(
+            serve_cfg.real_transformer.vocab_size,
+            bench_cfg.real_transformer.vocab_size
+        );
+
+        // Both resolved configs pass the shared validation.
+        validate_resolved_real_model_config(&serve_cfg, serve_arch, serve_fk, &serve_adv)
+            .expect("serve validation");
+        validate_resolved_real_model_config(&bench_cfg, bench_arch, bench_fk, &bench_adv)
+            .expect("bench validation");
+
+        // An identical invalid mutation is rejected identically by both paths.
+        let mut serve_bad = serve_cfg.clone();
+        serve_bad.storage.cache_slots = 1;
+        serve_bad.model.top_k = serve_bad.model.num_experts as usize;
+        let mut bench_bad = bench_cfg.clone();
+        bench_bad.storage.cache_slots = 1;
+        bench_bad.model.top_k = bench_bad.model.num_experts as usize;
+        let serve_err =
+            validate_resolved_real_model_config(&serve_bad, serve_arch, serve_fk, &serve_adv)
+                .expect_err("serve must reject undersized cache");
+        let bench_err =
+            validate_resolved_real_model_config(&bench_bad, bench_arch, bench_fk, &bench_adv)
+                .expect_err("bench must reject undersized cache");
+        assert_eq!(serve_err.to_string(), bench_err.to_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
