@@ -1,0 +1,48 @@
+{
+  "benchmark": "bench-real",
+  "status": "blocked",
+  "date": "2026-06-30",
+  "branch": "cpu-production-sprint",
+  "validation_commit": "a93317cb184569fbd2172b0ff5b69d349fd2c96e",
+  "required_model": {
+    "name": "Qwen3-Coder-30B-A3B-Instruct",
+    "quantization": "Q8_0",
+    "architecture": "Qwen3Moe",
+    "d_model": 2048,
+    "d_ff": 768,
+    "layers": 48,
+    "experts_per_layer": 128,
+    "top_k": 8,
+    "attention_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 128,
+    "vocabulary": 151936
+  },
+  "reason": "Full checkpoint shards or converted MER dense/expert weights were not present in this workspace, so mandatory real-checkpoint prompt/decode benchmarks were not run.",
+  "local_paths_checked": [
+    "<local model-configs>/qwen3-moe",
+    "<workspace checkout>/Micro-Expert-Router-SSD-Streamed-MoE-MER",
+    "<local checkout>/Micro-Expert-Router-SSD-Streamed-MoE-MER"
+  ],
+  "local_qwen_files_found": [
+    "<local model-configs>/qwen3-moe/config.json",
+    "<local model-configs>/qwen3-moe/model.safetensors.index.json"
+  ],
+  "validation_without_checkpoint": [
+    "rustfmt --edition 2021 src/config.rs src/server.rs src/transformer.rs",
+    "cargo test dense_tensor -- --nocapture",
+    "cargo test stage_timing -- --nocapture",
+    "cargo test config -- --nocapture",
+    "cargo test",
+    "cargo build --release",
+    "cargo build --release --features \"avx512,blas,tokenizer\"",
+    "git diff --check"
+  ],
+  "local_check_limitations": [
+    "The real Qwen checkpoint or converted MER dense/expert weights were not present, so bench-real real-checkpoint TPS benchmarks remain blocked.",
+    "The release builds still report the repository's existing warning backlog; this corrective pass did not add a new warning.",
+    "CUDA, Linux io_uring, and real checkpoint benchmark commands were intentionally not run in this macOS workspace."
+  ],
+  "not_a_performance_result": true,
+  "no_tps_improvement_claimed": true
+}

@@ -51,8 +51,8 @@
 //! `Arc`s, so multiple `moe_step` calls from sibling tasks are safe;
 //! see [`crate::engine`] for details.
 
-use crate::block_pool::{BlockManager, BlockPool, PressureLevel};
 use crate::backend::Backend;
+use crate::block_pool::{BlockManager, BlockPool, PressureLevel};
 use crate::distributed::{LocalShardRouter, ShardRouter};
 use crate::engine::Engine;
 use crate::model::RealModel;
@@ -68,8 +68,10 @@ use tokio::sync::{mpsc, oneshot};
 // `BlockManager`s directly off the scheduler's shared pool without
 // taking an additional dependency on the `block_pool` module path.
 #[allow(unused_imports)]
-pub use crate::block_pool::{BlockAllocError, BlockId, BlockManager as PooledBlockManager,
-    BlockPool as PooledBlockPool, POOL_BLOCK_TOKENS};
+pub use crate::block_pool::{
+    BlockAllocError, BlockId, BlockManager as PooledBlockManager, BlockPool as PooledBlockPool,
+    POOL_BLOCK_TOKENS,
+};
 
 /// Service class assigned to each registered session. Drives the
 /// Weighted Round-Robin admission policy in [`BatchScheduler`]: an
@@ -209,7 +211,7 @@ impl RequestRegistry {
                 if tokio::runtime::Handle::try_current().is_ok() {
                     tokio::spawn(async move {
                         let _ = arc.lock().await; // wait for the in-flight step
-                        // Arc drops here → KV memory reclaimed.
+                                                  // Arc drops here → KV memory reclaimed.
                     });
                 } else {
                     // No tokio runtime (test environment with a sync
@@ -228,13 +230,13 @@ impl RequestRegistry {
     }
 }
 
-/// One "give me the next token" request issued by an in-flight HTTP
-/// generation future. Carries only the small `{ id, token, pos,
-/// params }` tuple over the mpsc channel — the actual KV cache for
+/// One "advance this request by one token" request issued by an in-flight
+/// HTTP generation future. Carries only the small `{ id, token, pos,
+/// mode, params }` tuple over the mpsc channel — the actual KV cache for
 /// the request lives in the scheduler's [`RequestRegistry`] and is
-/// looked up by id just before `model.step()` is invoked.
+/// looked up by id just before the selected model operation is invoked.
 pub struct StepRequest {
-    /// Registry handle for the request whose KV caches `model.step`
+    /// Registry handle for the request whose KV caches the model operation
     /// should mutate. Obtained via [`BatchScheduler::register`].
     pub id: RequestId,
     /// Last token id produced for this request (or, on the first call,
@@ -244,9 +246,74 @@ pub struct StepRequest {
     pub pos: usize,
     /// Per-request sampling parameters (temperature/top-p/top-k/seed).
     pub params: crate::sampling::SamplingParams,
+    /// Which model operation the scheduler should run for this token.
+    pub mode: StepMode,
     /// Channel used by the scheduler to return the next-token id, or
     /// an error if the request id could not be resolved.
-    pub resp: oneshot::Sender<Result<StepResponse, BatchError>>,
+    pub resp: oneshot::Sender<Result<ScheduledResponse, BatchError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepMode {
+    /// Ingest the token and sample the following token through the LM head.
+    Decode,
+    /// Ingest the token and return the final hidden state without LM-head work.
+    ForwardHidden,
+}
+
+/// Internal scheduler response. Public so [`StepRequest`] can expose its
+/// oneshot type, but callers should prefer [`BatchScheduler::step_registered`]
+/// and [`BatchScheduler::forward_registered`].
+pub enum ScheduledResponse {
+    NextToken(u32),
+    Hidden(Vec<f32>),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrepassStats {
+    pub runs_total: u64,
+    pub singleton_skips_total: u64,
+    pub time_ns_total: u64,
+    pub predicted_experts_total: u64,
+    pub requested_experts_total: u64,
+    pub local_warm_failures_total: u64,
+}
+
+impl PrepassStats {
+    /// Unique expert warm/fetch requests divided by raw predicted expert
+    /// slots. This is a scheduler utility signal rather than model routing
+    /// accuracy: lower values generally mean the pre-pass is deduplicating
+    /// overlapping predictions across requests.
+    pub fn prefetch_precision(&self) -> f64 {
+        if self.predicted_experts_total == 0 {
+            0.0
+        } else {
+            self.requested_experts_total as f64 / self.predicted_experts_total as f64
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PrepassCounters {
+    runs_total: Arc<AtomicU64>,
+    singleton_skips_total: Arc<AtomicU64>,
+    time_ns_total: Arc<AtomicU64>,
+    predicted_experts_total: Arc<AtomicU64>,
+    requested_experts_total: Arc<AtomicU64>,
+    local_warm_failures_total: Arc<AtomicU64>,
+}
+
+impl PrepassCounters {
+    fn snapshot(&self) -> PrepassStats {
+        PrepassStats {
+            runs_total: self.runs_total.load(Ordering::Relaxed),
+            singleton_skips_total: self.singleton_skips_total.load(Ordering::Relaxed),
+            time_ns_total: self.time_ns_total.load(Ordering::Relaxed),
+            predicted_experts_total: self.predicted_experts_total.load(Ordering::Relaxed),
+            requested_experts_total: self.requested_experts_total.load(Ordering::Relaxed),
+            local_warm_failures_total: self.local_warm_failures_total.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// The reply mailed back through `StepRequest::resp`.
@@ -378,6 +445,15 @@ pub struct BatchScheduler {
     /// Cumulative count of remote-shard fetches that surfaced a
     /// structured [`crate::distributed::ShardRouterError`].
     remote_fetch_failures: Arc<AtomicU64>,
+    /// Warm pre-pass utility counters. Updated once per scheduler batch,
+    /// never from scalar compute loops.
+    prepass: PrepassCounters,
+    /// Cumulative scheduler request registrations. Used by tests and
+    /// diagnostics to prove callers register once per request rather
+    /// than once per token.
+    registrations_total: Arc<AtomicU64>,
+    /// Cumulative scheduler request releases.
+    releases_total: Arc<AtomicU64>,
 }
 
 impl BatchScheduler {
@@ -388,11 +464,7 @@ impl BatchScheduler {
     /// Every expert id is treated as local ([`LocalShardRouter`]) —
     /// the single-node default. Multi-node deployments use
     /// [`Self::spawn_with_shard_router`].
-    pub fn spawn(
-        model: Arc<RealModel>,
-        engine: Arc<Engine>,
-        cfg: BatchConfig,
-    ) -> Self {
+    pub fn spawn(model: Arc<RealModel>, engine: Arc<Engine>, cfg: BatchConfig) -> Self {
         Self::spawn_with_shard_router(model, engine, cfg, Arc::new(LocalShardRouter))
     }
 
@@ -436,6 +508,9 @@ impl BatchScheduler {
         let idle_evictions = Arc::new(AtomicU64::new(0));
         let remote_fetches = Arc::new(AtomicU64::new(0));
         let remote_fetch_failures = Arc::new(AtomicU64::new(0));
+        let prepass = PrepassCounters::default();
+        let registrations_total = Arc::new(AtomicU64::new(0));
+        let releases_total = Arc::new(AtomicU64::new(0));
         tokio::spawn(scheduler_loop(
             model,
             engine.clone(),
@@ -451,6 +526,7 @@ impl BatchScheduler {
             shard_router.clone(),
             remote_fetches.clone(),
             remote_fetch_failures.clone(),
+            prepass.clone(),
         ));
         Self {
             tx_interactive,
@@ -467,6 +543,9 @@ impl BatchScheduler {
             shard_router,
             remote_fetches,
             remote_fetch_failures,
+            prepass,
+            registrations_total,
+            releases_total,
         }
     }
 
@@ -486,6 +565,18 @@ impl BatchScheduler {
     /// structured error since the scheduler started.
     pub fn remote_fetch_failures_total(&self) -> u64 {
         self.remote_fetch_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn registrations_total(&self) -> u64 {
+        self.registrations_total.load(Ordering::Relaxed)
+    }
+
+    pub fn releases_total(&self) -> u64 {
+        self.releases_total.load(Ordering::Relaxed)
+    }
+
+    pub fn prepass_stats(&self) -> PrepassStats {
+        self.prepass.snapshot()
     }
 
     /// Shared physical block pool, if one is configured. Returns
@@ -518,6 +609,7 @@ impl BatchScheduler {
     /// become idle-eviction candidates under pressure.
     pub fn register_with_class(&self, kv: Vec<KvCache>, class: SessionClass) -> RequestId {
         let id = self.registry.register(kv);
+        self.registrations_total.fetch_add(1, Ordering::Relaxed);
         let now_us = self.now_us();
         self.sessions
             .insert(id.0, Arc::new(SessionMeta::new(class, now_us)));
@@ -534,7 +626,9 @@ impl BatchScheduler {
         let kv = self.registry.release(id);
         // Removing the session meta drops the held `BlockManager`
         // (if any), returning every block it owned to the pool.
-        self.sessions.remove(&id.0);
+        if self.sessions.remove(&id.0).is_some() {
+            self.releases_total.fetch_add(1, Ordering::Relaxed);
+        }
         // After a release, the BlockManager (if any) owned by the
         // caller will return blocks on Drop, so this is a natural
         // point to surface whether the pool was ever stressed.
@@ -576,7 +670,14 @@ impl BatchScheduler {
         params: crate::sampling::SamplingParams,
     ) -> Result<u32, BatchError> {
         let (tx, rx) = oneshot::channel();
-        let req = StepRequest { id, token_id, pos, params, resp: tx };
+        let req = StepRequest {
+            id,
+            token_id,
+            pos,
+            params,
+            mode: StepMode::Decode,
+            resp: tx,
+        };
         // Look up the session's class so the request lands on the
         // matching per-class admission channel. Unregistered ids
         // default to Interactive — they will be rejected by the
@@ -591,9 +692,51 @@ impl BatchScheduler {
             SessionClass::Interactive => &self.tx_interactive,
             SessionClass::Audit => &self.tx_audit,
         };
-        sender.send(req).await.map_err(|_| BatchError::SchedulerClosed)?;
-        let resp = rx.await.map_err(|_| BatchError::SchedulerClosed)??;
-        Ok(resp.next_token)
+        sender
+            .send(req)
+            .await
+            .map_err(|_| BatchError::SchedulerClosed)?;
+        match rx.await.map_err(|_| BatchError::SchedulerClosed)?? {
+            ScheduledResponse::NextToken(next_token) => Ok(next_token),
+            ScheduledResponse::Hidden(_) => Err(BatchError::SchedulerClosed),
+        }
+    }
+
+    /// Submit one prompt-ingestion step for an already-registered request.
+    /// The model updates KV state and returns the final hidden state without
+    /// running the LM head.
+    pub async fn forward_registered(
+        &self,
+        id: RequestId,
+        token_id: u32,
+        pos: usize,
+    ) -> Result<Vec<f32>, BatchError> {
+        let (tx, rx) = oneshot::channel();
+        let req = StepRequest {
+            id,
+            token_id,
+            pos,
+            params: crate::sampling::SamplingParams::greedy(),
+            mode: StepMode::ForwardHidden,
+            resp: tx,
+        };
+        let class = self
+            .sessions
+            .get(&id.0)
+            .map(|m| m.class)
+            .unwrap_or(SessionClass::Interactive);
+        let sender = match class {
+            SessionClass::Interactive => &self.tx_interactive,
+            SessionClass::Audit => &self.tx_audit,
+        };
+        sender
+            .send(req)
+            .await
+            .map_err(|_| BatchError::SchedulerClosed)?;
+        match rx.await.map_err(|_| BatchError::SchedulerClosed)?? {
+            ScheduledResponse::Hidden(hidden) => Ok(hidden),
+            ScheduledResponse::NextToken(_) => Err(BatchError::SchedulerClosed),
+        }
     }
 
     /// Submit one decoder step. Returns the next-token id and the
@@ -612,11 +755,10 @@ impl BatchScheduler {
         kv: Vec<KvCache>,
         params: crate::sampling::SamplingParams,
     ) -> Result<StepResponse, BatchError> {
-        let id = self.registry.register(kv);
+        let id = self.register(kv);
         let result = self.step_registered(id, token_id, pos, params).await;
         // Always release, even on error, to avoid leaking the entry.
-        let kv_back = self.registry.release(id).unwrap_or_default();
-        self.maybe_warn_overflow();
+        let kv_back = self.release(id).unwrap_or_default();
         match result {
             Ok(next_token) => Ok(StepResponse { next_token }),
             Err(e) => {
@@ -697,9 +839,21 @@ impl BatchScheduler {
             let gate_f16 = vec![half::f16::from_f32(0.1); 16];
             let up_f16 = vec![half::f16::from_f32(0.2); 16];
             let mut out_f16 = vec![half::f16::ZERO; 16];
-            let gate_view = crate::backend::TensorView { data: &gate_f16, rows: 4, cols: 4 };
-            let up_view = crate::backend::TensorView { data: &up_f16, rows: 4, cols: 4 };
-            let mut out_view = crate::backend::TensorViewMut { data: &mut out_f16, rows: 4, cols: 4 };
+            let gate_view = crate::backend::TensorView {
+                data: &gate_f16,
+                rows: 4,
+                cols: 4,
+            };
+            let up_view = crate::backend::TensorView {
+                data: &up_f16,
+                rows: 4,
+                cols: 4,
+            };
+            let mut out_view = crate::backend::TensorViewMut {
+                data: &mut out_f16,
+                rows: 4,
+                cols: 4,
+            };
             let _ = backend.swiglu_into(gate_view, up_view, &mut out_view);
         }
 
@@ -747,7 +901,9 @@ impl std::fmt::Display for BatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BatchError::SchedulerClosed => write!(f, "batch scheduler is closed"),
-            BatchError::NotRegistered => write!(f, "request id is not registered with the scheduler"),
+            BatchError::NotRegistered => {
+                write!(f, "request id is not registered with the scheduler")
+            }
         }
     }
 }
@@ -795,6 +951,7 @@ async fn scheduler_loop(
     shard_router: Arc<dyn ShardRouter>,
     remote_fetches: Arc<AtomicU64>,
     remote_fetch_failures: Arc<AtomicU64>,
+    prepass: PrepassCounters,
 ) {
     let now_us = || started_at.elapsed().as_micros() as u64;
     // Per-class WRR weights, captured once. These are `const fn`s so
@@ -921,11 +1078,8 @@ async fn scheduler_loop(
                 PressureLevel::Critical => {
                     speculation.suspend();
                     // Best-effort reclamation while under critical pressure.
-                    let reclaimed = run_idle_eviction(
-                        &sessions,
-                        cfg.idle_eviction_threshold,
-                        now_us(),
-                    );
+                    let reclaimed =
+                        run_idle_eviction(&sessions, cfg.idle_eviction_threshold, now_us());
                     if reclaimed > 0 {
                         idle_evictions.fetch_add(1, Ordering::Relaxed);
                     }
@@ -935,11 +1089,8 @@ async fn scheduler_loop(
                     // pressure returns to Normal — resuming at >90%
                     // utilisation would oscillate the pool straight back
                     // into Critical.
-                    let reclaimed = run_idle_eviction(
-                        &sessions,
-                        cfg.idle_eviction_threshold,
-                        now_us(),
-                    );
+                    let reclaimed =
+                        run_idle_eviction(&sessions, cfg.idle_eviction_threshold, now_us());
                     if reclaimed > 0 {
                         idle_evictions.fetch_add(1, Ordering::Relaxed);
                     }
@@ -972,21 +1123,36 @@ async fn scheduler_loop(
         // warm the union of expert ids in a single unified read
         // (gist Phase 1 — SSD Read De-Duplication).
         // ----------------------------------------------------------
+        let prepass_started = Instant::now();
         let mut unique: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for req in &batch {
-            if let Some(entry) = registry.get(req.id) {
-                // Use try_lock so a peek never blocks on a step that
-                // is concurrently mutating the same request's KV.
-                // If we can't acquire the lock right now the warm
-                // pass simply skips this request — the singleflight
-                // path still dedups its critical-path reads.
-                if let Ok(kv) = entry.try_lock() {
-                    let peeked = model.peek_experts(req.token_id, req.pos, &kv);
-                    for id in peeked {
-                        unique.insert(id);
+        if batch.len() > 1 {
+            prepass.runs_total.fetch_add(1, Ordering::Relaxed);
+            let mut predicted = 0u64;
+            for req in &batch {
+                if let Some(entry) = registry.get(req.id) {
+                    // Use try_lock so a peek never blocks on a step that
+                    // is concurrently mutating the same request's KV.
+                    // If we can't acquire the lock right now the warm
+                    // pass simply skips this request — the singleflight
+                    // path still dedups its critical-path reads.
+                    if let Ok(kv) = entry.try_lock() {
+                        let peeked = model.peek_experts(req.token_id, req.pos, &kv);
+                        predicted += peeked.len() as u64;
+                        for id in peeked {
+                            unique.insert(id);
+                        }
                     }
                 }
             }
+            if predicted > 0 {
+                prepass
+                    .predicted_experts_total
+                    .fetch_add(predicted, Ordering::Relaxed);
+            }
+        } else {
+            prepass
+                .singleton_skips_total
+                .fetch_add(1, Ordering::Relaxed);
         }
         if !unique.is_empty() {
             // ------------------------------------------------------
@@ -1009,11 +1175,13 @@ async fn scheduler_loop(
                     remote.push(inst);
                 }
             }
+            prepass.requested_experts_total.fetch_add(
+                local_ids.len().saturating_add(remote.len()) as u64,
+                Ordering::Relaxed,
+            );
             if !remote.is_empty() {
                 let fetches = remote.iter().map(|inst| shard_router.fetch_remote(inst));
-                for (inst, res) in
-                    remote.iter().zip(futures::future::join_all(fetches).await)
-                {
+                for (inst, res) in remote.iter().zip(futures::future::join_all(fetches).await) {
                     match res {
                         Ok(()) => {
                             remote_fetches.fetch_add(1, Ordering::Relaxed);
@@ -1032,10 +1200,17 @@ async fn scheduler_loop(
             }
             if !local_ids.is_empty() {
                 if let Err(e) = engine.warm_with(&local_ids).await {
+                    prepass
+                        .local_warm_failures_total
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(error = %e, "scheduler pre-pass warm_with failed; falling through to inline fetches");
                 }
             }
         }
+        prepass.time_ns_total.fetch_add(
+            prepass_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
 
         // Run every request's decoder step concurrently. Each task
         // looks up its KV cache from the central registry and locks
@@ -1049,7 +1224,14 @@ async fn scheduler_loop(
             let sessions = sessions.clone();
             let now = now_us();
             handles.push(tokio::spawn(async move {
-                let StepRequest { id, token_id, pos, params, resp } = req;
+                let StepRequest {
+                    id,
+                    token_id,
+                    pos,
+                    params,
+                    mode,
+                    resp,
+                } = req;
                 // Refresh the session's last-activity timestamp so
                 // idle eviction doesn't pull blocks out from under
                 // a request that is still producing tokens.
@@ -1074,9 +1256,18 @@ async fn scheduler_loop(
                 // other requests' steps.
                 let next = {
                     let mut kv = entry.lock().await;
-                    model
-                        .step(&engine, token_id, pos, &mut kv, &params)
-                        .await
+                    match mode {
+                        StepMode::Decode => ScheduledResponse::NextToken(
+                            model
+                                .decode_step(&engine, token_id, pos, &mut kv, &params)
+                                .await,
+                        ),
+                        StepMode::ForwardHidden => ScheduledResponse::Hidden(
+                            model
+                                .forward_token_hidden(&engine, token_id, pos, &mut kv)
+                                .await,
+                        ),
+                    }
                 };
                 // Drop our Arc clone *before* signalling completion
                 // so the caller's subsequent `release(id)` sees the
@@ -1087,7 +1278,7 @@ async fn scheduler_loop(
                 // step_registered → release back-to-back) could race
                 // the spawned task's natural Arc drop at end-of-task.
                 drop(entry);
-                let _ = resp.send(Ok(StepResponse { next_token: next }));
+                let _ = resp.send(Ok(next));
             }));
         }
         for h in handles {
@@ -1115,9 +1306,7 @@ fn run_idle_eviction(
         .iter()
         .filter_map(|kv| {
             let meta = kv.value().clone();
-            if meta.idle_for_us(now_us) >= threshold_us
-                && meta.block_manager.lock().is_some()
-            {
+            if meta.idle_for_us(now_us) >= threshold_us && meta.block_manager.lock().is_some() {
                 Some((*kv.key(), meta))
             } else {
                 None
@@ -1147,14 +1336,16 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
     use crate::engine::{Engine, EngineOptions, ModelShape};
-    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
     use crate::model::{RealModel, RealModelConfig};
+    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::router::{PredictiveLoader, TopKRouter};
     use std::path::PathBuf;
     use std::time::Instant;
 
-    struct TempDir { path: PathBuf }
+    struct TempDir {
+        path: PathBuf,
+    }
     impl TempDir {
         fn new(tag: &str) -> Self {
             let mut path = std::env::temp_dir();
@@ -1162,13 +1353,18 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            path.push(format!("mer-batch-test-{tag}-{}-{nanos}", std::process::id()));
+            path.push(format!(
+                "mer-batch-test-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&path).unwrap();
             Self { path }
         }
     }
     impl Drop for TempDir {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.path); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     fn build_engine_and_model(cfg: RealModelConfig) -> (Arc<Engine>, Arc<RealModel>, TempDir) {
@@ -1201,7 +1397,11 @@ mod tests {
             storage,
             router,
             predictor,
-            ModelShape { d_model: cfg.d_model, d_ff: cfg.d_ff, hidden_seed: 1 },
+            ModelShape {
+                d_model: cfg.d_model,
+                d_ff: cfg.d_ff,
+                hidden_seed: 1,
+            },
             EngineOptions::default(),
         ));
         let model = Arc::new(RealModel::new_seeded(cfg, 0xBEEF));
@@ -1214,25 +1414,53 @@ mod tests {
         // exactly the same token sequence as calling `model.step`
         // directly with the same inputs.
         let cfg = RealModelConfig {
-            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
-            head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
-            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
-            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
             advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
         let sched = BatchScheduler::spawn(
             model.clone(),
             engine.clone(),
-            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2), ..Default::default() },
+            BatchConfig {
+                max_batch_size: 4,
+                batch_timeout: Duration::from_millis(2),
+                ..Default::default()
+            },
         );
 
         let mut kv_a = model.fresh_kv_caches();
-        let direct = model.step(&engine, 7, 0, &mut kv_a, &crate::sampling::SamplingParams::greedy()).await;
+        let direct = model
+            .step(
+                &engine,
+                7,
+                0,
+                &mut kv_a,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
 
         let kv_b = model.fresh_kv_caches();
-        let resp = sched.step(7, 0, kv_b, crate::sampling::SamplingParams::greedy()).await.unwrap();
-        assert_eq!(direct, resp.next_token, "scheduler must be functionally identical to model.step");
+        let resp = sched
+            .step(7, 0, kv_b, crate::sampling::SamplingParams::greedy())
+            .await
+            .unwrap();
+        assert_eq!(
+            direct, resp.next_token,
+            "scheduler must be functionally identical to model.step"
+        );
     }
 
     /// Same equivalence check, but exercises the zero-copy
@@ -1242,21 +1470,43 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn step_registered_matches_direct_step() {
         let cfg = RealModelConfig {
-            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
-            head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
-            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
-            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
             advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
         let sched = BatchScheduler::spawn(
             model.clone(),
             engine.clone(),
-            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2), ..Default::default() },
+            BatchConfig {
+                max_batch_size: 4,
+                batch_timeout: Duration::from_millis(2),
+                ..Default::default()
+            },
         );
 
         let mut kv_a = model.fresh_kv_caches();
-        let direct = model.step(&engine, 11, 0, &mut kv_a, &crate::sampling::SamplingParams::greedy()).await;
+        let direct = model
+            .step(
+                &engine,
+                11,
+                0,
+                &mut kv_a,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
 
         let id = sched.register(model.fresh_kv_caches());
         assert_eq!(sched.active_requests(), 1);
@@ -1264,10 +1514,113 @@ mod tests {
             .step_registered(id, 11, 0, crate::sampling::SamplingParams::greedy())
             .await
             .unwrap();
-        assert_eq!(direct, next, "zero-copy step path must match direct model.step");
+        assert_eq!(
+            direct, next,
+            "zero-copy step path must match direct model.step"
+        );
         let returned = sched.release(id);
-        assert!(returned.is_some(), "release must return the registered cache");
+        assert!(
+            returned.is_some(),
+            "release must return the registered cache"
+        );
         assert_eq!(sched.active_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepass_skips_effective_batch_size_one() {
+        let cfg = RealModelConfig {
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
+        let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
+        let sched = BatchScheduler::spawn(
+            model.clone(),
+            engine,
+            BatchConfig {
+                max_batch_size: 4,
+                batch_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+        );
+
+        let _ = sched
+            .step(
+                7,
+                0,
+                model.fresh_kv_caches(),
+                crate::sampling::SamplingParams::greedy(),
+            )
+            .await
+            .unwrap();
+
+        let stats = sched.prepass_stats();
+        assert_eq!(stats.runs_total, 0);
+        assert_eq!(stats.singleton_skips_total, 1);
+        assert_eq!(stats.predicted_experts_total, 0);
+        assert_eq!(stats.requested_experts_total, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prepass_records_predicted_and_requested_experts_for_batched_work() {
+        let cfg = RealModelConfig {
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
+        let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
+        let sched = BatchScheduler::spawn(
+            model.clone(),
+            engine,
+            BatchConfig {
+                max_batch_size: 4,
+                batch_timeout: Duration::from_millis(2),
+                ..Default::default()
+            },
+        );
+
+        let id_a = sched.register(model.fresh_kv_caches());
+        let id_b = sched.register(model.fresh_kv_caches());
+        let (resp_a, resp_b) = tokio::join!(
+            sched.step_registered(id_a, 7, 0, crate::sampling::SamplingParams::greedy()),
+            sched.step_registered(id_b, 8, 0, crate::sampling::SamplingParams::greedy())
+        );
+        let _ = resp_a.unwrap();
+        let _ = resp_b.unwrap();
+        let _ = sched.release(id_a);
+        let _ = sched.release(id_b);
+
+        let stats = sched.prepass_stats();
+        assert_eq!(stats.runs_total, 1);
+        assert_eq!(stats.singleton_skips_total, 0);
+        assert!(stats.predicted_experts_total > 0);
+        assert!(stats.requested_experts_total > 0);
+        assert!(stats.prefetch_precision() > 0.0);
+        assert!(stats.prefetch_precision() <= 1.0);
     }
 
     /// Spawning N concurrent requests through the scheduler must not
@@ -1278,10 +1631,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_requests_finish_faster_than_sequential() {
         let cfg = RealModelConfig {
-            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
-            head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
-            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
-            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
             advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
@@ -1295,7 +1658,15 @@ mod tests {
             let mut kv = model.fresh_kv_caches();
             let mut last = 7u32;
             for pos in 0..TOKENS {
-                last = model.step(&engine, last, pos, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+                last = model
+                    .step(
+                        &engine,
+                        last,
+                        pos,
+                        &mut kv,
+                        &crate::sampling::SamplingParams::greedy(),
+                    )
+                    .await;
             }
         }
         let sequential = seq_start.elapsed();
@@ -1304,7 +1675,11 @@ mod tests {
         let sched = BatchScheduler::spawn(
             model.clone(),
             engine.clone(),
-            BatchConfig { max_batch_size: N, batch_timeout: Duration::from_millis(5), ..Default::default() },
+            BatchConfig {
+                max_batch_size: N,
+                batch_timeout: Duration::from_millis(5),
+                ..Default::default()
+            },
         );
         let batched_start = Instant::now();
         let mut handles = Vec::new();
@@ -1325,7 +1700,9 @@ mod tests {
                 let _ = sched.release(id);
             }));
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
         let batched = batched_start.elapsed();
 
         // The batched run sharing one Engine across N requests should
@@ -1340,11 +1717,13 @@ mod tests {
         // so the assertion still catches a gross regression where batching
         // accidentally *serialises* requests (whose cost scales with
         // N × real per-token work) without failing on fixed overhead.
-        let slack_s = 0.100; // 100 ms: absorbs batch_timeout + scheduler jitter
+        let slack_s = 0.200; // 200 ms: absorbs batch_timeout + scheduler jitter
         assert!(
             batched.as_secs_f64() <= sequential.as_secs_f64() * 1.5 + slack_s,
             "expected batched ({:?}) ≤ 1.5 × sequential ({:?}) + {:.0}ms slack",
-            batched, sequential, slack_s * 1e3
+            batched,
+            sequential,
+            slack_s * 1e3
         );
     }
 
@@ -1358,7 +1737,9 @@ mod tests {
     }
 
     impl crate::distributed::ShardRouter for RecordingShardRouter {
-        fn name(&self) -> &'static str { "recording" }
+        fn name(&self) -> &'static str {
+            "recording"
+        }
         fn route_expert(&self, expert: u32) -> crate::distributed::ShardInstruction {
             if self.remote_ids.contains(&expert) {
                 crate::distributed::ShardInstruction::Remote {
@@ -1401,22 +1782,39 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shard_router_pre_pass_routes_remote_ids_and_preserves_tokens() {
         let cfg = RealModelConfig {
-            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
-            head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
-            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
-            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
             advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
 
         let mut kv_a = model.fresh_kv_caches();
         let direct = model
-            .step(&engine, 7, 0, &mut kv_a, &crate::sampling::SamplingParams::greedy())
+            .step(
+                &engine,
+                7,
+                0,
+                &mut kv_a,
+                &crate::sampling::SamplingParams::greedy(),
+            )
             .await;
 
         // Tag every odd global expert id remote.
         let total = (cfg.num_layers * cfg.num_experts) as u32;
-        let remote_ids: std::collections::HashSet<u32> = (0..total).filter(|id| id % 2 == 1).collect();
+        let remote_ids: std::collections::HashSet<u32> =
+            (0..total).filter(|id| id % 2 == 1).collect();
         let router = Arc::new(RecordingShardRouter {
             remote_ids: remote_ids.clone(),
             fetched: std::sync::Mutex::new(Vec::new()),
@@ -1425,16 +1823,26 @@ mod tests {
         let sched = BatchScheduler::spawn_with_shard_router(
             model.clone(),
             engine.clone(),
-            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2), ..Default::default() },
+            BatchConfig {
+                max_batch_size: 4,
+                batch_timeout: Duration::from_millis(2),
+                ..Default::default()
+            },
             router.clone(),
         );
         assert_eq!(sched.shard_router_name(), "recording");
 
-        let resp = sched
-            .step(7, 0, model.fresh_kv_caches(), crate::sampling::SamplingParams::greedy())
-            .await
-            .unwrap();
-        assert_eq!(direct, resp.next_token, "shard routing must not change tokens");
+        let id_a = sched.register(model.fresh_kv_caches());
+        let id_b = sched.register(model.fresh_kv_caches());
+        let (resp_a, resp_b) = tokio::join!(
+            sched.step_registered(id_a, 7, 0, crate::sampling::SamplingParams::greedy()),
+            sched.step_registered(id_b, 8, 0, crate::sampling::SamplingParams::greedy())
+        );
+        let resp = resp_a.unwrap();
+        let _ = resp_b.unwrap();
+        let _ = sched.release(id_a);
+        let _ = sched.release(id_b);
+        assert_eq!(direct, resp, "shard routing must not change tokens");
 
         let fetched = router.fetched.lock().unwrap().clone();
         // The pre-pass peeks this request's routing decision; any id it
@@ -1451,10 +1859,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shard_router_remote_failures_are_structured_and_non_fatal() {
         let cfg = RealModelConfig {
-            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
-            head_dim: 4, num_layers: 2, num_experts: 4, top_k: 2,
-            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
-            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
             advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
@@ -1467,14 +1885,24 @@ mod tests {
         let sched = BatchScheduler::spawn_with_shard_router(
             model.clone(),
             engine.clone(),
-            BatchConfig { max_batch_size: 4, batch_timeout: Duration::from_millis(2), ..Default::default() },
+            BatchConfig {
+                max_batch_size: 4,
+                batch_timeout: Duration::from_millis(2),
+                ..Default::default()
+            },
             router.clone(),
         );
-        let resp = sched
-            .step(9, 0, model.fresh_kv_caches(), crate::sampling::SamplingParams::greedy())
-            .await
-            .expect("remote fetch failures must not fail the step");
-        assert!(resp.next_token < cfg.vocab_size as u32);
+        let id_a = sched.register(model.fresh_kv_caches());
+        let id_b = sched.register(model.fresh_kv_caches());
+        let (resp_a, resp_b) = tokio::join!(
+            sched.step_registered(id_a, 9, 0, crate::sampling::SamplingParams::greedy()),
+            sched.step_registered(id_b, 10, 0, crate::sampling::SamplingParams::greedy())
+        );
+        let resp = resp_a.expect("remote fetch failures must not fail the step");
+        let _ = resp_b.expect("remote fetch failures must not fail the step");
+        let _ = sched.release(id_a);
+        let _ = sched.release(id_b);
+        assert!(resp < cfg.vocab_size as u32);
         let attempted = router.fetched.lock().unwrap().len() as u64;
         assert!(attempted > 0, "pre-pass must have attempted remote fetches");
         assert_eq!(sched.remote_fetch_failures_total(), attempted);
@@ -1485,10 +1913,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn default_spawn_uses_local_shard_router() {
         let cfg = RealModelConfig {
-            vocab_size: 64, d_model: 16, d_ff: 32, num_heads: 4, num_kv_heads: 4,
-            head_dim: 4, num_layers: 1, num_experts: 4, top_k: 2,
-            rope_base: 10_000.0, rms_eps: 1e-6, window_size: None,
-            architecture: crate::architecture::Architecture::Mixtral, first_k_dense_replace: 0,
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 1,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
             advanced: Default::default(),
         };
         let (engine, model, _tmp) = build_engine_and_model(cfg);

@@ -200,6 +200,10 @@ rms_eps = 1e-6
 # `default_seed()` constant in `src/config.rs` (TOML doesn't accept
 # hex literals).
 seed = 12648430
+# Detailed per-request stage timing for real-transformer HTTP serving.
+# Disabled by default to avoid per-stage clock, mutex, and map-update work
+# in the normal inference hot path. Benchmarks still collect stage timings.
+stage_timing_enabled = false
 # Continuous batching: maximum number of concurrent in-flight requests
 # fused into a single decoder step. The scheduler waits up to
 # `batch_timeout_ms` for additional requests before flushing the
@@ -210,6 +214,13 @@ max_batch_size = 8
 # small amount of per-token latency for substantially better
 # throughput under concurrent load.
 batch_timeout_ms = 5
+# Dense CPU matvec backend for Q/K/V/O projections, router gates, MLA
+# projections, and the LM head. "auto" preserves the historical build
+# default. For CPU-production benchmarking, compare:
+#   "matrixmultiply"          # one tuned SGEMM per projection
+#   "rayon"                   # row-parallel dot products on the compute pool
+#   "rayon-matrixmultiply"    # row chunks on Rayon, SGEMM within each chunk
+dense_matvec_backend = "auto"
 
 # Predictive Architecture (the "Omniscient" upgrade). Three opt-in
 # components feed the speculative-I/O union-fetch `E = S ∪ L ∪ M`:

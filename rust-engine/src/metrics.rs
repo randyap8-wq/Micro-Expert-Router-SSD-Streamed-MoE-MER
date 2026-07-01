@@ -16,6 +16,7 @@ use prometheus::{
     register_int_gauge_with_registry, Counter, CounterVec, Encoder, Histogram, HistogramVec,
     IntGauge, Registry, TextEncoder,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Owns a `prometheus::Registry` and the metric handles. Cheap to clone
@@ -33,6 +34,12 @@ struct MetricsInner {
     pub cache_hits_total: Counter,
     pub cache_misses_total: Counter,
     pub io_wait_seconds: Histogram,
+    /// Cumulative wall time by real-transformer request stage.
+    pub stage_seconds_total: CounterVec,
+    /// Number of locally-aggregated timing events by request stage.
+    pub stage_events_total: CounterVec,
+    /// Per-request total wall time observed for each request stage.
+    pub stage_request_seconds: HistogramVec,
     /// Predicted expert IDs contained in the gate's actual top-K
     /// (prediction precision@K numerator).
     pub speculator_hits_total: Counter,
@@ -144,10 +151,38 @@ impl Metrics {
             "mer_io_wait_seconds",
             "Per-token critical-path SSD I/O wait time in seconds.",
             // 100us .. 1s, log-spaced.
-            vec![0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+            vec![
+                0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+                1.0
+            ],
             registry
         )
         .expect("metric registration: mer_io_wait_seconds");
+        let stage_seconds_total = register_counter_vec_with_registry!(
+            "mer_stage_seconds_total",
+            "Cumulative wall time spent in real-transformer request stages.",
+            &["stage"],
+            registry
+        )
+        .expect("metric registration: mer_stage_seconds_total");
+        let stage_events_total = register_counter_vec_with_registry!(
+            "mer_stage_events_total",
+            "Cumulative locally-aggregated timing event count by real-transformer request stage.",
+            &["stage"],
+            registry
+        )
+        .expect("metric registration: mer_stage_events_total");
+        let stage_request_seconds = register_histogram_vec_with_registry!(
+            "mer_stage_request_seconds",
+            "Per-request total wall time observed for a real-transformer request stage.",
+            &["stage"],
+            vec![
+                0.000001, 0.000005, 0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001,
+                0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0
+            ],
+            registry
+        )
+        .expect("metric registration: mer_stage_request_seconds");
         let speculator_hits_total = register_counter_with_registry!(
             "mer_speculator_hits_total",
             "Neural speculator predicted expert IDs contained in the gate's actual top-K; numerator of prediction precision@K.",
@@ -189,7 +224,10 @@ impl Metrics {
             "Per-token cumulative SSD stall time on the inference critical path.",
             // 10us .. 1s log-spaced; SSD stall is typically much
             // smaller than the wall-clock io wait when prefetch lands.
-            vec![0.00001, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+            vec![
+                0.00001, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+                0.1, 0.25, 0.5, 1.0
+            ],
             registry
         )
         .expect("metric registration: mer_ssd_stall_seconds");
@@ -250,6 +288,9 @@ impl Metrics {
                 cache_hits_total,
                 cache_misses_total,
                 io_wait_seconds,
+                stage_seconds_total,
+                stage_events_total,
+                stage_request_seconds,
                 speculator_hits_total,
                 speculator_misses_total,
                 speculator_accuracy_total,
@@ -270,8 +311,14 @@ impl Metrics {
     }
 
     pub fn record_request(&self, endpoint: &str, latency_seconds: f64) {
-        self.inner.requests_total.with_label_values(&[endpoint]).inc();
-        self.inner.request_latency_seconds.with_label_values(&[endpoint]).observe(latency_seconds);
+        self.inner
+            .requests_total
+            .with_label_values(&[endpoint])
+            .inc();
+        self.inner
+            .request_latency_seconds
+            .with_label_values(&[endpoint])
+            .observe(latency_seconds);
     }
 
     pub fn record_tokens(&self, n: u64) {
@@ -289,6 +336,33 @@ impl Metrics {
 
     pub fn record_io_wait(&self, seconds: f64) {
         self.inner.io_wait_seconds.observe(seconds);
+    }
+
+    /// Publish one request-local stage-timing snapshot. The hot path
+    /// aggregates locally; this method emits one counter update and one
+    /// histogram observation per stage at request completion/drop.
+    pub fn record_stage_timings(
+        &self,
+        snapshot: &BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
+    ) {
+        for (stage, timing) in snapshot {
+            if timing.total_seconds > 0.0 {
+                self.inner
+                    .stage_seconds_total
+                    .with_label_values(&[stage.as_str()])
+                    .inc_by(timing.total_seconds);
+                self.inner
+                    .stage_request_seconds
+                    .with_label_values(&[stage.as_str()])
+                    .observe(timing.total_seconds);
+            }
+            if timing.count > 0 {
+                self.inner
+                    .stage_events_total
+                    .with_label_values(&[stage.as_str()])
+                    .inc_by(timing.count as f64);
+            }
+        }
     }
 
     /// Record speculator prediction precision@K components: `hits`
@@ -367,7 +441,9 @@ impl Metrics {
     /// Record `n` speculative prefetches dropped to pool starvation.
     pub fn record_prefetch_dropped_pool_starved(&self, n: u64) {
         if n > 0 {
-            self.inner.prefetch_dropped_pool_starved_total.inc_by(n as f64);
+            self.inner
+                .prefetch_dropped_pool_starved_total
+                .inc_by(n as f64);
         }
     }
 
@@ -406,6 +482,17 @@ mod tests {
         m.record_tokens(10);
         m.record_cache(3, 1);
         m.record_io_wait(0.002);
+        let mut stage_timings = BTreeMap::new();
+        stage_timings.insert(
+            crate::stage_timing::EMBEDDING.to_string(),
+            crate::stage_timing::StageTimingSnapshot {
+                count: 2,
+                total_seconds: 0.003,
+                mean_seconds: 0.0015,
+                max_seconds: 0.002,
+            },
+        );
+        m.record_stage_timings(&stage_timings);
         m.record_speculator(7, 3);
         m.record_speculator_top1(1);
         m.record_speculator_top1(0);
@@ -426,6 +513,9 @@ mod tests {
             "mer_cache_hits_total",
             "mer_cache_misses_total",
             "mer_io_wait_seconds",
+            "mer_stage_seconds_total",
+            "mer_stage_events_total",
+            "mer_stage_request_seconds",
             "mer_speculator_hits_total",
             "mer_speculator_misses_total",
             "mer_speculator_accuracy_total",
@@ -442,10 +532,19 @@ mod tests {
             "mer_speculator_disabled_total",
             "mer_gpu_cpu_fallbacks_total",
         ] {
-            assert!(body.contains(name), "metric {name} missing from /metrics body:\n{body}");
+            assert!(
+                body.contains(name),
+                "metric {name} missing from /metrics body:\n{body}"
+            );
         }
         assert_metric_value(&body, "mer_speculator_accuracy_total", 1.0);
         assert_metric_value(&body, "mer_speculator_evaluations_total", 2.0);
+        assert_metric_value(
+            &body,
+            r#"mer_stage_seconds_total{stage="embedding"}"#,
+            0.003,
+        );
+        assert_metric_value(&body, r#"mer_stage_events_total{stage="embedding"}"#, 2.0);
         // The label we recorded must show up in the rendered text.
         assert!(body.contains("/v1/completions"));
     }

@@ -17,7 +17,7 @@
 //! deterministic dense projection trained to mimic the main MoE's
 //! next-token distribution. The implementation here is the simplest
 //! possible faithful draft head — a learned linear `vocab_size ×
-//! d_model` matrix tied to the main model's embedding plus a per-token
+//! d_model` matrix tied to a f32 snapshot of the main model's embedding plus a per-token
 //! position bias. It is **not** competitive with a real 1-2 B draft
 //! model on hit-rate, but it produces *deterministic* drafts (so
 //! verification is reproducible in tests) and exercises every code
@@ -76,12 +76,9 @@ pub trait DraftLike: Send + Sync {
 /// when run with `SamplingParams::greedy()`.
 pub struct DraftEngine {
     /// Shared `Arc<Vec<f32>>` snapshot of the main model's embedding
-    /// table. The current loader stores the embedding as a plain
-    /// `Vec<f32>` on `RealModel`, so `from_main` clones it into the
-    /// `Arc` once at construction. Tied embedding (in the ML sense:
-    /// the draft's logit projection reuses the same weight matrix as
-    /// the verifier's input embedding) is preserved regardless of
-    /// whether the bytes are physically shared.
+    /// table. Native quantized embeddings are dequantized once when the
+    /// draft is built, keeping the draft path simple and RAM-resident while
+    /// the verifier can keep its own embedding in compressed form.
     embedding: Arc<Vec<f32>>,
     /// Vocabulary size and hidden dim — copied from the main model
     /// at construction so the draft can run without holding a
@@ -183,15 +180,17 @@ impl DraftEngine {
         {
             let bias_s = bias.as_mut_slice();
             let inv_vocab = 1.0f32 / (vocab as f32);
+            let mut row = Vec::new();
             for tok in 0..vocab {
-                let row = &main.embedding[tok * d..(tok + 1) * d];
+                row.clear();
+                main.embedding.row_dequant_into(tok, &mut row);
                 for (i, &x) in row.iter().enumerate() {
                     bias_s[i] += x * inv_vocab;
                 }
             }
         }
         Self {
-            embedding: Arc::new(main.embedding.clone()),
+            embedding: Arc::new(main.embedding.to_f32_vec()),
             vocab_size: vocab,
             d_model: d,
             bias,

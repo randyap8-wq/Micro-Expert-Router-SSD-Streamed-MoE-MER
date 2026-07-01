@@ -34,12 +34,14 @@
 //! without forcing a stub call site.
 #![allow(dead_code)]
 
-
+use crate::backend::Backend;
+use crate::dense_tensor::{DenseDType, DenseWeight};
 use crate::expert_cache::ExpertResident;
 use crate::inference::{forward_candle_tensors, ExpertWeights, HiddenState};
 use candle_core::{Device, Tensor};
 use half::f16;
 use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
 
 /// RMSNorm: `y = x * rsqrt(mean(x^2) + eps) * weight`.
 ///
@@ -76,6 +78,13 @@ impl RmsNorm {
         let mut y = x.to_vec();
         self.forward_inplace(&mut y);
         y
+    }
+
+    pub fn forward_into(&self, x: &[f32], y: &mut Vec<f32>) {
+        debug_assert_eq!(x.len(), self.weight.len(), "RMSNorm dim mismatch");
+        y.clear();
+        y.extend_from_slice(x);
+        self.forward_inplace(y);
     }
 }
 
@@ -158,8 +167,7 @@ impl YarnRope {
     /// "correction dim").
     fn correction_dim(num_rotations: f32, dim: usize, base: f32, max_pos: usize) -> f32 {
         let d = dim as f32;
-        d * (max_pos as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln()
-            / (2.0 * base.ln())
+        d * (max_pos as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln())
     }
 
     /// Build the blended inverse-frequency table + attention factor for
@@ -211,7 +219,140 @@ impl YarnRope {
         // the canonical YaRN `0.1*ln(factor)+1`.
         let attn_factor = yarn_get_mscale(scaling.factor, scaling.mscale)
             / yarn_get_mscale(scaling.factor, scaling.mscale_all_dim);
-        Some(Self { inv_freq, attn_factor })
+        Some(Self {
+            inv_freq,
+            attn_factor,
+        })
+    }
+}
+
+/// Default number of absolute positions backed by per-position RoPE rows.
+///
+/// Qwen3-Coder long-context checkpoints commonly advertise very large
+/// `rope_theta` values and production prompts can move well past the old
+/// 4K/8K window. The cache is lazy: this allocates `OnceLock` slots, not
+/// sin/cos rows, so the steady RSS scales with positions actually touched.
+pub const DEFAULT_ROPE_CACHE_POSITIONS: usize = 262_144;
+
+#[derive(Debug, Clone, Copy)]
+struct RopePair {
+    sin: f32,
+    cos: f32,
+}
+
+/// Shared rotary-embedding cache for one `(rope_dim, base, scaling)` shape.
+///
+/// The expensive inverse-frequency table is computed once. Sin/cos rows are
+/// materialised lazily by absolute position and then reused by every layer/head
+/// sharing this cache. `OnceLock` keeps already-materialised positions on a
+/// lock-free fast path; only the first use of a new position performs work.
+#[derive(Debug)]
+pub struct RopeCache {
+    rope_dim: usize,
+    base_bits: u32,
+    yarn: bool,
+    attn_factor_bits: u32,
+    inv_freq: Box<[f32]>,
+    rows: Box<[OnceLock<Box<[RopePair]>>]>,
+}
+
+impl RopeCache {
+    pub fn new(rope_dim: usize, base: f32, yarn: Option<&YarnRope>) -> Option<Self> {
+        Self::with_positions(rope_dim, base, yarn, DEFAULT_ROPE_CACHE_POSITIONS)
+    }
+
+    pub fn with_positions(
+        rope_dim: usize,
+        base: f32,
+        yarn: Option<&YarnRope>,
+        positions: usize,
+    ) -> Option<Self> {
+        if rope_dim == 0 || !rope_dim.is_multiple_of(2) {
+            return None;
+        }
+        let half = rope_dim / 2;
+        let (inv_freq, attn_factor, has_yarn) = match yarn {
+            Some(y) if y.inv_freq.len() == half => {
+                (y.inv_freq.clone().into_boxed_slice(), y.attn_factor, true)
+            }
+            Some(_) => return None,
+            None => {
+                let mut inv_freq = Vec::with_capacity(half);
+                for i in 0..half {
+                    inv_freq.push(1.0 / base.powf(2.0 * i as f32 / rope_dim as f32));
+                }
+                (inv_freq.into_boxed_slice(), 1.0, false)
+            }
+        };
+        let rows = std::iter::repeat_with(OnceLock::new)
+            .take(positions)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Some(Self {
+            rope_dim,
+            base_bits: base.to_bits(),
+            yarn: has_yarn,
+            attn_factor_bits: attn_factor.to_bits(),
+            inv_freq,
+            rows,
+        })
+    }
+
+    #[inline]
+    fn matches(&self, rope_dim: usize, base: f32, yarn: Option<&YarnRope>) -> bool {
+        self.rope_dim == rope_dim
+            && self.base_bits == base.to_bits()
+            && self.yarn == yarn.is_some()
+            && self.attn_factor_bits
+                == yarn
+                    .map(|y| y.attn_factor.to_bits())
+                    .unwrap_or(1.0f32.to_bits())
+    }
+
+    fn compute_row(&self, pos: usize) -> Box<[RopePair]> {
+        let pos_f = pos as f32;
+        let m = f32::from_bits(self.attn_factor_bits);
+        self.inv_freq
+            .iter()
+            .map(|&inv| {
+                let theta = pos_f * inv;
+                let (sin, cos) = theta.sin_cos();
+                RopePair {
+                    sin: sin * m,
+                    cos: cos * m,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    pub fn apply_inplace(&self, v: &mut [f32], pos: usize) {
+        debug_assert_eq!(v.len(), self.rope_dim);
+        if let Some(slot) = self.rows.get(pos) {
+            let row = slot.get_or_init(|| self.compute_row(pos));
+            apply_rope_pairs(v, row);
+        } else {
+            let row = self.compute_row(pos);
+            apply_rope_pairs(v, &row);
+        }
+    }
+
+    #[cfg(test)]
+    fn materialized_positions(&self) -> usize {
+        self.rows.iter().filter(|slot| slot.get().is_some()).count()
+    }
+}
+
+#[inline]
+fn apply_rope_pairs(v: &mut [f32], pairs: &[RopePair]) {
+    let half = v.len() / 2;
+    debug_assert_eq!(pairs.len(), half);
+    for i in 0..half {
+        let a = v[i];
+        let b = v[i + half];
+        let p = pairs[i];
+        v[i] = a * p.cos - b * p.sin;
+        v[i + half] = a * p.sin + b * p.cos;
     }
 }
 
@@ -223,7 +364,11 @@ pub fn apply_rope_scaled_inplace(v: &mut [f32], pos: usize, yarn: &YarnRope) {
     let head_dim = v.len();
     debug_assert!(head_dim % 2 == 0, "RoPE requires even head_dim");
     let half = head_dim / 2;
-    debug_assert_eq!(yarn.inv_freq.len(), half, "YarnRope built for a different head_dim");
+    debug_assert_eq!(
+        yarn.inv_freq.len(),
+        half,
+        "YarnRope built for a different head_dim"
+    );
     let pos_f = pos as f32;
     let m = yarn.attn_factor;
     for i in 0..half {
@@ -245,6 +390,26 @@ pub fn apply_rope_maybe_scaled(v: &mut [f32], pos: usize, base: f32, yarn: Optio
         Some(y) => apply_rope_scaled_inplace(v, pos, y),
         None => apply_rope_inplace(v, pos, base),
     }
+}
+
+/// Cached RoPE dispatcher for hot attention paths. Falls back to the
+/// compatibility implementation if a caller supplies no cache or a cache
+/// for a different rotary shape.
+#[inline]
+pub fn apply_rope_with_cache(
+    v: &mut [f32],
+    pos: usize,
+    base: f32,
+    yarn: Option<&YarnRope>,
+    cache: Option<&RopeCache>,
+) {
+    if let Some(cache) = cache {
+        if cache.matches(v.len(), base, yarn) {
+            cache.apply_inplace(v, pos);
+            return;
+        }
+    }
+    apply_rope_maybe_scaled(v, pos, base, yarn);
 }
 
 /// One layer's **paged** KV cache (per-layer). Stores keys and values
@@ -404,17 +569,17 @@ impl KvCache {
     ///
     /// No-op for `pos == 0` and for global-attention layers (which never
     /// call this), preserving the original full-history behaviour.
-pub fn evict_before(&mut self, pos: usize) {
-    let pos = pos.min(self.seq_len);
-    // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
-    // absolute positions `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully
-    // below `pos` iff `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`.
-    // So the number of logical blocks entirely below `pos` is
-    // `pos / BLOCK`.
-    let target_evicted = pos / PAGED_BLOCK_TOKENS;
-    if target_evicted <= self.evicted_blocks {
-        return;
-    }
+    pub fn evict_before(&mut self, pos: usize) {
+        let pos = pos.min(self.seq_len);
+        // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
+        // absolute positions `[b * BLOCK, b * BLOCK + BLOCK)`. It is fully
+        // below `pos` iff `(b + 1) * BLOCK <= pos`, i.e. `b < pos / BLOCK`.
+        // So the number of logical blocks entirely below `pos` is
+        // `pos / BLOCK`.
+        let target_evicted = pos / PAGED_BLOCK_TOKENS;
+        if target_evicted <= self.evicted_blocks {
+            return;
+        }
         let blocks_to_drop = target_evicted - self.evicted_blocks;
         // Never drop more than what is physically resident (defensive;
         // `blocks_to_drop` is bounded by the resident block count in practice).
@@ -540,10 +705,10 @@ pub struct MultiHeadSelfAttention {
     /// `None` (every other architecture) means no scaling (factor 1.0).
     pub attention_value_scale: Option<f32>,
     pub rope_base: f32,
-    pub wq: Vec<f32>,
-    pub wk: Vec<f32>,
-    pub wv: Vec<f32>,
-    pub wo: Vec<f32>,
+    pub wq: DenseWeight,
+    pub wk: DenseWeight,
+    pub wv: DenseWeight,
+    pub wo: DenseWeight,
     /// Sliding-window attention span. When `Some(w)`, each query position
     /// `pos` only attends to KV positions in `[pos.saturating_sub(w - 1) ..=
     /// pos]`; `None` recovers full causal attention (the backward-compatible
@@ -574,6 +739,10 @@ pub struct MultiHeadSelfAttention {
     /// `1/base^(2i/d)` schedule. Built from the checkpoint's
     /// `rope_scaling` block; `None` keeps the standard rotation.
     pub rope_yarn: Option<YarnRope>,
+    /// Shared model-level RoPE table for this `(rope_dim, base, scaling)`
+    /// shape. Manual tests may leave it `None`, in which case the
+    /// compatibility path computes sin/cos directly.
+    pub rope_cache: Option<Arc<RopeCache>>,
     /// Optional additive bias for the Q projection (`attention_bias = true`
     /// in config, e.g. GPT-OSS), length `num_heads * head_dim`. Added to the
     /// raw `wq · x` projection before QK-Norm and RoPE. `None` for every
@@ -596,6 +765,20 @@ pub struct MultiHeadSelfAttention {
     pub sink_bias: Option<Vec<f32>>,
 }
 
+/// Reusable buffers for one standard attention block.
+///
+/// Kept inside [`TransformerLayerScratch`] so the real decode loop can carry
+/// Q/K/V projections, attention scores, and projection outputs across tokens
+/// without repeatedly allocating the same per-layer temporaries.
+#[derive(Debug, Default)]
+pub(crate) struct MultiHeadSelfAttentionScratch {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    scores: Vec<f32>,
+    attn_out: Vec<f32>,
+}
+
 impl MultiHeadSelfAttention {
     pub fn q_dim(&self) -> usize {
         self.num_heads * self.head_dim
@@ -616,6 +799,26 @@ impl MultiHeadSelfAttention {
     /// Equals [`Self::q_dim`] when `v_head_dim == head_dim`.
     pub fn attn_out_dim(&self) -> usize {
         self.num_heads * self.v_head_dim
+    }
+
+    pub(crate) fn gpu_dense_path_supported(&self) -> bool {
+        self.v_head_dim == self.head_dim
+            && self.sink_bias.is_none()
+            && self.wq.dtype() == DenseDType::F32
+            && self.wk.dtype() == DenseDType::F32
+            && self.wv.dtype() == DenseDType::F32
+            && self.wo.dtype() == DenseDType::F32
+    }
+
+    #[inline]
+    fn apply_rope_to(&self, v: &mut [f32], pos: usize) {
+        apply_rope_with_cache(
+            v,
+            pos,
+            self.rope_base,
+            self.rope_yarn.as_ref(),
+            self.rope_cache.as_deref(),
+        );
     }
 
     /// Apply the optional post-attention output scale (MiMo-V2-Flash
@@ -668,13 +871,19 @@ impl MultiHeadSelfAttention {
     /// the bias is part of the linear layer.
     fn apply_qkv_bias(&self, q: &mut [f32], k: &mut [f32], v: &mut [f32]) {
         if let Some(bq) = self.bq.as_ref() {
-            for (qi, bi) in q.iter_mut().zip(bq.iter()) { *qi += bi; }
+            for (qi, bi) in q.iter_mut().zip(bq.iter()) {
+                *qi += bi;
+            }
         }
         if let Some(bk) = self.bk.as_ref() {
-            for (ki, bi) in k.iter_mut().zip(bk.iter()) { *ki += bi; }
+            for (ki, bi) in k.iter_mut().zip(bk.iter()) {
+                *ki += bi;
+            }
         }
         if let Some(bv) = self.bv.as_ref() {
-            for (vi, bi) in v.iter_mut().zip(bv.iter()) { *vi += bi; }
+            for (vi, bi) in v.iter_mut().zip(bv.iter()) {
+                *vi += bi;
+            }
         }
     }
 
@@ -682,7 +891,9 @@ impl MultiHeadSelfAttention {
     /// when `bo` is `None`.
     fn apply_o_bias(&self, out: &mut [f32]) {
         if let Some(bo) = self.bo.as_ref() {
-            for (oi, bi) in out.iter_mut().zip(bo.iter()) { *oi += bi; }
+            for (oi, bi) in out.iter_mut().zip(bo.iter()) {
+                *oi += bi;
+            }
         }
     }
 
@@ -696,30 +907,57 @@ impl MultiHeadSelfAttention {
     /// verifier forward and the speculative KV preview so the two can
     /// never drift out of sync.
     pub fn project_kv(&self, x: &[f32], pos: usize) -> (Vec<f32>, Vec<f32>) {
-        let mut k = matmul_row_major(&self.wk, x, self.kv_dim(), self.d_model);
-        let mut v = matmul_row_major(&self.wv, x, self.v_proj_dim(), self.d_model);
+        let mut k = Vec::new();
+        let mut v = Vec::new();
+        self.project_kv_into_with_timing(x, pos, &mut k, &mut v, None);
+        (k, v)
+    }
+
+    pub fn project_kv_into_with_timing(
+        &self,
+        x: &[f32],
+        pos: usize,
+        k: &mut Vec<f32>,
+        v: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        k.resize(self.kv_dim(), 0.0);
+        v.resize(self.v_proj_dim(), 0.0);
+        crate::stage_timing::time_optional(timings, crate::stage_timing::K_PROJECTION, || {
+            self.wk.matvec_into(x, k)
+        });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::V_PROJECTION, || {
+            self.wv.matvec_into(x, v)
+        });
         if let Some(bk) = self.bk.as_ref() {
-            for (ki, bi) in k.iter_mut().zip(bk.iter()) { *ki += bi; }
+            for (ki, bi) in k.iter_mut().zip(bk.iter()) {
+                *ki += bi;
+            }
         }
         if let Some(bv) = self.bv.as_ref() {
-            for (vi, bi) in v.iter_mut().zip(bv.iter()) { *vi += bi; }
+            for (vi, bi) in v.iter_mut().zip(bv.iter()) {
+                *vi += bi;
+            }
         }
-        self.apply_k_norm(&mut k);
-        for h in 0..self.num_kv_heads {
-            let s = h * self.head_dim;
-            apply_rope_maybe_scaled(&mut k[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
-        }
-        (k, v)
+        crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+            self.apply_k_norm(k.as_mut_slice())
+        });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
+            for h in 0..self.num_kv_heads {
+                let s = h * self.head_dim;
+                self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
+            }
+        });
     }
 
     /// Forward one token at absolute position `pos`. Updates `kv` with
     /// the new K/V for this position. Returns a new hidden state of
     /// length `d_model`.
     ///
-    /// The GPU path (selected when `backend.is_gpu()`) dispatches the Q/K/V
-    /// and output projections through `backend.matmul_into`, writes K/V
-    /// straight into VRAM via `backend.kv_cache_insert`, and runs attention
-    /// via `backend.kv_attend` — no PCIe round-trip back to system RAM.
+    /// The GPU path (selected when `backend.is_gpu()`) currently converts
+    /// resident F32 projection weights and activations to F16 on the CPU,
+    /// uploads them through backend calls, writes K/V via
+    /// `backend.kv_cache_insert`, and runs attention via `backend.kv_attend`.
     /// The CPU path is the original paged-attention loop, byte-for-byte.
     pub fn forward(
         &self,
@@ -729,19 +967,31 @@ impl MultiHeadSelfAttention {
         kv: &mut KvCache,
         backend: &crate::backend::BackendBox,
     ) -> Vec<f32> {
+        self.forward_with_timing(x, pos, layer_idx, kv, backend, None)
+    }
+
+    pub fn forward_with_timing(
+        &self,
+        x: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<f32> {
         use crate::backend::{Backend, TensorView, TensorViewMut};
 
         debug_assert_eq!(x.len(), self.d_model);
         debug_assert_eq!(kv.kv_dim, self.kv_dim());
         debug_assert_eq!(kv.v_dim, self.v_proj_dim());
 
-        let q_dim  = self.q_dim();
+        let q_dim = self.q_dim();
         let kv_dim = self.kv_dim();
         let v_head_dim = self.v_head_dim;
         let cpu_attend = |q: &[f32], kv: &KvCache| -> Vec<f32> {
             let mut attn_out = vec![0.0f32; self.attn_out_dim()];
-            let scale   = 1.0 / (self.head_dim as f32).sqrt();
-            let t_max   = kv.seq_len;
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+            let t_max = kv.seq_len;
             // Per-layer attention mode: Global attends to all past
             // positions; SlidingWindow restricts the sum to the last
             // `window` positions. Equivalent to the previous match on
@@ -758,15 +1008,17 @@ impl MultiHeadSelfAttention {
 
             for h in 0..self.num_heads {
                 let kv_head = h * self.num_kv_heads / self.num_heads;
-                let q_head  = &q[h * self.head_dim..(h + 1) * self.head_dim];
-                let span    = t_max - t_start;
+                let q_head = &q[h * self.head_dim..(h + 1) * self.head_dim];
+                let span = t_max - t_start;
                 let mut scores = Vec::with_capacity(span);
 
                 for t in t_start..t_max {
                     let k_t = kv.key(t);
                     let k_h = &k_t[kv_head * self.head_dim..(kv_head + 1) * self.head_dim];
                     let mut s = 0.0f32;
-                    for j in 0..self.head_dim { s += q_head[j] * k_h[j]; }
+                    for j in 0..self.head_dim {
+                        s += q_head[j] * k_h[j];
+                    }
                     scores.push(s * scale);
                 }
                 // Attention sink bias (MiMo-V2-Flash `add_swa_attention_sink_bias`):
@@ -788,90 +1040,187 @@ impl MultiHeadSelfAttention {
                 // MiMo-V2-Flash); the attention output head is the same width.
                 let out_h = &mut attn_out[h * v_head_dim..(h + 1) * v_head_dim];
                 for (idx, score) in scores.iter().enumerate() {
-                    let t   = t_start + idx;
+                    let t = t_start + idx;
                     let v_t = kv.value(t);
                     let v_h = &v_t[kv_head * v_head_dim..(kv_head + 1) * v_head_dim];
-                    for j in 0..v_head_dim { out_h[j] += score * v_h[j]; }
+                    for j in 0..v_head_dim {
+                        out_h[j] += score * v_h[j];
+                    }
                 }
             }
             attn_out
         };
         let mut cpu_forward = || {
-            let mut q = matmul_row_major(&self.wq, x, q_dim, self.d_model);
+            let mut q = crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::Q_PROJECTION,
+                || self.wq.matvec(x),
+            );
             // Q bias (GPT-OSS `attention_bias`) before QK-Norm / RoPE; K and
             // V biases are applied inside `project_kv`.
             if let Some(bq) = self.bq.as_ref() {
-                for (qi, bi) in q.iter_mut().zip(bq.iter()) { *qi += bi; }
+                for (qi, bi) in q.iter_mut().zip(bq.iter()) {
+                    *qi += bi;
+                }
             }
             // QK-Norm (Qwen3): per-head RMSNorm on Q *before* RoPE.
-            self.apply_q_norm(&mut q);
+            crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                self.apply_q_norm(&mut q)
+            });
             // RoPE rotates only the first `rope_dim` dims of each head
             // (partial rotary on MiMo-V2-Flash; `rope_dim == head_dim`
             // elsewhere ⇒ full rotation).
-            for h in 0..self.num_heads {
-                let s = h * self.head_dim;
-                apply_rope_maybe_scaled(&mut q[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
-            }
-            // K/V projection (+ bias, QK-Norm, RoPE) is shared with the
-            // speculative KV preview via `project_kv`.
-            let (k, v) = self.project_kv(x, pos);
+            crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
+                for h in 0..self.num_heads {
+                    let s = h * self.head_dim;
+                    self.apply_rope_to(&mut q[s..s + self.rope_dim], pos);
+                }
+            });
+            // K/V projection (+ bias, QK-Norm, RoPE) is split here only
+            // when benchmark stage timings are active; the untimed path
+            // keeps using the shared helper that speculative KV preview
+            // also calls.
+            let (k, v) = if timings.is_some() {
+                let mut k = crate::stage_timing::time_optional(
+                    timings,
+                    crate::stage_timing::K_PROJECTION,
+                    || self.wk.matvec(x),
+                );
+                let mut v = crate::stage_timing::time_optional(
+                    timings,
+                    crate::stage_timing::V_PROJECTION,
+                    || self.wv.matvec(x),
+                );
+                if let Some(bk) = self.bk.as_ref() {
+                    for (ki, bi) in k.iter_mut().zip(bk.iter()) {
+                        *ki += bi;
+                    }
+                }
+                if let Some(bv) = self.bv.as_ref() {
+                    for (vi, bi) in v.iter_mut().zip(bv.iter()) {
+                        *vi += bi;
+                    }
+                }
+                crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                    self.apply_k_norm(&mut k)
+                });
+                crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
+                    for h in 0..self.num_kv_heads {
+                        let s = h * self.head_dim;
+                        self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
+                    }
+                });
+                (k, v)
+            } else {
+                self.project_kv(x, pos)
+            };
             kv.append(&k, &v);
-            let mut attn_out = cpu_attend(&q, kv);
+            let mut attn_out = crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::ATTENTION_SCORE_VALUE,
+                || cpu_attend(&q, kv),
+            );
             // Post-attention output scale (MiMo-V2-Flash 0.707), applied
             // before the output projection.
             self.apply_value_scale(&mut attn_out);
-            let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, self.attn_out_dim());
-            self.apply_o_bias(&mut out);
-            out
+            crate::stage_timing::time_optional(timings, crate::stage_timing::O_PROJECTION, || {
+                let mut out = self.wo.matvec(&attn_out);
+                self.apply_o_bias(&mut out);
+                out
+            })
         };
-        if !backend.is_gpu() || self.v_head_dim != self.head_dim || self.sink_bias.is_some() {
-            // The GPU attention kernels assume a symmetric K/V head dim, so
-            // MiMo-V2-Flash's asymmetric V (`v_head_dim != head_dim`) always
-            // takes the CPU path. The per-head attention sink bias
-            // (`add_swa_attention_sink_bias`) is likewise only implemented on
-            // the CPU softmax path, so force CPU when it is present.
+        if !backend.is_gpu() || !self.gpu_dense_path_supported() {
+            // The current GPU dense path copies full projection matrices to
+            // F16 per token, so it is only safe for resident F32 weights. Q8
+            // projections must stay on the CPU path to avoid full per-token
+            // dequantization. The GPU kernels also assume symmetric K/V head
+            // dims and do not apply attention sink bias yet.
             // TODO: apply attention_sink_bias on GPU path (kv_attend kernel).
             return cpu_forward();
         }
 
         // ── Helpers: f32 ↔ f16 conversion at the backend boundary ────────────
-        let to_f16 = |v: &[f32]| -> Vec<f16> {
-            v.iter().map(|&f| f16::from_f32(f)).collect()
-        };
-        let to_f32 = |v: &[f16]| -> Vec<f32> {
-            v.iter().map(|h| h.to_f32()).collect()
-        };
+        let to_f16 = |v: &[f32]| -> Vec<f16> { v.iter().map(|&f| f16::from_f32(f)).collect() };
+        let to_f32 = |v: &[f16]| -> Vec<f32> { v.iter().map(|h| h.to_f32()).collect() };
 
         let x_f16 = to_f16(x);
-        let wq_f16 = to_f16(&self.wq);
-        let wk_f16 = to_f16(&self.wk);
-        let wv_f16 = to_f16(&self.wv);
+        let wq_f32 = self.wq.to_f32_vec();
+        let wk_f32 = self.wk.to_f32_vec();
+        let wv_f32 = self.wv.to_f32_vec();
+        let wq_f16 = to_f16(&wq_f32);
+        let wk_f16 = to_f16(&wk_f32);
+        let wv_f16 = to_f16(&wv_f32);
 
-        let mut q_f16  = vec![f16::ZERO; q_dim];
-        let mut k_f16  = vec![f16::ZERO; kv_dim];
-        let mut v_f16  = vec![f16::ZERO; kv_dim];
+        let mut q_f16 = vec![f16::ZERO; q_dim];
+        let mut k_f16 = vec![f16::ZERO; kv_dim];
+        let mut v_f16 = vec![f16::ZERO; kv_dim];
 
-        if backend.matmul_into(
-            TensorView { data: &wq_f16, rows: q_dim,  cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut q_f16, rows: q_dim, cols: 1 },
-        ).is_err() {
+        if backend
+            .matmul_into(
+                TensorView {
+                    data: &wq_f16,
+                    rows: q_dim,
+                    cols: self.d_model,
+                },
+                TensorView {
+                    data: &x_f16,
+                    rows: self.d_model,
+                    cols: 1,
+                },
+                &mut TensorViewMut {
+                    data: &mut q_f16,
+                    rows: q_dim,
+                    cols: 1,
+                },
+            )
+            .is_err()
+        {
             return cpu_forward();
         }
 
-        if backend.matmul_into(
-            TensorView { data: &wk_f16, rows: kv_dim, cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut k_f16, rows: kv_dim, cols: 1 },
-        ).is_err() {
+        if backend
+            .matmul_into(
+                TensorView {
+                    data: &wk_f16,
+                    rows: kv_dim,
+                    cols: self.d_model,
+                },
+                TensorView {
+                    data: &x_f16,
+                    rows: self.d_model,
+                    cols: 1,
+                },
+                &mut TensorViewMut {
+                    data: &mut k_f16,
+                    rows: kv_dim,
+                    cols: 1,
+                },
+            )
+            .is_err()
+        {
             return cpu_forward();
         }
 
-        if backend.matmul_into(
-            TensorView { data: &wv_f16, rows: kv_dim, cols: self.d_model },
-            TensorView { data: &x_f16,  rows: self.d_model, cols: 1 },
-            &mut TensorViewMut { data: &mut v_f16, rows: kv_dim, cols: 1 },
-        ).is_err() {
+        if backend
+            .matmul_into(
+                TensorView {
+                    data: &wv_f16,
+                    rows: kv_dim,
+                    cols: self.d_model,
+                },
+                TensorView {
+                    data: &x_f16,
+                    rows: self.d_model,
+                    cols: 1,
+                },
+                &mut TensorViewMut {
+                    data: &mut v_f16,
+                    rows: kv_dim,
+                    cols: 1,
+                },
+            )
+            .is_err()
+        {
             return cpu_forward();
         }
 
@@ -892,11 +1241,11 @@ impl MultiHeadSelfAttention {
 
         for h in 0..self.num_heads {
             let s = h * self.head_dim;
-            apply_rope_maybe_scaled(&mut q[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+            self.apply_rope_to(&mut q[s..s + self.rope_dim], pos);
         }
         for h in 0..self.num_kv_heads {
             let s = h * self.head_dim;
-            apply_rope_maybe_scaled(&mut k[s..s + self.rope_dim], pos, self.rope_base, self.rope_yarn.as_ref());
+            self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
         }
 
         // ── 3) KV insert + attention ──────────────────────────────────────────
@@ -912,27 +1261,49 @@ impl MultiHeadSelfAttention {
         kv.append(&k, &v);
         let seq_len = kv.seq_len;
 
-        if backend.kv_cache_insert(
-            layer_idx,
-            pos,
-            TensorView { data: &k_f16_rope, rows: 1, cols: kv_dim },
-            TensorView { data: &v_f16_rope, rows: 1, cols: kv_dim },
-        ).is_err() {
+        if backend
+            .kv_cache_insert(
+                layer_idx,
+                pos,
+                TensorView {
+                    data: &k_f16_rope,
+                    rows: 1,
+                    cols: kv_dim,
+                },
+                TensorView {
+                    data: &v_f16_rope,
+                    rows: 1,
+                    cols: kv_dim,
+                },
+            )
+            .is_err()
+        {
             let mut attn_out = cpu_attend(&q, kv);
             self.apply_value_scale(&mut attn_out);
-            let mut out = matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim);
+            let mut out = self.wo.matvec(&attn_out);
             self.apply_o_bias(&mut out);
             return out;
         }
 
         let q_f16_rope = to_f16(&q);
         let mut out_f16 = vec![f16::ZERO; q_dim];
-        let attn_out = if backend.kv_attend(
-            layer_idx,
-            TensorView { data: &q_f16_rope, rows: self.num_heads, cols: self.head_dim },
-            seq_len,
-            &mut TensorViewMut { data: &mut out_f16, rows: self.num_heads, cols: self.head_dim },
-        ).is_ok() {
+        let attn_out = if backend
+            .kv_attend(
+                layer_idx,
+                TensorView {
+                    data: &q_f16_rope,
+                    rows: self.num_heads,
+                    cols: self.head_dim,
+                },
+                seq_len,
+                &mut TensorViewMut {
+                    data: &mut out_f16,
+                    rows: self.num_heads,
+                    cols: self.head_dim,
+                },
+            )
+            .is_ok()
+        {
             to_f32(&out_f16)
         } else {
             cpu_attend(&q, kv)
@@ -944,21 +1315,170 @@ impl MultiHeadSelfAttention {
         self.apply_value_scale(&mut attn_out);
 
         // ── 4) Output projection via backend ──────────────────────────────────
-        let wo_f16      = to_f16(&self.wo);
-        let attn_f16    = to_f16(&attn_out);
+        let wo_f32 = self.wo.to_f32_vec();
+        let wo_f16 = to_f16(&wo_f32);
+        let attn_f16 = to_f16(&attn_out);
         let mut out_f16 = vec![f16::ZERO; self.d_model];
 
-        let mut out = if backend.matmul_into(
-            TensorView { data: &wo_f16,   rows: self.d_model, cols: q_dim },
-            TensorView { data: &attn_f16, rows: q_dim,        cols: 1 },
-            &mut TensorViewMut { data: &mut out_f16, rows: self.d_model, cols: 1 },
-        ).is_ok() {
+        let mut out = if backend
+            .matmul_into(
+                TensorView {
+                    data: &wo_f16,
+                    rows: self.d_model,
+                    cols: q_dim,
+                },
+                TensorView {
+                    data: &attn_f16,
+                    rows: q_dim,
+                    cols: 1,
+                },
+                &mut TensorViewMut {
+                    data: &mut out_f16,
+                    rows: self.d_model,
+                    cols: 1,
+                },
+            )
+            .is_ok()
+        {
             to_f32(&out_f16)
         } else {
-            matmul_row_major(&self.wo, &attn_out, self.d_model, q_dim)
+            self.wo.matvec(&attn_out)
         };
         self.apply_o_bias(&mut out);
         out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_into_with_timing(
+        &self,
+        x: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut MultiHeadSelfAttentionScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        // The scratch path is the CPU-production path. Keep GPU behaviour
+        // byte-for-byte by delegating to the existing allocating path when a
+        // GPU backend is active.
+        if backend.is_gpu() {
+            let y = self.forward_with_timing(x, pos, layer_idx, kv, backend, timings);
+            out.clear();
+            out.extend_from_slice(&y);
+            return;
+        }
+
+        debug_assert_eq!(x.len(), self.d_model);
+        debug_assert_eq!(kv.kv_dim, self.kv_dim());
+        debug_assert_eq!(kv.v_dim, self.v_proj_dim());
+
+        let q_dim = self.q_dim();
+        scratch.q.resize(q_dim, 0.0);
+        crate::stage_timing::time_optional(timings, crate::stage_timing::Q_PROJECTION, || {
+            self.wq.matvec_into(x, &mut scratch.q)
+        });
+        if let Some(bq) = self.bq.as_ref() {
+            for (qi, bi) in scratch.q.iter_mut().zip(bq.iter()) {
+                *qi += bi;
+            }
+        }
+        crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+            self.apply_q_norm(&mut scratch.q)
+        });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
+            for h in 0..self.num_heads {
+                let s = h * self.head_dim;
+                self.apply_rope_to(&mut scratch.q[s..s + self.rope_dim], pos);
+            }
+        });
+
+        self.project_kv_into_with_timing(
+            x,
+            pos,
+            &mut scratch.k,
+            &mut scratch.v,
+            timings,
+        );
+        debug_assert_eq!(pos, kv.seq_len);
+        kv.append(&scratch.k, &scratch.v);
+
+        crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::ATTENTION_SCORE_VALUE,
+            || {
+                self.cpu_attend_into(
+                    &scratch.q,
+                    kv,
+                    &mut scratch.scores,
+                    &mut scratch.attn_out,
+                )
+            },
+        );
+        self.apply_value_scale(&mut scratch.attn_out);
+
+        out.resize(self.d_model, 0.0);
+        crate::stage_timing::time_optional(timings, crate::stage_timing::O_PROJECTION, || {
+            self.wo.matvec_into(&scratch.attn_out, out);
+            self.apply_o_bias(out);
+        });
+    }
+
+    fn cpu_attend_into(
+        &self,
+        q: &[f32],
+        kv: &KvCache,
+        scores: &mut Vec<f32>,
+        attn_out: &mut Vec<f32>,
+    ) {
+        attn_out.clear();
+        attn_out.resize(self.attn_out_dim(), 0.0);
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let t_max = kv.seq_len;
+        let t_start = match self.attention_mode() {
+            crate::architecture::AttentionMode::SlidingWindow { window } => {
+                t_max.saturating_sub(window)
+            }
+            crate::architecture::AttentionMode::Global => 0,
+        };
+        let span = t_max - t_start;
+
+        for h in 0..self.num_heads {
+            let kv_head = h * self.num_kv_heads / self.num_heads;
+            let q_head = &q[h * self.head_dim..(h + 1) * self.head_dim];
+            scores.resize(span, 0.0);
+
+            for (idx, score) in scores.iter_mut().enumerate() {
+                let t = t_start + idx;
+                let k_t = kv.key(t);
+                let k_h = &k_t[kv_head * self.head_dim..(kv_head + 1) * self.head_dim];
+                let mut s = 0.0f32;
+                for j in 0..self.head_dim {
+                    s += q_head[j] * k_h[j];
+                }
+                *score = s * scale;
+            }
+            if let Some(bias) = self.sink_bias.as_ref() {
+                if t_start == 0 && !scores.is_empty() {
+                    if let Some(b) = bias.get(h) {
+                        scores[0] += *b;
+                    }
+                }
+            }
+            softmax_inplace(scores);
+
+            let out_h = &mut attn_out[h * self.v_head_dim..(h + 1) * self.v_head_dim];
+            for (idx, score) in scores.iter().enumerate() {
+                let t = t_start + idx;
+                let v_t = kv.value(t);
+                let v_h =
+                    &v_t[kv_head * self.v_head_dim..(kv_head + 1) * self.v_head_dim];
+                for j in 0..self.v_head_dim {
+                    out_h[j] += score * v_h[j];
+                }
+            }
+        }
     }
 }
 
@@ -970,12 +1490,23 @@ impl MultiHeadSelfAttention {
 /// MoE combiner) that ignores the redundant `d_model` argument; kept for
 /// backwards compatibility with `TransformerLayer::moe_combine`.
 pub fn combine_moe_outputs(outputs: &[HiddenState], scores: &[f32], d_model: usize) -> HiddenState {
+    let mut out = Vec::new();
+    combine_moe_outputs_into(outputs, scores, d_model, &mut out);
+    out
+}
+
+pub fn combine_moe_outputs_into(
+    outputs: &[HiddenState],
+    scores: &[f32],
+    d_model: usize,
+    out: &mut Vec<f32>,
+) {
     debug_assert!(
         outputs.iter().all(|o| o.len() == d_model),
         "every expert output must have length d_model"
     );
     let _ = d_model;
-    crate::inference::combine_outputs(outputs, scores)
+    crate::inference::combine_outputs_into(outputs, scores, out);
 }
 
 /// Run one expert FFN by reinterpreting its on-disk bytes (already loaded
@@ -996,73 +1527,110 @@ pub fn run_expert_forward(
 /// Row-major matrix-vector multiply: `y = W · x` where `W` is
 /// `[rows, cols]` row-major. Returns a fresh `Vec<f32>` of length `rows`.
 ///
-/// **Auto-escalation (gist Task 1).** Dispatch, in order:
-///
-/// 1. `--features blas` → BLAS-shaped `matrixmultiply` SGEMV
-///    microkernel (the `ndarray`-style tuned path).
-/// 2. Otherwise, always delegate to `matmul_row_major_parallel`, which
-///    uses `parallel::par_row_chunks` to fork-join disjoint output-row
-///    chunks on the shared, process-wide `rayon` pool (resident workers,
-///    not per-call OS-thread spawning). Its inline fast path runs on the
-///    caller for a single row, a single-threaded pool, or `rows*cols <
-///    parallel::MIN_TOTAL_FOR_PARALLEL`; otherwise fan-out is bounded by
-///    `parallel::MIN_ELEMS_PER_TASK`. This folds the scalar fallback into
-///    the same helper and preserves per-row, bit-identical dot products.
-///    This path is now always compiled — the `--features simd` flag is
-///    no longer required and is retained only for backwards
-///    compatibility (it is a no-op).
+/// The implementation is selected at runtime via
+/// [`crate::parallel::DenseMatvecBackend`]. `Auto` preserves the previous
+/// build defaults (`blas` builds use one tuned matrixmultiply SGEMM call;
+/// other builds use the Rayon row-parallel dot-product path), while
+/// production configs can force serial matrixmultiply, Rayon reference/SIMD,
+/// or Rayon-chunked matrixmultiply without rebuilding.
 pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; rows];
+    matmul_row_major_into(w, x, &mut y, rows, cols);
+    y
+}
+
+pub fn matmul_row_major_with_backend(
+    w: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    backend: crate::parallel::DenseMatvecBackend,
+) -> Vec<f32> {
+    let mut y = vec![0.0f32; rows];
+    matmul_row_major_into_with_backend(w, x, &mut y, rows, cols, backend);
+    y
+}
+
+/// In-place row-major matrix-vector multiply: `y = W · x`.
+pub fn matmul_row_major_into(w: &[f32], x: &[f32], y: &mut [f32], rows: usize, cols: usize) {
+    matmul_row_major_into_with_backend(w, x, y, rows, cols, crate::parallel::dense_matvec_backend())
+}
+
+pub fn matmul_row_major_into_with_backend(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    cols: usize,
+    backend: crate::parallel::DenseMatvecBackend,
+) {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
-    // Note: the historic `simd`/`blas` mutual-exclusion `compile_error!`
-    // is no longer needed — `simd` is now a deprecated no-op feature
-    // (the runtime row-parallel path is always compiled). The `blas`
-    // branch still wins when present.
-    #[cfg(feature = "blas")]
-    {
-        // BLAS-equivalent SGEMV via `matrixmultiply::sgemm`: treat the
-        // matrix-vector product as a `(rows × cols) × (cols × 1)`
-        // SGEMM. The crate's tuned microkernel (the same one used by
-        // `ndarray`'s `dot`) gives ~order-of-magnitude speedups over
-        // the scalar loop on AVX2 / NEON for the dense projections in
-        // `TransformerLayer`.
-        let mut y = vec![0.0f32; rows];
-        // SAFETY: matrixmultiply::sgemm is defined as taking pointers
-        // to row-major (m × k) and (k × n) matrices and writing into a
-        // row-major (m × n) output. We satisfy all aliasing and bounds
-        // requirements: `w` is a borrowed slice of exactly `rows*cols`
-        // floats, `x` is `cols` floats, and `y` is a fresh `rows`-
-        // length buffer that doesn't alias either input. `rsa` / `csa`
-        // etc. are the row/col strides for the three matrices; `1`
-        // everywhere selects row-major.
-        unsafe {
-            matrixmultiply::sgemm(
-                rows,
-                cols,
-                1,
-                1.0,
-                w.as_ptr(),
-                cols as isize,
-                1,
-                x.as_ptr(),
-                1,
-                1,
-                0.0,
-                y.as_mut_ptr(),
-                1,
-                1,
-            );
+    debug_assert_eq!(y.len(), rows);
+
+    let backend = match backend {
+        crate::parallel::DenseMatvecBackend::Auto => {
+            crate::parallel::default_dense_matvec_backend()
         }
-        y
+        other => other,
+    };
+    match backend {
+        crate::parallel::DenseMatvecBackend::Auto => unreachable!("auto resolves before dispatch"),
+        crate::parallel::DenseMatvecBackend::Matrixmultiply => {
+            matmul_row_major_matrixmultiply_into(w, x, y, rows, cols);
+        }
+        crate::parallel::DenseMatvecBackend::Rayon => {
+            matmul_row_major_parallel_into(w, x, y, rows, cols);
+        }
+        crate::parallel::DenseMatvecBackend::RayonMatrixmultiply => {
+            matmul_row_major_parallel_matrixmultiply_into(w, x, y, rows, cols);
+        }
     }
-    // Runtime row-parallel path. Always compiled (no `#[cfg(feature =
-    // "simd")]` gate) so a single binary auto-escalates on any host
-    // with enough cores. The serial-vs-parallel decision now lives in
-    // `par_row_chunks` (it runs small matmuls inline), so we delegate
-    // unconditionally instead of duplicating a threshold here.
-    #[cfg(not(feature = "blas"))]
-    {
-        matmul_row_major_parallel(w, x, rows, cols)
+}
+
+/// Serial tuned SGEMV via `matrixmultiply::sgemm`.
+fn matmul_row_major_matrixmultiply(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; rows];
+    matmul_row_major_matrixmultiply_into(w, x, &mut y, rows, cols);
+    y
+}
+
+#[inline]
+fn matmul_row_major_matrixmultiply_into(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    if rows == 0 || cols == 0 {
+        y.fill(0.0);
+        return;
+    }
+    // SAFETY: matrixmultiply::sgemm is defined for row-major (m × k) and
+    // (k × n) matrices writing into row-major (m × n) output. `w` is
+    // exactly `rows * cols`, `x` is exactly `cols`, and `y` is a disjoint
+    // mutable output slice of `rows` elements.
+    unsafe {
+        matrixmultiply::sgemm(
+            rows,
+            cols,
+            1,
+            1.0,
+            w.as_ptr(),
+            cols as isize,
+            1,
+            x.as_ptr(),
+            1,
+            1,
+            0.0,
+            y.as_mut_ptr(),
+            1,
+            1,
+        );
     }
 }
 
@@ -1079,20 +1647,59 @@ pub fn matmul_row_major(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f
 /// batching) share one bounded pool instead of each oversubscribing the
 /// machine. The arithmetic — one `f32` dot product per output row — is
 /// unchanged, so the result is identical to the scalar path.
-#[cfg(not(feature = "blas"))]
 fn matmul_row_major_parallel(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; rows];
-    crate::parallel::par_row_chunks(&mut y, cols, |row_start, out| {
+    matmul_row_major_parallel_into(w, x, &mut y, rows, cols);
+    y
+}
+
+fn matmul_row_major_parallel_into(w: &[f32], x: &[f32], y: &mut [f32], rows: usize, cols: usize) {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    crate::parallel::par_row_chunks(y, cols, |row_start, out| {
         for (i, slot) in out.iter_mut().enumerate() {
             let row = &w[(row_start + i) * cols..(row_start + i + 1) * cols];
-            let mut acc = 0.0f32;
-            for j in 0..cols {
-                acc += row[j] * x[j];
-            }
-            *slot = acc;
+            *slot = crate::kernels::dot_f32(row, x);
         }
     });
+}
+
+/// Rayon-chunked matrixmultiply. Output rows are split into contiguous
+/// chunks on the existing global Rayon pool; each task invokes one tuned
+/// SGEMM over its chunk. If already running inside a Rayon worker, fall
+/// back to the serial matrixmultiply path to avoid nested pool fan-out.
+fn matmul_row_major_parallel_matrixmultiply(
+    w: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
+    let mut y = vec![0.0f32; rows];
+    matmul_row_major_parallel_matrixmultiply_into(w, x, &mut y, rows, cols);
     y
+}
+
+fn matmul_row_major_parallel_matrixmultiply_into(
+    w: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(y.len(), rows);
+    if crate::parallel::in_rayon_worker() {
+        matmul_row_major_matrixmultiply_into(w, x, y, rows, cols);
+        return;
+    }
+    crate::parallel::par_row_chunks(y, cols, |row_start, out| {
+        let row_count = out.len();
+        let w_start = row_start * cols;
+        let w_end = w_start + row_count * cols;
+        matmul_row_major_matrixmultiply_into(&w[w_start..w_end], x, out, row_count, cols);
+    });
 }
 
 /// Final language-modelling head: a linear projection from the residual
@@ -1102,7 +1709,7 @@ fn matmul_row_major_parallel(w: &[f32], x: &[f32], rows: usize, cols: usize) -> 
 /// matrix.
 #[derive(Debug, Clone)]
 pub struct LMHead {
-    pub weights: Vec<f32>,
+    pub weights: DenseWeight,
     pub vocab_size: usize,
     pub d_model: usize,
 }
@@ -1114,12 +1721,26 @@ impl LMHead {
             vocab_size * d_model,
             "lm_head weights must be [vocab_size, d_model]"
         );
-        Self { weights, vocab_size, d_model }
+        Self {
+            weights: DenseWeight::from_f32(weights, vocab_size, d_model),
+            vocab_size,
+            d_model,
+        }
+    }
+
+    pub fn from_dense(weights: DenseWeight, vocab_size: usize, d_model: usize) -> Self {
+        assert_eq!(weights.rows(), vocab_size, "lm_head row count mismatch");
+        assert_eq!(weights.cols(), d_model, "lm_head column count mismatch");
+        Self {
+            weights,
+            vocab_size,
+            d_model,
+        }
     }
 
     /// Compute logits = `W · hidden`.
     pub fn forward(&self, hidden: &[f32]) -> Vec<f32> {
-        matmul_row_major(&self.weights, hidden, self.vocab_size, self.d_model)
+        self.weights.matvec(hidden)
     }
 
     /// One-shot: project `hidden` to logits and sample a next-token id
@@ -1133,16 +1754,88 @@ impl LMHead {
         params: &crate::sampling::SamplingParams,
         position: u64,
     ) -> u32 {
+        if params.is_greedy() {
+            return self.weights.greedy_argmax(hidden);
+        }
+        if params.top_k > 0 && !(params.top_p > 0.0 && params.top_p < 1.0) {
+            return self.sample_top_k(hidden, params, position);
+        }
         let logits = self.forward(hidden);
         crate::sampling::sample(&logits, params, position)
+    }
+
+    fn sample_top_k(
+        &self,
+        hidden: &[f32],
+        params: &crate::sampling::SamplingParams,
+        position: u64,
+    ) -> u32 {
+        let candidates = self.weights.top_k_logits(hidden, params.top_k);
+        if candidates.is_empty() {
+            return 0;
+        }
+        let t = params.temperature.max(1e-6);
+        let max = candidates
+            .iter()
+            .map(|&(_, logit)| logit / t)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = candidates
+            .iter()
+            .map(|&(_, logit)| ((logit / t) - max).exp())
+            .collect();
+        let sum: f32 = probs.iter().sum();
+        if !(sum > 0.0) {
+            return candidates[0].0 as u32;
+        }
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+        let p_cut = if !(params.top_p > 0.0 && params.top_p < 1.0) {
+            candidates.len()
+        } else {
+            let target = params.top_p.clamp(1e-6, 1.0);
+            let mut cum = 0.0f32;
+            let mut idx = 0usize;
+            for (i, p) in probs.iter().enumerate() {
+                cum += *p;
+                idx = i + 1;
+                if cum >= target {
+                    break;
+                }
+            }
+            idx.min(candidates.len()).max(1)
+        };
+        let kept_sum: f32 = probs.iter().take(p_cut).sum();
+        if !(kept_sum > 0.0) {
+            return candidates[0].0 as u32;
+        }
+        let bits = params.step_seed(position);
+        let u = ((bits >> 40) as u32) as f32 / ((1u32 << 24) as f32) * kept_sum;
+        let mut acc = 0.0f32;
+        for (i, p) in probs.iter().take(p_cut).enumerate() {
+            acc += *p;
+            if u <= acc {
+                return candidates[i].0 as u32;
+            }
+        }
+        candidates[p_cut - 1].0 as u32
     }
 }
 
 /// Element-wise residual add: `y = a + b`.
 #[inline]
 pub fn add_residual(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let mut out = Vec::new();
+    add_residual_into(a, b, &mut out);
+    out
+}
+
+#[inline]
+pub fn add_residual_into(a: &[f32], b: &[f32], out: &mut Vec<f32>) {
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
+    out.clear();
+    out.reserve(a.len());
+    out.extend(a.iter().zip(b.iter()).map(|(x, y)| x + y));
 }
 
 /// A dense ("shared") expert FFN that is applied to **every** token in a
@@ -1228,7 +1921,13 @@ impl SharedExpert {
         let tensors = ExpertWeights::from_floats(&weights, d_model, d_ff)
             .ok()
             .and_then(|w| w.to_candle_tensors(&Device::Cpu).ok());
-        Some(Self { d_model, d_ff, weights, gate_inp, tensors })
+        Some(Self {
+            d_model,
+            d_ff,
+            weights,
+            gate_inp,
+            tensors,
+        })
     }
 
     /// Run the dense SwiGLU forward over `x` (the MoE-normalised hidden
@@ -1335,6 +2034,22 @@ pub struct TransformerLayer {
     pub dense_ffn: Option<SharedExpert>,
 }
 
+#[derive(Debug, Default)]
+pub struct TransformerLayerScratch {
+    pub(crate) attn_normed: Vec<f32>,
+    pub(crate) attn: MultiHeadSelfAttentionScratch,
+    pub(crate) moe_normed: Vec<f32>,
+    pub(crate) moe_accum: Vec<f32>,
+    pub(crate) routing: crate::gating::RoutingScratch,
+    pub(crate) global_expert_ids: Vec<u32>,
+}
+
+impl TransformerLayerScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 impl TransformerLayer {
     /// `hidden -> rmsnorm -> attention -> residual`. Updates `kv` with
     /// the K/V for this token. `layer_idx` and `backend` are threaded
@@ -1348,17 +2063,80 @@ impl TransformerLayer {
         kv: &mut KvCache,
         backend: &crate::backend::BackendBox,
     ) -> Vec<f32> {
-        let normed = self.rms_attn.forward(hidden);
-        let attn_out = match self.mla.as_ref() {
+        self.attn_block_with_timing(hidden, pos, layer_idx, kv, backend, None)
+    }
+
+    pub fn attn_block_with_timing(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<f32> {
+        let mut scratch = TransformerLayerScratch::new();
+        let mut out = Vec::new();
+        self.attn_block_into_with_timing(
+            hidden,
+            pos,
+            layer_idx,
+            kv,
+            backend,
+            &mut scratch,
+            &mut out,
+            timings,
+        );
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_block_into_with_timing(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut TransformerLayerScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+            self.rms_attn.forward_into(hidden, &mut scratch.attn_normed)
+        });
+        let normed = &scratch.attn_normed;
+        match self.mla.as_ref() {
             // DeepSeek-V3 multi-head latent attention runs on CPU against
             // the layer's compressed latent KV cache. The GPU attention
             // kernels are shaped for standard MHA (uniform K/V head dim),
             // so MLA stays on the reference path; `backend` is unused
             // here but kept in the signature for the standard path below.
-            Some(mla) => mla.forward(&normed, pos, kv),
-            None => self.attn.forward(&normed, pos, layer_idx, kv, backend),
-        };
-        add_residual(hidden, &attn_out)
+            Some(mla) => {
+                let attn_out = crate::stage_timing::time_optional(
+                    timings,
+                    crate::stage_timing::ATTENTION_SCORE_VALUE,
+                    || mla.forward(normed, pos, kv),
+                );
+                add_residual_into(hidden, &attn_out, out);
+            }
+            None => {
+                self.attn.forward_into_with_timing(
+                    normed,
+                    pos,
+                    layer_idx,
+                    kv,
+                    backend,
+                    &mut scratch.attn,
+                    out,
+                    timings,
+                );
+                debug_assert_eq!(hidden.len(), out.len());
+                for (oi, hi) in out.iter_mut().zip(hidden.iter()) {
+                    *oi += hi;
+                }
+            }
+        }
     }
 
     /// KV-cache width this layer needs: the MLA latent dim when latent
@@ -1385,9 +2163,48 @@ impl TransformerLayer {
     /// hidden state (which is what every expert FFN should consume) and
     /// the routing decision.
     pub fn moe_pre(&self, hidden: &[f32]) -> (Vec<f32>, crate::gating::RoutingDecision) {
-        let normed = self.rms_moe.forward(hidden);
-        let routing = self.gate.route(&normed);
+        self.moe_pre_with_timing(hidden, None)
+    }
+
+    pub fn moe_pre_with_timing(
+        &self,
+        hidden: &[f32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> (Vec<f32>, crate::gating::RoutingDecision) {
+        let mut scratch = crate::gating::RoutingScratch::new();
+        self.moe_pre_with_scratch_and_timing(hidden, &mut scratch, timings)
+    }
+
+    pub fn moe_pre_with_scratch_and_timing(
+        &self,
+        hidden: &[f32],
+        routing_scratch: &mut crate::gating::RoutingScratch,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> (Vec<f32>, crate::gating::RoutingDecision) {
+        let normed =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                self.rms_moe.forward(hidden)
+            });
+        let routing =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::ROUTER_GATE, || {
+                self.gate.route_with_scratch(&normed, routing_scratch)
+            });
         (normed, routing)
+    }
+
+    pub fn moe_pre_into_with_timing(
+        &self,
+        hidden: &[f32],
+        scratch: &mut TransformerLayerScratch,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> crate::gating::RoutingDecision {
+        crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+            self.rms_moe.forward_into(hidden, &mut scratch.moe_normed)
+        });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::ROUTER_GATE, || {
+            self.gate
+                .route_with_scratch(&scratch.moe_normed, &mut scratch.routing)
+        })
     }
 
     /// Fold the per-expert FFN outputs back into the residual stream:
@@ -1402,8 +2219,60 @@ impl TransformerLayer {
         expert_outputs: &[HiddenState],
         weights: &[f32],
     ) -> Vec<f32> {
-        let moe = combine_moe_outputs(expert_outputs, weights, self.attn.d_model);
-        add_residual(hidden, &moe)
+        self.moe_combine_with_timing(hidden, expert_outputs, weights, None)
+    }
+
+    pub fn moe_combine_with_timing(
+        &self,
+        hidden: &[f32],
+        expert_outputs: &[HiddenState],
+        weights: &[f32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<f32> {
+        crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::MOE_WEIGHTED_COMBINATION,
+            || {
+                let moe = combine_moe_outputs(expert_outputs, weights, self.attn.d_model);
+                add_residual(hidden, &moe)
+            },
+        )
+    }
+
+    pub fn moe_combine_into_with_timing(
+        &self,
+        hidden: &[f32],
+        expert_outputs: &[HiddenState],
+        weights: &[f32],
+        moe_accum: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::MOE_WEIGHTED_COMBINATION,
+            || {
+                combine_moe_outputs_into(expert_outputs, weights, self.attn.d_model, moe_accum);
+                add_residual_into(hidden, moe_accum, out);
+            },
+        )
+    }
+
+    pub fn moe_accumulated_into_with_timing(
+        &self,
+        hidden: &[f32],
+        moe_accum: &[f32],
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::MOE_WEIGHTED_COMBINATION,
+            || {
+                debug_assert_eq!(moe_accum.len(), self.attn.d_model);
+                add_residual_into(hidden, moe_accum, out);
+            },
+        )
     }
 
     /// Run the layer's optional shared expert over the MoE-normalised
@@ -1411,7 +2280,19 @@ impl TransformerLayer {
     /// Returns `None` when the layer has no shared expert (Mixtral), so
     /// the caller can skip the residual add entirely.
     pub fn shared_expert_forward(&self, normed: &[f32]) -> Option<HiddenState> {
-        self.shared_expert.as_ref().map(|se| se.forward(normed))
+        self.shared_expert_forward_with_timing(normed, None)
+    }
+
+    pub fn shared_expert_forward_with_timing(
+        &self,
+        normed: &[f32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Option<HiddenState> {
+        self.shared_expert.as_ref().map(|se| {
+            crate::stage_timing::time_optional(timings, crate::stage_timing::EXPERT_COMPUTE, || {
+                se.forward(normed)
+            })
+        })
     }
 
     /// `true` if this layer is a **dense** FFN layer (Mistral Small 3,
@@ -1428,9 +2309,24 @@ impl TransformerLayer {
     /// they do not exercise SSD streaming (by design — they have no experts
     /// to stream).
     pub fn dense_forward(&self, hidden: &[f32]) -> Option<Vec<f32>> {
+        self.dense_forward_with_timing(hidden, None)
+    }
+
+    pub fn dense_forward_with_timing(
+        &self,
+        hidden: &[f32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Option<Vec<f32>> {
         let ffn = self.dense_ffn.as_ref()?;
-        let normed = self.rms_moe.forward(hidden);
-        let out = ffn.forward(&normed);
+        let normed =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
+                self.rms_moe.forward(hidden)
+            });
+        let out = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::EXPERT_COMPUTE,
+            || ffn.forward(&normed),
+        );
         Some(add_residual(hidden, &out))
     }
 }
@@ -1569,6 +2465,145 @@ mod tests {
         crate::backend::BackendBox::Cpu(crate::backend::CandleBackend::new())
     }
 
+    fn reference_matmul(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        (0..rows)
+            .map(|r| {
+                let row = &w[r * cols..(r + 1) * cols];
+                row.iter().zip(x).map(|(a, b)| a * b).sum()
+            })
+            .collect()
+    }
+
+    fn q8_zero_weight(rows: usize, cols: usize) -> DenseWeight {
+        let blocks = rows
+            .saturating_mul(cols)
+            .div_ceil(crate::inference::Q8_0_BLOCK_ELEMS);
+        DenseWeight::from_q8_0_bytes(
+            vec![0u8; blocks * crate::inference::Q8_0_BLOCK_BYTES],
+            rows,
+            cols,
+        )
+        .unwrap()
+    }
+
+    fn gpu_dense_path_test_attention(q8_projection: Option<&str>) -> MultiHeadSelfAttention {
+        let d_model = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let num_kv_heads = 2;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mk = |rows: usize, cols: usize| {
+            DenseWeight::from_f32(
+                (0..rows * cols)
+                    .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+                    .collect(),
+                rows,
+                cols,
+            )
+        };
+        let projection = |name: &str, rows: usize, cols: usize| {
+            if q8_projection == Some(name) {
+                q8_zero_weight(rows, cols)
+            } else {
+                mk(rows, cols)
+            }
+        };
+        MultiHeadSelfAttention {
+            d_model,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim: head_dim,
+            v_head_dim: head_dim,
+            attention_value_scale: None,
+            rope_base: 10000.0,
+            wq: projection("wq", q_dim, d_model),
+            wk: projection("wk", kv_dim, d_model),
+            wv: projection("wv", kv_dim, d_model),
+            wo: projection("wo", d_model, q_dim),
+            window_size: None,
+            q_norm: None,
+            k_norm: None,
+            rope_yarn: None,
+            rope_cache: None,
+            bq: None,
+            bk: None,
+            bv: None,
+            bo: None,
+            sink_bias: None,
+        }
+    }
+
+    #[test]
+    fn dense_matvec_backends_match_reference() {
+        use crate::parallel::DenseMatvecBackend;
+
+        for &(rows, cols) in &[(1usize, 1usize), (7, 13), (128, 64), (257, 129)] {
+            let w: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i % 31) as f32 - 15.0) * 0.0075)
+                .collect();
+            let x: Vec<f32> = (0..cols)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.03125)
+                .collect();
+            let want = reference_matmul(&w, &x, rows, cols);
+            for backend in [
+                DenseMatvecBackend::Matrixmultiply,
+                DenseMatvecBackend::Rayon,
+                DenseMatvecBackend::RayonMatrixmultiply,
+                DenseMatvecBackend::Auto,
+            ] {
+                let got = matmul_row_major_with_backend(&w, &x, rows, cols, backend);
+                assert_eq!(got.len(), want.len());
+                for (idx, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (g - e).abs() <= 1e-4,
+                        "backend={backend:?} rows={rows} cols={cols} idx={idx}: {g} vs {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_tensor_gpu_dense_path_supported_for_all_f32_attention_projections() {
+        let attn = gpu_dense_path_test_attention(None);
+        assert!(attn.gpu_dense_path_supported());
+    }
+
+    #[test]
+    fn dense_tensor_gpu_dense_path_rejects_any_q8_attention_projection() {
+        for projection in ["wq", "wk", "wv", "wo"] {
+            let attn = gpu_dense_path_test_attention(Some(projection));
+            assert!(
+                !attn.gpu_dense_path_supported(),
+                "{projection} Q8_0 must force the CPU dense attention path"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_tensor_gpu_dense_path_check_leaves_q8_projection_storage_unchanged() {
+        let attn = gpu_dense_path_test_attention(Some("wq"));
+        let (before_ptr, before_len, before_resident_bytes) = match &attn.wq {
+            DenseWeight::Q8_0 { bytes, .. } => {
+                (bytes.as_ptr(), bytes.len(), attn.wq.resident_bytes())
+            }
+            other => panic!("expected Q8_0 wq, got {}", other.dtype()),
+        };
+
+        assert!(!attn.gpu_dense_path_supported());
+
+        let (after_ptr, after_len) = match &attn.wq {
+            DenseWeight::Q8_0 { bytes, .. } => (bytes.as_ptr(), bytes.len()),
+            other => panic!("expected Q8_0 wq after check, got {}", other.dtype()),
+        };
+        assert_eq!(after_ptr, before_ptr);
+        assert_eq!(after_len, before_len);
+        assert_eq!(attn.wq.resident_bytes(), before_resident_bytes);
+        assert_eq!(attn.wq.dtype(), DenseDType::Q8_0);
+    }
+
     #[test]
     fn rmsnorm_unit_weight_normalises_to_unit_variance() {
         let n = 8;
@@ -1579,6 +2614,19 @@ mod tests {
         let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
         // After RMSNorm with unit weight and tiny eps, mean(x^2) ≈ 1.
         assert!((mean_sq - 1.0).abs() < 1e-3, "mean_sq={mean_sq}");
+    }
+
+    #[test]
+    fn rmsnorm_forward_into_matches_forward_and_reuses_capacity() {
+        let n = 8;
+        let norm = RmsNorm::new((0..n).map(|i| 1.0 + i as f32 * 0.1).collect(), 1e-6);
+        let x: Vec<f32> = (0..n).map(|i| i as f32 - 3.5).collect();
+        let expected = norm.forward(&x);
+        let mut out = Vec::with_capacity(n * 2);
+        let capacity = out.capacity();
+        norm.forward_into(&x, &mut out);
+        assert_eq!(out, expected);
+        assert_eq!(out.capacity(), capacity);
     }
 
     #[test]
@@ -1598,6 +2646,23 @@ mod tests {
         apply_rope_inplace(&mut v, 7, 10000.0);
         let n_after: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((n_before - n_after).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rope_cache_matches_unscaled_reference_and_reuses_position() {
+        let cache = RopeCache::with_positions(16, 10_000.0, None, 32).expect("cache");
+        let original: Vec<f32> = (1..=16).map(|i| i as f32 * 0.125).collect();
+        let mut cached = original.clone();
+        let mut direct = original.clone();
+        cache.apply_inplace(&mut cached, 17);
+        apply_rope_inplace(&mut direct, 17, 10_000.0);
+        for (a, b) in cached.iter().zip(direct.iter()) {
+            assert!((a - b).abs() < 1e-6, "cached {a} direct {b}");
+        }
+        assert_eq!(cache.materialized_positions(), 1);
+        let mut cached_again = original;
+        cache.apply_inplace(&mut cached_again, 17);
+        assert_eq!(cache.materialized_positions(), 1);
     }
 
     fn yarn_test_scaling(factor: f32) -> crate::architecture::RopeScaling {
@@ -1650,6 +2715,21 @@ mod tests {
         // Default attention factor: 0.1 * ln(factor) + 1.
         let expected = 0.1 * 40.0f32.ln() + 1.0;
         assert!((yarn.attn_factor - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rope_cache_matches_yarn_reference() {
+        let s = yarn_test_scaling(8.0);
+        let yarn = YarnRope::from_scaling(16, 10_000.0, &s).expect("yarn config");
+        let cache = RopeCache::with_positions(16, 10_000.0, Some(&yarn), 32).expect("cache");
+        let original: Vec<f32> = (1..=16).map(|i| i as f32 * -0.075).collect();
+        let mut cached = original.clone();
+        let mut direct = original;
+        cache.apply_inplace(&mut cached, 19);
+        apply_rope_scaled_inplace(&mut direct, 19, &yarn);
+        for (a, b) in cached.iter().zip(direct.iter()) {
+            assert!((a - b).abs() < 1e-6, "cached {a} direct {b}");
+        }
     }
 
     #[test]
@@ -1739,7 +2819,10 @@ mod tests {
                 any_diff = true;
             }
         }
-        assert!(any_diff, "YaRN scaling must change attention outputs at pos > 0");
+        assert!(
+            any_diff,
+            "YaRN scaling must change attention outputs at pos > 0"
+        );
     }
 
     #[test]
@@ -1780,7 +2863,8 @@ mod tests {
         softmax_inplace(&mut v);
         let expected = 0.25;
         assert!(
-            v.iter().all(|&x| x.is_finite() && (x - expected).abs() < 1e-6),
+            v.iter()
+                .all(|&x| x.is_finite() && (x - expected).abs() < 1e-6),
             "got {v:?}"
         );
         let sum: f32 = v.iter().sum();
@@ -1797,7 +2881,9 @@ mod tests {
         let kv_dim = num_kv_heads * head_dim;
         // Use deterministic small weights so we exercise the math.
         let mk = |rows: usize, cols: usize| {
-            (0..rows * cols).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect()
+            (0..rows * cols)
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+                .collect()
         };
         let attn = MultiHeadSelfAttention {
             d_model,
@@ -1808,14 +2894,15 @@ mod tests {
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: mk(q_dim, d_model),
-            wk: mk(kv_dim, d_model),
-            wv: mk(kv_dim, d_model),
-            wo: mk(d_model, q_dim),
+            wq: DenseWeight::from_f32(mk(q_dim, d_model), q_dim, d_model),
+            wk: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wv: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wo: DenseWeight::from_f32(mk(d_model, q_dim), d_model, q_dim),
             window_size: None,
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            rope_cache: None,
             bq: None,
             bk: None,
             bv: None,
@@ -1846,7 +2933,9 @@ mod tests {
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let mk = |rows: usize, cols: usize| -> Vec<f32> {
-            (0..rows * cols).map(|i| ((i % 5) as f32 - 2.0) * 0.2).collect()
+            (0..rows * cols)
+                .map(|i| ((i % 5) as f32 - 2.0) * 0.2)
+                .collect()
         };
         let base = MultiHeadSelfAttention {
             d_model,
@@ -1857,14 +2946,15 @@ mod tests {
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: mk(q_dim, d_model),
-            wk: mk(kv_dim, d_model),
-            wv: mk(kv_dim, d_model),
-            wo: mk(d_model, q_dim),
+            wq: DenseWeight::from_f32(mk(q_dim, d_model), q_dim, d_model),
+            wk: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wv: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wo: DenseWeight::from_f32(mk(d_model, q_dim), d_model, q_dim),
             window_size: None,
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            rope_cache: None,
             bq: None,
             bk: None,
             bv: None,
@@ -1889,8 +2979,15 @@ mod tests {
         let y_plain = base.forward(&x1, 1, 0, &mut kv_a, &cpu_backend());
         let y_norm = normed.forward(&x1, 1, 0, &mut kv_b, &cpu_backend());
         assert!(y_norm.iter().all(|v| v.is_finite()));
-        let diff: f32 = y_plain.iter().zip(&y_norm).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 1e-4, "QK-Norm should change the output (diff={diff})");
+        let diff: f32 = y_plain
+            .iter()
+            .zip(&y_norm)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 1e-4,
+            "QK-Norm should change the output (diff={diff})"
+        );
     }
 
     #[test]
@@ -1900,9 +2997,15 @@ mod tests {
         let scores = vec![0.5, 0.25, 0.25];
         let y = combine_moe_outputs(&outs, &scores, d);
         // 0.5*1 + 0.25*2 + 0.25*4 = 2.0
-        for v in y {
+        for v in &y {
             assert!((v - 2.0).abs() < 1e-6);
         }
+
+        let mut into = Vec::with_capacity(d * 2);
+        let capacity = into.capacity();
+        combine_moe_outputs_into(&outs, &scores, d, &mut into);
+        assert_eq!(into, y);
+        assert_eq!(into.capacity(), capacity);
     }
 
     #[test]
@@ -1927,11 +3030,40 @@ mod tests {
     }
 
     #[test]
+    fn lm_head_top_k_sampling_matches_full_logits_sampler() {
+        let d_model = 3;
+        let vocab = 7;
+        let weights: Vec<f32> = (0..vocab * d_model)
+            .map(|i| ((i % 9) as f32 - 4.0) / 5.0)
+            .collect();
+        let hidden = [0.25, -0.75, 1.25];
+        let params = crate::sampling::SamplingParams {
+            temperature: 0.8,
+            top_p: 1.0,
+            top_k: 3,
+            seed: 1234,
+        };
+        let head = LMHead::new(weights, vocab, d_model);
+        let logits = head.forward(&hidden);
+        for pos in 0..16 {
+            let expected = crate::sampling::sample(&logits, &params, pos);
+            let got = head.sample(&hidden, &params, pos);
+            assert_eq!(got, expected, "position {pos}");
+        }
+    }
+
+    #[test]
     fn add_residual_is_elementwise() {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![10.0, 20.0, 30.0];
         let y = add_residual(&a, &b);
         assert_eq!(y, vec![11.0, 22.0, 33.0]);
+
+        let mut into = Vec::with_capacity(8);
+        let capacity = into.capacity();
+        add_residual_into(&a, &b, &mut into);
+        assert_eq!(into, y);
+        assert_eq!(into.capacity(), capacity);
     }
 
     /// Build a tiny `TransformerLayer` with deterministic small weights
@@ -1959,14 +3091,15 @@ mod tests {
                 v_head_dim: head_dim,
                 attention_value_scale: None,
                 rope_base: 10000.0,
-                wq: mk(q_dim, d_model, 0.05),
-                wk: mk(kv_dim, d_model, 0.05),
-                wv: mk(kv_dim, d_model, 0.05),
-                wo: mk(d_model, q_dim, 0.05),
+                wq: DenseWeight::from_f32(mk(q_dim, d_model, 0.05), q_dim, d_model),
+                wk: DenseWeight::from_f32(mk(kv_dim, d_model, 0.05), kv_dim, d_model),
+                wv: DenseWeight::from_f32(mk(kv_dim, d_model, 0.05), kv_dim, d_model),
+                wo: DenseWeight::from_f32(mk(d_model, q_dim, 0.05), d_model, q_dim),
                 window_size: None,
                 q_norm: None,
                 k_norm: None,
                 rope_yarn: None,
+                rope_cache: None,
                 bq: None,
                 bk: None,
                 bv: None,
@@ -1999,6 +3132,63 @@ mod tests {
         let y1 = layer.attn_block(&y0, 1, 0, &mut kv, &cpu_backend());
         assert_eq!(kv.seq_len, 2);
         assert!(y1.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn attention_forward_into_matches_forward_and_reuses_capacity() {
+        let d_model = 16;
+        let layer = make_layer(d_model, 4, 2);
+        let x0: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32 - 0.5).collect();
+        let x1: Vec<f32> = (0..d_model).map(|i| 0.07 * i as f32 - 0.25).collect();
+        let backend = cpu_backend();
+
+        let mut kv_ref = KvCache::new(layer.attn.kv_dim());
+        let mut kv_into = KvCache::new(layer.attn.kv_dim());
+        let y0_ref = layer.attn.forward(&x0, 0, 0, &mut kv_ref, &backend);
+        let y1_ref = layer.attn.forward(&x1, 1, 0, &mut kv_ref, &backend);
+
+        let mut scratch = MultiHeadSelfAttentionScratch::default();
+        let mut y0_into = Vec::with_capacity(d_model * 2);
+        let out_capacity = y0_into.capacity();
+        layer.attn.forward_into_with_timing(
+            &x0,
+            0,
+            0,
+            &mut kv_into,
+            &backend,
+            &mut scratch,
+            &mut y0_into,
+            None,
+        );
+        assert_eq!(y0_into.capacity(), out_capacity);
+        assert_eq!(y0_into.len(), d_model);
+        for (a, b) in y0_ref.iter().zip(y0_into.iter()) {
+            assert!((a - b).abs() < 1e-5, "forward_into mismatch: {a} vs {b}");
+        }
+
+        let q_capacity = scratch.q.capacity();
+        let k_capacity = scratch.k.capacity();
+        let v_capacity = scratch.v.capacity();
+        let attn_capacity = scratch.attn_out.capacity();
+        let mut y1_into = Vec::with_capacity(d_model * 2);
+        layer.attn.forward_into_with_timing(
+            &x1,
+            1,
+            0,
+            &mut kv_into,
+            &backend,
+            &mut scratch,
+            &mut y1_into,
+            None,
+        );
+        assert_eq!(scratch.q.capacity(), q_capacity);
+        assert_eq!(scratch.k.capacity(), k_capacity);
+        assert_eq!(scratch.v.capacity(), v_capacity);
+        assert_eq!(scratch.attn_out.capacity(), attn_capacity);
+        for (a, b) in y1_ref.iter().zip(y1_into.iter()) {
+            assert!((a - b).abs() < 1e-5, "forward_into mismatch: {a} vs {b}");
+        }
+        assert_eq!(kv_into.seq_len, kv_ref.seq_len);
     }
 
     #[test]
@@ -2055,14 +3245,15 @@ mod tests {
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: identity(d_model),
-            wk: identity(d_model),
-            wv: identity(d_model),
-            wo: identity(d_model),
+            wq: DenseWeight::from_f32(identity(d_model), d_model, d_model),
+            wk: DenseWeight::from_f32(identity(d_model), d_model, d_model),
+            wv: DenseWeight::from_f32(identity(d_model), d_model, d_model),
+            wo: DenseWeight::from_f32(identity(d_model), d_model, d_model),
             window_size: window,
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            rope_cache: None,
             bq: None,
             bk: None,
             bv: None,
@@ -2103,7 +3294,10 @@ mod tests {
         let _ = attn_full.forward(&small, 1, 0, &mut kv2, &cpu_backend());
         let _ = attn_full.forward(&small, 2, 0, &mut kv2, &cpu_backend());
         let y_full = attn_full.forward(&small, 3, 0, &mut kv2, &cpu_backend());
-        assert!(y_full[0] > 0.5, "full attention should see t=0 spike: {y_full:?}");
+        assert!(
+            y_full[0] > 0.5,
+            "full attention should see t=0 spike: {y_full:?}"
+        );
     }
 
     #[test]
@@ -2310,14 +3504,15 @@ mod tests {
             v_head_dim: head_dim,
             attention_value_scale: None,
             rope_base: 10000.0,
-            wq: mk(q_dim, d_model),
-            wk: mk(kv_dim, d_model),
-            wv: mk(kv_dim, d_model),
-            wo: mk(d_model, q_dim),
+            wq: DenseWeight::from_f32(mk(q_dim, d_model), q_dim, d_model),
+            wk: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wv: DenseWeight::from_f32(mk(kv_dim, d_model), kv_dim, d_model),
+            wo: DenseWeight::from_f32(mk(d_model, q_dim), d_model, q_dim),
             window_size: None,
             q_norm: None,
             k_norm: None,
             rope_yarn: None,
+            rope_cache: None,
             bq: None,
             bk: None,
             bv: None,
@@ -2328,7 +3523,11 @@ mod tests {
         // Walk past the first block boundary to exercise multi-block
         // indexing.
         let xs: Vec<Vec<f32>> = (0..(PAGED_BLOCK_TOKENS + 3))
-            .map(|t| (0..d_model).map(|j| 0.05 * (t as f32) + 0.01 * (j as f32)).collect())
+            .map(|t| {
+                (0..d_model)
+                    .map(|j| 0.05 * (t as f32) + 0.01 * (j as f32))
+                    .collect()
+            })
             .collect();
         let mut last = vec![0.0f32; d_model];
         for (pos, x) in xs.iter().enumerate() {

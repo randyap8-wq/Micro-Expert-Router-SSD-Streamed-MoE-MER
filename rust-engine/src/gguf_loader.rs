@@ -25,6 +25,9 @@
 //! (`expert_size` is the same for every expert, the file is page-padded,
 //! and `metadata.json::dtype` correctly describes the contents).
 
+use crate::dense_tensor::{
+    dense_checksum, DenseDType, DenseTensorManifest, DenseTensorManifestEntry,
+};
 use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo, GgufValue};
 use crate::inference::{
     dequantize_f16_to_f32, expert_weight_bytes_for, projection_weight_bytes_for, WeightDtype,
@@ -45,8 +48,9 @@ use tracing::{info, warn};
 pub struct ExtractionReport {
     /// Number of expert files written.
     pub experts_written: usize,
-    /// Number of dense tensors written (`embed.bin`, `final_rms.bin`,
-    /// per-layer attention projections, etc.).
+    /// Number of dense tensor payload files written. Manifest aliases
+    /// such as `embed.bin` / `attn_<L>_q.bin` do not create duplicate
+    /// files and are not counted separately.
     pub dense_written: usize,
     /// Number of tensors the loader skipped (missing in the GGUF, or
     /// an unsupported dtype like Q6_K). The engine falls back to seeded
@@ -691,6 +695,10 @@ fn extract_experts_from_source_inner(
         num_experts_per_layer: num_experts,
         num_layers,
     };
+    let mut dense_manifest = DenseTensorManifest {
+        format_version: 1,
+        tensors: Vec::new(),
+    };
 
     // Walk layers and emit per-expert files. Output dtype is `F32`
     // for the dequant path (legacy default), or whichever 4-bit dtype
@@ -855,115 +863,106 @@ fn extract_experts_from_source_inner(
             "experts-only conversion selected; skipping dense tensor extraction"
         );
     } else {
-        // Dense weights. The engine's `RealModel::from_dir` uses its own
-        // file-name convention (`embed.bin`, `attn_<L>_q.bin`, …), so we
-        // write *both* the gist-mandated llama.cpp-style names and the
-        // engine's native names. The duplicate write is small relative to
-        // the expert files and means the converter satisfies both APIs.
-        let dense_specs: Vec<(&str, &[&str], Vec<u64>)> = vec![
-            // (gguf_name, [engine_aliases...], expected_shape_innermost_first)
+        // Dense weights. Core resident tensors are written once under a
+        // canonical filename and exposed to legacy engine names through
+        // `dense_manifest.json` aliases. Q8_0 tensors keep their native
+        // bytes; other supported GGUF dense dtypes are materialised as f32.
+        let dense_specs: Vec<(&str, Vec<String>)> = vec![
             (
                 "token_embd.weight",
-                &["embedding.bin", "embed.bin"],
-                vec![d_model as u64, 0],
+                vec!["embedding.bin".to_string(), "embed.bin".to_string()],
             ),
             (
                 "output_norm.weight",
-                &["final_norm.bin", "final_rms.bin"],
-                vec![d_model as u64],
+                vec!["final_norm.bin".to_string(), "final_rms.bin".to_string()],
             ),
-            ("output.weight", &["lm_head.bin"], vec![d_model as u64, 0]),
+            ("output.weight", vec!["lm_head.bin".to_string()]),
         ];
-        for (gname, aliases, _) in &dense_specs {
-            if let Some(info) = gguf.tensor_info(gname).cloned() {
-                match dense_tensor_to_f32(gguf, &info) {
-                    Ok(f32s) => {
-                        for alias in *aliases {
-                            let path = out_dir.join(alias);
-                            let bytes = f32_vec_to_le_bytes(&f32s);
-                            write_file(&path, &bytes)?;
-                            report.dense_written += 1;
-                            report.total_bytes += bytes.len() as u64;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(name = gname, error = %e, "skipping dense tensor");
-                        report.skipped += 1;
-                    }
-                }
-            } else {
-                report.skipped += 1;
-            }
+        for (gname, aliases) in dense_specs {
+            emit_dense_manifest_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &mut dense_manifest,
+                gname,
+                aliases,
+            )?;
         }
 
         // Per-layer dense tensors.
         for layer in 0..num_layers {
-            let mut emit = |gname: String, aliases: Vec<String>| -> io::Result<()> {
-                if let Some(info) = gguf.tensor_info(&gname).cloned() {
-                    match dense_tensor_to_f32(gguf, &info) {
-                        Ok(f32s) => {
-                            let bytes = f32_vec_to_le_bytes(&f32s);
-                            for alias in &aliases {
-                                let path = out_dir.join(alias);
-                                write_file(&path, &bytes)?;
-                                report.dense_written += 1;
-                                report.total_bytes += bytes.len() as u64;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(name = gname, error = %e, "skipping per-layer dense tensor");
-                            report.skipped += 1;
-                        }
-                    }
-                } else {
-                    report.skipped += 1;
-                }
-                Ok(())
-            };
-            emit(
-                format!("blk.{layer}.attn_q.weight"),
+            emit_dense_manifest_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &mut dense_manifest,
+                &format!("blk.{layer}.attn_q.weight"),
                 vec![
                     format!("layer_{layer}_q.bin"),
                     format!("attn_{layer}_q.bin"),
                 ],
             )?;
-            emit(
-                format!("blk.{layer}.attn_k.weight"),
+            emit_dense_manifest_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &mut dense_manifest,
+                &format!("blk.{layer}.attn_k.weight"),
                 vec![
                     format!("layer_{layer}_k.bin"),
                     format!("attn_{layer}_k.bin"),
                 ],
             )?;
-            emit(
-                format!("blk.{layer}.attn_v.weight"),
+            emit_dense_manifest_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &mut dense_manifest,
+                &format!("blk.{layer}.attn_v.weight"),
                 vec![
                     format!("layer_{layer}_v.bin"),
                     format!("attn_{layer}_v.bin"),
                 ],
             )?;
-            emit(
-                format!("blk.{layer}.attn_output.weight"),
+            emit_dense_manifest_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &mut dense_manifest,
+                &format!("blk.{layer}.attn_output.weight"),
                 vec![
                     format!("layer_{layer}_o.bin"),
                     format!("attn_{layer}_o.bin"),
                 ],
             )?;
-            emit(
-                format!("blk.{layer}.attn_norm.weight"),
+            emit_dense_manifest_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &mut dense_manifest,
+                &format!("blk.{layer}.attn_norm.weight"),
                 vec![
                     format!("layer_{layer}_attn_norm.bin"),
                     format!("rms_attn_{layer}.bin"),
                 ],
             )?;
-            emit(
-                format!("blk.{layer}.ffn_norm.weight"),
+            emit_dense_manifest_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &mut dense_manifest,
+                &format!("blk.{layer}.ffn_norm.weight"),
                 vec![
                     format!("layer_{layer}_ffn_norm.bin"),
                     format!("rms_moe_{layer}.bin"),
                 ],
             )?;
-            emit(
-                format!("blk.{layer}.ffn_gate_inp.weight"),
+            emit_dense_manifest_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &mut dense_manifest,
+                &format!("blk.{layer}.ffn_gate_inp.weight"),
                 vec![format!("gate_{layer}.bin")],
             )?;
             // Qwen2-MoE-style "shared experts" — dense FFN tensors applied to
@@ -973,23 +972,44 @@ fn extract_experts_from_source_inner(
             // (both the gguf-style name and an engine-friendly alias). Files are
             // only written when the tensor exists, so non-MoE / no-shared-expert
             // architectures (e.g. Mixtral) are unaffected.
-            emit(
-                format!("blk.{layer}.ffn_gate_shexp.weight"),
-                vec![format!("layer_{layer}_shexp_gate.bin")],
+            emit_legacy_f32_dense_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &format!("blk.{layer}.ffn_gate_shexp.weight"),
+                &[format!("layer_{layer}_shexp_gate.bin")],
             )?;
-            emit(
-                format!("blk.{layer}.ffn_up_shexp.weight"),
-                vec![format!("layer_{layer}_shexp_up.bin")],
+            emit_legacy_f32_dense_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &format!("blk.{layer}.ffn_up_shexp.weight"),
+                &[format!("layer_{layer}_shexp_up.bin")],
             )?;
-            emit(
-                format!("blk.{layer}.ffn_down_shexp.weight"),
-                vec![format!("layer_{layer}_shexp_down.bin")],
+            emit_legacy_f32_dense_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &format!("blk.{layer}.ffn_down_shexp.weight"),
+                &[format!("layer_{layer}_shexp_down.bin")],
             )?;
-            emit(
-                format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
-                vec![format!("layer_{layer}_shexp_gate_inp.bin")],
+            emit_legacy_f32_dense_tensor(
+                gguf,
+                out_dir,
+                &mut report,
+                &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+                &[format!("layer_{layer}_shexp_gate_inp.bin")],
             )?;
         }
+        let dense_manifest_path = out_dir.join("dense_manifest.json");
+        let mut f = fs::File::create(&dense_manifest_path)?;
+        serde_json::to_writer_pretty(&mut f, &dense_manifest)?;
+        f.write_all(b"\n")?;
+        info!(
+            path = %dense_manifest_path.display(),
+            tensors = dense_manifest.tensors.len(),
+            "wrote dense manifest"
+        );
     }
 
     // metadata.json
@@ -1050,6 +1070,110 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, bytes)
+}
+
+fn dense_manifest_dims(info: &GgufTensorInfo) -> Option<Vec<usize>> {
+    match info.shape.as_slice() {
+        [n] => Some(vec![*n as usize, 1]),
+        [cols, rows] => Some(vec![*rows as usize, *cols as usize]),
+        _ => None,
+    }
+}
+
+fn dense_manifest_file_name(canonical: &str, dtype: DenseDType) -> String {
+    let mut stem = String::with_capacity(canonical.len());
+    for ch in canonical.chars() {
+        if ch.is_ascii_alphanumeric() {
+            stem.push(ch);
+        } else {
+            stem.push('_');
+        }
+    }
+    format!("dense_{stem}.{}.bin", dtype.as_str())
+}
+
+fn emit_dense_manifest_tensor(
+    gguf: &dyn GgufSource,
+    out_dir: &Path,
+    report: &mut ExtractionReport,
+    manifest: &mut DenseTensorManifest,
+    canonical: &str,
+    aliases: Vec<String>,
+) -> io::Result<()> {
+    let Some(info) = gguf.tensor_info(canonical).cloned() else {
+        report.skipped += 1;
+        return Ok(());
+    };
+    let Some(dims) = dense_manifest_dims(&info) else {
+        warn!(
+            name = canonical,
+            shape = ?info.shape,
+            "skipping dense tensor with unsupported rank"
+        );
+        report.skipped += 1;
+        return Ok(());
+    };
+    let (dtype, bytes) = if info.ggml_dtype == ggml_dtype::Q8_0 {
+        let bytes = gguf.read_tensor_owned(&info.name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tensor {} has no data slice", info.name),
+            )
+        })?;
+        (DenseDType::Q8_0, bytes)
+    } else {
+        match dense_tensor_to_f32(gguf, &info) {
+            Ok(f32s) => (DenseDType::F32, f32_vec_to_le_bytes(&f32s)),
+            Err(err) => {
+                warn!(name = canonical, error = %err, "skipping dense tensor");
+                report.skipped += 1;
+                return Ok(());
+            }
+        }
+    };
+    let file = dense_manifest_file_name(canonical, dtype);
+    let path = out_dir.join(&file);
+    write_file(&path, &bytes)?;
+    report.dense_written += 1;
+    report.total_bytes += bytes.len() as u64;
+    manifest.tensors.push(DenseTensorManifestEntry {
+        canonical_name: canonical.to_string(),
+        file,
+        aliases,
+        dtype,
+        dims,
+        byte_len: bytes.len(),
+        checksum: Some(dense_checksum(&bytes)),
+        tied_to: None,
+    });
+    Ok(())
+}
+
+fn emit_legacy_f32_dense_tensor(
+    gguf: &dyn GgufSource,
+    out_dir: &Path,
+    report: &mut ExtractionReport,
+    canonical: &str,
+    aliases: &[String],
+) -> io::Result<()> {
+    if let Some(info) = gguf.tensor_info(canonical).cloned() {
+        match dense_tensor_to_f32(gguf, &info) {
+            Ok(f32s) => {
+                let bytes = f32_vec_to_le_bytes(&f32s);
+                for alias in aliases {
+                    let path = out_dir.join(alias);
+                    write_file(&path, &bytes)?;
+                    report.dense_written += 1;
+                    report.total_bytes += bytes.len() as u64;
+                }
+            }
+            Err(err) => {
+                warn!(name = canonical, error = %err, "skipping legacy dense tensor");
+                report.skipped += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2418,6 +2542,92 @@ mod tests {
         }
         let got = bytes_to_f32(&bytes, ggml_dtype::F16, 3, "t").unwrap();
         assert_eq!(got, v);
+    }
+
+    #[test]
+    fn dense_manifest_emits_q8_canonical_file_without_alias_duplicate() {
+        struct FakeSource {
+            metadata: std::collections::HashMap<String, GgufValue>,
+            tensors: std::collections::HashMap<String, GgufTensorInfo>,
+            data: std::collections::HashMap<String, Vec<u8>>,
+        }
+        impl GgufSource for FakeSource {
+            fn metadata(&self) -> &std::collections::HashMap<String, GgufValue> {
+                &self.metadata
+            }
+
+            fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
+                self.tensors.get(name)
+            }
+
+            fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+                Ok(self.data.get(name).cloned())
+            }
+        }
+
+        use crate::inference::{quantize_q8_0_block, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 31.0) / 13.0).collect();
+        let mut q8 = vec![0u8; 2 * Q8_0_BLOCK_BYTES];
+        for block in 0..2 {
+            quantize_q8_0_block(
+                &values[block * Q8_0_BLOCK_ELEMS..(block + 1) * Q8_0_BLOCK_ELEMS],
+                &mut q8[block * Q8_0_BLOCK_BYTES..(block + 1) * Q8_0_BLOCK_BYTES],
+            );
+        }
+        let canonical = "token_embd.weight".to_string();
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert(
+            canonical.clone(),
+            GgufTensorInfo {
+                name: canonical.clone(),
+                shape: vec![32, 2],
+                ggml_dtype: ggml_dtype::Q8_0,
+                offset: 0,
+                byte_len: q8.len() as u64,
+            },
+        );
+        let mut data = std::collections::HashMap::new();
+        data.insert(canonical.clone(), q8.clone());
+        let source = FakeSource {
+            metadata: std::collections::HashMap::new(),
+            tensors,
+            data,
+        };
+        let tmp = tempfile_dir();
+        let mut report = ExtractionReport {
+            experts_written: 0,
+            dense_written: 0,
+            skipped: 0,
+            total_bytes: 0,
+            expert_dtype: WeightDtype::F32,
+            d_model: 32,
+            d_ff: 0,
+            num_experts_per_layer: 0,
+            num_layers: 0,
+        };
+        let mut manifest = DenseTensorManifest {
+            format_version: 1,
+            tensors: Vec::new(),
+        };
+        emit_dense_manifest_tensor(
+            &source,
+            &tmp,
+            &mut report,
+            &mut manifest,
+            &canonical,
+            vec!["embed.bin".to_string(), "embedding.bin".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(report.dense_written, 1);
+        assert_eq!(manifest.tensors.len(), 1);
+        let entry = &manifest.tensors[0];
+        assert_eq!(entry.dtype, DenseDType::Q8_0);
+        assert_eq!(entry.dims, vec![2, 32]);
+        assert_eq!(entry.checksum.as_ref().unwrap(), &dense_checksum(&q8));
+        assert_eq!(fs::read(tmp.join(&entry.file)).unwrap(), q8);
+        assert!(!tmp.join("embed.bin").exists());
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     /// Smoke-test the full extraction path against a synthetic 1-layer,

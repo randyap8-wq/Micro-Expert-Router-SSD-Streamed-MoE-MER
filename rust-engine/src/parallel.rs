@@ -55,7 +55,107 @@
 //! free for async work by default. An explicit `RAYON_NUM_THREADS` is
 //! treated as an operator override and wins.
 
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::{info, warn};
+
+/// Dense matrix-vector backend selected for `transformer::matmul_row_major`.
+///
+/// `Auto` preserves the historical build defaults: binaries built with
+/// `--features blas` use the serial `matrixmultiply` microkernel, while
+/// other binaries use the always-compiled Rayon row-parallel reference path.
+/// Operators can override this at runtime through
+/// `[real_transformer].dense_matvec_backend`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "kebab-case")]
+pub enum DenseMatvecBackend {
+    #[default]
+    Auto = 0,
+    /// One tuned `matrixmultiply::sgemm` call for the whole output.
+    Matrixmultiply = 1,
+    /// Row-parallel dot products via the shared Rayon pool and CPU kernels.
+    Rayon = 2,
+    /// Contiguous row chunks, each computed by one `matrixmultiply::sgemm`.
+    RayonMatrixmultiply = 3,
+}
+
+impl DenseMatvecBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Matrixmultiply => "matrixmultiply",
+            Self::Rayon => "rayon",
+            Self::RayonMatrixmultiply => "rayon-matrixmultiply",
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Matrixmultiply,
+            2 => Self::Rayon,
+            3 => Self::RayonMatrixmultiply,
+            _ => Self::Auto,
+        }
+    }
+
+    const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+impl fmt::Display for DenseMatvecBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DenseMatvecBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "matrixmultiply" | "serial-matrixmultiply" | "sgemm" => Ok(Self::Matrixmultiply),
+            "rayon" | "row-parallel" | "parallel" => Ok(Self::Rayon),
+            "rayon-matrixmultiply"
+            | "rayon_matrixmultiply"
+            | "chunked-matrixmultiply"
+            | "rayon-chunked-matrixmultiply"
+            | "chunked-sgemm" => Ok(Self::RayonMatrixmultiply),
+            other => Err(format!(
+                "unknown dense matvec backend {other:?}; expected auto, matrixmultiply, rayon, or rayon-matrixmultiply"
+            )),
+        }
+    }
+}
+
+static DENSE_MATVEC_BACKEND: AtomicU8 = AtomicU8::new(DenseMatvecBackend::Auto.code());
+
+pub fn set_dense_matvec_backend(backend: DenseMatvecBackend) {
+    DENSE_MATVEC_BACKEND.store(backend.code(), Ordering::Relaxed);
+    info!(backend = backend.as_str(), "dense matvec backend selected");
+}
+
+#[inline]
+pub fn dense_matvec_backend() -> DenseMatvecBackend {
+    DenseMatvecBackend::from_code(DENSE_MATVEC_BACKEND.load(Ordering::Relaxed))
+}
+
+#[inline]
+pub fn in_rayon_worker() -> bool {
+    rayon::current_thread_index().is_some()
+}
+
+pub fn default_dense_matvec_backend() -> DenseMatvecBackend {
+    if cfg!(feature = "blas") {
+        DenseMatvecBackend::Matrixmultiply
+    } else {
+        DenseMatvecBackend::Rayon
+    }
+}
 
 /// Below this many multiply-accumulates (`rows * cols`) a matmul runs
 /// inline on the calling thread. The fork-join handshake costs more than
@@ -208,8 +308,11 @@ where
     let total = rows.saturating_mul(cols.max(1));
     let nthreads = num_threads();
 
-    // Inline fast path: not enough work, nothing to split, or no pool.
-    if rows <= 1 || nthreads <= 1 || total < MIN_TOTAL_FOR_PARALLEL {
+    // Inline fast path: not enough work, nothing to split, no pool, or
+    // this call is already executing on a Rayon worker. The last guard
+    // prevents nested Rayon fan-out, keeping token-level compute at one
+    // explicit parallelism level.
+    if rows <= 1 || nthreads <= 1 || total < MIN_TOTAL_FOR_PARALLEL || in_rayon_worker() {
         f(0, out);
         return;
     }
@@ -239,7 +342,25 @@ mod tests {
     use super::*;
 
     fn build_test_pool(threads: usize) -> rayon::ThreadPool {
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap()
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn dense_matvec_backend_names_parse() {
+        assert_eq!("auto".parse(), Ok(DenseMatvecBackend::Auto));
+        assert_eq!(
+            "matrixmultiply".parse(),
+            Ok(DenseMatvecBackend::Matrixmultiply)
+        );
+        assert_eq!("row-parallel".parse(), Ok(DenseMatvecBackend::Rayon));
+        assert_eq!(
+            "rayon-chunked-matrixmultiply".parse(),
+            Ok(DenseMatvecBackend::RayonMatrixmultiply)
+        );
+        assert!("unknown".parse::<DenseMatvecBackend>().is_err());
     }
 
     /// Reference row-major mat-vec used as the parity oracle.
@@ -268,11 +389,12 @@ mod tests {
     fn matches_serial_across_sizes() {
         // Span the inline path (tiny), the boundary, and the fanned-out
         // path (large) to exercise both branches and the chunk seam.
-        let pool = build_test_pool(4);
         for &(rows, cols) in &[(1usize, 1usize), (3, 5), (64, 64), (1024, 512), (4096, 256)] {
-            let w: Vec<f32> = (0..rows * cols).map(|i| ((i % 17) as f32) * 0.01 - 0.5).collect();
+            let w: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i % 17) as f32) * 0.01 - 0.5)
+                .collect();
             let x: Vec<f32> = (0..cols).map(|i| ((i % 13) as f32) * 0.1 - 0.3).collect();
-            let got = pool.install(|| par_matvec(&w, &x, rows, cols));
+            let got = par_matvec(&w, &x, rows, cols);
             let want = serial_matvec(&w, &x, rows, cols);
             assert_eq!(got.len(), want.len());
             for (g, e) in got.iter().zip(want.iter()) {
@@ -288,14 +410,11 @@ mod tests {
         // index, so any double-write or skipped row would corrupt it.
         let rows = 1000usize;
         let mut out = vec![usize::MAX; rows];
-        let pool = build_test_pool(4);
-        pool.install(|| {
-            // Force the parallel path regardless of arithmetic width.
-            par_row_chunks(&mut out, MIN_TOTAL_FOR_PARALLEL, |row_start, chunk| {
-                for (i, slot) in chunk.iter_mut().enumerate() {
-                    *slot = row_start + i;
-                }
-            });
+        // Force the parallel path regardless of arithmetic width.
+        par_row_chunks(&mut out, MIN_TOTAL_FOR_PARALLEL, |row_start, chunk| {
+            for (i, slot) in chunk.iter_mut().enumerate() {
+                *slot = row_start + i;
+            }
         });
         for (i, v) in out.iter().enumerate() {
             assert_eq!(*v, i, "row {i} was not written exactly once");
@@ -323,6 +442,30 @@ mod tests {
     }
 
     #[test]
+    fn nested_rayon_worker_uses_inline_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let pool = build_test_pool(4);
+        let mut out = vec![usize::MAX; 1024];
+        pool.install(|| {
+            par_row_chunks(&mut out, MIN_TOTAL_FOR_PARALLEL, |row_start, chunk| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                for (i, slot) in chunk.iter_mut().enumerate() {
+                    *slot = row_start + i;
+                }
+            });
+        });
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "nested Rayon calls must not fan out again"
+        );
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(*v, i, "row {i} was not written exactly once");
+        }
+    }
+
+    #[test]
     fn default_threads_reserve_async_headroom() {
         // Tiny hosts keep every core — compute is already scarce.
         assert_eq!(default_compute_threads(1), 1);
@@ -335,7 +478,7 @@ mod tests {
         assert_eq!(default_compute_threads(9), 7);
         assert_eq!(default_compute_threads(16), 14);
         assert_eq!(default_compute_threads(32), 30); // the 32-vCPU reference box
-        // ...growing by one per additional sixteen cores.
+                                                     // ...growing by one per additional sixteen cores.
         assert_eq!(default_compute_threads(48), 45);
         assert_eq!(default_compute_threads(64), 60);
         assert_eq!(default_compute_threads(128), 120);
@@ -349,8 +492,14 @@ mod tests {
         for n in 1..=256 {
             let t = default_compute_threads(n);
             assert!(t >= 1, "n={n}: pool must keep at least one worker");
-            assert!(t <= n, "n={n}: cannot use more than {n} logical cores (got {t})");
-            assert!(t >= prev, "n={n}: compute threads went backwards {prev}->{t}");
+            assert!(
+                t <= n,
+                "n={n}: cannot use more than {n} logical cores (got {t})"
+            );
+            assert!(
+                t >= prev,
+                "n={n}: compute threads went backwards {prev}->{t}"
+            );
             prev = t;
         }
     }

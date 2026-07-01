@@ -16,10 +16,13 @@
 //!    files (one per tensor) and falls back to a deterministic seeded
 //!    initialisation when files are missing, so the engine always has an
 //!    end-to-end runnable path even without real model files.
-//! 4. [`RealModel::step`] — the per-token forward driver. Produces the
-//!    next-token id by running embedding → stacked layers (each calling
-//!    `attn_block`, `moe_pre`, awaiting the engine's SSD-streamed
-//!    `moe_step`, then `moe_combine`) → final RMSNorm → LM head → argmax.
+//! 4. [`RealModel::forward_token_hidden`] / [`RealModel::sample_hidden`]
+//!    — the split per-token API. Prompt ingestion runs embedding →
+//!    stacked layers (each calling `attn_block`, `moe_pre`, awaiting
+//!    the engine's SSD-streamed `moe_step`, then `moe_combine`) → final
+//!    RMSNorm and returns the final hidden state. Decode then samples
+//!    that hidden state through the LM head only when a next-token
+//!    prediction is actually needed.
 //!
 //! Multi-layer expert addressing: when `num_layers > 1`, expert ids on
 //! disk are encoded as `global_id = layer * num_experts_per_layer +
@@ -33,16 +36,20 @@
 //! is the default because it lets the existing engine instrumentation
 //! and prefetcher keep working without per-layer sharding.
 
-use crate::engine::Engine;
 use crate::architecture::{
     Architecture, ComputeSupport, FfnKind, MlaDims, RopeScaling, TensorNaming,
 };
+use crate::dense_tensor::{dense_checksum, DenseDType, DenseTensorManifest, DenseWeight};
+use crate::engine::Engine;
 use crate::gating::{LinearGate, ScoringFunc};
 use crate::mla::MultiHeadLatentAttention;
 use crate::transformer::{
-    KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, SharedExpert, TransformerLayer, YarnRope,
+    KvCache, LMHead, MultiHeadSelfAttention, RmsNorm, RopeCache, SharedExpert, TransformerLayer,
+    YarnRope,
 };
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -189,6 +196,171 @@ pub struct RealModelConfig {
     /// Mixtral/Qwen3 behaviour; populated from `config.json` for DeepSeek.
     pub advanced: AdvancedConfig,
 }
+
+/// Options that control how on-disk resident transformer weights are
+/// interpreted. The default preserves the historical "best effort"
+/// loader: missing dense tensors keep their deterministic seeded values.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RealModelLoadOptions {
+    /// When enabled, every required resident tensor for the selected
+    /// architecture must be present, decodable and shape-compatible. The
+    /// loader returns one aggregate error instead of retaining seeded
+    /// fallback values for any required tensor.
+    pub strict_weights: bool,
+}
+
+const GROUP_EMBEDDING: &str = "embedding";
+const GROUP_ATTENTION: &str = "attention";
+const GROUP_NORMS: &str = "norms";
+const GROUP_ROUTING_GATES: &str = "routing_gates";
+const GROUP_LM_HEAD: &str = "lm_head";
+const GROUP_SHARED_FFN: &str = "shared_ffn";
+const GROUP_DENSE_FFN: &str = "dense_ffn";
+
+#[derive(Debug, Clone, Default)]
+struct WeightLoadSummary {
+    by_group: BTreeMap<&'static str, WeightLoadBucket>,
+    by_dtype: BTreeMap<String, WeightLoadBucket>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WeightLoadBucket {
+    tensors: usize,
+    resident_bytes: u64,
+}
+
+impl WeightLoadSummary {
+    fn record(&mut self, group: &'static str, dtype: impl Into<String>, resident_bytes: usize) {
+        let resident_bytes = resident_bytes as u64;
+        let group_bucket = self.by_group.entry(group).or_default();
+        group_bucket.tensors += 1;
+        group_bucket.resident_bytes += resident_bytes;
+
+        let dtype_bucket = self.by_dtype.entry(dtype.into()).or_default();
+        dtype_bucket.tensors += 1;
+        dtype_bucket.resident_bytes += resident_bytes;
+    }
+}
+
+/// A strict checkpoint-load failure category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightLoadFailureKind {
+    Missing,
+    Unreadable,
+    Malformed,
+    ShapeMismatch,
+    Unsupported,
+}
+
+impl WeightLoadFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
+            Self::Malformed => "malformed",
+            Self::ShapeMismatch => "shape_mismatch",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// One required tensor that failed strict checkpoint validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightLoadFailure {
+    pub tensor: String,
+    pub group: &'static str,
+    pub kind: WeightLoadFailureKind,
+    pub expected: String,
+    pub actual: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl WeightLoadFailure {
+    fn missing(
+        tensor: impl Into<String>,
+        group: &'static str,
+        expected: impl Into<String>,
+    ) -> Self {
+        Self {
+            tensor: tensor.into(),
+            group,
+            kind: WeightLoadFailureKind::Missing,
+            expected: expected.into(),
+            actual: None,
+            detail: None,
+        }
+    }
+
+    fn unsupported(
+        tensor: impl Into<String>,
+        group: &'static str,
+        expected: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            tensor: tensor.into(),
+            group,
+            kind: WeightLoadFailureKind::Unsupported,
+            expected: expected.into(),
+            actual: None,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+/// Aggregate strict-load error. Keeping the individual failures attached
+/// lets startup callers and tests inspect the structured inventory instead
+/// of scraping a log line.
+#[derive(Debug, Clone)]
+pub struct StrictWeightLoadError {
+    dir: PathBuf,
+    failures: Vec<WeightLoadFailure>,
+}
+
+impl StrictWeightLoadError {
+    fn new(dir: &Path, failures: Vec<WeightLoadFailure>) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            failures,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn failures(&self) -> &[WeightLoadFailure] {
+        &self.failures
+    }
+}
+
+impl fmt::Display for StrictWeightLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "strict weight load failed for {} ({} failures):",
+            self.dir.display(),
+            self.failures.len()
+        )?;
+        for failure in &self.failures {
+            write!(
+                f,
+                "- tensor={} group={} kind={} expected={}",
+                failure.tensor,
+                failure.group,
+                failure.kind.as_str(),
+                failure.expected
+            )?;
+            if let Some(actual) = &failure.actual {
+                write!(f, " actual={actual}")?;
+            }
+            if let Some(detail) = &failure.detail {
+                write!(f, " detail={detail}")?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for StrictWeightLoadError {}
 
 impl RealModelConfig {
     /// Tiny default useful for tests / smoke runs (d_model=32, 1 layer).
@@ -425,7 +597,9 @@ impl RealModelConfig {
             // `default_swa_window()` returns `None` for every non-hybrid
             // family, so this fallback only ever activates for MiMo-V2 and
             // GPT-OSS — legacy families keep their explicit window (or none).
-            window_size: hf.sliding_window.or_else(|| hf.architecture.default_swa_window()),
+            window_size: hf
+                .sliding_window
+                .or_else(|| hf.architecture.default_swa_window()),
             architecture: hf.architecture,
             first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
             advanced,
@@ -438,10 +612,52 @@ impl RealModelConfig {
 /// stays resident in RAM.
 pub struct RealModel {
     pub config: RealModelConfig,
-    pub embedding: Vec<f32>, // [vocab_size, d_model]
+    pub embedding: DenseWeight, // [vocab_size, d_model]
     pub layers: Vec<TransformerLayer>,
     pub final_rms: RmsNorm,
     pub lm_head: LMHead,
+}
+
+type RopeCacheKey = (usize, u32, u8, u64);
+
+fn rope_cache_hash_yarn(yarn: Option<&YarnRope>) -> u64 {
+    let Some(yarn) = yarn else {
+        return 0;
+    };
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |bits: u32| {
+        h ^= bits as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(yarn.attn_factor.to_bits());
+    for &freq in &yarn.inv_freq {
+        mix(freq.to_bits());
+    }
+    h
+}
+
+fn rope_cache_key(rope_dim: usize, base: f32, yarn: Option<&YarnRope>) -> RopeCacheKey {
+    (
+        rope_dim,
+        base.to_bits(),
+        u8::from(yarn.is_some()),
+        rope_cache_hash_yarn(yarn),
+    )
+}
+
+fn shared_rope_cache(
+    caches: &mut BTreeMap<RopeCacheKey, Arc<RopeCache>>,
+    rope_dim: usize,
+    base: f32,
+    yarn: Option<&YarnRope>,
+) -> Option<Arc<RopeCache>> {
+    let key = rope_cache_key(rope_dim, base, yarn);
+    if let Some(cache) = caches.get(&key) {
+        return Some(cache.clone());
+    }
+    let cache = Arc::new(RopeCache::new(rope_dim, base, yarn)?);
+    caches.insert(key, cache.clone());
+    Some(cache)
 }
 
 impl RealModel {
@@ -452,7 +668,11 @@ impl RealModel {
     pub fn new_seeded(config: RealModelConfig, seed: u64) -> Self {
         config.validate().expect("invalid RealModelConfig");
         let mut rng = SplitMix64::new(seed);
-        let embedding = sample_uniform_vec(&mut rng, config.vocab_size * config.d_model, 0.04);
+        let embedding = DenseWeight::from_f32(
+            sample_uniform_vec(&mut rng, config.vocab_size * config.d_model, 0.04),
+            config.vocab_size,
+            config.d_model,
+        );
 
         let q_dim = config.num_heads * config.head_dim;
         // V projection / output-projection widths use `v_head_dim`, which
@@ -481,6 +701,7 @@ impl RealModel {
             }
         };
 
+        let mut rope_caches = BTreeMap::new();
         let layers: Vec<TransformerLayer> = (0..config.num_layers)
             .map(|layer_idx| {
                 let (q_norm, k_norm) = seed_qk_norm();
@@ -513,13 +734,11 @@ impl RealModel {
                 // `num_kv_heads` (4); `num_heads` is the same for both. All
                 // other architectures leave `swa_num_key_value_heads = None`,
                 // so every layer uses `num_kv_heads` (zero behaviour change).
-                let layer_num_kv_heads = match (
-                    layer_window,
-                    config.advanced.swa_num_key_value_heads,
-                ) {
-                    (Some(_), Some(swa_kv)) => swa_kv, // SWA layer
-                    _ => config.num_kv_heads,          // global layer / no override
-                };
+                let layer_num_kv_heads =
+                    match (layer_window, config.advanced.swa_num_key_value_heads) {
+                        (Some(_), Some(swa_kv)) => swa_kv, // SWA layer
+                        _ => config.num_kv_heads,          // global layer / no override
+                    };
                 let layer_kv_dim = layer_num_kv_heads * config.head_dim;
                 let layer_v_proj_dim = layer_num_kv_heads * v_head_dim;
                 // YaRN long-context RoPE scaling for the standard
@@ -530,57 +749,96 @@ impl RealModel {
                     .rope_scaling
                     .as_ref()
                     .and_then(|s| YarnRope::from_scaling(rope_dim, layer_rope_base, s));
-                TransformerLayer {
-                rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
-                attn: MultiHeadSelfAttention {
-                    d_model: config.d_model,
-                    num_heads: config.num_heads,
-                    num_kv_heads: layer_num_kv_heads,
-                    head_dim: config.head_dim,
+                let rope_cache = shared_rope_cache(
+                    &mut rope_caches,
                     rope_dim,
-                    v_head_dim,
-                    attention_value_scale: config.advanced.attention_value_scale,
-                    rope_base: layer_rope_base,
-                    wq: sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
-                    wk: sample_uniform_vec(&mut rng, layer_kv_dim * config.d_model, proj_scale),
-                    wv: sample_uniform_vec(&mut rng, layer_v_proj_dim * config.d_model, proj_scale),
-                    wo: sample_uniform_vec(&mut rng, config.d_model * attn_out_dim, proj_scale),
-                    window_size: layer_window,
-                    q_norm,
-                    k_norm,
-                    rope_yarn,
-                    // Attention projection biases (GPT-OSS `attention_bias`)
-                    // are seeded absent; the on-disk loader populates them
-                    // when the checkpoint sets `attention_bias = true`.
-                    bq: None,
-                    bk: None,
-                    bv: None,
-                    bo: None,
-                    // Attention sink bias (MiMo-V2-Flash) is seeded absent;
-                    // the on-disk loader populates it on SWA layers when the
-                    // checkpoint sets `add_swa_attention_sink_bias = true`.
-                    sink_bias: None,
-                },
-                mla,
-                rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
-                gate: LinearGate::new(
-                    sample_uniform_vec(&mut rng, config.num_experts * config.d_model, proj_scale),
-                    config.num_experts,
-                    config.d_model,
-                    config.top_k,
-                ),
-                // Shared experts are an optional, architecture-specific
-                // tensor (Qwen2-MoE / DeepSeek-MoE). The seeded fallback
-                // leaves them absent so non-shared-expert models and the
-                // synthetic smoke path behave identically to before; real
-                // shared experts are populated by the on-disk loaders.
-                shared_expert: None,
-                // Dense FFN (Mistral Small 3 / Phi-4 / DeepSeek dense
-                // prefix). Populated by the on-disk loaders for dense
-                // layers; `None` means this layer routes to streamed
-                // experts (Mixtral / Qwen3-MoE / DeepSeek sparse layers).
-                dense_ffn: None,
-            }
+                    layer_rope_base,
+                    rope_yarn.as_ref(),
+                );
+                TransformerLayer {
+                    rms_attn: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
+                    attn: MultiHeadSelfAttention {
+                        d_model: config.d_model,
+                        num_heads: config.num_heads,
+                        num_kv_heads: layer_num_kv_heads,
+                        head_dim: config.head_dim,
+                        rope_dim,
+                        v_head_dim,
+                        attention_value_scale: config.advanced.attention_value_scale,
+                        rope_base: layer_rope_base,
+                        wq: DenseWeight::from_f32(
+                            sample_uniform_vec(&mut rng, q_dim * config.d_model, proj_scale),
+                            q_dim,
+                            config.d_model,
+                        ),
+                        wk: DenseWeight::from_f32(
+                            sample_uniform_vec(
+                                &mut rng,
+                                layer_kv_dim * config.d_model,
+                                proj_scale,
+                            ),
+                            layer_kv_dim,
+                            config.d_model,
+                        ),
+                        wv: DenseWeight::from_f32(
+                            sample_uniform_vec(
+                                &mut rng,
+                                layer_v_proj_dim * config.d_model,
+                                proj_scale,
+                            ),
+                            layer_v_proj_dim,
+                            config.d_model,
+                        ),
+                        wo: DenseWeight::from_f32(
+                            sample_uniform_vec(
+                                &mut rng,
+                                config.d_model * attn_out_dim,
+                                proj_scale,
+                            ),
+                            config.d_model,
+                            attn_out_dim,
+                        ),
+                        window_size: layer_window,
+                        q_norm,
+                        k_norm,
+                        rope_yarn,
+                        rope_cache,
+                        // Attention projection biases (GPT-OSS `attention_bias`)
+                        // are seeded absent; the on-disk loader populates them
+                        // when the checkpoint sets `attention_bias = true`.
+                        bq: None,
+                        bk: None,
+                        bv: None,
+                        bo: None,
+                        // Attention sink bias (MiMo-V2-Flash) is seeded absent;
+                        // the on-disk loader populates it on SWA layers when the
+                        // checkpoint sets `add_swa_attention_sink_bias = true`.
+                        sink_bias: None,
+                    },
+                    mla,
+                    rms_moe: RmsNorm::new(vec![1.0; config.d_model], config.rms_eps),
+                    gate: LinearGate::new(
+                        sample_uniform_vec(
+                            &mut rng,
+                            config.num_experts * config.d_model,
+                            proj_scale,
+                        ),
+                        config.num_experts,
+                        config.d_model,
+                        config.top_k,
+                    ),
+                    // Shared experts are an optional, architecture-specific
+                    // tensor (Qwen2-MoE / DeepSeek-MoE). The seeded fallback
+                    // leaves them absent so non-shared-expert models and the
+                    // synthetic smoke path behave identically to before; real
+                    // shared experts are populated by the on-disk loaders.
+                    shared_expert: None,
+                    // Dense FFN (Mistral Small 3 / Phi-4 / DeepSeek dense
+                    // prefix). Populated by the on-disk loaders for dense
+                    // layers; `None` means this layer routes to streamed
+                    // experts (Mixtral / Qwen3-MoE / DeepSeek sparse layers).
+                    dense_ffn: None,
+                }
             })
             .collect();
         let final_rms = RmsNorm::new(vec![1.0; config.d_model], config.rms_eps);
@@ -589,7 +847,13 @@ impl RealModel {
             config.vocab_size,
             config.d_model,
         );
-        Self { config, embedding, layers, final_rms, lm_head }
+        Self {
+            config,
+            embedding,
+            layers,
+            final_rms,
+            lm_head,
+        }
     }
 
     /// Try to load weights from `dir`, populating any tensor present in
@@ -610,47 +874,60 @@ impl RealModel {
         dir: &Path,
         seed: u64,
     ) -> Result<Self, std::io::Error> {
+        Self::from_dir_with_options(config, dir, seed, RealModelLoadOptions::default())
+    }
+
+    /// Like [`Self::from_dir`], with opt-in strict validation for
+    /// production checkpoint loading.
+    pub fn from_dir_with_options(
+        config: RealModelConfig,
+        dir: &Path,
+        seed: u64,
+        options: RealModelLoadOptions,
+    ) -> Result<Self, std::io::Error> {
         config
             .validate()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let mut model = Self::new_seeded(config.clone(), seed);
+        let naming = config.tensor_naming();
         let mut loaded = 0usize;
         let mut tried = 0usize;
-
-        let try_load = |name: &str, expected: usize| -> Option<Vec<f32>> {
-            let path = dir.join(name);
-            if !path.is_file() {
-                return None;
-            }
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let n = bytes.len() / 4;
-                    if n < expected {
-                        warn!(
-                            file = %path.display(),
-                            have = n,
-                            need = expected,
-                            "weight file shorter than expected; falling back to seeded init"
-                        );
-                        return None;
-                    }
-                    let mut floats = Vec::with_capacity(expected);
-                    for chunk in bytes[..expected * 4].chunks_exact(4) {
-                        floats.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                    }
-                    Some(floats)
-                }
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "weight file read failed");
-                    None
-                }
-            }
-        };
+        let mut summary = WeightLoadSummary::default();
+        let mut failures = Vec::new();
+        let dense_manifest = load_dense_manifest(dir);
 
         macro_rules! maybe {
-            ($name:expr, $expected:expr, $assign:expr) => {{
+            ($group:expr, $name:expr, $expected:expr, $assign:expr) => {{
                 tried += 1;
-                if let Some(v) = try_load($name, $expected) {
+                if let Some(v) = try_load_resident_f32(
+                    dir,
+                    dense_manifest.as_ref(),
+                    $name,
+                    $expected,
+                    $group,
+                    options.strict_weights,
+                    &mut failures,
+                    &mut summary,
+                ) {
+                    $assign(v);
+                    loaded += 1;
+                }
+            }};
+        }
+        macro_rules! maybe_dense {
+            ($group:expr, $name:expr, $rows:expr, $cols:expr, $assign:expr) => {{
+                tried += 1;
+                if let Some(v) = try_load_dense_weight(
+                    dir,
+                    dense_manifest.as_ref(),
+                    $name,
+                    $rows,
+                    $cols,
+                    $group,
+                    options.strict_weights,
+                    &mut failures,
+                    &mut summary,
+                ) {
                     $assign(v);
                     loaded += 1;
                 }
@@ -660,13 +937,25 @@ impl RealModel {
         let d_model = config.d_model;
         let q_dim = config.num_heads * config.head_dim;
 
-        maybe!("embed.bin", config.vocab_size * d_model, |v| model.embedding = v);
-        maybe!("final_rms.bin", d_model, |v| {
+        maybe_dense!(
+            GROUP_EMBEDDING,
+            "embed.bin",
+            config.vocab_size,
+            d_model,
+            |v| model.embedding = v
+        );
+        maybe!(GROUP_NORMS, "final_rms.bin", d_model, |v| {
             model.final_rms = RmsNorm::new(v, config.rms_eps);
         });
-        maybe!("lm_head.bin", config.vocab_size * d_model, |v| {
-            model.lm_head = LMHead::new(v, config.vocab_size, d_model);
-        });
+        maybe_dense!(
+            GROUP_LM_HEAD,
+            "lm_head.bin",
+            config.vocab_size,
+            d_model,
+            |v| {
+                model.lm_head = LMHead::from_dense(v, config.vocab_size, d_model);
+            }
+        );
         for l in 0..config.num_layers {
             // Per-layer K/V projection widths. MiMo-V2-Flash SWA layers use a
             // different KV-head count than global layers; `new_seeded` already
@@ -674,32 +963,89 @@ impl RealModel {
             // tensor lengths from the seeded attention struct.
             let kv_dim = model.layers[l].attn.kv_dim();
             let v_proj_dim = model.layers[l].attn.v_proj_dim();
-            maybe!(&format!("rms_attn_{l}.bin"), d_model, |v| {
+            maybe!(GROUP_NORMS, &format!("rms_attn_{l}.bin"), d_model, |v| {
                 model.layers[l].rms_attn = RmsNorm::new(v, config.rms_eps);
             });
-            maybe!(&format!("rms_moe_{l}.bin"), d_model, |v| {
+            maybe!(GROUP_NORMS, &format!("rms_moe_{l}.bin"), d_model, |v| {
                 model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps);
             });
-            maybe!(&format!("attn_{l}_q.bin"), q_dim * d_model, |v| {
-                model.layers[l].attn.wq = v;
-            });
-            maybe!(&format!("attn_{l}_k.bin"), kv_dim * d_model, |v| {
-                model.layers[l].attn.wk = v;
-            });
-            maybe!(&format!("attn_{l}_v.bin"), v_proj_dim * d_model, |v| {
-                model.layers[l].attn.wv = v;
-            });
-            maybe!(&format!("attn_{l}_o.bin"), d_model * q_dim, |v| {
-                model.layers[l].attn.wo = v;
-            });
-            maybe!(&format!("gate_{l}.bin"), config.num_experts * d_model, |v| {
-                model.layers[l].gate = LinearGate::new(
-                    v,
+            maybe_dense!(
+                GROUP_ATTENTION,
+                &format!("attn_{l}_q.bin"),
+                q_dim,
+                d_model,
+                |v| {
+                    model.layers[l].attn.wq = v;
+                }
+            );
+            maybe_dense!(
+                GROUP_ATTENTION,
+                &format!("attn_{l}_k.bin"),
+                kv_dim,
+                d_model,
+                |v| {
+                    model.layers[l].attn.wk = v;
+                }
+            );
+            maybe_dense!(
+                GROUP_ATTENTION,
+                &format!("attn_{l}_v.bin"),
+                v_proj_dim,
+                d_model,
+                |v| {
+                    model.layers[l].attn.wv = v;
+                }
+            );
+            maybe_dense!(
+                GROUP_ATTENTION,
+                &format!("attn_{l}_o.bin"),
+                d_model,
+                q_dim,
+                |v| {
+                    model.layers[l].attn.wo = v;
+                }
+            );
+            if config.architecture.uses_qk_norm() && options.strict_weights {
+                failures.push(WeightLoadFailure::unsupported(
+                    format!("q_norm_{l}.bin"),
+                    GROUP_NORMS,
+                    format!("{} f32 elements", config.head_dim),
+                    "raw .bin loader does not define QK-Norm tensor files; use .safetensors",
+                ));
+                failures.push(WeightLoadFailure::unsupported(
+                    format!("k_norm_{l}.bin"),
+                    GROUP_NORMS,
+                    format!("{} f32 elements", config.head_dim),
+                    "raw .bin loader does not define QK-Norm tensor files; use .safetensors",
+                ));
+            }
+            if model.layers[l].mla.is_some() && options.strict_weights {
+                failures.push(WeightLoadFailure::unsupported(
+                    format!("mla_layer_{l}"),
+                    GROUP_ATTENTION,
+                    "DeepSeek MLA projection stack",
+                    "raw .bin loader does not define MLA tensor files; use .safetensors",
+                ));
+            }
+            if naming.ffn_kind(l) == FfnKind::Moe {
+                maybe_dense!(
+                    GROUP_ROUTING_GATES,
+                    &format!("gate_{l}.bin"),
                     config.num_experts,
                     d_model,
-                    config.top_k,
+                    |v| {
+                        model.layers[l].gate =
+                            LinearGate::from_dense(v, config.num_experts, d_model, config.top_k);
+                    }
                 );
-            });
+            } else if options.strict_weights {
+                failures.push(WeightLoadFailure::unsupported(
+                    format!("dense_ffn_{l}"),
+                    GROUP_DENSE_FFN,
+                    "resident dense FFN projections",
+                    "raw .bin loader does not define dense FFN tensor files; use .safetensors",
+                ));
+            }
             // Optional Qwen2-MoE / DeepSeek-MoE shared expert. The shared
             // expert's intermediate size is independent of the routed
             // `d_ff`, so we infer it from the on-disk tensor length
@@ -708,15 +1054,28 @@ impl RealModel {
             // `layer_{l}_shexp_*` names; absence (Mixtral) is a no-op.
             tried += 1;
             if let Some(se) = Self::load_shared_expert_bin(dir, l, d_model) {
+                let resident_bytes =
+                    (se.weights.len() + se.gate_inp.as_ref().map(|g| g.len()).unwrap_or(0)) * 4;
                 model.layers[l].shared_expert = Some(se);
+                summary.record(GROUP_SHARED_FFN, "f32", resident_bytes);
                 loaded += 1;
             }
+        }
+        if options.strict_weights && !failures.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                StrictWeightLoadError::new(dir, failures),
+            ));
         }
         info!(
             dir = %dir.display(),
             loaded,
             tried,
-            "real transformer weights loaded (missing tensors fell back to seeded init)"
+            strict_weights = options.strict_weights,
+            fallback_seeded = !options.strict_weights,
+            weight_groups = ?summary.by_group,
+            weight_dtypes = ?summary.by_dtype,
+            "real transformer weights loaded"
         );
         Ok(model)
     }
@@ -819,6 +1178,17 @@ impl RealModel {
         config: RealModelConfig,
         dir: &Path,
         seed: u64,
+    ) -> Result<Self, std::io::Error> {
+        Self::from_safetensors_with_options(config, dir, seed, RealModelLoadOptions::default())
+    }
+
+    /// Like [`Self::from_safetensors`], with opt-in strict validation for
+    /// production checkpoint loading.
+    pub fn from_safetensors_with_options(
+        config: RealModelConfig,
+        dir: &Path,
+        seed: u64,
+        options: RealModelLoadOptions,
     ) -> Result<Self, std::io::Error> {
         config
             .validate()
@@ -992,17 +1362,25 @@ impl RealModel {
         // require a separator (`.`/`_`) or end-of-string boundary after it,
         // so a path like `...o_proj` never matches `...o_projection`.
         let fp8_ignored = config.advanced.fp8_ignored_layers.clone();
-        let is_fp8_ignored = move |name: &str| -> bool {
-            fp8_ignored.iter().any(|ignored| {
-                let ignored = ignored.as_str();
-                name.match_indices(ignored).any(|(idx, _)| {
-                    let after = &name[idx + ignored.len()..];
-                    after.is_empty()
-                        || after.starts_with('.')
-                        || after.starts_with('_')
-                })
-            })
-        };
+        let is_fp8_ignored = |name: &str| safetensor_name_is_fp8_ignored(&fp8_ignored, name);
+
+        if options.strict_weights {
+            let failures = strict_safetensors_failures(
+                dir,
+                &parsed,
+                &model,
+                &config,
+                &naming,
+                fp8_block,
+                &fp8_ignored,
+            );
+            if !failures.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    StrictWeightLoadError::new(dir, failures),
+                ));
+            }
+        }
 
         // Closure: search every shard for the first matching `name` and
         // return its decoded f32 data regardless of length. Used by the
@@ -1010,26 +1388,30 @@ impl RealModel {
         // from the tensor length rather than asserting a configured one.
         // DeepSeek-V3 FP8 (`e4m3`) 2D weights are transparently
         // block-dequantised via their companion `<name>_scale_inv`.
-        let find_f32_any = |names: &[String]| -> Option<Vec<f32>> {
+        let find_f32_any_named = |names: &[String]| -> Option<(String, Vec<f32>)> {
             use safetensors::tensor::Dtype;
             for name in names {
                 for st in &parsed {
                     if let Ok(view) = st.tensor(name) {
                         if view.dtype() != Dtype::F8_E4M3 {
-                            return Some(decode_safetensor_to_f32(&view, name));
+                            return Some((name.clone(), decode_safetensor_to_f32(&view, name)));
                         }
                         if is_fp8_ignored(name) {
                             let raw = view.data();
                             // `ignored_layers` are stored as BF16. Some checkpoints still tag
                             // them as FP8 in metadata; detect BF16 payload by byte width.
                             if raw.len() % 2 == 0 {
-                                return Some(
+                                return Some((
+                                    name.clone(),
                                     raw.chunks_exact(2)
                                         .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
                                         .collect(),
-                                );
+                                ));
                             }
-                            warn!(tensor = name, "FP8-ignored tensor did not look like BF16 payload");
+                            warn!(
+                                tensor = name,
+                                "FP8-ignored tensor did not look like BF16 payload"
+                            );
                             return None;
                         }
                         let shape = view.shape();
@@ -1056,12 +1438,14 @@ impl RealModel {
                         if out.is_empty() {
                             return None;
                         }
-                        return Some(out);
+                        return Some((name.clone(), out));
                     }
                 }
             }
             None
         };
+        let find_f32_any =
+            |names: &[String]| -> Option<Vec<f32>> { find_f32_any_named(names).map(|(_, v)| v) };
 
         // Closure: search every shard for `name`, decoding it as f32 and
         // transparently dequantising DeepSeek-V3 FP8 (`e4m3`) weights via
@@ -1096,12 +1480,8 @@ impl RealModel {
                                     );
                                     return None;
                                 };
-                                let out = crate::dequant::dequant_mxfp4(
-                                    view.data(),
-                                    &scales,
-                                    rows,
-                                    cols,
-                                );
+                                let out =
+                                    crate::dequant::dequant_mxfp4(view.data(), &scales, rows, cols);
                                 if out.is_empty() {
                                     warn!(
                                         tensor = name,
@@ -1116,8 +1496,7 @@ impl RealModel {
                             // falls back to seeded init without log spam.
                             debug!(
                                 tensor = name,
-                                n_elem,
-                                "skipping non-weight U8 safetensors tensor"
+                                n_elem, "skipping non-weight U8 safetensors tensor"
                             );
                             return None;
                         }
@@ -1137,19 +1516,19 @@ impl RealModel {
                             let scale_name = format!("{name}_scale");
                             let scale = (|| {
                                 for s in &parsed {
-if let Ok(sv) = s.tensor(&scale_name) {
-    let v = decode_safetensor_to_f32(&sv, &scale_name);
-    if v.len() == 1 {
-        return Some(v[0]);
-    }
-    warn!(
-        tensor = name,
-        scale = %scale_name,
-        len = v.len(),
-        "INT8 companion scale tensor is not a scalar; ignoring"
-    );
-    return None;
-}
+                                    if let Ok(sv) = s.tensor(&scale_name) {
+                                        let v = decode_safetensor_to_f32(&sv, &scale_name);
+                                        if v.len() == 1 {
+                                            return Some(v[0]);
+                                        }
+                                        warn!(
+                                            tensor = name,
+                                            scale = %scale_name,
+                                            len = v.len(),
+                                            "INT8 companion scale tensor is not a scalar; ignoring"
+                                        );
+                                        return None;
+                                    }
                                 }
                                 None
                             })();
@@ -1179,7 +1558,9 @@ if let Ok(sv) = s.tensor(&scale_name) {
                                 if raw.len() % 2 == 0 {
                                     return Some(
                                         raw.chunks_exact(2)
-                                            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                                            .map(|c| {
+                                                half::bf16::from_le_bytes([c[0], c[1]]).to_f32()
+                                            })
                                             .collect(),
                                     );
                                 }
@@ -1259,10 +1640,13 @@ if let Ok(sv) = s.tensor(&scale_name) {
 
         let mut tried = 0usize;
         let mut loaded = 0usize;
+        let mut summary = WeightLoadSummary::default();
         macro_rules! maybe {
-            ($name:expr, $expected:expr, $assign:expr) => {{
+            ($group:expr, $name:expr, $expected:expr, $assign:expr) => {{
                 tried += 1;
-                if let Some(v) = find_f32($name, $expected) {
+                let name = $name;
+                if let Some(v) = find_f32(name, $expected) {
+                    summary.record($group, safetensor_source_dtype(&parsed, name), v.len() * 4);
                     $assign(v);
                     loaded += 1;
                 }
@@ -1280,15 +1664,25 @@ if let Ok(sv) = s.tensor(&scale_name) {
         // count); the output width is `num_heads * v_head_dim` for all layers.
         let attn_out_dim = config.num_heads * config.v_head_dim();
 
-        maybe!(&naming.embed(), config.vocab_size * d_model, |v| {
-            model.embedding = v;
-        });
-        maybe!(&naming.final_norm(), d_model, |v| {
+        maybe!(
+            GROUP_EMBEDDING,
+            &naming.embed(),
+            config.vocab_size * d_model,
+            |v| {
+                model.embedding = DenseWeight::from_f32(v, config.vocab_size, d_model);
+            }
+        );
+        maybe!(GROUP_NORMS, &naming.final_norm(), d_model, |v| {
             model.final_rms = RmsNorm::new(v, config.rms_eps);
         });
-        maybe!(&naming.lm_head(), config.vocab_size * d_model, |v| {
-            model.lm_head = LMHead::new(v, config.vocab_size, d_model);
-        });
+        maybe!(
+            GROUP_LM_HEAD,
+            &naming.lm_head(),
+            config.vocab_size * d_model,
+            |v| {
+                model.lm_head = LMHead::new(v, config.vocab_size, d_model);
+            }
+        );
         for l in 0..config.num_layers {
             // Per-layer K/V projection widths. MiMo-V2-Flash SWA layers use a
             // different KV-head count than global layers; `new_seeded` already
@@ -1296,12 +1690,17 @@ if let Ok(sv) = s.tensor(&scale_name) {
             // expected tensor lengths from the seeded attention struct.
             let kv_dim = model.layers[l].attn.kv_dim();
             let v_proj_dim = model.layers[l].attn.v_proj_dim();
-            maybe!(&naming.input_layernorm(l), d_model, |v| {
+            maybe!(GROUP_NORMS, &naming.input_layernorm(l), d_model, |v| {
                 model.layers[l].rms_attn = RmsNorm::new(v, config.rms_eps);
             });
-            maybe!(&naming.post_attention_layernorm(l), d_model, |v| {
-                model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps);
-            });
+            maybe!(
+                GROUP_NORMS,
+                &naming.post_attention_layernorm(l),
+                d_model,
+                |v| {
+                    model.layers[l].rms_moe = RmsNorm::new(v, config.rms_eps);
+                }
+            );
 
             // Attention projections. DeepSeek-V3 uses MLA (latent-KV)
             // attention with its own low-rank projection stack; every
@@ -1315,6 +1714,13 @@ if let Ok(sv) = s.tensor(&scale_name) {
                     &naming,
                     &config,
                     &find_f32_dequant,
+                    &mut |name, group, resident_bytes| {
+                        summary.record(
+                            group,
+                            safetensor_source_dtype(&parsed, name),
+                            resident_bytes,
+                        );
+                    },
                     &mut tried,
                     &mut loaded,
                 );
@@ -1323,30 +1729,50 @@ if let Ok(sv) = s.tensor(&scale_name) {
                 // ([(num_heads + 2*num_kv_heads) * head_dim, d_model],
                 // row-major) that we split into separate Q/K/V weights.
                 tried += 1;
-                if let Some(v) = find_f32(&naming.attn_qkv(l), (q_dim + 2 * kv_dim) * d_model) {
+                let qkv_name = naming.attn_qkv(l);
+                if let Some(v) = find_f32(&qkv_name, (q_dim + 2 * kv_dim) * d_model) {
+                    summary.record(
+                        GROUP_ATTENTION,
+                        safetensor_source_dtype(&parsed, &qkv_name),
+                        v.len() * 4,
+                    );
                     let (q_part, rest) = v.split_at(q_dim * d_model);
                     let (k_part, v_part) = rest.split_at(kv_dim * d_model);
-                    model.layers[l].attn.wq = q_part.to_vec();
-                    model.layers[l].attn.wk = k_part.to_vec();
-                    model.layers[l].attn.wv = v_part.to_vec();
+                    model.layers[l].attn.wq =
+                        DenseWeight::from_f32(q_part.to_vec(), q_dim, d_model);
+                    model.layers[l].attn.wk =
+                        DenseWeight::from_f32(k_part.to_vec(), kv_dim, d_model);
+                    model.layers[l].attn.wv =
+                        DenseWeight::from_f32(v_part.to_vec(), kv_dim, d_model);
                     loaded += 1;
                 }
-                maybe!(&naming.attn_o(l), d_model * q_dim, |v| {
-                    model.layers[l].attn.wo = v;
+                maybe!(GROUP_ATTENTION, &naming.attn_o(l), d_model * q_dim, |v| {
+                    model.layers[l].attn.wo = DenseWeight::from_f32(v, d_model, q_dim);
                 });
             } else {
-                maybe!(&naming.attn_q(l), q_dim * d_model, |v| {
-                    model.layers[l].attn.wq = v;
+                maybe!(GROUP_ATTENTION, &naming.attn_q(l), q_dim * d_model, |v| {
+                    model.layers[l].attn.wq = DenseWeight::from_f32(v, q_dim, d_model);
                 });
-                maybe!(&naming.attn_k(l), kv_dim * d_model, |v| {
-                    model.layers[l].attn.wk = v;
+                maybe!(GROUP_ATTENTION, &naming.attn_k(l), kv_dim * d_model, |v| {
+                    model.layers[l].attn.wk = DenseWeight::from_f32(v, kv_dim, d_model);
                 });
-                maybe!(&naming.attn_v(l), v_proj_dim * d_model, |v| {
-                    model.layers[l].attn.wv = v;
-                });
-                maybe!(&naming.attn_o(l), d_model * attn_out_dim, |v| {
-                    model.layers[l].attn.wo = v;
-                });
+                maybe!(
+                    GROUP_ATTENTION,
+                    &naming.attn_v(l),
+                    v_proj_dim * d_model,
+                    |v| {
+                        model.layers[l].attn.wv = DenseWeight::from_f32(v, v_proj_dim, d_model);
+                    }
+                );
+                maybe!(
+                    GROUP_ATTENTION,
+                    &naming.attn_o(l),
+                    d_model * attn_out_dim,
+                    |v| {
+                        model.layers[l].attn.wo =
+                            DenseWeight::from_f32(v, d_model, attn_out_dim);
+                    }
+                );
             }
 
             // QK-Norm (Qwen3 / Qwen3-MoE): per-head RMSNorm weights of
@@ -1354,10 +1780,10 @@ if let Ok(sv) = s.tensor(&scale_name) {
             // unit-weight in `new_seeded` for these architectures; overwrite
             // with the loaded weights when present.
             if config.architecture.uses_qk_norm() {
-                maybe!(&naming.attn_q_norm(l), config.head_dim, |v| {
+                maybe!(GROUP_NORMS, &naming.attn_q_norm(l), config.head_dim, |v| {
                     model.layers[l].attn.q_norm = Some(RmsNorm::new(v, config.rms_eps));
                 });
-                maybe!(&naming.attn_k_norm(l), config.head_dim, |v| {
+                maybe!(GROUP_NORMS, &naming.attn_k_norm(l), config.head_dim, |v| {
                     model.layers[l].attn.k_norm = Some(RmsNorm::new(v, config.rms_eps));
                 });
             }
@@ -1370,16 +1796,16 @@ if let Ok(sv) = s.tensor(&scale_name) {
             // no bias tensors degrades to the bias-free path rather than
             // failing the whole load.
             if config.advanced.attention_bias {
-                maybe!(&naming.q_proj_bias(l), q_dim, |v| {
+                maybe!(GROUP_ATTENTION, &naming.q_proj_bias(l), q_dim, |v| {
                     model.layers[l].attn.bq = Some(v);
                 });
-                maybe!(&naming.k_proj_bias(l), kv_dim, |v| {
+                maybe!(GROUP_ATTENTION, &naming.k_proj_bias(l), kv_dim, |v| {
                     model.layers[l].attn.bk = Some(v);
                 });
-                maybe!(&naming.v_proj_bias(l), v_proj_dim, |v| {
+                maybe!(GROUP_ATTENTION, &naming.v_proj_bias(l), v_proj_dim, |v| {
                     model.layers[l].attn.bv = Some(v);
                 });
-                maybe!(&naming.o_proj_bias(l), d_model, |v| {
+                maybe!(GROUP_ATTENTION, &naming.o_proj_bias(l), d_model, |v| {
                     model.layers[l].attn.bo = Some(v);
                 });
             }
@@ -1393,9 +1819,14 @@ if let Ok(sv) = s.tensor(&scale_name) {
             if config.advanced.add_swa_attention_sink_bias
                 && model.layers[l].attn.window_size.is_some()
             {
-                maybe!(&naming.attn_sink_bias(l), config.num_heads, |v| {
-                    model.layers[l].attn.sink_bias = Some(v);
-                });
+                maybe!(
+                    GROUP_ATTENTION,
+                    &naming.attn_sink_bias(l),
+                    config.num_heads,
+                    |v| {
+                        model.layers[l].attn.sink_bias = Some(v);
+                    }
+                );
             }
 
             // Dense FFN layers (Mistral Small 3, Phi-4, and DeepSeek's
@@ -1408,36 +1839,63 @@ if let Ok(sv) = s.tensor(&scale_name) {
                     // Phi-4: `mlp.gate_up_proj` is `[2*d_ff, d_model]`,
                     // row-major, gate rows first then up rows. `down_proj`
                     // is `[d_model, d_ff]`.
-                    let gate_up = find_f32_any(&[naming.mlp_gate_up(l)]);
-                    let down = find_f32_any(&[naming.mlp_down(l)]);
+                    let gate_up = find_f32_any_named(&[naming.mlp_gate_up(l)]);
+                    let down = find_f32_any_named(&[naming.mlp_down(l)]);
                     match (gate_up, down) {
-                        (Some(gu), Some(down))
-                            if d_model != 0
-                                && gu.len() % (2 * d_model) == 0
-                                && !gu.is_empty() =>
+                        (Some((gu_name, gu)), Some((down_name, down)))
+                            if d_model != 0 && gu.len() % (2 * d_model) == 0 && !gu.is_empty() =>
                         {
                             let ffn_d = gu.len() / (2 * d_model);
                             let (gate, up) = gu.split_at(ffn_d * d_model);
-                            SharedExpert::from_projections(
+                            let se = SharedExpert::from_projections(
                                 d_model, ffn_d, gate, up, &down, None,
-                            )
+                            );
+                            if se.is_some() {
+                                summary.record(
+                                    GROUP_DENSE_FFN,
+                                    safetensor_source_dtype(&parsed, &gu_name),
+                                    gu.len() * 4,
+                                );
+                                summary.record(
+                                    GROUP_DENSE_FFN,
+                                    safetensor_source_dtype(&parsed, &down_name),
+                                    down.len() * 4,
+                                );
+                            }
+                            se
                         }
                         _ => None,
                     }
                 } else {
-                    let gate = find_f32_any(&[naming.mlp_gate(l)]);
-                    let up = find_f32_any(&[naming.mlp_up(l)]);
-                    let down = find_f32_any(&[naming.mlp_down(l)]);
+                    let gate = find_f32_any_named(&[naming.mlp_gate(l)]);
+                    let up = find_f32_any_named(&[naming.mlp_up(l)]);
+                    let down = find_f32_any_named(&[naming.mlp_down(l)]);
                     match (gate, up, down) {
-                        (Some(gate), Some(up), Some(down))
-                            if d_model != 0
-                                && gate.len() % d_model == 0
-                                && !gate.is_empty() =>
+                        (Some((gate_name, gate)), Some((up_name, up)), Some((down_name, down)))
+                            if d_model != 0 && gate.len() % d_model == 0 && !gate.is_empty() =>
                         {
                             let ffn_d = gate.len() / d_model;
-                            SharedExpert::from_projections(
+                            let se = SharedExpert::from_projections(
                                 d_model, ffn_d, &gate, &up, &down, None,
-                            )
+                            );
+                            if se.is_some() {
+                                summary.record(
+                                    GROUP_DENSE_FFN,
+                                    safetensor_source_dtype(&parsed, &gate_name),
+                                    gate.len() * 4,
+                                );
+                                summary.record(
+                                    GROUP_DENSE_FFN,
+                                    safetensor_source_dtype(&parsed, &up_name),
+                                    up.len() * 4,
+                                );
+                                summary.record(
+                                    GROUP_DENSE_FFN,
+                                    safetensor_source_dtype(&parsed, &down_name),
+                                    down.len() * 4,
+                                );
+                            }
+                            se
                         }
                         _ => None,
                     }
@@ -1469,17 +1927,29 @@ if let Ok(sv) = s.tensor(&scale_name) {
                 // honoured when its length matches the configured shape;
                 // otherwise we fall back to the inline `moe_gate` tensor.
                 tried += 1;
-let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
-    .and_then(|mut v| {
-        if v.len() < expected {
-            None
-        } else {
-            v.truncate(expected);
-            Some(v)
-        }
-    })
-    .or_else(|| find_f32(&naming.moe_gate(l), expected));
+                let gate_bin = format!("gate_{l}.bin");
+                let (gate_vec, gate_dtype) =
+                    if let Some(mut v) = Self::read_full_f32(&dir.join(&gate_bin)) {
+                        if v.len() < expected {
+                            (None, None)
+                        } else {
+                            v.truncate(expected);
+                            (Some(v), Some("bin_f32".to_string()))
+                        }
+                    } else {
+                        let gate_name = naming.moe_gate(l);
+                        let v = find_f32(&gate_name, expected);
+                        let dtype = v
+                            .as_ref()
+                            .map(|_| safetensor_source_dtype(&parsed, &gate_name));
+                        (v, dtype)
+                    };
                 if let Some(v) = gate_vec {
+                    summary.record(
+                        GROUP_ROUTING_GATES,
+                        gate_dtype.unwrap_or_else(|| "unknown".to_string()),
+                        v.len() * 4,
+                    );
                     model.layers[l].gate = LinearGate::with_routing(
                         v,
                         config.num_experts,
@@ -1507,30 +1977,61 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
             if config.advanced.num_shared_experts > 0 {
                 let p = naming.prefix();
                 tried += 1;
-                let shexp_gate = find_f32_any(&[
+                let shexp_gate = find_f32_any_named(&[
                     format!("{p}model.layers.{l}.mlp.shared_expert.gate_proj.weight"),
                     format!("{p}model.layers.{l}.mlp.shared_experts.gate_proj.weight"),
                 ]);
-                let shexp_up = find_f32_any(&[
+                let shexp_up = find_f32_any_named(&[
                     format!("{p}model.layers.{l}.mlp.shared_expert.up_proj.weight"),
                     format!("{p}model.layers.{l}.mlp.shared_experts.up_proj.weight"),
                 ]);
-                let shexp_down = find_f32_any(&[
+                let shexp_down = find_f32_any_named(&[
                     format!("{p}model.layers.{l}.mlp.shared_expert.down_proj.weight"),
                     format!("{p}model.layers.{l}.mlp.shared_experts.down_proj.weight"),
                 ]);
                 if let (Some(gate), Some(up), Some(down)) = (shexp_gate, shexp_up, shexp_down) {
+                    let (gate_name, gate) = gate;
+                    let (up_name, up) = up;
+                    let (down_name, down) = down;
                     if d_model != 0 && gate.len() % d_model == 0 && gate.len() / d_model != 0 {
                         let shared_d_ff = gate.len() / d_model;
                         // Sigmoid gate is Qwen2-MoE-only (`shared_expert_gate`).
-                        let gate_inp = find_f32_any(&[format!(
+                        let gate_inp = find_f32_any_named(&[format!(
                             "{p}model.layers.{l}.mlp.shared_expert_gate.weight"
                         )])
-                        .filter(|g| g.len() == d_model);
+                        .filter(|(_, g)| g.len() == d_model);
+                        let gate_inp_vec = gate_inp.as_ref().map(|(_, g)| g.clone());
                         match SharedExpert::from_projections(
-                            d_model, shared_d_ff, &gate, &up, &down, gate_inp,
+                            d_model,
+                            shared_d_ff,
+                            &gate,
+                            &up,
+                            &down,
+                            gate_inp_vec,
                         ) {
                             Some(se) => {
+                                summary.record(
+                                    GROUP_SHARED_FFN,
+                                    safetensor_source_dtype(&parsed, &gate_name),
+                                    gate.len() * 4,
+                                );
+                                summary.record(
+                                    GROUP_SHARED_FFN,
+                                    safetensor_source_dtype(&parsed, &up_name),
+                                    up.len() * 4,
+                                );
+                                summary.record(
+                                    GROUP_SHARED_FFN,
+                                    safetensor_source_dtype(&parsed, &down_name),
+                                    down.len() * 4,
+                                );
+                                if let Some((gate_inp_name, gate_inp)) = gate_inp {
+                                    summary.record(
+                                        GROUP_SHARED_FFN,
+                                        safetensor_source_dtype(&parsed, &gate_inp_name),
+                                        gate_inp.len() * 4,
+                                    );
+                                }
                                 model.layers[l].shared_expert = Some(se);
                                 loaded += 1;
                             }
@@ -1550,7 +2051,11 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
             shards = shards.len(),
             loaded,
             tried,
-            "loaded dense weights from .safetensors (missing tensors fell back to seeded init)"
+            strict_weights = options.strict_weights,
+            fallback_seeded = !options.strict_weights,
+            weight_groups = ?summary.by_group,
+            weight_dtypes = ?summary.by_dtype,
+            "loaded dense weights from .safetensors"
         );
         Ok(model)
     }
@@ -1564,17 +2069,26 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
         dir: &Path,
         seed: u64,
     ) -> Result<Self, std::io::Error> {
+        Self::from_dir_auto_with_options(config, dir, seed, RealModelLoadOptions::default())
+    }
+
+    /// Auto-dispatching entry point with explicit load options.
+    pub fn from_dir_auto_with_options(
+        config: RealModelConfig,
+        dir: &Path,
+        seed: u64,
+        options: RealModelLoadOptions,
+    ) -> Result<Self, std::io::Error> {
         let has_safetensors = std::fs::read_dir(dir)
             .map(|it| {
-                it.flatten().any(|e| {
-                    e.path().extension().and_then(|s| s.to_str()) == Some("safetensors")
-                })
+                it.flatten()
+                    .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("safetensors"))
             })
             .unwrap_or(false);
         if has_safetensors {
-            Self::from_safetensors(config, dir, seed)
+            Self::from_safetensors_with_options(config, dir, seed, options)
         } else {
-            Self::from_dir(config, dir, seed)
+            Self::from_dir_with_options(config, dir, seed, options)
         }
     }
 
@@ -1589,8 +2103,9 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     /// Look up the embedding row for a token id.
     pub fn embed(&self, token_id: u32) -> Vec<f32> {
         let id = (token_id as usize) % self.config.vocab_size;
-        let d = self.config.d_model;
-        self.embedding[id * d..(id + 1) * d].to_vec()
+        let mut out = Vec::with_capacity(self.config.d_model);
+        self.embedding.row_dequant_into(id, &mut out);
+        out
     }
 
     /// Translate a `(layer, local_expert_id)` pair into the global flat
@@ -1625,12 +2140,7 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     /// The returned vector is **not** deduplicated; the caller is
     /// expected to fold it into a [`HashSet`] before calling
     /// [`Engine::warm_with`].
-    pub fn peek_experts(
-        &self,
-        token_id: u32,
-        pos: usize,
-        kv: &[KvCache],
-    ) -> Vec<u32> {
+    pub fn peek_experts(&self, token_id: u32, pos: usize, kv: &[KvCache]) -> Vec<u32> {
         assert_eq!(
             kv.len(),
             self.config.num_layers,
@@ -1671,7 +2181,8 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
         out
     }
 
-    /// Run one decoder step. Returns the sampled next-token id.
+    /// Ingest one token, update all per-layer KV caches, and return the
+    /// final RMS-normalised hidden state without evaluating the LM head.
     ///
     /// This is the realisation of the gist's pseudocode:
     ///
@@ -1682,34 +2193,59 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
     ///       (normed, routing) = layer.moe_pre(x)
     ///       experts_y = engine.moe_step(normed, routing.experts)  // SSD-streamed
     ///       x = layer.moe_combine(x, experts_y, routing.weights)
-    ///   x = final_rms(x)
-    ///   logits = lm_head(x)
-    ///   return sample(logits, params, pos)
+    ///   return final_rms(x)
     /// ```
     ///
     /// `engine.moe_step` is what reads expert weights from SSD via the
     /// LRU cache — that's the whole point of the substrate.
-    /// Sampling is delegated to [`crate::sampling::sample`], so
-    /// `temperature == 0.0` reproduces the original deterministic
-    /// `argmax` behaviour bit-for-bit.
-    pub async fn step(
+    /// This is the prompt-ingestion half of the real transformer path:
+    /// it performs every model/layer side effect required for future
+    /// attention, but deliberately does not pay for the LM head.
+    pub async fn forward_token_hidden(
         &self,
         engine: &Arc<Engine>,
         token_id: u32,
         pos: usize,
         kv: &mut [KvCache],
-        params: &crate::sampling::SamplingParams,
-    ) -> u32 {
+    ) -> Vec<f32> {
+        self.forward_token_hidden_with_timing(engine, token_id, pos, kv, None)
+            .await
+    }
+
+    pub async fn forward_token_hidden_with_timing(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<f32> {
         assert_eq!(
             kv.len(),
             self.config.num_layers,
             "kv cache slice must have one entry per layer"
         );
-        let mut x = self.embed(token_id);
+        let mut x =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::EMBEDDING, || {
+                self.embed(token_id)
+            });
         let backend = crate::backend::current();
+        let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
+        let mut next_x = Vec::with_capacity(self.config.d_model);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
-            x = layer.attn_block(&x, pos, layer_idx, &mut kv[layer_idx], &*backend);
+            layer.attn_block_into_with_timing(
+                &x,
+                pos,
+                layer_idx,
+                &mut kv[layer_idx],
+                &*backend,
+                &mut layer_scratch,
+                &mut next_x,
+                timings,
+            );
+            std::mem::swap(&mut x, &mut next_x);
+            next_x.clear();
             // Sliding-Window-Attention layers (MiMo-V2 SWA layers, GPT-OSS
             // banded layers, Mixtral's uniform window) only ever attend to
             // the last `window` positions, so KV entries older than that are
@@ -1724,36 +2260,132 @@ let gate_vec = Self::read_full_f32(&dir.join(format!("gate_{l}.bin")))
             // Dense FFN layers (Mistral Small 3, Phi-4, DeepSeek dense
             // prefix) bypass the SSD-streamed expert path entirely: run the
             // resident SwiGLU FFN and skip routing.
-            if let Some(dense_out) = layer.dense_forward(&x) {
+            if let Some(dense_out) = layer.dense_forward_with_timing(&x, timings) {
                 x = dense_out;
                 continue;
             }
             // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
-            let (normed, routing) = layer.moe_pre(&x);
-            let global_ids: Vec<u32> = routing
-                .experts
-                .iter()
-                .map(|&local| self.global_expert_id(layer_idx, local))
-                .collect();
+            let routing = layer.moe_pre_into_with_timing(&x, &mut layer_scratch, timings);
+            layer_scratch.global_expert_ids.clear();
+            layer_scratch
+                .global_expert_ids
+                .extend(
+                    routing
+                        .experts
+                        .iter()
+                        .map(|&local| self.global_expert_id(layer_idx, local)),
+                );
+            let normed = &layer_scratch.moe_normed;
             // `token_idx` here is just a digest seed; positional info is
             // already baked into RoPE inside `attn_block`.
-            let token_idx = (pos as u64).wrapping_mul(self.config.num_layers as u64)
-                + layer_idx as u64;
-            let expert_outs = engine
-                .moe_step(token_idx, layer_idx as u32, &normed, &global_ids)
+            let token_idx =
+                (pos as u64).wrapping_mul(self.config.num_layers as u64) + layer_idx as u64;
+            engine
+                .moe_step_weighted_into_with_timing(
+                    token_idx,
+                    layer_idx as u32,
+                    normed,
+                    &layer_scratch.global_expert_ids,
+                    &routing.weights,
+                    &mut layer_scratch.moe_accum,
+                    timings,
+                )
                 .await;
-            debug_assert_eq!(expert_outs.len(), routing.weights.len());
-            x = layer.moe_combine(&x, &expert_outs, &routing.weights);
+            layer.moe_accumulated_into_with_timing(
+                &x,
+                &layer_scratch.moe_accum,
+                &mut next_x,
+                timings,
+            );
+            std::mem::swap(&mut x, &mut next_x);
+            next_x.clear();
+            layer_scratch.routing.recycle_decision(routing);
             // Qwen2-MoE / DeepSeek-MoE shared expert: a dense always-on
             // FFN over the same MoE-normalised hidden, added to the
             // residual alongside the routed experts. `None` for Mixtral
             // (no-op), keeping the engine MoE-architecture-agnostic.
-            if let Some(shared) = layer.shared_expert_forward(&normed) {
-                x = crate::transformer::add_residual(&x, &shared);
+            if let Some(shared) = layer.shared_expert_forward_with_timing(normed, timings) {
+                crate::transformer::add_residual_into(&x, &shared, &mut next_x);
+                std::mem::swap(&mut x, &mut next_x);
+                next_x.clear();
             }
         }
-        let normed = self.final_rms.forward(&x);
-        self.lm_head.sample(&normed, params, pos as u64)
+        crate::stage_timing::time_optional(timings, crate::stage_timing::FINAL_RMS_NORM, || {
+            self.final_rms.forward(&x)
+        })
+    }
+
+    /// Sample a next-token id from an already-computed final hidden state.
+    ///
+    /// Sampling is delegated to [`crate::sampling::sample`], so
+    /// `temperature == 0.0` reproduces the original deterministic
+    /// `argmax` behaviour bit-for-bit.
+    pub fn sample_hidden(
+        &self,
+        hidden: &[f32],
+        params: &crate::sampling::SamplingParams,
+        pos: usize,
+    ) -> u32 {
+        self.lm_head.sample(hidden, params, pos as u64)
+    }
+
+    pub fn sample_hidden_with_timing(
+        &self,
+        hidden: &[f32],
+        params: &crate::sampling::SamplingParams,
+        pos: usize,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> u32 {
+        let logits =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::LM_HEAD, || {
+                self.lm_head.forward(hidden)
+            });
+        crate::stage_timing::time_optional(timings, crate::stage_timing::SAMPLING, || {
+            crate::sampling::sample(&logits, params, pos as u64)
+        })
+    }
+
+    /// Ingest one token and sample the following token. This is the
+    /// decode-step half of the split API and is equivalent to the old
+    /// `step` behavior.
+    pub async fn decode_step(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        params: &crate::sampling::SamplingParams,
+    ) -> u32 {
+        let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await;
+        self.sample_hidden(&hidden, params, pos)
+    }
+
+    pub async fn decode_step_with_timing(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        params: &crate::sampling::SamplingParams,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> u32 {
+        let hidden = self
+            .forward_token_hidden_with_timing(engine, token_id, pos, kv, timings)
+            .await;
+        self.sample_hidden_with_timing(&hidden, params, pos, timings)
+    }
+
+    /// Backwards-compatible alias for callers that still express a full
+    /// decoder step as "ingest one token and return the next token".
+    pub async fn step(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        params: &crate::sampling::SamplingParams,
+    ) -> u32 {
+        self.decode_step(engine, token_id, pos, kv, params).await
     }
 }
 
@@ -1765,7 +2397,9 @@ struct SplitMix64 {
 
 impl SplitMix64 {
     fn new(seed: u64) -> Self {
-        Self { state: seed.wrapping_add(0x9E3779B97F4A7C15) }
+        Self {
+            state: seed.wrapping_add(0x9E3779B97F4A7C15),
+        }
     }
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
@@ -1841,9 +2475,11 @@ fn seed_mla(
         // YaRN long-context scaling (DeepSeek-V3 ships `rope_scaling`
         // of type "yarn"): blended inverse frequencies over the rotary
         // portion plus the `mscale` attention-magnitude corrections.
-        rope_yarn: config.advanced.rope_scaling.as_ref().and_then(|s| {
-            YarnRope::from_scaling(dims.qk_rope_head_dim, config.rope_base, s)
-        }),
+        rope_yarn: config
+            .advanced
+            .rope_scaling
+            .as_ref()
+            .and_then(|s| YarnRope::from_scaling(dims.qk_rope_head_dim, config.rope_base, s)),
         softmax_scale: MultiHeadLatentAttention::yarn_softmax_scale(
             dims.qk_nope_head_dim,
             dims.qk_rope_head_dim,
@@ -1863,6 +2499,1034 @@ fn seed_mla(
 /// out over a 128x128 block grid).
 const FP8_BLOCK: usize = 128;
 
+fn load_dense_manifest(dir: &Path) -> Option<DenseTensorManifest> {
+    let path = dir.join("dense_manifest.json");
+    if !path.is_file() {
+        return None;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(body) => match serde_json::from_str::<DenseTensorManifest>(&body) {
+            Ok(manifest) => Some(manifest),
+            Err(err) => {
+                warn!(file = %path.display(), error = %err, "dense manifest parse failed");
+                None
+            }
+        },
+        Err(err) => {
+            warn!(file = %path.display(), error = %err, "dense manifest read failed");
+            None
+        }
+    }
+}
+
+fn try_load_resident_f32(
+    dir: &Path,
+    manifest: Option<&DenseTensorManifest>,
+    name: &str,
+    expected: usize,
+    group: &'static str,
+    strict_weights: bool,
+    failures: &mut Vec<WeightLoadFailure>,
+    summary: &mut WeightLoadSummary,
+) -> Option<Vec<f32>> {
+    try_load_dense_weight(
+        dir,
+        manifest,
+        name,
+        expected,
+        1,
+        group,
+        strict_weights,
+        failures,
+        summary,
+    )
+    .map(|weight| weight.to_f32_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_load_dense_weight(
+    dir: &Path,
+    manifest: Option<&DenseTensorManifest>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    group: &'static str,
+    strict_weights: bool,
+    failures: &mut Vec<WeightLoadFailure>,
+    summary: &mut WeightLoadSummary,
+) -> Option<DenseWeight> {
+    let expected = rows.saturating_mul(cols);
+    let Some(entry) = manifest.and_then(|m| m.find_alias(name)) else {
+        return try_load_f32_bin(
+            dir,
+            name,
+            expected,
+            group,
+            strict_weights,
+            failures,
+            summary,
+        )
+        .map(|v| DenseWeight::from_f32(v, rows, cols));
+    };
+
+    if entry.dims.iter().product::<usize>() != expected {
+        if strict_weights {
+            failures.push(WeightLoadFailure {
+                tensor: name.to_string(),
+                group,
+                kind: WeightLoadFailureKind::ShapeMismatch,
+                expected: format!("{rows}x{cols} ({expected} elements)"),
+                actual: Some(format!("{:?}", entry.dims)),
+                detail: Some(format!(
+                    "dense manifest entry {} has incompatible dims",
+                    entry.canonical_name
+                )),
+            });
+        }
+        warn!(
+            tensor = name,
+            canonical = %entry.canonical_name,
+            dims = ?entry.dims,
+            rows,
+            cols,
+            "dense manifest shape mismatch; falling back to seeded init"
+        );
+        return None;
+    }
+
+    let path = dir.join(&entry.file);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            if strict_weights {
+                failures.push(WeightLoadFailure {
+                    tensor: name.to_string(),
+                    group,
+                    kind: WeightLoadFailureKind::Unreadable,
+                    expected: format!("dense manifest file {}", entry.file),
+                    actual: None,
+                    detail: Some(err.to_string()),
+                });
+            }
+            warn!(file = %path.display(), error = %err, "dense manifest file read failed");
+            return None;
+        }
+    };
+    if bytes.len() != entry.byte_len {
+        if strict_weights {
+            failures.push(WeightLoadFailure {
+                tensor: name.to_string(),
+                group,
+                kind: WeightLoadFailureKind::ShapeMismatch,
+                expected: format!("{} bytes", entry.byte_len),
+                actual: Some(format!("{} bytes", bytes.len())),
+                detail: Some(format!(
+                    "dense manifest entry {} byte_len mismatch",
+                    entry.canonical_name
+                )),
+            });
+        }
+        warn!(
+            file = %path.display(),
+            have = bytes.len(),
+            need = entry.byte_len,
+            "dense manifest byte length mismatch; falling back to seeded init"
+        );
+        return None;
+    }
+    if let Some(expected_checksum) = entry.checksum.as_ref() {
+        let actual = dense_checksum(&bytes);
+        if &actual != expected_checksum {
+            if strict_weights {
+                failures.push(WeightLoadFailure {
+                    tensor: name.to_string(),
+                    group,
+                    kind: WeightLoadFailureKind::Malformed,
+                    expected: expected_checksum.clone(),
+                    actual: Some(actual.clone()),
+                    detail: Some(format!(
+                        "dense manifest entry {} checksum mismatch",
+                        entry.canonical_name
+                    )),
+                });
+            }
+            warn!(
+                file = %path.display(),
+                expected = %expected_checksum,
+                actual = %actual,
+                "dense manifest checksum mismatch; falling back to seeded init"
+            );
+            return None;
+        }
+    }
+
+    match entry.dtype {
+        DenseDType::F32 => {
+            if bytes.len() != expected.saturating_mul(4) || bytes.len() % 4 != 0 {
+                if strict_weights {
+                    failures.push(WeightLoadFailure {
+                        tensor: name.to_string(),
+                        group,
+                        kind: WeightLoadFailureKind::ShapeMismatch,
+                        expected: format!("{expected} f32 elements"),
+                        actual: Some(format!("{} bytes", bytes.len())),
+                        detail: Some(format!(
+                            "dense manifest entry {} f32 payload size mismatch",
+                            entry.canonical_name
+                        )),
+                    });
+                }
+                return None;
+            }
+            let mut values = Vec::with_capacity(expected);
+            for chunk in bytes.chunks_exact(4) {
+                values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            summary.record(group, entry.dtype.as_str(), values.len() * 4);
+            Some(DenseWeight::from_f32(values, rows, cols))
+        }
+        DenseDType::Q8_0 => match DenseWeight::from_q8_0_bytes(bytes, rows, cols) {
+            Ok(weight) => {
+                summary.record(group, entry.dtype.as_str(), weight.resident_bytes());
+                Some(weight)
+            }
+            Err(err) => {
+                if strict_weights {
+                    failures.push(WeightLoadFailure {
+                        tensor: name.to_string(),
+                        group,
+                        kind: WeightLoadFailureKind::ShapeMismatch,
+                        expected: format!("{rows}x{cols} q8_0 payload"),
+                        actual: Some(err.to_string()),
+                        detail: Some(format!(
+                            "dense manifest entry {} q8_0 payload mismatch",
+                            entry.canonical_name
+                        )),
+                    });
+                }
+                warn!(file = %path.display(), error = %err, "dense Q8_0 load failed");
+                None
+            }
+        },
+    }
+}
+
+fn try_load_f32_bin(
+    dir: &Path,
+    name: &str,
+    expected: usize,
+    group: &'static str,
+    strict_weights: bool,
+    failures: &mut Vec<WeightLoadFailure>,
+    summary: &mut WeightLoadSummary,
+) -> Option<Vec<f32>> {
+    let path = dir.join(name);
+    if !path.is_file() {
+        if strict_weights {
+            failures.push(WeightLoadFailure::missing(
+                name,
+                group,
+                format!("{expected} f32 elements"),
+            ));
+        }
+        return None;
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let n = bytes.len() / 4;
+            if strict_weights {
+                let expected_bytes = expected.saturating_mul(4);
+                if bytes.len() != expected_bytes || bytes.len() % 4 != 0 {
+                    let kind = if bytes.len() % 4 != 0 {
+                        WeightLoadFailureKind::Malformed
+                    } else {
+                        WeightLoadFailureKind::ShapeMismatch
+                    };
+                    failures.push(WeightLoadFailure {
+                        tensor: name.to_string(),
+                        group,
+                        kind,
+                        expected: format!("{expected} f32 elements ({expected_bytes} bytes)"),
+                        actual: Some(format!("{} bytes", bytes.len())),
+                        detail: None,
+                    });
+                    return None;
+                }
+            }
+            if n < expected {
+                warn!(
+                    file = %path.display(),
+                    have = n,
+                    need = expected,
+                    "weight file shorter than expected; falling back to seeded init"
+                );
+                return None;
+            }
+            let mut floats = Vec::with_capacity(expected);
+            for chunk in bytes[..expected * 4].chunks_exact(4) {
+                floats.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            summary.record(group, "f32", floats.len() * 4);
+            Some(floats)
+        }
+        Err(e) => {
+            if strict_weights {
+                failures.push(WeightLoadFailure {
+                    tensor: name.to_string(),
+                    group,
+                    kind: WeightLoadFailureKind::Unreadable,
+                    expected: format!("{expected} f32 elements"),
+                    actual: None,
+                    detail: Some(e.to_string()),
+                });
+            }
+            warn!(file = %path.display(), error = %e, "weight file read failed");
+            None
+        }
+    }
+}
+
+fn safetensor_name_is_fp8_ignored(fp8_ignored: &[String], name: &str) -> bool {
+    fp8_ignored.iter().any(|ignored| {
+        let ignored = ignored.as_str();
+        name.match_indices(ignored).any(|(idx, _)| {
+            let after = &name[idx + ignored.len()..];
+            after.is_empty() || after.starts_with('.') || after.starts_with('_')
+        })
+    })
+}
+
+fn safetensor_source_dtype(parsed: &[safetensors::SafeTensors<'_>], name: &str) -> String {
+    for st in parsed {
+        if let Ok(view) = st.tensor(name) {
+            return format!("{:?}", view.dtype()).to_ascii_lowercase();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn safetensor_present(parsed: &[safetensors::SafeTensors<'_>], name: &str) -> bool {
+    parsed.iter().any(|st| st.tensor(name).is_ok())
+}
+
+fn tensor_names_expected(names: &[String], expected: &str) -> String {
+    if names.len() == 1 {
+        expected.to_string()
+    } else {
+        format!("{expected}; one of [{}]", names.join(", "))
+    }
+}
+
+fn strict_safetensors_failures(
+    dir: &Path,
+    parsed: &[safetensors::SafeTensors<'_>],
+    model: &RealModel,
+    config: &RealModelConfig,
+    naming: &TensorNaming,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+) -> Vec<WeightLoadFailure> {
+    let mut failures = Vec::new();
+
+    let require = |name: String, expected: usize, group: &'static str, failures: &mut Vec<_>| {
+        strict_validate_safetensor(
+            parsed,
+            &name,
+            expected,
+            group,
+            fp8_block,
+            fp8_ignored,
+            failures,
+        );
+    };
+
+    let d_model = config.d_model;
+    let q_dim = config.num_heads * config.head_dim;
+    let attn_out_dim = config.num_heads * config.v_head_dim();
+
+    require(
+        naming.embed(),
+        config.vocab_size * d_model,
+        GROUP_EMBEDDING,
+        &mut failures,
+    );
+    require(naming.final_norm(), d_model, GROUP_NORMS, &mut failures);
+    require(
+        naming.lm_head(),
+        config.vocab_size * d_model,
+        GROUP_LM_HEAD,
+        &mut failures,
+    );
+
+    for l in 0..config.num_layers {
+        let kv_dim = model.layers[l].attn.kv_dim();
+        let v_proj_dim = model.layers[l].attn.v_proj_dim();
+        require(
+            naming.input_layernorm(l),
+            d_model,
+            GROUP_NORMS,
+            &mut failures,
+        );
+        require(
+            naming.post_attention_layernorm(l),
+            d_model,
+            GROUP_NORMS,
+            &mut failures,
+        );
+
+        if let Some(mla) = model.layers[l].mla.as_ref() {
+            let qk_head = mla.qk_nope_head_dim + mla.qk_rope_head_dim;
+            let q_total = mla.num_heads * qk_head;
+            let kv_proj_dim = mla.kv_lora_rank + mla.qk_rope_head_dim;
+            let kv_b_out = mla.num_heads * (mla.qk_nope_head_dim + mla.v_head_dim);
+            if mla.q_lora_rank > 0 {
+                require(
+                    naming.mla_q_a_proj(l),
+                    mla.q_lora_rank * d_model,
+                    GROUP_ATTENTION,
+                    &mut failures,
+                );
+                require(
+                    naming.mla_q_a_layernorm(l),
+                    mla.q_lora_rank,
+                    GROUP_NORMS,
+                    &mut failures,
+                );
+                require(
+                    naming.mla_q_b_proj(l),
+                    q_total * mla.q_lora_rank,
+                    GROUP_ATTENTION,
+                    &mut failures,
+                );
+            } else {
+                require(
+                    naming.attn_q(l),
+                    q_total * d_model,
+                    GROUP_ATTENTION,
+                    &mut failures,
+                );
+            }
+            require(
+                naming.mla_kv_a_proj(l),
+                kv_proj_dim * d_model,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+            require(
+                naming.mla_kv_a_layernorm(l),
+                mla.kv_lora_rank,
+                GROUP_NORMS,
+                &mut failures,
+            );
+            require(
+                naming.mla_kv_b_proj(l),
+                kv_b_out * mla.kv_lora_rank,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+            require(
+                naming.attn_o(l),
+                d_model * mla.num_heads * mla.v_head_dim,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+        } else if naming.attn_qkv_fused() {
+            require(
+                naming.attn_qkv(l),
+                (q_dim + 2 * kv_dim) * d_model,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+            require(
+                naming.attn_o(l),
+                d_model * q_dim,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+        } else {
+            require(
+                naming.attn_q(l),
+                q_dim * d_model,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+            require(
+                naming.attn_k(l),
+                kv_dim * d_model,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+            require(
+                naming.attn_v(l),
+                v_proj_dim * d_model,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+            require(
+                naming.attn_o(l),
+                d_model * attn_out_dim,
+                GROUP_ATTENTION,
+                &mut failures,
+            );
+        }
+
+        if config.architecture.uses_qk_norm() {
+            require(
+                naming.attn_q_norm(l),
+                config.head_dim,
+                GROUP_NORMS,
+                &mut failures,
+            );
+            require(
+                naming.attn_k_norm(l),
+                config.head_dim,
+                GROUP_NORMS,
+                &mut failures,
+            );
+        }
+
+        if config.advanced.attention_bias {
+            validate_optional_safetensor(
+                parsed,
+                naming.q_proj_bias(l),
+                q_dim,
+                GROUP_ATTENTION,
+                fp8_block,
+                fp8_ignored,
+                &mut failures,
+            );
+            validate_optional_safetensor(
+                parsed,
+                naming.k_proj_bias(l),
+                kv_dim,
+                GROUP_ATTENTION,
+                fp8_block,
+                fp8_ignored,
+                &mut failures,
+            );
+            validate_optional_safetensor(
+                parsed,
+                naming.v_proj_bias(l),
+                v_proj_dim,
+                GROUP_ATTENTION,
+                fp8_block,
+                fp8_ignored,
+                &mut failures,
+            );
+            validate_optional_safetensor(
+                parsed,
+                naming.o_proj_bias(l),
+                d_model,
+                GROUP_ATTENTION,
+                fp8_block,
+                fp8_ignored,
+                &mut failures,
+            );
+        }
+        if config.advanced.add_swa_attention_sink_bias && model.layers[l].attn.window_size.is_some()
+        {
+            validate_optional_safetensor(
+                parsed,
+                naming.attn_sink_bias(l),
+                config.num_heads,
+                GROUP_ATTENTION,
+                fp8_block,
+                fp8_ignored,
+                &mut failures,
+            );
+        }
+
+        match naming.ffn_kind(l) {
+            FfnKind::Dense => validate_dense_ffn_strict(
+                parsed,
+                naming,
+                l,
+                d_model,
+                config.d_ff,
+                fp8_block,
+                fp8_ignored,
+                &mut failures,
+            ),
+            FfnKind::Moe if config.architecture.is_moe() => {
+                validate_moe_gate_strict(
+                    dir,
+                    parsed,
+                    &naming.moe_gate(l),
+                    &format!("gate_{l}.bin"),
+                    config.num_experts * d_model,
+                    fp8_block,
+                    fp8_ignored,
+                    &mut failures,
+                );
+                validate_optional_safetensor(
+                    parsed,
+                    naming.moe_gate_correction_bias(l),
+                    config.num_experts,
+                    GROUP_ROUTING_GATES,
+                    fp8_block,
+                    fp8_ignored,
+                    &mut failures,
+                );
+            }
+            _ => {}
+        }
+
+        if config.advanced.num_shared_experts > 0 {
+            validate_shared_expert_strict(
+                parsed,
+                naming,
+                l,
+                d_model,
+                fp8_block,
+                fp8_ignored,
+                &mut failures,
+            );
+        }
+    }
+
+    failures
+}
+
+fn validate_dense_ffn_strict(
+    parsed: &[safetensors::SafeTensors<'_>],
+    naming: &TensorNaming,
+    layer: usize,
+    d_model: usize,
+    d_ff: usize,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+    failures: &mut Vec<WeightLoadFailure>,
+) {
+    if naming.mlp_gate_up_fused() {
+        strict_validate_safetensor(
+            parsed,
+            &naming.mlp_gate_up(layer),
+            2 * d_ff * d_model,
+            GROUP_DENSE_FFN,
+            fp8_block,
+            fp8_ignored,
+            failures,
+        );
+        strict_validate_safetensor(
+            parsed,
+            &naming.mlp_down(layer),
+            d_model * d_ff,
+            GROUP_DENSE_FFN,
+            fp8_block,
+            fp8_ignored,
+            failures,
+        );
+    } else {
+        strict_validate_safetensor(
+            parsed,
+            &naming.mlp_gate(layer),
+            d_ff * d_model,
+            GROUP_DENSE_FFN,
+            fp8_block,
+            fp8_ignored,
+            failures,
+        );
+        strict_validate_safetensor(
+            parsed,
+            &naming.mlp_up(layer),
+            d_ff * d_model,
+            GROUP_DENSE_FFN,
+            fp8_block,
+            fp8_ignored,
+            failures,
+        );
+        strict_validate_safetensor(
+            parsed,
+            &naming.mlp_down(layer),
+            d_model * d_ff,
+            GROUP_DENSE_FFN,
+            fp8_block,
+            fp8_ignored,
+            failures,
+        );
+    }
+}
+
+fn validate_shared_expert_strict(
+    parsed: &[safetensors::SafeTensors<'_>],
+    naming: &TensorNaming,
+    layer: usize,
+    d_model: usize,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+    failures: &mut Vec<WeightLoadFailure>,
+) {
+    let p = naming.prefix();
+    let gate_names = [
+        format!("{p}model.layers.{layer}.mlp.shared_expert.gate_proj.weight"),
+        format!("{p}model.layers.{layer}.mlp.shared_experts.gate_proj.weight"),
+    ];
+    let up_names = [
+        format!("{p}model.layers.{layer}.mlp.shared_expert.up_proj.weight"),
+        format!("{p}model.layers.{layer}.mlp.shared_experts.up_proj.weight"),
+    ];
+    let down_names = [
+        format!("{p}model.layers.{layer}.mlp.shared_expert.down_proj.weight"),
+        format!("{p}model.layers.{layer}.mlp.shared_experts.down_proj.weight"),
+    ];
+
+    let Some((gate_name, gate_len)) = strict_find_any_safetensor_len(
+        parsed,
+        &gate_names,
+        "non-empty multiple of d_model",
+        GROUP_SHARED_FFN,
+        fp8_block,
+        fp8_ignored,
+        failures,
+    ) else {
+        return;
+    };
+    let Some((up_name, up_len)) = strict_find_any_safetensor_len(
+        parsed,
+        &up_names,
+        "same length as shared expert gate",
+        GROUP_SHARED_FFN,
+        fp8_block,
+        fp8_ignored,
+        failures,
+    ) else {
+        return;
+    };
+    let Some((down_name, down_len)) = strict_find_any_safetensor_len(
+        parsed,
+        &down_names,
+        "d_model * shared_d_ff",
+        GROUP_SHARED_FFN,
+        fp8_block,
+        fp8_ignored,
+        failures,
+    ) else {
+        return;
+    };
+
+    if d_model == 0 || gate_len == 0 || gate_len % d_model != 0 {
+        failures.push(WeightLoadFailure {
+            tensor: gate_name,
+            group: GROUP_SHARED_FFN,
+            kind: WeightLoadFailureKind::ShapeMismatch,
+            expected: "non-empty multiple of d_model".to_string(),
+            actual: Some(format!("{gate_len} f32 elements")),
+            detail: None,
+        });
+        return;
+    }
+    let shared_d_ff = gate_len / d_model;
+    if up_len != gate_len {
+        failures.push(WeightLoadFailure {
+            tensor: up_name,
+            group: GROUP_SHARED_FFN,
+            kind: WeightLoadFailureKind::ShapeMismatch,
+            expected: format!("{gate_len} f32 elements"),
+            actual: Some(format!("{up_len} f32 elements")),
+            detail: Some("shared expert up projection must match gate projection".to_string()),
+        });
+    }
+    let expected_down = d_model * shared_d_ff;
+    if down_len != expected_down {
+        failures.push(WeightLoadFailure {
+            tensor: down_name,
+            group: GROUP_SHARED_FFN,
+            kind: WeightLoadFailureKind::ShapeMismatch,
+            expected: format!("{expected_down} f32 elements"),
+            actual: Some(format!("{down_len} f32 elements")),
+            detail: Some("shared expert down projection must be d_model * shared_d_ff".to_string()),
+        });
+    }
+
+    validate_optional_safetensor_any(
+        parsed,
+        &[format!(
+            "{p}model.layers.{layer}.mlp.shared_expert_gate.weight"
+        )],
+        d_model,
+        GROUP_SHARED_FFN,
+        fp8_block,
+        fp8_ignored,
+        failures,
+    );
+}
+
+fn validate_moe_gate_strict(
+    dir: &Path,
+    parsed: &[safetensors::SafeTensors<'_>],
+    safetensor_name: &str,
+    bin_name: &str,
+    expected: usize,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+    failures: &mut Vec<WeightLoadFailure>,
+) {
+    let bin_path = dir.join(bin_name);
+    if bin_path.is_file() {
+        match std::fs::metadata(&bin_path) {
+            Ok(meta) => {
+                let len = meta.len() as usize;
+                let expected_bytes = expected.saturating_mul(4);
+                if len == expected_bytes {
+                    return;
+                }
+                failures.push(WeightLoadFailure {
+                    tensor: bin_name.to_string(),
+                    group: GROUP_ROUTING_GATES,
+                    kind: if len % 4 == 0 {
+                        WeightLoadFailureKind::ShapeMismatch
+                    } else {
+                        WeightLoadFailureKind::Malformed
+                    },
+                    expected: format!("{expected} f32 elements ({expected_bytes} bytes)"),
+                    actual: Some(format!("{len} bytes")),
+                    detail: Some(
+                        "extracted gate override is present but not shape-compatible".to_string(),
+                    ),
+                });
+            }
+            Err(e) => failures.push(WeightLoadFailure {
+                tensor: bin_name.to_string(),
+                group: GROUP_ROUTING_GATES,
+                kind: WeightLoadFailureKind::Unreadable,
+                expected: format!("{expected} f32 elements"),
+                actual: None,
+                detail: Some(e.to_string()),
+            }),
+        }
+    }
+
+    strict_validate_safetensor(
+        parsed,
+        safetensor_name,
+        expected,
+        GROUP_ROUTING_GATES,
+        fp8_block,
+        fp8_ignored,
+        failures,
+    );
+}
+
+fn validate_optional_safetensor(
+    parsed: &[safetensors::SafeTensors<'_>],
+    name: String,
+    expected: usize,
+    group: &'static str,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+    failures: &mut Vec<WeightLoadFailure>,
+) {
+    if safetensor_present(parsed, &name) {
+        strict_validate_safetensor(
+            parsed,
+            &name,
+            expected,
+            group,
+            fp8_block,
+            fp8_ignored,
+            failures,
+        );
+    }
+}
+
+fn validate_optional_safetensor_any(
+    parsed: &[safetensors::SafeTensors<'_>],
+    names: &[String],
+    expected: usize,
+    group: &'static str,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+    failures: &mut Vec<WeightLoadFailure>,
+) {
+    for name in names {
+        if safetensor_present(parsed, name) {
+            strict_validate_safetensor(
+                parsed,
+                name,
+                expected,
+                group,
+                fp8_block,
+                fp8_ignored,
+                failures,
+            );
+            return;
+        }
+    }
+}
+
+fn strict_find_any_safetensor_len(
+    parsed: &[safetensors::SafeTensors<'_>],
+    names: &[String],
+    expected: &str,
+    group: &'static str,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+    failures: &mut Vec<WeightLoadFailure>,
+) -> Option<(String, usize)> {
+    for name in names {
+        if safetensor_present(parsed, name) {
+            return strict_safetensor_len(parsed, name, group, fp8_block, fp8_ignored, failures)
+                .map(|len| (name.clone(), len));
+        }
+    }
+    failures.push(WeightLoadFailure::missing(
+        names.join(" | "),
+        group,
+        tensor_names_expected(names, expected),
+    ));
+    None
+}
+
+fn strict_validate_safetensor(
+    parsed: &[safetensors::SafeTensors<'_>],
+    name: &str,
+    expected: usize,
+    group: &'static str,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+    failures: &mut Vec<WeightLoadFailure>,
+) -> bool {
+    match strict_safetensor_len(parsed, name, group, fp8_block, fp8_ignored, failures) {
+        Some(actual) if actual == expected => true,
+        Some(actual) => {
+            failures.push(WeightLoadFailure {
+                tensor: name.to_string(),
+                group,
+                kind: WeightLoadFailureKind::ShapeMismatch,
+                expected: format!("{expected} f32 elements"),
+                actual: Some(format!("{actual} f32 elements")),
+                detail: None,
+            });
+            false
+        }
+        None => false,
+    }
+}
+
+fn strict_safetensor_len(
+    parsed: &[safetensors::SafeTensors<'_>],
+    name: &str,
+    group: &'static str,
+    fp8_block: usize,
+    fp8_ignored: &[String],
+    failures: &mut Vec<WeightLoadFailure>,
+) -> Option<usize> {
+    use safetensors::tensor::Dtype;
+    for st in parsed {
+        if let Ok(view) = st.tensor(name) {
+            let shape = view.shape();
+            let n_elem: usize = shape.iter().product();
+            return match view.dtype() {
+                Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::I8 | Dtype::F8_E5M2 => Some(n_elem),
+                Dtype::F8_E4M3 if safetensor_name_is_fp8_ignored(fp8_ignored, name) => {
+                    let raw = view.data();
+                    if raw.len() % 2 != 0 {
+                        failures.push(WeightLoadFailure {
+                            tensor: name.to_string(),
+                            group,
+                            kind: WeightLoadFailureKind::Malformed,
+                            expected: "BF16-compatible even byte length".to_string(),
+                            actual: Some(format!("{} bytes", raw.len())),
+                            detail: Some("FP8 ignored layer is decoded as BF16".to_string()),
+                        });
+                        None
+                    } else {
+                        Some(raw.len() / 2)
+                    }
+                }
+                Dtype::F8_E4M3 => {
+                    if shape.len() != 2 {
+                        failures.push(WeightLoadFailure {
+                            tensor: name.to_string(),
+                            group,
+                            kind: WeightLoadFailureKind::Unsupported,
+                            expected: "2D FP8 E4M3 block-quantized weight".to_string(),
+                            actual: Some(format!("{shape:?}")),
+                            detail: None,
+                        });
+                        return None;
+                    }
+                    let rows = shape[0];
+                    let cols = shape[1];
+                    let scale_name = format!("{name}_scale_inv");
+                    let mut scale_len = None;
+                    for s in parsed {
+                        if let Ok(sv) = s.tensor(&scale_name) {
+                            scale_len = Some(sv.shape().iter().product::<usize>());
+                            break;
+                        }
+                    }
+                    let want = rows.div_ceil(fp8_block) * cols.div_ceil(fp8_block);
+                    match scale_len {
+                        Some(actual) if actual == want => Some(n_elem),
+                        Some(actual) => {
+                            failures.push(WeightLoadFailure {
+                                tensor: scale_name,
+                                group,
+                                kind: WeightLoadFailureKind::ShapeMismatch,
+                                expected: format!("{want} f32 scale elements"),
+                                actual: Some(format!("{actual} elements")),
+                                detail: Some("FP8 companion scale_inv shape mismatch".to_string()),
+                            });
+                            None
+                        }
+                        None => {
+                            failures.push(WeightLoadFailure::missing(
+                                scale_name,
+                                group,
+                                format!("{want} f32 scale elements"),
+                            ));
+                            None
+                        }
+                    }
+                }
+                Dtype::U8 => {
+                    if shape.len() != 2 || shape[0] == 0 {
+                        failures.push(WeightLoadFailure {
+                            tensor: name.to_string(),
+                            group,
+                            kind: WeightLoadFailureKind::Unsupported,
+                            expected: "2D MXFP4 packed weight".to_string(),
+                            actual: Some(format!("{shape:?}")),
+                            detail: None,
+                        });
+                        return None;
+                    }
+                    let rows = shape[0];
+                    let packed_cols = shape[1];
+                    let cols = packed_cols * 2;
+                    if find_mxfp4_scales(parsed, name, rows, cols).is_none() {
+                        failures.push(WeightLoadFailure {
+                            tensor: name.to_string(),
+                            group,
+                            kind: WeightLoadFailureKind::Missing,
+                            expected: "MXFP4 companion block scales".to_string(),
+                            actual: None,
+                            detail: None,
+                        });
+                        None
+                    } else {
+                        Some(rows * cols)
+                    }
+                }
+                other => {
+                    failures.push(WeightLoadFailure {
+                        tensor: name.to_string(),
+                        group,
+                        kind: WeightLoadFailureKind::Unsupported,
+                        expected: "supported resident weight dtype".to_string(),
+                        actual: Some(format!("{other:?}")),
+                        detail: None,
+                    });
+                    None
+                }
+            };
+        }
+    }
+    failures.push(WeightLoadFailure::missing(name, group, "present tensor"));
+    None
+}
+
 /// Load the on-disk MLA projection tensors for a single DeepSeek-V3
 /// layer, overwriting the seeded weights in `layer.mla`. Missing tensors
 /// keep their seeded values (matching the rest of the loader's
@@ -1874,12 +3538,15 @@ fn load_mla_layer<F>(
     naming: &TensorNaming,
     config: &RealModelConfig,
     find: &F,
+    record: &mut dyn FnMut(&str, &'static str, usize),
     tried: &mut usize,
     loaded: &mut usize,
 ) where
     F: Fn(&str, usize) -> Option<Vec<f32>>,
 {
-    let Some(mla) = layer.mla.as_mut() else { return };
+    let Some(mla) = layer.mla.as_mut() else {
+        return;
+    };
     let d_model = config.d_model;
     let n_h = mla.num_heads;
     let qk_head = mla.qk_nope_head_dim + mla.qk_rope_head_dim;
@@ -1888,42 +3555,63 @@ fn load_mla_layer<F>(
     let kv_b_out = n_h * (mla.qk_nope_head_dim + mla.v_head_dim);
 
     // (name, expected_len) -> Option<Vec<f32>>, counting every attempt.
-    let mut try_load = |name: String, expected: usize| -> Option<Vec<f32>> {
+    let mut try_load = |name: String, expected: usize, group: &'static str| -> Option<Vec<f32>> {
         *tried += 1;
         let v = find(&name, expected);
         if v.is_some() {
             *loaded += 1;
+            record(&name, group, expected * 4);
         }
         v
     };
 
     if mla.q_lora_rank > 0 {
-        if let Some(v) = try_load(naming.mla_q_a_proj(l), mla.q_lora_rank * d_model) {
+        if let Some(v) = try_load(
+            naming.mla_q_a_proj(l),
+            mla.q_lora_rank * d_model,
+            GROUP_ATTENTION,
+        ) {
             mla.q_a_proj = v;
         }
-        if let Some(v) = try_load(naming.mla_q_a_layernorm(l), mla.q_lora_rank) {
+        if let Some(v) = try_load(naming.mla_q_a_layernorm(l), mla.q_lora_rank, GROUP_NORMS) {
             mla.q_a_layernorm = Some(RmsNorm::new(v, config.rms_eps));
         }
-        if let Some(v) = try_load(naming.mla_q_b_proj(l), q_total * mla.q_lora_rank) {
+        if let Some(v) = try_load(
+            naming.mla_q_b_proj(l),
+            q_total * mla.q_lora_rank,
+            GROUP_ATTENTION,
+        ) {
             mla.q_b_proj = v;
         }
     } else {
         // q_lora_rank == 0: a single dense `q_proj` straight from d_model.
-        if let Some(v) = try_load(naming.attn_q(l), q_total * d_model) {
+        if let Some(v) = try_load(naming.attn_q(l), q_total * d_model, GROUP_ATTENTION) {
             mla.q_b_proj = v;
         }
     }
 
-    if let Some(v) = try_load(naming.mla_kv_a_proj(l), kv_proj_dim * d_model) {
+    if let Some(v) = try_load(
+        naming.mla_kv_a_proj(l),
+        kv_proj_dim * d_model,
+        GROUP_ATTENTION,
+    ) {
         mla.kv_a_proj_with_mqa = v;
     }
-    if let Some(v) = try_load(naming.mla_kv_a_layernorm(l), mla.kv_lora_rank) {
+    if let Some(v) = try_load(naming.mla_kv_a_layernorm(l), mla.kv_lora_rank, GROUP_NORMS) {
         mla.kv_a_layernorm = RmsNorm::new(v, config.rms_eps);
     }
-    if let Some(v) = try_load(naming.mla_kv_b_proj(l), kv_b_out * mla.kv_lora_rank) {
+    if let Some(v) = try_load(
+        naming.mla_kv_b_proj(l),
+        kv_b_out * mla.kv_lora_rank,
+        GROUP_ATTENTION,
+    ) {
         mla.kv_b_proj = v;
     }
-    if let Some(v) = try_load(naming.attn_o(l), d_model * n_h * mla.v_head_dim) {
+    if let Some(v) = try_load(
+        naming.attn_o(l),
+        d_model * n_h * mla.v_head_dim,
+        GROUP_ATTENTION,
+    ) {
         mla.o_proj = v;
     }
 }
@@ -2071,8 +3759,8 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
     use crate::engine::{Engine, EngineOptions, ModelShape};
-    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
+    use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::router::{PredictiveLoader, TopKRouter};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2089,10 +3777,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!(
-                "mer-model-{label}-{}-{n}-{ts}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("mer-model-{label}-{}-{n}-{ts}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             Self { path }
         }
@@ -2309,9 +3995,16 @@ mod tests {
         let m = RealModel::new_seeded(cfg, 3);
         for (l, layer) in m.layers.iter().enumerate() {
             if l % 2 == 0 {
-                assert_eq!(layer.attn.window_size, Some(128), "even layer {l} should be SWA");
+                assert_eq!(
+                    layer.attn.window_size,
+                    Some(128),
+                    "even layer {l} should be SWA"
+                );
             } else {
-                assert_eq!(layer.attn.window_size, None, "odd layer {l} should be global");
+                assert_eq!(
+                    layer.attn.window_size, None,
+                    "odd layer {l} should be global"
+                );
             }
         }
 
@@ -2340,10 +4033,7 @@ mod tests {
         assert_eq!(m.global_expert_id(2, 5), 21);
     }
 
-    fn build_engine_for_model(
-        dir: &Path,
-        cfg: &RealModelConfig,
-    ) -> Arc<Engine> {
+    fn build_engine_for_model(dir: &Path, cfg: &RealModelConfig) -> Arc<Engine> {
         // Total experts across all layers, addressed flat as
         // layer * num_experts + local.
         let total = cfg.num_layers as u32 * cfg.num_experts as u32;
@@ -2376,7 +4066,11 @@ mod tests {
             storage,
             router,
             predictor,
-            ModelShape { d_model: cfg.d_model, d_ff: cfg.d_ff, hidden_seed: 1 },
+            ModelShape {
+                d_model: cfg.d_model,
+                d_ff: cfg.d_ff,
+                hidden_seed: 1,
+            },
             EngineOptions::default(),
         ))
     }
@@ -2388,7 +4082,15 @@ mod tests {
         let engine = build_engine_for_model(&dir.path, &cfg);
         let model = RealModel::new_seeded(cfg.clone(), 0xDEAD);
         let mut kv = model.fresh_kv_caches();
-        let next = model.step(&engine, 42, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+        let next = model
+            .step(
+                &engine,
+                42,
+                0,
+                &mut kv,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
         assert!((next as usize) < cfg.vocab_size);
         // KV caches grew by exactly one position.
         for c in &kv {
@@ -2398,7 +4100,10 @@ mod tests {
         // misses).
         let r = engine.report();
         assert!(r.misses > 0, "first step should miss the cache");
-        assert!(r.bytes_read > 0, "engine should have read expert bytes from disk");
+        assert!(
+            r.bytes_read > 0,
+            "engine should have read expert bytes from disk"
+        );
     }
 
     /// Regression test for MLA KV-cache sizing. `fresh_kv_caches` must
@@ -2428,7 +4133,10 @@ mod tests {
         };
         let engine = build_engine_for_model(&dir.path, &cfg);
         let model = RealModel::new_seeded(cfg.clone(), 0x5EED);
-        assert!(model.layers.iter().all(|l| l.mla.is_some()), "all layers MLA");
+        assert!(
+            model.layers.iter().all(|l| l.mla.is_some()),
+            "all layers MLA"
+        );
 
         let mut kv = model.fresh_kv_caches();
         let latent = 16 + 4; // kv_lora_rank + qk_rope_head_dim
@@ -2437,8 +4145,24 @@ mod tests {
             assert_eq!(c.v_dim, latent, "MLA V cache must be latent-width");
         }
 
-        let t1 = model.step(&engine, 7, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
-        let t2 = model.step(&engine, t1, 1, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+        let t1 = model
+            .step(
+                &engine,
+                7,
+                0,
+                &mut kv,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
+        let t2 = model
+            .step(
+                &engine,
+                t1,
+                1,
+                &mut kv,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
         assert!((t1 as usize) < cfg.vocab_size);
         assert!((t2 as usize) < cfg.vocab_size);
         for c in &kv {
@@ -2454,12 +4178,44 @@ mod tests {
         let model = RealModel::new_seeded(cfg.clone(), 1);
 
         let mut kv1 = model.fresh_kv_caches();
-        let t1 = model.step(&engine, 7, 0, &mut kv1, &crate::sampling::SamplingParams::greedy()).await;
-        let t2 = model.step(&engine, t1, 1, &mut kv1, &crate::sampling::SamplingParams::greedy()).await;
+        let t1 = model
+            .step(
+                &engine,
+                7,
+                0,
+                &mut kv1,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
+        let t2 = model
+            .step(
+                &engine,
+                t1,
+                1,
+                &mut kv1,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
 
         let mut kv2 = model.fresh_kv_caches();
-        let u1 = model.step(&engine, 7, 0, &mut kv2, &crate::sampling::SamplingParams::greedy()).await;
-        let u2 = model.step(&engine, u1, 1, &mut kv2, &crate::sampling::SamplingParams::greedy()).await;
+        let u1 = model
+            .step(
+                &engine,
+                7,
+                0,
+                &mut kv2,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
+        let u2 = model
+            .step(
+                &engine,
+                u1,
+                1,
+                &mut kv2,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
 
         assert_eq!((t1, t2), (u1, u2));
     }
@@ -2476,7 +4232,15 @@ mod tests {
         let engine = build_engine_for_model(&dir.path, &cfg);
         let model = RealModel::new_seeded(cfg.clone(), 9);
         let mut kv = model.fresh_kv_caches();
-        let _ = model.step(&engine, 5, 0, &mut kv, &crate::sampling::SamplingParams::greedy()).await;
+        let _ = model
+            .step(
+                &engine,
+                5,
+                0,
+                &mut kv,
+                &crate::sampling::SamplingParams::greedy(),
+            )
+            .await;
         // Both layers contributed to KV cache growth.
         assert_eq!(kv.len(), 2);
         for c in &kv {
@@ -2490,8 +4254,8 @@ mod tests {
     /// minimal shard by hand and compare specific weights.
     #[test]
     fn from_safetensors_loads_dense_tensors() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let cfg = RealModelConfig {
             vocab_size: 8,
             d_model: 4,
@@ -2523,7 +4287,9 @@ mod tests {
         // HF Python pipeline emits.
         let to_bytes = |v: &[f32]| -> Vec<u8> {
             let mut out = Vec::with_capacity(v.len() * 4);
-            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
             out
         };
         let embed_bytes = to_bytes(&embed);
@@ -2532,7 +4298,8 @@ mod tests {
         let tensors: Vec<(String, TensorView)> = vec![
             (
                 "model.embed_tokens.weight".to_string(),
-                TensorView::new(Dtype::F32, vec![cfg.vocab_size, cfg.d_model], &embed_bytes).unwrap(),
+                TensorView::new(Dtype::F32, vec![cfg.vocab_size, cfg.d_model], &embed_bytes)
+                    .unwrap(),
             ),
             (
                 "model.layers.0.self_attn.q_proj.weight".to_string(),
@@ -2548,16 +4315,19 @@ mod tests {
 
         let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
         // Loaded tensors carry their sentinel values verbatim.
-        assert!(model.embedding.iter().all(|&x| x == 0.25));
-        assert!(model.layers[0].attn.wq.iter().all(|&x| x == 0.5));
+        assert!(model.embedding.iter().all(|x| x == 0.25));
+        assert!(model.layers[0].attn.wq.iter().all(|x| x == 0.5));
         // Anything else is still the seeded init (gate, k/v/o, MoE
         // gate, lm_head, rms_attn / rms_moe, etc.). Sanity: lm_head
         // wasn't provided, so its weights stayed at whatever the seed
         // produced — they must not be all-equal (which would only
         // happen if our find-tensor logic spuriously matched).
         let lm = &model.lm_head.weights;
-        let first = lm[0];
-        assert!(lm.iter().any(|&x| x != first), "lm_head should remain seeded, not constant");
+        let first = lm.iter().next().unwrap();
+        assert!(
+            lm.iter().any(|x| x != first),
+            "lm_head should remain seeded, not constant"
+        );
     }
 
     /// Regression: a checkpoint with `attention_bias = true` AND an
@@ -2569,8 +4339,8 @@ mod tests {
     /// lost.
     #[test]
     fn from_safetensors_loads_asymmetric_v_proj_bias() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let mut adv = AdvancedConfig::default();
         adv.attention_bias = true;
         adv.v_head_dim = Some(2); // V uses 2 while Q/K use head_dim = 4
@@ -2627,8 +4397,8 @@ mod tests {
     /// the `[q_dim | kv_dim | kv_dim]` row boundaries, in that order.
     #[test]
     fn from_safetensors_splits_phi4_fused_qkv() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let cfg = RealModelConfig {
             vocab_size: 8,
             d_model: 4,
@@ -2658,7 +4428,9 @@ mod tests {
         fused.extend(std::iter::repeat(0.3f32).take(kv_dim * cfg.d_model));
         let to_bytes = |v: &[f32]| -> Vec<u8> {
             let mut out = Vec::with_capacity(v.len() * 4);
-            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
             out
         };
         let fused_bytes = to_bytes(&fused);
@@ -2679,9 +4451,9 @@ mod tests {
         assert_eq!(attn.wq.len(), q_dim * cfg.d_model);
         assert_eq!(attn.wk.len(), kv_dim * cfg.d_model);
         assert_eq!(attn.wv.len(), kv_dim * cfg.d_model);
-        assert!(attn.wq.iter().all(|&x| x == 0.1), "wq region");
-        assert!(attn.wk.iter().all(|&x| x == 0.2), "wk region");
-        assert!(attn.wv.iter().all(|&x| x == 0.3), "wv region");
+        assert!(attn.wq.iter().all(|x| x == 0.1), "wq region");
+        assert!(attn.wk.iter().all(|x| x == 0.2), "wk region");
+        assert!(attn.wv.iter().all(|x| x == 0.3), "wv region");
     }
 
     /// Mistral Small 3 (`mistral3`) is multimodal; its language-model
@@ -2689,8 +4461,8 @@ mod tests {
     /// that prefix before looking tensors up.
     #[test]
     fn from_safetensors_handles_mistral_language_model_prefix() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let cfg = RealModelConfig {
             vocab_size: 8,
             d_model: 4,
@@ -2712,7 +4484,9 @@ mod tests {
         let embed = vec![0.7f32; cfg.vocab_size * cfg.d_model];
         let to_bytes = |v: &[f32]| -> Vec<u8> {
             let mut out = Vec::with_capacity(v.len() * 4);
-            for &x in v { out.extend_from_slice(&x.to_le_bytes()); }
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
             out
         };
         let embed_bytes = to_bytes(&embed);
@@ -2736,7 +4510,7 @@ mod tests {
 
         let model = RealModel::from_safetensors(cfg.clone(), &dir.path, 1).unwrap();
         assert!(
-            model.embedding.iter().all(|&x| x == 0.7),
+            model.embedding.iter().all(|x| x == 0.7),
             "prefixed embed_tokens must load via language_model. prefix"
         );
     }
@@ -2801,15 +4575,32 @@ mod tests {
             ..RealModelConfig::tiny()
         };
         let model = RealModel::new_seeded(cfg, 1);
+        let first_cache = model.layers[0]
+            .attn
+            .rope_cache
+            .as_ref()
+            .expect("standard path must carry a shared RoPE cache")
+            .clone();
         for layer in &model.layers {
-            assert!(layer.attn.rope_yarn.is_some(), "standard path must carry YaRN");
+            assert!(
+                layer.attn.rope_yarn.is_some(),
+                "standard path must carry YaRN"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &first_cache,
+                    layer
+                        .attn
+                        .rope_cache
+                        .as_ref()
+                        .expect("standard path must carry a shared RoPE cache")
+                ),
+                "identical layer RoPE configs should share one cache"
+            );
             let mla = layer.mla.as_ref().expect("MLA seeded");
             assert!(mla.rope_yarn.is_some(), "MLA path must carry YaRN");
-            let expected = crate::mla::MultiHeadLatentAttention::yarn_softmax_scale(
-                4,
-                4,
-                Some(&scaling),
-            );
+            let expected =
+                crate::mla::MultiHeadLatentAttention::yarn_softmax_scale(4, 4, Some(&scaling));
             assert!((mla.softmax_scale - expected).abs() < 1e-7);
             assert!(
                 mla.softmax_scale
@@ -2818,8 +4609,19 @@ mod tests {
             );
         }
         // Without a rope_scaling block, nothing is wired.
-        let plain = RealModel::new_seeded(RealModelConfig::tiny(), 1);
+        let plain = RealModel::new_seeded(
+            RealModelConfig {
+                num_layers: 2,
+                ..RealModelConfig::tiny()
+            },
+            1,
+        );
         assert!(plain.layers.iter().all(|l| l.attn.rope_yarn.is_none()));
+        let plain_cache = plain.layers[0].attn.rope_cache.as_ref().unwrap();
+        assert!(Arc::ptr_eq(
+            plain_cache,
+            plain.layers[1].attn.rope_cache.as_ref().unwrap()
+        ));
     }
 
     /// `from_hf_config` maps a parsed Qwen3-MoE `config.json` (explicit
@@ -2861,8 +4663,8 @@ mod tests {
     /// `from_dir_auto`-adjacent dispatch test.
     #[test]
     fn from_dir_auto_dispatches_on_safetensors_presence() {
-        use safetensors::tensor::{Dtype, TensorView};
         use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
         let cfg = RealModelConfig {
             vocab_size: 4,
             d_model: 4,
@@ -2891,13 +4693,10 @@ mod tests {
         let st_dir = TempDir::new("auto_st");
         let embed = vec![0.75f32; cfg.vocab_size * cfg.d_model];
         let mut bytes = Vec::with_capacity(embed.len() * 4);
-        for &x in &embed { bytes.extend_from_slice(&x.to_le_bytes()); }
-        let view = TensorView::new(
-            Dtype::F32,
-            vec![cfg.vocab_size, cfg.d_model],
-            &bytes,
-        )
-        .unwrap();
+        for &x in &embed {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        let view = TensorView::new(Dtype::F32, vec![cfg.vocab_size, cfg.d_model], &bytes).unwrap();
         serialize_to_file(
             [("model.embed_tokens.weight".to_string(), view)],
             &None,
@@ -2905,7 +4704,7 @@ mod tests {
         )
         .unwrap();
         let model = RealModel::from_dir_auto(cfg, &st_dir.path, 7).unwrap();
-        assert!(model.embedding.iter().all(|&x| x == 0.75));
+        assert!(model.embedding.iter().all(|x| x == 0.75));
     }
 
     /// Helper: write a slice of f32 as a little-endian `.bin` file.
@@ -2915,6 +4714,340 @@ mod tests {
             bytes.extend_from_slice(&x.to_le_bytes());
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn q8_bytes(values: &[f32]) -> Vec<u8> {
+        use crate::inference::{quantize_q8_0_block, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
+        let blocks = values.len().div_ceil(Q8_0_BLOCK_ELEMS);
+        let mut out = vec![0u8; blocks * Q8_0_BLOCK_BYTES];
+        for block in 0..blocks {
+            let start = block * Q8_0_BLOCK_ELEMS;
+            let end = (start + Q8_0_BLOCK_ELEMS).min(values.len());
+            quantize_q8_0_block(
+                &values[start..end],
+                &mut out[block * Q8_0_BLOCK_BYTES..(block + 1) * Q8_0_BLOCK_BYTES],
+            );
+        }
+        out
+    }
+
+    fn tiny_mixtral_loader_cfg() -> RealModelConfig {
+        RealModelConfig {
+            vocab_size: 8,
+            d_model: 4,
+            d_ff: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 2,
+            num_layers: 1,
+            num_experts: 2,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        }
+    }
+
+    fn f32_bytes(value: f32, len: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(len * 4);
+        for _ in 0..len {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn write_safetensors_f32(
+        dir: &TempDir,
+        specs: Vec<(String, Vec<usize>, f32)>,
+    ) -> std::path::PathBuf {
+        use safetensors::serialize_to_file;
+        use safetensors::tensor::{Dtype, TensorView};
+
+        let bytes: Vec<Vec<u8>> = specs
+            .iter()
+            .map(|(_, shape, fill)| f32_bytes(*fill, shape.iter().product()))
+            .collect();
+        let tensors: Vec<(String, TensorView)> = specs
+            .iter()
+            .zip(bytes.iter())
+            .map(|((name, shape, _), bytes)| {
+                (
+                    name.clone(),
+                    TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+                )
+            })
+            .collect();
+        let out_path = dir.path.join("model.safetensors");
+        serialize_to_file(tensors, &None, &out_path).unwrap();
+        out_path
+    }
+
+    fn complete_tiny_mixtral_specs(cfg: &RealModelConfig) -> Vec<(String, Vec<usize>, f32)> {
+        let naming = cfg.tensor_naming();
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        vec![
+            (naming.embed(), vec![cfg.vocab_size, cfg.d_model], 0.11),
+            (naming.final_norm(), vec![cfg.d_model], 1.0),
+            (naming.lm_head(), vec![cfg.vocab_size, cfg.d_model], 0.12),
+            (naming.input_layernorm(0), vec![cfg.d_model], 1.0),
+            (naming.post_attention_layernorm(0), vec![cfg.d_model], 1.0),
+            (naming.attn_q(0), vec![q_dim, cfg.d_model], 0.21),
+            (naming.attn_k(0), vec![kv_dim, cfg.d_model], 0.22),
+            (naming.attn_v(0), vec![kv_dim, cfg.d_model], 0.23),
+            (naming.attn_o(0), vec![cfg.d_model, q_dim], 0.24),
+            (naming.moe_gate(0), vec![cfg.num_experts, cfg.d_model], 0.31),
+        ]
+    }
+
+    fn strict_error(err: &std::io::Error) -> &StrictWeightLoadError {
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<StrictWeightLoadError>())
+            .expect("loader error should carry StrictWeightLoadError")
+    }
+
+    #[test]
+    fn from_dir_loads_native_q8_dense_manifest_without_alias_files() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let dir = TempDir::new("dense_manifest_q8");
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let mut tensors = Vec::new();
+        let mut add = |canonical: &str,
+                       file: &str,
+                       aliases: Vec<String>,
+                       dtype: &str,
+                       dims: Vec<usize>,
+                       bytes: Vec<u8>| {
+            std::fs::write(dir.path.join(file), &bytes).unwrap();
+            tensors.push(serde_json::json!({
+                "canonical_name": canonical,
+                "file": file,
+                "aliases": aliases,
+                "dtype": dtype,
+                "dims": dims,
+                "byte_len": bytes.len(),
+                "checksum": crate::dense_tensor::dense_checksum(&bytes),
+            }));
+        };
+        let q8_values = |len: usize, offset: f32| {
+            (0..len)
+                .map(|i| ((i % 11) as f32 - 5.0) / 7.0 + offset)
+                .collect::<Vec<f32>>()
+        };
+        let f32_manifest_bytes = |value: f32, len: usize| {
+            let mut bytes = Vec::with_capacity(len * 4);
+            for _ in 0..len {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes
+        };
+        let embed_values = q8_values(cfg.vocab_size * cfg.d_model, 0.0);
+        let embed_bytes = q8_bytes(&embed_values);
+        add(
+            "token_embd.weight",
+            "dense_token_embd_weight.q8_0.bin",
+            vec!["embed.bin".to_string()],
+            "q8_0",
+            vec![cfg.vocab_size, cfg.d_model],
+            embed_bytes.clone(),
+        );
+        add(
+            "output_norm.weight",
+            "dense_output_norm_weight.f32.bin",
+            vec!["final_rms.bin".to_string()],
+            "f32",
+            vec![cfg.d_model, 1],
+            f32_manifest_bytes(1.0, cfg.d_model),
+        );
+        add(
+            "output.weight",
+            "dense_output_weight.q8_0.bin",
+            vec!["lm_head.bin".to_string()],
+            "q8_0",
+            vec![cfg.vocab_size, cfg.d_model],
+            q8_bytes(&q8_values(cfg.vocab_size * cfg.d_model, 0.1)),
+        );
+        for (canonical, alias, rows, cols, offset) in [
+            ("blk.0.attn_q.weight", "attn_0_q.bin", q_dim, cfg.d_model, 0.2),
+            ("blk.0.attn_k.weight", "attn_0_k.bin", kv_dim, cfg.d_model, 0.3),
+            ("blk.0.attn_v.weight", "attn_0_v.bin", kv_dim, cfg.d_model, 0.4),
+            ("blk.0.attn_output.weight", "attn_0_o.bin", cfg.d_model, q_dim, 0.5),
+        ] {
+            add(
+                canonical,
+                &format!("{canonical}.q8_0.bin").replace('.', "_"),
+                vec![alias.to_string()],
+                "q8_0",
+                vec![rows, cols],
+                q8_bytes(&q8_values(rows * cols, offset)),
+            );
+        }
+        add(
+            "blk.0.attn_norm.weight",
+            "dense_blk_0_attn_norm_weight.f32.bin",
+            vec!["rms_attn_0.bin".to_string()],
+            "f32",
+            vec![cfg.d_model, 1],
+            f32_manifest_bytes(1.0, cfg.d_model),
+        );
+        add(
+            "blk.0.ffn_norm.weight",
+            "dense_blk_0_ffn_norm_weight.f32.bin",
+            vec!["rms_moe_0.bin".to_string()],
+            "f32",
+            vec![cfg.d_model, 1],
+            f32_manifest_bytes(1.0, cfg.d_model),
+        );
+        add(
+            "blk.0.ffn_gate_inp.weight",
+            "dense_blk_0_ffn_gate_inp_weight.q8_0.bin",
+            vec!["gate_0.bin".to_string()],
+            "q8_0",
+            vec![cfg.num_experts, cfg.d_model],
+            q8_bytes(&q8_values(cfg.num_experts * cfg.d_model, 0.6)),
+        );
+        std::fs::write(
+            dir.path.join("dense_manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "format_version": 1,
+                "tensors": tensors,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let model = RealModel::from_dir_with_options(
+            cfg.clone(),
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .unwrap();
+        assert!(!dir.path.join("embed.bin").exists());
+        assert_eq!(model.embedding.dtype(), crate::dense_tensor::DenseDType::Q8_0);
+        assert_eq!(
+            model.layers[0].attn.wq.dtype(),
+            crate::dense_tensor::DenseDType::Q8_0
+        );
+        assert_eq!(
+            model.layers[0].gate.weights.dtype(),
+            crate::dense_tensor::DenseDType::Q8_0
+        );
+        let expected_embedding =
+            DenseWeight::from_q8_0_bytes(embed_bytes, cfg.vocab_size, cfg.d_model).unwrap();
+        let mut expected_row = Vec::new();
+        expected_embedding.row_dequant_into(1, &mut expected_row);
+        assert_eq!(model.embed(1), expected_row);
+    }
+
+    #[test]
+    fn from_dir_strict_reports_all_missing_and_malformed_required_tensors() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let dir = TempDir::new("strict_bin_bad");
+        std::fs::write(dir.path.join("embed.bin"), [0u8, 1, 2]).unwrap();
+
+        let err = match RealModel::from_dir_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        ) {
+            Ok(_) => panic!("strict raw .bin load should reject malformed and missing tensors"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let strict = strict_error(&err);
+        assert!(
+            strict
+                .failures()
+                .iter()
+                .any(|f| { f.tensor == "embed.bin" && f.kind == WeightLoadFailureKind::Malformed }),
+            "malformed present tensor must be reported"
+        );
+        assert!(
+            strict
+                .failures()
+                .iter()
+                .any(|f| { f.tensor == "lm_head.bin" && f.kind == WeightLoadFailureKind::Missing }),
+            "strict mode must keep collecting after the first failure"
+        );
+        assert!(
+            strict
+                .failures()
+                .iter()
+                .any(|f| { f.tensor == "gate_0.bin" && f.group == GROUP_ROUTING_GATES }),
+            "MoE router gate is required for sparse layers"
+        );
+    }
+
+    #[test]
+    fn from_safetensors_strict_reports_missing_and_shape_mismatched_tensors() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let dir = TempDir::new("strict_st_bad");
+        write_safetensors_f32(
+            &dir,
+            vec![(cfg.tensor_naming().embed(), vec![1, cfg.d_model], 0.5)],
+        );
+
+        let err = match RealModel::from_safetensors_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        ) {
+            Ok(_) => panic!("strict safetensors load should reject an incomplete checkpoint"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let strict = strict_error(&err);
+        assert!(
+            strict.failures().iter().any(|f| {
+                f.tensor == "model.embed_tokens.weight"
+                    && f.kind == WeightLoadFailureKind::ShapeMismatch
+            }),
+            "bad embed shape must be reported"
+        );
+        assert!(
+            strict.failures().iter().any(|f| {
+                f.tensor == "lm_head.weight" && f.kind == WeightLoadFailureKind::Missing
+            }),
+            "missing LM head must be reported in the same aggregate error"
+        );
+        assert!(
+            strict.failures().len() > 2,
+            "strict error should aggregate every required tensor failure"
+        );
+    }
+
+    #[test]
+    fn from_safetensors_strict_accepts_complete_tiny_mixtral_checkpoint() {
+        let cfg = tiny_mixtral_loader_cfg();
+        let dir = TempDir::new("strict_st_good");
+        write_safetensors_f32(&dir, complete_tiny_mixtral_specs(&cfg));
+
+        let model = RealModel::from_safetensors_with_options(
+            cfg.clone(),
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .unwrap();
+        assert!(model.embedding.iter().all(|x| x == 0.11));
+        assert!(model.lm_head.weights.iter().all(|x| x == 0.12));
+        assert!(model.layers[0].attn.wq.iter().all(|x| x == 0.21));
+        assert_eq!(model.layers[0].gate.num_experts, cfg.num_experts);
     }
 
     /// `from_dir` must pick up the GGUF-extractor shared-expert `.bin`
@@ -2950,7 +5083,10 @@ mod tests {
             .shared_expert
             .as_ref()
             .expect("shared expert should be loaded");
-        assert_eq!(se.d_ff, shared_d_ff, "d_ff inferred from gate tensor length");
+        assert_eq!(
+            se.d_ff, shared_d_ff,
+            "d_ff inferred from gate tensor length"
+        );
         assert_eq!(se.d_model, d_model);
         assert!(se.gate_inp.is_some(), "sigmoid gate present");
         // forward produces a finite, d_model-length vector.
@@ -3032,7 +5168,10 @@ mod tests {
         .unwrap();
         let y_gated = gated.forward(&x);
         for (a, b) in y_ungated.iter().zip(y_gated.iter()) {
-            assert!((a * 0.5 - b).abs() < 1e-6, "gate=0 must halve output: {a} {b}");
+            assert!(
+                (a * 0.5 - b).abs() < 1e-6,
+                "gate=0 must halve output: {a} {b}"
+            );
         }
     }
 }

@@ -45,8 +45,12 @@ pub struct ServerConfig {
     pub admission_min_free_blocks: usize,
 }
 
-fn default_bind() -> String { "127.0.0.1:8080".to_string() }
-fn default_max_tokens() -> usize { 256 }
+fn default_bind() -> String {
+    "127.0.0.1:8080".to_string()
+}
+fn default_max_tokens() -> usize {
+    256
+}
 
 /// Optional API-key gate + simple in-process rate limiting.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -104,8 +108,12 @@ pub struct SamplingConfig {
     pub seed: u64,
 }
 
-fn default_temperature() -> f32 { 1.0 }
-fn default_top_p() -> f32 { 1.0 }
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_top_p() -> f32 {
+    1.0
+}
 
 impl Default for SamplingConfig {
     fn default() -> Self {
@@ -165,10 +173,16 @@ pub struct ModelConfig {
     pub dtype: WeightDtype,
 }
 
-fn default_dtype() -> WeightDtype { WeightDtype::F32 }
+fn default_dtype() -> WeightDtype {
+    WeightDtype::F32
+}
 
-fn default_top_k() -> usize { 2 }
-fn default_num_layers() -> usize { 1 }
+fn default_top_k() -> usize {
+    2
+}
+fn default_num_layers() -> usize {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfigToml {
@@ -236,14 +250,28 @@ pub struct StorageConfigToml {
     pub packed_manifest: Option<PathBuf>,
 }
 
-fn default_partial_load_fraction() -> f64 { 1.0 }
-fn default_pin_after_observations() -> u64 { 0 }
+fn default_partial_load_fraction() -> f64 {
+    1.0
+}
+fn default_pin_after_observations() -> u64 {
+    0
+}
 
-fn default_cache_slots() -> usize { 4 }
-fn default_block_align() -> usize { 4096 }
-fn default_predict_fanout() -> usize { 2 }
-fn default_pipeline_depth() -> u32 { crate::engine::DEFAULT_PIPELINE_DEPTH }
-fn default_predict_min_prob() -> f64 { 0.0 }
+fn default_cache_slots() -> usize {
+    4
+}
+fn default_block_align() -> usize {
+    4096
+}
+fn default_predict_fanout() -> usize {
+    2
+}
+fn default_pipeline_depth() -> u32 {
+    crate::engine::DEFAULT_PIPELINE_DEPTH
+}
+fn default_predict_min_prob() -> f64 {
+    0.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenizerConfig {
@@ -277,6 +305,13 @@ pub struct RealTransformerConfig {
     /// `crate::model::RealModel::from_dir` for the file-name schema.
     #[serde(default)]
     pub weights_dir: Option<PathBuf>,
+    /// Require a complete, shape-compatible resident checkpoint when
+    /// `weights_dir` is configured. When `true`, startup fails with one
+    /// aggregate error listing every missing, malformed, unsupported or
+    /// shape-mismatched required dense tensor instead of retaining seeded
+    /// fallback values. Optional architecture sidecars remain optional.
+    #[serde(default)]
+    pub strict_weights: bool,
     /// Vocab size. Must match the tokenizer when one is configured (for
     /// the byte fallback this should be 256).
     #[serde(default = "default_vocab_size")]
@@ -301,6 +336,12 @@ pub struct RealTransformerConfig {
     /// PRNG seed for the deterministic init fallback.
     #[serde(default = "default_seed")]
     pub seed: u64,
+
+    /// Detailed per-request real-transformer stage timing. Disabled by
+    /// default because the HTTP hot path records each stage through a
+    /// mutex-protected request-local map.
+    #[serde(default)]
+    pub stage_timing_enabled: bool,
 
     /// Continuous-batching: maximum number of in-flight requests fused
     /// into a single decoder step. The background scheduler waits up to
@@ -377,6 +418,25 @@ pub struct RealTransformerConfig {
     #[serde(default)]
     pub compute_offload: crate::backend::ComputeOffload,
 
+    /// Dense CPU matvec implementation used by
+    /// [`crate::transformer::matmul_row_major`] for Q/K/V/O projections,
+    /// router gates, MLA projections, and the LM head. `"auto"` preserves
+    /// the historical build default (`blas` builds use serial
+    /// matrixmultiply; other builds use Rayon row-parallel dot products).
+    /// Set `"matrixmultiply"`, `"rayon"`, or `"rayon-matrixmultiply"` to
+    /// force one implementation for production benchmarks.
+    #[serde(default)]
+    pub dense_matvec_backend: crate::parallel::DenseMatvecBackend,
+
+    /// Routed expert execution policy. `"auto"` picks between
+    /// expert-level and row-level parallelism from the current shape and
+    /// thread count; `"sequential-experts-row-parallel"` is the most
+    /// conservative CPU production setting; `"parallel-experts-single-thread"`
+    /// fans selected experts across the shared Rayon pool and leaves each
+    /// expert's inner kernels single-threaded.
+    #[serde(default)]
+    pub expert_execution_policy: crate::engine::ExpertExecutionPolicy,
+
     /// **Bounded speculative prefetches** (gist Part 1, fix #3).
     /// Maximum number of in-flight `Engine::spawn_prefetch` I/Os
     /// allowed at any one time. Each spawn acquires an owned permit
@@ -428,18 +488,40 @@ fn default_max_fetch_yields() -> usize {
     crate::engine::DEFAULT_MAX_FETCH_YIELDS
 }
 
-fn default_pressure_high_threshold() -> f32 { crate::block_pool::SOFT_CAP_RATIO }
-fn default_pressure_critical_threshold() -> f32 { crate::block_pool::CRITICAL_PRESSURE_RATIO }
+fn default_pressure_high_threshold() -> f32 {
+    crate::block_pool::SOFT_CAP_RATIO
+}
+fn default_pressure_critical_threshold() -> f32 {
+    crate::block_pool::CRITICAL_PRESSURE_RATIO
+}
 
-fn default_vocab_size() -> usize { 256 }
-fn default_num_heads() -> usize { 8 }
-fn default_rope_base() -> f32 { 10_000.0 }
-fn default_rms_eps() -> f32 { 1e-6 }
-fn default_seed() -> u64 { 0xC0FFEE }
-fn default_max_batch_size() -> usize { 8 }
-fn default_batch_timeout_ms() -> u64 { 5 }
-fn default_idle_eviction_threshold_ms() -> u64 { 5_000 }
-fn default_speculation_base_depth() -> usize { 1 }
+fn default_vocab_size() -> usize {
+    256
+}
+fn default_num_heads() -> usize {
+    8
+}
+fn default_rope_base() -> f32 {
+    10_000.0
+}
+fn default_rms_eps() -> f32 {
+    1e-6
+}
+fn default_seed() -> u64 {
+    0xC0FFEE
+}
+fn default_max_batch_size() -> usize {
+    8
+}
+fn default_batch_timeout_ms() -> u64 {
+    5
+}
+fn default_idle_eviction_threshold_ms() -> u64 {
+    5_000
+}
+fn default_speculation_base_depth() -> usize {
+    1
+}
 
 /// Configuration for the predictive architecture (`[predictive]` block).
 ///
@@ -555,14 +637,28 @@ pub struct PredictiveConfig {
     pub static_residency_profile: Option<String>,
 }
 
-fn default_prefetch_precision_floor() -> f64 { 0.05 }
-fn default_prefetch_contention_weight() -> f64 { 1.0 }
+fn default_prefetch_precision_floor() -> f64 {
+    0.05
+}
+fn default_prefetch_contention_weight() -> f64 {
+    1.0
+}
 
-fn default_locality_window() -> usize { 256 }
-fn default_locality_threshold() -> f32 { 0.10 }
-fn default_speculator_hidden() -> usize { 128 }
-fn default_affinity_neighbors_k() -> usize { 4 }
-fn default_affinity_decay_epoch() -> u64 { 100_000 }
+fn default_locality_window() -> usize {
+    256
+}
+fn default_locality_threshold() -> f32 {
+    0.10
+}
+fn default_speculator_hidden() -> usize {
+    128
+}
+fn default_affinity_neighbors_k() -> usize {
+    4
+}
+fn default_affinity_decay_epoch() -> u64 {
+    100_000
+}
 
 impl Default for PredictiveConfig {
     fn default() -> Self {
@@ -651,9 +747,15 @@ pub struct GpuCacheConfig {
     pub dtype: String,
 }
 
-fn default_promote_after_hits() -> u64 { 16 }
-fn default_vram_anchor_ratio() -> f32 { 0.5 }
-fn default_gpu_dtype() -> String { "f16".to_string() }
+fn default_promote_after_hits() -> u64 {
+    16
+}
+fn default_vram_anchor_ratio() -> f32 {
+    0.5
+}
+fn default_gpu_dtype() -> String {
+    "f16".to_string()
+}
 
 impl Default for GpuCacheConfig {
     fn default() -> Self {
@@ -707,7 +809,9 @@ pub struct DistributedConfig {
     pub remote_fetch_timeout_ms: u64,
 }
 
-fn default_remote_fetch_timeout_ms() -> u64 { 250 }
+fn default_remote_fetch_timeout_ms() -> u64 {
+    250
+}
 
 impl Default for DistributedConfig {
     fn default() -> Self {
@@ -922,7 +1026,11 @@ impl Config {
                     self.model.d_model
                 )));
             }
-            let kv_heads = if rt.num_kv_heads == 0 { rt.num_heads } else { rt.num_kv_heads };
+            let kv_heads = if rt.num_kv_heads == 0 {
+                rt.num_heads
+            } else {
+                rt.num_kv_heads
+            };
             if kv_heads == 0 || rt.num_heads % kv_heads != 0 {
                 return Err(ConfigError::Invalid(format!(
                     "real_transformer.num_kv_heads ({kv_heads}) must divide num_heads ({})",
@@ -1020,7 +1128,10 @@ impl Config {
 
 #[derive(Debug)]
 pub enum ConfigError {
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Parse(String),
     Invalid(String),
 }
@@ -1028,7 +1139,9 @@ pub enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConfigError::Io { path, source } => write!(f, "config io ({}): {source}", path.display()),
+            ConfigError::Io { path, source } => {
+                write!(f, "config io ({}): {source}", path.display())
+            }
             ConfigError::Parse(m) => write!(f, "config parse: {m}"),
             ConfigError::Invalid(m) => write!(f, "config invalid: {m}"),
         }
@@ -1084,6 +1197,10 @@ pub struct RuntimeConfig {
     /// `Config` rewrite once the access-log path is wired.
     #[allow(dead_code)]
     pub access_log_enabled: bool,
+    /// Enables request-local detailed stage timing for real-transformer
+    /// HTTP serving. When `false`, handlers do not allocate a
+    /// [`crate::stage_timing::StageTimings`] or publish stage metrics.
+    pub stage_timing_enabled: bool,
 }
 
 impl RuntimeConfig {
@@ -1095,6 +1212,7 @@ impl RuntimeConfig {
             // Default `true` matches the pre-refactor behaviour where
             // the request handlers unconditionally emitted an info log.
             access_log_enabled: true,
+            stage_timing_enabled: cfg.real_transformer.stage_timing_enabled,
         }
     }
 }
@@ -1265,7 +1383,8 @@ mod tests {
             max_overflow_capacity: Some(0),
             ..RealTransformerConfig::default()
         };
-        c.validate().expect("0 overflow cap should map to unbounded");
+        c.validate()
+            .expect("0 overflow cap should map to unbounded");
     }
 
     #[test]
@@ -1276,6 +1395,43 @@ mod tests {
         back.validate().unwrap();
         assert_eq!(back.model.num_experts, c.model.num_experts);
         assert_eq!(back.server.bind, c.server.bind);
+    }
+
+    #[test]
+    fn real_transformer_accepts_dense_matvec_backend_config() {
+        let rt: RealTransformerConfig = toml::from_str(
+            r#"
+            enabled = true
+            dense_matvec_backend = "rayon-matrixmultiply"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.dense_matvec_backend,
+            crate::parallel::DenseMatvecBackend::RayonMatrixmultiply
+        );
+    }
+
+    #[test]
+    fn real_transformer_stage_timing_defaults_to_disabled() {
+        let cfg = minimal_cfg();
+        assert!(!cfg.real_transformer.stage_timing_enabled);
+        assert!(!RuntimeConfig::from_config(&cfg).stage_timing_enabled);
+    }
+
+    #[test]
+    fn real_transformer_stage_timing_can_be_enabled_from_toml() {
+        let rt: RealTransformerConfig = toml::from_str(
+            r#"
+            stage_timing_enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(rt.stage_timing_enabled);
+
+        let mut cfg = minimal_cfg();
+        cfg.real_transformer = rt;
+        assert!(RuntimeConfig::from_config(&cfg).stage_timing_enabled);
     }
 
     /// `config.toml` documents weight dtypes using lowercase strings

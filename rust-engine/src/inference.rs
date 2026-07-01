@@ -60,6 +60,7 @@ compile_error!(
 use crate::expert_cache::ExpertResident;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 // Hugging Face Candle is the math backend for the per-expert SwiGLU
 // forward pass. The on-disk f32 layout (gate || up || down, row-major)
@@ -3187,8 +3188,9 @@ pub fn run_inference_q4_0(
 /// preferred middle ground when 4-bit is too aggressive but per-tensor
 /// `Int8` doesn't have enough scale headroom for the model. The
 /// dispatch in [`crate::engine::dispatch_expert_forward`] picks the
-/// `QMatMul` fast path ([`run_inference_q8_0_qmm`]) when block
-/// alignment allows it, and falls back here otherwise.
+/// prepared `QMatMul` fast path
+/// ([`run_inference_q8_0_qmm_with_timing`]) when block alignment
+/// allows it, and falls back here otherwise.
 pub fn run_inference_q8_0(
     token_idx: u64,
     resident: &ExpertResident,
@@ -3426,9 +3428,9 @@ fn cpu_qtensor_from_blocks(
 /// the resident bytes. Pure helper — `from_bytes_q4_*_qmm` deal with
 /// the dtype-specific block-size accounting and call into here.
 fn forward_qmm(
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+    gate: &QMatMul,
+    up: &QMatMul,
+    down: &QMatMul,
     x: &[f32],
     d_model: usize,
 ) -> Result<HiddenState, ExpertWeightsError> {
@@ -3450,6 +3452,15 @@ fn forward_qmm(
     let y = down.forward(&gated).map_err(map_err)?; // [1, d_model]
     let y = y.squeeze(0).map_err(map_err)?;
     y.to_vec1::<f32>().map_err(map_err)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedQ8_0Expert {
+    d_model: usize,
+    d_ff: usize,
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
 }
 
 /// **Q4_0 SwiGLU forward pass via candle's `QMatMul`** — no F32
@@ -3528,7 +3539,7 @@ fn forward_q4_0_qmm_from_exact_bytes(
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
-    forward_qmm(gate, up, down, x, d_model)
+    forward_qmm(&gate, &up, &down, x, d_model)
 }
 
 /// Bytes-in / `Vec<f32>`-out helper that powers
@@ -3601,7 +3612,7 @@ pub fn run_inference_q4k_qmm(
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
-    let y = forward_qmm(gate, up, down, x, d_model)?;
+    let y = forward_qmm(&gate, &up, &down, x, d_model)?;
     let out = summarise_output(token_idx, resident.id, &y);
     Ok((out, y))
 }
@@ -3611,14 +3622,41 @@ pub fn run_inference_q4k_qmm(
 /// [`run_inference_q4_0_qmm`]; per-block stride is 34 bytes / 32
 /// weights instead of 18 / 32. Activation stays F32 (`[1, d_model]`),
 /// only the output `Vec` is allocated per call.
-pub fn run_inference_q8_0_qmm(
+pub fn run_inference_q8_0_qmm_with_timing(
     token_idx: u64,
     resident: &ExpertResident,
     x: &[f32],
     d_model: usize,
     d_ff: usize,
+    timings: Option<&crate::stage_timing::StageTimings>,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
-    let bytes = resident.data();
+    let started = Instant::now();
+    let (prepared, prepared_now) =
+        resident.prepared_q8_0_qmm(|bytes| prepare_q8_0_qmm(bytes, d_model, d_ff));
+    if prepared_now {
+        crate::stage_timing::record_optional(
+            timings,
+            crate::stage_timing::EXPERT_PREPARATION,
+            started.elapsed(),
+        );
+    }
+    let prepared = prepared?;
+    if prepared.d_model != d_model || prepared.d_ff != d_ff {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "cached Q8_0 QMatMul shape is d_model={} d_ff={}, requested d_model={} d_ff={}",
+            prepared.d_model, prepared.d_ff, d_model, d_ff
+        )));
+    }
+    let y = forward_q8_0_qmm_prepared(prepared, x)?;
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+fn prepare_q8_0_qmm(
+    bytes: &[u8],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<PreparedQ8_0Expert, ExpertWeightsError> {
     let one = d_ff.saturating_mul(d_model);
     let one_blocks = one.div_ceil(Q8_0_BLOCK_ELEMS);
     let one_bytes = one_blocks * Q8_0_BLOCK_BYTES;
@@ -3657,9 +3695,26 @@ pub fn run_inference_q8_0_qmm(
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
-    let y = forward_qmm(gate, up, down, x, d_model)?;
-    let out = summarise_output(token_idx, resident.id, &y);
-    Ok((out, y))
+    Ok(PreparedQ8_0Expert {
+        d_model,
+        d_ff,
+        gate,
+        up,
+        down,
+    })
+}
+
+fn forward_q8_0_qmm_prepared(
+    prepared: &PreparedQ8_0Expert,
+    x: &[f32],
+) -> Result<HiddenState, ExpertWeightsError> {
+    forward_qmm(
+        &prepared.gate,
+        &prepared.up,
+        &prepared.down,
+        x,
+        prepared.d_model,
+    )
 }
 
 /// Partial-load counterpart of [`run_inference`]: reconstructs the
@@ -3701,23 +3756,30 @@ pub fn run_inference_partial(
 /// materialise on disk *from both* slices upstream so the weighted sum
 /// stays well-defined).
 pub fn combine_outputs(outputs: &[HiddenState], scores: &[f32]) -> HiddenState {
+    let mut out = Vec::new();
+    combine_outputs_into(outputs, scores, &mut out);
+    out
+}
+
+pub fn combine_outputs_into(outputs: &[HiddenState], scores: &[f32], out: &mut Vec<f32>) {
     debug_assert_eq!(
         outputs.len(),
         scores.len(),
         "combine_outputs: outputs and scores must have the same length"
     );
     if outputs.is_empty() {
-        return Vec::new();
+        out.clear();
+        return;
     }
     let d = outputs[0].len();
-    let mut out = vec![0.0f32; d];
+    out.clear();
+    out.resize(d, 0.0);
     for (vec, &s) in outputs.iter().zip(scores.iter()) {
         debug_assert_eq!(vec.len(), d);
         for (o, v) in out.iter_mut().zip(vec.iter()) {
             *o += s * *v;
         }
     }
-    out
 }
 
 /// Helper: build a uniform `[1/k; k]` score vector for the synthetic /
@@ -4965,6 +5027,78 @@ mod tests {
         let y = w.forward(&x);
         assert_eq!(y.len(), d_model);
         assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn prepared_q8_0_qmm_matches_dequant_and_prepares_once() {
+        let d_model = Q8_0_BLOCK_ELEMS;
+        let d_ff = Q8_0_BLOCK_ELEMS * 2;
+        let blocks_per_matrix = (d_model * d_ff).div_ceil(Q8_0_BLOCK_ELEMS);
+        let mut src = [0.0f32; Q8_0_BLOCK_ELEMS];
+        for (i, slot) in src.iter_mut().enumerate() {
+            *slot = (i as f32 - 15.0) * 0.02;
+        }
+        let mut block = [0u8; Q8_0_BLOCK_BYTES];
+        quantize_q8_0_block(&src, &mut block);
+        let mut bytes = Vec::new();
+        for _ in 0..(3 * blocks_per_matrix) {
+            bytes.extend_from_slice(&block);
+        }
+
+        let x = synth_hidden_state(7, d_model, 1);
+        let baseline = OwnedExpertWeights::from_bytes_q8_0(&bytes, d_model, d_ff)
+            .expect("baseline q8 dequant")
+            .forward(&x);
+
+        let slot = bytes.len().div_ceil(4096) * 4096;
+        let pool = crate::buffer_pool::BufferPool::new(1, slot, 4096);
+        let mut buffer = pool.try_acquire().expect("pooled buffer");
+        buffer.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+        let resident = crate::expert_cache::ExpertResident::new(42, buffer);
+        let timings = crate::stage_timing::StageTimings::default();
+
+        let (_, first) = run_inference_q8_0_qmm_with_timing(
+            0,
+            &resident,
+            &x,
+            d_model,
+            d_ff,
+            Some(&timings),
+        )
+        .expect("first prepared q8 qmm");
+        let (_, second) = run_inference_q8_0_qmm_with_timing(
+            1,
+            &resident,
+            &x,
+            d_model,
+            d_ff,
+            Some(&timings),
+        )
+        .expect("second prepared q8 qmm");
+
+        assert_eq!(baseline.len(), first.len());
+        for (i, ((a, b), c)) in baseline
+            .iter()
+            .zip(first.iter())
+            .zip(second.iter())
+            .enumerate()
+        {
+            let tol = 1e-3 * a.abs().max(1.0) + 1e-5;
+            assert!(
+                (a - b).abs() <= tol,
+                "prepared Q8_0 path diverged at {i}: baseline={a} qmm={b} tol={tol}"
+            );
+            assert!(
+                (b - c).abs() <= f32::EPSILON,
+                "cached Q8_0 output changed at {i}: first={b} second={c}"
+            );
+        }
+        let snapshot = timings.snapshot();
+        let prep = snapshot
+            .get(crate::stage_timing::EXPERT_PREPARATION)
+            .expect("missing expert preparation timing");
+        assert_eq!(prep.count, 1);
+        assert!(prep.total_seconds.is_finite());
     }
 
     #[test]

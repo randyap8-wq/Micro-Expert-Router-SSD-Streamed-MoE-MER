@@ -88,9 +88,8 @@ dashmap = "5.5"
 # files when present.
 safetensors = "0.4"
 
-# Optional BLAS-equivalent dense matmul backend. Pulled in only when
-# the `blas` cargo feature is enabled. We use `matrixmultiply` rather
-# than `cblas-sys` + `blas-src` because it:
+# Tuned dense matvec backend. We use `matrixmultiply` rather than
+# `cblas-sys` + `blas-src` because it:
 #   * is pure Rust — no `system OpenBLAS` install required, so CI and
 #     `cargo test` keep working out of the box;
 #   * provides the same hand-tuned-microkernel SGEMM/SGEMV used by
@@ -98,7 +97,7 @@ safetensors = "0.4"
 #     Rust ecosystem);
 #   * lets a follow-up PR drop in `cblas-sys` behind the same feature
 #     gate without touching call sites in `transformer.rs`.
-matrixmultiply = { version = "0.3", optional = true }
+matrixmultiply = "0.3"
 
 # fp16 (half-precision) weight support for SSD-streamed experts. Halving the
 # bytes-per-parameter halves every SSD read, which is the single highest-
@@ -179,14 +178,20 @@ io_uring = ["dep:io-uring"]
 # `--features simd`; new builds should omit it.
 simd = []
 
-# BLAS-equivalent dense matmul. When enabled, `matmul_row_major` routes
-# through `matrixmultiply`'s tuned SGEMV microkernel instead of the
-# always-compiled runtime row-parallel loop. Useful on hosts where the
-# `matrixmultiply` microkernel's ASM beats the auto-escalation path —
-# typically large `d_model × d_ff` Mixtral-class workloads on AVX2 /
-# NEON. Off by default; the auto-escalation path is good enough for
-# the common case and adds no extra crate dependency.
-blas = ["dep:matrixmultiply"]
+# BLAS-equivalent dense matmul. Retained as a compatibility feature and
+# as the `auto` default selector for deployments that already opted into
+# the old matrixmultiply path. The matrixmultiply crate is now compiled
+# unconditionally so `[real_transformer].dense_matvec_backend` can select
+# between serial matrixmultiply, Rayon row-parallel dot products, and
+# Rayon-chunked matrixmultiply at runtime inside one binary.
+blas = []
+# Opt-in allocation instrumentation for CPU hot-path microbenchmarks.
+#
+# This installs a process-wide counting allocator in the binary, so it is
+# deliberately off by default: production builds should not pay even atomic
+# counter traffic on every heap operation unless an operator is collecting a
+# focused allocation profile.
+alloc-count = []
 # Build the AVX-512 dispatcher in `kernels/avx512.rs`. Stable on
 # x86_64; the actual code is `#[target_feature]`-gated and only
 # executed when the runtime probe in `kernels::detect()` confirms the

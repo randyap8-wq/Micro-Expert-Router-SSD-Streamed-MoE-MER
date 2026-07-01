@@ -13,8 +13,9 @@
 //! * Backed by a [`dashmap::DashMap`] so concurrent HTTP handlers
 //!   read/write without contending on a global lock.
 //! * Each entry holds the per-layer KV caches plus a *position cursor*
-//!   (the absolute token offset where the next request should resume)
-//!   and a `last_used` timestamp for TTL eviction.
+//!   (the absolute token offset where the next request should resume),
+//!   an optional pending emitted token, and a `last_used` timestamp for
+//!   TTL eviction.
 //! * A background task ([`SessionStore::spawn_evictor`]) periodically
 //!   purges stale entries. The TTL is configurable from the TOML
 //!   `[server.session_ttl_secs]` field.
@@ -36,8 +37,8 @@
 
 use crate::transformer::KvCache;
 use dashmap::DashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// One active session's persisted state.
@@ -50,13 +51,17 @@ pub struct SessionState {
     /// explicitly so a future request can pick up regardless of how
     /// the KV cache is laid out internally).
     ///
-    /// On resume, the next request's prompt tokens are fed in starting
-    /// at this position so RoPE indices and KV slots line up with what
-    /// the prior turn already wrote. The "last token to feed into the
-    /// next step" is implicit: every request carries its own prompt,
-    /// and the new prompt's last token is what seeds the first
-    /// generated token of the new turn.
+    /// On resume, any [`Self::pending_token`] is ingested first at this
+    /// position, then the next request's prompt tokens are fed in starting
+    /// at the following position so RoPE indices and KV slots line up with
+    /// what the prior turn already wrote.
     pub position: usize,
+    /// The final token emitted by the previous request may not yet be in
+    /// the KV cache: corrected prompt/decode semantics produce token `n`
+    /// from the hidden state of token `n - 1`. Persisting this marker lets
+    /// the next request ingest that token without doing an LM-head call at
+    /// the end of the previous request.
+    pub pending_token: Option<u32>,
     /// When this session was last touched. Updated on every
     /// successful `take` / `put` round-trip.
     pub last_used: Instant,
@@ -64,7 +69,12 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(kv: Vec<KvCache>) -> Self {
-        Self { kv, position: 0, last_used: Instant::now() }
+        Self {
+            kv,
+            position: 0,
+            pending_token: None,
+            last_used: Instant::now(),
+        }
     }
 
     /// Overwrite every per-layer KV buffer with zeros so a later
@@ -203,12 +213,7 @@ impl SessionStore {
     /// `take` and produced new tokens. `checkout` must be the guard
     /// returned by `take` for this in-flight session; use `None` when
     /// storing a fresh session that was not checked out from the store.
-    pub fn put(
-        &self,
-        id: String,
-        mut state: SessionState,
-        checkout: Option<SessionCheckout>,
-    ) {
+    pub fn put(&self, id: String, mut state: SessionState, checkout: Option<SessionCheckout>) {
         // Returning an in-flight checkout must prove ownership of the
         // current marker. Callers that did not successfully `take`
         // pass `None` and must not clear another request's marker.
@@ -315,9 +320,10 @@ impl SessionStore {
             // another request may have reinserted the id (we treat
             // the fresh state as "no longer expired" and leave it),
             // or removed it (`remove` returns `None` — skip).
-            if let Some((_, mut state)) = self.inner.remove_if(&k, |_, s| {
-                now.duration_since(s.last_used) > ttl
-            }) {
+            if let Some((_, mut state)) = self
+                .inner
+                .remove_if(&k, |_, s| now.duration_since(s.last_used) > ttl)
+            {
                 state.zeroize_in_place();
                 removed += 1;
             }
@@ -414,7 +420,10 @@ mod tests {
         // both `delete` and `evict_expired` rely on.
         let mut kv = KvCache::new(4);
         kv.append(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]);
-        assert!(kv.num_blocks() > 0, "test setup: KV must own at least one block");
+        assert!(
+            kv.num_blocks() > 0,
+            "test setup: KV must own at least one block"
+        );
         let mut state = SessionState::new(vec![kv]);
         state.zeroize_in_place();
         assert_eq!(
@@ -466,10 +475,7 @@ mod tests {
         // Concurrent DELETE /v1/sessions/alice arrives. There is no
         // resident entry to remove, but the session is in flight —
         // the delete must still report success and arm a tombstone.
-        assert!(
-            store.delete("alice"),
-            "delete must see in-flight sessions"
-        );
+        assert!(store.delete("alice"), "delete must see in-flight sessions");
 
         // Request handler finishes and tries to put the session
         // back. The tombstone must prevent the reinsert.

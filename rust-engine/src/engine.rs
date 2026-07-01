@@ -22,9 +22,9 @@ use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
     run_inference_mixed_quant, run_inference_mxfp4, run_inference_q4_0, run_inference_q4_0_qmm,
     run_inference_q4k, run_inference_q4k_qmm, run_inference_q5k, run_inference_q6k,
-    run_inference_q8_0, run_inference_q8_0_qmm, synth_hidden_state, uniform_scores,
-    ExpertWeightsError, HiddenState, InferenceOutput, WeightDtype, Q4K_BLOCK_ELEMS,
-    Q4_0_BLOCK_ELEMS, Q8_0_BLOCK_ELEMS,
+    run_inference_q8_0, run_inference_q8_0_qmm_with_timing, synth_hidden_state, uniform_scores,
+    ExpertWeightsError, HiddenState, InferenceOutput, WeightDtype, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_ELEMS,
+    Q8_0_BLOCK_ELEMS,
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
@@ -853,6 +853,31 @@ pub struct ModelShape {
     pub hidden_seed: u64,
 }
 
+/// Explicit parallelism level for routed expert execution.
+///
+/// The production-safe default keeps the selected experts sequential and
+/// lets each expert use the row-parallel inner kernels. Expert-parallel
+/// mode fans the selected experts out across the shared Rayon pool, so
+/// those inner kernels see `in_rayon_worker()` and run inline instead of
+/// recursively occupying the whole pool.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExpertExecutionPolicy {
+    #[default]
+    Auto,
+    SequentialExpertsRowParallel,
+    ParallelExpertsSingleThread,
+}
+
 /// Run-time options that affect how `Engine::generate` executes a token.
 ///
 /// The defaults model a normal end-to-end run (router → I/O → SwiGLU
@@ -885,6 +910,11 @@ pub struct EngineOptions {
     /// (e.g. block-alignment mismatch on a corrupt blob), so this is
     /// a strict-superset behaviour switch.
     pub use_qmm_for_q4: bool,
+    /// Explicit expert-execution parallelism policy for the routed top-K.
+    /// `Auto` selects by dtype, selected-expert count, and available compute
+    /// workers while preserving the invariant that the engine never nests
+    /// full-pool expert parallelism inside full-pool row parallelism.
+    pub expert_execution_policy: ExpertExecutionPolicy,
     /// Upper bound on speculative prefetches in flight at any one
     /// time. Each call to `spawn_prefetch` must acquire a semaphore
     /// permit before issuing the I/O — when the bound is reached the
@@ -979,6 +1009,7 @@ impl Default for EngineOptions {
             partial_load_fraction: 1.0,
             pin_after_observations: 0,
             use_qmm_for_q4: true,
+            expert_execution_policy: ExpertExecutionPolicy::Auto,
             max_concurrent_prefetches: DEFAULT_MAX_CONCURRENT_PREFETCHES,
             max_fetch_yields: DEFAULT_MAX_FETCH_YIELDS,
             prefetch_governor: false,
@@ -1458,6 +1489,19 @@ fn run_compute_donated<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+enum MoeStepOutputMode<'a> {
+    PerExpert,
+    WeightedInto {
+        weights: &'a [f32],
+        out: &'a mut Vec<f32>,
+    },
+}
+
+enum MoeStepResult {
+    PerExpert(Vec<HiddenState>),
+    WeightedInto,
+}
+
 /// Dispatch a single per-expert SwiGLU forward pass according to
 /// `dtype`. For `Q4_0` / `Q4K` and `use_qmm = true` the
 /// `QMatMul`-based path is tried first and the dequant path is used
@@ -1465,6 +1509,7 @@ fn run_compute_donated<R>(f: impl FnOnce() -> R) -> R {
 /// corrupt block stream where dequant has more lenient bounds
 /// checks). For every other dtype the legacy entry point is called
 /// directly.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_expert_forward(
     dtype: WeightDtype,
     use_qmm: bool,
@@ -1473,6 +1518,7 @@ fn dispatch_expert_forward(
     x: &[f32],
     d_model: usize,
     d_ff: usize,
+    timings: Option<&crate::stage_timing::StageTimings>,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     // One-time diagnostic: log the actual resident buffer size against
     // the size the engine expects for this dtype/shape on the very
@@ -1539,7 +1585,7 @@ fn dispatch_expert_forward(
         WeightDtype::Q8_0
             if use_qmm && d_model % Q8_0_BLOCK_ELEMS == 0 && d_ff % Q8_0_BLOCK_ELEMS == 0 =>
         {
-            match run_inference_q8_0_qmm(token_idx, r, x, d_model, d_ff) {
+            match run_inference_q8_0_qmm_with_timing(token_idx, r, x, d_model, d_ff, timings) {
                 Ok(v) => Ok(v),
                 Err(e) => {
                     debug!(error = %e, "QMatMul Q8_0 path failed; falling back to dequant");
@@ -2456,6 +2502,7 @@ impl Engine {
                             x,
                             self.core.shape.d_model,
                             self.core.shape.d_ff,
+                            None,
                         )
                     };
                     match res {
@@ -3696,6 +3743,173 @@ impl Engine {
         x: &HiddenState,
         experts: &[u32],
     ) -> Vec<HiddenState> {
+        self.moe_step_with_timing(token_idx, layer, x, experts, None)
+            .await
+    }
+
+    fn resolved_expert_execution_policy(&self, selected_experts: usize) -> ExpertExecutionPolicy {
+        match self.core.options.expert_execution_policy {
+            ExpertExecutionPolicy::Auto => {
+                let threads = crate::parallel::num_threads();
+                if self.core.options.dtype == WeightDtype::Q8_0
+                    && selected_experts >= 4
+                    && threads >= selected_experts
+                    && self.core.shape.d_model.is_multiple_of(Q8_0_BLOCK_ELEMS)
+                    && self.core.shape.d_ff.is_multiple_of(Q8_0_BLOCK_ELEMS)
+                    && !crate::parallel::in_rayon_worker()
+                {
+                    ExpertExecutionPolicy::ParallelExpertsSingleThread
+                } else {
+                    ExpertExecutionPolicy::SequentialExpertsRowParallel
+                }
+            }
+            policy => policy,
+        }
+    }
+
+    fn forward_moe_resident(
+        &self,
+        token_idx: u64,
+        layer: u32,
+        r: &ExpertResident,
+        x: &HiddenState,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Result<HiddenState, ExpertWeightsError> {
+        // ── Phase 3: GPU fast path ────────────────────────────────────
+        // If the backend is GPU and the expert is VRAM-resident, dispatch
+        // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
+        // unconditionally, so we always guard behind is_gpu(). A VRAM
+        // miss returns Err and we fall through to the CPU path below.
+        // Both F32 and (block-aligned) Q4_0 experts are eligible —
+        // see `Engine::gpu_eligible_dtype`.
+        if self.core.backend.is_gpu() && self.gpu_eligible_dtype() {
+            let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
+            let x_f16: Vec<half::f16> = x.iter().map(|&f| half::f16::from_f32(f)).collect();
+            let x_view = crate::backend::TensorView {
+                data: &x_f16,
+                rows: 1,
+                cols: self.core.shape.d_model,
+            };
+            let mut out_view = crate::backend::TensorViewMut {
+                data: &mut out_f16,
+                rows: 1,
+                cols: self.core.shape.d_model,
+            };
+            let matmul_res = self.core.backend.expert_matmul(
+                layer as usize,
+                r.id,
+                x_view,
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+                &mut out_view,
+            );
+            match matmul_res {
+                Ok(()) => {
+                    return Ok(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>());
+                }
+                Err(e) => {
+                    // VRAM miss — fall through to CPU. Count it:
+                    // invisible mixed GPU/CPU execution (one CPU
+                    // expert dominating an otherwise-GPU token)
+                    // is a major source of inconsistent TPS.
+                    let prev = self
+                        .metrics
+                        .counters
+                        .gpu_cpu_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Some(p) = self.metrics.prom.as_ref() {
+                        p.record_gpu_cpu_fallback(1);
+                    }
+                    if prev == 0 {
+                        warn!(
+                            expert = r.id,
+                            error = %e,
+                            "GPU expert dispatch fell back to CPU \
+                             (further fallbacks counted in mer_gpu_cpu_fallbacks_total)"
+                        );
+                    }
+                }
+            }
+        }
+
+        dispatch_expert_forward(
+            self.core.options.dtype,
+            self.core.options.use_qmm_for_q4,
+            token_idx,
+            r,
+            x,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            timings,
+        )
+        .map(|(_out, y)| y)
+    }
+
+    pub async fn moe_step_with_timing(
+        self: &Arc<Self>,
+        token_idx: u64,
+        layer: u32,
+        x: &HiddenState,
+        experts: &[u32],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Vec<HiddenState> {
+        match self
+            .moe_step_inner(
+                token_idx,
+                layer,
+                x,
+                experts,
+                MoeStepOutputMode::PerExpert,
+                timings,
+            )
+            .await
+        {
+            MoeStepResult::PerExpert(outputs) => outputs,
+            MoeStepResult::WeightedInto => unreachable!("per-expert moe_step requested"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn moe_step_weighted_into_with_timing(
+        self: &Arc<Self>,
+        token_idx: u64,
+        layer: u32,
+        x: &HiddenState,
+        experts: &[u32],
+        weights: &[f32],
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) {
+        assert_eq!(
+            experts.len(),
+            weights.len(),
+            "moe_step_weighted_into_with_timing: experts and weights must align"
+        );
+        match self
+            .moe_step_inner(
+                token_idx,
+                layer,
+                x,
+                experts,
+                MoeStepOutputMode::WeightedInto { weights, out },
+                timings,
+            )
+            .await
+        {
+            MoeStepResult::WeightedInto => {}
+            MoeStepResult::PerExpert(_) => unreachable!("weighted moe_step requested"),
+        }
+    }
+
+    async fn moe_step_inner<'a>(
+        self: &Arc<Self>,
+        token_idx: u64,
+        layer: u32,
+        x: &HiddenState,
+        experts: &[u32],
+        output_mode: MoeStepOutputMode<'a>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> MoeStepResult {
         let cycle_start = Instant::now();
         // Tier 4: fold the previous step's prefetch precision window into
         // the governor's EWMA before issuing this step's speculation.
@@ -3814,6 +4028,7 @@ impl Engine {
         // counters per activation on the hot path.
         let mut gpu_hits_acc: u64 = 0;
         let mut gpu_misses_acc: u64 = 0;
+        let cache_lookup_start = Instant::now();
         for (i, &id) in target.iter().enumerate() {
             if let Some(gpu) = self.core.gpu_cache.as_ref() {
                 let lookup = gpu.get(id);
@@ -3862,6 +4077,11 @@ impl Engine {
                 cache_hits_per_expert.push(false);
             }
         }
+        crate::stage_timing::record_optional(
+            timings,
+            crate::stage_timing::EXPERT_CACHE_LOOKUP,
+            cache_lookup_start.elapsed(),
+        );
         // Aggregate VRAM-tier outcome for this routing decision.
         if let Some(p) = self.metrics.prom.as_ref() {
             if gpu_hits_acc > 0 || gpu_misses_acc > 0 {
@@ -3927,11 +4147,17 @@ impl Engine {
                 }
             }
         }
-        let io_wait_us = if had_misses {
-            io_wait_start.elapsed().as_micros() as u64
+        let io_wait_elapsed = if had_misses {
+            io_wait_start.elapsed()
         } else {
-            0
+            std::time::Duration::ZERO
         };
+        crate::stage_timing::record_optional(
+            timings,
+            crate::stage_timing::FOREGROUND_EXPERT_IO_WAIT,
+            io_wait_elapsed,
+        );
+        let io_wait_us = io_wait_elapsed.as_micros() as u64;
         // Drop the failed expert slots from the parallel arrays so the
         // downstream FFN loop only ever sees Some(_). To preserve the
         // alignment with the caller's mixing weights array, we emit a
@@ -3950,114 +4176,118 @@ impl Engine {
         // it inline would starve the speculative prefetch tasks spawned
         // above of a worker right when they must overlap this compute.
         let compute_start = Instant::now();
-        let per_expert_y: Vec<HiddenState> = run_compute_donated(|| {
-            let mut per_expert_y: Vec<HiddenState> = Vec::with_capacity(residents.len());
-            for r_opt in &residents {
-                let r = match r_opt {
-                    Some(r) => r,
-                    None => {
-                        // Failed fetch: push a zero vector so the caller's
-                        // weights[] alignment stays valid (combining with
-                        // weight `w_i * 0 = 0` is equivalent to dropping
-                        // this expert from the mixture).
-                        per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
-                        continue;
-                    }
-                };
-                // ── Phase 3: GPU fast path ────────────────────────────────────
-                // If the backend is GPU and the expert is VRAM-resident, dispatch
-                // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
-                // unconditionally, so we always guard behind is_gpu(). A VRAM
-                // miss returns Err and we fall through to the CPU path below.
-                // Both F32 and (block-aligned) Q4_0 experts are eligible —
-                // see `Engine::gpu_eligible_dtype`.
-                let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype() {
-                    let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
-                    let x_f16: Vec<half::f16> = x.iter().map(|&f| half::f16::from_f32(f)).collect();
-                    let x_view = crate::backend::TensorView {
-                        data: &x_f16,
-                        rows: 1,
-                        cols: self.core.shape.d_model,
-                    };
-                    let mut out_view = crate::backend::TensorViewMut {
-                        data: &mut out_f16,
-                        rows: 1,
-                        cols: self.core.shape.d_model,
-                    };
-                    let matmul_res = self.core.backend.expert_matmul(
-                        layer as usize,
-                        r.id,
-                        x_view,
-                        self.core.shape.d_model,
-                        self.core.shape.d_ff,
-                        &mut out_view,
-                    );
-                    match matmul_res {
-                        Ok(()) => Some(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>()),
-                        Err(e) => {
-                            // VRAM miss — fall through to CPU. Count it:
-                            // invisible mixed GPU/CPU execution (one CPU
-                            // expert dominating an otherwise-GPU token)
-                            // is a major source of inconsistent TPS.
-                            let prev = self
-                                .metrics
-                                .counters
-                                .gpu_cpu_fallbacks
-                                .fetch_add(1, Ordering::Relaxed);
-                            if let Some(p) = self.metrics.prom.as_ref() {
-                                p.record_gpu_cpu_fallback(1);
+        let expert_policy = self.resolved_expert_execution_policy(residents.len());
+        let step_result: MoeStepResult = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::EXPERT_COMPUTE,
+            || {
+                run_compute_donated(|| {
+                    match output_mode {
+                        MoeStepOutputMode::PerExpert => {
+                            let run_one = |r_opt: &Option<Arc<ExpertResident>>| -> HiddenState {
+                                let Some(r) = r_opt else {
+                                    // Failed fetch: push a zero vector so the caller's
+                                    // weights[] alignment stays valid (combining with
+                                    // weight `w_i * 0 = 0` is equivalent to dropping
+                                    // this expert from the mixture).
+                                    return vec![0.0f32; self.core.shape.d_model];
+                                };
+                                match self.forward_moe_resident(token_idx, layer, r, x, timings) {
+                                    Ok(y) => y,
+                                    Err(e) => {
+                                        warn!(
+                                            token = token_idx,
+                                            expert = r.id,
+                                            error = %e,
+                                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                                        );
+                                        // Preserve the legacy aligned-vector contract for callers
+                                        // that combine outside the engine.
+                                        vec![0.0f32; self.core.shape.d_model]
+                                    }
+                                }
+                            };
+                            let per_expert_y = match expert_policy {
+                                ExpertExecutionPolicy::ParallelExpertsSingleThread => {
+                                    use rayon::prelude::*;
+                                    residents.par_iter().map(run_one).collect()
+                                }
+                                ExpertExecutionPolicy::Auto
+                                | ExpertExecutionPolicy::SequentialExpertsRowParallel => {
+                                    residents.iter().map(run_one).collect()
+                                }
+                            };
+                            MoeStepResult::PerExpert(per_expert_y)
+                        }
+                        MoeStepOutputMode::WeightedInto { weights, out } => {
+                            debug_assert_eq!(residents.len(), weights.len());
+                            out.clear();
+                            out.resize(self.core.shape.d_model, 0.0);
+                            let accumulate_one = |slot: usize,
+                                                  r_opt: &Option<Arc<ExpertResident>>,
+                                                  acc: &mut [f32]| {
+                                let Some(r) = r_opt else {
+                                    return;
+                                };
+                                match self.forward_moe_resident(token_idx, layer, r, x, timings) {
+                                    Ok(y) => {
+                                        let weight = weights[slot];
+                                        if weight != 0.0 {
+                                            for (dst, v) in acc.iter_mut().zip(y.iter()) {
+                                                *dst += weight * *v;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            token = token_idx,
+                                            expert = r.id,
+                                            error = %e,
+                                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                                        );
+                                    }
+                                }
+                            };
+                            match expert_policy {
+                                ExpertExecutionPolicy::ParallelExpertsSingleThread => {
+                                    use rayon::prelude::*;
+                                    let chunks =
+                                        residents.len().min(crate::parallel::num_threads()).max(1);
+                                    let chunk_len = residents.len().div_ceil(chunks).max(1);
+                                    let d_model = self.core.shape.d_model;
+                                    let partials: Vec<Vec<f32>> = (0..chunks)
+                                        .into_par_iter()
+                                        .map(|chunk| {
+                                            let start = chunk * chunk_len;
+                                            let end = (start + chunk_len).min(residents.len());
+                                            let mut local = vec![0.0f32; d_model];
+                                            for (offset, r_opt) in
+                                                residents[start..end].iter().enumerate()
+                                            {
+                                                accumulate_one(start + offset, r_opt, &mut local);
+                                            }
+                                            local
+                                        })
+                                        .collect();
+                                    for partial in partials {
+                                        for (dst, v) in out.iter_mut().zip(partial.iter()) {
+                                            *dst += *v;
+                                        }
+                                    }
+                                }
+                                ExpertExecutionPolicy::Auto
+                                | ExpertExecutionPolicy::SequentialExpertsRowParallel => {
+                                    for (slot, r_opt) in residents.iter().enumerate() {
+                                        accumulate_one(slot, r_opt, out);
+                                    }
+                                }
                             }
-                            if prev == 0 {
-                                warn!(
-                                    expert = r.id,
-                                    error = %e,
-                                    "GPU expert dispatch fell back to CPU \
-                                     (further fallbacks counted in mer_gpu_cpu_fallbacks_total)"
-                                );
-                            }
-                            None
+                            MoeStepResult::WeightedInto
                         }
                     }
-                } else {
-                    None
-                };
-
-                let res = if let Some(gpu_out) = gpu_result {
-                    // Synthesize an InferenceOutput so downstream logging stays
-                    // shape-compatible with the CPU path.
-                    Ok((
-                        summarise_output_like_cpu(token_idx, r.id, &gpu_out),
-                        gpu_out,
-                    ))
-                } else {
-                    dispatch_expert_forward(
-                        self.core.options.dtype,
-                        self.core.options.use_qmm_for_q4,
-                        token_idx,
-                        r,
-                        x,
-                        self.core.shape.d_model,
-                        self.core.shape.d_ff,
-                    )
-                };
-                match res {
-                    Ok((_out, y)) => per_expert_y.push(y),
-                    Err(e) => {
-                        warn!(
-                            token = token_idx,
-                            expert = r.id,
-                            error = %e,
-                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
-                        );
-                        // Push a zero vector so the caller's weights[] alignment
-                        // stays valid; combining with weight `w_i * 0 = 0` is
-                        // the same as if this expert were never picked.
-                        per_expert_y.push(vec![0.0f32; self.core.shape.d_model]);
-                    }
-                }
-            }
-            per_expert_y
-        });
+                })
+            },
+        );
         let compute_us = compute_start.elapsed().as_micros() as u64;
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
         self.metrics
@@ -4119,7 +4349,7 @@ impl Engine {
             .tokens_processed
             .fetch_add(1, Ordering::Relaxed);
 
-        per_expert_y
+        step_result
     }
 
     /// Force-fetch a specific set of experts and load them into the cache.
@@ -4882,6 +5112,60 @@ mod tests {
             r.predictor_observations > 0,
             "predictor should have logged at least one transition"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moe_step_weighted_into_matches_per_expert_combiner() {
+        let dir = TempDir::new("moe-weighted-into");
+        let num_experts: u32 = 8;
+        let d_model = 16;
+        let d_ff = 32;
+        let seed = 0x574E_ADED_u64;
+        let engine = build_engine(
+            &dir.path,
+            num_experts,
+            d_model,
+            d_ff,
+            /*cache_slots=*/ 8,
+            /*top_k=*/ 3,
+            /*predict_fanout=*/ 1,
+            seed,
+        );
+        let mut engine_owned = match Arc::try_unwrap(engine) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        engine_owned.core.options.expert_execution_policy =
+            ExpertExecutionPolicy::ParallelExpertsSingleThread;
+        let engine = Arc::new(engine_owned);
+
+        let hidden = crate::inference::synth_hidden_state(3, d_model, seed);
+        let experts = [1, 3, 5];
+        let weights = [0.2, 0.3, 0.5];
+        let per_expert = engine.moe_step(0, /*layer=*/ 0, &hidden, &experts).await;
+        let expected = combine_outputs(&per_expert, &weights);
+
+        let mut direct = Vec::new();
+        engine
+            .moe_step_weighted_into_with_timing(
+                1,
+                /*layer=*/ 0,
+                &hidden,
+                &experts,
+                &weights,
+                &mut direct,
+                None,
+            )
+            .await;
+
+        assert_eq!(direct.len(), expected.len());
+        for (i, (&a, &b)) in direct.iter().zip(expected.iter()).enumerate() {
+            let tol = 1e-5 * b.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "weighted moe output diverged at {i}: direct={a} expected={b} tol={tol}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
