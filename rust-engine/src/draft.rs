@@ -180,8 +180,9 @@ impl DraftEngine {
         {
             let bias_s = bias.as_mut_slice();
             let inv_vocab = 1.0f32 / (vocab as f32);
+            let mut row = Vec::new();
             for tok in 0..vocab {
-                let mut row = Vec::new();
+                row.clear();
                 main.embedding.row_dequant_into(tok, &mut row);
                 for (i, &x) in row.iter().enumerate() {
                     bias_s[i] += x * inv_vocab;
