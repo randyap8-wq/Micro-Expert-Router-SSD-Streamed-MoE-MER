@@ -60,11 +60,20 @@ toolchain/hardware; enable them only on hosts that provide it.
 ## Runtime-dispatch summary
 
 * **Math backend.** `backend::install_default()` installs `CandleBackend`
-  (CPU) by default. When `[real_transformer].compute_offload = "gpu"`,
-  `GpuBackend::try_new()` runs first and, on success, is installed ahead of
-  the CPU backend in a single `OnceLock`. If no `wgpu` device can be
-  acquired, `BackendBox::init` logs `GPU init failed — activating CPU
-  fallback` and the CPU backend is used (Finding 5, fail-closed + observable).
+  (CPU) by default. When `[real_transformer].compute_offload = "gpu"` or
+  `"auto"`, `GpuBackend::try_new()` runs first and, on success, is installed
+  ahead of the CPU backend in a single `OnceLock`. A GPU initialization *or*
+  backend-installation failure is handled per the `compute_offload` mode:
+
+  | `compute_offload` | Semantics |
+  | --- | --- |
+  | `gpu` | **Fail closed** — GPU init *or* `set_backend`/installation failure is fatal; the run aborts and never silently continues on CPU. |
+  | `auto` | **Observable GPU→CPU fallback** — on failure fall back to CPU and record it in logs, metrics, and runtime metadata. |
+  | `cpu` | **CPU only** — no GPU initialization is attempted. |
+
+  Explicit GPU does **not** transparently fall back to CPU (Finding 5 / gist
+  finding 3); the run-command GPU installer (`install_run_gpu_backend`),
+  serving installer, and any other explicit GPU path all enforce this.
 * **CPU kernels.** `kernels::detect()` probes the host once at startup and
   auto-escalates AVX-512(+VNNI) → AVX2+FMA → scalar. The selected backend is
   logged on one startup line. No cargo feature is needed for AVX2.
@@ -82,13 +91,13 @@ toolchain/hardware; enable them only on hosts that provide it.
 
 | # | Finding | Status | Where | Regression tests |
 | --- | --- | --- | --- | --- |
-| F1 | Strict real-model loading + explicit seeded-development fallback | Complete | `model.rs` (strict loader / seeded fallback) | model-loading unit tests |
-| F2 | Required-vs-optional conversion inventory + BF16 dense decode | Complete | `gguf_loader.rs` (`emit_dense_manifest_tensor_req`, required `dense_specs`), `inference.rs` (`dequantize_bf16_to_f32`) | `required_dense_tensor_absence_is_fatal`, `required_dense_tensor_unsupported_quant_is_fatal` |
-| F3 | Logical tensor shape/orientation validation | Complete | `model.rs` (`safetensor_orientation_ok`, `require_2d`/`maybe2d!`, manifest `dense_dims_match_orientation`) | `safetensor_orientation_accepts_exact_and_vectors`, `safetensor_orientation_rejects_transposed_nonsquare`, `manifest_orientation_rejects_transposed_nonsquare` |
+| F1 | Strict real-model loading + explicit seeded-development fallback + required-vs-optional load accounting | Complete | `model.rs` (strict loader / seeded fallback, `WeightLoadStatus.optional_probed`/`optional_loaded`, gated shared-expert probe) | model-loading unit tests, `complete_strict_mixtral_converted_dir_reports_no_seeded_fallback`, `complete_strict_qwen3_moe_converted_dir_reports_no_seeded_fallback`, `declared_shared_expert_missing_required_weights_fails_strict`, `absent_optional_shared_sidecar_does_not_affect_required_counts` |
+| F2 | Required-vs-optional conversion inventory + BF16 dense decode + architecture-aware allowlist / tied output | Complete | `gguf_loader.rs` (`emit_dense_manifest_tensor_req`, `resolve_conversion_profile` allowlist, `emit_required_dense_tensor_checked`, tied-output-by-contract, `ExtractOptions::arch_override`), `inference.rs` (`dequantize_bf16_to_f32`) | `required_dense_tensor_absence_is_fatal`, `required_dense_tensor_unsupported_quant_is_fatal`, `convert_unknown_architecture_fails_closed`, `convert_unknown_architecture_rescued_by_override`, `convert_fused_qkv_architecture_is_unsupported`, `convert_qwen3_moe_ties_output_by_contract`, `convert_untied_architecture_missing_output_fails`, `convert_untied_architecture_ties_by_metadata_flag` |
+| F3 | Logical tensor shape/orientation validation (strict rank-2 matrices) | Complete | `model.rs` (`safetensor_orientation_ok` — exact rank-2 only, `require_2d`/`maybe2d!`, manifest `dense_dims_match_orientation`) | `safetensor_orientation_accepts_exact_rank2_only`, `safetensor_orientation_rejects_transposed_and_higher_rank`, `manifest_orientation_rejects_transposed_nonsquare` |
 | F4 | Real tokenizer requirement + vocabulary compatibility | Complete | `tokenizer.rs`, config vocab checks | tokenizer/vocab unit tests |
-| F5 | Explicit GPU fail-closed + observable Auto fallback | Complete | `backend/mod.rs` (`BackendBox::init`), startup logging | backend fallback tests |
+| F5 | Explicit GPU fail-closed (init **and** install stages) + observable Auto fallback | Complete | `backend/mod.rs` (`BackendBox::init`), `main.rs` (`install_run_gpu_backend` returns `Result`, serving installer), startup logging | backend fallback tests, `resolve_backend_selection` init-failure tests |
 | F6 | Strict manifest integrity + structural validation | Complete | `dense_tensor.rs` (`DenseTensorManifest` integrity: unsupported `format_version`, unsafe/traversal paths, duplicate name/alias/file, strict missing-checksum, byte-length mismatch, degenerate dims), wired in `model.rs` (`dense manifest integrity problem`) | `manifest_integrity_accepts_well_formed`, `manifest_integrity_rejects_unsupported_version`, `manifest_integrity_rejects_duplicate_alias`, `manifest_integrity_rejects_path_traversal`, `manifest_integrity_requires_checksum_only_under_strict`, `manifest_integrity_rejects_bytelen_mismatch`, `manifest_integrity_rejects_degenerate_dims` |
-| F7 | Post-reconciliation architecture-aware resolved validation | Complete | `main.rs` (`validate_resolved_bench_real_config`, called after `reconcile_bench_real_config`) | 6 F7 tests (accepts reconciled checkpoint, rejects top_k>num_experts, rejects GQA indivisibility, allows asymmetric v_head_dim, rejects undersized cache, rejects O_DIRECT-misaligned expert_size) |
+| F7 | Post-reconciliation architecture-aware resolved validation, shared by serving + bench-real; routed-cache working set excludes resident shared experts | Complete | `main.rs` (`reconcile_real_model_config` + `validate_resolved_real_model_config`, called by both `build_bench_real_runtime` and `cmd_serve`; cache-slot check uses `top_k` only) | 6 F7 tests (accepts reconciled checkpoint, rejects top_k>num_experts, rejects GQA indivisibility, allows asymmetric v_head_dim, rejects undersized cache, rejects O_DIRECT-misaligned expert_size), `serve_and_bench_real_share_reconcile_and_validation`, `explicit_architecture_still_reconciles_config_json`, `explicit_architecture_mismatch_is_rejected` |
 | F8 | Exact gate-sidecar sizing + canonical fallback | Complete | `main.rs` (`load_gate_weights`), `model.rs` gate sizing | gate-sidecar sizing tests |
 | F9 | Non-finite attention-softmax fallback observability | Complete | `transformer.rs` softmax guard + observability | softmax fallback tests |
 | F10 | Actual generated-token metrics | Complete | metrics/generation counters | generated-token metric tests |
@@ -98,3 +107,14 @@ toolchain/hardware; enable them only on hosts that provide it.
 Findings F1, F4, F5, F8, F9, F10 predate this branch and were reviewed only
 for integration regressions. F2, F3, F6, F7, F11, and F12 were implemented on
 this branch.
+
+A follow-up hardening pass on this branch further tightened several findings so
+production paths fail closed: F1 (explicit required-vs-optional load accounting
+so an architecture with no shared experts no longer trips
+`seeded_fallback_remained`), F2 (architecture-aware conversion allowlist,
+explicit `Unsupported` for fused-QKV/MLA families, and Qwen3-MoE tied-output by
+GGUF contract), F3 (strict exact rank-2 matrix validation — flattened rank-1 and
+rank>2 rejected), F5 (explicit GPU fail-closed at both init **and** install
+stages via `install_run_gpu_backend` returning `Result`), and F7 (serving and
+bench-real now share `reconcile_real_model_config` + `validate_resolved_real_model_config`,
+and the routed-cache working set no longer counts resident shared experts).
