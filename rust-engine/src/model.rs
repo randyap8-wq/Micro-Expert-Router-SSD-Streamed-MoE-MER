@@ -2380,60 +2380,44 @@ impl RealModel {
             .expect("global expert id overflows u32 (num_layers * num_experts too large)")
     }
 
-    /// **SSD-read pre-pass peek (gist Phase 1).** Return a best-effort
-    /// estimate of the global expert ids this step is likely to
-    /// require. The pre-pass is cheap and side-effect-free:
+    /// **SSD-read pre-pass peek (gist Phase 1, reworked by hardening
+    /// pass C2).** Return a best-effort, **lightweight** estimate of
+    /// the global expert ids this step is likely to require. The
+    /// pre-pass is cheap, side-effect-free and request-agnostic:
     ///
-    /// 1. **Layer 0 is exact:** we run the embedding +
-    ///    attention-normalised gate against a *clone* of the layer-0
-    ///    KV cache, so the prediction matches the actual routing
-    ///    decision the upcoming [`Self::step`] will make.
-    /// 2. **Deeper layers are approximated** by re-using the
-    ///    embedding as a stand-in for each layer's residual stream
-    ///    and running its gate. This is not exact — those decisions
-    ///    really depend on every preceding MoE FFN output — but it
-    ///    captures the strong layerwise correlation seen on
-    ///    Mixtral-class checkpoints and provides plenty of useful
-    ///    hints for the warm pass. The remaining miss-on-miss
-    ///    fetches still funnel through `Engine`'s in-flight
-    ///    singleflight, so deduplication holds even when the peek
-    ///    is wrong.
+    /// * Every layer's gate is evaluated against the token's
+    ///   **embedding** as a stand-in for that layer's residual
+    ///   stream. This is not exact — real routing depends on
+    ///   attention over the request's KV state and every preceding
+    ///   MoE FFN output — but it captures the strong tokenwise /
+    ///   layerwise routing correlation seen on Mixtral-class
+    ///   checkpoints and provides useful hints for the warm pass.
+    ///
+    /// The previous implementation additionally *cloned the layer-0 KV
+    /// cache and re-ran full layer-0 attention* per peeked token to
+    /// make layer 0 exact. That paid an `O(pos · kv_dim)` copy plus a
+    /// duplicate attention pass on every scheduled request per batch —
+    /// far more than the one routing decision it sharpened was worth —
+    /// and forced the scheduler to lock each request's KV state during
+    /// the pre-pass. Both are gone: the peek reads nothing but the
+    /// token id and the resident gate weights, so it never touches
+    /// request state and cannot leak routing observations across
+    /// requests.
+    ///
+    /// Misses are cheap by construction: anything the peek gets wrong
+    /// is still caught by the in-flight singleflight on the critical
+    /// path, and the scheduler's profitability gate disables the
+    /// pre-pass entirely when its measured benefit is non-positive.
     ///
     /// The returned vector is **not** deduplicated; the caller is
     /// expected to fold it into a [`HashSet`] before calling
     /// [`Engine::warm_with`].
-    pub fn peek_experts(&self, token_id: u32, pos: usize, kv: &[KvCache]) -> Vec<u32> {
-        assert_eq!(
-            kv.len(),
-            self.config.num_layers,
-            "kv cache slice must have one entry per layer"
-        );
+    pub fn peek_experts(&self, token_id: u32) -> Vec<u32> {
         // Each layer contributes exactly `routing.experts.len()` ids,
-        // which by the gating contract equals `config.top_k`. We
-        // assert this loosely below via `debug_assert`; the
-        // pre-allocation is a tight upper bound that avoids any
-        // `Vec` growth even when `top_k` is dynamically reduced
-        // (e.g. by alias-deduplication).
+        // which by the gating contract equals `config.top_k`.
         let mut out = Vec::with_capacity(self.config.num_layers * self.config.top_k);
         let embed = self.embed(token_id);
-        // Layer 0: run real attention against a *clone* of the KV
-        // slot so the cache is not mutated by the peek.
-        {
-            let layer = &self.layers[0];
-            let mut kv0 = kv[0].clone();
-            let backend = crate::backend::current();
-            let attn_out = layer.attn_block(&embed, pos, 0, &mut kv0, &*backend);
-            let (_normed, routing) = layer.moe_pre(&attn_out);
-            for &local in &routing.experts {
-                out.push(self.global_expert_id(0, local));
-            }
-        }
-        // Layers ≥ 1: use the embedding as a fast residual-stream
-        // approximation. Cheap (no attention, no cloning), and good
-        // enough to seed the warm pass — anything the peek misses is
-        // still caught by the in-flight singleflight on the critical
-        // path.
-        for layer_idx in 1..self.config.num_layers {
+        for layer_idx in 0..self.config.num_layers {
             let layer = &self.layers[layer_idx];
             let (_normed, routing) = layer.moe_pre(&embed);
             for &local in &routing.experts {

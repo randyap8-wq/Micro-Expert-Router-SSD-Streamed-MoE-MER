@@ -215,6 +215,15 @@ fn append_scheduler_metrics(body: &mut Vec<u8>, scheduler: &BatchScheduler) {
             "# HELP mer_scheduler_prepass_local_warm_failures_total Local warm_with calls that failed during scheduler pre-pass.\n",
             "# TYPE mer_scheduler_prepass_local_warm_failures_total counter\n",
             "mer_scheduler_prepass_local_warm_failures_total {}\n",
+            "# HELP mer_scheduler_prepass_gate_skips_total Batches the pre-pass profitability gate skipped because measured net benefit was non-positive.\n",
+            "# TYPE mer_scheduler_prepass_gate_skips_total counter\n",
+            "mer_scheduler_prepass_gate_skips_total {}\n",
+            "# HELP mer_scheduler_prepass_useful_warm_experts_total Peeked local experts that were not resident and were actually fetched by the pre-pass warm.\n",
+            "# TYPE mer_scheduler_prepass_useful_warm_experts_total counter\n",
+            "mer_scheduler_prepass_useful_warm_experts_total {}\n",
+            "# HELP mer_scheduler_prepass_cached_predictions_total Peeked local experts that were already resident (wasted prediction work).\n",
+            "# TYPE mer_scheduler_prepass_cached_predictions_total counter\n",
+            "mer_scheduler_prepass_cached_predictions_total {}\n",
         ),
         stats.runs_total,
         stats.singleton_skips_total,
@@ -223,6 +232,9 @@ fn append_scheduler_metrics(body: &mut Vec<u8>, scheduler: &BatchScheduler) {
         stats.requested_experts_total,
         precision,
         stats.local_warm_failures_total,
+        stats.gate_skips_total,
+        stats.useful_warm_experts_total,
+        stats.cached_predictions_total,
     );
     body.extend_from_slice(metrics.as_bytes());
 }

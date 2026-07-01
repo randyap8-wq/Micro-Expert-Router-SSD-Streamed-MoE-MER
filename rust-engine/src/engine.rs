@@ -4484,6 +4484,14 @@ impl Engine {
         Ok(step_result)
     }
 
+    /// Whether `id` is currently resident in the expert cache. Cheap
+    /// (one sharded-LRU lookup, no recency mutation) — used by the
+    /// batch scheduler's pre-pass profitability gate to count how many
+    /// peeked experts a warm pass would actually fetch.
+    pub fn is_expert_cached(&self, id: u32) -> bool {
+        self.core.cache.contains(id)
+    }
+
     /// Force-fetch a specific set of experts and load them into the cache.
     /// Mirrors the spec example "the router selects Expert ID 3 and 7".
     ///
