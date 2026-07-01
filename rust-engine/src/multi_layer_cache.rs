@@ -102,20 +102,22 @@ impl MultiLayerExpertCache {
     }
 
     /// Decode a global expert id into the index of its per-layer
-    /// cache. Clamps to the last layer when `id` is out of range so
-    /// downstream callers never panic on a malformed router output —
-    /// they get a miss instead, which is the correct degradation.
-    fn layer_idx(&self, id: u32) -> usize {
+    /// cache. Returns `None` when `id` is out of the validated
+    /// namespace (hardening pass, Part A6): a malformed id must never
+    /// be clamped into the last layer's cache — lookups miss, inserts
+    /// are rejected, and pin/unpin are no-ops for such ids.
+    fn try_layer_idx(&self, id: u32) -> Option<usize> {
         let layer = (id / self.experts_per_layer) as usize;
-        layer.min(self.caches.len().saturating_sub(1))
+        (layer < self.caches.len()).then_some(layer)
     }
 
-    /// Public counterpart of [`Self::layer_idx`]: the per-layer cache
-    /// index that owns the global expert id `id` (clamped to the last
-    /// layer for out-of-range ids). Used by the engine's locality
-    /// pinning to budget pins against each layer's own capacity.
+    /// The per-layer cache index that owns the global expert id `id`
+    /// (clamped to the last layer for out-of-range ids). Budgeting /
+    /// diagnostics only — the id-keyed cache operations use the
+    /// non-clamping [`Self::try_layer_idx`] instead.
     pub fn layer_of(&self, id: u32) -> usize {
-        self.layer_idx(id)
+        let layer = (id / self.experts_per_layer) as usize;
+        layer.min(self.caches.len().saturating_sub(1))
     }
 
     /// Residency capacity of one per-layer cache. Returns 0 for an
@@ -149,27 +151,36 @@ impl MultiLayerExpertCache {
     // so existing diagnostics keep reporting whole-engine totals.
 
     pub fn get(&self, id: u32) -> Option<Arc<ExpertResident>> {
-        self.caches[self.layer_idx(id)].get(id)
+        self.caches[self.try_layer_idx(id)?].get(id)
     }
 
     pub fn contains(&self, id: u32) -> bool {
-        self.caches[self.layer_idx(id)].contains(id)
+        self.try_layer_idx(id)
+            .is_some_and(|idx| self.caches[idx].contains(id))
     }
 
     pub fn insert(
         &self,
         resident: Arc<ExpertResident>,
     ) -> Result<Option<Arc<ExpertResident>>, Arc<ExpertResident>> {
-        let idx = self.layer_idx(resident.id);
+        // Out-of-namespace ids are rejected, never clamped into the
+        // last layer's cache (Part A6).
+        let Some(idx) = self.try_layer_idx(resident.id) else {
+            return Err(resident);
+        };
         self.caches[idx].insert(resident)
     }
 
     pub fn pin(&self, id: u32) {
-        self.caches[self.layer_idx(id)].pin(id);
+        if let Some(idx) = self.try_layer_idx(id) {
+            self.caches[idx].pin(id);
+        }
     }
 
     pub fn unpin(&self, id: u32) {
-        self.caches[self.layer_idx(id)].unpin(id);
+        if let Some(idx) = self.try_layer_idx(id) {
+            self.caches[idx].unpin(id);
+        }
     }
 
     /// **Tier 4 — cost-aware eviction.** Enable or disable the
@@ -314,6 +325,42 @@ mod tests {
         assert_eq!(mlc.capacity_of_layer(0), 3);
         assert_eq!(mlc.capacity_of_layer(1), 2);
         assert_eq!(mlc.capacity_of_layer(5), 0);
+    }
+
+    /// Part A6 (checked expert namespace): a global id outside the
+    /// validated `num_layers * experts_per_layer` namespace must never
+    /// be clamped into the last layer's cache — lookups miss, inserts
+    /// are rejected, and pin/unpin are no-ops.
+    #[test]
+    fn out_of_namespace_ids_are_rejected_not_clamped() {
+        let pool = BufferPool::new(4, 4096, 4096);
+        // 2 layers × 8 experts per layer → valid global ids are 0..16.
+        let mlc = MultiLayerExpertCache::with_capacities(vec![2, 2], 8);
+
+        // Boundary: last valid id (15) works normally.
+        let _ = mlc.insert(Arc::new(ExpertResident::new(
+            15,
+            pool.try_acquire().unwrap(),
+        )));
+        assert!(mlc.contains(15));
+        assert!(mlc.get(15).is_some());
+
+        // First out-of-range id (16) and u32::MAX: miss + rejected insert.
+        for bad in [16u32, u32::MAX] {
+            assert!(!mlc.contains(bad));
+            assert!(mlc.get(bad).is_none());
+            let rejected = mlc.insert(Arc::new(ExpertResident::new(
+                bad,
+                pool.try_acquire().unwrap(),
+            )));
+            assert!(rejected.is_err(), "insert of id {bad} must be rejected");
+            // The last layer's cache is untouched by the malformed id.
+            assert!(!mlc.contains(bad));
+            // pin/unpin must be no-ops, not panics or last-layer pins.
+            mlc.pin(bad);
+            mlc.unpin(bad);
+            assert_eq!(mlc.pinned_count(), 0);
+        }
     }
 
     #[test]

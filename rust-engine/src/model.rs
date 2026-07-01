@@ -2331,12 +2331,34 @@ impl RealModel {
             .collect()
     }
 
-    /// Look up the embedding row for a token id.
+    /// Look up the embedding row for a token id, wrapping out-of-range
+    /// ids with modulo. **Synthetic/speculative paths only** (routing
+    /// peeks, draft-token KV previews, seeded benchmarks): real
+    /// inference must use [`Self::try_embed`], which rejects invalid
+    /// ids instead of silently aliasing them onto a valid row
+    /// (hardening pass, Part A5).
     pub fn embed(&self, token_id: u32) -> Vec<f32> {
         let id = (token_id as usize) % self.config.vocab_size;
         let mut out = Vec::with_capacity(self.config.d_model);
         self.embedding.row_dequant_into(id, &mut out);
         out
+    }
+
+    /// Fail-closed embedding lookup for real inference (Part A5): a
+    /// token id outside `[0, vocab_size)` is a tokenizer/model
+    /// vocabulary mismatch or a caller bug and must fail the request,
+    /// never wrap onto an unrelated embedding row.
+    pub fn try_embed(&self, token_id: u32) -> Result<Vec<f32>, RealInferenceError> {
+        let id = token_id as usize;
+        if id >= self.config.vocab_size {
+            return Err(RealInferenceError::InvalidTokenId {
+                token_id,
+                vocab_size: self.config.vocab_size,
+            });
+        }
+        let mut out = Vec::with_capacity(self.config.d_model);
+        self.embedding.row_dequant_into(id, &mut out);
+        Ok(out)
     }
 
     /// Translate a `(layer, local_expert_id)` pair into the global flat
@@ -2346,7 +2368,16 @@ impl RealModel {
     /// API changes.
     #[inline]
     pub fn global_expert_id(&self, layer: usize, local: u32) -> u32 {
-        (layer as u32) * (self.config.num_experts as u32) + local
+        // Checked namespace arithmetic (hardening pass, Part A6): the
+        // product/sum is validated at config load, so an overflow here
+        // is a programming error — fail loudly instead of wrapping a
+        // malformed id into another layer's cache namespace.
+        let layer = u32::try_from(layer).expect("layer index exceeds u32");
+        debug_assert!((local as usize) < self.config.num_experts);
+        layer
+            .checked_mul(self.config.num_experts as u32)
+            .and_then(|base| base.checked_add(local))
+            .expect("global expert id overflows u32 (num_layers * num_experts too large)")
     }
 
     /// **SSD-read pre-pass peek (gist Phase 1).** Return a best-effort
@@ -2458,8 +2489,8 @@ impl RealModel {
         );
         let mut x =
             crate::stage_timing::time_optional(timings, crate::stage_timing::EMBEDDING, || {
-                self.embed(token_id)
-            });
+                self.try_embed(token_id)
+            })?;
         let backend = crate::backend::current();
         let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
         let mut next_x = Vec::with_capacity(self.config.d_model);
@@ -4619,6 +4650,50 @@ mod tests {
         for c in &kv {
             assert_eq!(c.seq_len, 2, "each MLA layer cached two positions");
         }
+    }
+
+    /// Part A5 (fail-closed inference): real-model forward must reject
+    /// token ids outside `[0, vocab_size)` instead of wrapping them
+    /// with modulo onto an unrelated embedding row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_rejects_out_of_range_token_ids() {
+        let dir = TempDir::new("badtok");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let model = RealModel::new_seeded(cfg.clone(), 1);
+        let vocab = cfg.vocab_size as u32;
+
+        // Boundary-valid ids succeed: token 0 and the last valid token.
+        for tid in [0u32, vocab - 1] {
+            let mut kv = model.fresh_kv_caches();
+            model
+                .forward_token_hidden(&engine, tid, 0, &mut kv)
+                .await
+                .unwrap_or_else(|e| panic!("token {tid} must be valid: {e}"));
+        }
+
+        // `vocab_size` (one past the end) and `u32::MAX` fail closed.
+        for tid in [vocab, u32::MAX] {
+            let mut kv = model.fresh_kv_caches();
+            let err = model
+                .forward_token_hidden(&engine, tid, 0, &mut kv)
+                .await
+                .expect_err("out-of-range token id must fail");
+            match err {
+                RealInferenceError::InvalidTokenId {
+                    token_id,
+                    vocab_size,
+                } => {
+                    assert_eq!(token_id, tid);
+                    assert_eq!(vocab_size, cfg.vocab_size);
+                }
+                other => panic!("expected InvalidTokenId, got: {other}"),
+            }
+        }
+
+        // try_embed mirrors the same contract directly.
+        assert!(model.try_embed(vocab - 1).is_ok());
+        assert!(model.try_embed(vocab).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

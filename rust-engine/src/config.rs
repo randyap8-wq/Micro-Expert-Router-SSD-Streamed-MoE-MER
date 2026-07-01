@@ -968,6 +968,23 @@ impl Config {
         if self.model.num_layers == 0 {
             return Err(ConfigError::Invalid("model.num_layers must be > 0".into()));
         }
+        // Checked expert-namespace arithmetic (hardening pass, Part A6):
+        // every global expert id is `layer * num_experts + local`, and
+        // storage, cache, predictor, router, trace writer and metrics all
+        // share that flat u32 namespace. Reject configurations whose
+        // namespace cannot be represented instead of letting ids wrap.
+        let layers_u32 = u32::try_from(self.model.num_layers).map_err(|_| {
+            ConfigError::Invalid(format!(
+                "model.num_layers ({}) exceeds u32",
+                self.model.num_layers
+            ))
+        })?;
+        if layers_u32.checked_mul(self.model.num_experts).is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "model.num_layers ({}) * model.num_experts ({}) overflows the u32 global                  expert-id namespace",
+                self.model.num_layers, self.model.num_experts
+            )));
+        }
         if !self.storage.block_align.is_power_of_two() || self.storage.block_align == 0 {
             return Err(ConfigError::Invalid(
                 "storage.block_align must be a positive power of two".into(),
@@ -1428,6 +1445,27 @@ mod tests {
         let mut c = minimal_cfg();
         c.model.top_k = 99;
         assert!(c.validate().is_err());
+    }
+
+    /// Part A6: the flat u32 global expert-id namespace
+    /// (`layer * num_experts + local`) must be validated with checked
+    /// arithmetic at config load.
+    #[test]
+    fn rejects_expert_namespace_overflow() {
+        let mut c = minimal_cfg();
+        c.model.num_layers = 4;
+        c.model.num_experts = u32::MAX / 2;
+        // Satisfy the multi-layer cache_slots >= num_layers rule so the
+        // overflow check is what fires.
+        c.storage.cache_slots = 4;
+        let err = c.validate().expect_err("namespace overflow must fail");
+        assert!(
+            err.to_string().contains("overflows"),
+            "unexpected error: {err}"
+        );
+        // The same shape with a small expert count is fine.
+        c.model.num_experts = 8;
+        c.validate().expect("small namespace is valid");
     }
 
     #[test]
