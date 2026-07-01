@@ -2167,9 +2167,18 @@ async fn build_bench_real_runtime(
     if cfg.real_transformer.weights_dir.is_none() {
         return Err("bench-real requires real_transformer.weights_dir; seeded fallback benchmarks are not production measurements".into());
     }
+    if cfg.real_transformer.allow_seeded_fallback {
+        return Err(
+            "bench-real rejects real_transformer.allow_seeded_fallback = true; seeded fallback \
+             benchmarks are not production measurements"
+                .into(),
+        );
+    }
     if !cfg.real_transformer.strict_weights {
-        warn!(
-            "real_transformer.strict_weights is false; benchmark may include seeded fallback tensors"
+        return Err(
+            "bench-real requires real_transformer.strict_weights = true; a benchmark that may \
+             include seeded fallback tensors is not a production measurement"
+                .into(),
         );
     }
 
@@ -2301,6 +2310,22 @@ async fn build_bench_real_runtime(
             strict_weights: rt.strict_weights,
         },
     )?);
+    if model.load_status.seeded_fallback_remained {
+        return Err(format!(
+            "bench-real loaded an incomplete checkpoint: {} of {} required tensors loaded, \
+             seeded fallback remained; not a production measurement",
+            model.load_status.loaded_tensors, model.load_status.required_tensors
+        )
+        .into());
+    }
+    info!(
+        strict = model.load_status.strict,
+        loader = model.load_status.loader,
+        loaded_tensors = model.load_status.loaded_tensors,
+        required_tensors = model.load_status.required_tensors,
+        seeded_fallback_remained = model.load_status.seeded_fallback_remained,
+        "bench-real model-loading status"
+    );
 
     info!(
         num_experts = model.layers[0].gate.num_experts,
@@ -3278,18 +3303,50 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         let load_options = crate::model::RealModelLoadOptions {
             strict_weights: rt.strict_weights,
         };
-        let m = match rt.weights_dir.as_ref() {
-            Some(dir) => crate::model::RealModel::from_dir_auto_with_options(
-                model_cfg,
-                dir,
-                rt.seed,
-                load_options,
-            )?,
-            None if rt.strict_weights => {
-                return Err("real_transformer.strict_weights = true requires weights_dir".into());
+        // Fail-closed real-model weight policy (gist Finding 1). A missing
+        // `weights_dir` or `strict_weights = false` is rejected unless the
+        // operator explicitly opts into the development seeded fallback.
+        let weight_policy = rt.resolve_weight_policy()?;
+        let m = match (rt.weights_dir.as_ref(), weight_policy) {
+            (Some(dir), _) => {
+                let loaded = crate::model::RealModel::from_dir_auto_with_options(
+                    model_cfg,
+                    dir,
+                    rt.seed,
+                    load_options,
+                )?;
+                if loaded.load_status.seeded_fallback_remained {
+                    warn!(
+                        loader = loaded.load_status.loader,
+                        loaded_tensors = loaded.load_status.loaded_tensors,
+                        required_tensors = loaded.load_status.required_tensors,
+                        "DEVELOPMENT FALLBACK: real_transformer served with seeded weights \
+                         remaining — output is NOT real-checkpoint inference"
+                    );
+                }
+                loaded
             }
-            None => crate::model::RealModel::new_seeded(model_cfg, rt.seed),
+            (None, crate::config::RealWeightPolicy::SeededDev) => {
+                warn!(
+                    "DEVELOPMENT FALLBACK: real_transformer.enabled with no weights_dir and \
+                     allow_seeded_fallback = true — serving deterministic SEEDED weights, \
+                     output is NOT real-checkpoint inference"
+                );
+                crate::model::RealModel::new_seeded(model_cfg, rt.seed)
+            }
+            // resolve_weight_policy already rejects (None, StrictReal).
+            (None, crate::config::RealWeightPolicy::StrictReal) => unreachable!(
+                "resolve_weight_policy rejects a missing weights_dir without seeded fallback"
+            ),
         };
+        info!(
+            strict = m.load_status.strict,
+            loader = m.load_status.loader,
+            loaded_tensors = m.load_status.loaded_tensors,
+            required_tensors = m.load_status.required_tensors,
+            seeded_fallback_remained = m.load_status.seeded_fallback_remained,
+            "real transformer model-loading status"
+        );
         Some(Arc::new(m))
     } else {
         None

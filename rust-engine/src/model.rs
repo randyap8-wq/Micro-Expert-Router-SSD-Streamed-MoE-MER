@@ -242,6 +242,42 @@ impl WeightLoadSummary {
     }
 }
 
+/// Structured summary of how a [`RealModel`]'s weights were resolved.
+///
+/// This is deliberately observable metadata (as opposed to an unstructured
+/// log line) so that startup and benchmark code can report — and, on
+/// production paths, *reject* — models that retained deterministic seeded
+/// fallback weights instead of a complete real checkpoint.
+#[derive(Debug, Clone)]
+pub struct WeightLoadStatus {
+    /// Whether the load ran under strict validation.
+    pub strict: bool,
+    /// Which loader produced the model: `"seeded"`, `"converted_dir"`, or
+    /// `"safetensors"`.
+    pub loader: &'static str,
+    /// Number of required resident tensors successfully loaded from disk.
+    pub loaded_tensors: usize,
+    /// Number of required resident tensors the loader attempted.
+    pub required_tensors: usize,
+    /// `true` when at least one required tensor kept its seeded fallback
+    /// value (only possible outside strict mode, or for a purely seeded
+    /// model).
+    pub seeded_fallback_remained: bool,
+}
+
+impl Default for WeightLoadStatus {
+    fn default() -> Self {
+        // A freshly seeded model: no real tensors loaded, everything seeded.
+        Self {
+            strict: false,
+            loader: "seeded",
+            loaded_tensors: 0,
+            required_tensors: 0,
+            seeded_fallback_remained: true,
+        }
+    }
+}
+
 /// A strict checkpoint-load failure category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightLoadFailureKind {
@@ -616,6 +652,10 @@ pub struct RealModel {
     pub layers: Vec<TransformerLayer>,
     pub final_rms: RmsNorm,
     pub lm_head: LMHead,
+    /// How this model's weights were resolved (seeded vs a real checkpoint).
+    /// Startup and benchmark paths inspect this to fail closed on seeded
+    /// fallback in production.
+    pub load_status: WeightLoadStatus,
 }
 
 type RopeCacheKey = (usize, u32, u8, u64);
@@ -853,6 +893,7 @@ impl RealModel {
             layers,
             final_rms,
             lm_head,
+            load_status: WeightLoadStatus::default(),
         }
     }
 
@@ -1080,12 +1121,20 @@ impl RealModel {
                 StrictWeightLoadError::new(dir, failures),
             ));
         }
+        model.load_status = WeightLoadStatus {
+            strict: options.strict_weights,
+            loader: "converted_dir",
+            loaded_tensors: loaded,
+            required_tensors: tried,
+            seeded_fallback_remained: loaded < tried,
+        };
         info!(
             dir = %dir.display(),
             loaded,
             tried,
             strict_weights = options.strict_weights,
             fallback_seeded = !options.strict_weights,
+            seeded_fallback_remained = model.load_status.seeded_fallback_remained,
             weight_groups = ?summary.by_group,
             weight_dtypes = ?summary.by_dtype,
             "real transformer weights loaded"
@@ -2059,6 +2108,13 @@ impl RealModel {
                 }
             }
         }
+        model.load_status = WeightLoadStatus {
+            strict: options.strict_weights,
+            loader: "safetensors",
+            loaded_tensors: loaded,
+            required_tensors: tried,
+            seeded_fallback_remained: loaded < tried,
+        };
         info!(
             dir = %dir.display(),
             shards = shards.len(),
@@ -2066,6 +2122,7 @@ impl RealModel {
             tried,
             strict_weights = options.strict_weights,
             fallback_seeded = !options.strict_weights,
+            seeded_fallback_remained = model.load_status.seeded_fallback_remained,
             weight_groups = ?summary.by_group,
             weight_dtypes = ?summary.by_dtype,
             "loaded dense weights from .safetensors"

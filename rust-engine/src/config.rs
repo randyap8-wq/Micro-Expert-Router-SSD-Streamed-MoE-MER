@@ -287,7 +287,7 @@ impl Default for TokenizerConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealTransformerConfig {
     /// When `true`, the server runs requests through the full real
     /// transformer (`embedding → stacked layers → LM head`), with each
@@ -306,12 +306,25 @@ pub struct RealTransformerConfig {
     #[serde(default)]
     pub weights_dir: Option<PathBuf>,
     /// Require a complete, shape-compatible resident checkpoint when
-    /// `weights_dir` is configured. When `true`, startup fails with one
-    /// aggregate error listing every missing, malformed, unsupported or
-    /// shape-mismatched required dense tensor instead of retaining seeded
-    /// fallback values. Optional architecture sidecars remain optional.
-    #[serde(default)]
+    /// `weights_dir` is configured. **Defaults to `true`** so real-model
+    /// production paths fail closed on incomplete or incompatible inputs.
+    /// When `true`, startup fails with one aggregate error listing every
+    /// missing, malformed, unsupported or shape-mismatched required dense
+    /// tensor instead of retaining seeded fallback values. Optional
+    /// architecture sidecars remain optional. Setting this to `false` is a
+    /// development-only mode that is rejected unless
+    /// [`Self::allow_seeded_fallback`] is also `true`.
+    #[serde(default = "default_true")]
     pub strict_weights: bool,
+    /// Development-only opt-in that permits deterministic seeded weights to
+    /// remain in the model when a real checkpoint is missing or loaded
+    /// non-strictly. **Defaults to `false`.** When `real_transformer.enabled
+    /// = true`, a missing `weights_dir` or `strict_weights = false` is a hard
+    /// startup error unless this flag is explicitly set. When it is set, a
+    /// prominent structured warning marks the run as *not* real-checkpoint
+    /// inference. `bench-real` always rejects this flag.
+    #[serde(default)]
+    pub allow_seeded_fallback: bool,
     /// Vocab size. Must match the tokenizer when one is configured (for
     /// the byte fallback this should be 256).
     #[serde(default = "default_vocab_size")]
@@ -478,6 +491,67 @@ pub struct RealTransformerConfig {
     /// silently mislabels an architecture.
     #[serde(default)]
     pub architecture: Option<String>,
+}
+
+impl Default for RealTransformerConfig {
+    fn default() -> Self {
+        // Derive the default from the serde field defaults so the two stay
+        // in lockstep. In particular this keeps `strict_weights = true` and
+        // `allow_seeded_fallback = false` — the fail-closed production
+        // policy — consistent between TOML deserialization and programmatic
+        // construction. Every field carries a `#[serde(default...)]`, so an
+        // empty table is always valid.
+        toml::from_str("").expect("empty RealTransformerConfig table is valid")
+    }
+}
+
+/// Resolved weight-loading policy for a real-model run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealWeightPolicy {
+    /// Load a complete real checkpoint from `weights_dir` under strict
+    /// validation. This is the only production-safe policy.
+    StrictReal,
+    /// Explicit development-only seeded fallback. Either no `weights_dir`
+    /// is configured, or a checkpoint is loaded best-effort (seeded gaps
+    /// tolerated). Requires `allow_seeded_fallback = true`.
+    SeededDev,
+}
+
+impl RealTransformerConfig {
+    /// Resolve the fail-closed weight-loading policy for real-model serving.
+    ///
+    /// Production real-model paths must fail closed on incomplete or
+    /// incompatible inputs. A missing `weights_dir` or `strict_weights =
+    /// false` is only permitted when the operator explicitly opts in with
+    /// `allow_seeded_fallback = true`, in which case the caller is expected
+    /// to emit a prominent warning that the run is *not* real-checkpoint
+    /// inference.
+    pub fn resolve_weight_policy(&self) -> Result<RealWeightPolicy, String> {
+        if !self.strict_weights && !self.allow_seeded_fallback {
+            return Err(
+                "real_transformer.strict_weights = false requires \
+                 real_transformer.allow_seeded_fallback = true (development-only). \
+                 Production real-model serving must load a strict, complete checkpoint."
+                    .into(),
+            );
+        }
+        match self.weights_dir {
+            Some(_) if self.strict_weights => Ok(RealWeightPolicy::StrictReal),
+            // Non-strict with a dir is only reachable once allow_seeded_fallback
+            // has been asserted above: a best-effort dev load with seeded gaps.
+            Some(_) => Ok(RealWeightPolicy::SeededDev),
+            None if self.allow_seeded_fallback => Ok(RealWeightPolicy::SeededDev),
+            None => Err(
+                "real_transformer.enabled = true requires real_transformer.weights_dir \
+                 (set allow_seeded_fallback = true for an explicit development-only seeded model)"
+                    .into(),
+            ),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_concurrent_prefetches() -> usize {
@@ -1409,6 +1483,74 @@ mod tests {
         assert_eq!(
             rt.dense_matvec_backend,
             crate::parallel::DenseMatvecBackend::RayonMatrixmultiply
+        );
+    }
+
+    // ---- Finding 1: fail-closed real-model weight policy ----
+
+    #[test]
+    fn strict_weights_defaults_to_true_from_toml() {
+        // A TOML table with no `strict_weights` key resolves to true.
+        let rt: RealTransformerConfig = toml::from_str("enabled = true").unwrap();
+        assert!(rt.strict_weights);
+        assert!(!rt.allow_seeded_fallback);
+    }
+
+    #[test]
+    fn real_transformer_config_default_is_strict() {
+        assert!(RealTransformerConfig::default().strict_weights);
+        assert!(!RealTransformerConfig::default().allow_seeded_fallback);
+    }
+
+    #[test]
+    fn weight_policy_rejects_missing_weights_without_dev_fallback() {
+        let rt: RealTransformerConfig = toml::from_str("enabled = true").unwrap();
+        // strict + no dir + no dev fallback → rejected.
+        assert!(rt.resolve_weight_policy().is_err());
+    }
+
+    #[test]
+    fn weight_policy_rejects_non_strict_without_dev_fallback() {
+        let rt: RealTransformerConfig = toml::from_str(
+            r#"
+            enabled = true
+            weights_dir = "/tmp/does-not-matter"
+            strict_weights = false
+            "#,
+        )
+        .unwrap();
+        assert!(rt.resolve_weight_policy().is_err());
+    }
+
+    #[test]
+    fn weight_policy_allows_explicit_seeded_dev_mode() {
+        // No dir but explicit dev fallback → SeededDev.
+        let rt: RealTransformerConfig = toml::from_str(
+            r#"
+            enabled = true
+            strict_weights = false
+            allow_seeded_fallback = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.resolve_weight_policy().unwrap(),
+            RealWeightPolicy::SeededDev
+        );
+    }
+
+    #[test]
+    fn weight_policy_strict_real_with_dir() {
+        let rt: RealTransformerConfig = toml::from_str(
+            r#"
+            enabled = true
+            weights_dir = "/tmp/ckpt"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            rt.resolve_weight_policy().unwrap(),
+            RealWeightPolicy::StrictReal
         );
     }
 
