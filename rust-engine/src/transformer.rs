@@ -2358,6 +2358,13 @@ pub(crate) fn record_nonfinite_softmax_fallback() {
     NONFINITE_SOFTMAX_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Serialises every test that reads or mutates the process-wide non-finite
+/// softmax fallback counter, so their before/after deltas stay deterministic
+/// even though the counter is a global atomic. Shared crate-wide (e.g. with
+/// the `bench-real` validity test in `main.rs`) so those tests cannot race.
+#[cfg(test)]
+pub(crate) static SOFTMAX_FALLBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn softmax_inplace(v: &mut [f32]) {
     if v.is_empty() {
         return;
@@ -2902,8 +2909,9 @@ mod tests {
 
     /// Serialises the tests that assert on the process-wide non-finite
     /// softmax fallback counter, so their before/after deltas are
-    /// deterministic even though the counter is a global atomic.
-    static SOFTMAX_FALLBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// deterministic even though the counter is a global atomic. Aliased to
+    /// the crate-wide lock so cross-module tests (e.g. `main.rs`) share it.
+    use super::SOFTMAX_FALLBACK_TEST_LOCK;
 
     #[test]
     fn softmax_nan_increments_fallback_counter_once() {

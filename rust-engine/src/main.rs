@@ -2173,11 +2173,13 @@ async fn build_bench_real_runtime(
     if !cfg.real_transformer.enabled {
         return Err("bench-real requires [real_transformer] enabled = true".into());
     }
-    if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu
-        || cfg.gpu_cache.enabled
+    if matches!(
+        cfg.real_transformer.compute_offload,
+        crate::backend::ComputeOffload::Gpu | crate::backend::ComputeOffload::Auto
+    ) || cfg.gpu_cache.enabled
     {
         return Err(
-            "bench-real is CPU-only for this sprint; disable real_transformer.compute_offload = \"gpu\" and [gpu_cache].enabled"
+            "bench-real is CPU-only for this sprint; set real_transformer.compute_offload = \"cpu\" (\"gpu\" and \"auto\" are rejected) and disable [gpu_cache].enabled"
                 .into(),
         );
     }
@@ -5940,8 +5942,10 @@ mod tests {
     fn bench_real_validity_detects_softmax_fallback_delta() {
         // Snapshot then force a fallback: the current count only grows, so a
         // check against the pre-snapshot baseline must report the run invalid.
-        // This is robust under concurrent tests because the counter is
-        // monotonic.
+        // Share the transformer softmax-fallback test lock so this mutation of
+        // the process-wide counter cannot race with the transformer tests that
+        // assert exact before/after deltas.
+        let _g = crate::transformer::SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
         let snapshot = crate::transformer::nonfinite_softmax_fallbacks();
         crate::transformer::record_nonfinite_softmax_fallback();
         assert!(
