@@ -898,7 +898,7 @@ fn extract_experts_from_source_inner(
                     "general.architecture {:?} is not a recognised convertible architecture; \
                      supply an explicit safe architecture override to convert a separate-QKV \
                      llama-like checkpoint",
-                    arch.unwrap_or("<missing>")
+                    effective_arch.unwrap_or("<missing>")
                 ),
             ));
         }
@@ -929,23 +929,36 @@ fn extract_experts_from_source_inner(
         // Per-head QK-Norm length for architectures that require it: prefer the
         // explicit key length, falling back to `d_model / head_count`.
         let head_dim = if profile.uses_qk_norm {
-            let hd = lookup("attention.key_length")
+            let hd = match lookup("attention.key_length")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
-                .or_else(|| {
-                    lookup("attention.head_count")
+            {
+                Some(hd) => hd,
+                None => {
+                    let head_count = lookup("attention.head_count")
                         .and_then(|v| v.as_u64())
                         .map(|v| v as usize)
                         .filter(|&h| h != 0)
-                        .map(|h| d_model / h)
-                })
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "QK-Norm architecture is missing attention.key_length / \
-                         attention.head_count needed to validate head_dim",
-                    )
-                })?;
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "QK-Norm architecture is missing attention.key_length / \
+                                 attention.head_count needed to validate head_dim",
+                            )
+                        })?;
+                    if d_model % head_count != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "QK-Norm architecture has attention.head_count {} that does not \
+                                 divide d_model {}; cannot derive a valid head_dim",
+                                head_count, d_model
+                            ),
+                        ));
+                    }
+                    d_model / head_count
+                }
+            };
             Some(hd)
         } else {
             None

@@ -484,7 +484,7 @@ impl Metrics {
         // Refresh gauges mirrored from process-wide atomics at scrape time.
         self.inner
             .nonfinite_softmax_fallbacks
-            .set(crate::transformer::nonfinite_softmax_fallbacks() as i64);
+            .set(crate::transformer::nonfinite_softmax_fallbacks().min(i64::MAX as u64) as i64);
         let metric_families = self.inner.registry.gather();
         let mut buf = Vec::new();
         TextEncoder::new().encode(&metric_families, &mut buf)?;
