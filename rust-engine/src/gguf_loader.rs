@@ -488,6 +488,17 @@ pub struct ExtractOptions {
     /// skipped deliberately, metadata records `experts_only`, and the
     /// resulting dataset remains valid for expert-streaming runs.
     pub experts_only: bool,
+
+    /// **Explicit safe-architecture override (Finding 6).**
+    ///
+    /// Dense conversion fails closed on an unknown or missing
+    /// `general.architecture`. When the operator knows a checkpoint is a
+    /// plain separate-QKV llama-like export whose GGUF metadata omits (or
+    /// mislabels) the architecture, they may supply the canonical
+    /// architecture string here to resolve the conversion profile instead
+    /// of the metadata value. It never downgrades a recognised fused-QKV or
+    /// MLA architecture to separate-QKV.
+    pub arch_override: Option<String>,
 }
 
 impl Default for ExtractOptions {
@@ -496,6 +507,7 @@ impl Default for ExtractOptions {
             emit_uth: true,
             native_quant: false,
             experts_only: false,
+            arch_override: None,
         }
     }
 }
@@ -870,12 +882,26 @@ fn extract_experts_from_source_inner(
         // `dense_manifest.json` aliases. Q8_0 tensors keep their native
         // bytes; other supported GGUF dense dtypes are materialised as f32.
         //
-        // Finding 2: the required-tensor inventory is architecture-aware.
-        // Fused-QKV and MLA families use an attention tensor set the expert
-        // extractor cannot satisfy, so conversion fails explicitly with an
-        // architecture-specific error rather than emitting a partial
-        // checkpoint that silently drops their real attention weights.
-        let profile = resolve_conversion_profile(arch);
+        // Finding 2/6: the required-tensor inventory is architecture-aware and
+        // the architecture is resolved from an explicit allowlist. An unknown
+        // or missing `general.architecture` fails closed unless the operator
+        // supplies a safe separate-QKV override. Recognised fused-QKV and MLA
+        // families use an attention tensor set the expert extractor cannot
+        // satisfy, so conversion fails explicitly with an architecture-specific
+        // error rather than emitting a partial checkpoint.
+        let effective_arch = opts.arch_override.as_deref().or(arch);
+        let profile = resolve_conversion_profile(effective_arch);
+        if !profile.recognized {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "general.architecture {:?} is not a recognised convertible architecture; \
+                     supply an explicit safe architecture override to convert a separate-QKV \
+                     llama-like checkpoint",
+                    arch.unwrap_or("<missing>")
+                ),
+            ));
+        }
         match profile.attention {
             ConvAttention::SeparateQkv => {}
             ConvAttention::FusedQkv => {
@@ -884,7 +910,7 @@ fn extract_experts_from_source_inner(
                     format!(
                         "architecture {:?} uses fused QKV attention, which the expert extractor \
                          does not support converting; supply a separate-QKV export",
-                        arch.unwrap_or("<unknown>")
+                        effective_arch.unwrap_or("<unknown>")
                     ),
                 ));
             }
@@ -894,7 +920,7 @@ fn extract_experts_from_source_inner(
                     format!(
                         "architecture {:?} uses MLA (latent-KV) attention, which the expert \
                          extractor does not support converting",
-                        arch.unwrap_or("<unknown>")
+                        effective_arch.unwrap_or("<unknown>")
                     ),
                 ));
             }
@@ -945,11 +971,15 @@ fn extract_experts_from_source_inner(
             true,
         )?;
 
-        // Output head. `output.weight` may be omitted only when embedding tying
-        // is positively established from authoritative metadata; the loader then
-        // reconstructs the LM head from `token_embd.weight` via `tied_to`. When
-        // present it is loaded independently. Absent *and* untied is fatal — we
-        // never infer tying solely from the tensor's absence (Finding 2).
+        // Output head. `output.weight` may be omitted when embedding tying is
+        // established either (a) from an explicit `tie_word_embeddings`
+        // metadata flag, or (b) by the architecture's upstream GGUF contract
+        // for verified families (e.g. Qwen3-MoE), which llama.cpp exports with
+        // no `output.weight` and a duplicated token embedding (Finding 5). The
+        // loader then reconstructs the LM head from `token_embd.weight` via
+        // `tied_to`. When `output.weight` is present it is always loaded
+        // independently. Absent *and* untied (unknown/untied architecture with
+        // no tie flag) is fatal — tying is never inferred from absence alone.
         let tie_word_embeddings = matches!(
             lookup("tie_word_embeddings").or_else(|| meta.get("general.tie_word_embeddings")),
             Some(GgufValue::Bool(true))
@@ -964,7 +994,7 @@ fn extract_experts_from_source_inner(
                 vec!["lm_head.bin".to_string()],
                 true,
             )?;
-        } else if tie_word_embeddings {
+        } else if tie_word_embeddings || profile.tied_output_by_contract {
             let embed_dims = gguf
                 .tensor_info("token_embd.weight")
                 .and_then(dense_manifest_dims)
@@ -975,12 +1005,20 @@ fn extract_experts_from_source_inner(
                     )
                 })?;
             push_tied_output_entry(&mut dense_manifest, embed_dims, "token_embd.weight");
-            info!("output.weight tied to token_embd.weight (embedding tying established)");
+            let basis = if tie_word_embeddings {
+                "tie_word_embeddings metadata"
+            } else {
+                "architecture GGUF contract"
+            };
+            info!(
+                basis,
+                "output.weight tied to token_embd.weight (embedding tying established)"
+            );
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "output.weight is absent and embedding tying is not established in metadata; \
-                 refusing partial conversion",
+                "output.weight is absent and embedding tying is not established by metadata or \
+                 architecture contract; refusing partial conversion",
             ));
         }
 
@@ -1254,37 +1292,64 @@ struct ConvArchProfile {
     attention: ConvAttention,
     /// Per-head QK-Norm (`attn_q_norm`/`attn_k_norm`) is architecture-required.
     uses_qk_norm: bool,
+    /// Whether the architecture is on the explicit conversion allowlist. An
+    /// unknown or missing architecture is *not* recognised and must fail
+    /// closed rather than being silently treated as generic separate-QKV
+    /// (Finding 6).
+    recognized: bool,
+    /// The architecture's upstream GGUF contract permits `output.weight` to be
+    /// absent and duplicate `token_embd.weight` (embedding tying) even when no
+    /// explicit `tie_word_embeddings` metadata flag is present (Finding 5).
+    tied_output_by_contract: bool,
 }
 
 /// Resolve the conversion profile for a GGUF `general.architecture` string.
 ///
-/// Known separate-QKV families (and any unrecognised llama-like producer) map
-/// to [`ConvAttention::SeparateQkv`]. Fused-QKV and MLA families are recognised
-/// but not yet convertible by the expert extractor, so they are surfaced to the
-/// caller so conversion can fail with an architecture-specific error rather than
-/// producing a partial checkpoint that silently omits their real attention set.
+/// Finding 6: this is an explicit allowlist. Recognised separate-QKV families
+/// convert normally; recognised fused-QKV / MLA families are surfaced with an
+/// architecture-specific unsupported error; and an unknown or missing
+/// architecture is reported as unrecognised so conversion fails closed instead
+/// of emitting a partial checkpoint from an unverified tensor layout.
 fn resolve_conversion_profile(arch: Option<&str>) -> ConvArchProfile {
     match arch.unwrap_or("") {
-        // DeepSeek-V2/V3 latent-KV attention.
+        // DeepSeek-V2/V3 latent-KV attention (recognised, unsupported).
         "deepseek2" | "deepseek_v3" | "deepseek3" => ConvArchProfile {
             attention: ConvAttention::Mla,
             uses_qk_norm: false,
+            recognized: true,
+            tied_output_by_contract: false,
         },
-        // Phi-3/Phi-4 fused `qkv_proj`.
+        // Phi-3/Phi-4 fused `qkv_proj` (recognised, unsupported).
         "phi2" | "phi3" | "phi4" => ConvArchProfile {
             attention: ConvAttention::FusedQkv,
             uses_qk_norm: false,
+            recognized: true,
+            tied_output_by_contract: false,
         },
-        // Qwen3 / Qwen3-MoE: separate QKV *with* per-head QK-Norm.
+        // Qwen3 / Qwen3-MoE: separate QKV *with* per-head QK-Norm. Upstream
+        // llama.cpp omits `output.weight` for these and duplicates the token
+        // embedding, so tying is defined by the architecture contract.
         "qwen3" | "qwen3moe" | "qwen3_moe" => ConvArchProfile {
             attention: ConvAttention::SeparateQkv,
             uses_qk_norm: true,
+            recognized: true,
+            tied_output_by_contract: true,
         },
-        // Everything else (llama, mixtral, qwen2, qwen2moe, gpt-oss, unknown):
-        // the generic separate-QKV llama layout without QK-Norm.
+        // Recognised separate-QKV llama-like families without QK-Norm. These
+        // always ship an explicit `output.weight` (no embedding tying).
+        "llama" | "mixtral" | "qwen2" | "qwen2moe" | "qwen2_moe" | "gptoss" | "gpt_oss"
+        | "gpt-oss" => ConvArchProfile {
+            attention: ConvAttention::SeparateQkv,
+            uses_qk_norm: false,
+            recognized: true,
+            tied_output_by_contract: false,
+        },
+        // Unknown or missing architecture: not on the allowlist (Finding 6).
         _ => ConvArchProfile {
             attention: ConvAttention::SeparateQkv,
             uses_qk_norm: false,
+            recognized: false,
+            tied_output_by_contract: false,
         },
     }
 }
@@ -3283,6 +3348,7 @@ mod tests {
                 emit_uth: false,
                 native_quant: false,
                 experts_only: false,
+                arch_override: None,
             },
         )
         .expect("extract no-uth");
@@ -3379,6 +3445,7 @@ mod tests {
                 emit_uth: true,
                 native_quant: false,
                 experts_only: true,
+                arch_override: None,
             },
         )
         .expect("extract experts only");
@@ -3727,6 +3794,7 @@ mod tests {
                 emit_uth: true,
                 native_quant: true,
                 experts_only: false,
+                arch_override: None,
             },
         )
         .expect_err("F32 native quant should fail closed");
@@ -4312,6 +4380,7 @@ mod tests {
                 emit_uth: true,
                 native_quant: true,
                 experts_only: false,
+                arch_override: None,
             },
         )
         .expect("extract");
@@ -4367,6 +4436,7 @@ mod tests {
                 emit_uth: true,
                 native_quant: true,
                 experts_only: false,
+                arch_override: None,
             },
         )
         .expect("extract mixed");

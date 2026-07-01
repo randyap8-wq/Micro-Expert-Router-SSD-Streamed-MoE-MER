@@ -896,14 +896,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The `run` subcommand grows one extra wrinkle: when invoked with
     // `--gpu` it must initialise the GPU compute backend *before* the
     // default CPU backend claims the `OnceLock` (gist Fix 2), mirroring
-    // `cmd_serve`. A failed GPU init falls back to `install_default`.
+    // `cmd_serve`. `--gpu` is an explicit request, so a failed GPU init is
+    // fatal (fail closed) — it never silently falls back to CPU.
     let run_gpu_cache = if let Cmd::Run {
         gpu: true,
         gpu_cache_mb,
         ..
     } = &cli.cmd
     {
-        install_run_gpu_backend(*gpu_cache_mb)
+        install_run_gpu_backend(*gpu_cache_mb)?
     } else if !matches!(cli.cmd, Cmd::Serve { .. }) {
         crate::backend::install_default();
         let b = crate::backend::current();
@@ -1216,9 +1217,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `set_backend` race — it falls back to
 /// [`install_default`](crate::backend::install_default) with a
 /// warning so the benchmark still runs on CPU.
+/// Install the GPU compute backend for an explicit `run --gpu` request.
+///
+/// Finding 5 (fail-closed GPU): `--gpu` is an explicit request, so both GPU
+/// initialisation failure and backend-installation failure are fatal. We never
+/// silently continue on CPU — that would produce a "GPU" benchmark measuring
+/// the CPU path. Operators who want best-effort GPU with CPU fallback use the
+/// serving `compute_offload = "auto"` path instead.
 fn install_run_gpu_backend(
     gpu_cache_mb: usize,
-) -> Option<Arc<crate::expert_cache::GpuExpertCache>> {
+) -> Result<Option<Arc<crate::expert_cache::GpuExpertCache>>, Box<dyn std::error::Error>> {
     // The KV-cache geometry below only sizes the dense-backbone cache,
     // which the synthetic `run` benchmark does not exercise — it routes
     // everything through `expert_matmul`.
@@ -1242,38 +1250,28 @@ fn install_run_gpu_backend(
         gpu_expert_cache.clone(),
     );
     if !backend_box.is_gpu() {
-        warn!("GPU REQUEST FAILED — RUNNING ON CPU");
-        crate::backend::install_default();
-        let b = crate::backend::current();
-        info!(
-            backend = b.device_name(),
-            compute_plane = b.compute_plane(),
-            "math backend installed"
-        );
-        return None;
+        return Err("explicit --gpu request failed: GPU backend initialization did not \
+                    produce a GPU device; refusing to run on CPU (use serving \
+                    compute_offload = \"auto\" for best-effort GPU with CPU fallback)"
+            .into());
     }
     let device_name = backend_box.device_name().to_string();
     let compute_plane = backend_box.compute_plane().to_string();
     let gpu = std::sync::Arc::new(backend_box);
     if let Err(e) = crate::backend::set_backend(gpu) {
-        warn!(error = e, "GPU REQUEST FAILED — RUNNING ON CPU");
-        crate::backend::install_default();
-        let b = crate::backend::current();
-        info!(
-            backend = b.device_name(),
-            compute_plane = b.compute_plane(),
-            "math backend installed"
-        );
-        None
-    } else {
-        info!(
-            device = device_name,
-            compute_plane,
-            vram_capacity_mb = gpu_cache_mb,
-            "GpuBackend installed for run benchmark"
-        );
-        Some(gpu_expert_cache)
+        return Err(format!(
+            "explicit --gpu request failed: GPU backend installation failed ({e}); \
+             refusing to run on CPU"
+        )
+        .into());
     }
+    info!(
+        device = device_name,
+        compute_plane,
+        vram_capacity_mb = gpu_cache_mb,
+        "GpuBackend installed for run benchmark"
+    );
+    Ok(Some(gpu_expert_cache))
 }
 
 /// **Tier 2.** Attach a packed expert blob to `storage` when both the blob
@@ -2207,10 +2205,10 @@ async fn build_bench_real_runtime(
     }
 
     let (resolved_architecture, resolved_first_k_dense_replace, resolved_advanced) =
-        reconcile_bench_real_config(&mut cfg)?;
+        reconcile_real_model_config(&mut cfg)?;
     // Finding 7: validate the fully-resolved configuration before any weights
     // are loaded or backends installed.
-    validate_resolved_bench_real_config(
+    validate_resolved_real_model_config(
         &cfg,
         resolved_architecture,
         resolved_first_k_dense_replace,
@@ -2486,7 +2484,16 @@ async fn build_bench_real_runtime(
     })
 }
 
-fn reconcile_bench_real_config(
+/// Reconcile the resolved real-model configuration from the TOML config and,
+/// when present, the checkpoint `config.json`. Shared by `build_bench_real_runtime`
+/// and `cmd_serve` (Finding 2) so serving and bench-real resolve identically.
+///
+/// The checkpoint `config.json` is always parsed when `weights_dir` points at a
+/// directory containing one, regardless of whether the TOML pins an
+/// architecture. An explicit TOML architecture never suppresses checkpoint
+/// reconciliation; if both are present they must agree or reconciliation fails
+/// naming both.
+fn reconcile_real_model_config(
     cfg: &mut crate::config::Config,
 ) -> Result<
     (
@@ -2588,9 +2595,10 @@ fn reconcile_bench_real_config(
 }
 
 /// Finding 7: post-reconciliation, architecture-aware validation of the
-/// fully-resolved bench-real configuration.
+/// fully-resolved real-model configuration. Shared by `build_bench_real_runtime`
+/// and `cmd_serve` (Finding 2) so both paths reject the same invalid configs.
 ///
-/// This runs *after* [`reconcile_bench_real_config`] has merged the TOML and
+/// This runs *after* [`reconcile_real_model_config`] has merged the TOML and
 /// checkpoint `config.json` into `cfg`. It validates the final resolved
 /// architecture, model shape, routing configuration, storage/cache
 /// relationships, and the integer conversions the loader will subsequently
@@ -2602,7 +2610,7 @@ fn reconcile_bench_real_config(
 /// Q/K/V through low-rank latents, and MiMo-V2-Flash uses an asymmetric
 /// `v_head_dim != head_dim` with a partial-rotary Q/K width), so applying it
 /// would reject valid checkpoints.
-fn validate_resolved_bench_real_config(
+fn validate_resolved_real_model_config(
     cfg: &crate::config::Config,
     arch: crate::architecture::Architecture,
     first_k_dense_replace: usize,
@@ -2706,16 +2714,16 @@ fn validate_resolved_bench_real_config(
     let cache_slots = cfg.storage.cache_slots;
     let block_align = cfg.storage.block_align;
     let expert_size = cfg.model.expert_size;
-    // The per-layer LRU must be able to hold every expert activated for a
-    // single token (the routed top-K plus the always-on shared experts);
-    // otherwise a single decode step thrashes and cannot make progress.
-    let activated_per_layer = top_k.saturating_add(advanced.num_shared_experts);
-    if cache_slots < activated_per_layer {
+    // The per-layer routed-expert LRU must be able to hold every *routed*
+    // expert activated for a single token (the top-K). Finding 7: always-on
+    // shared experts are loaded resident in the model (`layers[l].shared_expert`)
+    // and computed directly — they are never streamed through the routed
+    // SSD/expert cache, so they must NOT be added to this working-set
+    // requirement. Doing so would reject an otherwise-adequate `cache_slots`.
+    if cache_slots < top_k {
         errs.push(format!(
-            "storage.cache_slots ({cache_slots}) is smaller than the experts activated per layer \
-             (top_k {top_k} + shared {} = {activated_per_layer}); the cache cannot hold one \
-             layer's working set",
-            advanced.num_shared_experts
+            "storage.cache_slots ({cache_slots}) is smaller than the routed experts activated \
+             per layer (top_k {top_k}); the cache cannot hold one layer's routed working set"
         ));
     }
     if expert_size == 0 {
@@ -3267,75 +3275,32 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // (exact HF `model_type`) wins; otherwise auto-detect from
     // `config.json`; otherwise default to Mixtral. An unrecognised
     // architecture is a hard error — we never silently mislabel a model.
+    // Precedence: the checkpoint `config.json` (when present under
+    // `weights_dir`) is always parsed and reconciled; an explicit
+    // `[real_transformer] architecture = "…"` override never suppresses that
+    // reconciliation and must agree with the checkpoint if both are present
+    // (Finding 2). Serving and bench-real share the exact same reconciliation
+    // and resolved-validation helpers so they can never disagree on the
+    // resolved architecture/dims or accept a config the other rejects.
     let mut resolved_architecture = crate::architecture::Architecture::Mixtral;
     let mut resolved_first_k_dense_replace = 0usize;
-    // Advanced routing surface (DeepSeek-V3 aux-loss-free balancing:
-    // sigmoid scoring, group-limited top-K, routed scaling, plus
-    // `norm_topk_prob`). Reconciled from `config.json` alongside the
-    // dims below so the real model's per-layer `LinearGate` is built via
-    // `with_routing` with the checkpoint's actual scoring function — not
-    // silently defaulted to Mixtral-style softmax. Mixtral / Qwen3-MoE
-    // checkpoints map to the same values `AdvancedConfig::default()`
-    // already carries, so this is behaviour-preserving for them.
     let mut resolved_advanced = crate::model::AdvancedConfig::default();
     if cfg.real_transformer.enabled {
-        if let Some(arch_str) = cfg.real_transformer.architecture.clone() {
-            resolved_architecture = crate::architecture::Architecture::from_model_type(&arch_str)
-                .ok_or_else(|| {
-                format!(
-                    "[real_transformer] architecture = \"{arch_str}\" is not a recognised \
-                         model_type (expected one of: mixtral, qwen3, qwen3_moe, deepseek_v3, \
-                         mistral3, phi3)"
-                )
-            })?;
-        } else if let Some(dir) = cfg.real_transformer.weights_dir.clone() {
-            match crate::architecture::HfConfig::from_dir(&dir) {
-                Ok(Some(hf)) => {
-                    info!(
-                        architecture = ?hf.architecture,
-                        "config.json detected; reconciling [model] hyperparameters from checkpoint"
-                    );
-                    resolved_architecture = hf.architecture;
-                    resolved_first_k_dense_replace = hf.first_k_dense_replace.unwrap_or(0);
-                    // Map the checkpoint's routing hyperparameters (scoring
-                    // function, group-limited top-K, routed scaling factor,
-                    // `norm_topk_prob`) so they reach the per-layer gate.
-                    resolved_advanced = crate::model::RealModelConfig::from_hf_config(&hf).advanced;
-                    // GPT-OSS SwiGLU gate clamp: install the process-global
-                    // limit so the expert-FFN hot path applies it (no-op for
-                    // every architecture that leaves `swiglu_limit` unset).
-                    crate::inference::set_swiglu_limit(resolved_advanced.swiglu_limit);
-                    // Engine-visible dims (cache + expert namespace + router).
-                    cfg.model.d_model = hf.hidden_size;
-                    cfg.model.d_ff = hf.resolved_d_ff();
-                    cfg.model.num_layers = hf.num_hidden_layers;
-                    cfg.model.num_experts = hf.num_routed_experts.unwrap_or(1).max(1) as u32;
-                    cfg.model.top_k = hf
-                        .num_experts_per_tok
-                        .unwrap_or(1)
-                        .clamp(1, cfg.model.num_experts.max(1) as usize);
-                    // Attention / norm hyperparameters consumed when the
-                    // `RealModelConfig` is built further below.
-                    cfg.real_transformer.vocab_size = hf.vocab_size;
-                    cfg.real_transformer.num_heads = hf.num_attention_heads;
-                    cfg.real_transformer.num_kv_heads = if hf.num_key_value_heads == 0 {
-                        hf.num_attention_heads
-                    } else {
-                        hf.num_key_value_heads
-                    };
-                    cfg.real_transformer.head_dim = hf.resolved_head_dim();
-                    cfg.real_transformer.rope_base = hf.rope_theta;
-                    cfg.real_transformer.rms_eps = hf.rms_norm_eps;
-                    cfg.real_transformer.window_size = hf.sliding_window.unwrap_or(0);
-                }
-                Ok(None) => {} // no config.json — keep TOML-derived config
-                Err(e) => {
-                    return Err(
-                        format!("failed to read config.json from {}: {e}", dir.display()).into(),
-                    );
-                }
-            }
-        }
+        let (arch, first_k, advanced) = reconcile_real_model_config(&mut cfg)?;
+        resolved_architecture = arch;
+        resolved_first_k_dense_replace = first_k;
+        resolved_advanced = advanced;
+        // GPT-OSS SwiGLU gate clamp: install the process-global limit so the
+        // expert-FFN hot path applies it (no-op when `swiglu_limit` is unset).
+        crate::inference::set_swiglu_limit(resolved_advanced.swiglu_limit);
+        // Architecture-aware validation of the fully-resolved config, identical
+        // to the bench-real path (Finding 2/7).
+        validate_resolved_real_model_config(
+            &cfg,
+            resolved_architecture,
+            resolved_first_k_dense_replace,
+            &resolved_advanced,
+        )?;
     }
 
     info!(
@@ -3443,9 +3408,23 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         }
         let gpu = std::sync::Arc::new(backend_box);
         if let Err(e) = crate::backend::set_backend(gpu) {
+            // Finding 5 (fail-closed GPU): installation failure is fatal for an
+            // explicit `gpu` request — we must never silently continue on CPU.
+            // Under `auto` it is a recorded fallback instead.
+            if matches!(
+                resolution.requested,
+                crate::backend::ComputeOffload::Gpu
+            ) {
+                return Err(format!(
+                    "explicit compute_offload = \"gpu\": GpuBackend installation failed ({e}); \
+                     refusing to fall back to CPU"
+                )
+                .into());
+            }
+            backend_fallback_occurred = true;
             warn!(
                 error = e,
-                "failed to install GpuBackend; falling back to default"
+                "compute_offload = \"auto\": GpuBackend installation failed; falling back to CPU"
             );
         } else {
             info!(
@@ -5712,6 +5691,7 @@ fn cmd_gguf_convert(
         emit_uth,
         native_quant,
         experts_only,
+        arch_override: None,
     };
     let source = crate::gguf::open_gguf_source(gguf_path, legacy_eager)?;
     if let Some(arch) = source.architecture() {
@@ -6170,7 +6150,7 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 
-    /// Minimal `Config` for exercising [`reconcile_bench_real_config`]. The
+    /// Minimal `Config` for exercising [`reconcile_real_model_config`]. The
     /// non-`real_transformer` sections carry placeholder values; the tests
     /// only inspect fields the reconciler overwrites.
     fn minimal_bench_cfg() -> crate::config::Config {
@@ -6253,7 +6233,7 @@ mod tests {
         cfg.real_transformer.architecture = Some("qwen3_moe".to_string());
 
         let (arch, _first_k, advanced) =
-            reconcile_bench_real_config(&mut cfg).expect("reconcile should succeed");
+            reconcile_real_model_config(&mut cfg).expect("reconcile should succeed");
 
         assert_eq!(arch, crate::architecture::Architecture::Qwen3Moe);
         assert!(
@@ -6281,7 +6261,7 @@ mod tests {
         cfg.real_transformer.weights_dir = Some(dir.clone());
         cfg.real_transformer.architecture = Some("mixtral".to_string());
 
-        let err = reconcile_bench_real_config(&mut cfg)
+        let err = reconcile_real_model_config(&mut cfg)
             .expect_err("mismatched architecture must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("mixtral"), "error must name TOML arch: {msg}");
@@ -6302,8 +6282,8 @@ mod tests {
         let mut cfg = minimal_bench_cfg();
         cfg.real_transformer.weights_dir = Some(dir.clone());
         let (arch, first_k, advanced) =
-            reconcile_bench_real_config(&mut cfg).expect("reconcile should succeed");
-        validate_resolved_bench_real_config(&cfg, arch, first_k, &advanced)
+            reconcile_real_model_config(&mut cfg).expect("reconcile should succeed");
+        validate_resolved_real_model_config(&cfg, arch, first_k, &advanced)
             .expect("a well-formed reconciled checkpoint must pass validation");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6314,7 +6294,7 @@ mod tests {
         cfg.model.num_experts = 4;
         cfg.model.top_k = 8; // impossible: more activated than available
         let advanced = crate::model::AdvancedConfig::default();
-        let err = validate_resolved_bench_real_config(
+        let err = validate_resolved_real_model_config(
             &cfg,
             crate::architecture::Architecture::Mixtral,
             0,
@@ -6331,7 +6311,7 @@ mod tests {
         cfg.real_transformer.num_kv_heads = 4; // 6 % 4 != 0
         cfg.real_transformer.head_dim = 8;
         let advanced = crate::model::AdvancedConfig::default();
-        let err = validate_resolved_bench_real_config(
+        let err = validate_resolved_real_model_config(
             &cfg,
             crate::architecture::Architecture::Mixtral,
             0,
@@ -6353,7 +6333,7 @@ mod tests {
         cfg.real_transformer.head_dim = 24; // 4*24 = 96 != d_model 64
         let mut advanced = crate::model::AdvancedConfig::default();
         advanced.v_head_dim = Some(16);
-        validate_resolved_bench_real_config(
+        validate_resolved_real_model_config(
             &cfg,
             crate::architecture::Architecture::MiMoV2,
             0,
@@ -6368,7 +6348,7 @@ mod tests {
         cfg.model.top_k = 4;
         cfg.storage.cache_slots = 2; // smaller than activated per layer
         let advanced = crate::model::AdvancedConfig::default();
-        let err = validate_resolved_bench_real_config(
+        let err = validate_resolved_real_model_config(
             &cfg,
             crate::architecture::Architecture::Mixtral,
             0,
@@ -6385,7 +6365,7 @@ mod tests {
         cfg.storage.block_align = 4096;
         cfg.model.expert_size = 4097; // not a multiple of block_align
         let advanced = crate::model::AdvancedConfig::default();
-        let err = validate_resolved_bench_real_config(
+        let err = validate_resolved_real_model_config(
             &cfg,
             crate::architecture::Architecture::Mixtral,
             0,
