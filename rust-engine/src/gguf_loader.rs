@@ -961,24 +961,32 @@ fn extract_experts_from_source_inner(
             // weights applied to Q and K before RoPE. Emitted under the
             // engine-friendly `q_norm_{layer}.bin` / `k_norm_{layer}.bin`
             // aliases consumed by the converted-directory loader. Absent for
-            // architectures without QK-Norm (e.g. Mixtral), in which case
-            // `emit_dense_manifest_tensor` skips them.
-            emit_dense_manifest_tensor(
-                gguf,
-                out_dir,
-                &mut report,
-                &mut dense_manifest,
-                &format!("blk.{layer}.attn_q_norm.weight"),
-                vec![format!("q_norm_{layer}.bin")],
-            )?;
-            emit_dense_manifest_tensor(
-                gguf,
-                out_dir,
-                &mut report,
-                &mut dense_manifest,
-                &format!("blk.{layer}.attn_k_norm.weight"),
-                vec![format!("k_norm_{layer}.bin")],
-            )?;
+            // architectures without QK-Norm (e.g. Mixtral); only attempt
+            // extraction when at least one of the Q/K norm tensors is present
+            // for this layer so non-QK-Norm conversions don't inflate the
+            // reported `skipped` count.
+            let q_norm_name = format!("blk.{layer}.attn_q_norm.weight");
+            let k_norm_name = format!("blk.{layer}.attn_k_norm.weight");
+            if gguf.tensor_info(&q_norm_name).is_some()
+                || gguf.tensor_info(&k_norm_name).is_some()
+            {
+                emit_dense_manifest_tensor(
+                    gguf,
+                    out_dir,
+                    &mut report,
+                    &mut dense_manifest,
+                    &q_norm_name,
+                    vec![format!("q_norm_{layer}.bin")],
+                )?;
+                emit_dense_manifest_tensor(
+                    gguf,
+                    out_dir,
+                    &mut report,
+                    &mut dense_manifest,
+                    &k_norm_name,
+                    vec![format!("k_norm_{layer}.bin")],
+                )?;
+            }
             emit_dense_manifest_tensor(
                 gguf,
                 out_dir,
