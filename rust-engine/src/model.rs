@@ -2832,6 +2832,40 @@ fn try_load_dense_weight(
         .map(|v| DenseWeight::from_f32(v, rows, cols));
     };
 
+    // Tied entry (Finding 2): an entry such as a tied LM head carries no file
+    // of its own — it is reconstructed from a referenced source tensor (the
+    // token embedding). Resolve `tied_to` to the target entry and load its
+    // bytes, validating the reconstructed weight against the caller's expected
+    // `(rows, cols)` exactly as for a normal entry.
+    let entry = if let Some(target) = entry.tied_to.as_deref() {
+        match manifest.and_then(|m| m.find_alias(target)) {
+            Some(source) => source,
+            None => {
+                if strict_weights {
+                    failures.push(WeightLoadFailure {
+                        tensor: name.to_string(),
+                        group,
+                        kind: WeightLoadFailureKind::Missing,
+                        expected: format!("tied source tensor {target}"),
+                        actual: None,
+                        detail: Some(format!(
+                            "dense manifest entry {} is tied to {target}, which is not in the manifest",
+                            entry.canonical_name
+                        )),
+                    });
+                }
+                warn!(
+                    tensor = name,
+                    tied_to = target,
+                    "tied dense manifest target not found; falling back to seeded init"
+                );
+                return None;
+            }
+        }
+    } else {
+        entry
+    };
+
     if entry.dims.iter().product::<usize>() != expected {
         if strict_weights {
             failures.push(WeightLoadFailure {
@@ -5371,7 +5405,27 @@ mod tests {
 
     #[test]
     fn from_dir_loads_native_q8_dense_manifest_without_alias_files() {
-        let cfg = tiny_mixtral_loader_cfg();
+        // Q8_0 tensors must contain a whole number of 32-element blocks (F6).
+        // Size the fixture so every Q8_0 dense tensor's element count is a
+        // multiple of 32: d_model = 32 makes `k * d_model` a valid block
+        // multiple for any integer `k` (vocab, q/kv widths, num_experts).
+        let cfg = RealModelConfig {
+            vocab_size: 32,
+            d_model: 32,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 8,
+            num_layers: 1,
+            num_experts: 2,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
         let dir = TempDir::new("dense_manifest_q8");
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;

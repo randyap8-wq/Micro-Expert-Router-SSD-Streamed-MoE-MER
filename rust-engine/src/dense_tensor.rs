@@ -95,6 +95,10 @@ impl DenseTensorManifest {
         // every file we reference, so collisions are reported once.
         let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut seen_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Tied entries (e.g. an LM head reconstructed from the token embedding)
+        // carry no weight file of their own; record the referenced targets so
+        // they can be resolved against the full name set after the walk.
+        let mut tied_targets: Vec<(&str, &str)> = Vec::new();
 
         for entry in &self.tensors {
             let who = if entry.canonical_name.is_empty() {
@@ -117,6 +121,37 @@ impl DenseTensorManifest {
                         "duplicate dense manifest alias {alias} (entry {who})"
                     ));
                 }
+            }
+
+            // A tied entry reconstructs its weights from another tensor and has
+            // no file/bytes/checksum of its own. It must reference a target and
+            // must NOT carry a file, but its logical `dims` are still validated
+            // below so the reconstructed weight can be shape-checked.
+            if let Some(target) = entry.tied_to.as_deref() {
+                if target.is_empty() {
+                    problems.push(format!("dense manifest entry {who} has an empty tied_to target"));
+                } else {
+                    tied_targets.push((who, target));
+                }
+                if !entry.file.is_empty() {
+                    problems.push(format!(
+                        "dense manifest entry {who} is tied to {target} but also declares file {:?}",
+                        entry.file
+                    ));
+                }
+                if entry.byte_len != 0 {
+                    problems.push(format!(
+                        "dense manifest tied entry {who} must have byte_len 0, got {}",
+                        entry.byte_len
+                    ));
+                }
+                if entry.dims.is_empty() || entry.dims.iter().any(|&d| d == 0) {
+                    problems.push(format!(
+                        "dense manifest tied entry {who} has degenerate dims {:?}",
+                        entry.dims
+                    ));
+                }
+                continue;
             }
 
             if let Some(reason) = unsafe_manifest_file_name(&entry.file) {
@@ -172,6 +207,17 @@ impl DenseTensorManifest {
             if require_checksums && entry.checksum.is_none() {
                 problems.push(format!(
                     "dense manifest entry {who} is missing a checksum (required under strict load)"
+                ));
+            }
+        }
+
+        // Every tied entry must reference a target tensor that actually exists
+        // in the manifest (by canonical name or alias), so the loader can
+        // reconstruct the tied weight. A dangling reference is fatal.
+        for (who, target) in tied_targets {
+            if !seen_names.contains(target) {
+                problems.push(format!(
+                    "dense manifest tied entry {who} references unknown target {target}"
                 ));
             }
         }
