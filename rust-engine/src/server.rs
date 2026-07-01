@@ -1417,15 +1417,14 @@ async fn stream_tokens(
         }
     };
 
-    // Carry the cumulative completion ids so we can decode each step's
-    // *delta* (a new id may extend a multi-byte UTF-8 token from the
-    // previous one; decoding the cumulative buffer and diffing is the
-    // safe way to compute "what's new since last chunk").
+    // Incremental decoder (hardening pass, F2): each step decodes only
+    // a bounded look-behind window instead of re-decoding the entire
+    // cumulative completion and cloning the cumulative string.
     struct St {
         state: AppState,
         mode: GenMode,
         completion_ids: Vec<u32>,
-        decoded_so_far: String,
+        decoder: crate::tokenizer::StreamDecoder,
         emitted: usize,
         max_tokens: usize,
         finished_emitted: bool,
@@ -1438,7 +1437,7 @@ async fn stream_tokens(
         state,
         mode,
         completion_ids: Vec::with_capacity(max_tokens),
-        decoded_so_far: String::new(),
+        decoder: crate::tokenizer::StreamDecoder::new(),
         emitted: 0,
         max_tokens,
         finished_emitted: false,
@@ -1476,9 +1475,16 @@ async fn stream_tokens(
             }
             st.stage_timing.publish();
             st.finished_emitted = true;
+            // Flush any held-back (incomplete-sequence) text from the
+            // incremental decoder so the final chunk never drops
+            // trailing output (F2).
+            let tail = st
+                .decoder
+                .finish(&st.state.tokenizer)
+                .unwrap_or_default();
             return Some((
                 StreamChunk {
-                    text: String::new(),
+                    text: tail,
                     finished: true,
                     hits: 0,
                     misses: 0,
@@ -1568,23 +1574,17 @@ async fn stream_tokens(
         st.completion_ids.push(next);
         st.emitted += 1;
 
-        // Decode the cumulative ids and diff against what we've already
-        // sent — robust to multi-byte tokens. Tokenizer errors fall back
-        // to "no new text this step" rather than aborting the stream.
-        let new_decoded = st
-            .state
-            .tokenizer
-            .decode(&st.completion_ids)
-            .unwrap_or_else(|_| st.decoded_so_far.clone());
-        let delta = if new_decoded.starts_with(&st.decoded_so_far) {
-            new_decoded[st.decoded_so_far.len()..].to_string()
-        } else {
-            // Re-tokenized text changed earlier characters — emit the
-            // full new text and reset the cursor. Rare but possible
-            // with BPE tokenizers.
-            new_decoded.clone()
-        };
-        st.decoded_so_far = new_decoded;
+        // Incremental decode (F2): decode only the bounded look-behind
+        // window and emit the newly stable text. Tokenizer errors fall
+        // back to "no new text this step" rather than aborting the
+        // stream, matching the legacy behaviour.
+        let delta = st
+            .decoder
+            .push(&st.state.tokenizer, next)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "stream decoder failed; emitting no text this step");
+                String::new()
+            });
 
         Some((
             StreamChunk {
