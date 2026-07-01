@@ -2435,20 +2435,53 @@ fn reconcile_bench_real_config(
     let mut resolved_architecture = crate::architecture::Architecture::Mixtral;
     let mut resolved_first_k_dense_replace = 0usize;
     let mut resolved_advanced = crate::model::AdvancedConfig::default();
-    if let Some(arch_str) = cfg.real_transformer.architecture.clone() {
-        resolved_architecture = crate::architecture::Architecture::from_model_type(&arch_str)
-            .ok_or_else(|| {
+
+    // Parse the TOML-declared architecture (if any) up front. It is used to
+    // seed the default resolution and to cross-check against a checkpoint
+    // `config.json` — it must never suppress checkpoint reconciliation.
+    let toml_architecture = match cfg.real_transformer.architecture.clone() {
+        Some(arch_str) => Some(
+            crate::architecture::Architecture::from_model_type(&arch_str).ok_or_else(|| {
                 format!(
                     "[real_transformer] architecture = \"{arch_str}\" is not a recognised model_type"
                 )
-            })?;
-    } else if let Some(dir) = cfg.real_transformer.weights_dir.clone() {
+            })?,
+        ),
+        None => None,
+    };
+    if let Some(arch) = toml_architecture {
+        resolved_architecture = arch;
+    }
+
+    // Always reconcile from the checkpoint's `config.json` when it exists,
+    // regardless of whether the TOML pins an architecture. This keeps
+    // checkpoint-specific advanced routing semantics (norm_topk_prob,
+    // scoring_func, routed_scaling_factor, n_group, topk_group,
+    // num_shared_experts, rope_scaling, …) authoritative even when the user
+    // points `weights_dir` at original safetensors.
+    if let Some(dir) = cfg.real_transformer.weights_dir.clone() {
         match crate::architecture::HfConfig::from_dir(&dir) {
             Ok(Some(hf)) => {
                 info!(
                     architecture = ?hf.architecture,
                     "config.json detected; reconciling bench-real hyperparameters from checkpoint"
                 );
+                // If TOML also pinned an architecture, it must agree with the
+                // checkpoint. Silently preferring one over the other risks
+                // loading a checkpoint under the wrong routing/attention path.
+                if let Some(toml_arch) = toml_architecture {
+                    if toml_arch != hf.architecture {
+                        return Err(format!(
+                            "[real_transformer] architecture = \"{}\" conflicts with checkpoint \
+                             config.json architecture \"{}\" in {}; remove the TOML override or \
+                             point weights_dir at a matching checkpoint",
+                            toml_arch.model_type(),
+                            hf.architecture.model_type(),
+                            dir.display()
+                        )
+                        .into());
+                    }
+                }
                 resolved_architecture = hf.architecture;
                 resolved_first_k_dense_replace = hf.first_k_dense_replace.unwrap_or(0);
                 resolved_advanced = crate::model::RealModelConfig::from_hf_config(&hf).advanced;
@@ -2473,6 +2506,8 @@ fn reconcile_bench_real_config(
                 cfg.real_transformer.rms_eps = hf.rms_norm_eps;
                 cfg.real_transformer.window_size = hf.sliding_window.unwrap_or(0);
             }
+            // No `config.json` present: preserve TOML-only behaviour, using the
+            // TOML architecture already resolved above (or the Mixtral default).
             Ok(None) => {}
             Err(e) => {
                 return Err(
@@ -5704,5 +5739,128 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    /// Minimal `Config` for exercising [`reconcile_bench_real_config`]. The
+    /// non-`real_transformer` sections carry placeholder values; the tests
+    /// only inspect fields the reconciler overwrites.
+    fn minimal_bench_cfg() -> crate::config::Config {
+        use crate::config::*;
+        Config {
+            server: ServerConfig {
+                bind: "127.0.0.1:8080".into(),
+                max_tokens: 64,
+                session_ttl_secs: 0,
+                max_concurrent_requests: 0,
+                admission_min_free_blocks: 0,
+            },
+            model: ModelConfig {
+                data_dir: PathBuf::from("./data"),
+                num_experts: 8,
+                top_k: 2,
+                d_model: 64,
+                d_ff: 256,
+                expert_size: 4096,
+                num_layers: 1,
+                dtype: WeightDtype::F32,
+            },
+            storage: StorageConfigToml {
+                cache_slots: 4,
+                block_align: 4096,
+                no_direct: false,
+                predict_fanout: 2,
+                pipeline_depth: crate::engine::DEFAULT_PIPELINE_DEPTH,
+                predict_min_prob: 0.0,
+                partial_load_fraction: 1.0,
+                pin_after_observations: 0,
+                packed_blob: None,
+                packed_manifest: None,
+            },
+            tokenizer: TokenizerConfig::default(),
+            real_transformer: RealTransformerConfig::default(),
+            sampling: SamplingConfig::default(),
+            predictive: PredictiveConfig::default(),
+            security: SecurityConfig::default(),
+            gpu_cache: GpuCacheConfig::default(),
+            distributed: DistributedConfig::default(),
+        }
+    }
+
+    /// A distinctive tiny Qwen3-MoE `config.json` (checkpoint dims differ from
+    /// [`minimal_bench_cfg`]) with `norm_topk_prob = true`.
+    fn write_qwen3_moe_config_json(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let body = serde_json::json!({
+            "model_type": "qwen3_moe",
+            "hidden_size": 32,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 100,
+            "intermediate_size": 128,
+            "moe_intermediate_size": 64,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": true,
+            "rope_theta": 5_000_000.0,
+            "rms_norm_eps": 1e-5
+        });
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn explicit_architecture_still_reconciles_config_json() {
+        // D. Explicit TOML architecture must not suppress config.json
+        // reconciliation of advanced fields and dimensions.
+        let dir = tempdir_unique("bench-real-qwen3moe-cfg");
+        write_qwen3_moe_config_json(&dir);
+        let mut cfg = minimal_bench_cfg();
+        cfg.real_transformer.weights_dir = Some(dir.clone());
+        cfg.real_transformer.architecture = Some("qwen3_moe".to_string());
+
+        let (arch, _first_k, advanced) =
+            reconcile_bench_real_config(&mut cfg).expect("reconcile should succeed");
+
+        assert_eq!(arch, crate::architecture::Architecture::Qwen3Moe);
+        assert!(
+            advanced.norm_topk_prob,
+            "checkpoint norm_topk_prob=true must be reconciled even with explicit architecture"
+        );
+        // Dimensions come from config.json, not the placeholder TOML.
+        assert_eq!(cfg.model.d_model, 32);
+        assert_eq!(cfg.model.num_layers, 3);
+        assert_eq!(cfg.model.num_experts, 4);
+        assert_eq!(cfg.real_transformer.num_heads, 4);
+        assert_eq!(cfg.real_transformer.num_kv_heads, 2);
+        assert_eq!(cfg.real_transformer.head_dim, 8);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_architecture_mismatch_is_rejected() {
+        // E. A TOML architecture that disagrees with config.json is a hard
+        // configuration error naming both architectures.
+        let dir = tempdir_unique("bench-real-arch-mismatch");
+        write_qwen3_moe_config_json(&dir);
+        let mut cfg = minimal_bench_cfg();
+        cfg.real_transformer.weights_dir = Some(dir.clone());
+        cfg.real_transformer.architecture = Some("mixtral".to_string());
+
+        let err = reconcile_bench_real_config(&mut cfg)
+            .expect_err("mismatched architecture must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("mixtral"), "error must name TOML arch: {msg}");
+        assert!(
+            msg.contains("qwen3_moe"),
+            "error must name checkpoint arch: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1005,19 +1005,32 @@ impl RealModel {
                     model.layers[l].attn.wo = v;
                 }
             );
-            if config.architecture.uses_qk_norm() && options.strict_weights {
-                failures.push(WeightLoadFailure::unsupported(
-                    format!("q_norm_{l}.bin"),
+            // QK-Norm (Qwen3 / Qwen3-MoE): per-head RMSNorm weights of length
+            // `head_dim`, applied to Q and K before RoPE. Seeded as unit-weight
+            // in `new_seeded` for these architectures; the converted-directory
+            // loader overwrites them from `q_norm_<L>.bin` / `k_norm_<L>.bin`
+            // (or the `dense_manifest.json` aliases emitted by the GGUF
+            // converter). Under strict loading a missing/malformed/wrong-shape
+            // tensor is reported by `try_load_resident_f32`, so no seeded unit
+            // norm can silently survive. Architectures without QK-Norm (Mixtral
+            // and friends) never attempt these files.
+            if config.architecture.uses_qk_norm() {
+                maybe!(
                     GROUP_NORMS,
-                    format!("{} f32 elements", config.head_dim),
-                    "raw .bin loader does not define QK-Norm tensor files; use .safetensors",
-                ));
-                failures.push(WeightLoadFailure::unsupported(
-                    format!("k_norm_{l}.bin"),
+                    &format!("q_norm_{l}.bin"),
+                    config.head_dim,
+                    |v| {
+                        model.layers[l].attn.q_norm = Some(RmsNorm::new(v, config.rms_eps));
+                    }
+                );
+                maybe!(
                     GROUP_NORMS,
-                    format!("{} f32 elements", config.head_dim),
-                    "raw .bin loader does not define QK-Norm tensor files; use .safetensors",
-                ));
+                    &format!("k_norm_{l}.bin"),
+                    config.head_dim,
+                    |v| {
+                        model.layers[l].attn.k_norm = Some(RmsNorm::new(v, config.rms_eps));
+                    }
+                );
             }
             if model.layers[l].mla.is_some() && options.strict_weights {
                 failures.push(WeightLoadFailure::unsupported(
@@ -4729,6 +4742,233 @@ mod tests {
             );
         }
         out
+    }
+
+    fn tiny_qwen3_moe_loader_cfg() -> RealModelConfig {
+        RealModelConfig {
+            vocab_size: 8,
+            d_model: 4,
+            d_ff: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 2,
+            num_layers: 1,
+            num_experts: 2,
+            top_k: 1,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: Architecture::Qwen3Moe,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        }
+    }
+
+    /// Write a complete converted-directory raw-`.bin` fixture (every
+    /// strict-required base tensor except QK-Norm) for a single-layer MoE
+    /// config. Each tensor is filled with `1.0` and sized from the config so
+    /// the strict loader accepts it. QK-Norm tensors are supplied separately
+    /// per test.
+    fn write_converted_moe_base_raw(cfg: &RealModelConfig, dir: &Path) {
+        let d_model = cfg.d_model;
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let write = |name: &str, len: usize| {
+            std::fs::write(dir.join(name), f32_bytes(1.0, len)).unwrap();
+        };
+        write("embed.bin", cfg.vocab_size * d_model);
+        write("final_rms.bin", d_model);
+        write("lm_head.bin", cfg.vocab_size * d_model);
+        for l in 0..cfg.num_layers {
+            write(&format!("rms_attn_{l}.bin"), d_model);
+            write(&format!("rms_moe_{l}.bin"), d_model);
+            write(&format!("attn_{l}_q.bin"), q_dim * d_model);
+            write(&format!("attn_{l}_k.bin"), kv_dim * d_model);
+            write(&format!("attn_{l}_v.bin"), kv_dim * d_model);
+            write(&format!("attn_{l}_o.bin"), d_model * q_dim);
+            write(&format!("gate_{l}.bin"), cfg.num_experts * d_model);
+        }
+    }
+
+    /// Write a `dense_manifest.json` mapping `canonical -> file` under the
+    /// engine alias `alias`, with a payload of `values` as little-endian f32,
+    /// matching the manifest metadata the GGUF converter emits for QK-Norm.
+    fn write_qk_norm_manifest(dir: &Path, entries: &[(&str, &str, &str, Vec<usize>, Vec<f32>)]) {
+        let mut tensors = Vec::new();
+        for (canonical, file, alias, dims, values) in entries {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(dir.join(file), &bytes).unwrap();
+            tensors.push(serde_json::json!({
+                "canonical_name": canonical,
+                "file": file,
+                "aliases": [alias],
+                "dtype": "f32",
+                "dims": dims,
+                "byte_len": bytes.len(),
+                "checksum": crate::dense_tensor::dense_checksum(&bytes),
+            }));
+        }
+        std::fs::write(
+            dir.join("dense_manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "format_version": 1,
+                "tensors": tensors,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn strict_converted_qwen3_moe_manifest_loads_qk_norm() {
+        // A. Strict converted Qwen3-MoE manifest load succeeds and the QK-Norm
+        // tensors carry the fixture's sentinel values (not seeded unit norm).
+        let cfg = tiny_qwen3_moe_loader_cfg();
+        assert!(cfg.architecture.uses_qk_norm());
+        let dir = TempDir::new("qwen3_moe_qk_norm_ok");
+        write_converted_moe_base_raw(&cfg, &dir.path);
+        let q_sentinel = vec![0.25f32, 0.75];
+        let k_sentinel = vec![0.5f32, 0.9];
+        write_qk_norm_manifest(
+            &dir.path,
+            &[
+                (
+                    "blk.0.attn_q_norm.weight",
+                    "dense_blk_0_attn_q_norm_weight.f32.bin",
+                    "q_norm_0.bin",
+                    vec![cfg.head_dim],
+                    q_sentinel.clone(),
+                ),
+                (
+                    "blk.0.attn_k_norm.weight",
+                    "dense_blk_0_attn_k_norm_weight.f32.bin",
+                    "k_norm_0.bin",
+                    vec![cfg.head_dim],
+                    k_sentinel.clone(),
+                ),
+            ],
+        );
+
+        let model = RealModel::from_dir_with_options(
+            cfg.clone(),
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        )
+        .expect("strict converted Qwen3-MoE load with QK-Norm manifest should succeed");
+
+        let q_norm = model.layers[0]
+            .attn
+            .q_norm
+            .as_ref()
+            .expect("q_norm must be present");
+        let k_norm = model.layers[0]
+            .attn
+            .k_norm
+            .as_ref()
+            .expect("k_norm must be present");
+        assert_eq!(q_norm.weight, q_sentinel);
+        assert_eq!(k_norm.weight, k_sentinel);
+        // Seeded QK-Norm is unit weight; the loaded sentinels must differ.
+        assert_ne!(q_norm.weight, vec![1.0f32; cfg.head_dim]);
+        assert_ne!(k_norm.weight, vec![1.0f32; cfg.head_dim]);
+        assert_ne!(q_norm.weight, k_norm.weight);
+    }
+
+    #[test]
+    fn strict_converted_qwen3_moe_reports_missing_qk_norm() {
+        // B. Missing QK-Norm must be reported as Missing (never Unsupported).
+        let cfg = tiny_qwen3_moe_loader_cfg();
+        let dir = TempDir::new("qwen3_moe_qk_norm_missing");
+        write_converted_moe_base_raw(&cfg, &dir.path);
+
+        let err = match RealModel::from_dir_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        ) {
+            Ok(_) => panic!("strict load must reject missing QK-Norm"),
+            Err(err) => err,
+        };
+        let strict = strict_error(&err);
+        let missing = |name: &str| {
+            strict
+                .failures()
+                .iter()
+                .any(|f| f.tensor == name && f.kind == WeightLoadFailureKind::Missing)
+        };
+        let unsupported = |name: &str| {
+            strict
+                .failures()
+                .iter()
+                .any(|f| f.tensor == name && f.kind == WeightLoadFailureKind::Unsupported)
+        };
+        assert!(missing("q_norm_0.bin"), "q_norm must be reported Missing");
+        assert!(missing("k_norm_0.bin"), "k_norm must be reported Missing");
+        assert!(
+            !unsupported("q_norm_0.bin"),
+            "q_norm must not be Unsupported"
+        );
+        assert!(
+            !unsupported("k_norm_0.bin"),
+            "k_norm must not be Unsupported"
+        );
+    }
+
+    #[test]
+    fn strict_converted_qwen3_moe_rejects_qk_norm_shape_mismatch() {
+        // C. A QK-Norm tensor whose element count is not `head_dim` is a
+        // ShapeMismatch.
+        let cfg = tiny_qwen3_moe_loader_cfg();
+        let dir = TempDir::new("qwen3_moe_qk_norm_shape");
+        write_converted_moe_base_raw(&cfg, &dir.path);
+        write_qk_norm_manifest(
+            &dir.path,
+            &[
+                (
+                    "blk.0.attn_q_norm.weight",
+                    "dense_blk_0_attn_q_norm_weight.f32.bin",
+                    "q_norm_0.bin",
+                    // One element too many: not `head_dim`.
+                    vec![cfg.head_dim + 1],
+                    vec![0.1f32; cfg.head_dim + 1],
+                ),
+                (
+                    "blk.0.attn_k_norm.weight",
+                    "dense_blk_0_attn_k_norm_weight.f32.bin",
+                    "k_norm_0.bin",
+                    vec![cfg.head_dim],
+                    vec![0.2f32; cfg.head_dim],
+                ),
+            ],
+        );
+
+        let err = match RealModel::from_dir_with_options(
+            cfg,
+            &dir.path,
+            1,
+            RealModelLoadOptions {
+                strict_weights: true,
+            },
+        ) {
+            Ok(_) => panic!("strict load must reject QK-Norm shape mismatch"),
+            Err(err) => err,
+        };
+        let strict = strict_error(&err);
+        assert!(
+            strict.failures().iter().any(|f| {
+                f.tensor == "q_norm_0.bin" && f.kind == WeightLoadFailureKind::ShapeMismatch
+            }),
+            "wrong-length q_norm must be reported ShapeMismatch"
+        );
     }
 
     fn tiny_mixtral_loader_cfg() -> RealModelConfig {
