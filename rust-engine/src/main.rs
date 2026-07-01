@@ -3169,7 +3169,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cfg.gpu_cache.promote_after_hits,
         ))
     };
-    if cfg.real_transformer.compute_offload == crate::backend::ComputeOffload::Gpu {
+    let mut backend_fallback_occurred = false;
+    if matches!(
+        cfg.real_transformer.compute_offload,
+        crate::backend::ComputeOffload::Gpu | crate::backend::ComputeOffload::Auto
+    ) {
         let num_layers = cfg.model.num_layers;
         let max_seq_len = if cfg.real_transformer.window_size == 0 {
             4096
@@ -3200,8 +3204,31 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             gpu_expert_cache.clone(),
         );
         let has_device = backend_box.is_gpu();
+        // Reconcile the operator's request with the observed init result
+        // (Finding 5). An explicit `gpu` request fails closed; `auto`
+        // demotes to CPU and records a fallback. `is_gpu()` is the signal
+        // because `init_blocking` internally swallows GPU errors and returns
+        // a CPU backend.
+        let resolution = crate::backend::resolve_backend_selection(
+            cfg.real_transformer.compute_offload,
+            || {
+                if has_device {
+                    Ok(())
+                } else {
+                    Err("GPU backend initialization did not produce a GPU device".to_string())
+                }
+            },
+        )?;
+        backend_fallback_occurred = resolution.fallback_occurred;
         let device_name = backend_box.device_name().to_string();
         let compute_plane = backend_box.compute_plane().to_string();
+        if resolution.fallback_occurred {
+            warn!(
+                requested = ?resolution.requested,
+                resolved = ?resolution.resolved,
+                "compute_offload = \"auto\": GPU initialization failed; resolved to CPU"
+            );
+        }
         let gpu = std::sync::Arc::new(backend_box);
         if let Err(e) = crate::backend::set_backend(gpu) {
             warn!(
@@ -3211,7 +3238,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         } else {
             info!(
                 device = device_name,
-                compute_plane, has_device, "GpuBackend installed for dense backbone"
+                compute_plane,
+                has_device,
+                requested = ?resolution.requested,
+                resolved = ?resolution.resolved,
+                "math backend installed for dense backbone"
             );
         }
     }
@@ -3496,6 +3527,11 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     };
 
     let metrics = Metrics::new();
+    // Surface any auto GPU->CPU demotion decided above now that metrics
+    // exist (Finding 5).
+    if backend_fallback_occurred {
+        metrics.record_gpu_cpu_fallback(1);
+    }
     let mut engine_builder = Engine::with_options(
         cache,
         pool,

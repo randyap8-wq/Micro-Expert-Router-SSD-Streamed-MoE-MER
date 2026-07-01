@@ -2212,11 +2212,102 @@ pub fn current() -> Arc<BackendBox> {
 pub enum ComputeOffload {
     Cpu,
     Gpu,
+    /// Prefer GPU but fall back to CPU if GPU initialization fails. Unlike
+    /// an explicit `Gpu` request (which fails closed), `Auto` treats GPU as
+    /// best-effort and records a fallback event when it lands on CPU.
+    Auto,
 }
 
 impl Default for ComputeOffload {
     fn default() -> Self {
         Self::Cpu
+    }
+}
+
+/// Backend the runtime actually resolved to after (optionally) attempting
+/// GPU initialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedBackend {
+    Cpu,
+    Gpu,
+}
+
+/// Outcome of reconciling an operator's requested [`ComputeOffload`] with
+/// the result of GPU initialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendResolution {
+    pub requested: ComputeOffload,
+    pub resolved: ResolvedBackend,
+    /// True only when GPU was attempted, failed, and `Auto` demoted the run
+    /// to CPU. An explicit `Gpu` request never produces a silent fallback —
+    /// it errors instead.
+    pub fallback_occurred: bool,
+}
+
+/// Error returned when an explicit GPU request cannot be honored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitGpuUnavailable {
+    pub detail: String,
+}
+
+impl std::fmt::Display for ExplicitGpuUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "compute_offload = \"gpu\" was requested but GPU initialization failed: {}; \
+             set compute_offload = \"auto\" to allow CPU fallback, or \"cpu\" to run on CPU",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for ExplicitGpuUnavailable {}
+
+/// Reconcile a requested compute backend with the observed GPU
+/// initialization result (Finding 5).
+///
+/// * `Cpu` — resolves to CPU without attempting GPU; never a fallback.
+/// * `Gpu` — explicit request: GPU success resolves to GPU; GPU failure is
+///   a hard error (fail closed) so the operator is never silently downgraded.
+/// * `Auto` — best effort: GPU success resolves to GPU; GPU failure resolves
+///   to CPU and marks `fallback_occurred`.
+///
+/// `gpu_init` is only consulted when GPU is requested (`Gpu`/`Auto`), and is
+/// expressed as a closure so tests can inject success/failure without a real
+/// device.
+pub fn resolve_backend_selection<F>(
+    requested: ComputeOffload,
+    gpu_init: F,
+) -> Result<BackendResolution, ExplicitGpuUnavailable>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    match requested {
+        ComputeOffload::Cpu => Ok(BackendResolution {
+            requested,
+            resolved: ResolvedBackend::Cpu,
+            fallback_occurred: false,
+        }),
+        ComputeOffload::Gpu => match gpu_init() {
+            Ok(()) => Ok(BackendResolution {
+                requested,
+                resolved: ResolvedBackend::Gpu,
+                fallback_occurred: false,
+            }),
+            Err(detail) => Err(ExplicitGpuUnavailable { detail }),
+        },
+        ComputeOffload::Auto => match gpu_init() {
+            Ok(()) => Ok(BackendResolution {
+                requested,
+                resolved: ResolvedBackend::Gpu,
+                fallback_occurred: false,
+            }),
+            Err(_) => Ok(BackendResolution {
+                requested,
+                resolved: ResolvedBackend::Cpu,
+                fallback_occurred: true,
+            }),
+        },
     }
 }
 
@@ -2242,6 +2333,56 @@ mod tests {
             driver_info: "test-driver-info".to_string(),
             backend,
         }
+    }
+
+    // ---- Finding 5: explicit GPU requests fail closed ----
+
+    #[test]
+    fn explicit_gpu_request_with_init_failure_errors() {
+        let out = resolve_backend_selection(ComputeOffload::Gpu, || Err("no device".to_string()));
+        assert!(
+            out.is_err(),
+            "explicit GPU request must fail closed when init fails"
+        );
+    }
+
+    #[test]
+    fn explicit_gpu_request_with_success_resolves_to_gpu() {
+        let out =
+            resolve_backend_selection(ComputeOffload::Gpu, || Ok(())).expect("gpu init succeeded");
+        assert_eq!(out.resolved, ResolvedBackend::Gpu);
+        assert!(!out.fallback_occurred);
+    }
+
+    #[test]
+    fn auto_selection_with_init_failure_falls_back_to_cpu_and_marks_it() {
+        let out = resolve_backend_selection(ComputeOffload::Auto, || Err("no device".to_string()))
+            .expect("auto must not fail closed");
+        assert_eq!(out.resolved, ResolvedBackend::Cpu);
+        assert!(
+            out.fallback_occurred,
+            "auto GPU->CPU demotion must be recorded as a fallback"
+        );
+    }
+
+    #[test]
+    fn auto_selection_with_success_resolves_to_gpu_without_fallback() {
+        let out = resolve_backend_selection(ComputeOffload::Auto, || Ok(())).unwrap();
+        assert_eq!(out.resolved, ResolvedBackend::Gpu);
+        assert!(!out.fallback_occurred);
+    }
+
+    #[test]
+    fn explicit_cpu_resolves_to_cpu_without_attempting_gpu() {
+        let mut attempted = false;
+        let out = resolve_backend_selection(ComputeOffload::Cpu, || {
+            attempted = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(out.resolved, ResolvedBackend::Cpu);
+        assert!(!out.fallback_occurred);
+        assert!(!attempted, "CPU request must not attempt GPU initialization");
     }
 
     #[test]
