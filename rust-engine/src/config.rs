@@ -535,7 +535,7 @@ impl RealTransformerConfig {
                     .into(),
             );
         }
-        match self.weights_dir {
+        match self.weights_dir.as_ref() {
             Some(_) if self.strict_weights => Ok(RealWeightPolicy::StrictReal),
             // Non-strict with a dir is only reachable once allow_seeded_fallback
             // has been asserted above: a best-effort dev load with seeded gaps.
