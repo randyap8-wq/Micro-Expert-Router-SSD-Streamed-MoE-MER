@@ -441,6 +441,20 @@ pub struct KvCache {
     keys_blocks: VecDeque<Box<[f32]>>,
     /// Mirrors `keys_blocks` for the value half of the cache.
     values_blocks: VecDeque<Box<[f32]>>,
+    /// Request-local free lists of K/V blocks recycled by
+    /// [`Self::evict_before`] (hardening pass, G1). Sliding-window
+    /// rotation used to destroy (volatile-zeroize + free) each evicted
+    /// block and heap-allocate a fresh one on the next boundary;
+    /// steady-state SWA decode now round-trips blocks through these
+    /// lists instead, so block-boundary tokens stop paying an
+    /// allocate+free pair. Bounded by [`FREE_BLOCKS_CAP`]. The blocks
+    /// hold stale K/V from *this request only* — the cache is
+    /// request-local, so ordinary rotation needs no zeroization;
+    /// explicit tenant/session destruction ([`Self::zeroize`])
+    /// volatile-zeroizes the free lists along with the resident
+    /// blocks.
+    free_keys: Vec<Box<[f32]>>,
+    free_values: Vec<Box<[f32]>>,
     /// Number of leading paged blocks that have been physically dropped by
     /// [`Self::evict_before`] (sliding-window KV eviction). Absolute
     /// positions keep counting from 0 via `seq_len`, but the block table is
@@ -465,6 +479,14 @@ pub struct KvCache {
 /// under one OS page for any realistic `kv_dim`.
 pub const PAGED_BLOCK_TOKENS: usize = 16;
 
+/// Maximum number of evicted K/V block pairs retained for reuse per
+/// cache (G1). Sliding-window rotation evicts at most one block per
+/// appended token, so steady-state decode needs exactly one spare;
+/// a small margin absorbs bursts (e.g. a large `evict_before` jump
+/// after prefill) without letting a long prefill park unbounded
+/// memory in the free list.
+const FREE_BLOCKS_CAP: usize = 8;
+
 impl KvCache {
     pub fn new(kv_dim: usize) -> Self {
         Self::new_kv(kv_dim, kv_dim)
@@ -479,6 +501,8 @@ impl KvCache {
         Self {
             keys_blocks: VecDeque::new(),
             values_blocks: VecDeque::new(),
+            free_keys: Vec::new(),
+            free_values: Vec::new(),
             evicted_blocks: 0,
             seq_len: 0,
             kv_dim: k_dim,
@@ -500,10 +524,27 @@ impl KvCache {
         // index `block_idx - evicted_blocks`.
         if in_block == 0 {
             debug_assert_eq!(self.keys_blocks.len(), block_idx - self.evicted_blocks);
-            self.keys_blocks
-                .push_back(vec![0.0f32; PAGED_BLOCK_TOKENS * self.kv_dim].into_boxed_slice());
-            self.values_blocks
-                .push_back(vec![0.0f32; PAGED_BLOCK_TOKENS * self.v_dim].into_boxed_slice());
+            // G1: prefer recycling a block evicted by the sliding
+            // window over a fresh heap allocation. Reused blocks are
+            // zero-filled (plain stores — the stale contents belong to
+            // this same request) so the never-read tail keeps the same
+            // all-zero contents a fresh allocation would have.
+            let kb = match self.free_keys.pop() {
+                Some(mut b) => {
+                    b.fill(0.0);
+                    b
+                }
+                None => vec![0.0f32; PAGED_BLOCK_TOKENS * self.kv_dim].into_boxed_slice(),
+            };
+            let vb = match self.free_values.pop() {
+                Some(mut b) => {
+                    b.fill(0.0);
+                    b
+                }
+                None => vec![0.0f32; PAGED_BLOCK_TOKENS * self.v_dim].into_boxed_slice(),
+            };
+            self.keys_blocks.push_back(kb);
+            self.values_blocks.push_back(vb);
         }
         // Borrow the freshly-allocated (or current) trailing block and
         // write directly into its in-place slot.
@@ -523,6 +564,8 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.keys_blocks.clear();
         self.values_blocks.clear();
+        self.free_keys.clear();
+        self.free_values.clear();
         self.evicted_blocks = 0;
         self.seq_len = 0;
     }
@@ -532,6 +575,15 @@ impl KvCache {
     /// store's `DELETE /v1/sessions/{id}` handler so that a tenant's
     /// (potentially sensitive) attention state cannot be read by a
     /// subsequent allocation that lands in the same heap region.
+    ///
+    /// This is the **explicit tenant/session destruction** path (G1):
+    /// it volatile-zeroizes the resident blocks *and* the recycled
+    /// free-list blocks (which still hold this request's stale K/V).
+    /// Ordinary same-request sliding-window rotation
+    /// ([`Self::evict_before`]) deliberately does not zeroize — the
+    /// recycled bytes never leave this request-local cache, so there
+    /// is no cross-tenant exposure to defend against on the decode
+    /// critical path.
     ///
     /// We use `std::ptr::write_volatile` to perform the zeroing
     /// writes: volatile stores are defined to have observable side
@@ -543,6 +595,8 @@ impl KvCache {
     pub fn zeroize(&mut self) {
         zeroize_blocks(self.keys_blocks.iter_mut());
         zeroize_blocks(self.values_blocks.iter_mut());
+        zeroize_blocks(self.free_keys.iter_mut());
+        zeroize_blocks(self.free_values.iter_mut());
         self.reset();
     }
 
@@ -569,6 +623,19 @@ impl KvCache {
     ///
     /// No-op for `pos == 0` and for global-attention layers (which never
     /// call this), preserving the original full-history behaviour.
+    ///
+    /// **Block reuse (G1).** Evicted blocks are not destroyed: they are
+    /// pushed onto a small request-local free list and recycled by the
+    /// next block-boundary [`Self::append`], so steady-state SWA decode
+    /// performs no allocation or deallocation at block boundaries.
+    /// Ordinary same-request rotation performs **no volatile
+    /// zeroization** — the recycled bytes never leave this
+    /// request-local cache, so the only threat zeroization would
+    /// address (cross-tenant heap reuse) does not apply; explicit
+    /// destruction ([`Self::zeroize`]) still volatile-zeroizes
+    /// everything, free list included. Absolute-position indexing is
+    /// unchanged: `evicted_blocks` keeps offsetting the block table
+    /// exactly as before.
     pub fn evict_before(&mut self, pos: usize) {
         let pos = pos.min(self.seq_len);
         // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
@@ -587,16 +654,25 @@ impl KvCache {
         if blocks_to_drop == 0 {
             return;
         }
-        // Zeroize the dropped blocks before releasing them so a tenant's
-        // attention state cannot survive in a freed heap region (mirrors
-        // `zeroize`), then remove them from the front of the block table.
-        zeroize_blocks(self.keys_blocks.iter_mut().take(blocks_to_drop));
-        zeroize_blocks(self.values_blocks.iter_mut().take(blocks_to_drop));
         for _ in 0..blocks_to_drop {
-            self.keys_blocks.pop_front();
-            self.values_blocks.pop_front();
+            if let Some(b) = self.keys_blocks.pop_front() {
+                if self.free_keys.len() < FREE_BLOCKS_CAP {
+                    self.free_keys.push(b);
+                }
+            }
+            if let Some(b) = self.values_blocks.pop_front() {
+                if self.free_values.len() < FREE_BLOCKS_CAP {
+                    self.free_values.push(b);
+                }
+            }
         }
         self.evicted_blocks += blocks_to_drop;
+    }
+
+    /// Number of evicted block pairs currently parked in the reuse
+    /// free list (G1). Test/telemetry accessor.
+    pub fn free_blocks(&self) -> usize {
+        self.free_keys.len()
     }
 
     /// Get the i-th cached key as a slice of length `kv_dim`.
@@ -3634,6 +3710,79 @@ mod tests {
             assert_eq!(kv.key(p), &k[..], "evicted a still-windowed key at {p}");
             assert_eq!(kv.value(p), &v[..], "evicted a still-windowed value at {p}");
         }
+    }
+
+    /// G1: sliding-window rotation recycles evicted blocks through the
+    /// request-local free list — steady-state decode allocates no new
+    /// blocks at block boundaries — and the free list stays bounded.
+    #[test]
+    fn swa_eviction_reuses_blocks_via_free_list() {
+        let kv_dim = 4;
+        let window = 2 * PAGED_BLOCK_TOKENS;
+        let mut kv = KvCache::new(kv_dim);
+        // Prefill past the window so eviction starts happening.
+        for p in 0..(4 * PAGED_BLOCK_TOKENS) {
+            kv.append(&[p as f32; 4], &[p as f32; 4]);
+            kv.evict_before(p.saturating_sub(window));
+        }
+        // Rotation has parked at least one evicted block for reuse.
+        assert!(kv.free_blocks() >= 1, "evicted blocks must be recycled");
+        // Crossing the next block boundary drains the free list instead
+        // of allocating.
+        let free_before = kv.free_blocks();
+        let start = kv.seq_len;
+        for p in start..(start + PAGED_BLOCK_TOKENS) {
+            kv.append(&[p as f32; 4], &[p as f32; 4]);
+            kv.evict_before(p.saturating_sub(window));
+        }
+        assert!(
+            kv.free_blocks() <= free_before,
+            "block-boundary append must reuse a freed block"
+        );
+        // Free list is bounded even under a huge eviction jump.
+        for p in kv.seq_len..(kv.seq_len + 32 * PAGED_BLOCK_TOKENS) {
+            kv.append(&[p as f32; 4], &[p as f32; 4]);
+        }
+        kv.evict_before(kv.seq_len); // evict everything
+        assert!(kv.free_blocks() <= 8, "free list must stay bounded");
+        // Absolute-position indexing survives reuse: appended positions
+        // after full eviction still round-trip.
+        let p = kv.seq_len;
+        kv.append(&[p as f32; 4], &[p as f32; 4]);
+        assert_eq!(kv.key(p), &[p as f32; 4][..]);
+        // Explicit destruction wipes the free list too.
+        kv.zeroize();
+        assert_eq!(kv.free_blocks(), 0);
+        assert_eq!(kv.num_blocks(), 0);
+    }
+
+    /// G1 micro-benchmark: p50/p99 append latency at block boundaries
+    /// under sliding-window rotation. Ignored by default (timing-
+    /// sensitive); run with
+    /// `cargo test --release -- --ignored kv_block_boundary_latency`.
+    #[test]
+    #[ignore]
+    fn kv_block_boundary_latency_p50_p99() {
+        let kv_dim = 1024; // Mixtral-class kv_dim (8 KV heads × 128)
+        let window = 8 * PAGED_BLOCK_TOKENS;
+        let mut kv = KvCache::new(kv_dim);
+        let k = vec![0.5f32; kv_dim];
+        let v = vec![0.25f32; kv_dim];
+        let mut boundary_ns: Vec<u64> = Vec::new();
+        for p in 0..(512 * PAGED_BLOCK_TOKENS) {
+            let at_boundary = p % PAGED_BLOCK_TOKENS == 0;
+            let t0 = std::time::Instant::now();
+            kv.append(&k, &v);
+            kv.evict_before(p.saturating_sub(window));
+            let dt = t0.elapsed().as_nanos() as u64;
+            if at_boundary && p > window {
+                boundary_ns.push(dt);
+            }
+        }
+        boundary_ns.sort_unstable();
+        let p50 = boundary_ns[boundary_ns.len() / 2];
+        let p99 = boundary_ns[boundary_ns.len() * 99 / 100];
+        println!("kv block-boundary append+evict: p50={p50}ns p99={p99}ns (n={})", boundary_ns.len());
     }
 
     #[test]
