@@ -325,6 +325,27 @@ pub struct RealTransformerConfig {
     /// inference. `bench-real` always rejects this flag.
     #[serde(default)]
     pub allow_seeded_fallback: bool,
+    /// Development-only opt-in that lets the engine substitute a zero
+    /// contribution for a routed/shared expert whose load or compute
+    /// failed, instead of failing the request (hardening pass, Part
+    /// A1). **Defaults to `false`** — strict production mode fails
+    /// closed. When set, every substitution emits a prominent warning
+    /// and bumps the `degraded_expert_substitutions` counter, marking
+    /// the run's output non-authoritative. `bench-real` rejects this
+    /// flag.
+    #[serde(default)]
+    pub allow_degraded_experts: bool,
+    /// Development-only opt-in that re-enables the legacy tolerance for
+    /// quantised expert payloads that arrive up to one block alignment
+    /// (page) short of the exact logical size, zero-filling the missing
+    /// tail (hardening pass, Part A2). **Defaults to `false`** — strict
+    /// production mode requires the exact logical payload size and
+    /// never synthesizes missing weight bytes as zeros. The historical
+    /// root cause (a `model.expert_size` excluding the converter's UTH
+    /// page) is now rejected at startup, so this flag exists only for
+    /// legacy development datasets. `bench-real` rejects this flag.
+    #[serde(default)]
+    pub allow_truncated_expert_payloads: bool,
     /// Vocab size. Must match the tokenizer when one is configured (for
     /// the byte fallback this should be 256).
     #[serde(default = "default_vocab_size")]
@@ -958,6 +979,23 @@ impl Config {
         if self.model.num_layers == 0 {
             return Err(ConfigError::Invalid("model.num_layers must be > 0".into()));
         }
+        // Checked expert-namespace arithmetic (hardening pass, Part A6):
+        // every global expert id is `layer * num_experts + local`, and
+        // storage, cache, predictor, router, trace writer and metrics all
+        // share that flat u32 namespace. Reject configurations whose
+        // namespace cannot be represented instead of letting ids wrap.
+        let layers_u32 = u32::try_from(self.model.num_layers).map_err(|_| {
+            ConfigError::Invalid(format!(
+                "model.num_layers ({}) exceeds u32",
+                self.model.num_layers
+            ))
+        })?;
+        if layers_u32.checked_mul(self.model.num_experts).is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "model.num_layers ({}) * model.num_experts ({}) overflows the u32 global                  expert-id namespace",
+                self.model.num_layers, self.model.num_experts
+            )));
+        }
         if !self.storage.block_align.is_power_of_two() || self.storage.block_align == 0 {
             return Err(ConfigError::Invalid(
                 "storage.block_align must be a positive power of two".into(),
@@ -1418,6 +1456,27 @@ mod tests {
         let mut c = minimal_cfg();
         c.model.top_k = 99;
         assert!(c.validate().is_err());
+    }
+
+    /// Part A6: the flat u32 global expert-id namespace
+    /// (`layer * num_experts + local`) must be validated with checked
+    /// arithmetic at config load.
+    #[test]
+    fn rejects_expert_namespace_overflow() {
+        let mut c = minimal_cfg();
+        c.model.num_layers = 4;
+        c.model.num_experts = u32::MAX / 2;
+        // Satisfy the multi-layer cache_slots >= num_layers rule so the
+        // overflow check is what fires.
+        c.storage.cache_slots = 4;
+        let err = c.validate().expect_err("namespace overflow must fail");
+        assert!(
+            err.to_string().contains("overflows"),
+            "unexpected error: {err}"
+        );
+        // The same shape with a small expert count is fine.
+        c.model.num_experts = 8;
+        c.validate().expect("small namespace is valid");
     }
 
     #[test]

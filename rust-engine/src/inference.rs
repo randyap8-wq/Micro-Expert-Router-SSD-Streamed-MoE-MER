@@ -1168,6 +1168,20 @@ pub enum ExpertWeightsError {
     /// The expert's self-describing header is malformed or incompatible
     /// with the runtime shape/dtype dispatch.
     InvalidLayout(String),
+    /// The buffer is short of the exact logical payload size by no more
+    /// than one block alignment. In strict mode (the default) this is a
+    /// hard error — missing logical weight bytes must never be
+    /// synthesized as zeros. The most common root cause is a
+    /// `model.expert_size` config value that excludes the 4 KiB Unified
+    /// Tensor Header page prepended by the converter: the engine then
+    /// reads `expert_size` bytes from offset 0 and strips the header,
+    /// leaving the payload exactly one page short.
+    TruncatedPayload {
+        have: usize,
+        need: usize,
+        d_model: usize,
+        d_ff: usize,
+    },
 }
 
 impl fmt::Display for ExpertWeightsError {
@@ -1194,6 +1208,23 @@ impl fmt::Display for ExpertWeightsError {
                 )
             }
             ExpertWeightsError::InvalidLayout(msg) => write!(f, "invalid expert layout: {msg}"),
+            ExpertWeightsError::TruncatedPayload {
+                have,
+                need,
+                d_model,
+                d_ff,
+            } => write!(
+                f,
+                "expert payload truncated: have {have} bytes, need {need} for \
+                 d_model={d_model}, d_ff={d_ff} (shortfall {} bytes). Missing logical \
+                 weight bytes are never zero-filled in strict mode. If the shortfall is \
+                 exactly one page, check that model.expert_size includes the 4 KiB \
+                 Unified Tensor Header page prepended by the converter (use the \
+                 converter's metadata.json expert_size verbatim). Set \
+                 real_transformer.allow_truncated_expert_payloads = true only for \
+                 legacy development datasets.",
+                need - have
+            ),
         }
     }
 }
@@ -3366,34 +3397,77 @@ use std::sync::Arc as StdArc;
 
 /// Maximum shortfall (in bytes) tolerated when validating an on-disk
 /// quantised expert buffer against the engine's computed 3-matrix
-/// SwiGLU blob.
+/// SwiGLU blob — **legacy development mode only**
+/// ([`allow_truncated_expert_payloads`]).
 ///
-/// Real GGUF Q4_0 expert files can land exactly one `block_align`
-/// (page) short of the size the engine derives from `d_model`/`d_ff`
-/// — e.g. a Mixtral expert whose blob should be 99,090,432 bytes
-/// arrives as 99,086,336 (4,096 bytes / one page smaller). Rather
-/// than skipping the expert, we accept files within one block
-/// alignment of the expected size and zero-pad the (≤ one page) tail
-/// so the per-matrix block slices stay in-bounds. See gist Fix 1.
+/// Historically, real GGUF Q4_0 expert payloads could land exactly one
+/// `block_align` (page) short of the size the engine derives from
+/// `d_model`/`d_ff` — e.g. a Mixtral expert whose blob should be
+/// 99,090,432 bytes arrived as 99,086,336 (4,096 bytes / one page
+/// smaller). The root cause was a **misconfigured `model.expert_size`
+/// that excluded the 4 KiB Unified Tensor Header page** prepended by
+/// the converter: the engine reads `expert_size` bytes from offset 0
+/// and strips the UTH page, leaving the logical payload exactly one
+/// page short. That misconfiguration is now rejected at startup (see
+/// `NvmeStorage::validate_expert_file_layout`), and strict mode
+/// requires the exact logical payload size — missing weight bytes are
+/// never synthesized as zeros. The tolerance survives only behind the
+/// explicitly named `real_transformer.allow_truncated_expert_payloads`
+/// development flag, which `bench-real` rejects.
 pub(crate) const EXPERT_SIZE_TOLERANCE_BYTES: usize = crate::gguf_loader::DEFAULT_BLOCK_ALIGN;
 
+/// Process-wide switch for the legacy zero-padding tolerance on
+/// slightly-short quantised expert payloads. `false` (strict, the
+/// default): the exact logical payload size is required and any
+/// shortfall is a hard [`ExpertWeightsError::TruncatedPayload`] /
+/// [`ExpertWeightsError::BufferTooSmall`]. `true` (development only,
+/// set from `real_transformer.allow_truncated_expert_payloads`):
+/// payloads up to one block alignment short are zero-padded, marking
+/// output non-authoritative.
+static ALLOW_TRUNCATED_EXPERT_PAYLOADS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the legacy truncated-payload zero-fill tolerance.
+/// Called once at startup from config plumbing; `bench-real` rejects
+/// the enabling config outright.
+pub fn set_allow_truncated_expert_payloads(allow: bool) {
+    ALLOW_TRUNCATED_EXPERT_PAYLOADS.store(allow, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the legacy truncated-payload zero-fill tolerance is active.
+pub fn allow_truncated_expert_payloads() -> bool {
+    ALLOW_TRUNCATED_EXPERT_PAYLOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Effective shortfall tolerance in bytes: one block alignment in the
+/// legacy development mode, zero in strict mode.
+pub(crate) fn effective_expert_size_tolerance() -> usize {
+    if allow_truncated_expert_payloads() {
+        EXPERT_SIZE_TOLERANCE_BYTES
+    } else {
+        0
+    }
+}
+
 /// Return a buffer that is at least `need` bytes long — either a
-/// borrowed view of `bytes` or, when `bytes` is slightly short, an
-/// owned zero-padded copy.
+/// borrowed view of `bytes` or (legacy development mode only), when
+/// `bytes` is slightly short, an owned zero-padded copy.
 ///
 /// * `bytes.len() >= need` → borrow the buffer unchanged (the common
-///   path; any trailing `O_DIRECT` padding past `need` is ignored by
-///   the caller's slicing).
-/// * the expert is larger than one `block_align` and the buffer is no
-///   more than one `block_align` short
-///   (`need - bytes.len() <= EXPERT_SIZE_TOLERANCE_BYTES`) → return an
-///   owned copy zero-padded up to `need`, so a file that is up to one
-///   page short is still usable (the missing tail decodes to a final
-///   block of zero-weights instead of aborting the expert). The
-///   `need > EXPERT_SIZE_TOLERANCE_BYTES` guard only prevents applying
+///   path; any trailing `O_DIRECT` alignment padding past `need` is
+///   ignored by the caller's slicing).
+/// * strict mode (default): any shortfall is an error. A shortfall of
+///   at most one `block_align` returns the diagnostic
+///   [`ExpertWeightsError::TruncatedPayload`] (pointing at the
+///   `expert_size`-excludes-UTH root cause); larger shortfalls return
+///   [`ExpertWeightsError::BufferTooSmall`].
+/// * legacy mode ([`allow_truncated_expert_payloads`]): the expert is
+///   larger than one `block_align` and the buffer is no more than one
+///   `block_align` short → return an owned copy zero-padded up to
+///   `need` (the missing tail decodes to zero weights). The
+///   `need > EXPERT_SIZE_TOLERANCE_BYTES` guard prevents applying
 ///   tolerance to very small payloads (`need <= block_align`), where a
 ///   one-page shortfall could be all (or most) of the data.
-/// * otherwise → [`ExpertWeightsError::BufferTooSmall`].
 fn q4_expert_bytes_with_tolerance(
     bytes: &[u8],
     need: usize,
@@ -3409,6 +3483,20 @@ fn q4_expert_bytes_with_tolerance(
         // size there rather than zero-padding mostly-empty garbage.
         && need - bytes.len() <= EXPERT_SIZE_TOLERANCE_BYTES
     {
+        if !allow_truncated_expert_payloads() {
+            return Err(ExpertWeightsError::TruncatedPayload {
+                have: bytes.len(),
+                need,
+                d_model,
+                d_ff,
+            });
+        }
+        tracing::warn!(
+            have = bytes.len(),
+            need,
+            "zero-padding truncated expert payload \
+             (allow_truncated_expert_payloads = true; output is non-authoritative)"
+        );
         let mut padded = Vec::with_capacity(need);
         padded.extend_from_slice(bytes);
         padded.resize(need, 0);
@@ -3506,11 +3594,26 @@ pub fn run_inference_q4_0_qmm(
     let one_bytes = one_blocks * Q4_0_BLOCK_BYTES;
     let need = one_bytes * 3;
     let resident_bytes = resident.data();
-    let padded = resident.q4_0_padded_payload(need, EXPERT_SIZE_TOLERANCE_BYTES);
+    let bytes_holder;
     let bytes: &[u8] = if resident_bytes.len() >= need {
         resident_bytes
-    } else if let Some(ref cached) = padded {
-        cached.as_ref()
+    } else if let Some(cached) =
+        resident.q4_0_padded_payload(need, effective_expert_size_tolerance())
+    {
+        // Legacy development mode only (`allow_truncated_expert_payloads`):
+        // the tolerance is zero in strict mode, so this arm can never
+        // zero-fill missing logical bytes on the strict path.
+        bytes_holder = cached;
+        &bytes_holder
+    } else if need > EXPERT_SIZE_TOLERANCE_BYTES
+        && need - resident_bytes.len() <= EXPERT_SIZE_TOLERANCE_BYTES
+    {
+        return Err(ExpertWeightsError::TruncatedPayload {
+            have: resident_bytes.len(),
+            need,
+            d_model,
+            d_ff,
+        });
     } else {
         return Err(ExpertWeightsError::BufferTooSmall {
             have: resident_bytes.len(),
@@ -5372,17 +5475,34 @@ mod tests {
         }
     }
 
-    /// gist Fix 1: an on-disk Q4_0 expert that is up to one
-    /// `block_align` (4,096 bytes) shorter than the exact 3-matrix
-    /// blob must still decode (the missing tail is zero-padded), while
-    /// a buffer short by *more* than one page is still rejected.
-    #[test]
-    fn q4_0_tolerates_one_block_align_short_buffer() {
-        // Dims chosen so the full blob is comfortably larger than one
-        // page (need = 13,824 bytes > 4,096) and block-aligned for the
-        // QMatMul path (both dims are multiples of 32).
-        let d_model = 64usize;
-        let d_ff = 128usize;
+    /// Serialize tests that flip the process-wide
+    /// `allow_truncated_expert_payloads` switch so they can't race
+    /// other tests that rely on the strict default.
+    pub(crate) static TRUNCATION_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: enables the legacy truncated-payload tolerance for
+    /// the test body and restores strict mode on drop (even on panic).
+    pub(crate) struct LegacyTruncationGuard<'a>(
+        #[allow(dead_code)] std::sync::MutexGuard<'a, ()>,
+    );
+
+    pub(crate) fn legacy_truncation_mode() -> LegacyTruncationGuard<'static> {
+        let guard = TRUNCATION_MODE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_allow_truncated_expert_payloads(true);
+        LegacyTruncationGuard(guard)
+    }
+
+    impl Drop for LegacyTruncationGuard<'_> {
+        fn drop(&mut self) {
+            set_allow_truncated_expert_payloads(false);
+        }
+    }
+
+    /// Build a synthetic Q4_0 `gate||up||down` blob for the given dims
+    /// (every block has scale 0.05, all nibbles = 9).
+    fn synth_q4_0_blob(d_model: usize, d_ff: usize) -> Vec<u8> {
         let blocks_per_matrix = (d_model * d_ff).div_ceil(Q4_0_BLOCK_ELEMS);
         let mut blk = [0u8; Q4_0_BLOCK_BYTES];
         let scale16 = half::f16::from_f32(0.05).to_bits().to_le_bytes();
@@ -5394,6 +5514,85 @@ mod tests {
         for _ in 0..(3 * blocks_per_matrix) {
             bytes.extend_from_slice(&blk);
         }
+        bytes
+    }
+
+    /// Part A2 (strict, default): the exact logical Q4_0 payload size
+    /// is required. Exact and oversized-aligned buffers decode; a
+    /// one-byte-short or one-page-short buffer is a hard error and is
+    /// never zero-filled.
+    #[test]
+    fn q4_0_strict_requires_exact_logical_payload() {
+        let _guard = TRUNCATION_MODE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!allow_truncated_expert_payloads(), "strict default");
+        let d_model = 64usize;
+        let d_ff = 128usize;
+        let bytes = synth_q4_0_blob(d_model, d_ff);
+        let need = bytes.len();
+        assert!(need > EXPERT_SIZE_TOLERANCE_BYTES);
+        let x = synth_hidden_state(0, d_model, 1);
+
+        // Exact logical size → accepted.
+        let qmm = forward_q4_0_qmm_from_bytes(&bytes, &x, d_model, d_ff).expect("exact size");
+        assert_eq!(qmm.len(), d_model);
+
+        // Alignment padding *after* the complete logical payload →
+        // accepted (padding is ignored by the caller's slicing).
+        let mut oversized = bytes.clone();
+        let aligned = need.next_multiple_of(EXPERT_SIZE_TOLERANCE_BYTES);
+        oversized.resize(aligned.max(need + EXPERT_SIZE_TOLERANCE_BYTES), 0);
+        forward_q4_0_qmm_from_bytes(&oversized, &x, d_model, d_ff)
+            .expect("oversized-aligned buffer must be accepted");
+        OwnedExpertWeights::from_bytes_q4_0(&oversized, d_model, d_ff)
+            .expect("oversized-aligned dequant must be accepted");
+
+        // One byte short → TruncatedPayload, never zero-filled.
+        let one_byte_short = &bytes[..need - 1];
+        assert!(matches!(
+            forward_q4_0_qmm_from_bytes(one_byte_short, &x, d_model, d_ff),
+            Err(ExpertWeightsError::TruncatedPayload { .. })
+        ));
+        assert!(matches!(
+            OwnedExpertWeights::from_bytes_q4_0(one_byte_short, d_model, d_ff),
+            Err(ExpertWeightsError::TruncatedPayload { .. })
+        ));
+
+        // One page short (the historical expert_size-excludes-UTH
+        // signature) → TruncatedPayload.
+        let one_page_short = &bytes[..need - EXPERT_SIZE_TOLERANCE_BYTES];
+        assert!(matches!(
+            forward_q4_0_qmm_from_bytes(one_page_short, &x, d_model, d_ff),
+            Err(ExpertWeightsError::TruncatedPayload { .. })
+        ));
+        assert!(matches!(
+            OwnedExpertWeights::from_bytes_q4_0(one_page_short, d_model, d_ff),
+            Err(ExpertWeightsError::TruncatedPayload { .. })
+        ));
+
+        // Short by more than one page → BufferTooSmall.
+        let way_short = &bytes[..need - EXPERT_SIZE_TOLERANCE_BYTES - 1];
+        assert!(matches!(
+            forward_q4_0_qmm_from_bytes(way_short, &x, d_model, d_ff),
+            Err(ExpertWeightsError::BufferTooSmall { .. })
+        ));
+    }
+
+    /// Part A2 (legacy development flag): with
+    /// `allow_truncated_expert_payloads = true` a buffer up to one
+    /// `block_align` (4,096 bytes) short still decodes (the missing
+    /// tail is zero-padded), while a buffer short by *more* than one
+    /// page is still rejected.
+    #[test]
+    fn q4_0_legacy_flag_tolerates_one_block_align_short_buffer() {
+        let _mode = legacy_truncation_mode();
+        // Dims chosen so the full blob is comfortably larger than one
+        // page (need = 13,824 bytes > 4,096) and block-aligned for the
+        // QMatMul path (both dims are multiples of 32).
+        let d_model = 64usize;
+        let d_ff = 128usize;
+        let bytes = synth_q4_0_blob(d_model, d_ff);
         let need = bytes.len();
         assert!(need > EXPERT_SIZE_TOLERANCE_BYTES);
 
@@ -5402,11 +5601,11 @@ mod tests {
         // Exactly one block_align short → accepted (zero-padded tail).
         let short_one_page = &bytes[..need - EXPERT_SIZE_TOLERANCE_BYTES];
         let qmm = forward_q4_0_qmm_from_bytes(short_one_page, &x, d_model, d_ff)
-            .expect("one-page-short qmm should be tolerated");
+            .expect("one-page-short qmm should be tolerated in legacy mode");
         assert_eq!(qmm.len(), d_model);
         assert!(qmm.iter().all(|v| v.is_finite()));
         OwnedExpertWeights::from_bytes_q4_0(short_one_page, d_model, d_ff)
-            .expect("one-page-short dequant should be tolerated");
+            .expect("one-page-short dequant should be tolerated in legacy mode");
 
         // One byte more than a block_align short → rejected.
         let too_short = &bytes[..need - EXPERT_SIZE_TOLERANCE_BYTES - 1];

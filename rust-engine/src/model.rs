@@ -41,6 +41,7 @@ use crate::architecture::{
 };
 use crate::dense_tensor::{dense_checksum, DenseDType, DenseTensorManifest, DenseWeight};
 use crate::engine::Engine;
+use crate::engine::MoeStepError;
 use crate::gating::{LinearGate, ScoringFunc};
 use crate::mla::MultiHeadLatentAttention;
 use crate::transformer::{
@@ -650,6 +651,78 @@ impl RealModelConfig {
             first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
             advanced,
         }
+    }
+}
+
+/// Request-level error for the real-model inference path (hardening
+/// pass, Part A). Real-model methods fail closed: a corrupted or
+/// mathematically invalid step returns one of these instead of
+/// silently continuing with incomplete inference. Callers map it to an
+/// HTTP 500 (server) or a CLI error (bench) — never a panic.
+#[derive(Debug)]
+pub enum RealInferenceError {
+    /// A token id outside `[0, vocab_size)` reached real-model
+    /// embedding lookup (tokenizer/model vocabulary mismatch or caller
+    /// bug). Real inference never wraps ids with modulo.
+    InvalidTokenId { token_id: u32, vocab_size: usize },
+    /// A required routed or shared expert failed to load or execute.
+    MoeStep(MoeStepError),
+    /// An active attention softmax row produced unexpected NaN or
+    /// infinity — numerical corruption, not a valid masked row (A3
+    /// rework: propagated structurally from
+    /// `softmax → attention → transformer layer → RealModel`, with
+    /// full head/position/architecture context).
+    NonFiniteAttention {
+        layer: usize,
+        head: usize,
+        pos: usize,
+        architecture: crate::architecture::Architecture,
+        kind: crate::transformer::NumericalErrorKind,
+    },
+    /// A scheduler-registered KV state could not be recovered; the
+    /// request must fail rather than continue on a fresh KV cache.
+    KvStateLost(String),
+}
+
+impl std::fmt::Display for RealInferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RealInferenceError::InvalidTokenId {
+                token_id,
+                vocab_size,
+            } => write!(
+                f,
+                "invalid token id {token_id}: model vocab_size is {vocab_size}"
+            ),
+            RealInferenceError::MoeStep(e) => write!(f, "moe step failed: {e}"),
+            RealInferenceError::NonFiniteAttention {
+                layer,
+                head,
+                pos,
+                architecture,
+                kind,
+            } => write!(
+                f,
+                "non-finite attention detected: {kind} at layer {layer}, head {head}, \
+                 position {pos} (architecture {architecture:?})"
+            ),
+            RealInferenceError::KvStateLost(m) => write!(f, "kv state lost: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for RealInferenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RealInferenceError::MoeStep(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<MoeStepError> for RealInferenceError {
+    fn from(e: MoeStepError) -> Self {
+        RealInferenceError::MoeStep(e)
     }
 }
 
@@ -2274,12 +2347,34 @@ impl RealModel {
             .collect()
     }
 
-    /// Look up the embedding row for a token id.
+    /// Look up the embedding row for a token id, wrapping out-of-range
+    /// ids with modulo. **Synthetic/speculative paths only** (routing
+    /// peeks, draft-token KV previews, seeded benchmarks): real
+    /// inference must use [`Self::try_embed`], which rejects invalid
+    /// ids instead of silently aliasing them onto a valid row
+    /// (hardening pass, Part A5).
     pub fn embed(&self, token_id: u32) -> Vec<f32> {
         let id = (token_id as usize) % self.config.vocab_size;
         let mut out = Vec::with_capacity(self.config.d_model);
         self.embedding.row_dequant_into(id, &mut out);
         out
+    }
+
+    /// Fail-closed embedding lookup for real inference (Part A5): a
+    /// token id outside `[0, vocab_size)` is a tokenizer/model
+    /// vocabulary mismatch or a caller bug and must fail the request,
+    /// never wrap onto an unrelated embedding row.
+    pub fn try_embed(&self, token_id: u32) -> Result<Vec<f32>, RealInferenceError> {
+        let id = token_id as usize;
+        if id >= self.config.vocab_size {
+            return Err(RealInferenceError::InvalidTokenId {
+                token_id,
+                vocab_size: self.config.vocab_size,
+            });
+        }
+        let mut out = Vec::with_capacity(self.config.d_model);
+        self.embedding.row_dequant_into(id, &mut out);
+        Ok(out)
     }
 
     /// Translate a `(layer, local_expert_id)` pair into the global flat
@@ -2289,63 +2384,56 @@ impl RealModel {
     /// API changes.
     #[inline]
     pub fn global_expert_id(&self, layer: usize, local: u32) -> u32 {
-        (layer as u32) * (self.config.num_experts as u32) + local
+        // Checked namespace arithmetic (hardening pass, Part A6): the
+        // product/sum is validated at config load, so an overflow here
+        // is a programming error — fail loudly instead of wrapping a
+        // malformed id into another layer's cache namespace.
+        let layer = u32::try_from(layer).expect("layer index exceeds u32");
+        debug_assert!((local as usize) < self.config.num_experts);
+        layer
+            .checked_mul(self.config.num_experts as u32)
+            .and_then(|base| base.checked_add(local))
+            .expect("global expert id overflows u32 (num_layers * num_experts too large)")
     }
 
-    /// **SSD-read pre-pass peek (gist Phase 1).** Return a best-effort
-    /// estimate of the global expert ids this step is likely to
-    /// require. The pre-pass is cheap and side-effect-free:
+    /// **SSD-read pre-pass peek (gist Phase 1, reworked by hardening
+    /// pass C2).** Return a best-effort, **lightweight** estimate of
+    /// the global expert ids this step is likely to require. The
+    /// pre-pass is cheap, side-effect-free and request-agnostic:
     ///
-    /// 1. **Layer 0 is exact:** we run the embedding +
-    ///    attention-normalised gate against a *clone* of the layer-0
-    ///    KV cache, so the prediction matches the actual routing
-    ///    decision the upcoming [`Self::step`] will make.
-    /// 2. **Deeper layers are approximated** by re-using the
-    ///    embedding as a stand-in for each layer's residual stream
-    ///    and running its gate. This is not exact — those decisions
-    ///    really depend on every preceding MoE FFN output — but it
-    ///    captures the strong layerwise correlation seen on
-    ///    Mixtral-class checkpoints and provides plenty of useful
-    ///    hints for the warm pass. The remaining miss-on-miss
-    ///    fetches still funnel through `Engine`'s in-flight
-    ///    singleflight, so deduplication holds even when the peek
-    ///    is wrong.
+    /// * Every layer's gate is evaluated against the token's
+    ///   **embedding** as a stand-in for that layer's residual
+    ///   stream. This is not exact — real routing depends on
+    ///   attention over the request's KV state and every preceding
+    ///   MoE FFN output — but it captures the strong tokenwise /
+    ///   layerwise routing correlation seen on Mixtral-class
+    ///   checkpoints and provides useful hints for the warm pass.
+    ///
+    /// The previous implementation additionally *cloned the layer-0 KV
+    /// cache and re-ran full layer-0 attention* per peeked token to
+    /// make layer 0 exact. That paid an `O(pos · kv_dim)` copy plus a
+    /// duplicate attention pass on every scheduled request per batch —
+    /// far more than the one routing decision it sharpened was worth —
+    /// and forced the scheduler to lock each request's KV state during
+    /// the pre-pass. Both are gone: the peek reads nothing but the
+    /// token id and the resident gate weights, so it never touches
+    /// request state and cannot leak routing observations across
+    /// requests.
+    ///
+    /// Misses are cheap by construction: anything the peek gets wrong
+    /// is still caught by the in-flight singleflight on the critical
+    /// path, and the scheduler's profitability gate disables the
+    /// pre-pass entirely when its measured benefit is non-positive.
     ///
     /// The returned vector is **not** deduplicated; the caller is
     /// expected to fold it into a [`HashSet`] before calling
     /// [`Engine::warm_with`].
-    pub fn peek_experts(&self, token_id: u32, pos: usize, kv: &[KvCache]) -> Vec<u32> {
-        assert_eq!(
-            kv.len(),
-            self.config.num_layers,
-            "kv cache slice must have one entry per layer"
-        );
+    pub fn peek_experts(&self, token_id: u32) -> Vec<u32> {
         // Each layer contributes exactly `routing.experts.len()` ids,
-        // which by the gating contract equals `config.top_k`. We
-        // assert this loosely below via `debug_assert`; the
-        // pre-allocation is a tight upper bound that avoids any
-        // `Vec` growth even when `top_k` is dynamically reduced
-        // (e.g. by alias-deduplication).
+        // which by the gating contract equals `config.top_k`.
         let mut out = Vec::with_capacity(self.config.num_layers * self.config.top_k);
         let embed = self.embed(token_id);
-        // Layer 0: run real attention against a *clone* of the KV
-        // slot so the cache is not mutated by the peek.
-        {
-            let layer = &self.layers[0];
-            let mut kv0 = kv[0].clone();
-            let backend = crate::backend::current();
-            let attn_out = layer.attn_block(&embed, pos, 0, &mut kv0, &*backend);
-            let (_normed, routing) = layer.moe_pre(&attn_out);
-            for &local in &routing.experts {
-                out.push(self.global_expert_id(0, local));
-            }
-        }
-        // Layers ≥ 1: use the embedding as a fast residual-stream
-        // approximation. Cheap (no attention, no cloning), and good
-        // enough to seed the warm pass — anything the peek misses is
-        // still caught by the in-flight singleflight on the critical
-        // path.
-        for layer_idx in 1..self.config.num_layers {
+        for layer_idx in 0..self.config.num_layers {
             let layer = &self.layers[layer_idx];
             let (_normed, routing) = layer.moe_pre(&embed);
             for &local in &routing.experts {
@@ -2381,7 +2469,7 @@ impl RealModel {
         token_id: u32,
         pos: usize,
         kv: &mut [KvCache],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, RealInferenceError> {
         self.forward_token_hidden_with_timing(engine, token_id, pos, kv, None)
             .await
     }
@@ -2393,7 +2481,7 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, RealInferenceError> {
         assert_eq!(
             kv.len(),
             self.config.num_layers,
@@ -2401,23 +2489,57 @@ impl RealModel {
         );
         let mut x =
             crate::stage_timing::time_optional(timings, crate::stage_timing::EMBEDDING, || {
-                self.embed(token_id)
-            });
+                self.try_embed(token_id)
+            })?;
         let backend = crate::backend::current();
         let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
         let mut next_x = Vec::with_capacity(self.config.d_model);
+        // Fail-closed numerical propagation (hardening pass, A3
+        // rework): strict production mode routes attention through the
+        // `try_` variants, which return a typed
+        // [`crate::transformer::AttentionNumericalError`] from the
+        // softmax itself — no side-channel counters are consulted for
+        // correctness (the global `nonfinite_softmax_fallbacks`
+        // counter remains telemetry only). The development-only
+        // `allow_degraded_experts` mode keeps the legacy
+        // uniform-fallback behaviour. GPU-offloaded attention performs
+        // its softmax on-device where non-finite rows cannot be
+        // detected; strict mode therefore always uses the checked CPU
+        // attention path (see `forward_into_impl`).
+        let strict_numerics = !engine.allow_degraded_experts();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
-            layer.attn_block_into_with_timing(
-                &x,
-                pos,
-                layer_idx,
-                &mut kv[layer_idx],
-                &*backend,
-                &mut layer_scratch,
-                &mut next_x,
-                timings,
-            );
+            if strict_numerics {
+                layer
+                    .try_attn_block_into_with_timing(
+                        &x,
+                        pos,
+                        layer_idx,
+                        &mut kv[layer_idx],
+                        &*backend,
+                        &mut layer_scratch,
+                        &mut next_x,
+                        timings,
+                    )
+                    .map_err(|e| RealInferenceError::NonFiniteAttention {
+                        layer: layer_idx,
+                        head: e.head,
+                        pos: e.pos,
+                        architecture: self.config.architecture,
+                        kind: e.kind,
+                    })?;
+            } else {
+                layer.attn_block_into_with_timing(
+                    &x,
+                    pos,
+                    layer_idx,
+                    &mut kv[layer_idx],
+                    &*backend,
+                    &mut layer_scratch,
+                    &mut next_x,
+                    timings,
+                );
+            }
             std::mem::swap(&mut x, &mut next_x);
             next_x.clear();
             // Sliding-Window-Attention layers (MiMo-V2 SWA layers, GPT-OSS
@@ -2464,7 +2586,7 @@ impl RealModel {
                     &mut layer_scratch.moe_accum,
                     timings,
                 )
-                .await;
+                .await?;
             layer.moe_accumulated_into_with_timing(
                 &x,
                 &layer_scratch.moe_accum,
@@ -2484,9 +2606,11 @@ impl RealModel {
                 next_x.clear();
             }
         }
-        crate::stage_timing::time_optional(timings, crate::stage_timing::FINAL_RMS_NORM, || {
-            self.final_rms.forward(&x)
-        })
+        Ok(crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::FINAL_RMS_NORM,
+            || self.final_rms.forward(&x),
+        ))
     }
 
     /// Sample a next-token id from an already-computed final hidden state.
@@ -2503,6 +2627,13 @@ impl RealModel {
         self.lm_head.sample(hidden, params, pos as u64)
     }
 
+    /// Timed variant of [`Self::sample_hidden`] (hardening pass, D3):
+    /// delegates to [`crate::transformer::LMHead::sample_with_timing`],
+    /// which is the *same* code path as the untimed sampler with
+    /// per-stage timing recorded inside each fast path. Timing on/off
+    /// therefore selects the same algorithm and returns the same
+    /// token, and timed greedy / top-K-only sampling never allocates
+    /// full logits.
     pub fn sample_hidden_with_timing(
         &self,
         hidden: &[f32],
@@ -2510,13 +2641,8 @@ impl RealModel {
         pos: usize,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> u32 {
-        let logits =
-            crate::stage_timing::time_optional(timings, crate::stage_timing::LM_HEAD, || {
-                self.lm_head.forward(hidden)
-            });
-        crate::stage_timing::time_optional(timings, crate::stage_timing::SAMPLING, || {
-            crate::sampling::sample(&logits, params, pos as u64)
-        })
+        self.lm_head
+            .sample_with_timing(hidden, params, pos as u64, timings)
     }
 
     /// Ingest one token and sample the following token. This is the
@@ -2529,9 +2655,9 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
-    ) -> u32 {
-        let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await;
-        self.sample_hidden(&hidden, params, pos)
+    ) -> Result<u32, RealInferenceError> {
+        let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await?;
+        Ok(self.sample_hidden(&hidden, params, pos))
     }
 
     pub async fn decode_step_with_timing(
@@ -2542,11 +2668,11 @@ impl RealModel {
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> u32 {
+    ) -> Result<u32, RealInferenceError> {
         let hidden = self
             .forward_token_hidden_with_timing(engine, token_id, pos, kv, timings)
-            .await;
-        self.sample_hidden_with_timing(&hidden, params, pos, timings)
+            .await?;
+        Ok(self.sample_hidden_with_timing(&hidden, params, pos, timings))
     }
 
     /// Backwards-compatible alias for callers that still express a full
@@ -2558,7 +2684,7 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
-    ) -> u32 {
+    ) -> Result<u32, RealInferenceError> {
         self.decode_step(engine, token_id, pos, kv, params).await
     }
 }
@@ -4479,7 +4605,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         assert!((next as usize) < cfg.vocab_size);
         // KV caches grew by exactly one position.
         for c in &kv {
@@ -4542,7 +4669,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let t2 = model
             .step(
                 &engine,
@@ -4551,11 +4679,116 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         assert!((t1 as usize) < cfg.vocab_size);
         assert!((t2 as usize) < cfg.vocab_size);
         for c in &kv {
             assert_eq!(c.seq_len, 2, "each MLA layer cached two positions");
+        }
+    }
+
+    /// Part A5 (fail-closed inference): real-model forward must reject
+    /// token ids outside `[0, vocab_size)` instead of wrapping them
+    /// with modulo onto an unrelated embedding row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_rejects_out_of_range_token_ids() {
+        let dir = TempDir::new("badtok");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let model = RealModel::new_seeded(cfg.clone(), 1);
+        let vocab = cfg.vocab_size as u32;
+
+        // Boundary-valid ids succeed: token 0 and the last valid token.
+        for tid in [0u32, vocab - 1] {
+            let mut kv = model.fresh_kv_caches();
+            model
+                .forward_token_hidden(&engine, tid, 0, &mut kv)
+                .await
+                .unwrap_or_else(|e| panic!("token {tid} must be valid: {e}"));
+        }
+
+        // `vocab_size` (one past the end) and `u32::MAX` fail closed.
+        for tid in [vocab, u32::MAX] {
+            let mut kv = model.fresh_kv_caches();
+            let err = model
+                .forward_token_hidden(&engine, tid, 0, &mut kv)
+                .await
+                .expect_err("out-of-range token id must fail");
+            match err {
+                RealInferenceError::InvalidTokenId {
+                    token_id,
+                    vocab_size,
+                } => {
+                    assert_eq!(token_id, tid);
+                    assert_eq!(vocab_size, cfg.vocab_size);
+                }
+                other => panic!("expected InvalidTokenId, got: {other}"),
+            }
+        }
+
+        // try_embed mirrors the same contract directly.
+        assert!(model.try_embed(vocab - 1).is_ok());
+        assert!(model.try_embed(vocab).is_err());
+    }
+
+    /// Part A3 (fail-closed inference): unexpected NaN in an active
+    /// attention row must fail the request in strict mode instead of
+    /// fabricating a uniform attention distribution. Poisoning the
+    /// layer-1 Q projection makes every layer-1 attention row NaN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_fails_closed_on_non_finite_attention() {
+        let dir = TempDir::new("nanattn");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("NaN attention must fail the request in strict mode");
+        match err {
+            RealInferenceError::NonFiniteAttention {
+                layer,
+                head,
+                pos,
+                architecture,
+                kind,
+            } => {
+                assert_eq!(layer, 0);
+                assert_eq!(head, 0);
+                assert_eq!(pos, 0);
+                assert_eq!(architecture, cfg.architecture);
+                assert_eq!(kind, crate::transformer::NumericalErrorKind::NaNScores);
+            }
+            other => panic!("expected NonFiniteAttention, got: {other}"),
+        }
+    }
+
+    /// Part A3: a finite forward pass does not trip the non-finite
+    /// check (guards against false positives from the thread-local
+    /// counter snapshotting).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_finite_forward_passes_strict_numeric_check() {
+        let dir = TempDir::new("finiteattn");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let model = RealModel::new_seeded(cfg.clone(), 1);
+        let mut kv = model.fresh_kv_caches();
+        for pos in 0..3 {
+            model
+                .forward_token_hidden(&engine, (pos as u32) + 1, pos, &mut kv)
+                .await
+                .expect("finite forward must pass");
         }
     }
 
@@ -4575,7 +4808,8 @@ mod tests {
                 &mut kv1,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let t2 = model
             .step(
                 &engine,
@@ -4584,7 +4818,8 @@ mod tests {
                 &mut kv1,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
 
         let mut kv2 = model.fresh_kv_caches();
         let u1 = model
@@ -4595,7 +4830,8 @@ mod tests {
                 &mut kv2,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let u2 = model
             .step(
                 &engine,
@@ -4604,7 +4840,8 @@ mod tests {
                 &mut kv2,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
 
         assert_eq!((t1, t2), (u1, u2));
     }
@@ -4629,7 +4866,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         // Both layers contributed to KV cache growth.
         assert_eq!(kv.len(), 2);
         for c in &kv {

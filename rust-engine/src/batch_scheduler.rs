@@ -273,9 +273,20 @@ pub enum ScheduledResponse {
 pub struct PrepassStats {
     pub runs_total: u64,
     pub singleton_skips_total: u64,
+    /// Batches where the profitability gate held the pre-pass back
+    /// because its measured net benefit was non-positive.
+    pub gate_skips_total: u64,
     pub time_ns_total: u64,
     pub predicted_experts_total: u64,
     pub requested_experts_total: u64,
+    /// Peeked local experts that were *not* already resident — the
+    /// warm pass actually fetched these, i.e. useful misses avoided
+    /// on the critical path.
+    pub useful_warm_experts_total: u64,
+    /// Peeked local experts that were already resident — wasted
+    /// prediction work (and, for wrong predictions that do get
+    /// fetched, wasted prefetch bytes).
+    pub cached_predictions_total: u64,
     pub local_warm_failures_total: u64,
 }
 
@@ -297,9 +308,12 @@ impl PrepassStats {
 struct PrepassCounters {
     runs_total: Arc<AtomicU64>,
     singleton_skips_total: Arc<AtomicU64>,
+    gate_skips_total: Arc<AtomicU64>,
     time_ns_total: Arc<AtomicU64>,
     predicted_experts_total: Arc<AtomicU64>,
     requested_experts_total: Arc<AtomicU64>,
+    useful_warm_experts_total: Arc<AtomicU64>,
+    cached_predictions_total: Arc<AtomicU64>,
     local_warm_failures_total: Arc<AtomicU64>,
 }
 
@@ -308,11 +322,82 @@ impl PrepassCounters {
         PrepassStats {
             runs_total: self.runs_total.load(Ordering::Relaxed),
             singleton_skips_total: self.singleton_skips_total.load(Ordering::Relaxed),
+            gate_skips_total: self.gate_skips_total.load(Ordering::Relaxed),
             time_ns_total: self.time_ns_total.load(Ordering::Relaxed),
             predicted_experts_total: self.predicted_experts_total.load(Ordering::Relaxed),
             requested_experts_total: self.requested_experts_total.load(Ordering::Relaxed),
+            useful_warm_experts_total: self.useful_warm_experts_total.load(Ordering::Relaxed),
+            cached_predictions_total: self.cached_predictions_total.load(Ordering::Relaxed),
             local_warm_failures_total: self.local_warm_failures_total.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// Automatic profitability gate for the routing pre-pass (hardening
+/// pass C2). The pre-pass only pays off when the batch's peeked
+/// experts would otherwise miss on the critical path; when the cache
+/// already holds the working set (high hit rate) or predictions are
+/// mostly wrong/wasted, the peek + warm work is pure overhead.
+///
+/// The gate keeps an exponential moving average of each executed
+/// pre-pass's *net benefit*:
+///
+/// ```text
+///   net_ns = useful_fetches × EST_AVOIDED_MISS_NS − prepass_ns
+/// ```
+///
+/// where `useful_fetches` counts peeked local experts that were not
+/// already resident (i.e. warm reads that overlapped I/O the step
+/// tasks would have serialized on) and `EST_AVOIDED_MISS_NS` is a
+/// deliberately conservative estimate of the critical-path time one
+/// overlapped NVMe expert read saves. When the EMA goes non-positive
+/// the pre-pass is disabled; while disabled, one probe run is allowed
+/// every [`Self::PROBE_INTERVAL`] batches so the gate re-opens
+/// automatically when the workload shifts. Singleton batches never
+/// run the pre-pass regardless of the gate (a single request gains
+/// nothing from cross-request read de-duplication).
+struct PrepassGate {
+    ema_net_ns: f64,
+    batches_since_probe: u32,
+}
+
+impl PrepassGate {
+    /// Conservative per-avoided-miss benefit estimate: an NVMe expert
+    /// read that the warm pass overlaps ahead of the step tasks saves
+    /// roughly one queued read's critical-path latency. Real Q4
+    /// Mixtral experts take multiple ms to read; 200 µs deliberately
+    /// under-estimates so the gate only keeps the pre-pass alive when
+    /// it is clearly profitable.
+    const EST_AVOIDED_MISS_NS: f64 = 200_000.0;
+    /// EMA smoothing factor.
+    const ALPHA: f64 = 0.25;
+    /// While disabled, allow one probe run per this many batches.
+    const PROBE_INTERVAL: u32 = 32;
+
+    fn new() -> Self {
+        Self {
+            ema_net_ns: 0.0,
+            batches_since_probe: 0,
+        }
+    }
+
+    /// Decide whether this batch should run the pre-pass.
+    fn should_run(&mut self) -> bool {
+        if self.ema_net_ns >= 0.0 {
+            return true;
+        }
+        self.batches_since_probe += 1;
+        if self.batches_since_probe >= Self::PROBE_INTERVAL {
+            self.batches_since_probe = 0;
+            return true;
+        }
+        false
+    }
+
+    /// Fold one executed pre-pass's measured outcome into the EMA.
+    fn record(&mut self, useful_fetches: u64, prepass_ns: u64) {
+        let net = useful_fetches as f64 * Self::EST_AVOIDED_MISS_NS - prepass_ns as f64;
+        self.ema_net_ns = Self::ALPHA * net + (1.0 - Self::ALPHA) * self.ema_net_ns;
     }
 }
 
@@ -895,6 +980,12 @@ pub enum BatchError {
     /// registered it, called `release` already, or the scheduler was
     /// restarted between calls.
     NotRegistered,
+    /// The model step itself failed (fail-closed real inference,
+    /// hardening pass Part A1). Unlike the scheduler-infrastructure
+    /// variants above, callers must NOT retry this on a direct path:
+    /// the failure is deterministic model/storage corruption and the
+    /// request must surface it.
+    Inference(String),
 }
 
 impl std::fmt::Display for BatchError {
@@ -904,6 +995,7 @@ impl std::fmt::Display for BatchError {
             BatchError::NotRegistered => {
                 write!(f, "request id is not registered with the scheduler")
             }
+            BatchError::Inference(m) => write!(f, "inference failed: {m}"),
         }
     }
 }
@@ -958,6 +1050,8 @@ async fn scheduler_loop(
     // pulling them out of the loop is just a readability win.
     let wi = SessionClass::Interactive.weight() as usize;
     let wa = SessionClass::Audit.weight() as usize;
+    // C2: automatic profitability gate for the routing pre-pass.
+    let mut prepass_gate = PrepassGate::new();
 
     loop {
         // ----------------------------------------------------------
@@ -1119,41 +1213,45 @@ async fn scheduler_loop(
         // ----------------------------------------------------------
 
         // ----------------------------------------------------------
-        // Pre-pass: peek at every request's routing decision and
-        // warm the union of expert ids in a single unified read
-        // (gist Phase 1 — SSD Read De-Duplication).
+        // Pre-pass: peek at every request's likely routing decision
+        // and warm the union of expert ids in a single unified read
+        // (gist Phase 1 — SSD Read De-Duplication; reworked by
+        // hardening pass C2). The peek is embedding-only: it clones
+        // no KV state, runs no attention, takes no per-request lock
+        // and never connects one request's state to another's. An
+        // automatic profitability gate ([`PrepassGate`]) disables the
+        // pre-pass when its measured net benefit is non-positive;
+        // singleton batches always skip it.
         // ----------------------------------------------------------
         let prepass_started = Instant::now();
         let mut unique: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut prepass_ran = false;
         if batch.len() > 1 {
-            prepass.runs_total.fetch_add(1, Ordering::Relaxed);
-            let mut predicted = 0u64;
-            for req in &batch {
-                if let Some(entry) = registry.get(req.id) {
-                    // Use try_lock so a peek never blocks on a step that
-                    // is concurrently mutating the same request's KV.
-                    // If we can't acquire the lock right now the warm
-                    // pass simply skips this request — the singleflight
-                    // path still dedups its critical-path reads.
-                    if let Ok(kv) = entry.try_lock() {
-                        let peeked = model.peek_experts(req.token_id, req.pos, &kv);
-                        predicted += peeked.len() as u64;
-                        for id in peeked {
-                            unique.insert(id);
-                        }
+            if prepass_gate.should_run() {
+                prepass_ran = true;
+                prepass.runs_total.fetch_add(1, Ordering::Relaxed);
+                let mut predicted = 0u64;
+                for req in &batch {
+                    let peeked = model.peek_experts(req.token_id);
+                    predicted += peeked.len() as u64;
+                    for id in peeked {
+                        unique.insert(id);
                     }
                 }
-            }
-            if predicted > 0 {
-                prepass
-                    .predicted_experts_total
-                    .fetch_add(predicted, Ordering::Relaxed);
+                if predicted > 0 {
+                    prepass
+                        .predicted_experts_total
+                        .fetch_add(predicted, Ordering::Relaxed);
+                }
+            } else {
+                prepass.gate_skips_total.fetch_add(1, Ordering::Relaxed);
             }
         } else {
             prepass
                 .singleton_skips_total
                 .fetch_add(1, Ordering::Relaxed);
         }
+        let mut useful_fetches = 0u64;
         if !unique.is_empty() {
             // ------------------------------------------------------
             // Expert namespace partitioning: consult the placement
@@ -1199,6 +1297,22 @@ async fn scheduler_loop(
                 }
             }
             if !local_ids.is_empty() {
+                // Count how many local warms would actually fetch —
+                // this is the "useful misses avoided" input to the
+                // profitability gate; already-resident predictions are
+                // wasted work.
+                for &id in &local_ids {
+                    if engine.is_expert_cached(id) {
+                        prepass
+                            .cached_predictions_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        useful_fetches += 1;
+                    }
+                }
+                prepass
+                    .useful_warm_experts_total
+                    .fetch_add(useful_fetches, Ordering::Relaxed);
                 if let Err(e) = engine.warm_with(&local_ids).await {
                     prepass
                         .local_warm_failures_total
@@ -1207,10 +1321,11 @@ async fn scheduler_loop(
                 }
             }
         }
-        prepass.time_ns_total.fetch_add(
-            prepass_started.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        if prepass_ran {
+            let prepass_ns = prepass_started.elapsed().as_nanos() as u64;
+            prepass.time_ns_total.fetch_add(prepass_ns, Ordering::Relaxed);
+            prepass_gate.record(useful_fetches, prepass_ns);
+        }
 
         // Run every request's decoder step concurrently. Each task
         // looks up its KV cache from the central registry and locks
@@ -1257,17 +1372,16 @@ async fn scheduler_loop(
                 let next = {
                     let mut kv = entry.lock().await;
                     match mode {
-                        StepMode::Decode => ScheduledResponse::NextToken(
-                            model
-                                .decode_step(&engine, token_id, pos, &mut kv, &params)
-                                .await,
-                        ),
-                        StepMode::ForwardHidden => ScheduledResponse::Hidden(
-                            model
-                                .forward_token_hidden(&engine, token_id, pos, &mut kv)
-                                .await,
-                        ),
+                        StepMode::Decode => model
+                            .decode_step(&engine, token_id, pos, &mut kv, &params)
+                            .await
+                            .map(ScheduledResponse::NextToken),
+                        StepMode::ForwardHidden => model
+                            .forward_token_hidden(&engine, token_id, pos, &mut kv)
+                            .await
+                            .map(ScheduledResponse::Hidden),
                     }
+                    .map_err(|e| BatchError::Inference(e.to_string()))
                 };
                 // Drop our Arc clone *before* signalling completion
                 // so the caller's subsequent `release(id)` sees the
@@ -1278,7 +1392,7 @@ async fn scheduler_loop(
                 // step_registered → release back-to-back) could race
                 // the spawned task's natural Arc drop at end-of-task.
                 drop(entry);
-                let _ = resp.send(Ok(next));
+                let _ = resp.send(next);
             }));
         }
         for h in handles {
@@ -1450,7 +1564,8 @@ mod tests {
                 &mut kv_a,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("direct step");
 
         let kv_b = model.fresh_kv_caches();
         let resp = sched
@@ -1506,7 +1621,8 @@ mod tests {
                 &mut kv_a,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("direct step");
 
         let id = sched.register(model.fresh_kv_caches());
         assert_eq!(sched.active_requests(), 1);
@@ -1524,6 +1640,38 @@ mod tests {
             "release must return the registered cache"
         );
         assert_eq!(sched.active_requests(), 0);
+    }
+
+    /// C2 profitability gate: positive measured benefit keeps the
+    /// pre-pass enabled; sustained non-positive benefit disables it,
+    /// with a periodic probe re-run so it can recover.
+    #[test]
+    fn prepass_gate_disables_on_negative_benefit_and_probes() {
+        let mut gate = PrepassGate::new();
+        // Fresh gate runs.
+        assert!(gate.should_run());
+        // Profitable pre-pass (4 useful fetches, 100 µs cost) keeps it on.
+        gate.record(4, 100_000);
+        assert!(gate.should_run());
+        // Sustained unprofitable pre-passes (0 useful, 500 µs cost)
+        // drive the EMA negative and close the gate.
+        for _ in 0..8 {
+            gate.record(0, 500_000);
+        }
+        assert!(!gate.should_run(), "gate must close on negative EMA");
+        // While closed, exactly one probe is allowed per PROBE_INTERVAL.
+        let mut probes = 0;
+        for _ in 0..(2 * PrepassGate::PROBE_INTERVAL) {
+            if gate.should_run() {
+                probes += 1;
+            }
+        }
+        assert_eq!(probes, 2, "one probe per PROBE_INTERVAL batches");
+        // A run of profitable probes re-opens the gate.
+        for _ in 0..64 {
+            gate.record(8, 50_000);
+        }
+        assert!(gate.should_run(), "gate must re-open on positive EMA");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1666,7 +1814,8 @@ mod tests {
                         &mut kv,
                         &crate::sampling::SamplingParams::greedy(),
                     )
-                    .await;
+                    .await
+                    .expect("sequential step");
             }
         }
         let sequential = seq_start.elapsed();
@@ -1809,7 +1958,8 @@ mod tests {
                 &mut kv_a,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("direct step");
 
         // Tag every odd global expert id remote.
         let total = (cfg.num_layers * cfg.num_experts) as u32;

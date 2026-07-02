@@ -1252,11 +1252,16 @@ impl GpuBackend {
                 "Q4_0 expert total byte size overflow: 3 × {}B",
                 proj_bytes
             ))?;
-        let tol = crate::inference::EXPERT_SIZE_TOLERANCE_BYTES;
+        // Strict mode requires the exact logical payload; the ≤ one-page
+        // zero-fill shortfall survives only behind the explicitly named
+        // `allow_truncated_expert_payloads` development flag.
+        let tol = crate::inference::effective_expert_size_tolerance();
         anyhow::ensure!(
             weight_bytes.len() >= need
-                || (need > tol && need - weight_bytes.len() <= tol),
-            "Q4_0 expert weight buffer too small: got {} bytes, need {} (3 × {} blocks × {}B)",
+                || (need > tol && tol > 0 && need - weight_bytes.len() <= tol),
+            "Q4_0 expert weight buffer too small: got {} bytes, need {} (3 × {} blocks × {}B); \
+             missing logical bytes are never zero-filled in strict mode \
+             (allow_truncated_expert_payloads = false)",
             weight_bytes.len(), need, blocks_per_proj, Q4_0_BLOCK_BYTES
         );
         anyhow::ensure!(

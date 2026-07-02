@@ -325,44 +325,20 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         k: usize,
-    ) -> SpeculativeStepResult {
+    ) -> Result<SpeculativeStepResult, crate::model::RealInferenceError> {
         let drafts = draft.draft(seed_token, k);
 
-        // Phase A: warm union of expert ids predicted by the peek
-        // pre-pass for every draft position. Use a *clone* of the
-        // KV slice so peeking does not mutate it — the verifier
-        // path is what actually advances the real cache.
-        //
-        // **Position-1+ decay fix (gist Part 1, fix #3).** The
-        // previous implementation appended zero K/V vectors for every
-        // lookahead position past the first, which left the routing
-        // pre-pass conditioned on garbage data as the speculation
-        // window $K$ grew. Instead we now compute a lightweight
-        // hidden-state approximation: for the layer the peek actually
-        // re-attends over (layer 0), we project the draft token's
-        // embedding through the layer's `wk`/`wv` matrices, apply
-        // RoPE at the correct absolute position, and append the
-        // result. That anchors `peek_experts` for every $i > 0$ on a
-        // K/V slot derived from the real candidate token rather than
-        // a zero vector, recovering prefetch accuracy for the tail of
-        // the lookahead window. For layers $\geq 1$ the peek does not
-        // re-attend (it re-uses the embedding directly), so their
-        // KV-preview slots stay untouched — feeding them anything
-        // would just waste cycles without changing the routing
-        // decision.
+        // Phase A: warm union of expert ids predicted by the
+        // lightweight peek pre-pass for every draft position. The peek
+        // is embedding-only (hardening pass C2): it reads no KV state,
+        // so no preview clone or per-position KV advance is needed —
+        // the previous full `kv.to_vec()` clone of every layer's cache
+        // plus layer-0 re-attention per draft position is gone.
         let mut union: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut kv_preview: Vec<KvCache> = kv.to_vec();
         let mut cur = seed_token;
-        for (i, &draft_tok) in drafts.iter().enumerate() {
-            for id in self.peek_experts(cur, pos + i, &kv_preview) {
+        for &draft_tok in drafts.iter() {
+            for id in self.peek_experts(cur) {
                 union.insert(id);
-            }
-            // Advance the preview cache so the next iteration's peek
-            // is conditioned on a plausible position. Only layer 0
-            // is consulted by `peek_experts`'s attention pre-pass;
-            // other layers ignore their KV slots in the peek path.
-            if i + 1 < drafts.len() {
-                self.advance_preview_kv(&mut kv_preview[0], cur, pos + i);
             }
             cur = draft_tok;
         }
@@ -382,7 +358,7 @@ impl RealModel {
         let mut cur = seed_token;
         let mut accepted_len = 0usize;
         for (i, &draft_tok) in drafts.iter().enumerate() {
-            let next = self.step(engine, cur, pos + i, kv, &greedy).await;
+            let next = self.step(engine, cur, pos + i, kv, &greedy).await?;
             accepted.push(next);
             if next != draft_tok {
                 break;
@@ -394,47 +370,10 @@ impl RealModel {
             // k == 0: still emit one verifier-produced token so
             // callers can treat `step_speculative` as a strict
             // generalisation of `step`.
-            let next = self.step(engine, seed_token, pos, kv, &greedy).await;
+            let next = self.step(engine, seed_token, pos, kv, &greedy).await?;
             accepted.push(next);
         }
-        SpeculativeStepResult { accepted, accepted_len, warmed_experts }
-    }
-
-    /// Advance the layer-0 KV preview by one position using the draft
-    /// token's embedding as a hidden-state approximation. Pure
-    /// helper — does **not** touch the real KV cache. Used by
-    /// [`Self::step_speculative`] to fix the position-1+ decay the
-    /// gist flagged: the previous "append zeros" loop polluted the
-    /// peek pre-pass for $i > 0$.
-    fn advance_preview_kv(&self, kv0: &mut KvCache, draft_tok: u32, abs_pos: usize) {
-        let x = self.embed(draft_tok);
-        let layer = &self.layers[0];
-        // Mirror the verifier's `attn_block` dispatch: MLA layers cache a
-        // single latent vector (k == v == latent), the standard path caches
-        // projected K/V. Using the matching projection keeps the peek
-        // pre-pass faithful and, critically, matches the cache width
-        // `fresh_kv_caches` allocated for this layer (MLA → `latent_dim`),
-        // so the `append` below cannot hit a `copy_from_slice` mismatch.
-        if let Some(mla) = layer.mla.as_ref() {
-            debug_assert_eq!(kv0.kv_dim, mla.latent_dim());
-            debug_assert_eq!(kv0.v_dim, mla.latent_dim());
-            mla.project_and_cache_kv(&x, abs_pos, kv0);
-            return;
-        }
-        let attn = &layer.attn;
-        debug_assert_eq!(kv0.kv_dim, attn.kv_dim());
-        debug_assert_eq!(kv0.v_dim, attn.v_proj_dim());
-        // Project K/V exactly as the verifier's `attn_block` does — the
-        // shared `project_kv` applies QKV bias, QK-Norm and partial/scaled
-        // RoPE at the same absolute position the verifier will consume
-        // this token at (`abs_pos`, i.e. `pos + i`). Using the shared
-        // helper keeps the peek pre-pass faithful and prevents the V-width
-        // (`v_proj_dim`, not `kv_dim`) and RoPE-position drift the previous
-        // hand-rolled copy introduced. Skipping Q/wo + the attention sum
-        // keeps the helper lightweight; `peek_experts` only re-reads
-        // layer 0's K/V slots.
-        let (k, v) = attn.project_kv(&x, abs_pos);
-        kv0.append(&k, &v);
+        Ok(SpeculativeStepResult { accepted, accepted_len, warmed_experts })
     }
 }
 
@@ -530,7 +469,10 @@ mod tests {
         let mut expected = Vec::new();
         let mut cur = 5u32;
         for i in 0..4 {
-            cur = main.step(&engine, cur, i, &mut kv_ref, &greedy).await;
+            cur = main
+                .step(&engine, cur, i, &mut kv_ref, &greedy)
+                .await
+                .expect("verifier step");
             expected.push(cur);
         }
 
@@ -540,7 +482,8 @@ mod tests {
         let mut kv_spec = main.fresh_kv_caches();
         let result = main
             .step_speculative(&engine, &draft, 5u32, 0, &mut kv_spec, 4)
-            .await;
+            .await
+            .expect("speculative step");
         assert!(!result.accepted.is_empty(), "must emit at least one token");
         assert!(result.accepted.len() <= 4);
         for (i, t) in result.accepted.iter().enumerate() {

@@ -248,6 +248,31 @@ impl MultiHeadLatentAttention {
     /// decode), mirroring the contract of
     /// [`crate::transformer::MultiHeadSelfAttention::forward`].
     pub fn forward(&self, x: &[f32], pos: usize, kv: &mut KvCache) -> Vec<f32> {
+        self.forward_impl(x, pos, kv, false)
+            .expect("legacy MLA path is infallible (uniform softmax fallback)")
+    }
+
+    /// Strict variant of [`Self::forward`] (hardening pass, A3 rework):
+    /// a numerically invalid softmax row is propagated as a typed
+    /// [`crate::transformer::AttentionNumericalError`] (with head and
+    /// position context) instead of being replaced by a fabricated
+    /// uniform distribution.
+    pub fn try_forward(
+        &self,
+        x: &[f32],
+        pos: usize,
+        kv: &mut KvCache,
+    ) -> Result<Vec<f32>, crate::transformer::AttentionNumericalError> {
+        self.forward_impl(x, pos, kv, true)
+    }
+
+    fn forward_impl(
+        &self,
+        x: &[f32],
+        pos: usize,
+        kv: &mut KvCache,
+        strict: bool,
+    ) -> Result<Vec<f32>, crate::transformer::AttentionNumericalError> {
         debug_assert_eq!(x.len(), self.d_model);
         debug_assert_eq!(kv.kv_dim, self.latent_dim());
 
@@ -294,7 +319,15 @@ impl MultiHeadLatentAttention {
                 }
                 scores.push(s * self.softmax_scale);
             }
-            softmax_inplace(&mut scores);
+            // A3 rework: strict mode propagates a typed error; the
+            // legacy/degraded path keeps the counted uniform fallback.
+            if strict {
+                crate::transformer::softmax_inplace_checked(&mut scores).map_err(|kind| {
+                    crate::transformer::AttentionNumericalError { head: h, pos, kind }
+                })?;
+            } else {
+                softmax_inplace(&mut scores);
+            }
             let out_h = &mut attn_out[h * d_v..(h + 1) * d_v];
             for (t, score) in scores.iter().enumerate() {
                 let head_base = h * kv_b_row;
@@ -306,7 +339,12 @@ impl MultiHeadLatentAttention {
         }
 
         // 4) Output projection.
-        matmul_row_major(&self.o_proj, &attn_out, self.d_model, self.num_heads * d_v)
+        Ok(matmul_row_major(
+            &self.o_proj,
+            &attn_out,
+            self.d_model,
+            self.num_heads * d_v,
+        ))
     }
 }
 

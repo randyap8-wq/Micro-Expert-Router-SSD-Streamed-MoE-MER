@@ -2196,6 +2196,20 @@ async fn build_bench_real_runtime(
                 .into(),
         );
     }
+    if cfg.real_transformer.allow_degraded_experts {
+        return Err(
+            "bench-real rejects real_transformer.allow_degraded_experts = true; degraded-mode \
+             benchmarks are not production measurements"
+                .into(),
+        );
+    }
+    if cfg.real_transformer.allow_truncated_expert_payloads {
+        return Err(
+            "bench-real rejects real_transformer.allow_truncated_expert_payloads = true; \
+             zero-filled truncated expert payloads are not production measurements"
+                .into(),
+        );
+    }
     if !cfg.real_transformer.strict_weights {
         return Err(
             "bench-real requires real_transformer.strict_weights = true; a benchmark that may \
@@ -2257,6 +2271,10 @@ async fn build_bench_real_runtime(
     if !storage.is_packed() {
         storage.warmup_fds(0..total_experts_for_files)?;
     }
+    // Root-cause guard (hardening pass, Part A2): reject an
+    // `expert_size` that disagrees with the on-disk file layout before
+    // any truncated payload can be read.
+    storage.validate_expert_file_layout(0..total_experts_for_files.min(8))?;
 
     let pipeline_depth = cfg.storage.pipeline_depth.max(1) as usize;
     let shadow_slots = cfg.storage.predict_fanout.saturating_mul(pipeline_depth);
@@ -2391,6 +2409,7 @@ async fn build_bench_real_runtime(
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
             collect_route_profile: false,
+            allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
         },
     );
     engine_builder = engine_builder.with_pipeline_depth(cfg.storage.pipeline_depth);
@@ -2813,7 +2832,7 @@ async fn run_bench_real_once(
     let mut decode_latencies_us = Vec::with_capacity(output_tokens.saturating_sub(1));
 
     for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
-        let _ = runtime
+        runtime
             .model
             .forward_token_hidden_with_timing(
                 &runtime.engine,
@@ -2822,7 +2841,7 @@ async fn run_bench_real_once(
                 &mut kv,
                 Some(&stage_timings),
             )
-            .await;
+            .await?;
         forward_evaluations += 1;
         pos += 1;
     }
@@ -2839,7 +2858,7 @@ async fn run_bench_real_once(
             &mut kv,
             Some(&stage_timings),
         )
-        .await;
+        .await?;
     forward_evaluations += 1;
     pos += 1;
     let prompt_elapsed = prompt_started.elapsed();
@@ -2870,7 +2889,7 @@ async fn run_bench_real_once(
                 &params,
                 Some(&stage_timings),
             )
-            .await;
+            .await?;
         forward_evaluations += 1;
         lm_head_evaluations += 1;
         decode_latencies_us.push(step_started.elapsed().as_micros() as u64);
@@ -3487,6 +3506,10 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     if !storage.is_packed() {
         storage.warmup_fds(0..total_experts)?;
     }
+    // Root-cause guard (hardening pass, Part A2): reject an
+    // `expert_size` that disagrees with the on-disk file layout before
+    // any truncated payload can be read.
+    storage.validate_expert_file_layout(0..total_experts.min(8))?;
 
     // Double-buffered pool (Parts 1–2): split the RAM buffers into a
     // **primary** (Buffer A) half that backs the resident LRU plus one
@@ -3573,6 +3596,23 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // the gist's "wire `LinearGate` into `serve`" ask.
     let real_model: Option<Arc<crate::model::RealModel>> = if cfg.real_transformer.enabled {
         let rt = &cfg.real_transformer;
+        if rt.allow_degraded_experts {
+            warn!(
+                "DEGRADED MODE ENABLED: real_transformer.allow_degraded_experts = true — a \
+                 failed routed/shared expert is substituted with a zero contribution instead \
+                 of failing the request. Output and all benchmark figures are \
+                 NON-AUTHORITATIVE (see degraded_expert_substitutions)."
+            );
+        }
+        if rt.allow_truncated_expert_payloads {
+            warn!(
+                "TRUNCATED-PAYLOAD TOLERANCE ENABLED: \
+                 real_transformer.allow_truncated_expert_payloads = true — quantised expert \
+                 payloads up to one page short are zero-filled instead of failing the \
+                 request. Output is NON-AUTHORITATIVE."
+            );
+        }
+        crate::inference::set_allow_truncated_expert_payloads(rt.allow_truncated_expert_payloads);
         let head_dim = if rt.head_dim == 0 {
             cfg.model.d_model / rt.num_heads
         } else {
@@ -3749,6 +3789,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
             collect_route_profile: false,
+            allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
         },
     );
     // Apply the configured look-ahead pipeline depth (`[storage]
@@ -4830,6 +4871,10 @@ async fn cmd_run(
                 cost_aware_eviction: args.cost_aware_eviction,
                 pregate_enabled: args.pregate,
                 collect_route_profile: args.profile_out.is_some(),
+                // The synthetic `run` benchmark path keeps the legacy
+                // drop-from-mixture behaviour: a corrupt synthetic
+                // expert must not abort a long streaming benchmark.
+                allow_degraded_experts: true,
             },
         );
         if let Some(gpu_cache) = args.gpu_expert_cache.clone() {

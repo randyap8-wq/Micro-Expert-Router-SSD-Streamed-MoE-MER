@@ -26,7 +26,7 @@
 //! HTTP shape doesn't change.
 
 use crate::backend::Backend;
-use crate::batch_scheduler::{BatchScheduler, RequestId};
+use crate::batch_scheduler::{BatchError, BatchScheduler, RequestId};
 use crate::config::LiveConfig;
 use crate::engine::Engine;
 use crate::metrics::Metrics;
@@ -215,6 +215,15 @@ fn append_scheduler_metrics(body: &mut Vec<u8>, scheduler: &BatchScheduler) {
             "# HELP mer_scheduler_prepass_local_warm_failures_total Local warm_with calls that failed during scheduler pre-pass.\n",
             "# TYPE mer_scheduler_prepass_local_warm_failures_total counter\n",
             "mer_scheduler_prepass_local_warm_failures_total {}\n",
+            "# HELP mer_scheduler_prepass_gate_skips_total Batches the pre-pass profitability gate skipped because measured net benefit was non-positive.\n",
+            "# TYPE mer_scheduler_prepass_gate_skips_total counter\n",
+            "mer_scheduler_prepass_gate_skips_total {}\n",
+            "# HELP mer_scheduler_prepass_useful_warm_experts_total Peeked local experts that were not resident and were actually fetched by the pre-pass warm.\n",
+            "# TYPE mer_scheduler_prepass_useful_warm_experts_total counter\n",
+            "mer_scheduler_prepass_useful_warm_experts_total {}\n",
+            "# HELP mer_scheduler_prepass_cached_predictions_total Peeked local experts that were already resident (wasted prediction work).\n",
+            "# TYPE mer_scheduler_prepass_cached_predictions_total counter\n",
+            "mer_scheduler_prepass_cached_predictions_total {}\n",
         ),
         stats.runs_total,
         stats.singleton_skips_total,
@@ -223,6 +232,9 @@ fn append_scheduler_metrics(body: &mut Vec<u8>, scheduler: &BatchScheduler) {
         stats.requested_experts_total,
         precision,
         stats.local_warm_failures_total,
+        stats.gate_skips_total,
+        stats.useful_warm_experts_total,
+        stats.cached_predictions_total,
     );
     body.extend_from_slice(metrics.as_bytes());
 }
@@ -502,6 +514,10 @@ pub enum GenerateError {
     /// retries (legacy benchmark path). Maps to a 500 — the request
     /// fails, the process survives.
     ExpertRead(String),
+    /// Real-model inference failed closed (hardening pass, Part A):
+    /// expert load/compute failure, non-finite attention, invalid
+    /// token id, or lost scheduler KV state. Maps to a 500.
+    Inference(String),
 }
 
 impl std::fmt::Display for GenerateError {
@@ -510,6 +526,7 @@ impl std::fmt::Display for GenerateError {
             GenerateError::Tokenizer(m) => write!(f, "tokenizer error: {m}"),
             GenerateError::InvalidRequest(m) => write!(f, "invalid request: {m}"),
             GenerateError::ExpertRead(m) => write!(f, "expert read error: {m}"),
+            GenerateError::Inference(m) => write!(f, "inference error: {m}"),
         }
     }
 }
@@ -725,7 +742,7 @@ async fn generate(
         // LM head. This preserves P + C - 1 forward evaluations for the
         // request that produced it.
         if let Some(tid) = pending_token {
-            let _ = request.forward_token_hidden(tid, start_pos).await;
+            request.forward_token_hidden(tid, start_pos).await?;
             start_pos += 1;
         }
 
@@ -734,14 +751,14 @@ async fn generate(
         // prompt tokens except the final hidden state that seeds completion
         // token 0.
         for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
-            let _ = request.forward_token_hidden(tid, start_pos).await;
+            request.forward_token_hidden(tid, start_pos).await?;
             start_pos += 1;
         }
         let final_prompt_pos = start_pos;
         let final_prompt = *prompt_ids.last().expect("prompt_ids checked non-empty");
         let final_hidden = request
             .forward_token_hidden(final_prompt, final_prompt_pos)
-            .await;
+            .await?;
         start_pos += 1;
         stage_timing.record_since(crate::stage_timing::TOTAL_PROMPT, prompt_started);
         let first = request.sample_hidden(&final_hidden, &params, final_prompt_pos);
@@ -773,10 +790,11 @@ async fn generate(
             while completion_ids.len() < max_tokens {
                 let remaining = max_tokens - completion_ids.len();
                 let step_k = k.min(remaining);
-                let kv = request.direct_kv();
+                let kv = request.direct_kv()?;
                 let result = model
                     .step_speculative(&state.engine, draft.as_ref(), last, start_pos, kv, step_k)
-                    .await;
+                    .await
+                    .map_err(|e| GenerateError::Inference(e.to_string()))?;
                 for &tok in &result.accepted {
                     if completion_ids.len() >= max_tokens {
                         break;
@@ -788,7 +806,7 @@ async fn generate(
             }
         } else {
             while completion_ids.len() < max_tokens {
-                let next = request.decode_step(last, start_pos, &params).await;
+                let next = request.decode_step(last, start_pos, &params).await?;
                 completion_ids.push(next);
                 last = next;
                 start_pos += 1;
@@ -796,15 +814,16 @@ async fn generate(
         }
         stage_timing.record_since(crate::stage_timing::TOTAL_DECODE, decode_started);
         let pending_token = completion_ids.last().copied();
-        let kv = request.finish();
-        save_session_kv(
-            state,
-            session_id.as_deref(),
-            kv,
-            start_pos,
-            pending_token,
-            checkout,
-        );
+        if let Some(kv) = request.finish() {
+            save_session_kv(
+                state,
+                session_id.as_deref(),
+                kv,
+                start_pos,
+                pending_token,
+                checkout,
+            );
+        }
         let post = state.engine.report();
         hits_total = post.hits.saturating_sub(pre_hits);
         misses_total = post.misses.saturating_sub(pre_misses);
@@ -906,7 +925,11 @@ impl RealRequestState {
         }
     }
 
-    async fn forward_token_hidden(&mut self, token_id: u32, pos: usize) -> Vec<f32> {
+    async fn forward_token_hidden(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+    ) -> Result<Vec<f32>, GenerateError> {
         if let (Some(scheduler), Some(id)) = (self.scheduler.as_ref(), self.request_id) {
             let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             let result = scheduler.forward_registered(id, token_id, pos).await;
@@ -916,7 +939,14 @@ impl RealRequestState {
                 started,
             );
             match result {
-                Ok(hidden) => return hidden,
+                Ok(hidden) => return Ok(hidden),
+                // Fail-closed (Part A1): a deterministic model/storage
+                // failure must surface — retrying it on the direct
+                // path would recompute the same failure against a KV
+                // cache the scheduler step may already have advanced.
+                Err(e @ BatchError::Inference(_)) => {
+                    return Err(GenerateError::Inference(e.to_string()));
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "batch scheduler forward failed; falling back to direct model path");
                 }
@@ -925,10 +955,11 @@ impl RealRequestState {
         let engine = self.engine.clone();
         let model = self.model.clone();
         let stage_timings = self.stage_timings.clone();
-        let kv = self.direct_kv();
+        let kv = self.direct_kv()?;
         model
             .forward_token_hidden_with_timing(&engine, token_id, pos, kv, stage_timings.as_deref())
             .await
+            .map_err(|e| GenerateError::Inference(e.to_string()))
     }
 
     fn ensure_scheduler_registered(&mut self) -> Option<(Arc<BatchScheduler>, RequestId)> {
@@ -962,7 +993,7 @@ impl RealRequestState {
         token_id: u32,
         pos: usize,
         params: &crate::sampling::SamplingParams,
-    ) -> u32 {
+    ) -> Result<u32, GenerateError> {
         if let Some((scheduler, id)) = self.ensure_scheduler_registered() {
             let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             let result = scheduler.step_registered(id, token_id, pos, *params).await;
@@ -972,7 +1003,12 @@ impl RealRequestState {
                 started,
             );
             match result {
-                Ok(next) => return next,
+                Ok(next) => return Ok(next),
+                // Fail-closed (Part A1): deterministic inference
+                // failures surface instead of retrying directly.
+                Err(e @ BatchError::Inference(_)) => {
+                    return Err(GenerateError::Inference(e.to_string()));
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "batch scheduler decode failed; falling back to direct model path");
                 }
@@ -981,22 +1017,39 @@ impl RealRequestState {
         let engine = self.engine.clone();
         let model = self.model.clone();
         let stage_timings = self.stage_timings.clone();
-        let kv = self.direct_kv();
+        let kv = self.direct_kv()?;
         model
             .decode_step_with_timing(&engine, token_id, pos, kv, params, stage_timings.as_deref())
             .await
+            .map_err(|e| GenerateError::Inference(e.to_string()))
     }
 
-    fn direct_kv(&mut self) -> &mut Vec<crate::transformer::KvCache> {
-        if self.kv.is_none() {
-            self.release_scheduler_to_local();
+    /// Borrow the request's local KV caches, recovering them from the
+    /// scheduler first if the request is registered. **Never fabricates
+    /// fresh KV state** (hardening pass, Part A7): once a sequence has
+    /// KV history, continuing it on empty caches would silently reset
+    /// the context and produce mathematically wrong output — if the
+    /// exact state cannot be recovered the request fails.
+    fn direct_kv(&mut self) -> Result<&mut Vec<crate::transformer::KvCache>, GenerateError> {
+        if self.kv.is_none() && !self.release_scheduler_to_local() {
+            return Err(GenerateError::Inference(
+                "scheduler could not return this request's KV state;                  refusing to continue the sequence on a fresh KV cache"
+                    .into(),
+            ));
         }
-        self.kv
-            .as_mut()
-            .expect("RealRequestState must hold local KV after release")
+        self.kv.as_mut().ok_or_else(|| {
+            GenerateError::Inference(
+                "request holds no KV state and none is registered with the scheduler".into(),
+            )
+        })
     }
 
-    fn release_scheduler_to_local(&mut self) {
+    /// Recover the registered KV state from the scheduler into
+    /// `self.kv`. Returns `false` when the request was registered but
+    /// the scheduler could not return the exact state (Part A7: the
+    /// caller must fail, never continue on fresh KV). Returns `true`
+    /// when nothing was registered or the state was recovered.
+    fn release_scheduler_to_local(&mut self) -> bool {
         if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
             let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             self.kv = scheduler.release(id);
@@ -1006,19 +1059,28 @@ impl RealRequestState {
                 started,
             );
             if self.kv.is_none() {
-                self.kv = Some(self.model.fresh_kv_caches());
+                tracing::error!(
+                    request_id = id.0,
+                    "scheduler lost this request's KV state; failing the request instead of                      resetting context"
+                );
+                return false;
             }
         }
+        true
     }
 
-    fn take_kv(&mut self) -> Vec<crate::transformer::KvCache> {
-        self.release_scheduler_to_local();
-        self.kv
-            .take()
-            .unwrap_or_else(|| self.model.fresh_kv_caches())
+    /// Take ownership of the request's KV state for session
+    /// persistence. Returns `None` when the state was lost (Part A7):
+    /// callers must skip persisting rather than store an empty cache
+    /// under a session cursor that claims history.
+    fn take_kv(&mut self) -> Option<Vec<crate::transformer::KvCache>> {
+        if !self.release_scheduler_to_local() {
+            return None;
+        }
+        self.kv.take()
     }
 
-    fn finish(mut self) -> Vec<crate::transformer::KvCache> {
+    fn finish(mut self) -> Option<Vec<crate::transformer::KvCache>> {
         self.take_kv()
     }
 }
@@ -1322,18 +1384,18 @@ async fn stream_tokens(
         let mut request = RealRequestState::new(&state, model, kv, stage_timing.timings.clone());
         let prompt_started = stage_timing.start();
         if let Some(tid) = pending_token {
-            let _ = request.forward_token_hidden(tid, pos).await;
+            request.forward_token_hidden(tid, pos).await?;
             pos += 1;
         }
         for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
-            let _ = request.forward_token_hidden(tid, pos).await;
+            request.forward_token_hidden(tid, pos).await?;
             pos += 1;
         }
         let final_prompt_pos = pos;
         let final_prompt = *prompt_ids.last().expect("prompt_ids checked non-empty");
         let hidden = request
             .forward_token_hidden(final_prompt, final_prompt_pos)
-            .await;
+            .await?;
         pos += 1;
         stage_timing.record_since(crate::stage_timing::TOTAL_PROMPT, prompt_started);
         let first = request.sample_hidden(&hidden, &params, final_prompt_pos);
@@ -1355,15 +1417,14 @@ async fn stream_tokens(
         }
     };
 
-    // Carry the cumulative completion ids so we can decode each step's
-    // *delta* (a new id may extend a multi-byte UTF-8 token from the
-    // previous one; decoding the cumulative buffer and diffing is the
-    // safe way to compute "what's new since last chunk").
+    // Incremental decoder (hardening pass, F2): each step decodes only
+    // a bounded look-behind window instead of re-decoding the entire
+    // cumulative completion and cloning the cumulative string.
     struct St {
         state: AppState,
         mode: GenMode,
         completion_ids: Vec<u32>,
-        decoded_so_far: String,
+        decoder: crate::tokenizer::StreamDecoder,
         emitted: usize,
         max_tokens: usize,
         finished_emitted: bool,
@@ -1376,7 +1437,7 @@ async fn stream_tokens(
         state,
         mode,
         completion_ids: Vec::with_capacity(max_tokens),
-        decoded_so_far: String::new(),
+        decoder: crate::tokenizer::StreamDecoder::new(),
         emitted: 0,
         max_tokens,
         finished_emitted: false,
@@ -1400,22 +1461,30 @@ async fn stream_tokens(
                 ..
             } = &mut st.mode
             {
-                let kv_take = request.take_kv();
-                let pending_token = st.completion_ids.last().copied();
-                save_session_kv(
-                    &st.state,
-                    st.session_id.as_deref(),
-                    kv_take,
-                    *position,
-                    pending_token,
-                    checkout.take(),
-                );
+                if let Some(kv_take) = request.take_kv() {
+                    let pending_token = st.completion_ids.last().copied();
+                    save_session_kv(
+                        &st.state,
+                        st.session_id.as_deref(),
+                        kv_take,
+                        *position,
+                        pending_token,
+                        checkout.take(),
+                    );
+                }
             }
             st.stage_timing.publish();
             st.finished_emitted = true;
+            // Flush any held-back (incomplete-sequence) text from the
+            // incremental decoder so the final chunk never drops
+            // trailing output (F2).
+            let tail = st
+                .decoder
+                .finish(&st.state.tokenizer)
+                .unwrap_or_default();
             return Some((
                 StreamChunk {
-                    text: String::new(),
+                    text: tail,
                     finished: true,
                     hits: 0,
                     misses: 0,
@@ -1437,9 +1506,29 @@ async fn stream_tokens(
                     n
                 } else {
                     let decode_started = st.stage_timing.start();
-                    let n = request
+                    let n = match request
                         .decode_step(*last_token, *position, &st.params)
-                        .await;
+                        .await
+                    {
+                        Ok(n) => n,
+                        Err(e) => {
+                            // Fail-closed real inference (Part A1): a
+                            // deterministic model failure ends the
+                            // stream cleanly with a final chunk instead
+                            // of continuing with corrupt output.
+                            tracing::error!(error = %e, "real stream: decode failed; ending stream");
+                            st.finished_emitted = true;
+                            return Some((
+                                StreamChunk {
+                                    text: String::new(),
+                                    finished: true,
+                                    hits: 0,
+                                    misses: 0,
+                                },
+                                st,
+                            ));
+                        }
+                    };
                     st.stage_timing
                         .record_since(crate::stage_timing::TOTAL_DECODE, decode_started);
                     *position += 1;
@@ -1485,23 +1574,17 @@ async fn stream_tokens(
         st.completion_ids.push(next);
         st.emitted += 1;
 
-        // Decode the cumulative ids and diff against what we've already
-        // sent — robust to multi-byte tokens. Tokenizer errors fall back
-        // to "no new text this step" rather than aborting the stream.
-        let new_decoded = st
-            .state
-            .tokenizer
-            .decode(&st.completion_ids)
-            .unwrap_or_else(|_| st.decoded_so_far.clone());
-        let delta = if new_decoded.starts_with(&st.decoded_so_far) {
-            new_decoded[st.decoded_so_far.len()..].to_string()
-        } else {
-            // Re-tokenized text changed earlier characters — emit the
-            // full new text and reset the cursor. Rare but possible
-            // with BPE tokenizers.
-            new_decoded.clone()
-        };
-        st.decoded_so_far = new_decoded;
+        // Incremental decode (F2): decode only the bounded look-behind
+        // window and emit the newly stable text. Tokenizer errors fall
+        // back to "no new text this step" rather than aborting the
+        // stream, matching the legacy behaviour.
+        let delta = st
+            .decoder
+            .push(&st.state.tokenizer, next)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "stream decoder failed; emitting no text this step");
+                String::new()
+            });
 
         Some((
             StreamChunk {
@@ -1844,6 +1927,7 @@ fn error_response(e: GenerateError) -> Response {
         GenerateError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
         GenerateError::Tokenizer(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         GenerateError::ExpertRead(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+        GenerateError::Inference(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
     };
     (
         status,
@@ -2783,6 +2867,48 @@ mod tests {
             let needle = format!(r#"mer_stage_events_total{{stage="{stage}"}}"#);
             assert!(metrics.contains(&needle), "missing {needle} in:\n{metrics}");
         }
+    }
+
+    /// Part A7 (KV correctness): once a request has registered KV state
+    /// with the scheduler, losing that state must fail the request —
+    /// the direct fallback must never fabricate fresh KV caches for an
+    /// in-progress sequence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_kv_loss_fails_request_instead_of_resetting_context() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let model = state.real_model.as_ref().unwrap().clone();
+        let kv = model.fresh_kv_caches();
+        let mut request = RealRequestState::new(&state, &model, kv, None);
+
+        // First decode registers the request's KV with the scheduler.
+        request
+            .decode_step(1, 0, &crate::sampling::SamplingParams::greedy())
+            .await
+            .expect("first decode succeeds");
+        let scheduler = state.batch_scheduler.as_ref().unwrap().clone();
+        let id = request.request_id.expect("request registered");
+
+        // Simulate the scheduler losing the request's KV ownership
+        // (registry lookup failure / worker crash): release it out from
+        // under the request state.
+        let stolen = scheduler.release(id);
+        assert!(stolen.is_some(), "state was registered");
+
+        // The next decode hits NotRegistered, falls back to the direct
+        // path, cannot recover the exact KV state — and must fail
+        // rather than continue on a fresh cache.
+        let err = request
+            .decode_step(2, 1, &crate::sampling::SamplingParams::greedy())
+            .await
+            .expect_err("KV loss must fail the request");
+        assert!(
+            matches!(err, GenerateError::Inference(_)),
+            "expected Inference error, got: {err}"
+        );
+        // And the request's terminal KV take must not fabricate state
+        // either: the session store must skip persisting.
+        assert!(request.finish().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

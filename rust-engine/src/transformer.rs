@@ -441,6 +441,20 @@ pub struct KvCache {
     keys_blocks: VecDeque<Box<[f32]>>,
     /// Mirrors `keys_blocks` for the value half of the cache.
     values_blocks: VecDeque<Box<[f32]>>,
+    /// Request-local free lists of K/V blocks recycled by
+    /// [`Self::evict_before`] (hardening pass, G1). Sliding-window
+    /// rotation used to destroy (volatile-zeroize + free) each evicted
+    /// block and heap-allocate a fresh one on the next boundary;
+    /// steady-state SWA decode now round-trips blocks through these
+    /// lists instead, so block-boundary tokens stop paying an
+    /// allocate+free pair. Bounded by [`FREE_BLOCKS_CAP`]. The blocks
+    /// hold stale K/V from *this request only* — the cache is
+    /// request-local, so ordinary rotation needs no zeroization;
+    /// explicit tenant/session destruction ([`Self::zeroize`])
+    /// volatile-zeroizes the free lists along with the resident
+    /// blocks.
+    free_keys: Vec<Box<[f32]>>,
+    free_values: Vec<Box<[f32]>>,
     /// Number of leading paged blocks that have been physically dropped by
     /// [`Self::evict_before`] (sliding-window KV eviction). Absolute
     /// positions keep counting from 0 via `seq_len`, but the block table is
@@ -465,6 +479,14 @@ pub struct KvCache {
 /// under one OS page for any realistic `kv_dim`.
 pub const PAGED_BLOCK_TOKENS: usize = 16;
 
+/// Maximum number of evicted K/V block pairs retained for reuse per
+/// cache (G1). Sliding-window rotation evicts at most one block per
+/// appended token, so steady-state decode needs exactly one spare;
+/// a small margin absorbs bursts (e.g. a large `evict_before` jump
+/// after prefill) without letting a long prefill park unbounded
+/// memory in the free list.
+const FREE_BLOCKS_CAP: usize = 8;
+
 impl KvCache {
     pub fn new(kv_dim: usize) -> Self {
         Self::new_kv(kv_dim, kv_dim)
@@ -479,6 +501,8 @@ impl KvCache {
         Self {
             keys_blocks: VecDeque::new(),
             values_blocks: VecDeque::new(),
+            free_keys: Vec::new(),
+            free_values: Vec::new(),
             evicted_blocks: 0,
             seq_len: 0,
             kv_dim: k_dim,
@@ -500,10 +524,27 @@ impl KvCache {
         // index `block_idx - evicted_blocks`.
         if in_block == 0 {
             debug_assert_eq!(self.keys_blocks.len(), block_idx - self.evicted_blocks);
-            self.keys_blocks
-                .push_back(vec![0.0f32; PAGED_BLOCK_TOKENS * self.kv_dim].into_boxed_slice());
-            self.values_blocks
-                .push_back(vec![0.0f32; PAGED_BLOCK_TOKENS * self.v_dim].into_boxed_slice());
+            // G1: prefer recycling a block evicted by the sliding
+            // window over a fresh heap allocation. Reused blocks are
+            // zero-filled (plain stores — the stale contents belong to
+            // this same request) so the never-read tail keeps the same
+            // all-zero contents a fresh allocation would have.
+            let kb = match self.free_keys.pop() {
+                Some(mut b) => {
+                    b.fill(0.0);
+                    b
+                }
+                None => vec![0.0f32; PAGED_BLOCK_TOKENS * self.kv_dim].into_boxed_slice(),
+            };
+            let vb = match self.free_values.pop() {
+                Some(mut b) => {
+                    b.fill(0.0);
+                    b
+                }
+                None => vec![0.0f32; PAGED_BLOCK_TOKENS * self.v_dim].into_boxed_slice(),
+            };
+            self.keys_blocks.push_back(kb);
+            self.values_blocks.push_back(vb);
         }
         // Borrow the freshly-allocated (or current) trailing block and
         // write directly into its in-place slot.
@@ -523,6 +564,8 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.keys_blocks.clear();
         self.values_blocks.clear();
+        self.free_keys.clear();
+        self.free_values.clear();
         self.evicted_blocks = 0;
         self.seq_len = 0;
     }
@@ -532,6 +575,15 @@ impl KvCache {
     /// store's `DELETE /v1/sessions/{id}` handler so that a tenant's
     /// (potentially sensitive) attention state cannot be read by a
     /// subsequent allocation that lands in the same heap region.
+    ///
+    /// This is the **explicit tenant/session destruction** path (G1):
+    /// it volatile-zeroizes the resident blocks *and* the recycled
+    /// free-list blocks (which still hold this request's stale K/V).
+    /// Ordinary same-request sliding-window rotation
+    /// ([`Self::evict_before`]) deliberately does not zeroize — the
+    /// recycled bytes never leave this request-local cache, so there
+    /// is no cross-tenant exposure to defend against on the decode
+    /// critical path.
     ///
     /// We use `std::ptr::write_volatile` to perform the zeroing
     /// writes: volatile stores are defined to have observable side
@@ -543,6 +595,8 @@ impl KvCache {
     pub fn zeroize(&mut self) {
         zeroize_blocks(self.keys_blocks.iter_mut());
         zeroize_blocks(self.values_blocks.iter_mut());
+        zeroize_blocks(self.free_keys.iter_mut());
+        zeroize_blocks(self.free_values.iter_mut());
         self.reset();
     }
 
@@ -569,6 +623,19 @@ impl KvCache {
     ///
     /// No-op for `pos == 0` and for global-attention layers (which never
     /// call this), preserving the original full-history behaviour.
+    ///
+    /// **Block reuse (G1).** Evicted blocks are not destroyed: they are
+    /// pushed onto a small request-local free list and recycled by the
+    /// next block-boundary [`Self::append`], so steady-state SWA decode
+    /// performs no allocation or deallocation at block boundaries.
+    /// Ordinary same-request rotation performs **no volatile
+    /// zeroization** — the recycled bytes never leave this
+    /// request-local cache, so the only threat zeroization would
+    /// address (cross-tenant heap reuse) does not apply; explicit
+    /// destruction ([`Self::zeroize`]) still volatile-zeroizes
+    /// everything, free list included. Absolute-position indexing is
+    /// unchanged: `evicted_blocks` keeps offsetting the block table
+    /// exactly as before.
     pub fn evict_before(&mut self, pos: usize) {
         let pos = pos.min(self.seq_len);
         // Logical block `b` (where `BLOCK = PAGED_BLOCK_TOKENS`) covers
@@ -587,16 +654,25 @@ impl KvCache {
         if blocks_to_drop == 0 {
             return;
         }
-        // Zeroize the dropped blocks before releasing them so a tenant's
-        // attention state cannot survive in a freed heap region (mirrors
-        // `zeroize`), then remove them from the front of the block table.
-        zeroize_blocks(self.keys_blocks.iter_mut().take(blocks_to_drop));
-        zeroize_blocks(self.values_blocks.iter_mut().take(blocks_to_drop));
         for _ in 0..blocks_to_drop {
-            self.keys_blocks.pop_front();
-            self.values_blocks.pop_front();
+            if let Some(b) = self.keys_blocks.pop_front() {
+                if self.free_keys.len() < FREE_BLOCKS_CAP {
+                    self.free_keys.push(b);
+                }
+            }
+            if let Some(b) = self.values_blocks.pop_front() {
+                if self.free_values.len() < FREE_BLOCKS_CAP {
+                    self.free_values.push(b);
+                }
+            }
         }
         self.evicted_blocks += blocks_to_drop;
+    }
+
+    /// Number of evicted block pairs currently parked in the reuse
+    /// free list (G1). Test/telemetry accessor.
+    pub fn free_blocks(&self) -> usize {
+        self.free_keys.len()
     }
 
     /// Get the i-th cached key as a slice of length `kv_dim`.
@@ -1360,14 +1436,54 @@ impl MultiHeadSelfAttention {
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) {
+        self.forward_into_impl(x, pos, layer_idx, kv, backend, scratch, out, timings, false)
+            .expect("legacy attention path is infallible (uniform softmax fallback)");
+    }
+
+    /// Strict variant of [`Self::forward_into_with_timing`] (A3
+    /// rework): a numerically invalid softmax row is propagated as a
+    /// typed [`AttentionNumericalError`] instead of being replaced by
+    /// a fabricated uniform distribution.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_forward_into_with_timing(
+        &self,
+        x: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut MultiHeadSelfAttentionScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Result<(), AttentionNumericalError> {
+        self.forward_into_impl(x, pos, layer_idx, kv, backend, scratch, out, timings, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_into_impl(
+        &self,
+        x: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut MultiHeadSelfAttentionScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+        strict: bool,
+    ) -> Result<(), AttentionNumericalError> {
         // The scratch path is the CPU-production path. Keep GPU behaviour
         // byte-for-byte by delegating to the existing allocating path when a
-        // GPU backend is active.
-        if backend.is_gpu() {
+        // GPU backend is active — except in strict mode: the GPU attention
+        // kernels compute their softmax on-device, where non-finite rows are
+        // neither detected nor propagated, so GPU-offloaded attention is
+        // explicitly unsupported for strict real inference and strict
+        // requests stay on the checked CPU path (A3 rework).
+        if backend.is_gpu() && !strict {
             let y = self.forward_with_timing(x, pos, layer_idx, kv, backend, timings);
             out.clear();
             out.extend_from_slice(&y);
-            return;
+            return Ok(());
         }
 
         debug_assert_eq!(x.len(), self.d_model);
@@ -1413,9 +1529,11 @@ impl MultiHeadSelfAttention {
                     kv,
                     &mut scratch.scores,
                     &mut scratch.attn_out,
+                    pos,
+                    strict,
                 )
             },
-        );
+        )?;
         self.apply_value_scale(&mut scratch.attn_out);
 
         out.resize(self.d_model, 0.0);
@@ -1423,6 +1541,7 @@ impl MultiHeadSelfAttention {
             self.wo.matvec_into(&scratch.attn_out, out);
             self.apply_o_bias(out);
         });
+        Ok(())
     }
 
     fn cpu_attend_into(
@@ -1431,7 +1550,9 @@ impl MultiHeadSelfAttention {
         kv: &KvCache,
         scores: &mut Vec<f32>,
         attn_out: &mut Vec<f32>,
-    ) {
+        pos: usize,
+        strict: bool,
+    ) -> Result<(), AttentionNumericalError> {
         attn_out.clear();
         attn_out.resize(self.attn_out_dim(), 0.0);
         let scale = 1.0 / (self.head_dim as f32).sqrt();
@@ -1466,7 +1587,18 @@ impl MultiHeadSelfAttention {
                     }
                 }
             }
-            softmax_inplace(scores);
+            // A3 rework: strict mode propagates a typed error with head
+            // and position context; degraded/legacy mode keeps the
+            // counted uniform-distribution fallback.
+            if strict {
+                softmax_inplace_checked(scores).map_err(|kind| AttentionNumericalError {
+                    head: h,
+                    pos,
+                    kind,
+                })?;
+            } else {
+                softmax_inplace(scores);
+            }
 
             let out_h = &mut attn_out[h * self.v_head_dim..(h + 1) * self.v_head_dim];
             for (idx, score) in scores.iter().enumerate() {
@@ -1479,6 +1611,7 @@ impl MultiHeadSelfAttention {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1754,23 +1887,55 @@ impl LMHead {
         params: &crate::sampling::SamplingParams,
         position: u64,
     ) -> u32 {
-        if params.is_greedy() {
-            return self.weights.greedy_argmax(hidden);
-        }
-        if params.top_k > 0 && !(params.top_p > 0.0 && params.top_p < 1.0) {
-            return self.sample_top_k(hidden, params, position);
-        }
-        let logits = self.forward(hidden);
-        crate::sampling::sample(&logits, params, position)
+        self.sample_with_timing(hidden, params, position, None)
     }
 
-    fn sample_top_k(
+    /// Timed variant of [`Self::sample`] (hardening pass, D3).
+    ///
+    /// Timing instrumentation lives *inside* each existing fast path,
+    /// so enabling timing never changes which sampling algorithm runs
+    /// or which token is returned:
+    ///
+    /// * greedy → fused projection+argmax (`greedy_argmax`; no full
+    ///   logits allocation), recorded under `LM_HEAD`;
+    /// * top-K without nucleus top-p → partial `top_k_logits`
+    ///   selection recorded under `LM_HEAD` (no full logits
+    ///   allocation), candidate sampling recorded under `SAMPLING`;
+    /// * everything else → full logits + generic sampler, recorded
+    ///   under `LM_HEAD` / `SAMPLING` respectively.
+    ///
+    /// `sample` is literally this function with `timings = None`, so
+    /// the timed and untimed paths cannot drift apart.
+    pub fn sample_with_timing(
         &self,
         hidden: &[f32],
         params: &crate::sampling::SamplingParams,
         position: u64,
+        timings: Option<&crate::stage_timing::StageTimings>,
     ) -> u32 {
-        let candidates = self.weights.top_k_logits(hidden, params.top_k);
+        use crate::stage_timing::{time_optional, LM_HEAD, SAMPLING};
+        if params.is_greedy() {
+            return time_optional(timings, LM_HEAD, || self.weights.greedy_argmax(hidden));
+        }
+        if params.top_k > 0 && !(params.top_p > 0.0 && params.top_p < 1.0) {
+            let candidates = time_optional(timings, LM_HEAD, || {
+                self.weights.top_k_logits(hidden, params.top_k)
+            });
+            return time_optional(timings, SAMPLING, || {
+                Self::sample_from_top_k_candidates(&candidates, params, position)
+            });
+        }
+        let logits = time_optional(timings, LM_HEAD, || self.forward(hidden));
+        time_optional(timings, SAMPLING, || {
+            crate::sampling::sample(&logits, params, position)
+        })
+    }
+
+    fn sample_from_top_k_candidates(
+        candidates: &[(usize, f32)],
+        params: &crate::sampling::SamplingParams,
+        position: u64,
+    ) -> u32 {
         if candidates.is_empty() {
             return 0;
         }
@@ -2102,6 +2267,46 @@ impl TransformerLayer {
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) {
+        self.attn_block_into_impl(
+            hidden, pos, layer_idx, kv, backend, scratch, out, timings, false,
+        )
+        .expect("legacy attention path is infallible (uniform softmax fallback)");
+    }
+
+    /// Strict variant of [`Self::attn_block_into_with_timing`] (A3
+    /// rework): a numerically invalid softmax row anywhere in this
+    /// layer's attention (standard MHA or MLA) is propagated as a
+    /// typed [`AttentionNumericalError`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attn_block_into_with_timing(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut TransformerLayerScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Result<(), AttentionNumericalError> {
+        self.attn_block_into_impl(
+            hidden, pos, layer_idx, kv, backend, scratch, out, timings, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attn_block_into_impl(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut TransformerLayerScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+        strict: bool,
+    ) -> Result<(), AttentionNumericalError> {
         crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
             self.rms_attn.forward_into(hidden, &mut scratch.attn_normed)
         });
@@ -2116,12 +2321,18 @@ impl TransformerLayer {
                 let attn_out = crate::stage_timing::time_optional(
                     timings,
                     crate::stage_timing::ATTENTION_SCORE_VALUE,
-                    || mla.forward(normed, pos, kv),
-                );
+                    || {
+                        if strict {
+                            mla.try_forward(normed, pos, kv)
+                        } else {
+                            Ok(mla.forward(normed, pos, kv))
+                        }
+                    },
+                )?;
                 add_residual_into(hidden, &attn_out, out);
             }
             None => {
-                self.attn.forward_into_with_timing(
+                self.attn.forward_into_impl(
                     normed,
                     pos,
                     layer_idx,
@@ -2130,13 +2341,15 @@ impl TransformerLayer {
                     &mut scratch.attn,
                     out,
                     timings,
-                );
+                    strict,
+                )?;
                 debug_assert_eq!(hidden.len(), out.len());
                 for (oi, hi) in out.iter_mut().zip(hidden.iter()) {
                     *oi += hi;
                 }
             }
         }
+        Ok(())
     }
 
     /// KV-cache width this layer needs: the MLA latent dim when latent
@@ -2356,6 +2569,26 @@ pub fn nonfinite_softmax_fallbacks() -> u64 {
 #[inline]
 pub(crate) fn record_nonfinite_softmax_fallback() {
     NONFINITE_SOFTMAX_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    NONFINITE_SOFTMAX_TL.with(|c| c.set(c.get() + 1));
+}
+
+thread_local! {
+    /// Per-thread count of non-finite softmax fallback events
+    /// (hardening pass, Part A3). The CPU attention and router softmax
+    /// loops always run on the thread driving the model forward pass,
+    /// so the real-model layer loop can snapshot this before a layer
+    /// and fail the request when the layer produced numerical
+    /// corruption — without racing concurrent requests the way the
+    /// process-global counter would.
+    static NONFINITE_SOFTMAX_TL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Current per-thread count of non-finite softmax fallback events. See
+/// [`NONFINITE_SOFTMAX_TL`]; used by the fail-closed real-model forward
+/// pass to attribute numerical corruption to a specific layer.
+#[inline]
+pub fn thread_nonfinite_softmax_events() -> u64 {
+    NONFINITE_SOFTMAX_TL.with(|c| c.get())
 }
 
 /// Serialises every test that reads or mutates the process-wide non-finite
@@ -2365,10 +2598,57 @@ pub(crate) fn record_nonfinite_softmax_fallback() {
 #[cfg(test)]
 pub(crate) static SOFTMAX_FALLBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub fn softmax_inplace(v: &mut [f32]) {
-    if v.is_empty() {
-        return;
+/// What made a softmax row numerically invalid (hardening pass, A3
+/// rework). Structural error payload propagated `softmax → attention →
+/// transformer layer → RealModel → scheduler → HTTP/CLI`; the global
+/// counters above remain telemetry only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericalErrorKind {
+    /// One or more scores were `NaN`.
+    NaNScores,
+    /// The row's maximum was not finite: either a `+inf` score or a
+    /// fully-masked row (all `-inf`). No supported architecture
+    /// produces a legitimately fully-masked *active* row here (the
+    /// attention span always includes the current position), so this
+    /// is corruption, not masking.
+    NonFiniteMax,
+}
+
+impl std::fmt::Display for NumericalErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NumericalErrorKind::NaNScores => write!(f, "NaN attention scores"),
+            NumericalErrorKind::NonFiniteMax => write!(f, "non-finite attention score maximum"),
+        }
     }
+}
+
+/// Typed numerical-corruption error for one attention head's softmax
+/// row (A3 rework). Carries the head and query position; the model
+/// layer wraps it with layer and architecture context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionNumericalError {
+    pub head: usize,
+    pub pos: usize,
+    pub kind: NumericalErrorKind,
+}
+
+impl std::fmt::Display for AttentionNumericalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} in attention head {} at position {}",
+            self.kind, self.head, self.pos
+        )
+    }
+}
+
+impl std::error::Error for AttentionNumericalError {}
+
+/// Detect a numerically invalid softmax row. Returns the row's finite
+/// maximum on success.
+#[inline]
+fn softmax_row_check(v: &[f32]) -> Result<f32, NumericalErrorKind> {
     let mut max = f32::NEG_INFINITY;
     let mut saw_nan = false;
     for &x in v.iter() {
@@ -2378,16 +2658,17 @@ pub fn softmax_inplace(v: &mut [f32]) {
             max = x;
         }
     }
-    // Non-finite fallback: a stray `NaN`, a `+inf`, or a fully-masked row
-    // (every logit `-inf`, leaving `max == -inf`) cannot yield a meaningful
-    // distribution, so emit a uniform distribution rather than letting the
-    // `x - max` subtraction produce `NaN`s that propagate downstream.
-    if saw_nan || !max.is_finite() {
-        record_nonfinite_softmax_fallback();
-        let uniform = 1.0 / v.len() as f32;
-        v.iter_mut().for_each(|x| *x = uniform);
-        return;
+    if saw_nan {
+        Err(NumericalErrorKind::NaNScores)
+    } else if !max.is_finite() {
+        Err(NumericalErrorKind::NonFiniteMax)
+    } else {
+        Ok(max)
     }
+}
+
+#[inline]
+fn softmax_normalize(v: &mut [f32], max: f32) {
     let mut sum = 0.0f32;
     for x in v.iter_mut() {
         *x = (*x - max).exp();
@@ -2396,6 +2677,47 @@ pub fn softmax_inplace(v: &mut [f32]) {
     if sum > 0.0 {
         for x in v.iter_mut() {
             *x /= sum;
+        }
+    }
+}
+
+/// **Strict** numerically-stable softmax, in place (A3 rework): a
+/// `NaN`/`+inf` score or a fully-masked row is returned as a typed
+/// error instead of being converted into a fabricated uniform
+/// distribution. The row is left unmodified on error. The telemetry
+/// counters are still bumped so operators can watch the event rate,
+/// but correctness never depends on reading them.
+pub fn softmax_inplace_checked(v: &mut [f32]) -> Result<(), NumericalErrorKind> {
+    if v.is_empty() {
+        return Ok(());
+    }
+    match softmax_row_check(v) {
+        Ok(max) => {
+            softmax_normalize(v, max);
+            Ok(())
+        }
+        Err(kind) => {
+            record_nonfinite_softmax_fallback();
+            Err(kind)
+        }
+    }
+}
+
+/// Legacy numerically-stable softmax, in place: a non-finite row is
+/// replaced with a uniform distribution (and counted). Retained for
+/// the synthetic benchmark path and the development-only degraded
+/// mode; strict real inference goes through
+/// [`softmax_inplace_checked`] and fails the request instead.
+pub fn softmax_inplace(v: &mut [f32]) {
+    if v.is_empty() {
+        return;
+    }
+    match softmax_row_check(v) {
+        Ok(max) => softmax_normalize(v, max),
+        Err(_) => {
+            record_nonfinite_softmax_fallback();
+            let uniform = 1.0 / v.len() as f32;
+            v.iter_mut().for_each(|x| *x = uniform);
         }
     }
 }
@@ -3140,6 +3462,71 @@ mod tests {
         }
     }
 
+    /// D3: enabling stage timing must not change algorithm selection,
+    /// the returned token, or numerical behaviour — for greedy, top-K
+    /// only, top-K + top-p (nucleus), and full-distribution sampling.
+    /// Greedy and top-K-only timed paths must record `lm_head` timing
+    /// without going through the full-logits sampler.
+    #[test]
+    fn lm_head_sample_with_timing_selects_same_algorithm_and_token() {
+        let d_model = 3;
+        let vocab = 11;
+        let weights: Vec<f32> = (0..vocab * d_model)
+            .map(|i| ((i % 13) as f32 - 6.0) / 4.0)
+            .collect();
+        let head = LMHead::new(weights, vocab, d_model);
+        let hidden = [0.4, -1.1, 0.9];
+        let param_sets = [
+            // greedy (fused argmax fast path)
+            crate::sampling::SamplingParams::greedy(),
+            // top-K only (partial-selection fast path)
+            crate::sampling::SamplingParams {
+                temperature: 0.7,
+                top_p: 1.0,
+                top_k: 4,
+                seed: 99,
+            },
+            // top-K + nucleus top-p (generic full-logits path)
+            crate::sampling::SamplingParams {
+                temperature: 0.9,
+                top_p: 0.6,
+                top_k: 4,
+                seed: 7,
+            },
+            // pure temperature sampling (generic full-logits path)
+            crate::sampling::SamplingParams {
+                temperature: 1.3,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 3,
+            },
+        ];
+        for params in &param_sets {
+            let timings = crate::stage_timing::StageTimings::default();
+            for pos in 0..32u64 {
+                let untimed = head.sample(&hidden, params, pos);
+                let timed = head.sample_with_timing(&hidden, params, pos, Some(&timings));
+                assert_eq!(
+                    timed, untimed,
+                    "timed/untimed token mismatch for params {params:?} at pos {pos}"
+                );
+            }
+            let snap = timings.snapshot();
+            let lm_head = snap.get("lm_head").expect("lm_head stage recorded");
+            assert_eq!(lm_head.count, 32, "one lm_head sample per position");
+            if params.is_greedy() {
+                // Fused argmax path: no separate sampling stage.
+                assert!(
+                    !snap.contains_key("sampling"),
+                    "greedy fast path must not record a sampling stage"
+                );
+            } else {
+                let sampling = snap.get("sampling").expect("sampling stage recorded");
+                assert_eq!(sampling.count, 32);
+            }
+        }
+    }
+
     #[test]
     fn add_residual_is_elementwise() {
         let a = vec![1.0, 2.0, 3.0];
@@ -3517,6 +3904,79 @@ mod tests {
             assert_eq!(kv.key(p), &k[..], "evicted a still-windowed key at {p}");
             assert_eq!(kv.value(p), &v[..], "evicted a still-windowed value at {p}");
         }
+    }
+
+    /// G1: sliding-window rotation recycles evicted blocks through the
+    /// request-local free list — steady-state decode allocates no new
+    /// blocks at block boundaries — and the free list stays bounded.
+    #[test]
+    fn swa_eviction_reuses_blocks_via_free_list() {
+        let kv_dim = 4;
+        let window = 2 * PAGED_BLOCK_TOKENS;
+        let mut kv = KvCache::new(kv_dim);
+        // Prefill past the window so eviction starts happening.
+        for p in 0..(4 * PAGED_BLOCK_TOKENS) {
+            kv.append(&[p as f32; 4], &[p as f32; 4]);
+            kv.evict_before(p.saturating_sub(window));
+        }
+        // Rotation has parked at least one evicted block for reuse.
+        assert!(kv.free_blocks() >= 1, "evicted blocks must be recycled");
+        // Crossing the next block boundary drains the free list instead
+        // of allocating.
+        let free_before = kv.free_blocks();
+        let start = kv.seq_len;
+        for p in start..(start + PAGED_BLOCK_TOKENS) {
+            kv.append(&[p as f32; 4], &[p as f32; 4]);
+            kv.evict_before(p.saturating_sub(window));
+        }
+        assert!(
+            kv.free_blocks() <= free_before,
+            "block-boundary append must reuse a freed block"
+        );
+        // Free list is bounded even under a huge eviction jump.
+        for p in kv.seq_len..(kv.seq_len + 32 * PAGED_BLOCK_TOKENS) {
+            kv.append(&[p as f32; 4], &[p as f32; 4]);
+        }
+        kv.evict_before(kv.seq_len); // evict everything
+        assert!(kv.free_blocks() <= 8, "free list must stay bounded");
+        // Absolute-position indexing survives reuse: appended positions
+        // after full eviction still round-trip.
+        let p = kv.seq_len;
+        kv.append(&[p as f32; 4], &[p as f32; 4]);
+        assert_eq!(kv.key(p), &[p as f32; 4][..]);
+        // Explicit destruction wipes the free list too.
+        kv.zeroize();
+        assert_eq!(kv.free_blocks(), 0);
+        assert_eq!(kv.num_blocks(), 0);
+    }
+
+    /// G1 micro-benchmark: p50/p99 append latency at block boundaries
+    /// under sliding-window rotation. Ignored by default (timing-
+    /// sensitive); run with
+    /// `cargo test --release -- --ignored kv_block_boundary_latency`.
+    #[test]
+    #[ignore]
+    fn kv_block_boundary_latency_p50_p99() {
+        let kv_dim = 1024; // Mixtral-class kv_dim (8 KV heads × 128)
+        let window = 8 * PAGED_BLOCK_TOKENS;
+        let mut kv = KvCache::new(kv_dim);
+        let k = vec![0.5f32; kv_dim];
+        let v = vec![0.25f32; kv_dim];
+        let mut boundary_ns: Vec<u64> = Vec::new();
+        for p in 0..(512 * PAGED_BLOCK_TOKENS) {
+            let at_boundary = p % PAGED_BLOCK_TOKENS == 0;
+            let t0 = std::time::Instant::now();
+            kv.append(&k, &v);
+            kv.evict_before(p.saturating_sub(window));
+            let dt = t0.elapsed().as_nanos() as u64;
+            if at_boundary && p > window {
+                boundary_ns.push(dt);
+            }
+        }
+        boundary_ns.sort_unstable();
+        let p50 = boundary_ns[boundary_ns.len() / 2];
+        let p99 = boundary_ns[boundary_ns.len() * 99 / 100];
+        println!("kv block-boundary append+evict: p50={p50}ns p99={p99}ns (n={})", boundary_ns.len());
     }
 
     #[test]

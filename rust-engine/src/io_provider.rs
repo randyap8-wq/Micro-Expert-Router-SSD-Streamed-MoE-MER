@@ -659,6 +659,80 @@ impl NvmeStorage {
         Ok(Arc::new(file))
     }
 
+    /// Startup validation: the configured `expert_size` must match the
+    /// actual on-disk expert file layout.
+    ///
+    /// The engine reads exactly `expert_size` bytes from offset 0 of
+    /// each expert file and then strips any Unified Tensor Header page.
+    /// If the on-disk file is *larger* than `expert_size`, the read
+    /// silently drops the file's tail — historically this manifested as
+    /// real Mixtral Q4_0 payloads arriving exactly one page (4,096
+    /// bytes) short, because `expert_size` had been configured as the
+    /// bare weight-payload size while the converter prepends a
+    /// page-padded UTH. Those missing bytes were then zero-filled by
+    /// the legacy tolerance path, silently corrupting the expert's last
+    /// Q4 blocks. This check turns that misconfiguration into a precise
+    /// startup error instead.
+    ///
+    /// Probes the first expert id in `sample_ids` whose backing file
+    /// exists (ids whose files are absent are skipped — sparse layouts
+    /// are legal). No-ops when a packed blob is attached (the packed
+    /// manifest slot size is validated separately) or when no sampled
+    /// file exists.
+    pub fn validate_expert_file_layout(
+        &self,
+        sample_ids: impl IntoIterator<Item = u32>,
+    ) -> io::Result<()> {
+        if self.packed.is_some() {
+            return Ok(());
+        }
+        let expert_size = self.cfg.expert_size as u64;
+        let block_align = self.cfg.block_align as u64;
+        for id in sample_ids {
+            let path = self.expert_path(id);
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let file_size = meta.len();
+            if file_size == expert_size {
+                return Ok(());
+            }
+            // Distinguish the classic misconfiguration (expert_size
+            // excludes the converter's page-padded UTH prefix) from a
+            // generic size mismatch by probing the file head for a UTH.
+            let mut head = vec![0u8; UTH_BYTES];
+            let has_uth = File::open(&path)
+                .and_then(|f| f.read_at(&mut head, 0))
+                .map(|n| n >= UTH_BYTES && TensorHeader::probe(&head[..n]).is_some())
+                .unwrap_or(false);
+            let hint = if has_uth && file_size == expert_size + block_align {
+                format!(
+                    " The file carries a Unified Tensor Header page: model.expert_size \
+                     appears to be the bare weight-payload size and must include the \
+                     {block_align}-byte UTH page (set expert_size = {file_size}, i.e. the \
+                     converter metadata.json value)."
+                )
+            } else if has_uth {
+                " The file carries a Unified Tensor Header page; expert_size must equal \
+                 the full file size written by the converter (header page + payload)."
+                    .to_string()
+            } else {
+                String::new()
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expert file {} is {file_size} bytes but model.expert_size is \
+                     {expert_size}; the engine reads exactly expert_size bytes per expert, \
+                     so a mismatch truncates or over-reads every expert payload.{hint}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Get (and cache) the file handle for an expert id, bounded by the
     /// LRU fd cache (see [`Self::files`]).
     fn fd_for(&self, id: u32) -> io::Result<Arc<File>> {
@@ -2559,6 +2633,71 @@ mod tests {
                 assert!(storage.files.lock().len() <= 2);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Part A2 root-cause guard: `validate_expert_file_layout` rejects
+    /// an `expert_size` that disagrees with the on-disk file size, with
+    /// a targeted diagnosis when the file carries a page-padded UTH and
+    /// `expert_size` is exactly the bare payload size (the historical
+    /// one-page-short truncation), and accepts a matching layout.
+    #[test]
+    fn validate_expert_file_layout_detects_expert_size_uth_mismatch() {
+        let dir = tempdir("layoutval");
+        let block = 4096usize;
+        let payload = 2 * block;
+        // Write expert_0.bin = page-padded UTH prefix + payload, the
+        // converter's emit_uth layout.
+        let mut blob = Vec::with_capacity(block + payload);
+        crate::tensor_header::TensorHeader::for_swiglu_expert(
+            crate::inference::WeightDtype::Q4_0,
+            64,
+            128,
+        )
+        .write_padded(block, &mut blob);
+        blob.resize(block + payload, 0xAB);
+        std::fs::write(dir.join("expert_0.bin"), &blob).unwrap();
+
+        let mk = |expert_size: usize| {
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.clone(),
+                expert_size,
+                block_align: block,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .unwrap()
+        };
+
+        // Misconfigured: expert_size excludes the UTH page → precise error.
+        let err = mk(payload)
+            .validate_expert_file_layout(0..1)
+            .expect_err("payload-only expert_size must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unified Tensor Header"),
+            "error must diagnose the UTH root cause: {msg}"
+        );
+
+        // Correct: expert_size covers header page + payload → Ok.
+        mk(block + payload)
+            .validate_expert_file_layout(0..1)
+            .expect("full file size must validate");
+
+        // Corrupt header magic: probe fails, generic mismatch error
+        // (no UTH diagnosis) is still surfaced for a size mismatch.
+        let mut corrupt = blob.clone();
+        corrupt[0..4].copy_from_slice(b"XXXX");
+        std::fs::write(dir.join("expert_0.bin"), &corrupt).unwrap();
+        let err = mk(payload)
+            .validate_expert_file_layout(0..1)
+            .expect_err("size mismatch must still be rejected with a corrupt header");
+        assert!(err.to_string().contains("model.expert_size"));
+
+        // Missing files are skipped (sparse layouts are legal).
+        mk(payload)
+            .validate_expert_file_layout(5..6)
+            .expect("absent sample files are skipped");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
