@@ -667,9 +667,18 @@ pub enum RealInferenceError {
     InvalidTokenId { token_id: u32, vocab_size: usize },
     /// A required routed or shared expert failed to load or execute.
     MoeStep(MoeStepError),
-    /// An active attention/softmax row produced unexpected NaN or
-    /// infinity — numerical corruption, not a valid masked row.
-    NonFiniteSoftmax { layer: usize, pos: usize },
+    /// An active attention softmax row produced unexpected NaN or
+    /// infinity — numerical corruption, not a valid masked row (A3
+    /// rework: propagated structurally from
+    /// `softmax → attention → transformer layer → RealModel`, with
+    /// full head/position/architecture context).
+    NonFiniteAttention {
+        layer: usize,
+        head: usize,
+        pos: usize,
+        architecture: crate::architecture::Architecture,
+        kind: crate::transformer::NumericalErrorKind,
+    },
     /// A scheduler-registered KV state could not be recovered; the
     /// request must fail rather than continue on a fresh KV cache.
     KvStateLost(String),
@@ -686,9 +695,16 @@ impl std::fmt::Display for RealInferenceError {
                 "invalid token id {token_id}: model vocab_size is {vocab_size}"
             ),
             RealInferenceError::MoeStep(e) => write!(f, "moe step failed: {e}"),
-            RealInferenceError::NonFiniteSoftmax { layer, pos } => write!(
+            RealInferenceError::NonFiniteAttention {
+                layer,
+                head,
+                pos,
+                architecture,
+                kind,
+            } => write!(
                 f,
-                "non-finite attention/softmax detected at layer {layer}, position {pos}"
+                "non-finite attention detected: {kind} at layer {layer}, head {head}, \
+                 position {pos} (architecture {architecture:?})"
             ),
             RealInferenceError::KvStateLost(m) => write!(f, "kv state lost: {m}"),
         }
@@ -2478,35 +2494,52 @@ impl RealModel {
         let backend = crate::backend::current();
         let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
         let mut next_x = Vec::with_capacity(self.config.d_model);
-        // Fail-closed numerical check (hardening pass, Part A3): the CPU
-        // attention and router softmax loops run synchronously on this
-        // thread between awaits, so a per-thread event counter snapshot
-        // taken at the top of each layer attributes any non-finite
-        // softmax fallback (NaN / ±inf in an active row) to that layer.
-        // Strict production mode fails the request instead of serving
-        // output built on a fabricated uniform attention distribution.
-        // The development-only `allow_degraded_experts` mode keeps the
-        // legacy uniform-fallback behaviour (the process-global
-        // `nonfinite_softmax_fallbacks` counter still records it).
-        // Note: no supported architecture produces an intentionally
-        // fully-masked *active* row here — the attention span always
-        // includes the current position — so any non-finite row is
-        // numerical corruption. GPU-offloaded attention performs its
-        // softmax on-device and is not covered by this check.
+        // Fail-closed numerical propagation (hardening pass, A3
+        // rework): strict production mode routes attention through the
+        // `try_` variants, which return a typed
+        // [`crate::transformer::AttentionNumericalError`] from the
+        // softmax itself — no side-channel counters are consulted for
+        // correctness (the global `nonfinite_softmax_fallbacks`
+        // counter remains telemetry only). The development-only
+        // `allow_degraded_experts` mode keeps the legacy
+        // uniform-fallback behaviour. GPU-offloaded attention performs
+        // its softmax on-device where non-finite rows cannot be
+        // detected; strict mode therefore always uses the checked CPU
+        // attention path (see `forward_into_impl`).
         let strict_numerics = !engine.allow_degraded_experts();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let nonfinite_before = crate::transformer::thread_nonfinite_softmax_events();
             // Attention sub-block.
-            layer.attn_block_into_with_timing(
-                &x,
-                pos,
-                layer_idx,
-                &mut kv[layer_idx],
-                &*backend,
-                &mut layer_scratch,
-                &mut next_x,
-                timings,
-            );
+            if strict_numerics {
+                layer
+                    .try_attn_block_into_with_timing(
+                        &x,
+                        pos,
+                        layer_idx,
+                        &mut kv[layer_idx],
+                        &*backend,
+                        &mut layer_scratch,
+                        &mut next_x,
+                        timings,
+                    )
+                    .map_err(|e| RealInferenceError::NonFiniteAttention {
+                        layer: layer_idx,
+                        head: e.head,
+                        pos: e.pos,
+                        architecture: self.config.architecture,
+                        kind: e.kind,
+                    })?;
+            } else {
+                layer.attn_block_into_with_timing(
+                    &x,
+                    pos,
+                    layer_idx,
+                    &mut kv[layer_idx],
+                    &*backend,
+                    &mut layer_scratch,
+                    &mut next_x,
+                    timings,
+                );
+            }
             std::mem::swap(&mut x, &mut next_x);
             next_x.clear();
             // Sliding-Window-Attention layers (MiMo-V2 SWA layers, GPT-OSS
@@ -2524,14 +2557,6 @@ impl RealModel {
             // prefix) bypass the SSD-streamed expert path entirely: run the
             // resident SwiGLU FFN and skip routing.
             if let Some(dense_out) = layer.dense_forward_with_timing(&x, timings) {
-                if strict_numerics
-                    && crate::transformer::thread_nonfinite_softmax_events() != nonfinite_before
-                {
-                    return Err(RealInferenceError::NonFiniteSoftmax {
-                        layer: layer_idx,
-                        pos,
-                    });
-                }
                 x = dense_out;
                 continue;
             }
@@ -2551,17 +2576,6 @@ impl RealModel {
             // already baked into RoPE inside `attn_block`.
             let token_idx =
                 (pos as u64).wrapping_mul(self.config.num_layers as u64) + layer_idx as u64;
-            // Check before the await: attention and the router softmax
-            // both ran synchronously on this thread above, while the
-            // task may resume on a different thread afterwards.
-            if strict_numerics
-                && crate::transformer::thread_nonfinite_softmax_events() != nonfinite_before
-            {
-                return Err(RealInferenceError::NonFiniteSoftmax {
-                    layer: layer_idx,
-                    pos,
-                });
-            }
             engine
                 .moe_step_weighted_into_with_timing(
                     token_idx,
@@ -4743,11 +4757,20 @@ mod tests {
             .await
             .expect_err("NaN attention must fail the request in strict mode");
         match err {
-            RealInferenceError::NonFiniteSoftmax { layer, pos } => {
+            RealInferenceError::NonFiniteAttention {
+                layer,
+                head,
+                pos,
+                architecture,
+                kind,
+            } => {
                 assert_eq!(layer, 0);
+                assert_eq!(head, 0);
                 assert_eq!(pos, 0);
+                assert_eq!(architecture, cfg.architecture);
+                assert_eq!(kind, crate::transformer::NumericalErrorKind::NaNScores);
             }
-            other => panic!("expected NonFiniteSoftmax, got: {other}"),
+            other => panic!("expected NonFiniteAttention, got: {other}"),
         }
     }
 

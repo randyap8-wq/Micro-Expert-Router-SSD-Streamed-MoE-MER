@@ -1436,14 +1436,54 @@ impl MultiHeadSelfAttention {
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) {
+        self.forward_into_impl(x, pos, layer_idx, kv, backend, scratch, out, timings, false)
+            .expect("legacy attention path is infallible (uniform softmax fallback)");
+    }
+
+    /// Strict variant of [`Self::forward_into_with_timing`] (A3
+    /// rework): a numerically invalid softmax row is propagated as a
+    /// typed [`AttentionNumericalError`] instead of being replaced by
+    /// a fabricated uniform distribution.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_forward_into_with_timing(
+        &self,
+        x: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut MultiHeadSelfAttentionScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Result<(), AttentionNumericalError> {
+        self.forward_into_impl(x, pos, layer_idx, kv, backend, scratch, out, timings, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_into_impl(
+        &self,
+        x: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut MultiHeadSelfAttentionScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+        strict: bool,
+    ) -> Result<(), AttentionNumericalError> {
         // The scratch path is the CPU-production path. Keep GPU behaviour
         // byte-for-byte by delegating to the existing allocating path when a
-        // GPU backend is active.
-        if backend.is_gpu() {
+        // GPU backend is active — except in strict mode: the GPU attention
+        // kernels compute their softmax on-device, where non-finite rows are
+        // neither detected nor propagated, so GPU-offloaded attention is
+        // explicitly unsupported for strict real inference and strict
+        // requests stay on the checked CPU path (A3 rework).
+        if backend.is_gpu() && !strict {
             let y = self.forward_with_timing(x, pos, layer_idx, kv, backend, timings);
             out.clear();
             out.extend_from_slice(&y);
-            return;
+            return Ok(());
         }
 
         debug_assert_eq!(x.len(), self.d_model);
@@ -1489,9 +1529,11 @@ impl MultiHeadSelfAttention {
                     kv,
                     &mut scratch.scores,
                     &mut scratch.attn_out,
+                    pos,
+                    strict,
                 )
             },
-        );
+        )?;
         self.apply_value_scale(&mut scratch.attn_out);
 
         out.resize(self.d_model, 0.0);
@@ -1499,6 +1541,7 @@ impl MultiHeadSelfAttention {
             self.wo.matvec_into(&scratch.attn_out, out);
             self.apply_o_bias(out);
         });
+        Ok(())
     }
 
     fn cpu_attend_into(
@@ -1507,7 +1550,9 @@ impl MultiHeadSelfAttention {
         kv: &KvCache,
         scores: &mut Vec<f32>,
         attn_out: &mut Vec<f32>,
-    ) {
+        pos: usize,
+        strict: bool,
+    ) -> Result<(), AttentionNumericalError> {
         attn_out.clear();
         attn_out.resize(self.attn_out_dim(), 0.0);
         let scale = 1.0 / (self.head_dim as f32).sqrt();
@@ -1542,7 +1587,18 @@ impl MultiHeadSelfAttention {
                     }
                 }
             }
-            softmax_inplace(scores);
+            // A3 rework: strict mode propagates a typed error with head
+            // and position context; degraded/legacy mode keeps the
+            // counted uniform-distribution fallback.
+            if strict {
+                softmax_inplace_checked(scores).map_err(|kind| AttentionNumericalError {
+                    head: h,
+                    pos,
+                    kind,
+                })?;
+            } else {
+                softmax_inplace(scores);
+            }
 
             let out_h = &mut attn_out[h * self.v_head_dim..(h + 1) * self.v_head_dim];
             for (idx, score) in scores.iter().enumerate() {
@@ -1555,6 +1611,7 @@ impl MultiHeadSelfAttention {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -2210,6 +2267,46 @@ impl TransformerLayer {
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) {
+        self.attn_block_into_impl(
+            hidden, pos, layer_idx, kv, backend, scratch, out, timings, false,
+        )
+        .expect("legacy attention path is infallible (uniform softmax fallback)");
+    }
+
+    /// Strict variant of [`Self::attn_block_into_with_timing`] (A3
+    /// rework): a numerically invalid softmax row anywhere in this
+    /// layer's attention (standard MHA or MLA) is propagated as a
+    /// typed [`AttentionNumericalError`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attn_block_into_with_timing(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut TransformerLayerScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Result<(), AttentionNumericalError> {
+        self.attn_block_into_impl(
+            hidden, pos, layer_idx, kv, backend, scratch, out, timings, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attn_block_into_impl(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut TransformerLayerScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+        strict: bool,
+    ) -> Result<(), AttentionNumericalError> {
         crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
             self.rms_attn.forward_into(hidden, &mut scratch.attn_normed)
         });
@@ -2224,12 +2321,18 @@ impl TransformerLayer {
                 let attn_out = crate::stage_timing::time_optional(
                     timings,
                     crate::stage_timing::ATTENTION_SCORE_VALUE,
-                    || mla.forward(normed, pos, kv),
-                );
+                    || {
+                        if strict {
+                            mla.try_forward(normed, pos, kv)
+                        } else {
+                            Ok(mla.forward(normed, pos, kv))
+                        }
+                    },
+                )?;
                 add_residual_into(hidden, &attn_out, out);
             }
             None => {
-                self.attn.forward_into_with_timing(
+                self.attn.forward_into_impl(
                     normed,
                     pos,
                     layer_idx,
@@ -2238,13 +2341,15 @@ impl TransformerLayer {
                     &mut scratch.attn,
                     out,
                     timings,
-                );
+                    strict,
+                )?;
                 debug_assert_eq!(hidden.len(), out.len());
                 for (oi, hi) in out.iter_mut().zip(hidden.iter()) {
                     *oi += hi;
                 }
             }
         }
+        Ok(())
     }
 
     /// KV-cache width this layer needs: the MLA latent dim when latent
@@ -2493,10 +2598,57 @@ pub fn thread_nonfinite_softmax_events() -> u64 {
 #[cfg(test)]
 pub(crate) static SOFTMAX_FALLBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub fn softmax_inplace(v: &mut [f32]) {
-    if v.is_empty() {
-        return;
+/// What made a softmax row numerically invalid (hardening pass, A3
+/// rework). Structural error payload propagated `softmax → attention →
+/// transformer layer → RealModel → scheduler → HTTP/CLI`; the global
+/// counters above remain telemetry only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericalErrorKind {
+    /// One or more scores were `NaN`.
+    NaNScores,
+    /// The row's maximum was not finite: either a `+inf` score or a
+    /// fully-masked row (all `-inf`). No supported architecture
+    /// produces a legitimately fully-masked *active* row here (the
+    /// attention span always includes the current position), so this
+    /// is corruption, not masking.
+    NonFiniteMax,
+}
+
+impl std::fmt::Display for NumericalErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NumericalErrorKind::NaNScores => write!(f, "NaN attention scores"),
+            NumericalErrorKind::NonFiniteMax => write!(f, "non-finite attention score maximum"),
+        }
     }
+}
+
+/// Typed numerical-corruption error for one attention head's softmax
+/// row (A3 rework). Carries the head and query position; the model
+/// layer wraps it with layer and architecture context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionNumericalError {
+    pub head: usize,
+    pub pos: usize,
+    pub kind: NumericalErrorKind,
+}
+
+impl std::fmt::Display for AttentionNumericalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} in attention head {} at position {}",
+            self.kind, self.head, self.pos
+        )
+    }
+}
+
+impl std::error::Error for AttentionNumericalError {}
+
+/// Detect a numerically invalid softmax row. Returns the row's finite
+/// maximum on success.
+#[inline]
+fn softmax_row_check(v: &[f32]) -> Result<f32, NumericalErrorKind> {
     let mut max = f32::NEG_INFINITY;
     let mut saw_nan = false;
     for &x in v.iter() {
@@ -2506,16 +2658,17 @@ pub fn softmax_inplace(v: &mut [f32]) {
             max = x;
         }
     }
-    // Non-finite fallback: a stray `NaN`, a `+inf`, or a fully-masked row
-    // (every logit `-inf`, leaving `max == -inf`) cannot yield a meaningful
-    // distribution, so emit a uniform distribution rather than letting the
-    // `x - max` subtraction produce `NaN`s that propagate downstream.
-    if saw_nan || !max.is_finite() {
-        record_nonfinite_softmax_fallback();
-        let uniform = 1.0 / v.len() as f32;
-        v.iter_mut().for_each(|x| *x = uniform);
-        return;
+    if saw_nan {
+        Err(NumericalErrorKind::NaNScores)
+    } else if !max.is_finite() {
+        Err(NumericalErrorKind::NonFiniteMax)
+    } else {
+        Ok(max)
     }
+}
+
+#[inline]
+fn softmax_normalize(v: &mut [f32], max: f32) {
     let mut sum = 0.0f32;
     for x in v.iter_mut() {
         *x = (*x - max).exp();
@@ -2524,6 +2677,47 @@ pub fn softmax_inplace(v: &mut [f32]) {
     if sum > 0.0 {
         for x in v.iter_mut() {
             *x /= sum;
+        }
+    }
+}
+
+/// **Strict** numerically-stable softmax, in place (A3 rework): a
+/// `NaN`/`+inf` score or a fully-masked row is returned as a typed
+/// error instead of being converted into a fabricated uniform
+/// distribution. The row is left unmodified on error. The telemetry
+/// counters are still bumped so operators can watch the event rate,
+/// but correctness never depends on reading them.
+pub fn softmax_inplace_checked(v: &mut [f32]) -> Result<(), NumericalErrorKind> {
+    if v.is_empty() {
+        return Ok(());
+    }
+    match softmax_row_check(v) {
+        Ok(max) => {
+            softmax_normalize(v, max);
+            Ok(())
+        }
+        Err(kind) => {
+            record_nonfinite_softmax_fallback();
+            Err(kind)
+        }
+    }
+}
+
+/// Legacy numerically-stable softmax, in place: a non-finite row is
+/// replaced with a uniform distribution (and counted). Retained for
+/// the synthetic benchmark path and the development-only degraded
+/// mode; strict real inference goes through
+/// [`softmax_inplace_checked`] and fails the request instead.
+pub fn softmax_inplace(v: &mut [f32]) {
+    if v.is_empty() {
+        return;
+    }
+    match softmax_row_check(v) {
+        Ok(max) => softmax_normalize(v, max),
+        Err(_) => {
+            record_nonfinite_softmax_fallback();
+            let uniform = 1.0 / v.len() as f32;
+            v.iter_mut().for_each(|x| *x = uniform);
         }
     }
 }
