@@ -1702,6 +1702,39 @@ fn summarise_output_like_cpu(token_idx: u64, expert_id: u32, y: &[f32]) -> Infer
     }
 }
 
+struct FfnTraceConfig {
+    trace_every: u64,
+    slow_us: u64,
+}
+
+fn get_ffn_trace_config() -> Option<&'static FfnTraceConfig> {
+    static CONFIG: std::sync::OnceLock<Option<FfnTraceConfig>> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let trace_every = std::env::var("MER_FFN_TRACE_EVERY")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if trace_every == 0 {
+            return None;
+        }
+        let slow_us = std::env::var("MER_FFN_TRACE_SLOW_US")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(80_000);
+        Some(FfnTraceConfig { trace_every, slow_us })
+    }).as_ref()
+}
+
+#[cfg(target_os = "linux")]
+fn get_current_cpu() -> i32 {
+    unsafe { libc::sched_getcpu() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_current_cpu() -> i32 {
+    -1
+}
+
 impl Engine {
     pub fn new(
         cache: Arc<MultiLayerExpertCache>,
@@ -2453,6 +2486,12 @@ impl Engine {
         //    donate the worker thread (`block_in_place`) for its
         //    duration — otherwise the speculative prefetch tasks fired
         //    above can't get a worker to overlap this compute.
+        let ffn_trace = get_ffn_trace_config();
+        let cpu_before_compute = if ffn_trace.is_some() {
+            get_current_cpu()
+        } else {
+            -1
+        };
         let compute_start = Instant::now();
         let compute_us = run_compute_donated(|| {
             if self.core.options.io_only {
@@ -2620,6 +2659,53 @@ impl Engine {
                 us
             }
         });
+
+        if let Some(config) = ffn_trace {
+            let is_slow = compute_us >= config.slow_us;
+            let current_regime = if is_slow { 2u8 } else { 1u8 };
+
+            static LAST_REGIME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+            let prev_regime = LAST_REGIME.swap(current_regime, std::sync::atomic::Ordering::Relaxed);
+
+            let transitioned = prev_regime != 0 && prev_regime != current_regime;
+
+            if token_idx % config.trace_every == 0 || transitioned {
+                let cpu_after_compute = get_current_cpu();
+                let regime_str = if is_slow { "slow" } else { "fast" };
+                let expert_ids: Vec<u32> = residents.iter().map(|r| r.id).collect();
+                let shadow_status: Vec<bool> = residents.iter().map(|r| r.buffer.is_shadow()).collect();
+                let buffer_ptrs: Vec<String> = residents.iter().map(|r| format!("{:p}", r.buffer.as_slice().as_ptr())).collect();
+                let payload_ptrs: Vec<String> = residents.iter().map(|r| format!("{:p}", r.data().as_ptr())).collect();
+
+                // caller_rayon_worker usually returns None because it measures the Tokio/blocking caller
+                info!(
+                    target: "mer_ffn_trace",
+                    token = token_idx,
+                    compute_us,
+                    slow_threshold = config.slow_us,
+                    regime = regime_str,
+                    transitioned,
+                    caller_cpu_before_compute = cpu_before_compute,
+                    caller_cpu_after_compute = cpu_after_compute,
+                    caller_thread_id = ?std::thread::current().id(),
+                    caller_thread_name = std::thread::current().name().unwrap_or("unknown"),
+                    caller_rayon_worker = rayon::current_thread_index(),
+                    rayon_thread_count = rayon::current_num_threads(),
+                    io_wait_us,
+                    had_misses,
+                    ?expert_ids,
+                    ?cache_hits_per_expert,
+                    ?shadow_status,
+                    ?buffer_ptrs,
+                    ?payload_ptrs,
+                    dtype = ?self.core.options.dtype,
+                    qmm_enabled = self.core.options.use_qmm_for_q4,
+                    gpu_backend_active = self.core.backend.is_gpu(),
+                    "FFN bimodality diagnostic"
+                );
+            }
+        }
+
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
         self.metrics
             .total_compute_us
