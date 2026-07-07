@@ -2680,6 +2680,7 @@ impl Engine {
                 // caller_rayon_worker usually returns None because it measures the Tokio/blocking caller
                 info!(
                     target: "mer_ffn_trace",
+                    path = "generate",
                     token = token_idx,
                     compute_us,
                     slow_threshold = config.slow_us,
@@ -4394,6 +4395,12 @@ impl Engine {
         // readback) is a multi-millisecond blocking slice, and running
         // it inline would starve the speculative prefetch tasks spawned
         // above of a worker right when they must overlap this compute.
+        let ffn_trace = get_ffn_trace_config();
+        let cpu_before_compute = if ffn_trace.is_some() {
+            get_current_cpu()
+        } else {
+            -1
+        };
         let compute_start = Instant::now();
         let expert_policy = self.resolved_expert_execution_policy(residents.len());
         let step_result: Result<MoeStepResult, MoeStepError> = crate::stage_timing::time_optional(
@@ -4539,6 +4546,64 @@ impl Engine {
         );
         let step_result = step_result?;
         let compute_us = compute_start.elapsed().as_micros() as u64;
+
+        if let Some(config) = ffn_trace {
+            let is_slow = compute_us >= config.slow_us;
+            let current_regime = if is_slow { 2u8 } else { 1u8 };
+
+            static LAST_REGIME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+            let prev_regime = LAST_REGIME.swap(current_regime, std::sync::atomic::Ordering::Relaxed);
+
+            let transitioned = prev_regime != 0 && prev_regime != current_regime;
+
+            if token_idx % config.trace_every == 0 || transitioned {
+                let cpu_after_compute = get_current_cpu();
+                let regime_str = if is_slow { "slow" } else { "fast" };
+                let expert_ids: Vec<u32> = target.clone();
+                let shadow_status: Vec<Option<bool>> = residents
+                    .iter()
+                    .map(|r| r.as_ref().map(|r| r.buffer.is_shadow()))
+                    .collect();
+                let buffer_ptrs: Vec<Option<String>> = residents
+                    .iter()
+                    .map(|r| r.as_ref().map(|r| format!("{:p}", r.buffer.as_slice().as_ptr())))
+                    .collect();
+                let payload_ptrs: Vec<Option<String>> = residents
+                    .iter()
+                    .map(|r| r.as_ref().map(|r| format!("{:p}", r.data().as_ptr())))
+                    .collect();
+
+                // caller_rayon_worker usually returns None because it measures the Tokio/blocking caller
+                info!(
+                    target: "mer_ffn_trace",
+                    path = "moe_step",
+                    token = token_idx,
+                    layer,
+                    compute_us,
+                    slow_threshold = config.slow_us,
+                    regime = regime_str,
+                    transitioned,
+                    caller_cpu_before_compute = cpu_before_compute,
+                    caller_cpu_after_compute = cpu_after_compute,
+                    caller_thread_id = ?std::thread::current().id(),
+                    caller_thread_name = std::thread::current().name().unwrap_or("unknown"),
+                    caller_rayon_worker = rayon::current_thread_index(),
+                    rayon_thread_count = rayon::current_num_threads(),
+                    io_wait_us,
+                    had_misses,
+                    ?expert_ids,
+                    ?cache_hits_per_expert,
+                    ?shadow_status,
+                    ?buffer_ptrs,
+                    ?payload_ptrs,
+                    dtype = ?self.core.options.dtype,
+                    qmm_enabled = self.core.options.use_qmm_for_q4,
+                    gpu_backend_active = self.core.backend.is_gpu(),
+                    "FFN bimodality diagnostic"
+                );
+            }
+        }
+
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
         self.metrics
             .total_compute_us
