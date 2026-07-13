@@ -84,6 +84,8 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "mkl_num_threads=1"
   echo "blis_num_threads=1"
   echo "malloc_arena_max=2"
+  echo "rust_log=off"
+  echo "no_color=1"
 } > "$ARTIFACT_DIR/environment.txt"
 
 uname -a > "$ARTIFACT_DIR/uname.txt"
@@ -132,6 +134,8 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export BLIS_NUM_THREADS=1
 export MALLOC_ARENA_MAX=2
+export RUST_LOG=off
+export NO_COLOR=1
 
 if [[ "${MER_SKIP_BUILD:-0}" != 1 ]]; then
   cargo build \
