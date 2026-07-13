@@ -55,7 +55,9 @@ architecture = "qwen3_moe"
 vocab_size = 151936
 num_heads = 32
 num_kv_heads = 4
-head_dim = 128
+# Use auto during generic pre-reconciliation validation. The checkpoint
+# config.json reconciliation installs the actual Qwen head_dim=128.
+head_dim = 0
 rope_base = 10000000.0
 rms_eps = 1e-6
 stage_timing_enabled = true
