@@ -1,0 +1,4 @@
+{
+  "prompt": "Implement a Rust function that receives a slice of signed 64-bit integers and returns the longest contiguous subarray whose sum is zero. Explain the algorithm, handle an empty input, avoid quadratic time, and include three unit tests covering repeated prefix sums, an all-zero input, and an input with no zero-sum subarray.",
+  "max_tokens": 128
+}

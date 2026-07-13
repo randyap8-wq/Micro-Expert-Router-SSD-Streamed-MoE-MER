@@ -1,0 +1,89 @@
+# Prompt 2 target-host benchmark template. The collection script replaces the
+# three @...@ placeholders in a per-run artifact directory; do not edit this
+# file between before and after runs.
+
+[server]
+bind = "127.0.0.1:0"
+max_tokens = 256
+session_ttl_secs = 0
+max_concurrent_requests = 0
+admission_min_free_blocks = 0
+
+[performance]
+progress_timeout_secs = 1800
+
+[sampling]
+temperature = 0.0
+top_p = 1.0
+top_k = 0
+seed = 0
+
+[model]
+data_dir = "@MODEL_DIR@"
+num_experts = 128
+top_k = 8
+d_model = 2048
+d_ff = 768
+# Qwen Q8_0 logical payload is 5,013,504 bytes. The converter's physical
+# O_DIRECT slot is one page larger and is the value required by MER.
+expert_size = 5017600
+num_layers = 48
+dtype = "q8_0"
+
+[storage]
+cache_slots = @CACHE_SLOTS@
+block_align = 4096
+no_direct = false
+predict_fanout = 2
+pipeline_depth = 3
+predict_min_prob = 0.0
+partial_load_fraction = 1.0
+pin_after_observations = 0
+
+[tokenizer]
+path = "@TOKENIZER_PATH@"
+
+[real_transformer]
+enabled = true
+weights_dir = "@MODEL_DIR@"
+strict_weights = true
+allow_seeded_fallback = false
+allow_degraded_experts = false
+allow_nonfinite_attention_fallback = false
+allow_truncated_expert_payloads = false
+architecture = "qwen3_moe"
+vocab_size = 151936
+num_heads = 32
+num_kv_heads = 4
+head_dim = 128
+rope_base = 10000000.0
+rms_eps = 1e-6
+stage_timing_enabled = true
+max_batch_size = 1
+batch_timeout_ms = 0
+compute_offload = "cpu"
+dense_matvec_backend = "rayon-matrixmultiply"
+expert_execution_policy = "auto"
+
+[predictive]
+locality_enabled = false
+speculator_enabled = false
+affinity_enabled = false
+prefetch_governor = false
+cost_aware_eviction = false
+pregate_enabled = false
+static_residency_fraction = 0.0
+static_residency_warmup_tokens = 0
+
+[gpu_cache]
+enabled = false
+vram_capacity_mb = 0
+promote_after_hits = 0
+vram_anchor_ratio = 0.5
+dtype = "q8_0"
+
+[distributed]
+enabled = false
+nodes = []
+self_index = 0
+remote_fetch_timeout_ms = 250

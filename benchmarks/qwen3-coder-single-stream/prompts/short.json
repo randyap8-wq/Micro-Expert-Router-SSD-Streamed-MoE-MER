@@ -1,0 +1,4 @@
+{
+  "prompt": "Write a small Rust function that checks whether a string is a palindrome.",
+  "max_tokens": 128
+}
