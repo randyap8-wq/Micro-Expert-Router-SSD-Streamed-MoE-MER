@@ -58,6 +58,7 @@ compile_error!(
 );
 
 use crate::expert_cache::ExpertResident;
+use serde::Serialize;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -2536,6 +2537,7 @@ static Q8_PREPARATION_NANOS: AtomicU64 = AtomicU64::new(0);
 static Q8_GATE_UP_NANOS: AtomicU64 = AtomicU64::new(0);
 static Q8_DOWN_NANOS: AtomicU64 = AtomicU64::new(0);
 static Q8_PREPARED_DUPLICATE_BYTES: AtomicU64 = AtomicU64::new(0);
+static TRUNCATED_EXPERT_PAYLOAD_USES: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn add_elapsed(counter: &AtomicU64, elapsed: std::time::Duration) {
@@ -2564,6 +2566,10 @@ pub fn q8_down_kernel_seconds() -> f64 {
 
 pub fn prepared_duplicate_expert_bytes() -> u64 {
     Q8_PREPARED_DUPLICATE_BYTES.load(Ordering::Relaxed)
+}
+
+pub fn truncated_expert_payload_uses() -> u64 {
+    TRUNCATED_EXPERT_PAYLOAD_USES.load(Ordering::Relaxed)
 }
 
 pub fn quantized_projection_dispatches() -> u64 {
@@ -3943,7 +3949,7 @@ pub(crate) const EXPERT_SIZE_TOLERANCE_BYTES: usize = crate::gguf_loader::DEFAUL
 /// silently enables another. The policy is engine/model-scoped (held
 /// in `EngineOptions` and threaded into Q4 preparation) — there is no
 /// process-global policy switch.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct RealInferencePolicy {
     /// A routed/shared/dense expert that fails to load, prepare, or
     /// execute is dropped from the mixture as a zero contribution
@@ -4040,6 +4046,7 @@ fn q4_expert_bytes_with_tolerance(
         let mut padded = Vec::with_capacity(need);
         padded.extend_from_slice(bytes);
         padded.resize(need, 0);
+        TRUNCATED_EXPERT_PAYLOAD_USES.fetch_add(1, Ordering::Relaxed);
         Ok(Cow::Owned(padded))
     } else {
         Err(ExpertWeightsError::BufferTooSmall {
@@ -4152,6 +4159,7 @@ pub fn run_inference_q4_0_qmm(
         // the tolerance is zero in strict mode, so this arm can never
         // zero-fill missing logical bytes on the strict path.
         bytes_holder = cached;
+        TRUNCATED_EXPERT_PAYLOAD_USES.fetch_add(1, Ordering::Relaxed);
         &bytes_holder
     } else if need > EXPERT_SIZE_TOLERANCE_BYTES
         && need - resident_bytes.len() <= EXPERT_SIZE_TOLERANCE_BYTES

@@ -57,6 +57,7 @@ command -v lscpu >/dev/null
 command -v lsblk >/dev/null
 command -v findmnt >/dev/null
 command -v taskset >/dev/null
+command -v sha256sum >/dev/null
 test -x /usr/bin/time
 
 if [[ -n "$(git -C "$ROOT" status --short)" && "${MER_ALLOW_DIRTY:-0}" != 1 ]]; then
@@ -93,15 +94,26 @@ lscpu > "$ARTIFACT_DIR/lscpu.txt"
 lsblk -o NAME,PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL > "$ARTIFACT_DIR/lsblk.txt"
 findmnt > "$ARTIFACT_DIR/findmnt.txt"
 findmnt -T "$MODEL_REAL" -o TARGET,SOURCE,FSTYPE,OPTIONS > "$ARTIFACT_DIR/model-findmnt.txt"
+findmnt --json -T "$MODEL_REAL" -o TARGET,SOURCE,FSTYPE,OPTIONS > "$ARTIFACT_DIR/model-findmnt.json"
+jq -e --arg mount "$MOUNT_REAL" '
+  .filesystems[0].target == $mount and
+  .filesystems[0].fstype == "ext4" and
+  ((["rw", "noatime", "nodiratime"] - (.filesystems[0].options | split(","))) | length == 0)
+' "$ARTIFACT_DIR/model-findmnt.json" >/dev/null
 df -T "$MODEL_REAL" > "$ARTIFACT_DIR/model-df.txt"
 grep -E 'MemTotal|MemAvailable' /proc/meminfo > "$ARTIFACT_DIR/memory-preflight.txt"
 taskset -pc $$ > "$ARTIFACT_DIR/collector-effective-cpu-mask.txt"
 git -C "$ROOT" rev-parse HEAD > "$ARTIFACT_DIR/git-commit.txt"
 git -C "$ROOT" status --short > "$ARTIFACT_DIR/git-status-short.txt"
+EXPECTED_COMMIT=$(tr -d '\n' < "$ARTIFACT_DIR/git-commit.txt")
 
 jq -j .prompt "$FIXTURES/prompts/short.json" | sha256sum > "$ARTIFACT_DIR/prompt-short.sha256"
 jq -j .prompt "$FIXTURES/prompts/medium.json" | sha256sum > "$ARTIFACT_DIR/prompt-medium.sha256"
+SHORT_PROMPT_SHA=$(awk '{print $1}' "$ARTIFACT_DIR/prompt-short.sha256")
+MEDIUM_PROMPT_SHA=$(awk '{print $1}' "$ARTIFACT_DIR/prompt-medium.sha256")
 sha256sum "$MODEL_REAL/config.json" "$MODEL_REAL/dense_manifest.json" > "$ARTIFACT_DIR/checkpoint-metadata.sha256"
+CONFIG_SHA=$(sha256sum "$MODEL_REAL/config.json" | awk '{print $1}')
+DENSE_MANIFEST_SHA=$(sha256sum "$MODEL_REAL/dense_manifest.json" | awk '{print $1}')
 
 render_config() {
   local slots=$1
@@ -152,6 +164,8 @@ sha256sum "$BIN" > "$ARTIFACT_DIR/binary.sha256"
 run_case() {
   local slots=$1
   local prompt_id=$2
+  local expected_prompt_tokens=$3
+  local expected_prompt_sha=$4
   local stem="baseline-${slots}-${prompt_id}"
   local json="$ARTIFACT_DIR/$stem.json"
   local request="$FIXTURES/prompts/$prompt_id.json"
@@ -176,25 +190,236 @@ run_case() {
 
   test -s "$json"
   jq empty "$json"
-  jq -e '
+  jq -e \
+    --arg commit "$EXPECTED_COMMIT" \
+    --arg prompt_id "$prompt_id" \
+    --arg prompt_sha "$expected_prompt_sha" \
+    --arg config_sha "$CONFIG_SHA" \
+    --arg dense_manifest_sha "$DENSE_MANIFEST_SHA" \
+    --argjson slots "$slots" \
+    --argjson prompt_tokens "$expected_prompt_tokens" '
+    .schema == {"name":"mer-bench-real","version":2} and
     .benchmark == "bench-real" and
+    .warmup_runs == 1 and
     .measured_runs == 5 and
     .cache_reset == "keep" and
     .greedy == true and
+    .execution.git_commit_full == $commit and
+    .execution.worktree_dirty_at_execution == false and
+    .execution.build_profile == "release" and
+    (.execution.cargo_features | contains(["tokenizer", "io_uring", "blas", "avx512", "q8-candle-reference"])) and
+    .execution.operating_system == "linux" and
+    .execution.architecture == "x86_64" and
+    (.execution.cpu_vendor | length > 0) and
+    (.execution.cpu_model | length > 0) and
+    (.execution.cpu_instruction_features | contains(["avx2", "fma"])) and
+    .execution.logical_cpu_count == 32 and
+    .execution.requested_cpu_mask == "0-31" and
+    .execution.requested_cpu_mask_source == "cli" and
+    .execution.effective_cpu_affinity == "0-31" and
+    .execution.requested_rayon_workers == 30 and
+    .execution.actual_rayon_pool_size == 30 and
+    .execution.rayon_selection_source == "cli" and
+    .execution.dense_matvec_backend == "rayon-matrixmultiply" and
+    .execution.direct_q8_expert_backend == "avx2-fma" and
+    .execution.direct_q8_avx2_fma_selected == true and
+    .execution.direct_q8_avx512_selected == false and
+    (.model.checkpoint_identifier | length > 0) and
+    .model.config_json_sha256 == $config_sha and
+    .model.dense_manifest_sha256 == $dense_manifest_sha and
+    (.model.converted_manifest_identity | test("^[0-9a-f]{64}$")) and
+    .model.architecture == "qwen3_moe" and
+    .model.d_model == 2048 and
+    .model.d_ff == 768 and
+    .model.layer_count == 48 and
+    .model.expert_count_per_layer == 128 and
+    .model.layer_qualified_expert_count == 6144 and
+    .model.top_k == 8 and
+    .model.query_head_count == 32 and
+    .model.kv_head_count == 4 and
+    .model.head_dim == 128 and
+    .model.vocab_size == 151936 and
+    (.model.dense_dtype | contains("q8_0")) and
+    .model.expert_dtype == "q8_0" and
+    .prompt_identity.fixture_identifier == $prompt_id and
+    .prompt_identity.sha256 == $prompt_sha and
+    .prompt_identity.requested_completion_tokens == 128 and
+    .storage.active_expert_io_backend == "pread-odirect" and
+    .storage.direct_io_enabled == true and
+    .storage.io_uring_compiled == true and
+    .storage.io_uring_active_for_expert_reads == false and
+    .storage.packed_expert_storage == false and
+    .strictness.strict_weights == true and
+    (.strictness.loader | length > 0) and
+    .strictness.required_tensor_count > 0 and
+    .strictness.loaded_tensor_count == .strictness.required_tensor_count and
+    .strictness.seeded_fallback_remained == false and
+    .strictness.inference_policy == {
+      "allow_degraded_experts":false,
+      "allow_nonfinite_attention_fallback":false,
+      "allow_truncated_expert_payloads":false
+    } and
+    .memory_layout.primary_expert_pool_allocated_bytes > 0 and
+    .memory_layout.shadow_expert_pool_allocated_bytes > 0 and
+    .memory_layout.total_expert_pool_allocated_bytes ==
+      (.memory_layout.primary_expert_pool_allocated_bytes + .memory_layout.shadow_expert_pool_allocated_bytes) and
+    .memory_layout.prepared_duplicate_expert_bytes == 0 and
+    .memory_layout.external_peak_rss_source == "collector:/usr/bin/time-v" and
+    .predictive_policy == {
+      "markov_prefetch_fanout":2,
+      "pipeline_depth":3,
+      "locality_enabled":false,
+      "speculator_enabled":false,
+      "affinity_enabled":false,
+      "prefetch_governor_enabled":false,
+      "cost_aware_eviction_enabled":false,
+      "pregate_enabled":false,
+      "static_residency_fraction":0
+    } and
     .aggregate.output_token_parity == true and
     (.runs | length == 5) and
+    ([.runs[].prompt_tokens] | all(. == $prompt_tokens)) and
     ([.runs[].completion_tokens] | all(. == 128)) and
-    ([.runs[].prompt_tokens] | unique | length == 1) and
-    ([.runs[].output_token_ids] | unique | length == 1)
+    ([.runs[].total_api_tokens] | all(. == ($prompt_tokens + 128))) and
+    ([.runs[].output_token_ids] | unique | length == 1) and
+    ([.runs[].correctness] | all(
+      .strict_weights == true and
+      .required_tensor_count > 0 and
+      .loaded_tensor_count == .required_tensor_count and
+      .seeded_fallback_remained == false and
+      .degraded_expert_substitutions == 0 and
+      .expert_read_failures == 0 and
+      .truncated_expert_payload_uses == 0 and
+      .nonfinite_attention_fallbacks == 0 and
+      has("nonfinite_output_count") and
+      .q8_scalar_layout_fallbacks == 0 and
+      .q8_direct_kernel_dispatches > 0 and
+      .prepared_duplicate_expert_bytes == 0 and
+      (.inference_policy | all(. == false))
+    )) and
+    ([.runs[].cache_io] | all(
+      .cache_capacity_experts == $slots and
+      .cache_resident_experts_at_sample >= 0 and
+      .cache_resident_experts_at_sample <= .cache_capacity_experts and
+      .shadow_resident_experts_at_sample >= 0 and
+      .expert_read_failures == 0 and
+      .prefetch_enabled == true and
+      .cache_evictions >= 0 and
+      .foreground_read_operations >= 0 and
+      .foreground_expert_bytes >= 0 and
+      .foreground_expert_io_wait_seconds >= 0 and
+      .total_expert_bytes_read >= 0 and
+      .prefetch_submitted >= 0 and
+      .prefetch_completed >= 0 and
+      .prefetch_used >= 0 and
+      .prefetch_bytes >= 0 and
+      .useful_prefetch_bytes >= 0 and
+      .unused_prefetch_bytes_at_sample >= 0 and
+      .prefetch_dropped_concurrency >= 0 and
+      .prefetch_dropped_pool_starved >= 0 and
+      .prefetch_dropped_governor == 0 and
+      .prefetch_dropped_bytes == 0
+    )) and
+    ([.runs[].memory] | all(
+      .current_rss_bytes > 0 and
+      .current_rss_sample_point == "after_completion_decode_before_report_serialization" and
+      .resident_expert_buffer_bytes >= 0 and
+      .primary_expert_pool_allocated_bytes > 0 and
+      .shadow_expert_pool_allocated_bytes > 0 and
+      .total_expert_pool_allocated_bytes ==
+        (.primary_expert_pool_allocated_bytes + .shadow_expert_pool_allocated_bytes) and
+      .prepared_duplicate_expert_bytes == 0 and
+      .external_peak_rss_bytes == null
+    )) and
+    ([.runs[].critical_path.prompt, .runs[].critical_path.decode] | all(
+      .wall_seconds > 0 and
+      .attributed_seconds >= 0 and
+      has("unattributed_residual_seconds") and
+      .coverage_ratio >= 0.95 and
+      .non_overlap_invariant_passed == true and
+      .coverage_95_percent_passed == true and
+      .qualification_passed == true and
+      ([.categories[]] | all(type == "number" and . >= 0))
+    ))
   ' "$json" >/dev/null
-  jq '{prompt_tokens: [.runs[].prompt_tokens] | unique, completion_tokens: [.runs[].completion_tokens] | unique, output_token_parity: .aggregate.output_token_parity}' \
-    "$json" > "$ARTIFACT_DIR/$stem.validity.json"
+
+  local peak_rss_kib
+  peak_rss_kib=$(awk -F: '/Maximum resident set size \(kbytes\)/ {gsub(/[[:space:]]/, "", $2); print $2}' "$ARTIFACT_DIR/$stem.time.txt")
+  if [[ ! "$peak_rss_kib" =~ ^[0-9]+$ || "$peak_rss_kib" == 0 ]]; then
+    echo "failed to parse external peak RSS for $stem" >&2
+    exit 1
+  fi
+  local peak_rss_bytes=$((peak_rss_kib * 1024))
+  jq \
+    --arg case "$stem" \
+    --arg prompt_id "$prompt_id" \
+    --argjson cache_slots "$slots" \
+    --argjson peak_rss_bytes "$peak_rss_bytes" \
+    '{
+      schema: {name:"mer-prompt2-case-summary", version:1},
+      case: $case,
+      cache_slots: $cache_slots,
+      prompt_fixture: $prompt_id,
+      prompt_tokens: ([.runs[].prompt_tokens] | unique | first),
+      requested_completion_tokens: .prompt_identity.requested_completion_tokens,
+      actual_completion_tokens: ([.runs[].completion_tokens] | unique | first),
+      decode_tps_mean: .aggregate.decode_tps_mean,
+      prompt_tps_mean: .aggregate.prompt_tps_mean,
+      time_to_first_token_p50_seconds: .aggregate.time_to_first_token_p50_seconds,
+      decode_seconds_mean: .aggregate.decode_seconds_mean,
+      total_seconds_mean: .aggregate.total_seconds_mean,
+      cache_hit_rate: .aggregate.hit_rate,
+      cache_misses_total: .aggregate.cache_misses_total,
+      ssd_bytes_total: .aggregate.ssd_bytes_total,
+      external_peak_rss_bytes: $peak_rss_bytes,
+      storage_identity_artifact: "model-findmnt.json",
+      prompt_critical_path_coverage_min: ([.runs[].critical_path.prompt.coverage_ratio] | min),
+      decode_critical_path_coverage_min: ([.runs[].critical_path.decode.coverage_ratio] | min),
+      output_token_parity: .aggregate.output_token_parity,
+      qualification_passed: true
+    }' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"
 }
 
-run_case 1536 short
-run_case 1536 medium
-run_case 6144 short
-run_case 6144 medium
+run_case 1536 short 14 "$SHORT_PROMPT_SHA"
+run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"
+run_case 6144 short 14 "$SHORT_PROMPT_SHA"
+run_case 6144 medium 65 "$MEDIUM_PROMPT_SHA"
 
-echo "baseline collection completed; jq syntax/parity checks passed"
-echo "IMPORTANT: Prompt 2 qualification still requires the schema and critical-path gates listed in docs/benchmarks/qwen3-coder-single-stream-decode-phase-0.md"
+jq -s '{
+  schema: {name:"mer-prompt2-four-case-summary", version:1},
+  cases: .,
+  qualification_passed: (all(.qualification_passed == true))
+}' \
+  "$ARTIFACT_DIR/baseline-1536-short.case-summary.json" \
+  "$ARTIFACT_DIR/baseline-1536-medium.case-summary.json" \
+  "$ARTIFACT_DIR/baseline-6144-short.case-summary.json" \
+  "$ARTIFACT_DIR/baseline-6144-medium.case-summary.json" \
+  > "$ARTIFACT_DIR/four-case-summary.json"
+
+jq -n \
+  --arg commit "$EXPECTED_COMMIT" \
+  --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{
+    schema: {name:"mer-prompt2-qualification", version:1},
+    git_commit_full: $commit,
+    captured_at_utc: $captured_at_utc,
+    four_required_cases_present: true,
+    schema_and_required_fields_passed: true,
+    provenance_and_backend_gates_passed: true,
+    prompt_identity_gates_passed: true,
+    strictness_and_correctness_gates_passed: true,
+    critical_path_coverage_gates_passed: true,
+    external_peak_rss_present: true,
+    qualification_passed: true
+  }' > "$ARTIFACT_DIR/qualification.json"
+
+# Hash immutable artifacts last. The two tee-backed collector logs and this
+# manifest are excluded because they are still open while the manifest is made.
+find "$ARTIFACT_DIR" -type f \
+  ! -name 'collector.log' \
+  ! -name 'collector.stderr.log' \
+  ! -name 'artifact-sha256.txt' \
+  -print0 | sort -z | xargs -0 sha256sum > "$ARTIFACT_DIR/artifact-sha256.txt"
+
+echo "QUALIFICATION: PASS"
+echo "four-case instrumented baseline collection completed: $ARTIFACT_DIR"

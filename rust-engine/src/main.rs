@@ -127,6 +127,7 @@ mod aligned_buffer;
 mod architecture;
 mod backend;
 mod batch_scheduler;
+mod benchmark_hash;
 mod block_pool;
 mod buffer_pool;
 mod config;
@@ -175,11 +176,11 @@ mod tui;
 mod workload;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -197,6 +198,21 @@ use crate::router::{
 const SUPPORTED_SYNTHETIC_DTYPES: &str = "f32, f16, bf16, int8, q4k, q4_0, q8_0, mxfp4";
 const SUPPORTED_RUNTIME_DTYPES: &str =
     "f32, f16, bf16, int8, q4k, q4_0, q5k, q6k, q8_0, mxfp4, mixed";
+
+const BENCH_REAL_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Clone, Debug)]
+struct StartupExecutionInfo {
+    requested_cpu_mask: Option<String>,
+    requested_cpu_mask_source: String,
+    effective_cpu_affinity: String,
+    logical_cpu_count: usize,
+    requested_rayon_workers: Option<usize>,
+    actual_rayon_workers: usize,
+    rayon_selection_source: String,
+}
+
+static STARTUP_EXECUTION_INFO: OnceLock<StartupExecutionInfo> = OnceLock::new();
 
 /// MoE execution engine that streams experts from NVMe via O_DIRECT pread(2).
 #[derive(Parser, Debug)]
@@ -1587,7 +1603,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         profile_threads,
     )
     .map_err(|e| format!("rayon thread selection: {e}"))?;
-    crate::parallel::init_global_pool(rayon_selection, effective_affinity.logical_cores);
+    let actual_rayon_workers =
+        crate::parallel::init_global_pool(rayon_selection, effective_affinity.logical_cores);
+    let _ = STARTUP_EXECUTION_INFO.set(StartupExecutionInfo {
+        requested_cpu_mask: cpu_mask_request
+            .as_ref()
+            .map(|request| request.display.clone()),
+        requested_cpu_mask_source: cpu_mask_request
+            .as_ref()
+            .map(|request| request.source.as_str().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        effective_cpu_affinity: effective_affinity.display.clone(),
+        logical_cpu_count: effective_affinity.logical_cores,
+        requested_rayon_workers: rayon_selection.threads,
+        actual_rayon_workers,
+        rayon_selection_source: rayon_selection.source.as_str().to_string(),
+    });
 
     // Log the selected math kernel backend once. The dispatcher itself
     // is lazy, but emitting this at startup gives ops a single line in
@@ -2167,6 +2198,8 @@ struct MatvecShape {
 
 struct BenchRealInput {
     prompt: String,
+    prompt_id: String,
+    prompt_sha256: String,
     output_tokens: usize,
 }
 
@@ -2177,8 +2210,121 @@ struct BenchRealRuntime {
     tokenizer: Arc<crate::tokenizer::Tokenizer>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct BenchRealSchemaInfo {
+    name: String,
+    version: u32,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealExecutionProvenance {
+    git_commit_full: String,
+    worktree_dirty_at_execution: bool,
+    build_profile: String,
+    cargo_features: Vec<&'static str>,
+    operating_system: String,
+    architecture: String,
+    cpu_vendor: String,
+    cpu_model: String,
+    cpu_instruction_features: Vec<String>,
+    logical_cpu_count: usize,
+    requested_cpu_mask: Option<String>,
+    requested_cpu_mask_source: String,
+    effective_cpu_affinity: String,
+    requested_rayon_workers: Option<usize>,
+    actual_rayon_pool_size: usize,
+    rayon_selection_source: String,
+    dense_matvec_backend: String,
+    direct_q8_expert_backend: String,
+    direct_q8_avx2_fma_selected: bool,
+    direct_q8_avx512_selected: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealModelIdentity {
+    checkpoint_identifier: String,
+    converted_weights_dir: String,
+    config_json_sha256: String,
+    dense_manifest_sha256: String,
+    converted_manifest_identity: String,
+    architecture: String,
+    d_model: usize,
+    d_ff: usize,
+    layer_count: usize,
+    expert_count_per_layer: u32,
+    layer_qualified_expert_count: u64,
+    top_k: usize,
+    query_head_count: usize,
+    kv_head_count: usize,
+    head_dim: usize,
+    vocab_size: usize,
+    dense_dtype: String,
+    expert_dtype: String,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealPromptIdentity {
+    fixture_identifier: String,
+    sha256: String,
+    requested_completion_tokens: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealStorageIdentity {
+    expert_data_dir: String,
+    active_expert_io_backend: String,
+    direct_io_enabled: bool,
+    io_uring_compiled: bool,
+    io_uring_active_for_expert_reads: bool,
+    packed_expert_storage: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealStrictnessInfo {
+    strict_weights: bool,
+    loader: String,
+    required_tensor_count: usize,
+    loaded_tensor_count: usize,
+    seeded_fallback_remained: bool,
+    inference_policy: crate::inference::RealInferencePolicy,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealMemoryLayout {
+    primary_expert_pool_allocated_bytes: u64,
+    shadow_expert_pool_allocated_bytes: u64,
+    total_expert_pool_allocated_bytes: u64,
+    prepared_duplicate_expert_bytes: u64,
+    external_peak_rss_source: &'static str,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealPredictivePolicy {
+    markov_prefetch_fanout: usize,
+    pipeline_depth: u32,
+    locality_enabled: bool,
+    speculator_enabled: bool,
+    affinity_enabled: bool,
+    prefetch_governor_enabled: bool,
+    cost_aware_eviction_enabled: bool,
+    pregate_enabled: bool,
+    static_residency_fraction: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealReportContext {
+    execution: BenchRealExecutionProvenance,
+    model: BenchRealModelIdentity,
+    prompt_identity: BenchRealPromptIdentity,
+    storage: BenchRealStorageIdentity,
+    strictness: BenchRealStrictnessInfo,
+    memory_layout: BenchRealMemoryLayout,
+    predictive_policy: BenchRealPredictivePolicy,
+}
+
 #[derive(Serialize)]
 struct BenchRealSuiteReport {
+    schema: BenchRealSchemaInfo,
     benchmark: &'static str,
     config: String,
     prompt: String,
@@ -2186,6 +2332,13 @@ struct BenchRealSuiteReport {
     measured_runs: usize,
     cache_reset: BenchRealCacheReset,
     greedy: bool,
+    execution: BenchRealExecutionProvenance,
+    model: BenchRealModelIdentity,
+    prompt_identity: BenchRealPromptIdentity,
+    storage: BenchRealStorageIdentity,
+    strictness: BenchRealStrictnessInfo,
+    memory_layout: BenchRealMemoryLayout,
+    predictive_policy: BenchRealPredictivePolicy,
     build: BenchRealBuildInfo,
     aggregate: BenchRealAggregate,
     runs: Vec<BenchRealRunReport>,
@@ -2194,9 +2347,83 @@ struct BenchRealSuiteReport {
 #[derive(Serialize)]
 struct BenchRealBuildInfo {
     git_commit: String,
+    worktree_dirty: bool,
+    build_profile: String,
     build_features: Vec<&'static str>,
     threads: usize,
+    rayon_selection_source: String,
     dense_matvec_backend: String,
+    direct_q8_expert_backend: String,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealRunCorrectness {
+    strict_weights: bool,
+    required_tensor_count: usize,
+    loaded_tensor_count: usize,
+    seeded_fallback_remained: bool,
+    degraded_expert_substitutions: u64,
+    expert_read_failures: u64,
+    truncated_expert_payload_uses: u64,
+    nonfinite_attention_fallbacks: u64,
+    nonfinite_output_count: Option<u64>,
+    q8_scalar_layout_fallbacks: u64,
+    q8_direct_kernel_dispatches: u64,
+    prepared_duplicate_expert_bytes: u64,
+    inference_policy: crate::inference::RealInferencePolicy,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealRunCacheIo {
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_hit_rate: f64,
+    cache_evictions: u64,
+    cache_capacity_experts: usize,
+    cache_resident_experts_at_sample: usize,
+    shadow_resident_experts_at_sample: usize,
+    foreground_read_operations: u64,
+    foreground_expert_bytes: u64,
+    foreground_expert_io_wait_seconds: f64,
+    total_expert_bytes_read: u64,
+    prefetch_enabled: bool,
+    prefetch_submitted: u64,
+    prefetch_completed: u64,
+    prefetch_used: u64,
+    prefetch_bytes: u64,
+    useful_prefetch_bytes: u64,
+    unused_prefetch_bytes_at_sample: u64,
+    prefetch_dropped_concurrency: u64,
+    prefetch_dropped_pool_starved: u64,
+    prefetch_dropped_governor: u64,
+    prefetch_dropped_bytes: u64,
+    expert_read_failures: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealRunMemory {
+    current_rss_bytes: Option<u64>,
+    current_rss_sample_point: &'static str,
+    resident_expert_buffer_bytes: u64,
+    primary_expert_pool_allocated_bytes: u64,
+    shadow_expert_pool_allocated_bytes: u64,
+    total_expert_pool_allocated_bytes: u64,
+    prepared_duplicate_expert_bytes: u64,
+    external_peak_rss_bytes: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealDiagnosticStageTimings {
+    semantics: &'static str,
+    prompt: std::collections::BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
+    decode: std::collections::BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealCriticalPath {
+    semantics: &'static str,
+    prompt: crate::stage_timing::CriticalPathReport,
+    decode: crate::stage_timing::CriticalPathReport,
 }
 
 #[derive(Clone, Serialize)]
@@ -2223,6 +2450,11 @@ struct BenchRealRunReport {
     ssd_bytes: u64,
     ssd_stall_seconds: f64,
     rss_bytes: Option<u64>,
+    correctness: BenchRealRunCorrectness,
+    cache_io: BenchRealRunCacheIo,
+    memory: BenchRealRunMemory,
+    critical_path: BenchRealCriticalPath,
+    diagnostic_stage_timings: BenchRealDiagnosticStageTimings,
     output_token_ids: Vec<u32>,
     output_text: String,
     stage_timings: std::collections::BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
@@ -2251,6 +2483,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
 
     if args.cache_reset == BenchRealCacheReset::Keep {
         let runtime = build_bench_real_runtime(&args.config).await?;
+        let context = build_bench_real_report_context(&runtime, &input)?;
         let params = bench_sampling_params(&runtime.cfg, args.greedy);
         for i in 0..args.warmup_runs {
             let _ = with_progress_timeout(
@@ -2273,7 +2506,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
             );
         }
         assert_no_softmax_fallbacks(softmax_before)?;
-        emit_bench_real_report(&args, input, runs)?;
+        emit_bench_real_report(&args, input, context, runs)?;
     } else {
         for i in 0..args.warmup_runs {
             let runtime = build_bench_real_runtime(&args.config).await?;
@@ -2287,8 +2520,12 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
         }
         let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
+        let mut context = None;
         for i in 0..args.measured_runs {
             let runtime = build_bench_real_runtime(&args.config).await?;
+            if context.is_none() {
+                context = Some(build_bench_real_report_context(&runtime, &input)?);
+            }
             let params = bench_sampling_params(&runtime.cfg, args.greedy);
             runs.push(
                 with_progress_timeout(
@@ -2300,7 +2537,12 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
             );
         }
         assert_no_softmax_fallbacks(softmax_before)?;
-        emit_bench_real_report(&args, input, runs)?;
+        emit_bench_real_report(
+            &args,
+            input,
+            context.expect("measured_runs > 0 ensures report context"),
+            runs,
+        )?;
     }
     Ok(())
 }
@@ -2767,14 +3009,7 @@ fn cmd_matvec_microbench(args: MatvecMicrobenchArgs) -> Result<(), Box<dyn std::
         vocab_size: 151_936,
         warmup_runs: args.warmup_runs,
         measured_runs: args.measured_runs,
-        build: BenchRealBuildInfo {
-            git_commit: git_commit_short(),
-            build_features: build_features(),
-            threads: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-            dense_matvec_backend: crate::parallel::dense_matvec_backend().to_string(),
-        },
+        build: current_bench_build_info(),
         results,
     };
     if args.json {
@@ -2828,14 +3063,7 @@ fn cmd_scratch_alloc_microbench(
             top_k: args.top_k,
             warmup_tokens: args.warmup_tokens,
             measured_tokens: args.measured_tokens,
-            build: BenchRealBuildInfo {
-                git_commit: git_commit_short(),
-                build_features: build_features(),
-                threads: std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1),
-                dense_matvec_backend: crate::parallel::dense_matvec_backend().to_string(),
-            },
+            build: current_bench_build_info(),
             results,
         };
         if args.json {
@@ -3172,6 +3400,13 @@ fn load_bench_real_input(
     args: &BenchRealArgs,
 ) -> Result<BenchRealInput, Box<dyn std::error::Error>> {
     let mut json_max_tokens = None;
+    let prompt_id = args
+        .request_json
+        .as_ref()
+        .and_then(|path| path.file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("inline")
+        .to_string();
     let prompt = if let Some(prompt) = args.prompt.as_ref() {
         prompt.clone()
     } else if let Some(path) = args.request_json.as_ref() {
@@ -3201,7 +3436,9 @@ fn load_bench_real_input(
         return Err("bench-real requires output token count > 0".into());
     }
     Ok(BenchRealInput {
+        prompt_sha256: crate::benchmark_hash::sha256_hex(prompt.as_bytes()),
         prompt,
+        prompt_id,
         output_tokens,
     })
 }
@@ -3902,6 +4139,182 @@ fn validate_resolved_real_model_config(
     }
 }
 
+fn build_bench_real_report_context(
+    runtime: &BenchRealRuntime,
+    input: &BenchRealInput,
+) -> Result<BenchRealReportContext, Box<dyn std::error::Error>> {
+    let weights_dir = runtime
+        .cfg
+        .real_transformer
+        .weights_dir
+        .as_ref()
+        .expect("bench-real policy requires weights_dir");
+    let config_json_path = weights_dir.join("config.json");
+    let dense_manifest_path = weights_dir.join("dense_manifest.json");
+    let config_json = std::fs::read(&config_json_path)?;
+    let dense_manifest_bytes = std::fs::read(&dense_manifest_path)?;
+    let config_json_sha256 = crate::benchmark_hash::sha256_hex(&config_json);
+    let dense_manifest_sha256 = crate::benchmark_hash::sha256_hex(&dense_manifest_bytes);
+    let converted_manifest_identity = crate::benchmark_hash::sha256_hex(
+        format!("config={config_json_sha256};dense_manifest={dense_manifest_sha256}").as_bytes(),
+    );
+    let config_value: serde_json::Value = serde_json::from_slice(&config_json)?;
+    let checkpoint_identifier = ["_name_or_path", "name_or_path", "model_type"]
+        .iter()
+        .find_map(|key| config_value.get(*key).and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .or_else(|| {
+            weights_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let dense_manifest: crate::dense_tensor::DenseTensorManifest =
+        serde_json::from_slice(&dense_manifest_bytes)?;
+    let dense_dtypes: std::collections::BTreeSet<String> = dense_manifest
+        .tensors
+        .iter()
+        .map(|tensor| tensor.dtype.to_string())
+        .collect();
+    let dense_dtype = if dense_dtypes.len() == 1 {
+        dense_dtypes
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    } else if dense_dtypes.is_empty() {
+        "unknown".to_string()
+    } else {
+        format!(
+            "mixed:{}",
+            dense_dtypes.into_iter().collect::<Vec<_>>().join(",")
+        )
+    };
+
+    let cpu = crate::kernels::cpu_features();
+    let mut cpu_instruction_features = Vec::new();
+    for (name, enabled) in [
+        ("avx2", cpu.avx2),
+        ("fma", cpu.fma),
+        ("avx512f", cpu.avx512f),
+        ("avx512bw", cpu.avx512bw),
+        ("avx512vnni", cpu.avx512vnni),
+        ("amx_tile", cpu.amx_tile),
+        ("amx_int8", cpu.amx_int8),
+        ("amx_bf16", cpu.amx_bf16),
+    ] {
+        if enabled {
+            cpu_instruction_features.push(name.to_string());
+        }
+    }
+    let startup = STARTUP_EXECUTION_INFO
+        .get()
+        .cloned()
+        .unwrap_or_else(|| StartupExecutionInfo {
+            requested_cpu_mask: None,
+            requested_cpu_mask_source: "unknown".to_string(),
+            effective_cpu_affinity: crate::numa::effective_cpu_affinity().display,
+            logical_cpu_count: std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1),
+            requested_rayon_workers: None,
+            actual_rayon_workers: crate::parallel::num_threads(),
+            rayon_selection_source: "unknown".to_string(),
+        });
+    let direct_q8_expert_backend = crate::inference::q8_direct_kernel_backend().to_string();
+    let engine_report = runtime.engine.report();
+    let model = &runtime.model.config;
+    Ok(BenchRealReportContext {
+        execution: BenchRealExecutionProvenance {
+            git_commit_full: git_commit_full(),
+            worktree_dirty_at_execution: git_worktree_dirty(),
+            build_profile: build_profile().to_string(),
+            cargo_features: build_features(),
+            operating_system: std::env::consts::OS.to_string(),
+            architecture: std::env::consts::ARCH.to_string(),
+            cpu_vendor: cpu.vendor.clone(),
+            cpu_model: cpu.model.clone(),
+            cpu_instruction_features,
+            logical_cpu_count: startup.logical_cpu_count,
+            requested_cpu_mask: startup.requested_cpu_mask,
+            requested_cpu_mask_source: startup.requested_cpu_mask_source,
+            effective_cpu_affinity: startup.effective_cpu_affinity,
+            requested_rayon_workers: startup.requested_rayon_workers,
+            actual_rayon_pool_size: startup.actual_rayon_workers,
+            rayon_selection_source: startup.rayon_selection_source,
+            dense_matvec_backend: crate::parallel::dense_matvec_backend().to_string(),
+            direct_q8_avx2_fma_selected: direct_q8_expert_backend == "avx2-fma",
+            direct_q8_avx512_selected: direct_q8_expert_backend == "avx512f-bw",
+            direct_q8_expert_backend,
+        },
+        model: BenchRealModelIdentity {
+            checkpoint_identifier,
+            converted_weights_dir: weights_dir.display().to_string(),
+            config_json_sha256,
+            dense_manifest_sha256,
+            converted_manifest_identity,
+            architecture: model.architecture.model_type().to_string(),
+            d_model: model.d_model,
+            d_ff: model.d_ff,
+            layer_count: model.num_layers,
+            expert_count_per_layer: runtime.cfg.model.num_experts,
+            layer_qualified_expert_count: (model.num_layers as u64)
+                .saturating_mul(runtime.cfg.model.num_experts as u64),
+            top_k: model.top_k,
+            query_head_count: model.num_heads,
+            kv_head_count: model.num_kv_heads,
+            head_dim: model.head_dim,
+            vocab_size: model.vocab_size,
+            dense_dtype,
+            expert_dtype: runtime.cfg.model.dtype.as_str().to_string(),
+        },
+        prompt_identity: BenchRealPromptIdentity {
+            fixture_identifier: input.prompt_id.clone(),
+            sha256: input.prompt_sha256.clone(),
+            requested_completion_tokens: input.output_tokens,
+        },
+        storage: BenchRealStorageIdentity {
+            expert_data_dir: runtime.cfg.model.data_dir.display().to_string(),
+            active_expert_io_backend: if runtime.cfg.storage.no_direct {
+                "pread-buffered".to_string()
+            } else {
+                "pread-odirect".to_string()
+            },
+            direct_io_enabled: !runtime.cfg.storage.no_direct,
+            io_uring_compiled: cfg!(feature = "io_uring"),
+            io_uring_active_for_expert_reads: false,
+            packed_expert_storage: runtime.cfg.storage.packed_blob.is_some(),
+        },
+        strictness: BenchRealStrictnessInfo {
+            strict_weights: runtime.model.load_status.strict,
+            loader: runtime.model.load_status.loader.to_string(),
+            required_tensor_count: runtime.model.load_status.required_tensors,
+            loaded_tensor_count: runtime.model.load_status.loaded_tensors,
+            seeded_fallback_remained: runtime.model.load_status.seeded_fallback_remained,
+            inference_policy: engine_report.inference_policy,
+        },
+        memory_layout: BenchRealMemoryLayout {
+            primary_expert_pool_allocated_bytes: engine_report.expert_buffer_pool_primary_bytes,
+            shadow_expert_pool_allocated_bytes: engine_report.expert_buffer_pool_shadow_bytes,
+            total_expert_pool_allocated_bytes: engine_report.expert_buffer_pool_allocated_bytes,
+            prepared_duplicate_expert_bytes: engine_report.prepared_duplicate_expert_bytes,
+            external_peak_rss_source: "collector:/usr/bin/time-v",
+        },
+        predictive_policy: BenchRealPredictivePolicy {
+            markov_prefetch_fanout: runtime.cfg.storage.predict_fanout,
+            pipeline_depth: runtime.cfg.storage.pipeline_depth,
+            locality_enabled: runtime.cfg.predictive.locality_enabled,
+            speculator_enabled: runtime.cfg.predictive.speculator_enabled,
+            affinity_enabled: runtime.cfg.predictive.affinity_enabled,
+            prefetch_governor_enabled: runtime.cfg.predictive.prefetch_governor,
+            cost_aware_eviction_enabled: runtime.cfg.predictive.cost_aware_eviction,
+            pregate_enabled: runtime.cfg.predictive.pregate_enabled,
+            static_residency_fraction: runtime.cfg.predictive.static_residency_fraction,
+        },
+    })
+}
+
 async fn run_bench_real_once(
     runtime: &BenchRealRuntime,
     prompt: &str,
@@ -3913,9 +4326,12 @@ async fn run_bench_real_once(
     if prompt_ids.is_empty() {
         return Err("bench-real prompt encoded to zero tokens".into());
     }
-    let stage_timings = crate::stage_timing::StageTimings::default();
+    let prompt_stage_timings = crate::stage_timing::StageTimings::default();
+    let decode_stage_timings = crate::stage_timing::StageTimings::default();
     let mut kv = runtime.model.fresh_kv_caches();
     let pre = runtime.engine.report();
+    let truncated_payload_uses_before = crate::inference::truncated_expert_payload_uses();
+    let nonfinite_attention_before = crate::transformer::nonfinite_softmax_fallbacks();
     let total_started = Instant::now();
     let prompt_started = Instant::now();
     let mut pos = 0usize;
@@ -3932,7 +4348,7 @@ async fn run_bench_real_once(
                 tid,
                 pos,
                 &mut kv,
-                Some(&stage_timings),
+                Some(&prompt_stage_timings),
             )
             .await?;
         forward_evaluations += 1;
@@ -3949,19 +4365,19 @@ async fn run_bench_real_once(
             final_prompt,
             final_prompt_pos,
             &mut kv,
-            Some(&stage_timings),
+            Some(&prompt_stage_timings),
         )
         .await?;
     forward_evaluations += 1;
     pos += 1;
     let prompt_elapsed = prompt_started.elapsed();
-    stage_timings.record(crate::stage_timing::TOTAL_PROMPT, prompt_elapsed);
+    prompt_stage_timings.record(crate::stage_timing::TOTAL_PROMPT, prompt_elapsed);
     let prompt_seconds = prompt_elapsed.as_secs_f64();
     let first = runtime.model.sample_hidden_with_timing(
         &final_hidden,
         &params,
         final_prompt_pos,
-        Some(&stage_timings),
+        Some(&prompt_stage_timings),
     );
     lm_head_evaluations += 1;
     let _first_token_latency_us = first_started.elapsed().as_micros() as u64;
@@ -3980,7 +4396,7 @@ async fn run_bench_real_once(
                 pos,
                 &mut kv,
                 &params,
-                Some(&stage_timings),
+                Some(&decode_stage_timings),
             )
             .await?;
         forward_evaluations += 1;
@@ -3991,7 +4407,7 @@ async fn run_bench_real_once(
         pos += 1;
     }
     let decode_elapsed = decode_started.elapsed();
-    stage_timings.record(crate::stage_timing::TOTAL_DECODE, decode_elapsed);
+    decode_stage_timings.record(crate::stage_timing::TOTAL_DECODE, decode_elapsed);
     let decode_seconds = decode_elapsed.as_secs_f64();
     let total_seconds = total_started.elapsed().as_secs_f64();
     debug_assert_eq!(
@@ -4016,7 +4432,42 @@ async fn run_bench_real_once(
         .saturating_sub(pre.predictive.ssd_stall_us);
     decode_latencies_us.sort_unstable();
     let output_text = runtime.tokenizer.decode(&completion_ids)?;
-    let stage_timings = stage_timings.snapshot();
+    let prompt_stage_timings = prompt_stage_timings.snapshot();
+    let decode_stage_timings = decode_stage_timings.snapshot();
+    let stage_timings =
+        crate::stage_timing::merge_snapshots(&[&prompt_stage_timings, &decode_stage_timings]);
+    let current_rss = current_rss_bytes();
+    let degraded_expert_substitutions = post
+        .degraded_expert_substitutions
+        .saturating_sub(pre.degraded_expert_substitutions);
+    let expert_read_failures = post
+        .expert_read_failures
+        .saturating_sub(pre.expert_read_failures);
+    let truncated_expert_payload_uses = crate::inference::truncated_expert_payload_uses()
+        .saturating_sub(truncated_payload_uses_before);
+    let nonfinite_attention_fallbacks = crate::transformer::nonfinite_softmax_fallbacks()
+        .saturating_sub(nonfinite_attention_before);
+    let q8_scalar_layout_fallbacks = post
+        .q8_scalar_layout_fallbacks
+        .saturating_sub(pre.q8_scalar_layout_fallbacks);
+    let q8_direct_kernel_dispatches = post
+        .q8_direct_kernel_dispatches
+        .saturating_sub(pre.q8_direct_kernel_dispatches);
+    let prefetch_bytes = post
+        .prefetch_bytes_read
+        .saturating_sub(pre.prefetch_bytes_read);
+    let prefetch_used = post.prefetch_used.saturating_sub(pre.prefetch_used);
+    let useful_prefetch_bytes = prefetch_used
+        .saturating_mul(runtime.cfg.model.expert_size as u64)
+        .min(prefetch_bytes);
+    let prompt_critical_path = crate::stage_timing::CriticalPathReport::from_snapshot(
+        time_to_first_token_seconds,
+        &prompt_stage_timings,
+    );
+    let decode_critical_path = crate::stage_timing::CriticalPathReport::from_snapshot(
+        decode_seconds,
+        &decode_stage_timings,
+    );
 
     Ok(BenchRealRunReport {
         run_index,
@@ -4041,7 +4492,83 @@ async fn run_bench_real_once(
         hit_rate,
         ssd_bytes,
         ssd_stall_seconds: ssd_stall_us as f64 / 1_000_000.0,
-        rss_bytes: current_rss_bytes(),
+        rss_bytes: current_rss,
+        correctness: BenchRealRunCorrectness {
+            strict_weights: runtime.model.load_status.strict,
+            required_tensor_count: runtime.model.load_status.required_tensors,
+            loaded_tensor_count: runtime.model.load_status.loaded_tensors,
+            seeded_fallback_remained: runtime.model.load_status.seeded_fallback_remained,
+            degraded_expert_substitutions,
+            expert_read_failures,
+            truncated_expert_payload_uses,
+            nonfinite_attention_fallbacks,
+            nonfinite_output_count: None,
+            q8_scalar_layout_fallbacks,
+            q8_direct_kernel_dispatches,
+            prepared_duplicate_expert_bytes: post.prepared_duplicate_expert_bytes,
+            inference_policy: post.inference_policy,
+        },
+        cache_io: BenchRealRunCacheIo {
+            cache_hits,
+            cache_misses,
+            cache_hit_rate: hit_rate,
+            cache_evictions: post.cache_evictions.saturating_sub(pre.cache_evictions),
+            cache_capacity_experts: post.cache_capacity,
+            cache_resident_experts_at_sample: post.cache_resident_experts,
+            shadow_resident_experts_at_sample: post.shadow_resident_experts,
+            foreground_read_operations: post
+                .foreground_read_operations
+                .saturating_sub(pre.foreground_read_operations),
+            foreground_expert_bytes: post
+                .foreground_bytes_read
+                .saturating_sub(pre.foreground_bytes_read),
+            foreground_expert_io_wait_seconds: ssd_stall_us as f64 / 1_000_000.0,
+            total_expert_bytes_read: ssd_bytes,
+            prefetch_enabled: runtime.cfg.storage.predict_fanout > 0,
+            prefetch_submitted: post
+                .prefetch_submitted
+                .saturating_sub(pre.prefetch_submitted),
+            prefetch_completed: post
+                .prefetch_completed
+                .saturating_sub(pre.prefetch_completed),
+            prefetch_used,
+            prefetch_bytes,
+            useful_prefetch_bytes,
+            unused_prefetch_bytes_at_sample: prefetch_bytes
+                .saturating_sub(useful_prefetch_bytes),
+            prefetch_dropped_concurrency: post
+                .prefetch_dropped_concurrency
+                .saturating_sub(pre.prefetch_dropped_concurrency),
+            prefetch_dropped_pool_starved: post
+                .prefetch_dropped_pool_starved
+                .saturating_sub(pre.prefetch_dropped_pool_starved),
+            prefetch_dropped_governor: post
+                .prefetch_dropped_governor
+                .saturating_sub(pre.prefetch_dropped_governor),
+            // All three drop counters fire before a storage read is issued.
+            prefetch_dropped_bytes: 0,
+            expert_read_failures,
+        },
+        memory: BenchRealRunMemory {
+            current_rss_bytes: current_rss,
+            current_rss_sample_point: "after_completion_decode_before_report_serialization",
+            resident_expert_buffer_bytes: post.resident_expert_buffer_bytes,
+            primary_expert_pool_allocated_bytes: post.expert_buffer_pool_primary_bytes,
+            shadow_expert_pool_allocated_bytes: post.expert_buffer_pool_shadow_bytes,
+            total_expert_pool_allocated_bytes: post.expert_buffer_pool_allocated_bytes,
+            prepared_duplicate_expert_bytes: post.prepared_duplicate_expert_bytes,
+            external_peak_rss_bytes: None,
+        },
+        critical_path: BenchRealCriticalPath {
+            semantics: "exclusive request-path wall durations; nested diagnostic kernel timers excluded",
+            prompt: prompt_critical_path,
+            decode: decode_critical_path,
+        },
+        diagnostic_stage_timings: BenchRealDiagnosticStageTimings {
+            semantics: "cumulative diagnostics; may be nested or worker-cumulative and must not be summed as wall time",
+            prompt: prompt_stage_timings,
+            decode: decode_stage_timings,
+        },
         output_token_ids: completion_ids,
         output_text,
         stage_timings,
@@ -4051,9 +4578,23 @@ async fn run_bench_real_once(
 fn emit_bench_real_report(
     args: &BenchRealArgs,
     input: BenchRealInput,
+    context: BenchRealReportContext,
     runs: Vec<BenchRealRunReport>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let BenchRealReportContext {
+        execution,
+        model,
+        prompt_identity,
+        storage,
+        strictness,
+        memory_layout,
+        predictive_policy,
+    } = context;
     let suite = BenchRealSuiteReport {
+        schema: BenchRealSchemaInfo {
+            name: "mer-bench-real".to_string(),
+            version: BENCH_REAL_SCHEMA_VERSION,
+        },
         benchmark: "bench-real",
         config: args.config.display().to_string(),
         prompt: input.prompt,
@@ -4061,13 +4602,22 @@ fn emit_bench_real_report(
         measured_runs: args.measured_runs,
         cache_reset: args.cache_reset,
         greedy: args.greedy,
+        execution: execution.clone(),
+        model,
+        prompt_identity,
+        storage,
+        strictness,
+        memory_layout,
+        predictive_policy,
         build: BenchRealBuildInfo {
-            git_commit: git_commit_short(),
-            build_features: build_features(),
-            threads: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-            dense_matvec_backend: crate::parallel::dense_matvec_backend().to_string(),
+            git_commit: execution.git_commit_full.clone(),
+            worktree_dirty: execution.worktree_dirty_at_execution,
+            build_profile: execution.build_profile.clone(),
+            build_features: execution.cargo_features.clone(),
+            threads: execution.actual_rayon_pool_size,
+            rayon_selection_source: execution.rayon_selection_source.clone(),
+            dense_matvec_backend: execution.dense_matvec_backend.clone(),
+            direct_q8_expert_backend: execution.direct_q8_expert_backend.clone(),
         },
         aggregate: aggregate_bench_real(&runs),
         runs,
@@ -4089,10 +4639,14 @@ fn print_bench_real_human(suite: &BenchRealSuiteReport) {
         suite.warmup_runs, suite.measured_runs, suite.cache_reset, suite.greedy
     );
     println!(
-        "  build: git={} threads={} dense_matvec_backend={} features={}",
+        "  build: git={} dirty={} profile={} threads={} rayon_source={} dense_matvec_backend={} direct_q8_backend={} features={}",
         suite.build.git_commit,
+        suite.build.worktree_dirty,
+        suite.build.build_profile,
         suite.build.threads,
+        suite.build.rayon_selection_source,
         suite.build.dense_matvec_backend,
+        suite.build.direct_q8_expert_backend,
         suite.build.build_features.join(",")
     );
     for run in &suite.runs {
@@ -4260,13 +4814,56 @@ fn build_features() -> Vec<&'static str> {
     features
 }
 
-fn git_commit_short() -> String {
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+        .to_path_buf()
+}
+
+fn git_commit_full() -> String {
     let output = std::process::Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repository_root())
         .output();
     match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+fn git_worktree_dirty() -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain=v1"])
+        .current_dir(repository_root())
+        .output()
+        .map(|output| !output.status.success() || !output.stdout.is_empty())
+        .unwrap_or(true)
+}
+
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+fn current_bench_build_info() -> BenchRealBuildInfo {
+    let startup = STARTUP_EXECUTION_INFO.get();
+    BenchRealBuildInfo {
+        git_commit: git_commit_full(),
+        worktree_dirty: git_worktree_dirty(),
+        build_profile: build_profile().to_string(),
+        build_features: build_features(),
+        threads: startup
+            .map(|info| info.actual_rayon_workers)
+            .unwrap_or_else(crate::parallel::num_threads),
+        rayon_selection_source: startup
+            .map(|info| info.rayon_selection_source.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        dense_matvec_backend: crate::parallel::dense_matvec_backend().to_string(),
+        direct_q8_expert_backend: crate::inference::q8_direct_kernel_backend().to_string(),
     }
 }
 
@@ -7608,6 +8205,18 @@ mod tests {
     }
 
     #[test]
+    fn bench_real_schema_version_round_trips() {
+        let schema = BenchRealSchemaInfo {
+            name: "mer-bench-real".to_string(),
+            version: BENCH_REAL_SCHEMA_VERSION,
+        };
+        let encoded = serde_json::to_string(&schema).unwrap();
+        let decoded: BenchRealSchemaInfo = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, schema);
+        assert_eq!(decoded.version, 2);
+    }
+
+    #[test]
     fn bench_real_request_json_supports_chat_messages_and_max_tokens() {
         let path = tempdir_unique("bench-real-request.json");
         std::fs::write(
@@ -7659,6 +8268,11 @@ mod tests {
         let input = load_bench_real_input(&args).unwrap();
         assert_eq!(input.prompt, "hello");
         assert_eq!(input.output_tokens, 3);
+        assert!(input.prompt_id.starts_with("bench-real-request-override"));
+        assert_eq!(
+            input.prompt_sha256,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
         let _ = std::fs::remove_file(path);
     }
 

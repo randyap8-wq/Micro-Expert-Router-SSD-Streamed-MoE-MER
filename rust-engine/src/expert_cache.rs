@@ -445,6 +445,16 @@ impl ExpertCache {
         self.inner.lock().len()
     }
 
+    /// Number of residents currently backed by speculative shadow-pool
+    /// buffers. Read-only benchmark/health telemetry.
+    pub fn shadow_resident_count(&self) -> usize {
+        self.inner
+            .lock()
+            .iter()
+            .filter(|(_, resident)| resident.is_shadow_backed())
+            .count()
+    }
+
     /// Pop the least-recently-used **non-pinned** entry. Returns the
     /// removed `Arc` so callers can observe (and log) what was evicted;
     /// once the `Arc` is dropped its `PooledBuffer` returns to the

@@ -797,6 +797,15 @@ pub(crate) struct Counters {
     /// sum(critical-path miss bytes)` always holds — see the test
     /// `assert_singleflight_dedupes_concurrent_misses`.
     bytes_read: AtomicU64,
+    /// Successful foreground expert reads and their physical bytes.
+    foreground_read_operations: AtomicU64,
+    foreground_bytes_read: AtomicU64,
+    /// Speculative reads admitted/spawned and bytes that completed.
+    prefetch_submitted: AtomicU64,
+    prefetch_bytes_read: AtomicU64,
+    /// CPU expert-cache residents displaced by foreground or speculative
+    /// cache management.
+    cache_evictions: AtomicU64,
     /// Cumulative experts dropped from a `moe_step` mixture because
     /// their fetch failed after all retry attempts. Surfaced via
     /// `EngineReport::expert_read_failures` so operators can alert on
@@ -2853,6 +2862,10 @@ impl Engine {
         // when the cache is fully pinned and speculation is saturated.
         if self.core.cache.len() >= self.core.cache.capacity() {
             if let Some(evicted) = self.core.cache.evict_lru() {
+                self.metrics
+                    .counters
+                    .cache_evictions
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(evicted = evicted.id, "evicted LRU to make room");
                 drop(evicted);
             }
@@ -2881,13 +2894,27 @@ impl Engine {
                     .counters
                     .bytes_read
                     .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                self.metrics
+                    .counters
+                    .foreground_read_operations
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .counters
+                    .foreground_bytes_read
+                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
                 let resident = Arc::new(ExpertResident::new_with_block_align(
                     id,
                     buf,
                     self.core.storage.config().block_align,
                 ));
                 match self.core.cache.insert(resident.clone()) {
-                    Ok(Some(_evicted)) => debug!(expert = id, "inserted (with eviction)"),
+                    Ok(Some(_evicted)) => {
+                        self.metrics
+                            .counters
+                            .cache_evictions
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(expert = id, "inserted (with eviction)")
+                    }
                     Ok(None) => debug!(expert = id, "inserted"),
                     Err(rejected) => {
                         // Cache is full of pinned entries — surface this
@@ -2968,6 +2995,10 @@ impl Engine {
             }
         };
         let me = self.clone();
+        self.metrics
+            .counters
+            .prefetch_submitted
+            .fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             // Permit released on task completion (drop). Holding it
             // across the I/O is what enforces the bound.
@@ -3041,6 +3072,10 @@ impl Engine {
                     // elsewhere the buffer comes back later — drop
                     // this speculative load, exactly like before.
                     match me.core.cache.evict_lru_shadow_backed().and_then(|victim| {
+                        me.metrics
+                            .counters
+                            .cache_evictions
+                            .fetch_add(1, Ordering::Relaxed);
                         debug!(
                             expert = id,
                             recycled = victim.id,
@@ -3074,6 +3109,10 @@ impl Engine {
                         .counters
                         .bytes_read
                         .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                    me.metrics
+                        .counters
+                        .prefetch_bytes_read
+                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
                     // **Self-balancing shadow accounting.** We insert the
                     // resident still holding its *shadow*-tagged buffer
                     // rather than calling `BufferPool::promote_shadow`
@@ -3098,12 +3137,21 @@ impl Engine {
                     // the insert (every slot pinned), the resident drops
                     // here and its buffer returns to the shadow pool —
                     // exactly the right behaviour for a speculative load.
-                    if let Err(_rejected) = me.core.cache.insert(resident.clone()) {
-                        debug!(
-                            expert = id,
-                            "prefetch dropped: cache full of pinned entries"
-                        );
-                        return;
+                    match me.core.cache.insert(resident.clone()) {
+                        Ok(Some(_evicted)) => {
+                            me.metrics
+                                .counters
+                                .cache_evictions
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(None) => {}
+                        Err(_rejected) => {
+                            debug!(
+                                expert = id,
+                                "prefetch dropped: cache full of pinned entries"
+                            );
+                            return;
+                        }
                     }
                     // **Eager VRAM promotion.** A speculative prefetch is
                     // a strong "about to be routed" signal, so try to
@@ -4231,6 +4279,11 @@ impl Engine {
         // non-authoritative.
         let allow_degraded = self.core.options.policy.allow_degraded_experts;
         let mut first_fetch_error: Option<MoeStepError> = None;
+        // Exclusive critical-path wait begins only after cache coordination,
+        // miss task submission, and trace bookkeeping. The historical
+        // FOREGROUND_EXPERT_IO_WAIT timer above intentionally includes those
+        // earlier slices and remains a cumulative diagnostic.
+        let io_await_start = Instant::now();
         for (i, h) in miss_handles {
             // `fetch_with_retry` already retried with backoff. A join
             // error means the task itself panicked, which is fatal —
@@ -4274,6 +4327,15 @@ impl Engine {
                 }
             }
         }
+        crate::stage_timing::record_optional(
+            timings,
+            crate::stage_timing::FOREGROUND_EXPERT_IO_AWAIT,
+            if had_misses {
+                io_await_start.elapsed()
+            } else {
+                std::time::Duration::ZERO
+            },
+        );
         let io_wait_elapsed = if had_misses {
             io_wait_start.elapsed()
         } else {
@@ -4616,6 +4678,31 @@ impl Engine {
                 .prefetch_completed
                 .load(Ordering::Relaxed),
             bytes_read: self.metrics.counters.bytes_read.load(Ordering::Relaxed),
+            foreground_read_operations: self
+                .metrics
+                .counters
+                .foreground_read_operations
+                .load(Ordering::Relaxed),
+            foreground_bytes_read: self
+                .metrics
+                .counters
+                .foreground_bytes_read
+                .load(Ordering::Relaxed),
+            prefetch_submitted: self
+                .metrics
+                .counters
+                .prefetch_submitted
+                .load(Ordering::Relaxed),
+            prefetch_bytes_read: self
+                .metrics
+                .counters
+                .prefetch_bytes_read
+                .load(Ordering::Relaxed),
+            cache_evictions: self
+                .metrics
+                .counters
+                .cache_evictions
+                .load(Ordering::Relaxed),
             cycle_p50_us: cycle.value_at_quantile(0.50),
             cycle_p95_us: cycle.value_at_quantile(0.95),
             cycle_p99_us: cycle.value_at_quantile(0.99),
@@ -4750,6 +4837,8 @@ impl Engine {
                 .counters
                 .singleflight_followers
                 .load(Ordering::Relaxed),
+            cache_resident_experts: self.core.cache.len(),
+            shadow_resident_experts: self.core.cache.shadow_resident_count(),
             resident_expert_buffer_bytes: crate::expert_cache::resident_expert_buffer_bytes(),
             expert_buffer_pool_allocated_bytes: self.core.pool.allocated_bytes() as u64,
             expert_buffer_pool_primary_bytes: self.core.pool.primary_allocated_bytes() as u64,
@@ -4957,6 +5046,11 @@ pub struct EngineReport {
     pub misses: u64,
     pub prefetch_completed: u64,
     pub bytes_read: u64,
+    pub foreground_read_operations: u64,
+    pub foreground_bytes_read: u64,
+    pub prefetch_submitted: u64,
+    pub prefetch_bytes_read: u64,
+    pub cache_evictions: u64,
     pub cycle_p50_us: u64,
     pub cycle_p95_us: u64,
     pub cycle_p99_us: u64,
@@ -5104,6 +5198,8 @@ pub struct EngineReport {
     /// issuing their own (Phase 1 — SSD read de-duplication). Each one
     /// maps directly to one disk read that was avoided.
     pub singleflight_followers: u64,
+    pub cache_resident_experts: usize,
+    pub shadow_resident_experts: usize,
     /// Bytes held by live CPU resident expert buffers (occupancy, not pool allocation).
     pub resident_expert_buffer_bytes: u64,
     /// Bytes preallocated by all primary and shadow expert-buffer slots.

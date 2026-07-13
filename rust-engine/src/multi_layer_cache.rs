@@ -227,6 +227,13 @@ impl MultiLayerExpertCache {
         self.caches.iter().map(|c| c.len()).sum()
     }
 
+    pub fn shadow_resident_count(&self) -> usize {
+        self.caches
+            .iter()
+            .map(|cache| cache.shadow_resident_count())
+            .sum()
+    }
+
     /// Pop a least-recently-used, non-pinned, **shadow-backed** entry
     /// (see [`ExpertCache::evict_lru_shadow_backed`]). Walks layers
     /// heaviest-first so Buffer B recycling relieves the most-pressured
