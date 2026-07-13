@@ -306,6 +306,7 @@ run_case() {
       .prefetch_enabled == true and
       .cache_evictions >= 0 and
       .foreground_read_operations >= 0 and
+      .foreground_read_operations_issued >= .foreground_read_operations and
       .foreground_expert_bytes >= 0 and
       .foreground_expert_io_wait_seconds >= 0 and
       .total_expert_bytes_read >= 0 and
@@ -318,7 +319,17 @@ run_case() {
       .prefetch_dropped_concurrency >= 0 and
       .prefetch_dropped_pool_starved >= 0 and
       .prefetch_dropped_governor == 0 and
-      .prefetch_dropped_bytes == 0
+      .prefetch_dropped_bytes == 0 and
+      .speculative_read_operations_issued >= 0 and
+      .demand_requests_joined_inflight_prefetch >= 0 and
+      .demand_requests_joined_inflight_foreground >= 0 and
+      .speculative_loads_promoted_to_demand >= 0 and
+      .duplicate_physical_reads_avoided ==
+        (.demand_requests_joined_inflight_prefetch + .demand_requests_joined_inflight_foreground) and
+      .completed_prefetch_direct_handoffs >= 0 and
+      .in_flight_registry_peak_size >= .in_flight_registry_size_at_sample and
+      .in_flight_entries_removed >= .in_flight_failed_or_abandoned_entries_removed and
+      .in_flight_failed_or_abandoned_entries_removed >= 0
     )) and
     ([.runs[].memory] | all(
       .current_rss_bytes > 0 and
@@ -369,8 +380,29 @@ run_case() {
       decode_seconds_mean: .aggregate.decode_seconds_mean,
       total_seconds_mean: .aggregate.total_seconds_mean,
       cache_hit_rate: .aggregate.hit_rate,
+      cache_hits_total: .aggregate.cache_hits_total,
       cache_misses_total: .aggregate.cache_misses_total,
+      cache_evictions_total: ([.runs[].cache_io.cache_evictions] | add),
       ssd_bytes_total: .aggregate.ssd_bytes_total,
+      foreground_read_operations_total: ([.runs[].cache_io.foreground_read_operations] | add),
+      foreground_read_operations_issued_total: ([.runs[].cache_io.foreground_read_operations_issued] | add),
+      foreground_expert_bytes_total: ([.runs[].cache_io.foreground_expert_bytes] | add),
+      foreground_expert_io_wait_seconds_total: ([.runs[].cache_io.foreground_expert_io_wait_seconds] | add),
+      prefetch_submitted_total: ([.runs[].cache_io.prefetch_submitted] | add),
+      prefetch_completed_total: ([.runs[].cache_io.prefetch_completed] | add),
+      prefetch_used_total: ([.runs[].cache_io.prefetch_used] | add),
+      prefetch_bytes_total: ([.runs[].cache_io.prefetch_bytes] | add),
+      useful_prefetch_bytes_total: ([.runs[].cache_io.useful_prefetch_bytes] | add),
+      unused_prefetch_bytes_at_sample_total: ([.runs[].cache_io.unused_prefetch_bytes_at_sample] | add),
+      speculative_read_operations_issued_total: ([.runs[].cache_io.speculative_read_operations_issued] | add),
+      demand_requests_joined_inflight_prefetch_total: ([.runs[].cache_io.demand_requests_joined_inflight_prefetch] | add),
+      demand_requests_joined_inflight_foreground_total: ([.runs[].cache_io.demand_requests_joined_inflight_foreground] | add),
+      speculative_loads_promoted_to_demand_total: ([.runs[].cache_io.speculative_loads_promoted_to_demand] | add),
+      duplicate_physical_reads_avoided_total: ([.runs[].cache_io.duplicate_physical_reads_avoided] | add),
+      completed_prefetch_direct_handoffs_total: ([.runs[].cache_io.completed_prefetch_direct_handoffs] | add),
+      in_flight_registry_peak_size: ([.runs[].cache_io.in_flight_registry_peak_size] | max),
+      in_flight_entries_removed_total: ([.runs[].cache_io.in_flight_entries_removed] | add),
+      in_flight_failed_or_abandoned_entries_removed_total: ([.runs[].cache_io.in_flight_failed_or_abandoned_entries_removed] | add),
       external_peak_rss_bytes: $peak_rss_bytes,
       storage_identity_artifact: "model-findmnt.json",
       prompt_critical_path_coverage_min: ([.runs[].critical_path.prompt.coverage_ratio] | min),
