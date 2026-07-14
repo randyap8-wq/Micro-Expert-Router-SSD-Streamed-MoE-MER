@@ -316,7 +316,6 @@ run_case() {
       .prefetch_enabled == true and
       .cache_evictions >= 0 and
       .foreground_read_operations >= 0 and
-      .foreground_read_operations_issued >= .foreground_read_operations and
       .foreground_expert_bytes >= 0 and
       .foreground_expert_io_wait_seconds >= 0 and
       .total_expert_bytes_read >= 0 and
@@ -329,17 +328,7 @@ run_case() {
       .prefetch_dropped_concurrency >= 0 and
       .prefetch_dropped_pool_starved >= 0 and
       .prefetch_dropped_governor == 0 and
-      .prefetch_dropped_bytes == 0 and
-      .speculative_read_operations_issued >= 0 and
-      .demand_requests_joined_inflight_prefetch >= 0 and
-      .demand_requests_joined_inflight_foreground >= 0 and
-      .speculative_loads_promoted_to_demand >= 0 and
-      .duplicate_physical_reads_avoided ==
-        (.demand_requests_joined_inflight_prefetch + .demand_requests_joined_inflight_foreground) and
-      .completed_prefetch_direct_handoffs >= 0 and
-      .in_flight_registry_peak_size >= .in_flight_registry_size_at_sample and
-      .in_flight_entries_removed >= .in_flight_failed_or_abandoned_entries_removed and
-      .in_flight_failed_or_abandoned_entries_removed >= 0
+      .prefetch_dropped_bytes == 0
     )) and
     ([.runs[].memory] | all(
       .current_rss_bytes > 0 and
@@ -390,29 +379,8 @@ run_case() {
       decode_seconds_mean: .aggregate.decode_seconds_mean,
       total_seconds_mean: .aggregate.total_seconds_mean,
       cache_hit_rate: .aggregate.hit_rate,
-      cache_hits_total: .aggregate.cache_hits_total,
       cache_misses_total: .aggregate.cache_misses_total,
-      cache_evictions_total: ([.runs[].cache_io.cache_evictions] | add),
       ssd_bytes_total: .aggregate.ssd_bytes_total,
-      foreground_read_operations_total: ([.runs[].cache_io.foreground_read_operations] | add),
-      foreground_read_operations_issued_total: ([.runs[].cache_io.foreground_read_operations_issued] | add),
-      foreground_expert_bytes_total: ([.runs[].cache_io.foreground_expert_bytes] | add),
-      foreground_expert_io_wait_seconds_total: ([.runs[].cache_io.foreground_expert_io_wait_seconds] | add),
-      prefetch_submitted_total: ([.runs[].cache_io.prefetch_submitted] | add),
-      prefetch_completed_total: ([.runs[].cache_io.prefetch_completed] | add),
-      prefetch_used_total: ([.runs[].cache_io.prefetch_used] | add),
-      prefetch_bytes_total: ([.runs[].cache_io.prefetch_bytes] | add),
-      useful_prefetch_bytes_total: ([.runs[].cache_io.useful_prefetch_bytes] | add),
-      unused_prefetch_bytes_at_sample_total: ([.runs[].cache_io.unused_prefetch_bytes_at_sample] | add),
-      speculative_read_operations_issued_total: ([.runs[].cache_io.speculative_read_operations_issued] | add),
-      demand_requests_joined_inflight_prefetch_total: ([.runs[].cache_io.demand_requests_joined_inflight_prefetch] | add),
-      demand_requests_joined_inflight_foreground_total: ([.runs[].cache_io.demand_requests_joined_inflight_foreground] | add),
-      speculative_loads_promoted_to_demand_total: ([.runs[].cache_io.speculative_loads_promoted_to_demand] | add),
-      duplicate_physical_reads_avoided_total: ([.runs[].cache_io.duplicate_physical_reads_avoided] | add),
-      completed_prefetch_direct_handoffs_total: ([.runs[].cache_io.completed_prefetch_direct_handoffs] | add),
-      in_flight_registry_peak_size: ([.runs[].cache_io.in_flight_registry_peak_size] | max),
-      in_flight_entries_removed_total: ([.runs[].cache_io.in_flight_entries_removed] | add),
-      in_flight_failed_or_abandoned_entries_removed_total: ([.runs[].cache_io.in_flight_failed_or_abandoned_entries_removed] | add),
       external_peak_rss_bytes: $peak_rss_bytes,
       storage_identity_artifact: "model-findmnt.json",
       prompt_critical_path_coverage_min: ([.runs[].critical_path.prompt.coverage_ratio] | min),
@@ -422,97 +390,21 @@ run_case() {
     }' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"
 }
 
+RESIDENT_STATUS=0
 if [[ "$COLLECTOR_MODE" == resident-only ]]; then
   run_case 6144 short 14 "$SHORT_PROMPT_SHA"
   run_case 6144 medium 65 "$MEDIUM_PROMPT_SHA"
 
-  for json in \
-    "$ARTIFACT_DIR/baseline-6144-short.json" \
-    "$ARTIFACT_DIR/baseline-6144-medium.json"; do
-    jq -e '
-      .aggregate.output_token_parity == true and
-      .aggregate.cache_misses_total == 0 and
-      .aggregate.ssd_bytes_total == 0 and
-      ([.runs[].cache_io] | all(
-        .cache_misses == 0 and
-        .cache_evictions == 0 and
-        .foreground_read_operations == 0 and
-        .foreground_read_operations_issued == 0 and
-        .foreground_expert_bytes == 0 and
-        .foreground_expert_io_wait_seconds == 0 and
-        .total_expert_bytes_read == 0 and
-        .prefetch_submitted == 0 and
-        .prefetch_completed == 0 and
-        .prefetch_bytes == 0 and
-        .speculative_read_operations_issued == 0 and
-        .demand_requests_joined_inflight_prefetch == 0 and
-        .demand_requests_joined_inflight_foreground == 0 and
-        .speculative_loads_promoted_to_demand == 0 and
-        .duplicate_physical_reads_avoided == 0 and
-        .completed_prefetch_direct_handoffs == 0 and
-        .in_flight_registry_size_at_sample == 0 and
-        .in_flight_entries_removed == 0 and
-        .in_flight_failed_or_abandoned_entries_removed == 0
-      ))
-    ' "$json" >/dev/null
-  done
-
-  jq -n \
-    --arg commit "$EXPECTED_COMMIT" \
-    --slurpfile short "$ARTIFACT_DIR/baseline-6144-short.case-summary.json" \
-    --slurpfile medium "$ARTIFACT_DIR/baseline-6144-medium.case-summary.json" \
-    --argjson reference 3.500144036461 '
-    (($short[0].decode_tps_mean * $medium[0].decode_tps_mean) | sqrt) as $gm |
-    {
-      schema: {name:"mer-prompt2-resident-control-summary", version:1},
-      git_commit_full: $commit,
-      cases: [$short[0], $medium[0]],
-      reference: {
-        commit: "327d263193c48f9dde9f6a716562260ab49fa7ef",
-        source: "immediate Phase 1 A-B-A recheck",
-        geometric_mean_decode_tps: $reference,
-        tolerance_percent: 2.0
-      },
-      resident_geometric_mean_decode_tps: $gm,
-      delta_from_reference_percent: (100 * ($gm / $reference - 1)),
-      no_ssd_or_handoff_activity: true,
-      qualification_passed: (
-        ($gm >= ($reference * 0.98)) and
-        ($gm <= ($reference * 1.02)) and
-        ([$short[0], $medium[0]] | all(
-          .qualification_passed == true and
-          .output_token_parity == true and
-          .cache_misses_total == 0 and
-          .ssd_bytes_total == 0 and
-          .foreground_read_operations_total == 0 and
-          .foreground_read_operations_issued_total == 0 and
-          .speculative_read_operations_issued_total == 0 and
-          .duplicate_physical_reads_avoided_total == 0
-        ))
-      )
-    }' > "$ARTIFACT_DIR/resident-control-summary.json"
-  jq -e '.qualification_passed == true' \
-    "$ARTIFACT_DIR/resident-control-summary.json" >/dev/null
-
-  jq -n \
-    --arg commit "$EXPECTED_COMMIT" \
-    --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --slurpfile summary "$ARTIFACT_DIR/resident-control-summary.json" '
-    {
-      schema: {name:"mer-prompt2-resident-qualification", version:1},
-      git_commit_full: $commit,
-      captured_at_utc: $captured_at_utc,
-      two_required_resident_cases_present: true,
-      schema_and_required_fields_passed: true,
-      provenance_and_backend_gates_passed: true,
-      prompt_identity_gates_passed: true,
-      strictness_and_correctness_gates_passed: true,
-      critical_path_coverage_gates_passed: true,
-      external_peak_rss_present: true,
-      no_ssd_or_handoff_activity: $summary[0].no_ssd_or_handoff_activity,
-      resident_reference_tolerance_passed: $summary[0].qualification_passed,
-      qualification_passed: $summary[0].qualification_passed
-    }' > "$ARTIFACT_DIR/qualification.json"
+  if bash "$ROOT/scripts/finalize_qwen3_coder_prompt2_resident.sh" \
+    "$ARTIFACT_DIR" "$EXPECTED_COMMIT"; then
+    RESIDENT_STATUS=0
+  else
+    RESIDENT_STATUS=$?
+  fi
+  if (( RESIDENT_STATUS != 0 && RESIDENT_STATUS != 1 )); then
+    echo "resident-only collection is incomplete; final artifacts were not written" >&2
+    exit "$RESIDENT_STATUS"
+  fi
 else
   run_case 1536 short 14 "$SHORT_PROMPT_SHA"
   run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"
@@ -555,6 +447,12 @@ find "$ARTIFACT_DIR" -type f \
   ! -name 'collector.stderr.log' \
   ! -name 'artifact-sha256.txt' \
   -print0 | sort -z | xargs -0 sha256sum > "$ARTIFACT_DIR/artifact-sha256.txt"
+
+if (( RESIDENT_STATUS == 1 )); then
+  echo "QUALIFICATION: FAIL"
+  echo "resident-only collection completed with an auditable gate failure: $ARTIFACT_DIR"
+  exit 1
+fi
 
 echo "QUALIFICATION: PASS"
 echo "$COLLECTOR_MODE instrumented baseline collection completed: $ARTIFACT_DIR"

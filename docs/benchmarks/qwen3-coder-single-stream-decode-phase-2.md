@@ -1,22 +1,34 @@
-# Qwen3-Coder single-stream decode: Phase 2 in-flight resident handoff
+# Qwen3-Coder single-stream decode: Phase 2 negative result
 
-## Status and scope
+## Final status
 
-This phase implemented one narrowly scoped foreground-I/O optimization:
-demand-aware publication of an in-flight expert read's immutable resident.
-The target-host collector subsequently exercised the mechanism, but the
-candidate was not a performance win: streaming throughput did not improve and
-the first implementation regressed the all-resident control. Phase 2B isolates
-the resident fast path from the miss-only handoff state before the optimization
-is reconsidered. It does not change routing, prediction, cache capacity, model
-math, storage layout, prompts, token counts, sampling, CPU placement, Rayon
-sizing, or any experimental predictive policy. Mac results remain correctness
-evidence only; Phase 2B throughput requires a new Linux x86_64 collection.
+Phase 2 activated an in-flight resident handoff mechanism intended to let a
+demand request consume the immutable resident produced by an overlapping
+foreground or speculative expert read. The Linux target-host run confirmed
+that the mechanism was active: it avoided 454 duplicate physical reads in the
+1,536-short case and 424 in 1,536-medium, or 878 in total.
 
-The `bench-real` schema remains `mer-bench-real` version 2. The new fields are
-additive and do not change Phase 1 qualification semantics.
+That reduction did not produce a performance benefit. SSD traffic changed
+negligibly, streaming throughput did not improve, and the all-resident control
+regressed. The Phase 2B resident-path isolation attempt also failed its gate,
+measuring 9.33% below the immediate Phase 1 resident reference. The handoff
+runtime has therefore been removed. This document retains the experiment as a
+negative result; no performance win is claimed.
 
-## Qualified A-B-A result
+The production runtime is restored to the qualified Phase 1 implementation at
+commit `327d263193c48f9dde9f6a716562260ab49fa7ef` for every file changed by the
+handoff experiment. This restores notify-only single-flight coordination and
+the original counter/layout behavior. It also removes result publication,
+direct resident handoff and demand-promotion state, handoff-specific retry
+outcomes and ownership changes, separate handoff counters, registry guards,
+runtime telemetry fields, and tests specific to that removed implementation.
+
+The rollback preserves Phase 1 direct-Q8 zero-copy inference, observability,
+strict inference, output parity, expert-cache behavior, primary/shadow buffer
+ownership, and qualification semantics. No dead or disabled copy of the
+handoff runtime remains behind a runtime conditional or feature.
+
+## Evidence
 
 The qualified Linux target-host A-B-A comparison was:
 
@@ -26,279 +38,80 @@ The qualified Linux target-host A-B-A comparison was:
 | Phase 2 handoff | 1.2877193867 | 1.4804354696 | 1.380719180341 | 3.1906553312 | 3.0339322511 | 3.111307138724 |
 | Phase 1 immediate recheck | 1.2944549612 | 1.5184726960 | 1.401996617251 | 3.4921515988 | 3.5081547663 | 3.500144036461 |
 
-The Phase 1 streaming metric reproduced within about 0.2%. Relative to the
-immediate Phase 1 recheck, Phase 2 was about 1.5% slower on the streaming
-geometric mean and 11.1% slower on the resident-control geometric mean. The
-handoff mechanism was nevertheless exercised: 454 duplicate physical reads
-were avoided in 1,536-short and 424 in 1,536-medium, for 878 joined demand
-requests/direct handoffs in total. SSD traffic changed negligibly, so the
-avoided duplicate reads did not translate into streaming throughput.
+Relative to the immediate Phase 1 recheck, Phase 2 was about 1.5% slower on
+the streaming geometric mean and about 11% slower on the resident geometric
+mean. The 878 avoided reads did not materially reduce bytes read from SSD, so
+they did not improve the measured streaming rate. Both resident cases had zero
+SSD bytes, cache misses, foreground reads, speculative reads, and handoff
+joins; the resident regression was therefore not caused by I/O.
 
-Both 6,144-slot cases reported zero SSD reads, cache misses, foreground reads,
-speculative reads, and handoff joins. The first Phase 2 implementation
-therefore had a non-I/O resident-control regression. Phase 2B is intended to
-remove that non-I/O influence before any decision to retain or reconsider the
-handoff optimization. Phase 2 must not be described as a performance win.
+Phase 2B moved miss/handoff state away from the resident fast path but did not
+recover the control:
 
-## Phase 2B resident-path audit and correction
+| Phase 2B resident case | Decode TPS |
+| --- | ---: |
+| 6,144 short | 3.2589499509 |
+| 6,144 medium | 3.0904253666 |
+| Geometric mean | 3.173569220438 |
 
-The exact `327d263..06d9f044` audit found no registry lookup in either ordinary
-resident execution loop: `generate` and `moe_step_inner` both return the
-cached `Arc<ExpertResident>` inline and only spawn `fetch_with_retry` after a
-confirmed miss. The direct-Q8 dispatch and resident ownership flow were
-unchanged. Report sampling reads the registry gauge only before/after a
-benchmark run, not per activation.
+The Phase 2B geometric mean was `-9.330325%` relative to the Phase 1 reference
+of `3.500144036461`. Output parity passed and the run recorded zero SSD bytes,
+cache misses, foreground reads, speculative reads, and handoff joins, but the
+performance gate failed. Further incremental adjustment of the handoff
+implementation was rejected in favor of removing it.
 
-Two structural Phase 2 changes could still influence the all-resident binary:
+## Collector behavior retained
 
-1. ten miss/handoff atomics were inserted into the shared `Counters`
-   allocation, expanding the hot counter block from 18 to 28 atomics and
-   shifting the pre-existing fields that follow `singleflight_followers`; and
-2. the enlarged outcome/guard/retry state machine remained part of the public
-   cache-or-load async function instead of a distinct miss-only function.
+The original four-case collector remains the qualification path and retains
+its Phase 1 case validation and output. The `--resident-only` mode remains
+available as a faster control gate and runs only 6,144-short and 6,144-medium.
+It compares their decode-TPS geometric mean with the immediate Phase 1
+reference using a +/-2% tolerance.
 
-Phase 2B restores the exact Phase 1 `Counters` footprint and moves the ten
-handoff atomics into a separate allocation that is touched only by load
-lifecycle events or report sampling. `fetch_with_retry` now performs only the
-explicit cache probe on a hit; after a confirmed miss it calls a non-inlined
-miss-only helper containing leader election, outcome inspection, atomics, and
-the guard. `spawn_prefetch` likewise has an explicit resident return before
-its registry check. A test-only per-engine access probe proves those returns
-do not reach the registry; the probe and field are compiled out of release
-builds. Linux validation is still required to determine whether removing
-these code/layout influences restores the measured resident throughput.
+Because the production handoff runtime and its telemetry fields are gone, a
+resident-only Phase 1 report has no handoff counter to sample. The resident
+summary records `handoff_runtime_present: false`; zero handoff activity is by
+construction. It still requires output parity, zero cache misses, zero SSD
+bytes, zero foreground expert I/O, and zero speculative prefetch I/O.
 
-## Qualified Phase 1 evidence
+After both cases complete, the collector always writes:
 
-The qualified target-host Phase 1 run passed schema/provenance, output parity,
-strict inference, native AVX2/FMA direct-Q8, zero prepared duplicate bytes,
-truthful `pread-odirect` expert-I/O, inactive production `io_uring`, critical
-path coverage above 97%, and artifact checksum gates.
+- `resident-control-summary.json`;
+- `qualification.json`;
+- `artifact-sha256.txt`;
+- both raw reports and case summaries; and
+- the normal build, configuration, provenance, storage, prompt, timing, and
+  environment artifacts.
 
-| Case | Decode TPS | Decode wall |
-| --- | ---: | ---: |
-| 1,536 short | 1.2802183838270493 | 99.203 s |
-| 1,536 medium | 1.4685114039759062 | 86.483 s |
-| 6,144 short | 3.181157734961981 | 39.923 s |
-| 6,144 medium | 3.027596566141206 | 41.948 s |
+When the performance tolerance fails, both JSON finalization files contain
+`qualification_passed: false` and an explicit failure reason. The collector
+hashes the complete artifact and only then exits nonzero, so
+`sha256sum -c artifact-sha256.txt` remains valid. A missing, empty, or invalid
+case is instead reported as `INCOMPLETE`; it is not converted into a completed
+gate failure and does not receive final summary or qualification files.
 
-The primary 1,536-slot geometric mean is `1.3711364980298737` decode
-tokens/s. The 6,144-slot all-resident control geometric mean is
-`3.103427497900415` decode tokens/s; it is not SSD-streaming throughput.
+## Validation policy
 
-Foreground expert-I/O wait accounts for 59.38% of 1,536-short decode and
-50.92% of 1,536-medium decode, while it is zero in both resident controls.
-Major compute-stage absolute durations are nearly identical between streaming
-and resident cases. Expert-cache coordination is only about 0.05--0.06% of
-decode wall time, so cache-map and lock bookkeeping were not selected.
+macOS compilation and tests are correctness evidence only. Runtime and
+performance decisions target Linux x86_64. Do not claim throughput recovery,
+production-feature compilation, or Linux `io_uring` validation from a Mac
+result.
 
-Across five measured runs, the 1,536 cases performed 70,217 and 72,234
-foreground reads, while only 4,743 of 11,624 completed short prefetches and
-4,557 of 11,285 completed medium prefetches became useful. More than 99% of
-misses still reached foreground reads. This selected the foreground-I/O and
-prefetch lifecycle for audit.
+Local correctness validation includes the library check, complete test suite,
+the macOS-supported release build, shell syntax checks, resident finalization
+tests for pass/fail/incomplete outcomes, and `git diff --check`. The resident
+finalization test verifies that a complete tolerance failure returns nonzero
+only after writing both JSON files and that the resulting checksum manifest
+verifies successfully.
 
-## Lifecycle audit before implementation
+## Exact Linux resident-only validation
 
-### Prediction and submission
-
-`PredictiveLoader` learns first- and second-order Markov transitions from
-routed expert sets. `Engine::union_prefetch` combines Markov candidates with
-the disabled-by-baseline locality/speculator arms, canonicalizes aliases,
-drops current targets and residents, ranks the remaining candidates, and
-truncates to the shadow-slot budget. `spawn_prefetch` rejects residents and
-known in-flight identities, applies the disabled-by-baseline governor, and
-requires a bounded prefetch-semaphore permit.
-
-There is no explicit queued-prefetch registry between `tokio::spawn` and the
-task's first poll. If demand arrives in that window, demand installs the
-foreground in-flight entry and the later prefetch task observes it and exits.
-The result is one foreground read, not duplicate I/O. Once the prefetch task
-installs its entry, subsequent demand joins it.
-
-### Buffer allocation and storage read
-
-An admitted prefetch first tries a shadow (`Buffer B`) slot. If all shadow
-slots are parked in cache residents, it evicts the least-recently-used
-unpinned shadow-backed resident and retries once; otherwise it records a
-pool-starvation drop. It never waits for or consumes a primary slot when the
-split pool is configured. A later demand for a dropped prediction follows the
-ordinary foreground path.
-
-Foreground loads evict an LRU resident when necessary and await a primary
-buffer. Neither the cache nor in-flight registry lock is held across storage
-I/O. Production expert reads call `NvmeStorage::read_expert`, which uses
-positional `pread` with `O_DIRECT` on the qualified target.
-
-### Completion, residency, and consumption
-
-A successful prefetch constructs one `Arc<ExpertResident>` over the exact
-shadow buffer and inserts it into the ordinary CPU expert cache. It
-deliberately leaves the buffer shadow-tagged so eventual eviction returns the
-slot to Buffer B. Demand can execute directly over that resident; no byte copy
-or prepared expert representation is created, and direct-Q8 continues to read
-`ExpertResident::data()`.
-
-Before this phase, the in-flight map stored only `Arc<Notify>`. A demand or
-second foreground caller joined the active operation, waited for a
-notification, and then looked in the cache. The leader inserted before
-notifying, so the common case worked, but the operation did not publish its
-result to its waiters.
-
-That notify-only handoff created two concrete races:
-
-1. another cache insertion or shadow-pool recycle could evict the completed
-   resident before a notified demand task reacquired the cache; and
-2. a cache full of pinned entries could reject the insert even though the
-   leader still held a perfectly usable resident.
-
-In both cases an already-joined demand caller saw an empty cache after wakeup,
-won a new foreground election, and issued another physical `pread`. Multiple
-foreground callers had the same sequential-duplicate risk. The physical
-reads were not simultaneous, but completion was not reliably coalesced.
-
-### Exact pre-change state answers
-
-- Primary-cache resident: demand cloned and used the cached `Arc`.
-- Shadow-backed resident in the cache: demand cloned the same `Arc`; the first
-  routing consumption credited `prefetch_used`.
-- Prefetch task queued but not started: demand could become the foreground
-  leader; the later prefetch task exited on the in-flight check.
-- Prefetch physical read in progress: demand waited on its `Notify`, then
-  re-read the cache.
-- Prefetch complete but not yet published: insertion was synchronous, but
-  demand still had no owning reference until its later cache lookup.
-- Concurrent duplicate demand: one active read leader, but followers depended
-  on post-notify cache residency and could issue sequential duplicate reads.
-- Evicted unused prefetch: the cache dropped its last `Arc` and the buffer
-  returned to its original shadow free list.
-- Pool-starved prediction: the prefetch was dropped and later demand used the
-  foreground path.
-- Prefetch-use accounting: the higher-level routing paths credited both a
-  normal shadow-resident cache hit and a successful miss task that returned a
-  shadow resident. The in-flight registry itself did not distinguish
-  foreground and speculative leaders, so it could not report joins or
-  promotions precisely.
-
-## Chosen implementation
-
-The bounded per-expert map now stores an `InFlightEntry` containing:
-
-- immutable origin (`foreground` or `prefetch`);
-- a one-way demand-promotion flag;
-- one terminal outcome (`Arc<ExpertResident>`, final foreground error, or
-  `Retry` for a failed/abandoned speculative leader); and
-- a race-safe `Notify`.
-
-The one physical-read leader publishes its outcome before removing the map
-entry and notifying waiters. Each already-joined demand waiter holds an
-`Arc<InFlightEntry>`, so the published resident and its pooled buffer stay
-alive even if the LRU rejects or evicts the resident. All successful waiters
-receive clones of the exact same immutable `Arc<ExpertResident>`.
-
-A foreground leader publishes its final retry-loop error to every waiter, so
-they fail consistently without a retry herd. A speculative read failure still
-publishes `Retry`: this preserves the previous contract that best-effort
-prefetch failure is not itself a demand failure. Demand callers re-contend,
-exactly one becomes the foreground retry leader, and the others join it.
-
-## Concurrency and ownership invariants
-
-1. At most one registry entry and one active physical operation exist for an
-   expert identity.
-2. Different identities use different entries and may load concurrently.
-3. No cache or registry shard lock is held during buffer waits, storage I/O,
-   retry backoff, or waiter suspension.
-4. Publication precedes bounded-map removal and notification.
-5. Joined waiters own the entry; its published resident pins the pooled buffer
-   until each waiter has cloned or dropped the outcome.
-6. Completed, failed, cancelled, and panicking leader paths remove the map
-   entry. The guard publishes `Retry` if normal completion did not publish.
-7. Dropping a demand waiter does not cancel or strand the shared operation.
-8. Shadow buffers remain shadow-tagged; direct handoff changes ownership, not
-   bytes or pool capacity.
-9. Final foreground errors remain fail-closed and are identical for all
-   waiters.
-
-The global map is bounded by active operations and removes every terminal
-entry immediately. Only waiters that already joined may retain a completed
-entry temporarily; no completed entry remains discoverable from the map.
-
-## Telemetry semantics
-
-The following additive per-run fields are exposed under `runs[].cache_io`:
-
-- `demand_requests_joined_inflight_prefetch`: demand callers that found and
-  joined a speculative entry;
-- `demand_requests_joined_inflight_foreground`: demand callers that joined a
-  foreground entry;
-- `speculative_loads_promoted_to_demand`: speculative operations marked
-  demand-critical, once per operation on the first join;
-- `duplicate_physical_reads_avoided`: joined demand callers that did not issue
-  a competing physical read, regardless of the leader outcome; it equals the
-  two demand-join counters;
-- `completed_prefetch_direct_handoffs`: successful speculative operations that
-  published their resident to an entry with at least one demand join, counted
-  once per operation; a caller cancelled after joining is not subtracted, so
-  confirmed routing consumption remains the existing `prefetch_used` metric;
-- `foreground_read_operations_issued`: foreground storage calls issued,
-  including failures; the existing `foreground_read_operations` retains its
-  Phase 1 meaning of successful foreground reads;
-- `speculative_read_operations_issued`: speculative storage calls issued after
-  admission and buffer acquisition;
-- `in_flight_registry_peak_size`: lifetime high-water mark sampled in each
-  run; it is a gauge, not a per-run delta;
-- `in_flight_registry_size_at_sample`: current map occupancy at the run sample;
-- `in_flight_entries_removed`: all terminal entry removals; and
-- `in_flight_failed_or_abandoned_entries_removed`: the subset removed with a
-  failed, cancelled, or abandoned outcome.
-
-The collector validates the fields and adds aggregate totals to each case
-summary. Schema version 2 remains appropriate because existing fields and
-qualification gates retain their meaning.
-
-## Tests
-
-Deterministic engine tests use a test-only storage read gate with per-expert
-physical-read counters and explicit completion permits. They cover:
-
-- repeated resident fetches returning the same `Arc` without a registry
-  access, entry allocation, or handoff-counter update;
-- an all-resident strict inference fixture keeping the registry empty and
-  untouched while preserving cache-hit accounting;
-- the common `Counters` allocation retaining its exact Phase 1 footprint;
-- 32 simultaneous demand requests returning the same resident after one read;
-- demand joining an in-flight prefetch after one speculative read;
-- demand reusing a completed shadow-backed prefetch without copy or foreground
-  I/O;
-- one final foreground error published to every waiter and registry cleanup;
-- a dropped demand waiter and an abandoned leader guard not stranding state;
-- a published resident surviving LRU eviction until the waiter owns its `Arc`;
-- unrelated expert reads progressing concurrently; and
-- bounded primary/shadow pool progress without deadlock.
-
-Existing strict-mode, buffer-pool, expert-cache, direct-Q8, prepared-duplicate,
-`bench-real` schema, prompt fixture, and output-parity tests remain applicable.
-
-## Target-host validation
-
-Push the committed branch from a foreground terminal on the development host:
+Run this on the 32-logical-CPU Linux x86_64 target VM. The model must be the
+converted Qwen directory at `/mnt/localssd/data/qwen3-coder-q8`, and the
+repository checkout must be `$HOME/mer-prompt2`.
 
 ```bash
-cd /path/to/Micro-Expert-Router-SSD-Streamed-MoE-MER
-git status --short
-git push origin perf/qwen3-coder-single-stream-decode
-```
-
-First run the resident-only gate in a foreground VM terminal. It reuses the
-unchanged collector configuration but runs only 6,144-short and 6,144-medium.
-The collector requires their geometric mean to remain within +/-2% of the
-immediate Phase 1 reference (`3.500144036461`) and rejects any SSD bytes,
-cache miss, foreground/speculative read, handoff join, parity failure,
-qualification failure, or checksum mismatch:
-
-```bash
-cd /home/randyap8/Micro-Expert-Router-SSD-Streamed-MoE-MER
+cd "$HOME/mer-prompt2"
 git fetch origin perf/qwen3-coder-single-stream-decode
 git switch perf/qwen3-coder-single-stream-decode
 git pull --ff-only origin perf/qwen3-coder-single-stream-decode
@@ -311,190 +124,44 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export BLIS_NUM_THREADS=1
 export MALLOC_ARENA_MAX=2
-export MER_QWEN_CONVERTED_DIR=/mnt/localssd/models/qwen3-coder-30b-a3b-q8
-export MER_QWEN_TOKENIZER="$MER_QWEN_CONVERTED_DIR/tokenizer.json"
+export MER_QWEN_CONVERTED_DIR=/mnt/localssd/data/qwen3-coder-q8
+export MER_QWEN_TOKENIZER=/mnt/localssd/data/qwen3-coder-q8/tokenizer.json
 export MER_EXPECTED_NVME_MOUNT=/mnt/localssd
 
-ARTIFACT_DIR="/mnt/localssd/benchmarks/prompt2-phase2b-resident-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+ARTIFACT_DIR="/mnt/localssd/benchmarks/prompt2-phase2c-resident-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+set +e
 scripts/collect_qwen3_coder_prompt2_baseline.sh "$ARTIFACT_DIR" --resident-only
-jq . "$ARTIFACT_DIR/qualification.json"
+COLLECTOR_STATUS=$?
+set -e
+
+test -s "$ARTIFACT_DIR/baseline-6144-short.json"
+test -s "$ARTIFACT_DIR/baseline-6144-medium.json"
+test -s "$ARTIFACT_DIR/resident-control-summary.json"
+test -s "$ARTIFACT_DIR/qualification.json"
+test -s "$ARTIFACT_DIR/artifact-sha256.txt"
 jq . "$ARTIFACT_DIR/resident-control-summary.json"
+jq . "$ARTIFACT_DIR/qualification.json"
 sha256sum -c "$ARTIFACT_DIR/artifact-sha256.txt"
+exit "$COLLECTOR_STATUS"
 ```
 
-Only after that gate passes, run the complete four-case collector; the
-resident mode does not replace or weaken it:
+A zero status means every resident gate passed. Status 1 with all five final
+files present is an auditable completed gate failure; inspect
+`failure_reasons`. Status 2 or missing case/final files is an incomplete run
+and must not be interpreted as a performance result.
+
+Only after the resident-only gate passes should the unchanged four-case
+collector be run:
 
 ```bash
-FULL_ARTIFACT_DIR="/mnt/localssd/benchmarks/prompt2-phase2b-full-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+cd "$HOME/mer-prompt2"
+FULL_ARTIFACT_DIR="/mnt/localssd/benchmarks/prompt2-phase2c-full-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
 scripts/collect_qwen3_coder_prompt2_baseline.sh "$FULL_ARTIFACT_DIR"
-jq . "$FULL_ARTIFACT_DIR/qualification.json"
 jq . "$FULL_ARTIFACT_DIR/four-case-summary.json"
+jq . "$FULL_ARTIFACT_DIR/qualification.json"
 sha256sum -c "$FULL_ARTIFACT_DIR/artifact-sha256.txt"
 ```
 
-Do not change the prompts, output tokens, run counts, cache sizes, sampling,
-CPU mask, Rayon worker count, storage layout, or predictive-policy switches.
-
-### Exact candidate comparison
-
-Select the newest artifact for the exact qualified Phase 1 commit and retain
-`CANDIDATE_DIR` from the full collection above. The commit assertion below prevents
-an identically named diagnostic or another Phase 1 revision from being used:
-
-```bash
-BASELINE_DIR=$(find /mnt/localssd/benchmarks -maxdepth 1 -type d -name 'prompt2-phase1-327d263193c4-*' -print | sort | tail -n 1)
-CANDIDATE_DIR="$FULL_ARTIFACT_DIR"
-test -n "$BASELINE_DIR"
-test -f "$BASELINE_DIR/qualification.json"
-test -f "$CANDIDATE_DIR/qualification.json"
-jq -e --arg commit 327d263193c48f9dde9f6a716562260ab49fa7ef \
-  '.qualification_passed == true and .git_commit_full == $commit' \
-  "$BASELINE_DIR/qualification.json"
-jq -e '.qualification_passed == true' "$CANDIDATE_DIR/qualification.json"
-```
-
-Calculate per-case TPS, TTFT and peak-RSS deltas; streaming/control geometric
-means; the streaming geometric-mean delta; and percentage of the
-streaming-to-resident gap closed:
-
-```bash
-jq -n \
-  --slurpfile bs "$BASELINE_DIR/baseline-1536-short.case-summary.json" \
-  --slurpfile bm "$BASELINE_DIR/baseline-1536-medium.case-summary.json" \
-  --slurpfile brs "$BASELINE_DIR/baseline-6144-short.case-summary.json" \
-  --slurpfile brm "$BASELINE_DIR/baseline-6144-medium.case-summary.json" \
-  --slurpfile cs "$CANDIDATE_DIR/baseline-1536-short.case-summary.json" \
-  --slurpfile cm "$CANDIDATE_DIR/baseline-1536-medium.case-summary.json" \
-  --slurpfile crs "$CANDIDATE_DIR/baseline-6144-short.case-summary.json" \
-  --slurpfile crm "$CANDIDATE_DIR/baseline-6144-medium.case-summary.json" '
-  def delta($b; $c): 100 * ($c / $b - 1);
-  def row($b; $c): {
-    baseline_decode_tps: $b.decode_tps_mean,
-    candidate_decode_tps: $c.decode_tps_mean,
-    decode_tps_delta_percent: delta($b.decode_tps_mean; $c.decode_tps_mean),
-    ttft_delta_seconds: ($c.time_to_first_token_p50_seconds - $b.time_to_first_token_p50_seconds),
-    external_peak_rss_delta_bytes: ($c.external_peak_rss_bytes - $b.external_peak_rss_bytes),
-    output_parity: $c.output_token_parity,
-    qualification_passed: $c.qualification_passed
-  };
-  ($bs[0]) as $bs | ($bm[0]) as $bm |
-  ($brs[0]) as $brs | ($brm[0]) as $brm |
-  ($cs[0]) as $cs | ($cm[0]) as $cm |
-  ($crs[0]) as $crs | ($crm[0]) as $crm |
-  (($bs.decode_tps_mean * $bm.decode_tps_mean) | sqrt) as $bgm |
-  (($cs.decode_tps_mean * $cm.decode_tps_mean) | sqrt) as $cgm |
-  (($brs.decode_tps_mean * $brm.decode_tps_mean) | sqrt) as $brgm |
-  (($crs.decode_tps_mean * $crm.decode_tps_mean) | sqrt) as $crgm |
-  {
-    streaming_short: row($bs; $cs),
-    streaming_medium: row($bm; $cm),
-    streaming_geometric_mean: {
-      baseline: $bgm,
-      candidate: $cgm,
-      delta_percent: delta($bgm; $cgm),
-      gap_closed_percent: (100 * ($cgm - 1.3711364980298737) /
-        (3.103427497900415 - 1.3711364980298737)),
-      minimum_1_50_passed: ($cgm >= 1.50)
-    },
-    resident_short: row($brs; $crs),
-    resident_medium: row($brm; $crm),
-    resident_geometric_mean: {
-      baseline: $brgm,
-      candidate: $crgm,
-      delta_percent: delta($brgm; $crgm)
-    }
-  }'
-```
-
-Calculate foreground/cache/prefetch deltas and all new mechanism counters from
-the raw reports. The same command checks output parity, strictness, fallback,
-read-failure, and prepared-duplicate status:
-
-```bash
-jq -n \
-  --slurpfile bs "$BASELINE_DIR/baseline-1536-short.json" \
-  --slurpfile bm "$BASELINE_DIR/baseline-1536-medium.json" \
-  --slurpfile brs "$BASELINE_DIR/baseline-6144-short.json" \
-  --slurpfile brm "$BASELINE_DIR/baseline-6144-medium.json" \
-  --slurpfile cs "$CANDIDATE_DIR/baseline-1536-short.json" \
-  --slurpfile cm "$CANDIDATE_DIR/baseline-1536-medium.json" \
-  --slurpfile crs "$CANDIDATE_DIR/baseline-6144-short.json" \
-  --slurpfile crm "$CANDIDATE_DIR/baseline-6144-medium.json" '
-  def total($r; $field): ([$r.runs[].cache_io[$field]] | add);
-  def change($b; $c; $field): {
-    baseline: total($b; $field),
-    candidate: total($c; $field),
-    delta: (total($c; $field) - total($b; $field))
-  };
-  def case($b; $c): {
-    foreground_read_operations: change($b; $c; "foreground_read_operations"),
-    foreground_read_operations_issued: total($c; "foreground_read_operations_issued"),
-    foreground_expert_bytes: change($b; $c; "foreground_expert_bytes"),
-    foreground_expert_io_wait_seconds: change($b; $c; "foreground_expert_io_wait_seconds"),
-    cache_hits: change($b; $c; "cache_hits"),
-    cache_misses: change($b; $c; "cache_misses"),
-    cache_evictions: change($b; $c; "cache_evictions"),
-    prefetch_useful_bytes: change($b; $c; "useful_prefetch_bytes"),
-    prefetch_unused_bytes_at_sample: change($b; $c; "unused_prefetch_bytes_at_sample"),
-    new_mechanism_totals: {
-      speculative_read_operations_issued: total($c; "speculative_read_operations_issued"),
-      demand_joined_prefetch: total($c; "demand_requests_joined_inflight_prefetch"),
-      demand_joined_foreground: total($c; "demand_requests_joined_inflight_foreground"),
-      speculative_promoted_to_demand: total($c; "speculative_loads_promoted_to_demand"),
-      duplicate_physical_reads_avoided: total($c; "duplicate_physical_reads_avoided"),
-      completed_prefetch_direct_handoffs: total($c; "completed_prefetch_direct_handoffs"),
-      in_flight_registry_peak_size: ([$c.runs[].cache_io.in_flight_registry_peak_size] | max),
-      in_flight_entries_removed: total($c; "in_flight_entries_removed"),
-      failed_or_abandoned_entries_removed: total($c; "in_flight_failed_or_abandoned_entries_removed")
-    },
-    output_parity: $c.aggregate.output_token_parity,
-    strict_fail_closed: (
-      $c.strictness.strict_weights and
-      ($c.strictness.seeded_fallback_remained | not) and
-      ([$c.runs[].correctness] | all(
-        .degraded_expert_substitutions == 0 and
-        .expert_read_failures == 0 and
-        .truncated_expert_payload_uses == 0 and
-        .nonfinite_attention_fallbacks == 0 and
-        .q8_scalar_layout_fallbacks == 0 and
-        .prepared_duplicate_expert_bytes == 0 and
-        (.inference_policy | all(. == false))))
-    )
-  };
-  {
-    streaming_short: case($bs[0]; $cs[0]),
-    streaming_medium: case($bm[0]; $cm[0]),
-    resident_short: case($brs[0]; $crs[0]),
-    resident_medium: case($brm[0]; $crm[0])
-  }'
-```
-
-## Acceptance and rollback
-
-Phase 2B must first retain every Phase 1 qualification gate, output parity,
-strict fail-closed inference, zero degraded substitutions/read failures,
-native AVX2/FMA direct-Q8, zero prepared duplicate bytes, and artifact
-checksums in the resident-only run. Both cases must have zero SSD bytes, cache
-misses, foreground/speculative reads, and handoff joins. Their geometric mean
-must be within +/-2% of the immediate Phase 1 resident reference
-(`3.500144036461`) before the complete streaming collector is run.
-
-The subsequent four-case run is required evidence, not permission to describe
-Phase 2 as a win. Report its streaming result and mechanism counters even if
-they remain below the original milestone. Phase 2B changes only non-I/O
-isolation; selecting another speculative optimization is a separate decision.
-
-## Limitations and later work
-
-- The registry begins when the spawned prefetch task is polled, not at
-  `spawn_prefetch` submission. Demand in the short queued window already wins
-  foreground leadership, so it does not duplicate I/O, but it is not counted
-  as a speculative promotion.
-- The portable `pread` provider has no device-level priority API. Promotion
-  makes lifecycle ownership demand-safe; it cannot reprioritize a syscall
-  already executing in the kernel.
-- This change cannot improve incorrect predictions that never overlap demand.
-  Prefetch admission quality, speculative/foreground device scheduling, and
-  production `io_uring` remain separate later workstreams and must not be
-  combined with this candidate before target-host review.
+Do not change the prompts, output-token count, warmup or measured-run counts,
+cache sizes, CPU mask, Rayon worker count, storage layout, or predictive-policy
+switches when comparing with the Phase 1 evidence.

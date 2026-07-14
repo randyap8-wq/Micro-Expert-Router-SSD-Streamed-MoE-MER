@@ -2383,7 +2383,6 @@ struct BenchRealRunCacheIo {
     cache_resident_experts_at_sample: usize,
     shadow_resident_experts_at_sample: usize,
     foreground_read_operations: u64,
-    foreground_read_operations_issued: u64,
     foreground_expert_bytes: u64,
     foreground_expert_io_wait_seconds: f64,
     total_expert_bytes_read: u64,
@@ -2398,16 +2397,6 @@ struct BenchRealRunCacheIo {
     prefetch_dropped_pool_starved: u64,
     prefetch_dropped_governor: u64,
     prefetch_dropped_bytes: u64,
-    speculative_read_operations_issued: u64,
-    demand_requests_joined_inflight_prefetch: u64,
-    demand_requests_joined_inflight_foreground: u64,
-    speculative_loads_promoted_to_demand: u64,
-    duplicate_physical_reads_avoided: u64,
-    completed_prefetch_direct_handoffs: u64,
-    in_flight_registry_peak_size: u64,
-    in_flight_registry_size_at_sample: usize,
-    in_flight_entries_removed: u64,
-    in_flight_failed_or_abandoned_entries_removed: u64,
     expert_read_failures: u64,
 }
 
@@ -4530,9 +4519,6 @@ async fn run_bench_real_once(
             foreground_read_operations: post
                 .foreground_read_operations
                 .saturating_sub(pre.foreground_read_operations),
-            foreground_read_operations_issued: post
-                .foreground_read_operations_issued
-                .saturating_sub(pre.foreground_read_operations_issued),
             foreground_expert_bytes: post
                 .foreground_bytes_read
                 .saturating_sub(pre.foreground_bytes_read),
@@ -4561,33 +4547,6 @@ async fn run_bench_real_once(
                 .saturating_sub(pre.prefetch_dropped_governor),
             // All three drop counters fire before a storage read is issued.
             prefetch_dropped_bytes: 0,
-            speculative_read_operations_issued: post
-                .speculative_read_operations_issued
-                .saturating_sub(pre.speculative_read_operations_issued),
-            demand_requests_joined_inflight_prefetch: post
-                .demand_requests_joined_inflight_prefetch
-                .saturating_sub(pre.demand_requests_joined_inflight_prefetch),
-            demand_requests_joined_inflight_foreground: post
-                .demand_requests_joined_inflight_foreground
-                .saturating_sub(pre.demand_requests_joined_inflight_foreground),
-            speculative_loads_promoted_to_demand: post
-                .speculative_loads_promoted_to_demand
-                .saturating_sub(pre.speculative_loads_promoted_to_demand),
-            duplicate_physical_reads_avoided: post
-                .duplicate_physical_reads_avoided
-                .saturating_sub(pre.duplicate_physical_reads_avoided),
-            completed_prefetch_direct_handoffs: post
-                .completed_prefetch_direct_handoffs
-                .saturating_sub(pre.completed_prefetch_direct_handoffs),
-            // A lifetime high-water mark is a gauge, not a counter delta.
-            in_flight_registry_peak_size: post.in_flight_registry_peak_size,
-            in_flight_registry_size_at_sample: post.in_flight_registry_size_at_sample,
-            in_flight_entries_removed: post
-                .in_flight_entries_removed
-                .saturating_sub(pre.in_flight_entries_removed),
-            in_flight_failed_or_abandoned_entries_removed: post
-                .in_flight_failed_or_abandoned_entries_removed
-                .saturating_sub(pre.in_flight_failed_or_abandoned_entries_removed),
             expert_read_failures,
         },
         memory: BenchRealRunMemory {
@@ -8255,63 +8214,6 @@ mod tests {
         let decoded: BenchRealSchemaInfo = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, schema);
         assert_eq!(decoded.version, 2);
-    }
-
-    #[test]
-    fn bench_real_cache_io_serializes_phase2_handoff_telemetry() {
-        let cache_io = BenchRealRunCacheIo {
-            cache_hits: 0,
-            cache_misses: 0,
-            cache_hit_rate: 0.0,
-            cache_evictions: 0,
-            cache_capacity_experts: 1,
-            cache_resident_experts_at_sample: 0,
-            shadow_resident_experts_at_sample: 0,
-            foreground_read_operations: 0,
-            foreground_read_operations_issued: 0,
-            foreground_expert_bytes: 0,
-            foreground_expert_io_wait_seconds: 0.0,
-            total_expert_bytes_read: 0,
-            prefetch_enabled: true,
-            prefetch_submitted: 0,
-            prefetch_completed: 0,
-            prefetch_used: 0,
-            prefetch_bytes: 0,
-            useful_prefetch_bytes: 0,
-            unused_prefetch_bytes_at_sample: 0,
-            prefetch_dropped_concurrency: 0,
-            prefetch_dropped_pool_starved: 0,
-            prefetch_dropped_governor: 0,
-            prefetch_dropped_bytes: 0,
-            speculative_read_operations_issued: 3,
-            demand_requests_joined_inflight_prefetch: 2,
-            demand_requests_joined_inflight_foreground: 4,
-            speculative_loads_promoted_to_demand: 1,
-            duplicate_physical_reads_avoided: 6,
-            completed_prefetch_direct_handoffs: 1,
-            in_flight_registry_peak_size: 5,
-            in_flight_registry_size_at_sample: 0,
-            in_flight_entries_removed: 7,
-            in_flight_failed_or_abandoned_entries_removed: 1,
-            expert_read_failures: 0,
-        };
-        let value = serde_json::to_value(cache_io).unwrap();
-        assert_eq!(value["foreground_read_operations_issued"], 0);
-        assert_eq!(value["speculative_read_operations_issued"], 3);
-        assert_eq!(value["demand_requests_joined_inflight_prefetch"], 2);
-        assert_eq!(value["demand_requests_joined_inflight_foreground"], 4);
-        assert_eq!(value["speculative_loads_promoted_to_demand"], 1);
-        assert_eq!(value["duplicate_physical_reads_avoided"], 6);
-        assert_eq!(value["completed_prefetch_direct_handoffs"], 1);
-        assert_eq!(value["in_flight_registry_peak_size"], 5);
-        assert_eq!(value["in_flight_registry_size_at_sample"], 0);
-        assert_eq!(value["in_flight_entries_removed"], 7);
-        assert_eq!(
-            value["in_flight_failed_or_abandoned_entries_removed"],
-            1
-        );
-        // Additive telemetry does not change Phase 1 qualification semantics.
-        assert_eq!(BENCH_REAL_SCHEMA_VERSION, 2);
     }
 
     #[test]

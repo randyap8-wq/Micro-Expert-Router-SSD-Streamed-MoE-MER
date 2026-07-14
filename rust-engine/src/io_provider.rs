@@ -54,57 +54,6 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 
-/// Test-only deterministic read gate. Engine concurrency tests can observe
-/// exactly when a physical storage operation is issued and release it without
-/// timing-sensitive sleeps or a production storage abstraction.
-#[cfg(test)]
-pub(crate) struct TestReadControl {
-    reads: Mutex<HashMap<u32, u64>>,
-    started: tokio::sync::Notify,
-    permits: tokio::sync::Semaphore,
-}
-
-#[cfg(test)]
-impl TestReadControl {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            reads: Mutex::new(HashMap::new()),
-            started: tokio::sync::Notify::new(),
-            permits: tokio::sync::Semaphore::new(0),
-        })
-    }
-
-    async fn before_read(&self, id: u32) {
-        *self.reads.lock().entry(id).or_insert(0) += 1;
-        self.started.notify_waiters();
-        self.permits
-            .acquire()
-            .await
-            .expect("test read gate remains open")
-            .forget();
-    }
-
-    pub(crate) fn read_count(&self, id: u32) -> u64 {
-        self.reads.lock().get(&id).copied().unwrap_or(0)
-    }
-
-    pub(crate) async fn wait_for_reads(&self, id: u32, expected: u64) {
-        loop {
-            let notified = self.started.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.read_count(id) >= expected {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    pub(crate) fn release(&self, operations: usize) {
-        self.permits.add_permits(operations);
-    }
-}
-
 // =====================================================================
 // Fault-tolerant I/O knobs (gist Task 3 — "Hardened" MER).
 // =====================================================================
@@ -521,8 +470,6 @@ pub struct NvmeStorage {
     /// experts into one vectored `preadv`. `None` (default) keeps the
     /// original one-file-per-expert path bit-for-bit.
     packed: Option<Arc<crate::packed_storage::PackedBlob>>,
-    #[cfg(test)]
-    test_read_control: Option<Arc<TestReadControl>>,
 }
 
 impl NvmeStorage {
@@ -546,15 +493,7 @@ impl NvmeStorage {
             breakers: RwLock::new(HashMap::new()),
             drive_breakers: vec![Arc::new(DriveBreakerState::default())],
             packed: None,
-            #[cfg(test)]
-            test_read_control: None,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_test_read_control(mut self, control: Arc<TestReadControl>) -> Self {
-        self.test_read_control = Some(control);
-        self
     }
 
     /// Override the bounded fd-cache capacity (see [`Self::files`]).
@@ -1193,10 +1132,6 @@ impl NvmeStorage {
     /// on success — short reads are surfaced as an `UnexpectedEof` error).
     pub async fn read_expert(&self, expert_id: u32, buf: &mut PooledBuffer) -> io::Result<usize> {
         debug_assert_eq!(buf.len(), self.cfg.expert_size);
-        #[cfg(test)]
-        if let Some(control) = self.test_read_control.as_ref() {
-            control.before_read(expert_id).await;
-        }
         // Tier 2 packed path: source the bytes from the shared blob fd at
         // the expert's recorded offset. The fault-tolerant retry +
         // circuit-breaker wrapper is reused unchanged — only the (file,
