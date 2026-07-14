@@ -1296,6 +1296,9 @@ pub(crate) struct EngineSpeculation {
 /// histograms, additional exporters) lands in one cohesive place.
 pub(crate) struct EngineMetrics {
     pub(super) counters: Arc<Counters>,
+    /// Prompt 2 Phase 3A miss-only fanout / physical-read telemetry. No
+    /// method on this object is called by an ordinary resident layer.
+    pub(super) demand_fetch: Arc<crate::demand_fetch_telemetry::DemandFetchTelemetry>,
     /// Latency histogram of per-token cycle time, in microseconds.
     pub(super) cycle_hist: parking_lot::Mutex<Histogram<u64>>,
     /// Latency histogram of cache-miss I/O reads, in microseconds.
@@ -1454,7 +1457,7 @@ impl EngineSpeculation {
 }
 
 impl EngineMetrics {
-    fn new() -> Self {
+    fn new(top_k: usize) -> Self {
         // 1us..60s, 3 sig figs — wide enough for cache hits (sub-ms)
         // and slow SSD stalls (multi-second worst case) alike.
         let mk_hist = || {
@@ -1465,6 +1468,9 @@ impl EngineMetrics {
         };
         Self {
             counters: Arc::new(Counters::default()),
+            demand_fetch: Arc::new(
+                crate::demand_fetch_telemetry::DemandFetchTelemetry::new(top_k),
+            ),
             cycle_hist: mk_hist(),
             io_hist: mk_hist(),
             compute_hist: mk_hist(),
@@ -1528,6 +1534,12 @@ enum MoeStepOutputMode<'a> {
 enum MoeStepResult {
     PerExpert(Vec<HiddenState>),
     WeightedInto,
+}
+
+#[derive(Clone)]
+struct DemandFetchContext {
+    layer: Arc<crate::demand_fetch_telemetry::LayerFetchTracker>,
+    routed_slot: usize,
 }
 
 /// Error taxonomy for a failed real-model MoE step (hardening pass,
@@ -1738,7 +1750,7 @@ impl Engine {
         Self {
             core: EngineCore::new(cache, pool, storage, router, predictor, shape, options),
             speculation: EngineSpeculation::new(speculator_topk_default),
-            metrics: EngineMetrics::new(),
+            metrics: EngineMetrics::new(speculator_topk_default),
         }
     }
 
@@ -2685,6 +2697,14 @@ impl Engine {
         self: &Arc<Self>,
         id: u32,
     ) -> Result<Arc<ExpertResident>, ExpertReadError> {
+        self.fetch_with_retry_observed(id, None).await
+    }
+
+    async fn fetch_with_retry_observed(
+        self: &Arc<Self>,
+        id: u32,
+        observation: Option<DemandFetchContext>,
+    ) -> Result<Arc<ExpertResident>, ExpertReadError> {
         // Fast path: already cached — no singleflight needed. We
         // deliberately do *not* bump the `hits` counter here: the
         // upstream `moe_step` path already increments hits/misses
@@ -2735,7 +2755,16 @@ impl Engine {
                     return Ok(r);
                 }
                 if self.core.in_flight.contains_key(&id) {
+                    let wait_started = observation.as_ref().map(|_| Instant::now());
                     fut.await;
+                    if let (Some(observation), Some(wait_started)) =
+                        (observation.as_ref(), wait_started)
+                    {
+                        observation.layer.record_singleflight_wait(
+                            observation.routed_slot,
+                            wait_started.elapsed(),
+                        );
+                    }
                     if let Some(r) = self.core.cache.get(id) {
                         self.metrics
                             .counters
@@ -2790,7 +2819,7 @@ impl Engine {
             const MAX_ATTEMPTS: usize = 3;
             let mut last_err: Option<String> = None;
             for attempt in 0..MAX_ATTEMPTS {
-                match self.fetch_once(id).await {
+                match self.fetch_once(id, observation.as_ref()).await {
                     Ok(r) => {
                         if attempt > 0 {
                             info!(expert = id, attempt, "expert fetch recovered after retry");
@@ -2842,7 +2871,11 @@ impl Engine {
     /// if the pool is under pressure), issues the read, and either
     /// installs the resident in the cache or surfaces the I/O error
     /// to the retry loop.
-    async fn fetch_once(self: &Arc<Self>, id: u32) -> Result<Arc<ExpertResident>, FetchOnceError> {
+    async fn fetch_once(
+        self: &Arc<Self>,
+        id: u32,
+        observation: Option<&DemandFetchContext>,
+    ) -> Result<Arc<ExpertResident>, FetchOnceError> {
         let io_start = Instant::now();
         // Acquire-with-eviction: evict an LRU entry if the cache is at
         // capacity (which releases its `PooledBuffer` on `Arc` drop),
@@ -2870,13 +2903,34 @@ impl Engine {
                 drop(evicted);
             }
         }
+        let buffer_wait_started = observation.map(|_| Instant::now());
         let mut buf = self.core.pool.acquire().await;
+        if let (Some(observation), Some(buffer_wait_started)) =
+            (observation, buffer_wait_started)
+        {
+            observation.layer.record_buffer_wait(
+                observation.routed_slot,
+                buffer_wait_started.elapsed(),
+            );
+        }
         // Tier 4: mark this as a foreground (token-blocking) read for the
         // duration of the device I/O so the governor throttles
         // speculation that would otherwise queue ahead of it. No-op when
         // the governor is disabled.
         let _fg = self.core.governor.foreground_guard();
-        let read_result = self.core.storage.read_expert(id, &mut buf).await;
+        let read_result = match observation {
+            Some(observation) => {
+                let observer = observation.layer.physical_read_observer(
+                    self.metrics.demand_fetch.clone(),
+                    observation.routed_slot,
+                );
+                self.core
+                    .storage
+                    .read_expert_observed(id, &mut buf, &observer)
+                    .await
+            }
+            None => self.core.storage.read_expert(id, &mut buf).await,
+        };
         match read_result {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
@@ -3093,6 +3147,10 @@ impl Engine {
                 }
             };
             let started = Instant::now();
+            // Miss-only contention observability: this gauge does not claim
+            // causality. A foreground issue that overlaps it is reported as
+            // shared-device exposure, never as proven speculative delay.
+            let _speculative_read = me.metrics.demand_fetch.begin_speculative_read();
             match me.core.storage.read_expert(id, &mut buf).await {
                 Ok(_) => {
                     me.metrics
@@ -4181,6 +4239,12 @@ impl Engine {
             usize,
             tokio::task::JoinHandle<Result<Arc<ExpertResident>, ExpertReadError>>,
         )> = Vec::new();
+        // Allocated lazily on the first initial miss. All-resident layers keep
+        // the qualified Phase 1 path: no new timestamp, allocation, lock, or
+        // atomic update is performed for Phase 3A telemetry.
+        let mut layer_fetch_tracker: Option<
+            Arc<crate::demand_fetch_telemetry::LayerFetchTracker>,
+        > = None;
         let mut cache_hits_per_expert: Vec<bool> = Vec::with_capacity(target.len());
         // VRAM (GPU) tier — aggregate hits/misses across this routing
         // decision and record once, rather than incrementing Prometheus
@@ -4228,10 +4292,30 @@ impl Engine {
                 cache_hits_per_expert.push(true);
             } else {
                 self.metrics.counters.misses.fetch_add(1, Ordering::Relaxed);
+                let tracker = layer_fetch_tracker.get_or_insert_with(|| {
+                    crate::demand_fetch_telemetry::LayerFetchTracker::new(
+                        token_idx,
+                        layer,
+                        &target,
+                        Instant::now(),
+                    )
+                });
+                tracker.mark_miss(i);
                 let me = self.clone();
+                let task_tracker = tracker.clone();
+                let observation = DemandFetchContext {
+                    layer: tracker.clone(),
+                    routed_slot: i,
+                };
                 miss_handles.push((
                     i,
-                    tokio::spawn(async move { me.fetch_with_retry(id).await }),
+                    tokio::spawn(async move {
+                        let result = me.fetch_with_retry_observed(id, Some(observation)).await;
+                        if result.is_ok() {
+                            task_tracker.record_available(i);
+                        }
+                        result
+                    }),
                 ));
                 cache_hits_per_expert.push(false);
             }
@@ -4288,7 +4372,11 @@ impl Engine {
             // `fetch_with_retry` already retried with backoff. A join
             // error means the task itself panicked, which is fatal —
             // re-raise so the supervising scheduler can restart us.
-            match h.await.expect("expert fetch task panicked") {
+            let fetched = h.await.expect("expert fetch task panicked");
+            if let Some(tracker) = layer_fetch_tracker.as_ref() {
+                tracker.record_consumed(i);
+            }
+            match fetched {
                 Ok(r) => {
                     let new_hits = r.record_hit();
                     self.credit_prefetch_use(&r, new_hits);
@@ -4347,6 +4435,10 @@ impl Engine {
             io_wait_elapsed,
         );
         let io_wait_us = io_wait_elapsed.as_micros() as u64;
+        if let Some(tracker) = layer_fetch_tracker.as_ref() {
+            tracker.record_compute_begin();
+            tracker.finish_fetch(&self.metrics.demand_fetch);
+        }
         // Strict mode: surface the first fetch failure now that every
         // handle has been drained (so no fetch task is left detached
         // mid-flight holding a pool buffer).
@@ -4513,6 +4605,9 @@ impl Engine {
         self.metrics
             .total_compute_us
             .fetch_add(compute_us, Ordering::Relaxed);
+        if let Some(tracker) = layer_fetch_tracker.as_ref() {
+            tracker.finish_layer(&self.metrics.demand_fetch);
+        }
         self.metrics
             .total_io_wait_us
             .fetch_add(io_wait_us, Ordering::Relaxed);
@@ -4578,6 +4673,13 @@ impl Engine {
     /// peeked experts a warm pass would actually fetch.
     pub fn is_expert_cached(&self, id: u32) -> bool {
         self.core.cache.contains(id)
+    }
+
+    /// Reset the bounded Phase 3A miss-only collector at a benchmark phase
+    /// boundary. Returns `false` if a foreground physical read is still active;
+    /// callers must not erase an in-progress interval.
+    pub fn reset_demand_fetch_telemetry(&self) -> bool {
+        self.metrics.demand_fetch.reset()
     }
 
     /// Force-fetch a specific set of experts and load them into the cache.
@@ -4850,6 +4952,7 @@ impl Engine {
             q8_preparation_seconds: crate::inference::q8_preparation_seconds(),
             q8_gate_up_kernel_seconds: crate::inference::q8_gate_up_kernel_seconds(),
             q8_down_kernel_seconds: crate::inference::q8_down_kernel_seconds(),
+            demand_fetch: self.metrics.demand_fetch.snapshot(),
         }
     }
 
@@ -5216,6 +5319,10 @@ pub struct EngineReport {
     pub q8_preparation_seconds: f64,
     pub q8_gate_up_kernel_seconds: f64,
     pub q8_down_kernel_seconds: f64,
+    /// Miss-only Prompt 2 Phase 3A counters for the current telemetry epoch.
+    /// The benchmark report combines these with the existing routed-layer and
+    /// hit/miss deltas to derive the zero-miss histogram bucket.
+    pub demand_fetch: crate::demand_fetch_telemetry::DemandFetchSnapshot,
 }
 
 #[cfg(test)]
@@ -5437,6 +5544,38 @@ mod tests {
             r.predictor_observations > 0,
             "predictor should have logged at least one transition"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phase3a_all_resident_layer_stays_miss_telemetry_inactive() {
+        let dir = TempDir::new("phase3a-resident");
+        let engine = build_engine(&dir.path, 4, 16, 32, 4, 2, 0, 0xA31A);
+        let hidden = crate::inference::synth_hidden_state(9, 16, 0xA31A);
+        let experts = [1, 3];
+
+        let cold = engine
+            .moe_step(9, 0, &hidden, &experts)
+            .await
+            .expect("cold layer");
+        assert!(engine.reset_demand_fetch_telemetry());
+        let pre = engine.report();
+        let resident = engine
+            .moe_step(9, 0, &hidden, &experts)
+            .await
+            .expect("resident layer");
+        let post = engine.report();
+
+        assert_eq!(cold, resident, "telemetry must not alter resident output");
+        assert_eq!(post.tokens_processed.saturating_sub(pre.tokens_processed), 1);
+        assert_eq!(post.misses.saturating_sub(pre.misses), 0);
+        assert_eq!(post.hits.saturating_sub(pre.hits), 2);
+        assert_eq!(post.demand_fetch.foreground_physical_read_operations, 0);
+        assert!(post
+            .demand_fetch
+            .missing_experts_per_layer_nonzero
+            .iter()
+            .all(|&count| count == 0));
+        assert!(post.demand_fetch.worst_layer_fetch.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

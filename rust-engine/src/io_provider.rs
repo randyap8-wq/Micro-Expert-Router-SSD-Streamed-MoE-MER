@@ -54,6 +54,15 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 
+/// Miss-only callbacks bracketing one logical physical expert-read service.
+/// `issued` runs after path/fd resolution and immediately before the blocking
+/// positional-read call; `completed` runs immediately after it returns, on
+/// success or failure. Implementations must not retain a lock across the gap.
+pub(crate) trait PhysicalReadObserver: Send + Sync {
+    fn issued(&self);
+    fn completed(&self);
+}
+
 // =====================================================================
 // Fault-tolerant I/O knobs (gist Task 3 — "Hardened" MER).
 // =====================================================================
@@ -1131,6 +1140,27 @@ impl NvmeStorage {
     /// Returns the number of bytes actually read (which equals `expert_size`
     /// on success — short reads are surfaced as an `UnexpectedEof` error).
     pub async fn read_expert(&self, expert_id: u32, buf: &mut PooledBuffer) -> io::Result<usize> {
+        self.read_expert_inner(expert_id, buf, None).await
+    }
+
+    /// Instrumented foreground sibling of [`Self::read_expert`]. The normal
+    /// speculative path uses `read_expert`; only a routed demand miss supplies
+    /// an observer, so resident hits remain entirely outside this code.
+    pub(crate) async fn read_expert_observed(
+        &self,
+        expert_id: u32,
+        buf: &mut PooledBuffer,
+        observer: &dyn PhysicalReadObserver,
+    ) -> io::Result<usize> {
+        self.read_expert_inner(expert_id, buf, Some(observer)).await
+    }
+
+    async fn read_expert_inner(
+        &self,
+        expert_id: u32,
+        buf: &mut PooledBuffer,
+        observer: Option<&dyn PhysicalReadObserver>,
+    ) -> io::Result<usize> {
         debug_assert_eq!(buf.len(), self.cfg.expert_size);
         // Tier 2 packed path: source the bytes from the shared blob fd at
         // the expert's recorded offset. The fault-tolerant retry +
@@ -1145,15 +1175,21 @@ impl NvmeStorage {
             })?;
             let file = packed.file().clone();
             let dst_len = buf.len();
-            let n = tokio::task::block_in_place(|| {
+            if let Some(observer) = observer {
+                observer.issued();
+            }
+            let result = tokio::task::block_in_place(|| {
                 self.read_at_with_retries(
                     &file,
                     expert_id,
                     entry.offset,
                     &mut buf.as_mut_slice()[..dst_len],
                 )
-            })?;
-            return Ok(n);
+            });
+            if let Some(observer) = observer {
+                observer.completed();
+            }
+            return result;
         }
         // Note: the breaker fast-fail used to live here for symmetry
         // with `read_at_with_retries`, but that bypassed the
@@ -1167,10 +1203,16 @@ impl NvmeStorage {
         // length check is needed here. Each expert is stored as its
         // own file, so the read always starts at byte 0.
         let dst_len = buf.len();
-        let n = tokio::task::block_in_place(|| {
+        if let Some(observer) = observer {
+            observer.issued();
+        }
+        let result = tokio::task::block_in_place(|| {
             self.read_at_with_retries(&file, expert_id, 0, &mut buf.as_mut_slice()[..dst_len])
-        })?;
-        Ok(n)
+        });
+        if let Some(observer) = observer {
+            observer.completed();
+        }
+        result
     }
 
     /// Batched read: fill `bufs[i]` with the bytes of `ids[i]`, all in

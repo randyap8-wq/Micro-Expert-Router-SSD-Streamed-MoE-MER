@@ -330,6 +330,60 @@ run_case() {
       .prefetch_dropped_governor == 0 and
       .prefetch_dropped_bytes == 0
     )) and
+    ([.runs[].demand_miss_fanout] | all(
+      (.semantics | length > 0) and
+      ([.prompt, .decode] | all(
+        .routed_layers_observed > 0 and
+        .routed_expert_activations_observed == (.routed_layers_observed * 8) and
+        .resident_hits_at_initial_layer_lookup + .misses_at_initial_layer_lookup ==
+          .routed_expert_activations_observed and
+        (.missing_experts_per_routed_layer | length) == 9 and
+        ([.missing_experts_per_routed_layer[]] | all(type == "number" and . >= 0)) and
+        ([.missing_experts_per_routed_layer[]] | add) == .routed_layers_observed and
+        ([.missing_experts_per_routed_layer | to_entries[] | (.key * .value)] | add) ==
+          .misses_at_initial_layer_lookup and
+        .layers_with_multiple_simultaneous_misses ==
+          ([.missing_experts_per_routed_layer[2:9][]] | add) and
+        (.layers_with_no_foreground_physical_read +
+         .layers_with_one_physical_read +
+         .layers_with_serial_physical_reads +
+         .layers_with_overlapping_physical_reads) ==
+          ([.missing_experts_per_routed_layer[1:9][]] | add) and
+        .foreground_admission_control == "none" and
+        .primary_buffer_partition == "primary-buffer-a" and
+        .speculative_buffer_partition == "shadow-buffer-b" and
+        .expert_compute_start_policy == "wait-for-all-required-experts" and
+        .cache_lookup_seconds >= 0 and
+        .foreground_physical_read_operations >= 0 and
+        .peak_foreground_physical_reads_in_flight >= 0 and
+        .foreground_physical_read_concurrency_integral_seconds >= 0 and
+        .foreground_physical_read_active_seconds >= 0 and
+        .average_foreground_physical_read_concurrency >= 0 and
+        .physical_read_issue_to_completion_seconds >= 0 and
+        .physical_read_issue_to_completion_mean_seconds >= 0 and
+        .physical_read_issue_to_completion_max_seconds >= 0 and
+        (.physical_read_issue_to_completion_histogram | length) == 16 and
+        ([.physical_read_issue_to_completion_histogram[].count] | add) ==
+          .foreground_physical_read_operations and
+        .primary_buffer_acquisition_wait_seconds >= 0 and
+        .foreground_admission_wait_seconds == 0 and
+        .singleflight_wait_seconds >= 0 and
+        .completion_to_consumption_delay_seconds >= 0 and
+        .layer_expert_fetch_critical_path_seconds >= 0 and
+        .layer_expert_fetch_critical_path_wall_fraction >= 0 and
+        .layers_beginning_compute_before_all_misses_available == 0 and
+        .demand_reads_issued_while_speculative_reads_active >= 0 and
+        .demand_critical_reads_delayed_by_speculative_activity == null and
+        (.final_straggler_routed_slot_histogram | length) == 9 and
+        ([.final_straggler_routed_slot_histogram[]] | add) ==
+          ([.missing_experts_per_routed_layer[1:9][]] | add)
+      ))
+    )) and
+    ([.runs[]] | all(
+      (.demand_miss_fanout.prompt.foreground_physical_read_operations +
+       .demand_miss_fanout.decode.foreground_physical_read_operations) >=
+        .cache_io.foreground_read_operations
+    )) and
     ([.runs[].memory] | all(
       .current_rss_bytes > 0 and
       .current_rss_sample_point == "after_completion_decode_before_report_serialization" and
@@ -386,7 +440,87 @@ run_case() {
       prompt_critical_path_coverage_min: ([.runs[].critical_path.prompt.coverage_ratio] | min),
       decode_critical_path_coverage_min: ([.runs[].critical_path.decode.coverage_ratio] | min),
       output_token_parity: .aggregate.output_token_parity,
-      qualification_passed: true
+      qualification_passed: true,
+      phase3a_decode: {
+        routed_layers_observed: ([.runs[].demand_miss_fanout.decode.routed_layers_observed] | add),
+        routed_expert_activations_observed: ([.runs[].demand_miss_fanout.decode.routed_expert_activations_observed] | add),
+        resident_hits_at_initial_layer_lookup: ([.runs[].demand_miss_fanout.decode.resident_hits_at_initial_layer_lookup] | add),
+        misses_at_initial_layer_lookup: ([.runs[].demand_miss_fanout.decode.misses_at_initial_layer_lookup] | add),
+        cache_lookup_seconds: ([.runs[].demand_miss_fanout.decode.cache_lookup_seconds] | add),
+        missing_experts_per_routed_layer: [
+          range(0; 9) as $i |
+          ([.runs[].demand_miss_fanout.decode.missing_experts_per_routed_layer[$i]] | add)
+        ],
+        layers_with_multiple_simultaneous_misses: ([.runs[].demand_miss_fanout.decode.layers_with_multiple_simultaneous_misses] | add),
+        layers_with_no_foreground_physical_read: ([.runs[].demand_miss_fanout.decode.layers_with_no_foreground_physical_read] | add),
+        layers_with_one_physical_read: ([.runs[].demand_miss_fanout.decode.layers_with_one_physical_read] | add),
+        layers_with_serial_physical_reads: ([.runs[].demand_miss_fanout.decode.layers_with_serial_physical_reads] | add),
+        layers_with_overlapping_physical_reads: ([.runs[].demand_miss_fanout.decode.layers_with_overlapping_physical_reads] | add),
+        layers_beginning_compute_before_all_misses_available: ([.runs[].demand_miss_fanout.decode.layers_beginning_compute_before_all_misses_available] | add),
+        foreground_physical_read_operations: ([.runs[].demand_miss_fanout.decode.foreground_physical_read_operations] | add),
+        peak_foreground_physical_reads_in_flight: ([.runs[].demand_miss_fanout.decode.peak_foreground_physical_reads_in_flight] | max),
+        foreground_physical_read_concurrency_integral_seconds: ([.runs[].demand_miss_fanout.decode.foreground_physical_read_concurrency_integral_seconds] | add),
+        foreground_physical_read_active_seconds: ([.runs[].demand_miss_fanout.decode.foreground_physical_read_active_seconds] | add),
+        average_foreground_physical_read_concurrency: (
+          ([.runs[].demand_miss_fanout.decode.foreground_physical_read_concurrency_integral_seconds] | add) as $integral |
+          ([.runs[].demand_miss_fanout.decode.foreground_physical_read_active_seconds] | add) as $active |
+          if $active == 0 then 0 else ($integral / $active) end
+        ),
+        physical_read_issue_to_completion_seconds: ([.runs[].demand_miss_fanout.decode.physical_read_issue_to_completion_seconds] | add),
+        physical_read_issue_to_completion_mean_seconds: (
+          ([.runs[].demand_miss_fanout.decode.physical_read_issue_to_completion_seconds] | add) as $service |
+          ([.runs[].demand_miss_fanout.decode.foreground_physical_read_operations] | add) as $reads |
+          if $reads == 0 then 0 else ($service / $reads) end
+        ),
+        physical_read_issue_to_completion_max_seconds: ([.runs[].demand_miss_fanout.decode.physical_read_issue_to_completion_max_seconds] | max),
+        physical_read_issue_to_completion_histogram: [
+          range(0; 16) as $i |
+          {
+            upper_bound_microseconds: .runs[0].demand_miss_fanout.decode.physical_read_issue_to_completion_histogram[$i].upper_bound_microseconds,
+            count: ([.runs[].demand_miss_fanout.decode.physical_read_issue_to_completion_histogram[$i].count] | add)
+          }
+        ],
+        primary_buffer_acquisition_wait_seconds: ([.runs[].demand_miss_fanout.decode.primary_buffer_acquisition_wait_seconds] | add),
+        foreground_admission_wait_seconds: ([.runs[].demand_miss_fanout.decode.foreground_admission_wait_seconds] | add),
+        singleflight_wait_seconds: ([.runs[].demand_miss_fanout.decode.singleflight_wait_seconds] | add),
+        completion_to_consumption_delay_seconds: ([.runs[].demand_miss_fanout.decode.completion_to_consumption_delay_seconds] | add),
+        first_miss_to_first_read_issue_seconds: ([.runs[].demand_miss_fanout.decode.first_miss_to_first_read_issue_seconds] | add),
+        first_miss_to_last_read_issue_seconds: ([.runs[].demand_miss_fanout.decode.first_miss_to_last_read_issue_seconds] | add),
+        first_to_last_read_issue_spread_seconds: ([.runs[].demand_miss_fanout.decode.first_to_last_read_issue_spread_seconds] | add),
+        first_miss_to_first_required_expert_available_seconds: ([.runs[].demand_miss_fanout.decode.first_miss_to_first_required_expert_available_seconds] | add),
+        first_miss_to_final_required_expert_available_seconds: ([.runs[].demand_miss_fanout.decode.first_miss_to_final_required_expert_available_seconds] | add),
+        first_to_last_required_expert_completion_spread_seconds: ([.runs[].demand_miss_fanout.decode.first_to_last_required_expert_completion_spread_seconds] | add),
+        first_miss_to_expert_compute_begin_seconds: ([.runs[].demand_miss_fanout.decode.first_miss_to_expert_compute_begin_seconds] | add),
+        first_miss_to_layer_completion_seconds: ([.runs[].demand_miss_fanout.decode.first_miss_to_layer_completion_seconds] | add),
+        layer_expert_fetch_critical_path_seconds: ([.runs[].demand_miss_fanout.decode.layer_expert_fetch_critical_path_seconds] | add),
+        layer_expert_fetch_critical_path_mean_seconds: (
+          ([.runs[].demand_miss_fanout.decode.layer_expert_fetch_critical_path_seconds] | add) as $critical |
+          ([.runs[].demand_miss_fanout.decode.missing_experts_per_routed_layer[1:9][]] | add) as $layers |
+          if $layers == 0 then 0 else ($critical / $layers) end
+        ),
+        layer_expert_fetch_critical_path_max_seconds: ([.runs[].demand_miss_fanout.decode.layer_expert_fetch_critical_path_max_seconds] | max),
+        decode_wall_seconds: ([.runs[].decode_seconds] | add),
+        decode_wall_fraction_attributable_to_layer_expert_fetch: (
+          ([.runs[].demand_miss_fanout.decode.layer_expert_fetch_critical_path_seconds] | add) /
+          ([.runs[].decode_seconds] | add)
+        ),
+        demand_reads_issued_while_speculative_reads_active: ([.runs[].demand_miss_fanout.decode.demand_reads_issued_while_speculative_reads_active] | add),
+        demand_critical_reads_delayed_by_speculative_activity: null,
+        final_straggler_routed_slot_histogram: [
+          range(0; 9) as $i |
+          ([.runs[].demand_miss_fanout.decode.final_straggler_routed_slot_histogram[$i]] | add)
+        ],
+        worst_layer_fetch: (
+          [.runs[] |
+            select(.demand_miss_fanout.decode.worst_layer_fetch != null) |
+            {
+              run_index,
+              sample: .demand_miss_fanout.decode.worst_layer_fetch
+            }
+          ] |
+          if length == 0 then null else max_by(.sample.critical_path_seconds) end
+        )
+      }
     }' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"
 }
 

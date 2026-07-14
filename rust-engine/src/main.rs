@@ -133,6 +133,7 @@ mod buffer_pool;
 mod config;
 mod dense_tensor;
 mod dequant;
+mod demand_fetch_telemetry;
 mod distributed;
 mod draft;
 mod engine;
@@ -2427,6 +2428,34 @@ struct BenchRealCriticalPath {
 }
 
 #[derive(Clone, Serialize)]
+struct BenchRealDemandFetchPhase {
+    routed_layers_observed: u64,
+    routed_expert_activations_observed: u64,
+    resident_hits_at_initial_layer_lookup: u64,
+    misses_at_initial_layer_lookup: u64,
+    /// Exact bounded buckets indexed by miss count (`0..=top_k`). Bucket zero
+    /// is derived from the existing routed-layer counter, so resident layers
+    /// pay no new Phase 3A hot-path operation.
+    missing_experts_per_routed_layer: Vec<u64>,
+    cache_lookup_seconds: f64,
+    foreground_admission_control: &'static str,
+    primary_buffer_partition: &'static str,
+    speculative_buffer_partition: &'static str,
+    storage_submission_path: &'static str,
+    expert_compute_start_policy: &'static str,
+    layer_expert_fetch_critical_path_wall_fraction: f64,
+    #[serde(flatten)]
+    miss_path: crate::demand_fetch_telemetry::DemandFetchSnapshot,
+}
+
+#[derive(Clone, Serialize)]
+struct BenchRealDemandFetchTelemetry {
+    semantics: &'static str,
+    prompt: BenchRealDemandFetchPhase,
+    decode: BenchRealDemandFetchPhase,
+}
+
+#[derive(Clone, Serialize)]
 struct BenchRealRunReport {
     run_index: usize,
     prompt_tokens: usize,
@@ -2455,6 +2484,7 @@ struct BenchRealRunReport {
     memory: BenchRealRunMemory,
     critical_path: BenchRealCriticalPath,
     diagnostic_stage_timings: BenchRealDiagnosticStageTimings,
+    demand_miss_fanout: BenchRealDemandFetchTelemetry,
     output_token_ids: Vec<u32>,
     output_text: String,
     stage_timings: std::collections::BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
@@ -4315,6 +4345,51 @@ fn build_bench_real_report_context(
     })
 }
 
+fn bench_real_demand_fetch_phase(
+    before: &crate::engine::EngineReport,
+    after: &crate::engine::EngineReport,
+    stages: &std::collections::BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
+    wall_seconds: f64,
+) -> BenchRealDemandFetchPhase {
+    let routed_layers = after
+        .tokens_processed
+        .saturating_sub(before.tokens_processed);
+    let resident_hits = after.hits.saturating_sub(before.hits);
+    let misses = after.misses.saturating_sub(before.misses);
+    let mut histogram = after.demand_fetch.missing_experts_per_layer_nonzero.clone();
+    if histogram.is_empty() {
+        histogram.push(0);
+    }
+    let miss_layers: u64 = histogram.iter().skip(1).copied().sum();
+    histogram[0] = routed_layers.saturating_sub(miss_layers);
+    let cache_lookup_seconds = stages
+        .get(crate::stage_timing::EXPERT_CACHE_LOOKUP)
+        .map(|timing| timing.total_seconds)
+        .unwrap_or(0.0);
+    let layer_fetch_seconds = after
+        .demand_fetch
+        .layer_expert_fetch_critical_path_seconds;
+    BenchRealDemandFetchPhase {
+        routed_layers_observed: routed_layers,
+        routed_expert_activations_observed: resident_hits.saturating_add(misses),
+        resident_hits_at_initial_layer_lookup: resident_hits,
+        misses_at_initial_layer_lookup: misses,
+        missing_experts_per_routed_layer: histogram,
+        cache_lookup_seconds,
+        foreground_admission_control: "none",
+        primary_buffer_partition: "primary-buffer-a",
+        speculative_buffer_partition: "shadow-buffer-b",
+        storage_submission_path: "independent-o_direct-positional-pread-per-demand-leader",
+        expert_compute_start_policy: "wait-for-all-required-experts",
+        layer_expert_fetch_critical_path_wall_fraction: if wall_seconds > 0.0 {
+            layer_fetch_seconds / wall_seconds
+        } else {
+            0.0
+        },
+        miss_path: after.demand_fetch.clone(),
+    }
+}
+
 async fn run_bench_real_once(
     runtime: &BenchRealRuntime,
     prompt: &str,
@@ -4329,6 +4404,9 @@ async fn run_bench_real_once(
     let prompt_stage_timings = crate::stage_timing::StageTimings::default();
     let decode_stage_timings = crate::stage_timing::StageTimings::default();
     let mut kv = runtime.model.fresh_kv_caches();
+    if !runtime.engine.reset_demand_fetch_telemetry() {
+        return Err("cannot reset Phase 3A telemetry while a foreground read is active".into());
+    }
     let pre = runtime.engine.report();
     let truncated_payload_uses_before = crate::inference::truncated_expert_payload_uses();
     let nonfinite_attention_before = crate::transformer::nonfinite_softmax_fallbacks();
@@ -4383,6 +4461,18 @@ async fn run_bench_real_once(
     let _first_token_latency_us = first_started.elapsed().as_micros() as u64;
     let time_to_first_token_seconds = total_started.elapsed().as_secs_f64();
     completion_ids.push(first);
+
+    // Prompt and decode need independent peak-QD / worst-layer epochs. Demand
+    // handles are fully drained by `forward_token_hidden_with_timing`, so a
+    // failed reset here would expose a real ownership bug.
+    let prompt_post = runtime.engine.report();
+    if !runtime.engine.reset_demand_fetch_telemetry() {
+        return Err(
+            "cannot start decode Phase 3A telemetry while a prompt foreground read is active"
+                .into(),
+        );
+    }
+    let decode_pre = runtime.engine.report();
 
     let decode_started = Instant::now();
     let mut last = first;
@@ -4468,6 +4558,21 @@ async fn run_bench_real_once(
         decode_seconds,
         &decode_stage_timings,
     );
+    let demand_miss_fanout = BenchRealDemandFetchTelemetry {
+        semantics: "miss-only bounded telemetry; storage service brackets NvmeStorage positional-read execution, while cache lookup, primary-buffer wait, admission wait, and completion-to-consumption delay are separate",
+        prompt: bench_real_demand_fetch_phase(
+            &pre,
+            &prompt_post,
+            &prompt_stage_timings,
+            time_to_first_token_seconds,
+        ),
+        decode: bench_real_demand_fetch_phase(
+            &decode_pre,
+            &post,
+            &decode_stage_timings,
+            decode_seconds,
+        ),
+    };
 
     Ok(BenchRealRunReport {
         run_index,
@@ -4569,6 +4674,7 @@ async fn run_bench_real_once(
             prompt: prompt_stage_timings,
             decode: decode_stage_timings,
         },
+        demand_miss_fanout,
         output_token_ids: completion_ids,
         output_text,
         stage_timings,

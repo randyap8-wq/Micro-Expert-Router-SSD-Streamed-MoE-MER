@@ -64,6 +64,52 @@ jq -n \
         .prefetch_completed == 0 and
         .prefetch_bytes == 0
       )
+    )),
+    zero_phase3_miss_telemetry: ([$short_raw, $medium_raw] | all(
+      [.runs[].demand_miss_fanout.prompt, .runs[].demand_miss_fanout.decode] | all(
+        .misses_at_initial_layer_lookup == 0 and
+        .missing_experts_per_routed_layer[0] == .routed_layers_observed and
+        ([.missing_experts_per_routed_layer[1:][]] | all(. == 0)) and
+        .layers_with_multiple_simultaneous_misses == 0 and
+        .layers_with_one_physical_read == 0 and
+        .layers_with_no_foreground_physical_read == 0 and
+        .layers_with_serial_physical_reads == 0 and
+        .layers_with_overlapping_physical_reads == 0 and
+        .layers_beginning_compute_before_all_misses_available == 0 and
+        .foreground_physical_read_operations == 0 and
+        .peak_foreground_physical_reads_in_flight == 0 and
+        .foreground_physical_read_concurrency_integral_seconds == 0 and
+        .foreground_physical_read_active_seconds == 0 and
+        .average_foreground_physical_read_concurrency == 0 and
+        .physical_read_issue_to_completion_seconds == 0 and
+        .physical_read_issue_to_completion_mean_seconds == 0 and
+        .physical_read_issue_to_completion_max_seconds == 0 and
+        ([.physical_read_issue_to_completion_histogram[].count] | all(. == 0)) and
+        .primary_buffer_acquisition_wait_seconds == 0 and
+        .primary_buffer_acquisition_wait_mean_seconds == 0 and
+        .primary_buffer_acquisition_wait_max_seconds == 0 and
+        .foreground_admission_wait_seconds == 0 and
+        .foreground_admission_wait_mean_seconds == 0 and
+        .singleflight_wait_seconds == 0 and
+        .completion_to_consumption_delay_seconds == 0 and
+        .completion_to_consumption_delay_mean_seconds == 0 and
+        .completion_to_consumption_delay_max_seconds == 0 and
+        .first_miss_to_first_read_issue_seconds == 0 and
+        .first_miss_to_last_read_issue_seconds == 0 and
+        .first_to_last_read_issue_spread_seconds == 0 and
+        .first_miss_to_first_required_expert_available_seconds == 0 and
+        .first_miss_to_final_required_expert_available_seconds == 0 and
+        .first_to_last_required_expert_completion_spread_seconds == 0 and
+        .first_miss_to_expert_compute_begin_seconds == 0 and
+        .first_miss_to_layer_completion_seconds == 0 and
+        .layer_expert_fetch_critical_path_seconds == 0 and
+        .layer_expert_fetch_critical_path_mean_seconds == 0 and
+        .layer_expert_fetch_critical_path_max_seconds == 0 and
+        .demand_reads_issued_while_speculative_reads_active == 0 and
+        .demand_critical_reads_delayed_by_speculative_activity == null and
+        ([.final_straggler_routed_slot_histogram[]] | all(. == 0)) and
+        .worst_layer_fetch == null
+      )
     ))
   } as $resident_gates |
   (($gm >= $lower) and ($gm <= $upper)) as $performance_passed |
@@ -81,6 +127,8 @@ jq -n \
       else "resident cases recorded foreground expert I/O" end,
       if $resident_gates.zero_prefetch_io then empty
       else "resident cases recorded speculative prefetch I/O" end,
+      if $resident_gates.zero_phase3_miss_telemetry then empty
+      else "resident cases activated Phase 3A miss-only telemetry" end,
       if $performance_passed then empty
       elif $gm < $lower then
         "resident performance gate failed: geometric mean decode TPS \($gm) is below the lower bound \($lower)"
@@ -109,7 +157,8 @@ jq -n \
       $resident_gates.zero_cache_misses and
       $resident_gates.zero_ssd_bytes and
       $resident_gates.zero_foreground_io and
-      $resident_gates.zero_prefetch_io
+      $resident_gates.zero_prefetch_io and
+      $resident_gates.zero_phase3_miss_telemetry
     ),
     performance_gate: {
       lower_bound_decode_tps: $lower,
