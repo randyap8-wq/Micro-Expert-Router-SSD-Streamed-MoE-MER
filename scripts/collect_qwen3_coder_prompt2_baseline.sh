@@ -11,10 +11,19 @@ FEATURES="avx512,blas,tokenizer,io_uring,q8-candle-reference"
 
 TOKENIZER=${MER_QWEN_TOKENIZER:-$MER_QWEN_CONVERTED_DIR/tokenizer.json}
 ARTIFACT_DIR=${1:-}
+MODE_ARG=${2:-four-case}
 if [[ -z "$ARTIFACT_DIR" ]]; then
-  echo "usage: $0 ARTIFACT_DIR" >&2
+  echo "usage: $0 ARTIFACT_DIR [four-case|--resident-only]" >&2
   exit 2
 fi
+case "$MODE_ARG" in
+  four-case) COLLECTOR_MODE=four-case ;;
+  resident-only|--resident-only) COLLECTOR_MODE=resident-only ;;
+  *)
+    echo "unknown collector mode: $MODE_ARG (expected four-case or --resident-only)" >&2
+    exit 2
+    ;;
+esac
 
 for value in "$MER_QWEN_CONVERTED_DIR" "$TOKENIZER"; do
   if [[ "$value" == *'&'* || "$value" == *'|'* || "$value" == *$'\n'* ]]; then
@@ -87,6 +96,7 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "malloc_arena_max=2"
   echo "rust_log=off"
   echo "no_color=1"
+  echo "collector_mode=$COLLECTOR_MODE"
 } > "$ARTIFACT_DIR/environment.txt"
 
 uname -a > "$ARTIFACT_DIR/uname.txt"
@@ -412,38 +422,131 @@ run_case() {
     }' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"
 }
 
-run_case 1536 short 14 "$SHORT_PROMPT_SHA"
-run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"
-run_case 6144 short 14 "$SHORT_PROMPT_SHA"
-run_case 6144 medium 65 "$MEDIUM_PROMPT_SHA"
+if [[ "$COLLECTOR_MODE" == resident-only ]]; then
+  run_case 6144 short 14 "$SHORT_PROMPT_SHA"
+  run_case 6144 medium 65 "$MEDIUM_PROMPT_SHA"
 
-jq -s '{
-  schema: {name:"mer-prompt2-four-case-summary", version:1},
-  cases: .,
-  qualification_passed: (all(.qualification_passed == true))
-}' \
-  "$ARTIFACT_DIR/baseline-1536-short.case-summary.json" \
-  "$ARTIFACT_DIR/baseline-1536-medium.case-summary.json" \
-  "$ARTIFACT_DIR/baseline-6144-short.case-summary.json" \
-  "$ARTIFACT_DIR/baseline-6144-medium.case-summary.json" \
-  > "$ARTIFACT_DIR/four-case-summary.json"
+  for json in \
+    "$ARTIFACT_DIR/baseline-6144-short.json" \
+    "$ARTIFACT_DIR/baseline-6144-medium.json"; do
+    jq -e '
+      .aggregate.output_token_parity == true and
+      .aggregate.cache_misses_total == 0 and
+      .aggregate.ssd_bytes_total == 0 and
+      ([.runs[].cache_io] | all(
+        .cache_misses == 0 and
+        .cache_evictions == 0 and
+        .foreground_read_operations == 0 and
+        .foreground_read_operations_issued == 0 and
+        .foreground_expert_bytes == 0 and
+        .foreground_expert_io_wait_seconds == 0 and
+        .total_expert_bytes_read == 0 and
+        .prefetch_submitted == 0 and
+        .prefetch_completed == 0 and
+        .prefetch_bytes == 0 and
+        .speculative_read_operations_issued == 0 and
+        .demand_requests_joined_inflight_prefetch == 0 and
+        .demand_requests_joined_inflight_foreground == 0 and
+        .speculative_loads_promoted_to_demand == 0 and
+        .duplicate_physical_reads_avoided == 0 and
+        .completed_prefetch_direct_handoffs == 0 and
+        .in_flight_registry_size_at_sample == 0 and
+        .in_flight_entries_removed == 0 and
+        .in_flight_failed_or_abandoned_entries_removed == 0
+      ))
+    ' "$json" >/dev/null
+  done
 
-jq -n \
-  --arg commit "$EXPECTED_COMMIT" \
-  --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{
-    schema: {name:"mer-prompt2-qualification", version:1},
-    git_commit_full: $commit,
-    captured_at_utc: $captured_at_utc,
-    four_required_cases_present: true,
-    schema_and_required_fields_passed: true,
-    provenance_and_backend_gates_passed: true,
-    prompt_identity_gates_passed: true,
-    strictness_and_correctness_gates_passed: true,
-    critical_path_coverage_gates_passed: true,
-    external_peak_rss_present: true,
-    qualification_passed: true
-  }' > "$ARTIFACT_DIR/qualification.json"
+  jq -n \
+    --arg commit "$EXPECTED_COMMIT" \
+    --slurpfile short "$ARTIFACT_DIR/baseline-6144-short.case-summary.json" \
+    --slurpfile medium "$ARTIFACT_DIR/baseline-6144-medium.case-summary.json" \
+    --argjson reference 3.500144036461 '
+    (($short[0].decode_tps_mean * $medium[0].decode_tps_mean) | sqrt) as $gm |
+    {
+      schema: {name:"mer-prompt2-resident-control-summary", version:1},
+      git_commit_full: $commit,
+      cases: [$short[0], $medium[0]],
+      reference: {
+        commit: "327d263193c48f9dde9f6a716562260ab49fa7ef",
+        source: "immediate Phase 1 A-B-A recheck",
+        geometric_mean_decode_tps: $reference,
+        tolerance_percent: 2.0
+      },
+      resident_geometric_mean_decode_tps: $gm,
+      delta_from_reference_percent: (100 * ($gm / $reference - 1)),
+      no_ssd_or_handoff_activity: true,
+      qualification_passed: (
+        ($gm >= ($reference * 0.98)) and
+        ($gm <= ($reference * 1.02)) and
+        ([$short[0], $medium[0]] | all(
+          .qualification_passed == true and
+          .output_token_parity == true and
+          .cache_misses_total == 0 and
+          .ssd_bytes_total == 0 and
+          .foreground_read_operations_total == 0 and
+          .foreground_read_operations_issued_total == 0 and
+          .speculative_read_operations_issued_total == 0 and
+          .duplicate_physical_reads_avoided_total == 0
+        ))
+      )
+    }' > "$ARTIFACT_DIR/resident-control-summary.json"
+  jq -e '.qualification_passed == true' \
+    "$ARTIFACT_DIR/resident-control-summary.json" >/dev/null
+
+  jq -n \
+    --arg commit "$EXPECTED_COMMIT" \
+    --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --slurpfile summary "$ARTIFACT_DIR/resident-control-summary.json" '
+    {
+      schema: {name:"mer-prompt2-resident-qualification", version:1},
+      git_commit_full: $commit,
+      captured_at_utc: $captured_at_utc,
+      two_required_resident_cases_present: true,
+      schema_and_required_fields_passed: true,
+      provenance_and_backend_gates_passed: true,
+      prompt_identity_gates_passed: true,
+      strictness_and_correctness_gates_passed: true,
+      critical_path_coverage_gates_passed: true,
+      external_peak_rss_present: true,
+      no_ssd_or_handoff_activity: $summary[0].no_ssd_or_handoff_activity,
+      resident_reference_tolerance_passed: $summary[0].qualification_passed,
+      qualification_passed: $summary[0].qualification_passed
+    }' > "$ARTIFACT_DIR/qualification.json"
+else
+  run_case 1536 short 14 "$SHORT_PROMPT_SHA"
+  run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"
+  run_case 6144 short 14 "$SHORT_PROMPT_SHA"
+  run_case 6144 medium 65 "$MEDIUM_PROMPT_SHA"
+
+  jq -s '{
+    schema: {name:"mer-prompt2-four-case-summary", version:1},
+    cases: .,
+    qualification_passed: (all(.qualification_passed == true))
+  }' \
+    "$ARTIFACT_DIR/baseline-1536-short.case-summary.json" \
+    "$ARTIFACT_DIR/baseline-1536-medium.case-summary.json" \
+    "$ARTIFACT_DIR/baseline-6144-short.case-summary.json" \
+    "$ARTIFACT_DIR/baseline-6144-medium.case-summary.json" \
+    > "$ARTIFACT_DIR/four-case-summary.json"
+
+  jq -n \
+    --arg commit "$EXPECTED_COMMIT" \
+    --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{
+      schema: {name:"mer-prompt2-qualification", version:1},
+      git_commit_full: $commit,
+      captured_at_utc: $captured_at_utc,
+      four_required_cases_present: true,
+      schema_and_required_fields_passed: true,
+      provenance_and_backend_gates_passed: true,
+      prompt_identity_gates_passed: true,
+      strictness_and_correctness_gates_passed: true,
+      critical_path_coverage_gates_passed: true,
+      external_peak_rss_present: true,
+      qualification_passed: true
+    }' > "$ARTIFACT_DIR/qualification.json"
+fi
 
 # Hash immutable artifacts last. The two tee-backed collector logs and this
 # manifest are excluded because they are still open while the manifest is made.
@@ -454,4 +557,4 @@ find "$ARTIFACT_DIR" -type f \
   -print0 | sort -z | xargs -0 sha256sum > "$ARTIFACT_DIR/artifact-sha256.txt"
 
 echo "QUALIFICATION: PASS"
-echo "four-case instrumented baseline collection completed: $ARTIFACT_DIR"
+echo "$COLLECTOR_MODE instrumented baseline collection completed: $ARTIFACT_DIR"

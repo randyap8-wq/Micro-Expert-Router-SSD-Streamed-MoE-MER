@@ -2,16 +2,71 @@
 
 ## Status and scope
 
-This phase implements one narrowly scoped foreground-I/O optimization:
+This phase implemented one narrowly scoped foreground-I/O optimization:
 demand-aware publication of an in-flight expert read's immutable resident.
-It does not change routing, prediction, cache capacity, model math, storage
-layout, prompts, token counts, sampling, CPU placement, Rayon sizing, or any
-experimental predictive policy. Mac results are correctness evidence only.
-Candidate throughput is intentionally absent until the unchanged four-case
-collector runs on the Linux target host.
+The target-host collector subsequently exercised the mechanism, but the
+candidate was not a performance win: streaming throughput did not improve and
+the first implementation regressed the all-resident control. Phase 2B isolates
+the resident fast path from the miss-only handoff state before the optimization
+is reconsidered. It does not change routing, prediction, cache capacity, model
+math, storage layout, prompts, token counts, sampling, CPU placement, Rayon
+sizing, or any experimental predictive policy. Mac results remain correctness
+evidence only; Phase 2B throughput requires a new Linux x86_64 collection.
 
 The `bench-real` schema remains `mer-bench-real` version 2. The new fields are
 additive and do not change Phase 1 qualification semantics.
+
+## Qualified A-B-A result
+
+The qualified Linux target-host A-B-A comparison was:
+
+| Candidate | 1,536 short | 1,536 medium | Streaming GM | 6,144 short | 6,144 medium | Resident GM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Phase 1 initial | 1.3000562561 | 1.5165972824 | 1.404158746356 | 3.7349088600 | 3.5123644733 | 3.621927827950 |
+| Phase 2 handoff | 1.2877193867 | 1.4804354696 | 1.380719180341 | 3.1906553312 | 3.0339322511 | 3.111307138724 |
+| Phase 1 immediate recheck | 1.2944549612 | 1.5184726960 | 1.401996617251 | 3.4921515988 | 3.5081547663 | 3.500144036461 |
+
+The Phase 1 streaming metric reproduced within about 0.2%. Relative to the
+immediate Phase 1 recheck, Phase 2 was about 1.5% slower on the streaming
+geometric mean and 11.1% slower on the resident-control geometric mean. The
+handoff mechanism was nevertheless exercised: 454 duplicate physical reads
+were avoided in 1,536-short and 424 in 1,536-medium, for 878 joined demand
+requests/direct handoffs in total. SSD traffic changed negligibly, so the
+avoided duplicate reads did not translate into streaming throughput.
+
+Both 6,144-slot cases reported zero SSD reads, cache misses, foreground reads,
+speculative reads, and handoff joins. The first Phase 2 implementation
+therefore had a non-I/O resident-control regression. Phase 2B is intended to
+remove that non-I/O influence before any decision to retain or reconsider the
+handoff optimization. Phase 2 must not be described as a performance win.
+
+## Phase 2B resident-path audit and correction
+
+The exact `327d263..06d9f044` audit found no registry lookup in either ordinary
+resident execution loop: `generate` and `moe_step_inner` both return the
+cached `Arc<ExpertResident>` inline and only spawn `fetch_with_retry` after a
+confirmed miss. The direct-Q8 dispatch and resident ownership flow were
+unchanged. Report sampling reads the registry gauge only before/after a
+benchmark run, not per activation.
+
+Two structural Phase 2 changes could still influence the all-resident binary:
+
+1. ten miss/handoff atomics were inserted into the shared `Counters`
+   allocation, expanding the hot counter block from 18 to 28 atomics and
+   shifting the pre-existing fields that follow `singleflight_followers`; and
+2. the enlarged outcome/guard/retry state machine remained part of the public
+   cache-or-load async function instead of a distinct miss-only function.
+
+Phase 2B restores the exact Phase 1 `Counters` footprint and moves the ten
+handoff atomics into a separate allocation that is touched only by load
+lifecycle events or report sampling. `fetch_with_retry` now performs only the
+explicit cache probe on a hit; after a confirmed miss it calls a non-inlined
+miss-only helper containing leader election, outcome inspection, atomics, and
+the guard. `spawn_prefetch` likewise has an explicit resident return before
+its registry check. A test-only per-engine access probe proves those returns
+do not reach the registry; the probe and field are compiled out of release
+builds. Linux validation is still required to determine whether removing
+these code/layout influences restores the measured resident throughput.
 
 ## Qualified Phase 1 evidence
 
@@ -207,6 +262,11 @@ qualification gates retain their meaning.
 Deterministic engine tests use a test-only storage read gate with per-expert
 physical-read counters and explicit completion permits. They cover:
 
+- repeated resident fetches returning the same `Arc` without a registry
+  access, entry allocation, or handoff-counter update;
+- an all-resident strict inference fixture keeping the registry empty and
+  untouched while preserving cache-hit accounting;
+- the common `Counters` allocation retaining its exact Phase 1 footprint;
 - 32 simultaneous demand requests returning the same resident after one read;
 - demand joining an in-flight prefetch after one speculative read;
 - demand reusing a completed shadow-backed prefetch without copy or foreground
@@ -230,7 +290,12 @@ git status --short
 git push origin perf/qwen3-coder-single-stream-decode
 ```
 
-Then run the unchanged four-case collector in a foreground VM terminal:
+First run the resident-only gate in a foreground VM terminal. It reuses the
+unchanged collector configuration but runs only 6,144-short and 6,144-medium.
+The collector requires their geometric mean to remain within +/-2% of the
+immediate Phase 1 reference (`3.500144036461`) and rejects any SSD bytes,
+cache miss, foreground/speculative read, handoff join, parity failure,
+qualification failure, or checksum mismatch:
 
 ```bash
 cd /home/randyap8/Micro-Expert-Router-SSD-Streamed-MoE-MER
@@ -250,11 +315,22 @@ export MER_QWEN_CONVERTED_DIR=/mnt/localssd/models/qwen3-coder-30b-a3b-q8
 export MER_QWEN_TOKENIZER="$MER_QWEN_CONVERTED_DIR/tokenizer.json"
 export MER_EXPECTED_NVME_MOUNT=/mnt/localssd
 
-ARTIFACT_DIR="/mnt/localssd/benchmarks/prompt2-phase2-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
-scripts/collect_qwen3_coder_prompt2_baseline.sh "$ARTIFACT_DIR"
+ARTIFACT_DIR="/mnt/localssd/benchmarks/prompt2-phase2b-resident-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+scripts/collect_qwen3_coder_prompt2_baseline.sh "$ARTIFACT_DIR" --resident-only
 jq . "$ARTIFACT_DIR/qualification.json"
-jq . "$ARTIFACT_DIR/four-case-summary.json"
+jq . "$ARTIFACT_DIR/resident-control-summary.json"
 sha256sum -c "$ARTIFACT_DIR/artifact-sha256.txt"
+```
+
+Only after that gate passes, run the complete four-case collector; the
+resident mode does not replace or weaken it:
+
+```bash
+FULL_ARTIFACT_DIR="/mnt/localssd/benchmarks/prompt2-phase2b-full-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+scripts/collect_qwen3_coder_prompt2_baseline.sh "$FULL_ARTIFACT_DIR"
+jq . "$FULL_ARTIFACT_DIR/qualification.json"
+jq . "$FULL_ARTIFACT_DIR/four-case-summary.json"
+sha256sum -c "$FULL_ARTIFACT_DIR/artifact-sha256.txt"
 ```
 
 Do not change the prompts, output tokens, run counts, cache sizes, sampling,
@@ -263,12 +339,12 @@ CPU mask, Rayon worker count, storage layout, or predictive-policy switches.
 ### Exact candidate comparison
 
 Select the newest artifact for the exact qualified Phase 1 commit and retain
-`CANDIDATE_DIR` from the collection above. The commit assertion below prevents
+`CANDIDATE_DIR` from the full collection above. The commit assertion below prevents
 an identically named diagnostic or another Phase 1 revision from being used:
 
 ```bash
 BASELINE_DIR=$(find /mnt/localssd/benchmarks -maxdepth 1 -type d -name 'prompt2-phase1-327d263193c4-*' -print | sort | tail -n 1)
-CANDIDATE_DIR="$ARTIFACT_DIR"
+CANDIDATE_DIR="$FULL_ARTIFACT_DIR"
 test -n "$BASELINE_DIR"
 test -f "$BASELINE_DIR/qualification.json"
 test -f "$CANDIDATE_DIR/qualification.json"
@@ -396,26 +472,18 @@ jq -n \
 
 ## Acceptance and rollback
 
-The candidate must retain every Phase 1 qualification gate, output parity,
+Phase 2B must first retain every Phase 1 qualification gate, output parity,
 strict fail-closed inference, zero degraded substitutions/read failures,
-native AVX2/FMA direct-Q8, zero prepared duplicate bytes, and comparable peak
-RSS. The new telemetry must show whether demand joined speculative or
-foreground operations. For the 1,536 cases, successful foreground operations
-or foreground-I/O wait must decrease without a material regression in either
-case. Both 6,144 resident controls must remain within normal run variance.
+native AVX2/FMA direct-Q8, zero prepared duplicate bytes, and artifact
+checksums in the resident-only run. Both cases must have zero SSD bytes, cache
+misses, foreground/speculative reads, and handoff joins. Their geometric mean
+must be within +/-2% of the immediate Phase 1 resident reference
+(`3.500144036461`) before the complete streaming collector is run.
 
-The minimum milestone is a 1,536-slot geometric mean of at least 1.50 decode
-tokens/s (about 9.4% above Phase 1). Report the result even below the threshold.
-Retain a sub-threshold candidate only if telemetry proves less foreground I/O
-with no meaningful throughput or memory regression. Otherwise revert this
-single candidate before selecting another workstream.
-
-Use:
-
-```text
-gap_closed_percent = 100 * (candidate_streaming_GM - 1.3711364980298737)
-                           / (3.103427497900415 - 1.3711364980298737)
-```
+The subsequent four-case run is required evidence, not permission to describe
+Phase 2 as a win. Report its streaming result and mechanism counters even if
+they remain below the original milestone. Phase 2B changes only non-I/O
+isolation; selecting another speculative optimization is a separate decision.
 
 ## Limitations and later work
 

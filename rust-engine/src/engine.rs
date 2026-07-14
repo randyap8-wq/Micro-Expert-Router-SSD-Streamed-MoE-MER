@@ -443,7 +443,7 @@ struct SingleflightLeaderGuard {
     map: Arc<DashMap<u32, Arc<InFlightEntry>>>,
     id: u32,
     entry: Arc<InFlightEntry>,
-    counters: Arc<Counters>,
+    counters: Arc<HandoffCounters>,
     armed: bool,
 }
 
@@ -909,36 +909,6 @@ pub(crate) struct Counters {
     /// (gist Phase 1 — SSD Read De-Duplication). Each increment maps
     /// directly to one disk read that was *not* performed.
     singleflight_followers: AtomicU64,
-    /// Demand requests that joined a speculative operation already reading
-    /// the same expert. Counted once per demand request, before awaiting.
-    demand_requests_joined_inflight_prefetch: AtomicU64,
-    /// Demand requests that joined another foreground operation already
-    /// reading the same expert. Counted once per demand request.
-    demand_requests_joined_inflight_foreground: AtomicU64,
-    /// Speculative physical operations whose ownership was upgraded because
-    /// at least one demand request joined. Counted once per operation.
-    speculative_loads_promoted_to_demand: AtomicU64,
-    /// Demand-side physical reads not issued because an operation for the
-    /// same expert already owned the in-flight slot. Counted per joined
-    /// demand request, independent of the leader's eventual outcome.
-    duplicate_physical_reads_avoided: AtomicU64,
-    /// Successful speculative operations that handed their exact immutable
-    /// resident directly to one or more already-joined demand requests.
-    /// Counted once per completed physical operation, not per waiter.
-    completed_prefetch_direct_handoffs: AtomicU64,
-    /// Foreground storage read attempts actually issued, including attempts
-    /// that fail. The older `foreground_read_operations` remains the count of
-    /// successful foreground reads for backward-compatible Phase 1 deltas.
-    foreground_read_operations_issued: AtomicU64,
-    /// Speculative storage read operations actually issued, excluding
-    /// submissions dropped before storage I/O.
-    speculative_read_operations_issued: AtomicU64,
-    /// Maximum bounded in-flight registry size observed since engine start.
-    in_flight_registry_peak_size: AtomicU64,
-    /// Registry entries removed on every terminal leader path.
-    in_flight_entries_removed: AtomicU64,
-    /// Removed entries whose leader failed or was cancelled/abandoned.
-    in_flight_failed_or_abandoned_entries_removed: AtomicU64,
     /// Speculative prefetches dropped because the concurrent-prefetch
     /// semaphore was exhausted (gist Phase 3 — bounded prefetch).
     /// Surfaced via `EngineReport::prefetch_dropped_concurrency`.
@@ -969,6 +939,47 @@ pub(crate) struct Counters {
     /// miss). Invisible mixed GPU/CPU execution is a major source of
     /// inconsistent token latency, so make it countable.
     gpu_cpu_fallbacks: AtomicU64,
+}
+
+/// Phase 2 handoff telemetry is deliberately kept out of [`Counters`].
+///
+/// The resident path updates the first fields of `Counters` on every expert
+/// activation. Appending the Phase 2 fields there changed the size and cache
+/// layout of that hot allocation even when no in-flight operation existed.
+/// This separate allocation is only touched after a confirmed cache miss, by
+/// speculative load lifecycle events, or at report sampling boundaries.
+#[derive(Default)]
+struct HandoffCounters {
+    /// Demand requests that joined a speculative operation already reading
+    /// the same expert. Counted once per demand request, before awaiting.
+    demand_requests_joined_inflight_prefetch: AtomicU64,
+    /// Demand requests that joined another foreground operation already
+    /// reading the same expert. Counted once per demand request.
+    demand_requests_joined_inflight_foreground: AtomicU64,
+    /// Speculative physical operations whose ownership was upgraded because
+    /// at least one demand request joined. Counted once per operation.
+    speculative_loads_promoted_to_demand: AtomicU64,
+    /// Demand-side physical reads not issued because an operation for the
+    /// same expert already owned the in-flight slot. Counted per joined
+    /// demand request, independent of the leader's eventual outcome.
+    duplicate_physical_reads_avoided: AtomicU64,
+    /// Successful speculative operations that handed their exact immutable
+    /// resident directly to one or more already-joined demand requests.
+    /// Counted once per completed physical operation, not per waiter.
+    completed_prefetch_direct_handoffs: AtomicU64,
+    /// Foreground storage read attempts actually issued, including attempts
+    /// that fail. The older `foreground_read_operations` remains the count of
+    /// successful foreground reads for backward-compatible Phase 1 deltas.
+    foreground_read_operations_issued: AtomicU64,
+    /// Speculative storage read operations actually issued, excluding
+    /// submissions dropped before storage I/O.
+    speculative_read_operations_issued: AtomicU64,
+    /// Maximum bounded in-flight registry size observed since engine start.
+    in_flight_registry_peak_size: AtomicU64,
+    /// Registry entries removed on every terminal leader path.
+    in_flight_entries_removed: AtomicU64,
+    /// Removed entries whose leader failed or was cancelled/abandoned.
+    in_flight_failed_or_abandoned_entries_removed: AtomicU64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -1249,6 +1260,11 @@ pub(crate) struct EngineCore {
     /// per-prefetch `admit` check and the per-hit precision feedback add
     /// only a handful of relaxed atomic ops to the hot path.
     pub(super) governor: Arc<crate::prefetch_governor::PrefetchGovernor>,
+    /// Test-only proof that a request crossed the resident/miss boundary and
+    /// touched the in-flight registry. This field and every update are absent
+    /// from release builds.
+    #[cfg(test)]
+    in_flight_registry_accesses: AtomicU64,
 }
 
 /// Predictive-routing state: aliasing & frequency-based pinning,
@@ -1445,6 +1461,10 @@ pub(crate) struct EngineMetrics {
     /// Optional JSONL trace sink. When set, every `generate` call
     /// appends one record. See [`TraceWriter`] and gist Phase 6.
     pub(super) trace_writer: parking_lot::RwLock<Option<Arc<TraceWriter>>>,
+    /// Miss/load-only Phase 2 telemetry. Kept last so all pre-Phase 2 metric
+    /// fields retain their layout and the resident path's `Counters` stays
+    /// exactly its Phase 1 size.
+    handoff: Arc<HandoffCounters>,
 }
 
 impl EngineCore {
@@ -1537,7 +1557,21 @@ impl EngineCore {
                 crate::backend::CandleBackend::new(),
             )),
             governor,
+            #[cfg(test)]
+            in_flight_registry_accesses: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn note_in_flight_registry_access(&self) {
+        self.in_flight_registry_accesses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn in_flight_registry_access_count(&self) -> u64 {
+        self.in_flight_registry_accesses.load(Ordering::Relaxed)
     }
 }
 
@@ -1593,6 +1627,7 @@ impl EngineMetrics {
             tokens_processed: AtomicU64::new(0),
             prom: None,
             trace_writer: parking_lot::RwLock::new(None),
+            handoff: Arc::new(HandoffCounters::default()),
         }
     }
 }
@@ -2762,7 +2797,7 @@ impl Engine {
     }
 
     async fn fetch(self: &Arc<Self>, id: u32) -> Result<Arc<ExpertResident>, ExpertReadError> {
-        match self.fetch_with_retry(id).await {
+        match self.fetch_after_confirmed_cache_miss(id).await {
             Ok(r) => Ok(r),
             Err(e) => {
                 // Critical-path miss could not be satisfied even after
@@ -2799,18 +2834,43 @@ impl Engine {
     /// the [`BufferPool`] is saturated (the leader may still return
     /// [`ExpertReadError::PoolStarved`] and the waiters retry
     /// through their own [`Self::fetch_once`] path).
-    pub async fn fetch_with_retry(
+    #[inline]
+    pub fn fetch_with_retry(
         self: &Arc<Self>,
         id: u32,
-    ) -> Result<Arc<ExpertResident>, ExpertReadError> {
+    ) -> impl std::future::Future<Output = Result<Arc<ExpertResident>, ExpertReadError>> + Send + '_
+    {
         // Fast path: already cached — no singleflight needed. We
         // deliberately do *not* bump the `hits` counter here: the
         // upstream `moe_step` path already increments hits/misses
         // before deciding to call us, so doing it again would
         // double-count.
-        if let Some(r) = self.core.cache.get(id) {
-            return Ok(r);
+        let resident = self.core.cache.get(id);
+        async move {
+            if let Some(resident) = resident {
+                return Ok(resident);
+            }
+
+            // Type-erase the large Phase 2 state machine behind one pointer.
+            // The allocation occurs only after the synchronous cache probe
+            // confirmed a miss. Production routing paths already know they
+            // missed and call the helper directly, avoiding this box.
+            Box::pin(self.fetch_after_confirmed_cache_miss(id)).await
         }
+    }
+
+    /// Miss-only half of [`Self::fetch_with_retry`]. Keeping the in-flight
+    /// outcome enum, leader guard, registry coordination, and retry state out
+    /// of the cache-hit function prevents Phase 2 from enlarging or reshaping
+    /// the resident fast path. The cache is checked again after leadership is
+    /// acquired to preserve the existing race-free SSD de-duplication rule.
+    #[inline(never)]
+    async fn fetch_after_confirmed_cache_miss(
+        self: &Arc<Self>,
+        id: u32,
+    ) -> Result<Arc<ExpertResident>, ExpertReadError> {
+        #[cfg(test)]
+        self.core.note_in_flight_registry_access();
 
         // Loop so that a follower whose leader failed re-contends
         // for the singleflight slot rather than barrelling into its
@@ -2836,26 +2896,26 @@ impl Engine {
                     match entry.origin {
                         InFlightOrigin::Prefetch => {
                             self.metrics
-                                .counters
+                                .handoff
                                 .demand_requests_joined_inflight_prefetch
                                 .fetch_add(1, Ordering::Relaxed);
                             if entry.promote_to_demand() {
                                 self.metrics
-                                    .counters
+                                    .handoff
                                     .speculative_loads_promoted_to_demand
                                     .fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         InFlightOrigin::Foreground => {
                             self.metrics
-                                .counters
+                                .handoff
                                 .demand_requests_joined_inflight_foreground
                                 .fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     drop(occ);
                     self.metrics
-                        .counters
+                        .handoff
                         .duplicate_physical_reads_avoided
                         .fetch_add(1, Ordering::Relaxed);
                     match entry.wait().await {
@@ -2882,7 +2942,7 @@ impl Engine {
 
             let registry_size = self.core.in_flight.len() as u64;
             self.metrics
-                .counters
+                .handoff
                 .in_flight_registry_peak_size
                 .fetch_max(registry_size, Ordering::Relaxed);
 
@@ -2893,7 +2953,7 @@ impl Engine {
                 map: self.core.in_flight.clone(),
                 id,
                 entry: entry.clone(),
-                counters: self.metrics.counters.clone(),
+                counters: self.metrics.handoff.clone(),
                 armed: true,
             };
 
@@ -3017,7 +3077,7 @@ impl Engine {
         // the governor is disabled.
         let _fg = self.core.governor.foreground_guard();
         self.metrics
-            .counters
+            .handoff
             .foreground_read_operations_issued
             .fetch_add(1, Ordering::Relaxed);
         let read_result = self.core.storage.read_expert(id, &mut buf).await;
@@ -3094,7 +3154,15 @@ impl Engine {
         // genuinely new one. Racing with a concurrent insert/landing is
         // fine: the post-spawn `contains` re-check and the singleflight
         // entry below stay authoritative.
-        if self.core.cache.contains(id) || self.core.in_flight.contains_key(&id) {
+        // This return is intentionally its own branch: a resident prediction
+        // must not evaluate, lock, or even take a reference to the in-flight
+        // registry that follows.
+        if self.core.cache.contains(id) {
+            return;
+        }
+        #[cfg(test)]
+        self.core.note_in_flight_registry_access();
+        if self.core.in_flight.contains_key(&id) {
             return;
         }
         // **Tier 4 admission gate.** Before spending a semaphore permit
@@ -3151,6 +3219,8 @@ impl Engine {
             if me.core.cache.contains(id) {
                 return;
             }
+            #[cfg(test)]
+            me.core.note_in_flight_registry_access();
             // **Get-or-wait join (Part 3).** Register this prefetch in
             // the singleflight `in_flight` map *before* issuing the
             // read, using the exact same leader/follower protocol as
@@ -3172,7 +3242,7 @@ impl Engine {
             };
             let registry_size = me.core.in_flight.len() as u64;
             me.metrics
-                .counters
+                .handoff
                 .in_flight_registry_peak_size
                 .fetch_max(registry_size, Ordering::Relaxed);
             // The guard removes the in-flight slot and notifies every
@@ -3184,7 +3254,7 @@ impl Engine {
                 map: me.core.in_flight.clone(),
                 id,
                 entry: entry.clone(),
-                counters: me.metrics.counters.clone(),
+                counters: me.metrics.handoff.clone(),
                 armed: true,
             };
             // **Double-buffered acquire (Part 2).** Speculation draws
@@ -3242,7 +3312,7 @@ impl Engine {
             };
             let started = Instant::now();
             me.metrics
-                .counters
+                .handoff
                 .speculative_read_operations_issued
                 .fetch_add(1, Ordering::Relaxed);
             match me.core.storage.read_expert(id, &mut buf).await {
@@ -4395,7 +4465,7 @@ impl Engine {
                 let me = self.clone();
                 miss_handles.push((
                     i,
-                    tokio::spawn(async move { me.fetch_with_retry(id).await }),
+                    tokio::spawn(async move { me.fetch_after_confirmed_cache_miss(id).await }),
                 ));
                 cache_hits_per_expert.push(false);
             }
@@ -4780,7 +4850,7 @@ impl Engine {
         }
 
         // Spawn one fetch task per unique uncached id. All of them
-        // funnel through `fetch_with_retry` (singleflight'd), so the
+        // funnel through the miss-only singleflight helper, so the
         // SSD sees at most one read per id even when this method is
         // called concurrently from multiple call sites (e.g. the
         // BatchScheduler pre-pass and a parallel speculative-decode
@@ -4788,9 +4858,9 @@ impl Engine {
         let mut handles = Vec::with_capacity(unique.len());
         for id in unique {
             let me = self.clone();
-            handles.push(tokio::spawn(
-                async move { (id, me.fetch_with_retry(id).await) },
-            ));
+            handles.push(tokio::spawn(async move {
+                (id, me.fetch_after_confirmed_cache_miss(id).await)
+            }));
         }
         for h in handles {
             match h.await {
@@ -5003,53 +5073,53 @@ impl Engine {
                 .load(Ordering::Relaxed),
             demand_requests_joined_inflight_prefetch: self
                 .metrics
-                .counters
+                .handoff
                 .demand_requests_joined_inflight_prefetch
                 .load(Ordering::Relaxed),
             demand_requests_joined_inflight_foreground: self
                 .metrics
-                .counters
+                .handoff
                 .demand_requests_joined_inflight_foreground
                 .load(Ordering::Relaxed),
             speculative_loads_promoted_to_demand: self
                 .metrics
-                .counters
+                .handoff
                 .speculative_loads_promoted_to_demand
                 .load(Ordering::Relaxed),
             duplicate_physical_reads_avoided: self
                 .metrics
-                .counters
+                .handoff
                 .duplicate_physical_reads_avoided
                 .load(Ordering::Relaxed),
             completed_prefetch_direct_handoffs: self
                 .metrics
-                .counters
+                .handoff
                 .completed_prefetch_direct_handoffs
                 .load(Ordering::Relaxed),
             foreground_read_operations_issued: self
                 .metrics
-                .counters
+                .handoff
                 .foreground_read_operations_issued
                 .load(Ordering::Relaxed),
             speculative_read_operations_issued: self
                 .metrics
-                .counters
+                .handoff
                 .speculative_read_operations_issued
                 .load(Ordering::Relaxed),
             in_flight_registry_peak_size: self
                 .metrics
-                .counters
+                .handoff
                 .in_flight_registry_peak_size
                 .load(Ordering::Relaxed),
             in_flight_registry_size_at_sample: self.core.in_flight.len(),
             in_flight_entries_removed: self
                 .metrics
-                .counters
+                .handoff
                 .in_flight_entries_removed
                 .load(Ordering::Relaxed),
             in_flight_failed_or_abandoned_entries_removed: self
                 .metrics
-                .counters
+                .handoff
                 .in_flight_failed_or_abandoned_entries_removed
                 .load(Ordering::Relaxed),
             cache_resident_experts: self.core.cache.len(),
@@ -5522,6 +5592,40 @@ mod tests {
         )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for read {expected} of expert {id}"));
+    }
+
+    fn handoff_counter_snapshot(engine: &Engine) -> [u64; 10] {
+        let counters = &engine.metrics.handoff;
+        [
+            counters
+                .demand_requests_joined_inflight_prefetch
+                .load(Ordering::Relaxed),
+            counters
+                .demand_requests_joined_inflight_foreground
+                .load(Ordering::Relaxed),
+            counters
+                .speculative_loads_promoted_to_demand
+                .load(Ordering::Relaxed),
+            counters
+                .duplicate_physical_reads_avoided
+                .load(Ordering::Relaxed),
+            counters
+                .completed_prefetch_direct_handoffs
+                .load(Ordering::Relaxed),
+            counters
+                .foreground_read_operations_issued
+                .load(Ordering::Relaxed),
+            counters
+                .speculative_read_operations_issued
+                .load(Ordering::Relaxed),
+            counters
+                .in_flight_registry_peak_size
+                .load(Ordering::Relaxed),
+            counters.in_flight_entries_removed.load(Ordering::Relaxed),
+            counters
+                .in_flight_failed_or_abandoned_entries_removed
+                .load(Ordering::Relaxed),
+        ]
     }
 
     fn build_engine(
@@ -6071,6 +6175,109 @@ mod tests {
         assert!(r.cycle_p50_us > 0);
     }
 
+    #[test]
+    fn phase2_handoff_telemetry_does_not_expand_common_counters() {
+        // All fields in the Phase 1 counter block are AtomicU64. Keeping its
+        // exact 18-field footprint prevents miss-only Phase 2 telemetry from
+        // changing the allocation/cache layout touched on every resident hit.
+        assert_eq!(
+            std::mem::size_of::<Counters>(),
+            18 * std::mem::size_of::<AtomicU64>()
+        );
+        assert_eq!(
+            std::mem::size_of::<HandoffCounters>(),
+            10 * std::mem::size_of::<AtomicU64>()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_resident_fetches_do_not_touch_handoff_state() {
+        let dir = TempDir::new("resident-fetch-fast-path");
+        let engine = build_engine(&dir.path, 8, 16, 32, 8, 2, 0, 0xFA57);
+
+        let first = engine.fetch_with_retry(5).await.expect("initial load");
+        assert!(engine.core.in_flight.is_empty());
+        let registry_accesses = engine.core.in_flight_registry_access_count();
+        let counters = handoff_counter_snapshot(&engine);
+        let report_before = engine.report();
+
+        let fast_future = engine.fetch_with_retry(5);
+        let fast_future_size = std::mem::size_of_val(&fast_future);
+        assert!(
+            fast_future_size <= 64,
+            "resident cache-or-load future unexpectedly embeds miss state: {fast_future_size} bytes"
+        );
+        let hit = fast_future.await.expect("resident hit");
+        assert!(Arc::ptr_eq(&first, &hit));
+
+        for _ in 1..128 {
+            let hit = engine.fetch_with_retry(5).await.expect("resident hit");
+            assert!(Arc::ptr_eq(&first, &hit));
+        }
+
+        assert_eq!(
+            engine.core.in_flight_registry_access_count(),
+            registry_accesses,
+            "resident fetch crossed into the in-flight registry"
+        );
+        assert_eq!(handoff_counter_snapshot(&engine), counters);
+        assert!(engine.core.in_flight.is_empty());
+        let report_after = engine.report();
+        assert_eq!(report_after.hits, report_before.hits);
+        assert_eq!(report_after.misses, report_before.misses);
+        assert_eq!(
+            report_after.foreground_read_operations_issued,
+            report_before.foreground_read_operations_issued
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_resident_inference_keeps_registry_untouched_and_empty() {
+        let dir = TempDir::new("all-resident-inference");
+        let engine = build_engine(&dir.path, 8, 16, 32, 8, 8, 1, 0xA11);
+        let all_experts: Vec<u32> = (0..8).collect();
+        engine
+            .warm_with(&all_experts)
+            .await
+            .expect("populate every cache slot");
+        assert_eq!(engine.core.cache.len(), all_experts.len());
+        assert!(engine.core.in_flight.is_empty());
+
+        let registry_accesses = engine.core.in_flight_registry_access_count();
+        let handoff_before = handoff_counter_snapshot(&engine);
+        let report_before = engine.report();
+        let hidden = synth_hidden_state(0, 16, 0xA11);
+        for token in 0..3 {
+            let outputs = engine
+                .moe_step(token, 0, &hidden, &all_experts)
+                .await
+                .expect("all-resident strict inference");
+            assert_eq!(outputs.len(), all_experts.len());
+        }
+
+        assert_eq!(
+            engine.core.in_flight_registry_access_count(),
+            registry_accesses,
+            "all-resident inference accessed the in-flight registry"
+        );
+        assert_eq!(handoff_counter_snapshot(&engine), handoff_before);
+        assert!(engine.core.in_flight.is_empty());
+        let report_after = engine.report();
+        assert_eq!(report_after.misses, report_before.misses);
+        assert_eq!(
+            report_after.hits - report_before.hits,
+            (all_experts.len() * 3) as u64
+        );
+        assert_eq!(
+            report_after.foreground_read_operations_issued,
+            report_before.foreground_read_operations_issued
+        );
+        assert_eq!(
+            report_after.speculative_read_operations_issued,
+            report_before.speculative_read_operations_issued
+        );
+    }
+
     /// Gist Phase 1 — SSD Read De-Duplication.
     ///
     /// Drive many concurrent `fetch_with_retry` calls against the same
@@ -6122,7 +6329,7 @@ mod tests {
         wait_until("all demand followers to join one foreground load", || {
             engine
                 .metrics
-                .counters
+                .handoff
                 .demand_requests_joined_inflight_foreground
                 .load(Ordering::Relaxed)
                 == (N - 1) as u64
@@ -6179,7 +6386,7 @@ mod tests {
         wait_until("demand to promote the in-flight prefetch", || {
             engine
                 .metrics
-                .counters
+                .handoff
                 .demand_requests_joined_inflight_prefetch
                 .load(Ordering::Relaxed)
                 == 1
@@ -6268,7 +6475,7 @@ mod tests {
         wait_until("failed-load demand followers", || {
             engine
                 .metrics
-                .counters
+                .handoff
                 .demand_requests_joined_inflight_foreground
                 .load(Ordering::Relaxed)
                 == (N - 1) as u64
@@ -6319,7 +6526,7 @@ mod tests {
         wait_until("dropped waiter to join", || {
             engine
                 .metrics
-                .counters
+                .handoff
                 .demand_requests_joined_inflight_prefetch
                 .load(Ordering::Relaxed)
                 == 1
@@ -6364,7 +6571,7 @@ mod tests {
         let map = Arc::new(DashMap::new());
         let entry = Arc::new(InFlightEntry::new(InFlightOrigin::Prefetch));
         map.insert(5, entry.clone());
-        let counters = Arc::new(Counters::default());
+        let counters = Arc::new(HandoffCounters::default());
         let guard = SingleflightLeaderGuard {
             map: map.clone(),
             id: 5,
@@ -6440,7 +6647,7 @@ mod tests {
         let follower = tokio::spawn(async move { e.fetch_with_retry(5).await });
         while engine
             .metrics
-            .counters
+            .handoff
             .demand_requests_joined_inflight_prefetch
             .load(Ordering::Relaxed)
             == 0
@@ -6451,7 +6658,7 @@ mod tests {
             map: engine.core.in_flight.clone(),
             id: 5,
             entry,
-            counters: engine.metrics.counters.clone(),
+            counters: engine.metrics.handoff.clone(),
             armed: true,
         };
         guard.complete(InFlightOutcome::Retry);
