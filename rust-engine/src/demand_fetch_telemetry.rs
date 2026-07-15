@@ -1,4 +1,5 @@
-//! Prompt 2 Phase 3A foreground demand-miss observability.
+//! Prompt 2 Phase 3 foreground demand-miss observability and demand-priority
+//! speculative-I/O arbitration.
 //!
 //! The resident path never touches this module. A [`LayerFetchTracker`] is
 //! allocated only after a routed layer observes its first initial cache miss;
@@ -6,9 +7,22 @@
 //! zero-miss bucket from the already-qualified Phase 1 routed-layer counter.
 
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+const SPECULATIVE_COUNT_MASK: u64 = u32::MAX as u64;
+const DEMAND_BURST_ONE: u64 = 1u64 << 32;
+
+#[inline]
+fn demand_burst_count(state: u64) -> u64 {
+    state >> 32
+}
+
+#[inline]
+fn speculative_read_count(state: u64) -> u64 {
+    state & SPECULATIVE_COUNT_MASK
+}
 
 const LATENCY_BUCKET_UPPER_US: [u64; 16] = [
     10,
@@ -113,7 +127,28 @@ pub struct DemandFetchSnapshot {
     pub layer_expert_fetch_critical_path_seconds: f64,
     pub layer_expert_fetch_critical_path_mean_seconds: f64,
     pub layer_expert_fetch_critical_path_max_seconds: f64,
+    /// Phase 3B demand-priority arbitration and overlap telemetry. These
+    /// counters remain zero for an all-resident epoch because the demand-burst
+    /// guard is created only after the first initial layer miss.
+    pub foreground_demand_bursts_entered: u64,
+    pub foreground_demand_pressure_active_seconds: f64,
+    pub speculative_physical_reads_admitted_without_demand_pressure: u64,
+    pub speculative_physical_reads_deferred_for_demand_pressure: u64,
+    pub deferred_speculative_physical_reads_resumed: u64,
+    pub deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit: u64,
+    pub speculative_physical_reads_active_when_demand_burst_began: u64,
     pub demand_reads_issued_while_speculative_reads_active: u64,
+    pub demand_physical_read_service_without_speculation_operations: u64,
+    pub demand_physical_read_service_without_speculation_seconds: f64,
+    pub demand_physical_read_service_without_speculation_mean_seconds: f64,
+    pub demand_physical_read_service_without_speculation_max_seconds: f64,
+    pub demand_physical_read_service_without_speculation_histogram: Vec<LatencyBucketSnapshot>,
+    pub demand_physical_read_service_with_speculation_operations: u64,
+    pub demand_physical_read_service_with_speculation_seconds: f64,
+    pub demand_physical_read_service_with_speculation_mean_seconds: f64,
+    pub demand_physical_read_service_with_speculation_max_seconds: f64,
+    pub demand_physical_read_service_with_speculation_histogram: Vec<LatencyBucketSnapshot>,
+    pub demand_layers_final_straggler_issued_while_speculative_reads_active: u64,
     /// Device-level delay cannot be inferred merely from overlap, so Phase 3A
     /// reports this as unobservable instead of manufacturing a causal count.
     pub demand_critical_reads_delayed_by_speculative_activity: Option<u64>,
@@ -220,8 +255,32 @@ pub struct DemandFetchTelemetry {
     discovery_layer_complete_ns: AtomicU64,
     layer_critical_ns: AtomicU64,
     layer_critical_max_ns: AtomicU64,
+    /// Packed arbitration state: high 32 bits are active demand bursts and low
+    /// 32 bits are speculative reads already admitted into physical service.
+    /// A speculative CAS can increment the low half only while the high half
+    /// is zero, giving demand-burst entry and speculative submission one
+    /// race-safe linearization point without ever blocking demand.
+    priority_state: AtomicU64,
+    priority_clock_origin: OnceLock<Instant>,
+    pressure_started_ns: AtomicU64,
+    demand_bursts_entered: AtomicU64,
+    demand_pressure_active_ns: AtomicU64,
+    speculative_admitted: AtomicU64,
+    speculative_deferred: AtomicU64,
+    speculative_resumed: AtomicU64,
+    speculative_deferred_dropped: AtomicU64,
+    speculative_active_at_burst_begin: AtomicU64,
     reads_while_speculative: AtomicU64,
-    speculative_active: AtomicU64,
+    service_without_spec_reads: AtomicU64,
+    service_without_spec_ns: AtomicU64,
+    service_without_spec_max_ns: AtomicU64,
+    service_without_spec_buckets: [AtomicU64; LATENCY_BUCKET_UPPER_US.len()],
+    service_with_spec_reads: AtomicU64,
+    service_with_spec_ns: AtomicU64,
+    service_with_spec_max_ns: AtomicU64,
+    service_with_spec_buckets: [AtomicU64; LATENCY_BUCKET_UPPER_US.len()],
+    final_straggler_issued_with_speculation: AtomicU64,
+    pressure_cleared: tokio::sync::Notify,
     straggler_slots: Box<[AtomicU64]>,
     concurrency: parking_lot::Mutex<ConcurrencyState>,
     worst: parking_lot::Mutex<WorstState>,
@@ -264,8 +323,27 @@ impl DemandFetchTelemetry {
             discovery_layer_complete_ns: AtomicU64::new(0),
             layer_critical_ns: AtomicU64::new(0),
             layer_critical_max_ns: AtomicU64::new(0),
+            priority_state: AtomicU64::new(0),
+            priority_clock_origin: OnceLock::new(),
+            pressure_started_ns: AtomicU64::new(0),
+            demand_bursts_entered: AtomicU64::new(0),
+            demand_pressure_active_ns: AtomicU64::new(0),
+            speculative_admitted: AtomicU64::new(0),
+            speculative_deferred: AtomicU64::new(0),
+            speculative_resumed: AtomicU64::new(0),
+            speculative_deferred_dropped: AtomicU64::new(0),
+            speculative_active_at_burst_begin: AtomicU64::new(0),
             reads_while_speculative: AtomicU64::new(0),
-            speculative_active: AtomicU64::new(0),
+            service_without_spec_reads: AtomicU64::new(0),
+            service_without_spec_ns: AtomicU64::new(0),
+            service_without_spec_max_ns: AtomicU64::new(0),
+            service_without_spec_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            service_with_spec_reads: AtomicU64::new(0),
+            service_with_spec_ns: AtomicU64::new(0),
+            service_with_spec_max_ns: AtomicU64::new(0),
+            service_with_spec_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            final_straggler_issued_with_speculation: AtomicU64::new(0),
+            pressure_cleared: tokio::sync::Notify::new(),
             straggler_slots: (0..bucket_count)
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>()
@@ -275,22 +353,99 @@ impl DemandFetchTelemetry {
         }
     }
 
-    pub fn begin_speculative_read(self: &Arc<Self>) -> SpeculativeReadGuard {
-        self.speculative_active.fetch_add(1, Ordering::Relaxed);
-        SpeculativeReadGuard {
-            telemetry: self.clone(),
+    /// Try to enter speculative physical storage service. The successful CAS
+    /// is the admission/submission linearization point; `NvmeStorage` invokes
+    /// it after fd resolution and immediately before positional-read service.
+    pub fn try_begin_speculative_read(
+        self: &Arc<Self>,
+        was_deferred: bool,
+    ) -> Option<SpeculativeReadGuard> {
+        let mut state = self.priority_state.load(Ordering::Acquire);
+        loop {
+            if demand_burst_count(state) != 0 {
+                return None;
+            }
+            debug_assert!(speculative_read_count(state) < SPECULATIVE_COUNT_MASK);
+            match self.priority_state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.speculative_admitted.fetch_add(1, Ordering::Relaxed);
+                    if was_deferred {
+                        self.speculative_resumed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Some(SpeculativeReadGuard {
+                        telemetry: self.clone(),
+                    });
+                }
+                Err(observed) => state = observed,
+            }
         }
     }
 
-    fn begin_physical_read(&self, now: Instant) {
+    /// Wait until the union of all active demand bursts becomes empty. Only
+    /// speculative tasks call this; demand never waits on this notification.
+    pub async fn wait_for_demand_pressure_clear(&self) {
+        loop {
+            let notified = self.pressure_cleared.notified();
+            if demand_burst_count(self.priority_state.load(Ordering::Acquire)) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn demand_pressure_active(&self) -> bool {
+        demand_burst_count(self.priority_state.load(Ordering::Acquire)) != 0
+    }
+
+    pub fn record_speculative_deferred(&self) {
+        self.speculative_deferred.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_deferred_speculative_drop(&self) {
+        self.speculative_deferred_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn begin_demand_burst(self: &Arc<Self>) -> DemandBurstGuard {
+        let origin = *self.priority_clock_origin.get_or_init(Instant::now);
+        let started_ns = duration_ns(origin.elapsed()).saturating_add(1);
+        let old = self
+            .priority_state
+            .fetch_add(DEMAND_BURST_ONE, Ordering::AcqRel);
+        debug_assert!(demand_burst_count(old) < u32::MAX as u64);
+        self.demand_bursts_entered.fetch_add(1, Ordering::Relaxed);
+        self.speculative_active_at_burst_begin
+            .fetch_add(speculative_read_count(old), Ordering::Relaxed);
+        if demand_burst_count(old) == 0 {
+            self.pressure_started_ns
+                .store(started_ns, Ordering::Release);
+        }
+        DemandBurstGuard {
+            telemetry: self.clone(),
+            active: AtomicBool::new(true),
+        }
+    }
+
+    fn speculative_reads_active(&self) -> u64 {
+        speculative_read_count(self.priority_state.load(Ordering::Acquire))
+    }
+
+    fn begin_physical_read(&self, now: Instant) -> bool {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        if self.speculative_active.load(Ordering::Relaxed) > 0 {
+        let speculative_active = self.speculative_reads_active() > 0;
+        if speculative_active {
             self.reads_while_speculative.fetch_add(1, Ordering::Relaxed);
         }
         self.concurrency.lock().begin(now);
+        speculative_active
     }
 
-    fn end_physical_read(&self, now: Instant, service_ns: u64) {
+    fn end_physical_read(&self, now: Instant, service_ns: u64, speculative_active_at_issue: bool) {
         self.concurrency.lock().end(now);
         self.service_ns.fetch_add(service_ns, Ordering::Relaxed);
         atomic_max(&self.service_max_ns, service_ns);
@@ -300,9 +455,31 @@ impl DemandFetchTelemetry {
             .position(|&upper| service_us <= upper)
             .unwrap_or(LATENCY_BUCKET_UPPER_US.len() - 1);
         self.latency_buckets[idx].fetch_add(1, Ordering::Relaxed);
+        let (reads, total, max, buckets) = if speculative_active_at_issue {
+            (
+                &self.service_with_spec_reads,
+                &self.service_with_spec_ns,
+                &self.service_with_spec_max_ns,
+                &self.service_with_spec_buckets,
+            )
+        } else {
+            (
+                &self.service_without_spec_reads,
+                &self.service_without_spec_ns,
+                &self.service_without_spec_max_ns,
+                &self.service_without_spec_buckets,
+            )
+        };
+        reads.fetch_add(1, Ordering::Relaxed);
+        total.fetch_add(service_ns, Ordering::Relaxed);
+        atomic_max(max, service_ns);
+        buckets[idx].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn reset(&self) -> bool {
+        if demand_burst_count(self.priority_state.load(Ordering::Acquire)) != 0 {
+            return false;
+        }
         if !self.concurrency.lock().reset_if_idle() {
             return false;
         }
@@ -314,6 +491,13 @@ impl DemandFetchTelemetry {
             counter.store(0, Ordering::Relaxed);
         }
         for counter in &self.latency_buckets {
+            counter.store(0, Ordering::Relaxed);
+        }
+        for counter in self
+            .service_without_spec_buckets
+            .iter()
+            .chain(self.service_with_spec_buckets.iter())
+        {
             counter.store(0, Ordering::Relaxed);
         }
         for counter in [
@@ -345,7 +529,22 @@ impl DemandFetchTelemetry {
             &self.discovery_layer_complete_ns,
             &self.layer_critical_ns,
             &self.layer_critical_max_ns,
+            &self.pressure_started_ns,
+            &self.demand_bursts_entered,
+            &self.demand_pressure_active_ns,
+            &self.speculative_admitted,
+            &self.speculative_deferred,
+            &self.speculative_resumed,
+            &self.speculative_deferred_dropped,
+            &self.speculative_active_at_burst_begin,
             &self.reads_while_speculative,
+            &self.service_without_spec_reads,
+            &self.service_without_spec_ns,
+            &self.service_without_spec_max_ns,
+            &self.service_with_spec_reads,
+            &self.service_with_spec_ns,
+            &self.service_with_spec_max_ns,
+            &self.final_straggler_issued_with_speculation,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -362,6 +561,10 @@ impl DemandFetchTelemetry {
         let admission_wait_ns = self.admission_wait_ns.load(Ordering::Relaxed);
         let consumption_count = self.completion_consumption_count.load(Ordering::Relaxed);
         let consumption_ns = self.completion_consumption_ns.load(Ordering::Relaxed);
+        let without_spec_reads = self.service_without_spec_reads.load(Ordering::Relaxed);
+        let without_spec_ns = self.service_without_spec_ns.load(Ordering::Relaxed);
+        let with_spec_reads = self.service_with_spec_reads.load(Ordering::Relaxed);
+        let with_spec_ns = self.service_with_spec_ns.load(Ordering::Relaxed);
         let miss_layers: u64 = self
             .missing_layers
             .iter()
@@ -473,8 +676,72 @@ impl DemandFetchTelemetry {
             layer_expert_fetch_critical_path_max_seconds: ns_seconds(
                 self.layer_critical_max_ns.load(Ordering::Relaxed),
             ),
+            foreground_demand_bursts_entered: self.demand_bursts_entered.load(Ordering::Relaxed),
+            foreground_demand_pressure_active_seconds: ns_seconds(
+                self.demand_pressure_active_ns.load(Ordering::Relaxed),
+            ),
+            speculative_physical_reads_admitted_without_demand_pressure: self
+                .speculative_admitted
+                .load(Ordering::Relaxed),
+            speculative_physical_reads_deferred_for_demand_pressure: self
+                .speculative_deferred
+                .load(Ordering::Relaxed),
+            deferred_speculative_physical_reads_resumed: self
+                .speculative_resumed
+                .load(Ordering::Relaxed),
+            deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit: self
+                .speculative_deferred_dropped
+                .load(Ordering::Relaxed),
+            speculative_physical_reads_active_when_demand_burst_began: self
+                .speculative_active_at_burst_begin
+                .load(Ordering::Relaxed),
             demand_reads_issued_while_speculative_reads_active: self
                 .reads_while_speculative
+                .load(Ordering::Relaxed),
+            demand_physical_read_service_without_speculation_operations: without_spec_reads,
+            demand_physical_read_service_without_speculation_seconds: ns_seconds(without_spec_ns),
+            demand_physical_read_service_without_speculation_mean_seconds: if without_spec_reads
+                == 0
+            {
+                0.0
+            } else {
+                ns_seconds(without_spec_ns) / without_spec_reads as f64
+            },
+            demand_physical_read_service_without_speculation_max_seconds: ns_seconds(
+                self.service_without_spec_max_ns.load(Ordering::Relaxed),
+            ),
+            demand_physical_read_service_without_speculation_histogram: self
+                .service_without_spec_buckets
+                .iter()
+                .enumerate()
+                .map(|(idx, count)| LatencyBucketSnapshot {
+                    upper_bound_microseconds: (LATENCY_BUCKET_UPPER_US[idx] != u64::MAX)
+                        .then_some(LATENCY_BUCKET_UPPER_US[idx]),
+                    count: count.load(Ordering::Relaxed),
+                })
+                .collect(),
+            demand_physical_read_service_with_speculation_operations: with_spec_reads,
+            demand_physical_read_service_with_speculation_seconds: ns_seconds(with_spec_ns),
+            demand_physical_read_service_with_speculation_mean_seconds: if with_spec_reads == 0 {
+                0.0
+            } else {
+                ns_seconds(with_spec_ns) / with_spec_reads as f64
+            },
+            demand_physical_read_service_with_speculation_max_seconds: ns_seconds(
+                self.service_with_spec_max_ns.load(Ordering::Relaxed),
+            ),
+            demand_physical_read_service_with_speculation_histogram: self
+                .service_with_spec_buckets
+                .iter()
+                .enumerate()
+                .map(|(idx, count)| LatencyBucketSnapshot {
+                    upper_bound_microseconds: (LATENCY_BUCKET_UPPER_US[idx] != u64::MAX)
+                        .then_some(LATENCY_BUCKET_UPPER_US[idx]),
+                    count: count.load(Ordering::Relaxed),
+                })
+                .collect(),
+            demand_layers_final_straggler_issued_while_speculative_reads_active: self
+                .final_straggler_issued_with_speculation
                 .load(Ordering::Relaxed),
             demand_critical_reads_delayed_by_speculative_activity: None,
             final_straggler_routed_slot_histogram: self
@@ -493,9 +760,46 @@ pub struct SpeculativeReadGuard {
 
 impl Drop for SpeculativeReadGuard {
     fn drop(&mut self) {
-        self.telemetry
-            .speculative_active
-            .fetch_sub(1, Ordering::Relaxed);
+        let old = self.telemetry.priority_state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(speculative_read_count(old) > 0);
+    }
+}
+
+pub struct DemandBurstGuard {
+    telemetry: Arc<DemandFetchTelemetry>,
+    active: AtomicBool,
+}
+
+impl DemandBurstGuard {
+    pub fn finish(&self) {
+        if !self.active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let old = self
+            .telemetry
+            .priority_state
+            .fetch_sub(DEMAND_BURST_ONE, Ordering::AcqRel);
+        debug_assert!(demand_burst_count(old) > 0);
+        if demand_burst_count(old) == 1 {
+            let origin = *self
+                .telemetry
+                .priority_clock_origin
+                .get()
+                .expect("demand-burst clock initialized on entry");
+            let finished_ns = duration_ns(origin.elapsed()).saturating_add(1);
+            let started_ns = self.telemetry.pressure_started_ns.swap(0, Ordering::AcqRel);
+            debug_assert!(started_ns > 0);
+            self.telemetry
+                .demand_pressure_active_ns
+                .fetch_add(finished_ns.saturating_sub(started_ns), Ordering::Relaxed);
+            self.telemetry.pressure_cleared.notify_waiters();
+        }
+    }
+}
+
+impl Drop for DemandBurstGuard {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -508,6 +812,8 @@ struct SlotTrace {
     last_issue_ns: AtomicU64,
     last_complete_ns: AtomicU64,
     current_issue_ns: AtomicU64,
+    current_issue_with_speculation: AtomicU64,
+    last_issue_with_speculation: AtomicU64,
     service_ns: AtomicU64,
     physical_reads: AtomicU64,
     available_ns: AtomicU64,
@@ -525,6 +831,8 @@ impl SlotTrace {
             last_issue_ns: AtomicU64::new(0),
             last_complete_ns: AtomicU64::new(0),
             current_issue_ns: AtomicU64::new(0),
+            current_issue_with_speculation: AtomicU64::new(0),
+            last_issue_with_speculation: AtomicU64::new(0),
             service_ns: AtomicU64::new(0),
             physical_reads: AtomicU64::new(0),
             available_ns: AtomicU64::new(0),
@@ -544,10 +852,17 @@ pub struct LayerFetchTracker {
     active_physical_reads: AtomicU64,
     physical_overlap_observed: AtomicU64,
     compute_begin_ns: AtomicU64,
+    demand_burst: DemandBurstGuard,
 }
 
 impl LayerFetchTracker {
-    pub fn new(token_index: u64, layer: u32, experts: &[u32], started: Instant) -> Arc<Self> {
+    pub fn new(
+        token_index: u64,
+        layer: u32,
+        experts: &[u32],
+        started: Instant,
+        telemetry: Arc<DemandFetchTelemetry>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             token_index,
             layer,
@@ -557,6 +872,7 @@ impl LayerFetchTracker {
             active_physical_reads: AtomicU64::new(0),
             physical_overlap_observed: AtomicU64::new(0),
             compute_begin_ns: AtomicU64::new(0),
+            demand_burst: telemetry.begin_demand_burst(),
         })
     }
 
@@ -612,6 +928,10 @@ impl LayerFetchTracker {
     }
 
     pub fn finish_fetch(&self, telemetry: &DemandFetchTelemetry) {
+        // Every required miss handle has been drained before this method is
+        // called. End pressure before bookkeeping; speculation may now resume
+        // while the layer proceeds to expert compute.
+        self.demand_burst.finish();
         let missing = self.missing_count.load(Ordering::Relaxed) as usize;
         if missing == 0 {
             return;
@@ -744,6 +1064,15 @@ impl LayerFetchTracker {
             if final_slot < telemetry.straggler_slots.len() {
                 telemetry.straggler_slots[final_slot].fetch_add(1, Ordering::Relaxed);
             }
+            if self.slots[final_slot]
+                .last_issue_with_speculation
+                .load(Ordering::Relaxed)
+                != 0
+            {
+                telemetry
+                    .final_straggler_issued_with_speculation
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let compute = self.compute_begin_ns.load(Ordering::Acquire);
             if compute > 0 {
                 let compute = compute - 1;
@@ -818,6 +1147,12 @@ impl LayerFetchTracker {
         telemetry
             .service_ns
             .fetch_add(complete_ns.saturating_sub(issue_ns), Ordering::Relaxed);
+        telemetry
+            .service_without_spec_reads
+            .fetch_add(1, Ordering::Relaxed);
+        telemetry
+            .service_without_spec_ns
+            .fetch_add(complete_ns.saturating_sub(issue_ns), Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -872,7 +1207,13 @@ impl crate::io_provider::PhysicalReadObserver for DemandPhysicalReadObserver {
                 .physical_overlap_observed
                 .store(1, Ordering::Relaxed);
         }
-        self.telemetry.begin_physical_read(now);
+        let speculative_active = self.telemetry.begin_physical_read(now);
+        trace
+            .current_issue_with_speculation
+            .store(u64::from(speculative_active), Ordering::Release);
+        trace
+            .last_issue_with_speculation
+            .store(u64::from(speculative_active), Ordering::Release);
     }
 
     fn completed(&self) {
@@ -883,6 +1224,10 @@ impl crate::io_provider::PhysicalReadObserver for DemandPhysicalReadObserver {
         let offset = duration_ns(now.saturating_duration_since(self.layer.started));
         let trace = &self.layer.slots[self.slot];
         let issue = trace.current_issue_ns.swap(0, Ordering::AcqRel);
+        let speculative_active_at_issue = trace
+            .current_issue_with_speculation
+            .swap(0, Ordering::AcqRel)
+            != 0;
         let service_ns = if issue == 0 {
             0
         } else {
@@ -892,7 +1237,8 @@ impl crate::io_provider::PhysicalReadObserver for DemandPhysicalReadObserver {
             .last_complete_ns
             .store(offset.saturating_add(1), Ordering::Release);
         trace.service_ns.fetch_add(service_ns, Ordering::Relaxed);
-        self.telemetry.end_physical_read(now, service_ns);
+        self.telemetry
+            .end_physical_read(now, service_ns, speculative_active_at_issue);
     }
 }
 
@@ -906,7 +1252,7 @@ mod tests {
     ) -> (Arc<DemandFetchTelemetry>, Arc<LayerFetchTracker>) {
         let telemetry = Arc::new(DemandFetchTelemetry::new(top_k));
         let experts: Vec<u32> = (0..top_k as u32).collect();
-        let layer = LayerFetchTracker::new(7, 3, &experts, Instant::now());
+        let layer = LayerFetchTracker::new(7, 3, &experts, Instant::now(), telemetry.clone());
         for &(slot, _) in misses {
             layer.mark_miss(slot);
         }
@@ -916,6 +1262,7 @@ mod tests {
     #[test]
     fn zero_miss_epoch_remains_inactive_and_resets() {
         let telemetry = DemandFetchTelemetry::new(8);
+        assert!(telemetry.priority_clock_origin.get().is_none());
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.foreground_physical_read_operations, 0);
         assert!(snapshot
@@ -923,6 +1270,7 @@ mod tests {
             .iter()
             .all(|&count| count == 0));
         assert!(telemetry.reset());
+        assert!(telemetry.priority_clock_origin.get().is_none());
     }
 
     #[test]
@@ -1047,5 +1395,195 @@ mod tests {
         assert_eq!(after.missing_experts_per_layer_nonzero[1], 0);
         assert_eq!(after.foreground_physical_read_operations, 0);
         assert!(after.worst_layer_fetch.is_none());
+    }
+
+    #[test]
+    fn speculation_enters_storage_only_without_demand_pressure() {
+        let telemetry = Arc::new(DemandFetchTelemetry::new(8));
+        let speculative = telemetry
+            .try_begin_speculative_read(false)
+            .expect("idle arbitration admits speculation");
+        assert_eq!(
+            speculative_read_count(telemetry.priority_state.load(Ordering::Acquire)),
+            1
+        );
+        assert_eq!(
+            telemetry
+                .snapshot()
+                .speculative_physical_reads_admitted_without_demand_pressure,
+            1
+        );
+        drop(speculative);
+        assert_eq!(
+            speculative_read_count(telemetry.priority_state.load(Ordering::Acquire)),
+            0
+        );
+    }
+
+    #[test]
+    fn demand_entry_never_waits_for_already_running_speculation() {
+        let telemetry = Arc::new(DemandFetchTelemetry::new(8));
+        let speculative = telemetry
+            .try_begin_speculative_read(false)
+            .expect("initial speculation");
+        let demand = telemetry.begin_demand_burst();
+        assert_eq!(
+            demand_burst_count(telemetry.priority_state.load(Ordering::Acquire)),
+            1
+        );
+        assert_eq!(
+            telemetry
+                .snapshot()
+                .speculative_physical_reads_active_when_demand_burst_began,
+            1
+        );
+        assert!(telemetry.try_begin_speculative_read(false).is_none());
+        demand.finish();
+        assert_eq!(
+            speculative_read_count(telemetry.priority_state.load(Ordering::Acquire)),
+            1
+        );
+        drop(speculative);
+    }
+
+    #[test]
+    fn overlapping_demand_bursts_hold_priority_until_the_last_release() {
+        let telemetry = Arc::new(DemandFetchTelemetry::new(8));
+        let first = telemetry.begin_demand_burst();
+        let second = telemetry.begin_demand_burst();
+        assert!(telemetry.try_begin_speculative_read(false).is_none());
+        first.finish();
+        assert!(telemetry.demand_pressure_active());
+        assert!(telemetry.try_begin_speculative_read(false).is_none());
+        second.finish();
+        assert!(!telemetry.demand_pressure_active());
+        assert!(telemetry.try_begin_speculative_read(true).is_some());
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.foreground_demand_bursts_entered, 2);
+        assert_eq!(snapshot.deferred_speculative_physical_reads_resumed, 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_speculation_resumes_after_pressure_clears() {
+        let telemetry = Arc::new(DemandFetchTelemetry::new(8));
+        let demand = telemetry.begin_demand_burst();
+        assert!(telemetry.try_begin_speculative_read(false).is_none());
+        telemetry.record_speculative_deferred();
+
+        let waiter = telemetry.clone();
+        let task = tokio::spawn(async move {
+            waiter.wait_for_demand_pressure_clear().await;
+            waiter
+                .try_begin_speculative_read(true)
+                .expect("resumed speculation admitted")
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        demand.finish();
+        drop(task.await.expect("wait task"));
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(
+            snapshot.speculative_physical_reads_deferred_for_demand_pressure,
+            1
+        );
+        assert_eq!(snapshot.deferred_speculative_physical_reads_resumed, 1);
+    }
+
+    #[test]
+    fn deferred_stale_duplicate_or_cache_hit_is_accounted_without_failure() {
+        let telemetry = Arc::new(DemandFetchTelemetry::new(8));
+        telemetry.record_speculative_deferred();
+        // The engine calls this when its existing post-deferral cache or
+        // singleflight re-check makes the speculative request stale.
+        telemetry.record_deferred_speculative_drop();
+        let snapshot = telemetry.snapshot();
+        assert_eq!(
+            snapshot.speculative_physical_reads_deferred_for_demand_pressure,
+            1
+        );
+        assert_eq!(
+            snapshot.deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit,
+            1
+        );
+        assert_eq!(snapshot.deferred_speculative_physical_reads_resumed, 0);
+        assert_eq!(
+            snapshot.speculative_physical_reads_admitted_without_demand_pressure,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn arbitration_holds_no_lock_across_injected_storage_io() {
+        let telemetry = Arc::new(DemandFetchTelemetry::new(8));
+        let speculative = telemetry
+            .try_begin_speculative_read(false)
+            .expect("initial speculation");
+        let (storage_entered_tx, storage_entered_rx) = tokio::sync::oneshot::channel();
+        let (storage_release_tx, storage_release_rx) = tokio::sync::oneshot::channel();
+        let storage = tokio::spawn(async move {
+            let _physical_service_guard = speculative;
+            storage_entered_tx.send(()).expect("signal storage entry");
+            storage_release_rx.await.expect("release injected storage");
+        });
+        storage_entered_rx.await.expect("storage entered");
+
+        // This synchronous demand entry completes while injected storage is
+        // still blocked, proving arbitration retains no mutex/permit across I/O.
+        let demand = telemetry.begin_demand_burst();
+        assert_eq!(
+            telemetry
+                .snapshot()
+                .speculative_physical_reads_active_when_demand_burst_began,
+            1
+        );
+        demand.finish();
+        storage_release_tx.send(()).expect("release storage");
+        storage.await.expect("storage task");
+    }
+
+    #[test]
+    fn demand_service_categories_and_final_straggler_overlap_are_bounded() {
+        let telemetry = Arc::new(DemandFetchTelemetry::new(1));
+        let speculative = telemetry
+            .try_begin_speculative_read(false)
+            .expect("initial speculation");
+        let experts = [0];
+        let layer = LayerFetchTracker::new(7, 3, &experts, Instant::now(), telemetry.clone());
+        layer.mark_miss(0);
+        let observer = layer.physical_read_observer(telemetry.clone(), 0);
+        crate::io_provider::PhysicalReadObserver::issued(&observer);
+        crate::io_provider::PhysicalReadObserver::completed(&observer);
+        layer.record_available_ns(0, 10);
+        layer.record_consumed_ns(0, 11);
+        layer.record_compute_ns(12);
+        layer.finish_fetch(&telemetry);
+        drop(speculative);
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(
+            snapshot.demand_reads_issued_while_speculative_reads_active,
+            1
+        );
+        assert_eq!(
+            snapshot.demand_physical_read_service_with_speculation_operations,
+            1
+        );
+        assert_eq!(
+            snapshot.demand_physical_read_service_without_speculation_operations,
+            0
+        );
+        assert_eq!(
+            snapshot.demand_layers_final_straggler_issued_while_speculative_reads_active,
+            1
+        );
+        assert_eq!(
+            snapshot
+                .demand_physical_read_service_with_speculation_histogram
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<u64>(),
+            1
+        );
     }
 }

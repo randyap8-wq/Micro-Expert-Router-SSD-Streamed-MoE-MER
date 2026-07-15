@@ -372,7 +372,35 @@ run_case() {
         .layer_expert_fetch_critical_path_seconds >= 0 and
         .layer_expert_fetch_critical_path_wall_fraction >= 0 and
         .layers_beginning_compute_before_all_misses_available == 0 and
+        .foreground_demand_bursts_entered ==
+          ([.missing_experts_per_routed_layer[1:9][]] | add) and
+        .foreground_demand_pressure_active_seconds >= 0 and
+        .speculative_physical_reads_admitted_without_demand_pressure >= 0 and
+        .speculative_physical_reads_deferred_for_demand_pressure >= 0 and
+        .deferred_speculative_physical_reads_resumed >= 0 and
+        .deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit >= 0 and
+        .speculative_physical_reads_active_when_demand_burst_began >= 0 and
         .demand_reads_issued_while_speculative_reads_active >= 0 and
+        .demand_physical_read_service_without_speculation_operations >= 0 and
+        .demand_physical_read_service_without_speculation_seconds >= 0 and
+        .demand_physical_read_service_without_speculation_mean_seconds >= 0 and
+        .demand_physical_read_service_without_speculation_max_seconds >= 0 and
+        (.demand_physical_read_service_without_speculation_histogram | length) == 16 and
+        ([.demand_physical_read_service_without_speculation_histogram[].count] | add) ==
+          .demand_physical_read_service_without_speculation_operations and
+        .demand_physical_read_service_with_speculation_operations >= 0 and
+        .demand_physical_read_service_with_speculation_seconds >= 0 and
+        .demand_physical_read_service_with_speculation_mean_seconds >= 0 and
+        .demand_physical_read_service_with_speculation_max_seconds >= 0 and
+        (.demand_physical_read_service_with_speculation_histogram | length) == 16 and
+        ([.demand_physical_read_service_with_speculation_histogram[].count] | add) ==
+          .demand_physical_read_service_with_speculation_operations and
+        (.demand_physical_read_service_without_speculation_operations +
+         .demand_physical_read_service_with_speculation_operations) ==
+          .foreground_physical_read_operations and
+        .demand_layers_final_straggler_issued_while_speculative_reads_active >= 0 and
+        .demand_layers_final_straggler_issued_while_speculative_reads_active <=
+          ([.missing_experts_per_routed_layer[1:9][]] | add) and
         .demand_critical_reads_delayed_by_speculative_activity == null and
         (.final_straggler_routed_slot_histogram | length) == 9 and
         ([.final_straggler_routed_slot_histogram[]] | add) ==
@@ -419,7 +447,48 @@ run_case() {
     --arg prompt_id "$prompt_id" \
     --argjson cache_slots "$slots" \
     --argjson peak_rss_bytes "$peak_rss_bytes" \
-    '{
+    '
+    def phase3b($phase):
+      [.runs[].demand_miss_fanout[$phase]] as $samples |
+      ([$samples[].demand_physical_read_service_without_speculation_operations] | add) as $without_reads |
+      ([$samples[].demand_physical_read_service_without_speculation_seconds] | add) as $without_seconds |
+      ([$samples[].demand_physical_read_service_with_speculation_operations] | add) as $with_reads |
+      ([$samples[].demand_physical_read_service_with_speculation_seconds] | add) as $with_seconds |
+      {
+        foreground_demand_bursts_entered: ([$samples[].foreground_demand_bursts_entered] | add),
+        foreground_demand_pressure_active_seconds: ([$samples[].foreground_demand_pressure_active_seconds] | add),
+        speculative_physical_reads_admitted_without_demand_pressure: ([$samples[].speculative_physical_reads_admitted_without_demand_pressure] | add),
+        speculative_physical_reads_deferred_for_demand_pressure: ([$samples[].speculative_physical_reads_deferred_for_demand_pressure] | add),
+        deferred_speculative_physical_reads_resumed: ([$samples[].deferred_speculative_physical_reads_resumed] | add),
+        deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit: ([$samples[].deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit] | add),
+        speculative_physical_reads_active_when_demand_burst_began: ([$samples[].speculative_physical_reads_active_when_demand_burst_began] | add),
+        demand_reads_issued_while_speculative_reads_active: ([$samples[].demand_reads_issued_while_speculative_reads_active] | add),
+        demand_physical_read_service_without_speculation_operations: $without_reads,
+        demand_physical_read_service_without_speculation_seconds: $without_seconds,
+        demand_physical_read_service_without_speculation_mean_seconds: (if $without_reads == 0 then 0 else ($without_seconds / $without_reads) end),
+        demand_physical_read_service_without_speculation_max_seconds: ([$samples[].demand_physical_read_service_without_speculation_max_seconds] | max),
+        demand_physical_read_service_without_speculation_histogram: [
+          range(0; 16) as $i |
+          {
+            upper_bound_microseconds: $samples[0].demand_physical_read_service_without_speculation_histogram[$i].upper_bound_microseconds,
+            count: ([$samples[].demand_physical_read_service_without_speculation_histogram[$i].count] | add)
+          }
+        ],
+        demand_physical_read_service_with_speculation_operations: $with_reads,
+        demand_physical_read_service_with_speculation_seconds: $with_seconds,
+        demand_physical_read_service_with_speculation_mean_seconds: (if $with_reads == 0 then 0 else ($with_seconds / $with_reads) end),
+        demand_physical_read_service_with_speculation_max_seconds: ([$samples[].demand_physical_read_service_with_speculation_max_seconds] | max),
+        demand_physical_read_service_with_speculation_histogram: [
+          range(0; 16) as $i |
+          {
+            upper_bound_microseconds: $samples[0].demand_physical_read_service_with_speculation_histogram[$i].upper_bound_microseconds,
+            count: ([$samples[].demand_physical_read_service_with_speculation_histogram[$i].count] | add)
+          }
+        ],
+        demand_layers_final_straggler_issued_while_speculative_reads_active: ([$samples[].demand_layers_final_straggler_issued_while_speculative_reads_active] | add),
+        causal_delay_claim: null
+      };
+    {
       schema: {name:"mer-prompt2-case-summary", version:1},
       case: $case,
       cache_slots: $cache_slots,
@@ -520,7 +589,9 @@ run_case() {
           ] |
           if length == 0 then null else max_by(.sample.critical_path_seconds) end
         )
-      }
+      },
+      phase3b_prompt: phase3b("prompt"),
+      phase3b_decode: phase3b("decode")
     }' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"
 }
 

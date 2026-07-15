@@ -2435,7 +2435,7 @@ struct BenchRealDemandFetchPhase {
     misses_at_initial_layer_lookup: u64,
     /// Exact bounded buckets indexed by miss count (`0..=top_k`). Bucket zero
     /// is derived from the existing routed-layer counter, so resident layers
-    /// pay no new Phase 3A hot-path operation.
+    /// pay no new Phase 3 hot-path operation.
     missing_experts_per_routed_layer: Vec<u64>,
     cache_lookup_seconds: f64,
     foreground_admission_control: &'static str,
@@ -4405,7 +4405,7 @@ async fn run_bench_real_once(
     let decode_stage_timings = crate::stage_timing::StageTimings::default();
     let mut kv = runtime.model.fresh_kv_caches();
     if !runtime.engine.reset_demand_fetch_telemetry() {
-        return Err("cannot reset Phase 3A telemetry while a foreground read is active".into());
+        return Err("cannot reset Phase 3 telemetry while foreground demand is active".into());
     }
     let pre = runtime.engine.report();
     let truncated_payload_uses_before = crate::inference::truncated_expert_payload_uses();
@@ -4468,8 +4468,7 @@ async fn run_bench_real_once(
     let prompt_post = runtime.engine.report();
     if !runtime.engine.reset_demand_fetch_telemetry() {
         return Err(
-            "cannot start decode Phase 3A telemetry while a prompt foreground read is active"
-                .into(),
+            "cannot start decode Phase 3 telemetry while prompt foreground demand is active".into(),
         );
     }
     let decode_pre = runtime.engine.report();
@@ -4559,7 +4558,7 @@ async fn run_bench_real_once(
         &decode_stage_timings,
     );
     let demand_miss_fanout = BenchRealDemandFetchTelemetry {
-        semantics: "miss-only bounded telemetry; storage service brackets NvmeStorage positional-read execution, while cache lookup, primary-buffer wait, admission wait, and completion-to-consumption delay are separate",
+        semantics: "miss-only bounded telemetry; storage service brackets NvmeStorage positional-read execution, Phase 3B speculative admission is checked immediately before physical submission, overlap is not a causal-delay claim, and cache lookup, primary-buffer wait, foreground admission wait, and completion-to-consumption delay remain separate",
         prompt: bench_real_demand_fetch_phase(
             &pre,
             &prompt_post,

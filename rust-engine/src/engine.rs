@@ -2995,6 +2995,10 @@ impl Engine {
     }
 
     fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
+        self.spawn_prefetch_inner(id, p, false);
+    }
+
+    fn spawn_prefetch_inner(self: &Arc<Self>, id: u32, p: f64, was_deferred: bool) {
         // **Dedup before spending a permit.** `union_prefetch` and
         // `speculate_layer_ahead` can both nominate the same id for one
         // token; without this pre-check each duplicate consumed a
@@ -3005,6 +3009,9 @@ impl Engine {
         // fine: the post-spawn `contains` re-check and the singleflight
         // entry below stay authoritative.
         if self.core.cache.contains(id) || self.core.in_flight.contains_key(&id) {
+            if was_deferred {
+                self.metrics.demand_fetch.record_deferred_speculative_drop();
+            }
             return;
         }
         // **Tier 4 admission gate.** Before spending a semaphore permit
@@ -3049,16 +3056,33 @@ impl Engine {
             }
         };
         let me = self.clone();
-        self.metrics
-            .counters
-            .prefetch_submitted
-            .fetch_add(1, Ordering::Relaxed);
+        if !was_deferred {
+            self.metrics
+                .counters
+                .prefetch_submitted
+                .fetch_add(1, Ordering::Relaxed);
+        }
         tokio::spawn(async move {
             // Permit released on task completion (drop). Holding it
             // across the I/O is what enforces the bound.
-            let _permit = permit;
+            let permit = permit;
+            if me.metrics.demand_fetch.demand_pressure_active() {
+                if !was_deferred {
+                    me.metrics.demand_fetch.record_speculative_deferred();
+                }
+                me.metrics
+                    .demand_fetch
+                    .wait_for_demand_pressure_clear()
+                    .await;
+                drop(permit);
+                me.spawn_prefetch_inner(id, p, true);
+                return;
+            }
             // Re-check (could have been loaded by another task in the meantime).
             if me.core.cache.contains(id) {
+                if was_deferred {
+                    me.metrics.demand_fetch.record_deferred_speculative_drop();
+                }
                 return;
             }
             // **Get-or-wait join (Part 3).** Register this prefetch in
@@ -3075,7 +3099,12 @@ impl Engine {
             // in-flight slot, there is nothing useful to do: they are
             // already fetching this id, so drop.
             let notify = match me.core.in_flight.entry(id) {
-                dashmap::mapref::entry::Entry::Occupied(_) => return,
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    if was_deferred {
+                        me.metrics.demand_fetch.record_deferred_speculative_drop();
+                    }
+                    return;
+                }
                 dashmap::mapref::entry::Entry::Vacant(vac) => {
                     let n = Arc::new(Notify::new());
                     vac.insert(n.clone());
@@ -3087,12 +3116,18 @@ impl Engine {
             // early return, read error, or success). Followers then
             // re-check the cache: a hit on success, or a re-contention
             // for leadership on failure — never a wedged stale entry.
-            let _guard = SingleflightLeaderGuard {
+            let guard = SingleflightLeaderGuard {
                 map: me.core.in_flight.clone(),
                 id,
                 notify,
                 armed: true,
             };
+            if me.core.cache.contains(id) {
+                if was_deferred {
+                    me.metrics.demand_fetch.record_deferred_speculative_drop();
+                }
+                return;
+            }
             // **Double-buffered acquire (Part 2).** Speculation draws
             // from the **shadow** (Buffer B) half of the pool, never the
             // primary (Buffer A) half that backs the resident LRU and
@@ -3147,11 +3182,34 @@ impl Engine {
                 }
             };
             let started = Instant::now();
-            // Miss-only contention observability: this gauge does not claim
-            // causality. A foreground issue that overlaps it is reported as
-            // shared-device exposure, never as proven speculative delay.
-            let _speculative_read = me.metrics.demand_fetch.begin_speculative_read();
-            match me.core.storage.read_expert(id, &mut buf).await {
+            // `read_expert_if_admitted` resolves the fd/packed slot first,
+            // then executes the packed-state CAS immediately before pread.
+            let arbitration = me.metrics.demand_fetch.clone();
+            let submission = me
+                .core
+                .storage
+                .read_expert_if_admitted(id, &mut buf, move || {
+                    arbitration.try_begin_speculative_read(was_deferred)
+                })
+                .await;
+            let read_result = match submission {
+                crate::io_provider::AdmittedPhysicalRead::Deferred => {
+                    if !was_deferred {
+                        me.metrics.demand_fetch.record_speculative_deferred();
+                    }
+                    drop(buf);
+                    drop(guard);
+                    me.metrics
+                        .demand_fetch
+                        .wait_for_demand_pressure_clear()
+                        .await;
+                    drop(permit);
+                    me.spawn_prefetch_inner(id, p, true);
+                    return;
+                }
+                crate::io_provider::AdmittedPhysicalRead::Completed(result) => result,
+            };
+            match read_result {
                 Ok(_) => {
                     me.metrics
                         .counters
@@ -3233,7 +3291,7 @@ impl Engine {
                         elapsed_us = started.elapsed().as_micros() as u64,
                         "prefetch complete"
                     );
-                    // `_guard` drops here: the in-flight slot is removed
+                    // `guard` drops here: the in-flight slot is removed
                     // and any foreground follower waiting on this id is
                     // woken to re-check the cache — where it now hits.
                 }
@@ -4241,7 +4299,7 @@ impl Engine {
         )> = Vec::new();
         // Allocated lazily on the first initial miss. All-resident layers keep
         // the qualified Phase 1 path: no new timestamp, allocation, lock, or
-        // atomic update is performed for Phase 3A telemetry.
+        // atomic update is performed for Phase 3 telemetry or arbitration.
         let mut layer_fetch_tracker: Option<
             Arc<crate::demand_fetch_telemetry::LayerFetchTracker>,
         > = None;
@@ -4298,6 +4356,7 @@ impl Engine {
                         layer,
                         &target,
                         Instant::now(),
+                        self.metrics.demand_fetch.clone(),
                     )
                 });
                 tracker.mark_miss(i);
@@ -5575,6 +5634,61 @@ mod tests {
             .missing_experts_per_layer_nonzero
             .iter()
             .all(|&count| count == 0));
+        assert_eq!(post.demand_fetch.foreground_demand_bursts_entered, 0);
+        assert_eq!(
+            post.demand_fetch.foreground_demand_pressure_active_seconds,
+            0.0
+        );
+        assert_eq!(
+            post.demand_fetch
+                .speculative_physical_reads_admitted_without_demand_pressure,
+            0
+        );
+        assert_eq!(
+            post.demand_fetch
+                .speculative_physical_reads_deferred_for_demand_pressure,
+            0
+        );
+        assert_eq!(
+            post.demand_fetch
+                .deferred_speculative_physical_reads_resumed,
+            0
+        );
+        assert_eq!(
+            post.demand_fetch
+                .deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit,
+            0
+        );
+        assert_eq!(
+            post.demand_fetch
+                .speculative_physical_reads_active_when_demand_burst_began,
+            0
+        );
+        assert_eq!(
+            post.demand_fetch
+                .demand_physical_read_service_without_speculation_operations,
+            0
+        );
+        assert_eq!(
+            post.demand_fetch
+                .demand_physical_read_service_with_speculation_operations,
+            0
+        );
+        assert_eq!(
+            post.demand_fetch
+                .demand_layers_final_straggler_issued_while_speculative_reads_active,
+            0
+        );
+        assert!(post
+            .demand_fetch
+            .demand_physical_read_service_without_speculation_histogram
+            .iter()
+            .chain(
+                post.demand_fetch
+                    .demand_physical_read_service_with_speculation_histogram
+                    .iter()
+            )
+            .all(|bucket| bucket.count == 0));
         assert!(post.demand_fetch.worst_layer_fetch.is_none());
     }
 
