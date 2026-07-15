@@ -105,25 +105,7 @@ jq -n \
         .layer_expert_fetch_critical_path_seconds == 0 and
         .layer_expert_fetch_critical_path_mean_seconds == 0 and
         .layer_expert_fetch_critical_path_max_seconds == 0 and
-        .foreground_demand_bursts_entered == 0 and
-        .foreground_demand_pressure_active_seconds == 0 and
-        .speculative_physical_reads_admitted_without_demand_pressure == 0 and
-        .speculative_physical_reads_deferred_for_demand_pressure == 0 and
-        .deferred_speculative_physical_reads_resumed == 0 and
-        .deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit == 0 and
-        .speculative_physical_reads_active_when_demand_burst_began == 0 and
         .demand_reads_issued_while_speculative_reads_active == 0 and
-        .demand_physical_read_service_without_speculation_operations == 0 and
-        .demand_physical_read_service_without_speculation_seconds == 0 and
-        .demand_physical_read_service_without_speculation_mean_seconds == 0 and
-        .demand_physical_read_service_without_speculation_max_seconds == 0 and
-        ([.demand_physical_read_service_without_speculation_histogram[].count] | all(. == 0)) and
-        .demand_physical_read_service_with_speculation_operations == 0 and
-        .demand_physical_read_service_with_speculation_seconds == 0 and
-        .demand_physical_read_service_with_speculation_mean_seconds == 0 and
-        .demand_physical_read_service_with_speculation_max_seconds == 0 and
-        ([.demand_physical_read_service_with_speculation_histogram[].count] | all(. == 0)) and
-        .demand_layers_final_straggler_issued_while_speculative_reads_active == 0 and
         .demand_critical_reads_delayed_by_speculative_activity == null and
         ([.final_straggler_routed_slot_histogram[]] | all(. == 0)) and
         .worst_layer_fetch == null
@@ -146,7 +128,7 @@ jq -n \
       if $resident_gates.zero_prefetch_io then empty
       else "resident cases recorded speculative prefetch I/O" end,
       if $resident_gates.zero_phase3_miss_telemetry then empty
-      else "resident cases activated Phase 3 miss-only telemetry or arbitration" end,
+      else "resident cases activated Phase 3A miss-only telemetry" end,
       if $performance_passed then empty
       elif $gm < $lower then
         "resident performance gate failed: geometric mean decode TPS \($gm) is below the lower bound \($lower)"

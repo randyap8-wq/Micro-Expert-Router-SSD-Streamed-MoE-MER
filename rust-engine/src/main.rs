@@ -131,9 +131,9 @@ mod benchmark_hash;
 mod block_pool;
 mod buffer_pool;
 mod config;
+mod demand_fetch_telemetry;
 mod dense_tensor;
 mod dequant;
-mod demand_fetch_telemetry;
 mod distributed;
 mod draft;
 mod engine;
@@ -1282,10 +1282,7 @@ fn maybe_run_startup_rayon_autotune(
         "Rayon autotune selected worker count"
     );
 
-    let use_selected = selected_autotune_threads(
-        &selection,
-        *allow_low_confidence_rayon_autotune,
-    );
+    let use_selected = selected_autotune_threads(&selection, *allow_low_confidence_rayon_autotune);
     if use_selected.is_none() {
         warn!(
             threads = best.threads,
@@ -2435,7 +2432,7 @@ struct BenchRealDemandFetchPhase {
     misses_at_initial_layer_lookup: u64,
     /// Exact bounded buckets indexed by miss count (`0..=top_k`). Bucket zero
     /// is derived from the existing routed-layer counter, so resident layers
-    /// pay no new Phase 3 hot-path operation.
+    /// pay no new Phase 3A hot-path operation.
     missing_experts_per_routed_layer: Vec<u64>,
     cache_lookup_seconds: f64,
     foreground_admission_control: &'static str,
@@ -2645,7 +2642,9 @@ fn cmd_q8_expert_microbench(
         if measured_runs == 0 {
             return Err("q8-expert-microbench requires --measured-runs > 0".into());
         }
-        let weights = d_model.checked_mul(d_ff).ok_or("Q8 benchmark shape overflow")?;
+        let weights = d_model
+            .checked_mul(d_ff)
+            .ok_or("Q8 benchmark shape overflow")?;
         let blocks = weights.div_ceil(crate::inference::Q8_0_BLOCK_ELEMS);
         let logical_bytes = blocks
             .checked_mul(crate::inference::Q8_0_BLOCK_BYTES)
@@ -2659,8 +2658,7 @@ fn cmd_q8_expert_microbench(
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
-                *value = (((state >> 40) as u32 as f32) / ((1u32 << 24) - 1) as f32 - 0.5)
-                    * 0.08;
+                *value = (((state >> 40) as u32 as f32) / ((1u32 << 24) - 1) as f32 - 0.5) * 0.08;
             }
             let mut block = [0u8; crate::inference::Q8_0_BLOCK_BYTES];
             crate::inference::quantize_q8_0_block(&values, &mut block);
@@ -2744,7 +2742,10 @@ fn cmd_q8_expert_microbench(
             d_model: usize,
             d_ff: usize,
         ) -> Result<
-            (crate::inference::InferenceOutput, crate::inference::HiddenState),
+            (
+                crate::inference::InferenceOutput,
+                crate::inference::HiddenState,
+            ),
             crate::inference::ExpertWeightsError,
         > {
             match path {
@@ -2904,10 +2905,7 @@ fn cmd_q8_expert_microbench(
             )?;
             println!(
                 "{name:<18} {backend:<16} {:>22.3} {:>20.3} {:>28.3} {:>26.3}",
-                single.first_exec_ms,
-                single.repeated_ms,
-                top8.first_exec_ms,
-                top8.repeated_ms,
+                single.first_exec_ms, single.repeated_ms, top8.first_exec_ms, top8.repeated_ms,
             );
             for (count, result) in [(1, &single), (8, &top8)] {
                 for (stage, memory) in [
@@ -4366,9 +4364,7 @@ fn bench_real_demand_fetch_phase(
         .get(crate::stage_timing::EXPERT_CACHE_LOOKUP)
         .map(|timing| timing.total_seconds)
         .unwrap_or(0.0);
-    let layer_fetch_seconds = after
-        .demand_fetch
-        .layer_expert_fetch_critical_path_seconds;
+    let layer_fetch_seconds = after.demand_fetch.layer_expert_fetch_critical_path_seconds;
     BenchRealDemandFetchPhase {
         routed_layers_observed: routed_layers,
         routed_expert_activations_observed: resident_hits.saturating_add(misses),
@@ -4405,7 +4401,7 @@ async fn run_bench_real_once(
     let decode_stage_timings = crate::stage_timing::StageTimings::default();
     let mut kv = runtime.model.fresh_kv_caches();
     if !runtime.engine.reset_demand_fetch_telemetry() {
-        return Err("cannot reset Phase 3 telemetry while foreground demand is active".into());
+        return Err("cannot reset Phase 3A telemetry while a foreground read is active".into());
     }
     let pre = runtime.engine.report();
     let truncated_payload_uses_before = crate::inference::truncated_expert_payload_uses();
@@ -4468,7 +4464,8 @@ async fn run_bench_real_once(
     let prompt_post = runtime.engine.report();
     if !runtime.engine.reset_demand_fetch_telemetry() {
         return Err(
-            "cannot start decode Phase 3 telemetry while prompt foreground demand is active".into(),
+            "cannot start decode Phase 3A telemetry while a prompt foreground read is active"
+                .into(),
         );
     }
     let decode_pre = runtime.engine.report();
@@ -4558,7 +4555,7 @@ async fn run_bench_real_once(
         &decode_stage_timings,
     );
     let demand_miss_fanout = BenchRealDemandFetchTelemetry {
-        semantics: "miss-only bounded telemetry; storage service brackets NvmeStorage positional-read execution, Phase 3B speculative admission is checked immediately before physical submission, overlap is not a causal-delay claim, and cache lookup, primary-buffer wait, foreground admission wait, and completion-to-consumption delay remain separate",
+        semantics: "miss-only bounded telemetry; storage service brackets NvmeStorage positional-read execution, while cache lookup, primary-buffer wait, admission wait, and completion-to-consumption delay are separate",
         prompt: bench_real_demand_fetch_phase(
             &pre,
             &prompt_post,

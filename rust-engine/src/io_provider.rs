@@ -63,13 +63,6 @@ pub(crate) trait PhysicalReadObserver: Send + Sync {
     fn completed(&self);
 }
 
-/// Result of a speculative read whose final admission decision is made after
-/// fd/packed-slot resolution and immediately before physical storage service.
-pub(crate) enum AdmittedPhysicalRead {
-    Deferred,
-    Completed(io::Result<usize>),
-}
-
 // =====================================================================
 // Fault-tolerant I/O knobs (gist Task 3 — "Hardened" MER).
 // =====================================================================
@@ -1160,46 +1153,6 @@ impl NvmeStorage {
         observer: &dyn PhysicalReadObserver,
     ) -> io::Result<usize> {
         self.read_expert_inner(expert_id, buf, Some(observer)).await
-    }
-
-    /// Speculative sibling whose `admit` closure is invoked at the last safe
-    /// boundary before `block_in_place` submits the positional read. A denied
-    /// admission performs no storage I/O and is not represented as an error.
-    pub(crate) async fn read_expert_if_admitted<G>(
-        &self,
-        expert_id: u32,
-        buf: &mut PooledBuffer,
-        admit: impl FnOnce() -> Option<G>,
-    ) -> AdmittedPhysicalRead
-    where
-        G: Send,
-    {
-        debug_assert_eq!(buf.len(), self.cfg.expert_size);
-        let (file, offset) = if let Some(packed) = &self.packed {
-            let entry = match packed.entry(expert_id) {
-                Some(entry) => entry,
-                None => {
-                    return AdmittedPhysicalRead::Completed(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("expert {expert_id} is not present in the packed blob manifest"),
-                    )))
-                }
-            };
-            (packed.file().clone(), entry.offset)
-        } else {
-            match self.fd_for(expert_id) {
-                Ok(file) => (file, 0),
-                Err(error) => return AdmittedPhysicalRead::Completed(Err(error)),
-            }
-        };
-        let dst_len = buf.len();
-        let Some(_admission_guard) = admit() else {
-            return AdmittedPhysicalRead::Deferred;
-        };
-        let result = tokio::task::block_in_place(|| {
-            self.read_at_with_retries(&file, expert_id, offset, &mut buf.as_mut_slice()[..dst_len])
-        });
-        AdmittedPhysicalRead::Completed(result)
     }
 
     async fn read_expert_inner(
@@ -2530,44 +2483,6 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&d0);
         let _ = std::fs::remove_dir_all(&d1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn admitted_read_defers_without_io_or_false_storage_error() {
-        let dir = tempdir("admitted-read");
-        let block = 4096usize;
-        let expert_size = block;
-        let payload = vec![0x5Au8; expert_size];
-        std::fs::write(dir.join("expert_0.bin"), &payload).unwrap();
-        let storage = NvmeStorage::new(StorageConfig {
-            base_path: dir.clone(),
-            expert_size,
-            block_align: block,
-            use_direct_io: false,
-            num_experts_per_layer: None,
-        })
-        .unwrap();
-        let pool = BufferPool::new(1, expert_size, block);
-        let mut buffer = pool.acquire().await;
-        buffer.as_mut_slice().fill(0xA5);
-
-        let deferred = storage
-            .read_expert_if_admitted(0, &mut buffer, || None::<()>)
-            .await;
-        assert!(matches!(deferred, AdmittedPhysicalRead::Deferred));
-        assert!(buffer.as_slice().iter().all(|&byte| byte == 0xA5));
-
-        let completed = storage
-            .read_expert_if_admitted(0, &mut buffer, || Some(()))
-            .await;
-        match completed {
-            AdmittedPhysicalRead::Completed(result) => {
-                assert_eq!(result.unwrap(), expert_size);
-            }
-            AdmittedPhysicalRead::Deferred => panic!("idle read unexpectedly deferred"),
-        }
-        assert_eq!(buffer.as_slice(), payload.as_slice());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

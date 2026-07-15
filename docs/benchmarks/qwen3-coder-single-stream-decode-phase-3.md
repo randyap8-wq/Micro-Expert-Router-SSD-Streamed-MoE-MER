@@ -1,173 +1,197 @@
 # Qwen3-Coder single-stream decode: Prompt 2 Phase 3
 
-## Scope and status
+## Disposition
 
 Phase 3A, commit `f59ba97afb7829a2cbf4bea50a959181ec95de2e`,
-instrumented foreground demand-miss fanout without changing runtime policy. Its
-qualified Linux four-case collection ran on the required GCP
-`g2-standard-32`: Linux x86_64, 32 online logical CPUs, CPU mask `0-31`, 30
-Rayon workers, about 128 GB RAM, and local ext4 NVMe at `/mnt/localssd` mounted
-`rw,noatime,nodiratime` with O_DIRECT expert reads.
+added bounded, miss-only foreground demand-fetch telemetry without changing
+runtime policy. Phase 3B, tested commit
+`ca7ca5389bbcd86f199c45244e99a48483de249c`, added a demand-priority
+speculative-read arbitration policy.
 
-That evidence established:
+The qualified same-host Linux x86_64 A-B-A benchmark rejected that policy. The
+small throughput improvement appears real, but it did not reach the preferred
+threshold and the latency, resident, miss, fetch-fraction, and accounting gates
+did not support production use. The follow-up disposition therefore removes
+the Phase 3B arbitration and restores the Phase 3A demand and speculative
+physical-read paths. The Phase 3A miss telemetry remains enabled.
 
-- top-8 demand misses are already logically concurrent;
-- multiple physical reads overlap and peak foreground physical-read
-  concurrency reaches eight;
-- primary Buffer-A wait and demand-task issue spread are negligible;
-- expert compute begins almost immediately after the final required expert is
-  available;
-- storage-service stragglers dominate the layer-fetch critical path; and
-- about one third of demand reads were issued while speculative physical reads
-  were active.
+Phase 3B is disabled and no Phase 3B production performance claim is made.
+macOS results are correctness evidence only and are not Linux or NVMe
+performance evidence.
 
-Those findings reject Buffer-A capacity, generic Tokio fanout, routed-order
-handle consumption, and expert-compute pipelining as the first Phase 3B target.
-They also leave packed storage, io_uring, cache policy, routing, model math, and
-native direct-Q8 execution outside this phase.
+## Qualified Linux A-B-A result
 
-Phase 3B tests one narrower hypothesis: a newly starting speculative read can
-contribute to foreground storage-service tails by sharing `NvmeStorage`, Tokio
-blocking capacity, the kernel/device queue, and the NVMe device with an active
-demand burst. Overlap remains exposure, not proof of causal delay.
+All three collections ran on the same qualified GCP `g2-standard-32`: Linux
+x86_64, 32 online logical CPUs, CPU mask `0-31`, 30 Rayon workers, about
+128 GB RAM, and local ext4 NVMe at `/mnt/localssd` mounted
+`rw,noatime,nodiratime` with O_DIRECT expert reads. The Phase 3A before and
+after measurements bracketed the tested Phase 3B commit.
 
-No Linux performance result is included in the implementation commit. macOS
-results below are correctness evidence only.
+| Measurement | Phase 3A before | Phase 3B | Phase 3A after |
+| --- | ---: | ---: | ---: |
+| Short decode TPS | 1.293438199065394 | 1.305594662395702 | 1.297117606206983 |
+| Medium decode TPS | 1.5008307858944783 | 1.5249795388009992 | 1.494644032414944 |
+| Streaming geometric-mean TPS | 1.3932809726717916 | 1.4110298175875817 | 1.3923825226774516 |
+| Resident geometric-mean TPS | 3.2307087765796116 | 3.532783148464943 | 3.2437048410808447 |
 
-## Unchanged production control flow
+The two Phase 3A streaming geometric means differed by
+`-0.06448448029956477%`, about 0.06%, so the A measurements were stable. Phase
+3B improved streaming geometric-mean throughput by `+1.3392%` versus the
+fresh Phase 3A after measurement. It was `+0.6535%` on the short fixture and
+`+2.0296%` on the medium fixture.
 
-For each sparse transformer layer, `moe_step_inner` routes top-k experts,
-submits the existing prediction arms, probes the resident cache in routed
-order, and spawns every initial demand miss before awaiting any miss handle.
-`fetch_with_retry` retains its cache rechecks, per-identity DashMap
-singleflight, primary Buffer-A acquisition, retries, strict errors, and cache
-insertion. A demand leader still calls the same O_DIRECT positional `pread`
-through `NvmeStorage::read_expert_observed`. There is no foreground semaphore
-and demand physical-read concurrency is unchanged.
+The detailed Phase 3B versus fresh Phase 3A changes were:
 
-Speculation retains the existing prediction identities, bounded concurrency
-semaphore, separate shadow Buffer-B pool, singleflight identity, cache policy,
-and insertion/error behavior. Already-running speculative storage calls are
-never canceled.
+| Metric | Short | Medium | Disposition |
+| --- | ---: | ---: | --- |
+| Decode TPS | +0.6535% | +2.0296% | Positive, but geometric mean remained below +2% |
+| Mean demand-storage latency | +3.6406% | -0.2809% | Inconsistent |
+| Mean layer-fetch critical path | +5.3349% | +4.0320% | Worse in both fixtures |
+| Decode-wall fetch fraction | +6.0315% | +6.3846% | Worse in both fixtures |
+| Cache misses | +1.6641% | +1.2174% | Increased in both fixtures |
+| SSD bytes | -0.5781% | -0.8048% | Decreased slightly in both fixtures |
 
-## Phase 3B arbitration semantics
+Maximum demand-storage latency and maximum layer-fetch critical-path changes
+were inconsistent between the fixtures; the retained, checksummed comparison
+artifacts remain the canonical exact record for those per-case values. Phase
+3B resident geometric-mean TPS was `+9.350095993645734%` above the Phase 3A
+before measurement and `+8.9119794046296%` above the Phase 3A after
+measurement. Arbitration should be inactive during resident inference, so that
+approximately 9% separation is not accepted as evidence of a resident-path
+improvement.
 
-The miss-only `LayerFetchTracker` owns a demand-burst guard. It is created only
-after the layer observes its first initial cache miss, before that layer's
-demand tasks can enter storage, and is finished after every required miss
-handle has been drained. Dropping the tracker is a failure-safe release path.
+The tested Phase 3B service split also showed that demand reads issued while
+speculative physical reads were active remained substantially slower than
+demand reads issued without speculative activity. Arbitration did not close
+that gap. This keeps the broader shared-device-tail hypothesis open, but does
+not validate the tested policy or establish speculation as the cause.
 
-One engine-scoped `AtomicU64` packs two gauges:
+The policy failed acceptance because:
 
-- high 32 bits: active foreground demand-burst guards;
-- low 32 bits: speculative reads admitted into physical storage service.
+1. streaming geometric-mean improvement was `+1.3392%`, below the preferred
+   `+2%`;
+2. mean layer-fetch critical path worsened in both fixtures;
+3. decode-wall fetch fraction worsened in both fixtures;
+4. maximum-latency improvement was inconsistent between fixtures;
+5. cache misses increased in both fixtures;
+6. resident performance differed from both surrounding Phase 3A resident
+   measurements by about 9%; and
+7. the deferred/resumed terminal accounting was incomplete at snapshot time.
 
-Demand entry performs one non-waiting atomic increment. Speculative admission
-uses a compare/exchange that can increment the low half only when the high half
-is zero. The successful speculative CAS is executed immediately before
-the positional `pread`, after fd resolution, Buffer-B acquisition, and
-singleflight election. This gives demand entry and speculative physical
-submission one total atomic order:
+## Active runtime after disposition
 
-- if speculative admission linearizes first, it is already running when the
-  demand burst begins and is allowed to finish;
-- if demand entry linearizes first, speculative admission fails before storage
-  submission and the request defers.
+The active runtime is the Phase 3A runtime:
 
-When pressure is already visible, a speculative task waits without claiming a
-singleflight identity or Buffer-B slot. If pressure races the final admission
-check, the task releases its Buffer-B slot and singleflight guard before
-waiting. This prevents a foreground request for the same expert from waiting
-on a deferred speculative leader. Demand never waits for a Phase 3B permit,
-semaphore, condition, queue slot, or speculative completion.
+- demand misses retain the existing cache rechecks, per-identity DashMap
+  singleflight, primary Buffer-A acquisition, retry, strict-error, cache
+  insertion, and O_DIRECT positional-read behavior;
+- all initial routed misses are spawned before any miss handle is awaited, with
+  no foreground admission semaphore;
+- speculative requests retain their existing prediction identities, governor,
+  bounded concurrency semaphore, cache/singleflight logic, separate Buffer-B
+  pool, insertion behavior, and ordinary `NvmeStorage::read_expert` call;
+- demand and speculative reads are no longer ordered by a Phase 3B packed
+  arbitration state, demand-burst guard, notification, or deferred retry;
+- the Phase 3B conditional storage API and arbitration-only tests/state are
+  removed; and
+- model math, routing, cache and eviction policy, strictness, output order,
+  native direct-Q8 execution, storage backend, Buffer-A semantics, and Buffer-B
+  semantics are unchanged.
 
-Only speculative tasks wait on the pressure-cleared notification. The final
-overlapping demand guard wakes them when the packed demand count reaches zero.
-They retry through the existing bounded speculative semaphore, cache recheck,
-governor, singleflight election, and Buffer-B acquisition. Cache hits and
-duplicates retain their existing best-effort exit; deferred instances receive
-an additional accounting counter rather than a storage or strictness failure.
+Phase 3A telemetry remains passive and miss-only. A `LayerFetchTracker` is
+allocated only after a routed layer observes its first initial cache miss.
+It records cache lookup, Buffer-A wait, storage service, singleflight wait,
+completion-to-consumption delay, bounded miss histograms, read concurrency,
+issue/availability spreads, layer fetch critical path, final-straggler slot,
+and one bounded worst-layer sample. The existing speculative-active gauge only
+classifies overlap observed when a demand physical read begins; it does not
+defer, cancel, admit, or reorder either read class. An all-resident layer does
+not allocate a tracker or update miss telemetry.
 
-No arbitration lock is held across I/O. The policy itself has no mutex. The
-existing fd-cache, cache, singleflight, pool, and telemetry-concurrency locks
-remain confined to their prior non-I/O ownership boundaries.
+Overlap remains exposure rather than proof of causal delay.
+`demand_critical_reads_delayed_by_speculative_activity` therefore remains
+`null`.
 
-### Race and starvation analysis
+## Phase 3B deferral-accounting audit
 
-- A speculative request cannot pass a stale `pressure == 0` observation: the
-  final packed-state CAS is authoritative.
-- Demand entry cannot cancel a read represented in the packed speculative
-  count; it only prevents later speculative admissions.
-- Multiple demand bursts are unioned. Releasing any guard except the last
-  leaves pressure active.
-- Notification registration occurs before the speculative task rechecks the
-  demand count, avoiding a lost wakeup at the zero transition.
-- Deferred tasks remain bounded by the existing speculative permit count.
-  When demand pressure clears they are woken together and must reacquire the
-  same bounded machinery, so there is no unbounded deferred queue.
-- Sustained foreground traffic can postpone speculation by design. Once the
-  union becomes empty, notification plus the existing retry path makes the
-  deferred work eligible again; stale work is explicitly accounted instead of
-  being reported as I/O failure.
+The historical Phase 3B counters did not share one terminal unit:
 
-## Resident-path protection
+- `speculative_physical_reads_deferred_for_demand_pressure` incremented once
+  when one logical speculative operation first encountered demand pressure.
+  The `was_deferred` flag prevented the same operation from incrementing it
+  again on subsequent pressure encounters.
+- `deferred_speculative_physical_reads_resumed` incremented when a previously
+  deferred operation later passed the final admission compare/exchange and
+  entered physical storage service. It counted admission, not successful read
+  completion.
+- `deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit`
+  incremented only when a later cache or singleflight recheck made the
+  deferred operation unnecessary.
 
-The per-layer tracker, demand guard, timestamp, and arbitration atomic update
-are created only inside the first-miss branch. A zero-miss layer executes no
-new Phase 3B timestamp read, allocation, lock/condition access, registry or
-queue operation, histogram update, formatting, trace event, or shared atomic
-update. Speculative arbitration is inspected only by a speculative request
-that has survived the existing cache/dedup/admission checks and is attempting a
-physical read. The 6,144 resident control requires every Phase 3B counter and
-histogram to stay zero in addition to the prior zero-I/O gates.
+A deferred retry re-entered the complete existing speculative path. It could
+therefore also exit through the pre-existing governor, concurrency-ceiling, or
+Buffer-B/pool-starvation counters. Those outcomes did not increment the named
+Phase 3B stale/duplicate/cache-hit counter. A storage error happened only after
+admission, so a deferred operation reaching that point was already counted as
+resumed.
 
-## Telemetry definitions
+Speculative tasks were detached `tokio::spawn` tasks; their join handles were
+not retained. The benchmark took the prompt and decode snapshots immediately
+after foreground generation and did not drain speculative tasks. The Phase 3B
+telemetry reset rejected active demand bursts and foreground reads, but did not
+wait for deferred speculative tasks. Consequently, a snapshot could contain
+deferred work that was still waiting or retrying, and such a task could cross a
+prompt/decode reset boundary. There was no separate deferred queue or
+retry-shutdown terminal counter; runtime shutdown could cancel remaining
+detached tasks.
 
-`bench-real` preserves every Phase 3A field and adds the following bounded
-fields independently under `demand_miss_fanout.prompt` and `.decode`:
+The captured aggregate values were:
 
-- `foreground_demand_bursts_entered`: miss-only layer guards created;
-- `foreground_demand_pressure_active_seconds`: union time with at least one
-  guard active;
-- `speculative_physical_reads_admitted_without_demand_pressure`: successful
-  final admission CAS operations;
-- `speculative_physical_reads_deferred_for_demand_pressure`: logical
-  speculative operations that first encountered pressure;
-- `deferred_speculative_physical_reads_resumed`: deferred operations later
-  admitted into physical service;
-- `deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit`:
-  deferred operations made unnecessary by the existing cache/singleflight
-  rechecks;
-- `speculative_physical_reads_active_when_demand_burst_began`: running
-  speculative reads observed at demand-guard entry, summed across bursts;
-- `demand_reads_issued_while_speculative_reads_active`: preserved Phase 3A
-  overlap count;
-- `demand_physical_read_service_{without,with}_speculation_{operations,seconds,mean_seconds,max_seconds,histogram}`:
-  demand storage service categorized by speculative physical activity at issue;
-- `demand_layers_final_straggler_issued_while_speculative_reads_active`: layers
-  whose last-required expert's final physical issue observed speculation; and
-- `demand_critical_reads_delayed_by_speculative_activity: null`: retained to
-  make clear that overlap alone is not a causal-delay claim.
+| Epoch | Deferred once | Later admitted (“resumed”) | Stale/duplicate/cache-hit drop | Not classified by those terminal counters at snapshot |
+| --- | ---: | ---: | ---: | ---: |
+| Prompt | 5,002 | 4,424 | 0 | 578 |
+| Decode | 16,360 | 15,051 | 0 | 1,309 |
 
-Both service histograms reuse the fixed 16 Phase 3A latency buckets. Per-layer
-state remains exactly top-k slots plus one bounded worst-layer sample; no
-per-token or per-expert history is retained.
+The final column is a snapshot difference, not a count of leaked or lost work.
+The retained artifacts cannot distinguish still-pending detached work from
+exits through the existing bounded-mechanism counters, especially across reset
+boundaries. No leak or loss claim is supported.
 
-Case summaries preserve `phase3a_decode` and add `phase3b_prompt` and
-`phase3b_decode`. The latter aggregate all Phase 3B counters and both bounded
-service histograms across the five measured runs.
+Because arbitration and its retry state are now removed, no ambiguous
+Phase 3B counter remains in production. The comparison helper preserves the
+historical fields but now reports
+`classified_by_phase3b_terminal_counters`,
+`not_classified_by_phase3b_terminal_counters_at_snapshot`, and
+`fully_classified_at_snapshot` with the exact semantics above.
 
-## Deterministic and macOS correctness evidence
+## Comparison helper and acceptance report
 
-The arbitration tests use atomic schedules, Tokio notifications, and oneshot
-channels rather than arbitrary sleeps. They cover idle speculative admission,
-non-waiting demand entry, deferral before submission, no cancellation,
-overlapping demand guards, wake/resume, stale/duplicate/cache-hit accounting,
-and a blocked injected-storage operation proving that arbitration holds no
-lock. The all-resident engine test additionally asserts every Phase 3B field
-and histogram is inactive.
+`scripts/qwen3_coder_prompt2_same_host_compare.jq` defines a portable
+`absolute` helper instead of jq's unavailable `abs` filter, so it executes
+with jq 1.6-compatible syntax. The shell fixture runs the complete helper,
+including a negative resident delta that exercises `absolute`.
 
-Run the complete macOS correctness set (performance conclusions are forbidden):
+Comparison schema version 2 adds a real `acceptance` object. It reports:
+
+- same-host identity;
+- streaming and resident qualifications and output parity;
+- contemporaneous resident percent delta and ±2% status;
+- short and medium throughput-regression status;
+- streaming geometric-mean percent delta and the preferred +2% threshold;
+- per-fixture mean and maximum demand-storage and layer-fetch critical-path
+  changes;
+- decode-wall fetch-fraction, cache-miss, and SSD-byte changes;
+- prompt and decode deferred/resumed/drop accounting; and
+- `policy_accepted` plus explicit rejection reasons.
+
+The helper does not mutate or rewrite either source artifact. For the captured
+Phase 3B result, `acceptance.policy_accepted` is `false`.
+
+## Correctness checks
+
+Run the complete macOS correctness set below. These checks validate restored
+runtime behavior and artifact processing; they do not establish Linux
+performance:
 
 ```bash
 cargo test --manifest-path rust-engine/Cargo.toml --bin micro-expert-router
@@ -180,80 +204,36 @@ bash scripts/tests/test_qwen3_coder_prompt2_resident_finalization.sh
 bash scripts/tests/test_qwen3_coder_prompt2_same_host_compare.sh
 ```
 
-On macOS, the implementation commit passed the default binary suite (`748`
-passed, `2` ignored, `0` failed), all 14 Phase 3 telemetry/arbitration tests,
-the resident-inactivity test, weighted combiner test, concurrent-resident
-direct-Q8 test, Candle-reference direct-Q8 parity test, resident-finalizer
-fixture test, and immutable same-host comparison fixture test. These are
-correctness and artifact-pipeline results only; they provide no Linux or NVMe
-performance evidence.
+Also run `bash -n` on every changed shell file, compile and execute the jq
+comparison fixture, run rustfmt on changed Rust files, and finish with
+`git diff --check`.
 
-Also run `bash -n` on every changed shell file, compile the jq comparison
-program with the synthetic helper test, run rustfmt on the changed Rust files,
-and finish with `git diff --check`.
+The disposition commit passed the full macOS binary suite (`740` passed, `2`
+ignored, `0` failed), all seven Phase 3A demand-fetch telemetry tests, the
+resident-inactivity test, weighted combiner test, concurrent-resident direct-Q8
+test, Candle-reference direct-Q8 parity test, resident-finalizer fixture, and
+same-host comparison fixture. Rustfmt and shell syntax checks also passed.
+These results are correctness and artifact-pipeline evidence only.
 
-## Exact qualified Linux collection
+## Historical artifact handling
 
-Use the same qualified host for both commits. Keep the Phase 3A and Phase 3B
-streaming/resident directories below one bundle directory per phase so the
-read-only comparison helper can discover them.
+The qualified Phase 3A and Phase 3B streaming/resident directories and their
+checksums must be retained unchanged. Reproduce comparisons read-only with:
 
 ```bash
-cd /path/to/Micro-Expert-Router-SSD-Streamed-MoE-MER
-
-export MER_QWEN_CONVERTED_DIR=/mnt/localssd/qwen3-coder-30b-a3b-instruct-q8_0
-export MER_QWEN_TOKENIZER="$MER_QWEN_CONVERTED_DIR/tokenizer.json"
-export MER_EXPECTED_NVME_MOUNT=/mnt/localssd
-
-# Collect this once from the exact qualified Phase 3A commit.
-git switch --detach f59ba97afb7829a2cbf4bea50a959181ec95de2e
-PHASE3A_ROOT=/mnt/localssd/benchmarks/prompt2-phase3a-same-host
-scripts/collect_qwen3_coder_prompt2_baseline.sh "$PHASE3A_ROOT/streaming" four-case
-scripts/collect_qwen3_coder_prompt2_baseline.sh "$PHASE3A_ROOT/resident" --resident-only || true
-sha256sum -c "$PHASE3A_ROOT/streaming/artifact-sha256.txt"
-sha256sum -c "$PHASE3A_ROOT/resident/artifact-sha256.txt"
-
-# Return to the committed Phase 3B candidate and collect without changing any fixture.
-git switch perf/qwen3-coder-single-stream-decode
-PHASE3B_ROOT=/mnt/localssd/benchmarks/prompt2-phase3b-same-host
-scripts/collect_qwen3_coder_prompt2_baseline.sh "$PHASE3B_ROOT/streaming" four-case
-scripts/collect_qwen3_coder_prompt2_baseline.sh "$PHASE3B_ROOT/resident" --resident-only || true
-sha256sum -c "$PHASE3B_ROOT/streaming/artifact-sha256.txt"
-sha256sum -c "$PHASE3B_ROOT/resident/artifact-sha256.txt"
-
-# Writes only the new destination; neither source artifact is modified.
 scripts/compare_qwen3_coder_prompt2_same_host.sh \
-  "$PHASE3A_ROOT" "$PHASE3B_ROOT" \
-  > /mnt/localssd/benchmarks/prompt2-phase3a-vs-phase3b-same-host.json
-jq . /mnt/localssd/benchmarks/prompt2-phase3a-vs-phase3b-same-host.json
+  /path/to/prompt2-phase3a-same-host \
+  /path/to/prompt2-phase3b-same-host \
+  > /path/to/prompt2-phase3a-vs-phase3b-same-host.json
+jq . /path/to/prompt2-phase3a-vs-phase3b-same-host.json
 ```
 
 The resident collector intentionally preserves the historical reference
 `3.500144036461` decode TPS geometric mean from commit
 `327d263193c48f9dde9f6a716562260ab49fa7ef`. The replacement VM is known to
-fall below that cross-VM gate. Keep its `qualification_passed: false` and
+fall below that cross-VM gate. Keep `qualification_passed: false` and its
 failure reason truthful. The comparison helper separately reports the
 contemporaneous Phase 3A-to-3B resident delta and never rewrites either source.
 
-## Success and rollback criteria
-
-Phase 3B is successful only when the same-host Linux report shows all of the
-following:
-
-- streaming and resident correctness, strictness, provenance, prompt identity,
-  critical-path coverage, checksums, and exact output parity pass;
-- every resident Phase 3B counter/histogram remains zero and the same-host
-  resident geometric mean stays within ±2% of Phase 3A;
-- neither 1,536 short nor medium streaming case materially regresses;
-- streaming geometric mean improves beyond likely noise, preferably at least
-  2%;
-- demand storage tail or layer fetch critical path decreases consistently;
-- cache-miss and SSD-byte changes are reported, including increases; and
-- every deferred speculative operation is accounted as resumed, made stale by
-  cache/singleflight state, or dropped by an existing bounded-mechanism counter.
-
-If those criteria fail, retain and checksum the Phase 3B artifacts, record the
-negative result, and revert the runtime arbitration commit (or remove the
-policy while retaining additive telemetry). Do not reinterpret overlap as
-causality, silently update the historical resident reference, or claim Linux
-performance from macOS correctness checks.
+The failed Phase 3B implementation commit and all captured benchmark artifacts
+remain experimental evidence only. Production behavior is Phase 3A.

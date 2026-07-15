@@ -49,25 +49,7 @@ write_raw_case() {
       layer_expert_fetch_critical_path_seconds: 0,
       layer_expert_fetch_critical_path_mean_seconds: 0,
       layer_expert_fetch_critical_path_max_seconds: 0,
-      foreground_demand_bursts_entered: 0,
-      foreground_demand_pressure_active_seconds: 0,
-      speculative_physical_reads_admitted_without_demand_pressure: 0,
-      speculative_physical_reads_deferred_for_demand_pressure: 0,
-      deferred_speculative_physical_reads_resumed: 0,
-      deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit: 0,
-      speculative_physical_reads_active_when_demand_burst_began: 0,
       demand_reads_issued_while_speculative_reads_active: 0,
-      demand_physical_read_service_without_speculation_operations: 0,
-      demand_physical_read_service_without_speculation_seconds: 0,
-      demand_physical_read_service_without_speculation_mean_seconds: 0,
-      demand_physical_read_service_without_speculation_max_seconds: 0,
-      demand_physical_read_service_without_speculation_histogram: [range(0;16) | {count:0}],
-      demand_physical_read_service_with_speculation_operations: 0,
-      demand_physical_read_service_with_speculation_seconds: 0,
-      demand_physical_read_service_with_speculation_mean_seconds: 0,
-      demand_physical_read_service_with_speculation_max_seconds: 0,
-      demand_physical_read_service_with_speculation_histogram: [range(0;16) | {count:0}],
-      demand_layers_final_straggler_issued_while_speculative_reads_active: 0,
       demand_critical_reads_delayed_by_speculative_activity: null,
       final_straggler_routed_slot_histogram: [0,0,0,0,0,0,0,0,0],
       worst_layer_fetch: null
@@ -143,7 +125,7 @@ jq '(.runs[0].demand_miss_fanout.decode.foreground_physical_read_operations) = 1
 mv "$TELEMETRY_FAIL_DIR/baseline-6144-short.json.tmp" \
   "$TELEMETRY_FAIL_DIR/baseline-6144-short.json"
 if bash "$FINALIZER" "$TELEMETRY_FAIL_DIR" test-commit; then
-  echo "expected resident Phase 3 telemetry or arbitration activation to fail qualification" >&2
+  echo "expected resident Phase 3A telemetry activation to fail qualification" >&2
   exit 1
 else
   status=$?
@@ -151,7 +133,7 @@ fi
 test "$status" -eq 1
 jq -e '
   .qualification_passed == false and
-  (.failure_reasons | index("resident cases activated Phase 3 miss-only telemetry or arbitration")) != null
+  (.failure_reasons | index("resident cases activated Phase 3A miss-only telemetry")) != null
 ' "$TELEMETRY_FAIL_DIR/qualification.json" >/dev/null
 jq -e '.resident_gates.zero_phase3_miss_telemetry == false' \
   "$TELEMETRY_FAIL_DIR/resident-control-summary.json" >/dev/null

@@ -22,9 +22,8 @@ use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
     run_inference_mixed_quant, run_inference_mxfp4, run_inference_q4_0, run_inference_q4_0_qmm,
     run_inference_q4k, run_inference_q4k_qmm, run_inference_q5k, run_inference_q6k,
-    run_inference_q8_0_direct_with_timing, synth_hidden_state, uniform_scores,
-    ExpertWeightsError, HiddenState, InferenceOutput, WeightDtype, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_ELEMS,
-    Q8_0_BLOCK_ELEMS,
+    run_inference_q8_0_direct_with_timing, synth_hidden_state, uniform_scores, ExpertWeightsError,
+    HiddenState, InferenceOutput, WeightDtype, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_ELEMS, Q8_0_BLOCK_ELEMS,
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
@@ -875,16 +874,7 @@ pub struct ModelShape {
 /// mode fans the selected experts out across the shared Rayon pool, so
 /// those inner kernels see `in_rayon_worker()` and run inline instead of
 /// recursively occupying the whole pool.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    Eq,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExpertExecutionPolicy {
     #[default]
@@ -1468,9 +1458,9 @@ impl EngineMetrics {
         };
         Self {
             counters: Arc::new(Counters::default()),
-            demand_fetch: Arc::new(
-                crate::demand_fetch_telemetry::DemandFetchTelemetry::new(top_k),
-            ),
+            demand_fetch: Arc::new(crate::demand_fetch_telemetry::DemandFetchTelemetry::new(
+                top_k,
+            )),
             cycle_hist: mk_hist(),
             io_hist: mk_hist(),
             compute_hist: mk_hist(),
@@ -1896,8 +1886,13 @@ impl Engine {
         // automatically when no adapter is present, so this never
         // panics.
         let backend = crate::backend::BackendBox::init_blocking(
-            /* num_layers   = */ 1, /* max_seq_len  = */ 1, /* num_heads    = */ 1,
-            /* num_kv_heads = */ 1, /* head_dim     = */ 1, /* v_head_dim   = */ 1, gpu,
+            /* num_layers   = */ 1,
+            /* max_seq_len  = */ 1,
+            /* num_heads    = */ 1,
+            /* num_kv_heads = */ 1,
+            /* head_dim     = */ 1,
+            /* v_head_dim   = */ 1,
+            gpu,
             self.core.options.policy.expert_size_tolerance(),
         );
         self.core.backend = Arc::new(backend);
@@ -2905,13 +2900,10 @@ impl Engine {
         }
         let buffer_wait_started = observation.map(|_| Instant::now());
         let mut buf = self.core.pool.acquire().await;
-        if let (Some(observation), Some(buffer_wait_started)) =
-            (observation, buffer_wait_started)
-        {
-            observation.layer.record_buffer_wait(
-                observation.routed_slot,
-                buffer_wait_started.elapsed(),
-            );
+        if let (Some(observation), Some(buffer_wait_started)) = (observation, buffer_wait_started) {
+            observation
+                .layer
+                .record_buffer_wait(observation.routed_slot, buffer_wait_started.elapsed());
         }
         // Tier 4: mark this as a foreground (token-blocking) read for the
         // duration of the device I/O so the governor throttles
@@ -2995,10 +2987,6 @@ impl Engine {
     }
 
     fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
-        self.spawn_prefetch_inner(id, p, false);
-    }
-
-    fn spawn_prefetch_inner(self: &Arc<Self>, id: u32, p: f64, was_deferred: bool) {
         // **Dedup before spending a permit.** `union_prefetch` and
         // `speculate_layer_ahead` can both nominate the same id for one
         // token; without this pre-check each duplicate consumed a
@@ -3009,9 +2997,6 @@ impl Engine {
         // fine: the post-spawn `contains` re-check and the singleflight
         // entry below stay authoritative.
         if self.core.cache.contains(id) || self.core.in_flight.contains_key(&id) {
-            if was_deferred {
-                self.metrics.demand_fetch.record_deferred_speculative_drop();
-            }
             return;
         }
         // **Tier 4 admission gate.** Before spending a semaphore permit
@@ -3056,33 +3041,16 @@ impl Engine {
             }
         };
         let me = self.clone();
-        if !was_deferred {
-            self.metrics
-                .counters
-                .prefetch_submitted
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.metrics
+            .counters
+            .prefetch_submitted
+            .fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             // Permit released on task completion (drop). Holding it
             // across the I/O is what enforces the bound.
-            let permit = permit;
-            if me.metrics.demand_fetch.demand_pressure_active() {
-                if !was_deferred {
-                    me.metrics.demand_fetch.record_speculative_deferred();
-                }
-                me.metrics
-                    .demand_fetch
-                    .wait_for_demand_pressure_clear()
-                    .await;
-                drop(permit);
-                me.spawn_prefetch_inner(id, p, true);
-                return;
-            }
+            let _permit = permit;
             // Re-check (could have been loaded by another task in the meantime).
             if me.core.cache.contains(id) {
-                if was_deferred {
-                    me.metrics.demand_fetch.record_deferred_speculative_drop();
-                }
                 return;
             }
             // **Get-or-wait join (Part 3).** Register this prefetch in
@@ -3099,12 +3067,7 @@ impl Engine {
             // in-flight slot, there is nothing useful to do: they are
             // already fetching this id, so drop.
             let notify = match me.core.in_flight.entry(id) {
-                dashmap::mapref::entry::Entry::Occupied(_) => {
-                    if was_deferred {
-                        me.metrics.demand_fetch.record_deferred_speculative_drop();
-                    }
-                    return;
-                }
+                dashmap::mapref::entry::Entry::Occupied(_) => return,
                 dashmap::mapref::entry::Entry::Vacant(vac) => {
                     let n = Arc::new(Notify::new());
                     vac.insert(n.clone());
@@ -3116,18 +3079,12 @@ impl Engine {
             // early return, read error, or success). Followers then
             // re-check the cache: a hit on success, or a re-contention
             // for leadership on failure — never a wedged stale entry.
-            let guard = SingleflightLeaderGuard {
+            let _guard = SingleflightLeaderGuard {
                 map: me.core.in_flight.clone(),
                 id,
                 notify,
                 armed: true,
             };
-            if me.core.cache.contains(id) {
-                if was_deferred {
-                    me.metrics.demand_fetch.record_deferred_speculative_drop();
-                }
-                return;
-            }
             // **Double-buffered acquire (Part 2).** Speculation draws
             // from the **shadow** (Buffer B) half of the pool, never the
             // primary (Buffer A) half that backs the resident LRU and
@@ -3182,34 +3139,11 @@ impl Engine {
                 }
             };
             let started = Instant::now();
-            // `read_expert_if_admitted` resolves the fd/packed slot first,
-            // then executes the packed-state CAS immediately before pread.
-            let arbitration = me.metrics.demand_fetch.clone();
-            let submission = me
-                .core
-                .storage
-                .read_expert_if_admitted(id, &mut buf, move || {
-                    arbitration.try_begin_speculative_read(was_deferred)
-                })
-                .await;
-            let read_result = match submission {
-                crate::io_provider::AdmittedPhysicalRead::Deferred => {
-                    if !was_deferred {
-                        me.metrics.demand_fetch.record_speculative_deferred();
-                    }
-                    drop(buf);
-                    drop(guard);
-                    me.metrics
-                        .demand_fetch
-                        .wait_for_demand_pressure_clear()
-                        .await;
-                    drop(permit);
-                    me.spawn_prefetch_inner(id, p, true);
-                    return;
-                }
-                crate::io_provider::AdmittedPhysicalRead::Completed(result) => result,
-            };
-            match read_result {
+            // Miss-only contention observability: this gauge does not claim
+            // causality. A foreground issue that overlaps it is reported as
+            // shared-device exposure, never as proven speculative delay.
+            let _speculative_read = me.metrics.demand_fetch.begin_speculative_read();
+            match me.core.storage.read_expert(id, &mut buf).await {
                 Ok(_) => {
                     me.metrics
                         .counters
@@ -3291,7 +3225,7 @@ impl Engine {
                         elapsed_us = started.elapsed().as_micros() as u64,
                         "prefetch complete"
                     );
-                    // `guard` drops here: the in-flight slot is removed
+                    // `_guard` drops here: the in-flight slot is removed
                     // and any foreground follower waiting on this id is
                     // woken to re-check the cache — where it now hits.
                 }
@@ -4299,10 +4233,9 @@ impl Engine {
         )> = Vec::new();
         // Allocated lazily on the first initial miss. All-resident layers keep
         // the qualified Phase 1 path: no new timestamp, allocation, lock, or
-        // atomic update is performed for Phase 3 telemetry or arbitration.
-        let mut layer_fetch_tracker: Option<
-            Arc<crate::demand_fetch_telemetry::LayerFetchTracker>,
-        > = None;
+        // atomic update is performed for Phase 3A telemetry.
+        let mut layer_fetch_tracker: Option<Arc<crate::demand_fetch_telemetry::LayerFetchTracker>> =
+            None;
         let mut cache_hits_per_expert: Vec<bool> = Vec::with_capacity(target.len());
         // VRAM (GPU) tier — aggregate hits/misses across this routing
         // decision and record once, rather than incrementing Prometheus
@@ -4356,7 +4289,6 @@ impl Engine {
                         layer,
                         &target,
                         Instant::now(),
-                        self.metrics.demand_fetch.clone(),
                     )
                 });
                 tracker.mark_miss(i);
@@ -4576,47 +4508,49 @@ impl Engine {
                             debug_assert_eq!(residents.len(), weights.len());
                             out.clear();
                             out.resize(self.core.shape.d_model, 0.0);
-                            let accumulate_one = |slot: usize,
-                                                  r_opt: &Option<Arc<ExpertResident>>,
-                                                  acc: &mut [f32]|
-                             -> Result<(), MoeStepError> {
-                                let Some(r) = r_opt else {
-                                    // Degraded mode only: failed fetch drops out of the
-                                    // mixture (strict mode returned above).
-                                    return Ok(());
-                                };
-                                match self.forward_moe_resident(token_idx, layer, r, x, timings) {
-                                    Ok(y) => {
-                                        let weight = weights[slot];
-                                        if weight != 0.0 {
-                                            for (dst, v) in acc.iter_mut().zip(y.iter()) {
-                                                *dst += weight * *v;
+                            let accumulate_one =
+                                |slot: usize,
+                                 r_opt: &Option<Arc<ExpertResident>>,
+                                 acc: &mut [f32]|
+                                 -> Result<(), MoeStepError> {
+                                    let Some(r) = r_opt else {
+                                        // Degraded mode only: failed fetch drops out of the
+                                        // mixture (strict mode returned above).
+                                        return Ok(());
+                                    };
+                                    match self.forward_moe_resident(token_idx, layer, r, x, timings)
+                                    {
+                                        Ok(y) => {
+                                            let weight = weights[slot];
+                                            if weight != 0.0 {
+                                                for (dst, v) in acc.iter_mut().zip(y.iter()) {
+                                                    *dst += weight * *v;
+                                                }
                                             }
+                                            Ok(())
                                         }
-                                        Ok(())
+                                        Err(e) if allow_degraded => {
+                                            self.metrics
+                                                .counters
+                                                .degraded_expert_substitutions
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            warn!(
+                                                token = token_idx,
+                                                expert = r.id,
+                                                error = %e,
+                                                "DEGRADED MODE: expert compute failed; dropping from \
+                                                 mixture (allow_degraded_experts = true, output is \
+                                                 non-authoritative)"
+                                            );
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(MoeStepError::ExpertCompute {
+                                            layer,
+                                            expert: r.id,
+                                            detail: e.to_string(),
+                                        }),
                                     }
-                                    Err(e) if allow_degraded => {
-                                        self.metrics
-                                            .counters
-                                            .degraded_expert_substitutions
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            token = token_idx,
-                                            expert = r.id,
-                                            error = %e,
-                                            "DEGRADED MODE: expert compute failed; dropping from \
-                                             mixture (allow_degraded_experts = true, output is \
-                                             non-authoritative)"
-                                        );
-                                        Ok(())
-                                    }
-                                    Err(e) => Err(MoeStepError::ExpertCompute {
-                                        layer,
-                                        expert: r.id,
-                                        detail: e.to_string(),
-                                    }),
-                                }
-                            };
+                                };
                             match expert_policy {
                                 ExpertExecutionPolicy::ParallelExpertsSingleThread => {
                                     use rayon::prelude::*;
@@ -4624,8 +4558,7 @@ impl Engine {
                                         residents.len().min(crate::parallel::num_threads()).max(1);
                                     let chunk_len = residents.len().div_ceil(chunks).max(1);
                                     let d_model = self.core.shape.d_model;
-                                    let partials: Result<Vec<Vec<f32>>, MoeStepError> = (0
-                                        ..chunks)
+                                    let partials: Result<Vec<Vec<f32>>, MoeStepError> = (0..chunks)
                                         .into_par_iter()
                                         .map(|chunk| {
                                             let start = chunk * chunk_len;
@@ -5004,8 +4937,7 @@ impl Engine {
             expert_buffer_pool_allocated_bytes: self.core.pool.allocated_bytes() as u64,
             expert_buffer_pool_primary_bytes: self.core.pool.primary_allocated_bytes() as u64,
             expert_buffer_pool_shadow_bytes: self.core.pool.shadow_allocated_bytes() as u64,
-            prepared_duplicate_expert_bytes:
-                crate::inference::prepared_duplicate_expert_bytes(),
+            prepared_duplicate_expert_bytes: crate::inference::prepared_duplicate_expert_bytes(),
             q8_direct_kernel_dispatches: crate::inference::q8_direct_kernel_dispatches(),
             q8_scalar_layout_fallbacks: crate::inference::q8_scalar_layout_fallbacks(),
             q8_preparation_seconds: crate::inference::q8_preparation_seconds(),
@@ -5625,7 +5557,10 @@ mod tests {
         let post = engine.report();
 
         assert_eq!(cold, resident, "telemetry must not alter resident output");
-        assert_eq!(post.tokens_processed.saturating_sub(pre.tokens_processed), 1);
+        assert_eq!(
+            post.tokens_processed.saturating_sub(pre.tokens_processed),
+            1
+        );
         assert_eq!(post.misses.saturating_sub(pre.misses), 0);
         assert_eq!(post.hits.saturating_sub(pre.hits), 2);
         assert_eq!(post.demand_fetch.foreground_physical_read_operations, 0);
@@ -5634,61 +5569,6 @@ mod tests {
             .missing_experts_per_layer_nonzero
             .iter()
             .all(|&count| count == 0));
-        assert_eq!(post.demand_fetch.foreground_demand_bursts_entered, 0);
-        assert_eq!(
-            post.demand_fetch.foreground_demand_pressure_active_seconds,
-            0.0
-        );
-        assert_eq!(
-            post.demand_fetch
-                .speculative_physical_reads_admitted_without_demand_pressure,
-            0
-        );
-        assert_eq!(
-            post.demand_fetch
-                .speculative_physical_reads_deferred_for_demand_pressure,
-            0
-        );
-        assert_eq!(
-            post.demand_fetch
-                .deferred_speculative_physical_reads_resumed,
-            0
-        );
-        assert_eq!(
-            post.demand_fetch
-                .deferred_speculative_physical_reads_dropped_stale_duplicate_or_cache_hit,
-            0
-        );
-        assert_eq!(
-            post.demand_fetch
-                .speculative_physical_reads_active_when_demand_burst_began,
-            0
-        );
-        assert_eq!(
-            post.demand_fetch
-                .demand_physical_read_service_without_speculation_operations,
-            0
-        );
-        assert_eq!(
-            post.demand_fetch
-                .demand_physical_read_service_with_speculation_operations,
-            0
-        );
-        assert_eq!(
-            post.demand_fetch
-                .demand_layers_final_straggler_issued_while_speculative_reads_active,
-            0
-        );
-        assert!(post
-            .demand_fetch
-            .demand_physical_read_service_without_speculation_histogram
-            .iter()
-            .chain(
-                post.demand_fetch
-                    .demand_physical_read_service_with_speculation_histogram
-                    .iter()
-            )
-            .all(|bucket| bucket.count == 0));
         assert!(post.demand_fetch.worst_layer_fetch.is_none());
     }
 
