@@ -1,5 +1,5 @@
 # Prompt 2 target-host benchmark template. The collection script replaces the
-# three @...@ placeholders in a per-run artifact directory; do not edit this
+# five @...@ placeholders in a per-run artifact directory; do not edit this
 # file between before and after runs.
 
 [server]
@@ -34,8 +34,8 @@ dtype = "q8_0"
 cache_slots = @CACHE_SLOTS@
 block_align = 4096
 no_direct = false
-predict_fanout = 2
-pipeline_depth = 3
+predict_fanout = @PREDICT_FANOUT@
+pipeline_depth = @PIPELINE_DEPTH@
 predict_min_prob = 0.0
 partial_load_fraction = 1.0
 pin_after_observations = 0

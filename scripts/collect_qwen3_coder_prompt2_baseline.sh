@@ -5,9 +5,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FIXTURES="$ROOT/benchmarks/qwen3-coder-single-stream"
 TEMPLATE="$FIXTURES/qwen3-coder-q8.toml.in"
 FEATURES="avx512,blas,tokenizer,io_uring,q8-candle-reference"
+source "$ROOT/scripts/qwen3_coder_prompt2_collector_config.sh"
 
 : "${MER_QWEN_CONVERTED_DIR:?set MER_QWEN_CONVERTED_DIR to the converted Qwen directory on local NVMe}"
 : "${MER_EXPECTED_NVME_MOUNT:?set MER_EXPECTED_NVME_MOUNT to the local-NVMe mount, for example /mnt/localssd}"
+
+prompt2_resolve_ablation_config
 
 TOKENIZER=${MER_QWEN_TOKENIZER:-$MER_QWEN_CONVERTED_DIR/tokenizer.json}
 ARTIFACT_DIR=${1:-}
@@ -97,6 +100,10 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "rust_log=off"
   echo "no_color=1"
   echo "collector_mode=$COLLECTOR_MODE"
+  echo "experiment_name=prompt2-phase4a-prefetch-ablation"
+  echo "predict_fanout=$PREDICT_FANOUT"
+  echo "pipeline_depth=$PIPELINE_DEPTH"
+  echo "prefetch_expected_active=$PREFETCH_EXPECTED_ACTIVE"
 } > "$ARTIFACT_DIR/environment.txt"
 
 uname -a > "$ARTIFACT_DIR/uname.txt"
@@ -125,24 +132,16 @@ sha256sum "$MODEL_REAL/config.json" "$MODEL_REAL/dense_manifest.json" > "$ARTIFA
 CONFIG_SHA=$(sha256sum "$MODEL_REAL/config.json" | awk '{print $1}')
 DENSE_MANIFEST_SHA=$(sha256sum "$MODEL_REAL/dense_manifest.json" | awk '{print $1}')
 
-render_config() {
-  local slots=$1
-  local output=$2
-  sed \
-    -e "s|@MODEL_DIR@|$MODEL_REAL|g" \
-    -e "s|@TOKENIZER_PATH@|$TOKENIZER_REAL|g" \
-    -e "s|@CACHE_SLOTS@|$slots|g" \
-    "$TEMPLATE" > "$output"
-}
-
-render_config 1536 "$ARTIFACT_DIR/configs/qwen3-coder-q8-1536.toml"
-render_config 6144 "$ARTIFACT_DIR/configs/qwen3-coder-q8-6144.toml"
+prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-1536.toml" \
+  "$MODEL_REAL" "$TOKENIZER_REAL" 1536 "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
+prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-6144.toml" \
+  "$MODEL_REAL" "$TOKENIZER_REAL" 6144 "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
 
 # Physical pool sizing from build_bench_real_runtime:
-# primary=(cache_slots+1), shadow=predict_fanout*pipeline_depth=6.
+# primary=(cache_slots+1), shadow=predict_fanout*pipeline_depth.
 for slots in 1536 6144; do
   primary_slots=$((slots + 1))
-  shadow_slots=6
+  shadow_slots=$((PREDICT_FANOUT * PIPELINE_DEPTH))
   primary_bytes=$((primary_slots * 5017600))
   shadow_bytes=$((shadow_slots * 5017600))
   total_bytes=$((primary_bytes + shadow_bytes))
@@ -170,6 +169,55 @@ fi
 BIN=${MER_BIN:-$ROOT/rust-engine/target/release/micro-expert-router}
 test -x "$BIN"
 sha256sum "$BIN" > "$ARTIFACT_DIR/binary.sha256"
+BINARY_SHA=$(awk '{print $1}' "$ARTIFACT_DIR/binary.sha256")
+HOSTNAME_VALUE=$(hostname)
+LOGICAL_CPU_COUNT=$(getconf _NPROCESSORS_ONLN)
+EFFECTIVE_CPU_MASK=$(awk -F': ' 'NR == 1 {print $2}' "$ARTIFACT_DIR/collector-effective-cpu-mask.txt")
+jq -n \
+  --arg experiment_name "prompt2-phase4a-prefetch-ablation" \
+  --argjson predict_fanout "$PREDICT_FANOUT" \
+  --argjson pipeline_depth "$PIPELINE_DEPTH" \
+  --argjson prefetch_expected_active "$PREFETCH_EXPECTED_ACTIVE" \
+  --arg git_commit_full "$EXPECTED_COMMIT" \
+  --arg config_json_sha256 "$CONFIG_SHA" \
+  --arg dense_manifest_sha256 "$DENSE_MANIFEST_SHA" \
+  --arg short_prompt_sha256 "$SHORT_PROMPT_SHA" \
+  --arg medium_prompt_sha256 "$MEDIUM_PROMPT_SHA" \
+  --arg hostname "$HOSTNAME_VALUE" \
+  --argjson logical_cpu_count "$LOGICAL_CPU_COUNT" \
+  --arg requested_cpu_mask "0-31" \
+  --arg effective_cpu_mask "$EFFECTIVE_CPU_MASK" \
+  --arg cargo_features "$FEATURES" \
+  --arg binary_sha256 "$BINARY_SHA" \
+  --arg collector_mode "$COLLECTOR_MODE" \
+  --slurpfile model_mount "$ARTIFACT_DIR/model-findmnt.json" '
+  {
+    schema: {name:"mer-prompt2-phase4a-ablation-provenance", version:1},
+    experiment_name: $experiment_name,
+    predict_fanout: $predict_fanout,
+    pipeline_depth: $pipeline_depth,
+    prefetch_expected_active: $prefetch_expected_active,
+    git_commit_full: $git_commit_full,
+    model_hashes: {
+      config_json_sha256: $config_json_sha256,
+      dense_manifest_sha256: $dense_manifest_sha256
+    },
+    prompt_hashes: {
+      short_sha256: $short_prompt_sha256,
+      medium_sha256: $medium_prompt_sha256
+    },
+    host: {
+      hostname: $hostname,
+      logical_cpu_count: $logical_cpu_count,
+      requested_cpu_mask: $requested_cpu_mask,
+      effective_cpu_mask: $effective_cpu_mask
+    },
+    model_mount_identity: $model_mount[0].filesystems[0],
+    cargo_features: ($cargo_features | split(",") | sort),
+    binary_sha256: $binary_sha256,
+    collector_mode: $collector_mode
+  }
+' > "$ARTIFACT_DIR/ablation-provenance.json"
 
 run_case() {
   local slots=$1
@@ -207,7 +255,9 @@ run_case() {
     --arg config_sha "$CONFIG_SHA" \
     --arg dense_manifest_sha "$DENSE_MANIFEST_SHA" \
     --argjson slots "$slots" \
-    --argjson prompt_tokens "$expected_prompt_tokens" '
+    --argjson prompt_tokens "$expected_prompt_tokens" \
+    --argjson predict_fanout "$PREDICT_FANOUT" \
+    --argjson pipeline_depth "$PIPELINE_DEPTH" '
     .schema == {"name":"mer-bench-real","version":2} and
     .benchmark == "bench-real" and
     .warmup_runs == 1 and
@@ -270,14 +320,14 @@ run_case() {
       "allow_truncated_expert_payloads":false
     } and
     .memory_layout.primary_expert_pool_allocated_bytes > 0 and
-    .memory_layout.shadow_expert_pool_allocated_bytes > 0 and
+    .memory_layout.shadow_expert_pool_allocated_bytes >= 0 and
     .memory_layout.total_expert_pool_allocated_bytes ==
       (.memory_layout.primary_expert_pool_allocated_bytes + .memory_layout.shadow_expert_pool_allocated_bytes) and
     .memory_layout.prepared_duplicate_expert_bytes == 0 and
     .memory_layout.external_peak_rss_source == "collector:/usr/bin/time-v" and
     .predictive_policy == {
-      "markov_prefetch_fanout":2,
-      "pipeline_depth":3,
+      "markov_prefetch_fanout":$predict_fanout,
+      "pipeline_depth":$pipeline_depth,
       "locality_enabled":false,
       "speculator_enabled":false,
       "affinity_enabled":false,
@@ -313,7 +363,7 @@ run_case() {
       .cache_resident_experts_at_sample <= .cache_capacity_experts and
       .shadow_resident_experts_at_sample >= 0 and
       .expert_read_failures == 0 and
-      .prefetch_enabled == true and
+      .prefetch_enabled == ($predict_fanout > 0) and
       .cache_evictions >= 0 and
       .foreground_read_operations >= 0 and
       .foreground_expert_bytes >= 0 and
@@ -328,7 +378,17 @@ run_case() {
       .prefetch_dropped_concurrency >= 0 and
       .prefetch_dropped_pool_starved >= 0 and
       .prefetch_dropped_governor == 0 and
-      .prefetch_dropped_bytes == 0
+      .prefetch_dropped_bytes == 0 and
+      (if $predict_fanout == 0 then
+        .prefetch_submitted == 0 and
+        .prefetch_completed == 0 and
+        .prefetch_used == 0 and
+        .prefetch_bytes == 0 and
+        .useful_prefetch_bytes == 0 and
+        .unused_prefetch_bytes_at_sample == 0 and
+        .prefetch_dropped_concurrency == 0 and
+        .prefetch_dropped_pool_starved == 0
+      else true end)
     )) and
     ([.runs[].demand_miss_fanout] | all(
       (.semantics | length > 0) and
@@ -372,7 +432,11 @@ run_case() {
         .layer_expert_fetch_critical_path_seconds >= 0 and
         .layer_expert_fetch_critical_path_wall_fraction >= 0 and
         .layers_beginning_compute_before_all_misses_available == 0 and
-        .demand_reads_issued_while_speculative_reads_active >= 0 and
+        (if $predict_fanout == 0 then
+          .demand_reads_issued_while_speculative_reads_active == 0
+        else
+          .demand_reads_issued_while_speculative_reads_active >= 0
+        end) and
         .demand_critical_reads_delayed_by_speculative_activity == null and
         (.final_straggler_routed_slot_histogram | length) == 9 and
         ([.final_straggler_routed_slot_histogram[]] | add) ==
@@ -389,7 +453,7 @@ run_case() {
       .current_rss_sample_point == "after_completion_decode_before_report_serialization" and
       .resident_expert_buffer_bytes >= 0 and
       .primary_expert_pool_allocated_bytes > 0 and
-      .shadow_expert_pool_allocated_bytes > 0 and
+      .shadow_expert_pool_allocated_bytes >= 0 and
       .total_expert_pool_allocated_bytes ==
         (.primary_expert_pool_allocated_bytes + .shadow_expert_pool_allocated_bytes) and
       .prepared_duplicate_expert_bytes == 0 and
@@ -404,8 +468,18 @@ run_case() {
       .coverage_95_percent_passed == true and
       .qualification_passed == true and
       ([.categories[]] | all(type == "number" and . >= 0))
-    ))
+    )) and
+    (if $predict_fanout > 0 then
+      .memory_layout.shadow_expert_pool_allocated_bytes > 0 and
+      ([.runs[].memory.shadow_expert_pool_allocated_bytes] | all(. > 0))
+    else true end)
   ' "$json" >/dev/null
+
+  jq -e \
+    --argjson predict_fanout "$PREDICT_FANOUT" \
+    --argjson pipeline_depth "$PIPELINE_DEPTH" \
+    -f "$ROOT/scripts/qwen3_coder_prompt2_prefetch_qualification.jq" \
+    "$json" >/dev/null
 
   local peak_rss_kib
   peak_rss_kib=$(awk -F: '/Maximum resident set size \(kbytes\)/ {gsub(/[[:space:]]/, "", $2); print $2}' "$ARTIFACT_DIR/$stem.time.txt")
@@ -419,7 +493,21 @@ run_case() {
     --arg prompt_id "$prompt_id" \
     --argjson cache_slots "$slots" \
     --argjson peak_rss_bytes "$peak_rss_bytes" \
-    '{
+    --argjson predict_fanout "$PREDICT_FANOUT" \
+    --argjson pipeline_depth "$PIPELINE_DEPTH" \
+    '([.runs[].cache_io] | {
+      prefetch_submitted: (map(.prefetch_submitted) | add),
+      prefetch_completed: (map(.prefetch_completed) | add),
+      prefetch_used: (map(.prefetch_used) | add),
+      prefetch_bytes: (map(.prefetch_bytes) | add),
+      useful_prefetch_bytes: (map(.useful_prefetch_bytes) | add),
+      unused_prefetch_bytes_at_sample: (map(.unused_prefetch_bytes_at_sample) | add),
+      prefetch_dropped_concurrency: (map(.prefetch_dropped_concurrency) | add),
+      prefetch_dropped_pool_starved: (map(.prefetch_dropped_pool_starved) | add),
+      prefetch_dropped_governor: (map(.prefetch_dropped_governor) | add),
+      prefetch_dropped_bytes: (map(.prefetch_dropped_bytes) | add)
+    }) as $prefetch_counters |
+    {
       schema: {name:"mer-prompt2-case-summary", version:1},
       case: $case,
       cache_slots: $cache_slots,
@@ -441,6 +529,25 @@ run_case() {
       decode_critical_path_coverage_min: ([.runs[].critical_path.decode.coverage_ratio] | min),
       output_token_parity: .aggregate.output_token_parity,
       qualification_passed: true,
+      phase4a_prefetch: {
+        requested_predict_fanout: $predict_fanout,
+        requested_pipeline_depth: $pipeline_depth,
+        expected_active: ($predict_fanout > 0),
+        reported_enabled_values: ([.runs[].cache_io.prefetch_enabled] | unique),
+        all_runs_reported_expected_enabled: (
+          [.runs[].cache_io.prefetch_enabled] | all(. == ($predict_fanout > 0))
+        ),
+        counters: $prefetch_counters,
+        all_prefetch_counters_zero: (
+          [$prefetch_counters[]] | all(. == 0)
+        ),
+        prompt_demand_reads_issued_while_speculative_reads_active: (
+          [.runs[].demand_miss_fanout.prompt.demand_reads_issued_while_speculative_reads_active] | add
+        ),
+        decode_demand_reads_issued_while_speculative_reads_active: (
+          [.runs[].demand_miss_fanout.decode.demand_reads_issued_while_speculative_reads_active] | add
+        )
+      },
       phase3a_decode: {
         routed_layers_observed: ([.runs[].demand_miss_fanout.decode.routed_layers_observed] | add),
         routed_expert_activations_observed: ([.runs[].demand_miss_fanout.decode.routed_expert_activations_observed] | add),

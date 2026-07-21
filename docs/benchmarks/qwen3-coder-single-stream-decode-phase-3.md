@@ -19,6 +19,26 @@ Phase 3B is disabled and no Phase 3B production performance claim is made.
 macOS results are correctness evidence only and are not Linux or NVMe
 performance evidence.
 
+## Post-recovery Linux validation
+
+The recovery disposition at commit
+`f8d9bec77c401a3fa495ce53cef4d9e11c19ab00` was subsequently validated
+successfully on the qualified Linux x86_64 target. The post-recovery controls
+had a streaming geometric-mean delta of
+`-0.09392105780625659%` and a resident geometric-mean delta of
+`+0.22680199849025584%`. All streaming qualifications and output-token parity
+gates passed.
+
+The historical fixed resident-reference gate remained false on both controls,
+as expected for the replacement VM, while the contemporaneous resident
+comparison was within ±2%. That cross-VM historical gate is retained as an
+auditable fact and is not used to reject the stable same-host controls.
+
+This validation does not change the Phase 3 disposition: Phase 3B remains
+rejected and disabled. Phase 4A instead holds the runtime commit fixed and
+tests whether the existing predictive prefetch configuration provides positive
+net value relative to a configuration that fully disables it.
+
 ## Qualified Linux A-B-A result
 
 All three collections ran on the same qualified GCP `g2-standard-32`: Linux
