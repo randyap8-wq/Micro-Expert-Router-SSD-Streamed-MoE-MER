@@ -5818,7 +5818,22 @@ mod tests {
                     .expect("demand expert id") as u32
             })
             .collect::<Vec<_>>();
-        assert_eq!(demand_read_sequence, vec![1, 3, 5]);
+        // Physical demand reads run concurrently, so their issue-event order is
+        // intentionally scheduler-dependent even though routing order is stable.
+        assert_eq!(
+            demand_read_sequence.len(),
+            3,
+            "all three routed experts must issue demand reads"
+        );
+
+        let mut observed_demand_experts = demand_read_sequence.clone();
+        observed_demand_experts.sort_unstable();
+
+        assert_eq!(
+            observed_demand_experts,
+            vec![1, 3, 5],
+            "demand reads may issue concurrently in any order, but must cover exactly the routed experts"
+        );
 
         trace.inject_writer_failure();
         let control_after_failure = control
