@@ -1626,13 +1626,31 @@ impl Phase4bTrace {
                         && !l.publication_rejected
                 })
                 .count() as u64;
-            lifecycle.still_resident_unused_at_sample = state
+            lifecycle.first_use = 0;
+            lifecycle.evicted_before_first_use = 0;
+            lifecycle.still_resident_unused_at_sample = 0;
+            for published in state
                 .lifecycles
                 .values()
-                .filter(|l| {
-                    l.published_ns.is_some() && l.first_use_ns.is_none() && l.evicted_ns.is_none()
-                })
-                .count() as u64;
+                .filter(|lifecycle| lifecycle.published_ns.is_some())
+            {
+                match (
+                    published.first_use_ns.is_some(),
+                    published.evicted_ns.is_some(),
+                ) {
+                    (true, _) => {
+                        lifecycle.first_use = lifecycle.first_use.saturating_add(1);
+                    }
+                    (false, true) => {
+                        lifecycle.evicted_before_first_use =
+                            lifecycle.evicted_before_first_use.saturating_add(1);
+                    }
+                    (false, false) => {
+                        lifecycle.still_resident_unused_at_sample =
+                            lifecycle.still_resident_unused_at_sample.saturating_add(1);
+                    }
+                }
+            }
             let mut timeliness = state.timeliness.clone();
             timeliness.published_but_never_requested = lifecycle.still_resident_unused_at_sample;
             timeliness.completed_but_publication_rejected = lifecycle.publication_rejected;
@@ -2221,6 +2239,62 @@ mod tests {
         assert_eq!(
             snapshot.predictor_quality.cross_request_history_use_count,
             1
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn published_terminal_snapshot_excludes_unpublished_first_use_observations() {
+        let path = temp_path("published-terminal-population");
+        let trace = Phase4bTrace::open(&path, 256).unwrap();
+        let request = trace.begin_request("fixture", 0, true);
+
+        let consumed_before_publication = candidate(&trace, request, 1, 0);
+        trace.transition(consumed_before_publication, "admitted");
+        trace.transition(consumed_before_publication, "task_spawned");
+        trace.transition(consumed_before_publication, "singleflight_leader");
+        let pending_read = trace.speculative_read_issued(consumed_before_publication, 4096);
+        let lookup = trace.initial_lookup(request, 0, 1, 0, 1, false);
+        assert_eq!(
+            lookup.classification,
+            InitialLookupClass::SpeculativeReadInFlight
+        );
+        trace.physical_read_completed(pending_read, 4096);
+        trace.lookup_available(lookup);
+        trace.layer_compute_start(request, 0, 1, &[1]);
+
+        let published_but_unused = candidate(&trace, request, 2, 1);
+        publish(&trace, published_but_unused);
+
+        assert_eq!(
+            trace.state.lock().lifecycle.first_use,
+            1,
+            "the cumulative observation counter retains the unpublished first use"
+        );
+        let snapshot = trace.snapshot();
+        assert_eq!(snapshot.lifecycle.physical_read_completed, 2);
+        assert_eq!(snapshot.lifecycle.published, 1);
+        assert_eq!(snapshot.lifecycle.completion_not_yet_published_at_sample, 1);
+        assert_eq!(
+            snapshot.lifecycle.first_use, 0,
+            "an unpublished first-use observation is outside the published terminal population"
+        );
+        assert_eq!(snapshot.lifecycle.evicted_before_first_use, 0);
+        assert_eq!(snapshot.lifecycle.still_resident_unused_at_sample, 1);
+        assert_eq!(
+            snapshot.lifecycle.first_use
+                + snapshot.lifecycle.evicted_before_first_use
+                + snapshot.lifecycle.still_resident_unused_at_sample,
+            snapshot.lifecycle.published,
+            "published terminal categories must be mutually exclusive and exhaustive"
+        );
+        assert!(snapshot.lifecycle_reconciliation_passed);
+        assert!(snapshot.lifecycle_reconciliation_errors.is_empty());
+
+        let body = std::fs::read_to_string(&path).expect("trace body");
+        assert!(
+            body.contains("\"transition\":\"first_use\""),
+            "the cumulative first-use observation must remain in the emitted trace"
         );
         let _ = std::fs::remove_file(path);
     }
