@@ -159,6 +159,7 @@ mod multi_layer_cache;
 mod numa;
 mod packed_storage;
 mod parallel;
+mod phase4b;
 mod prefetch_governor;
 mod pregate;
 mod rayon_autotune;
@@ -2337,6 +2338,9 @@ struct BenchRealSuiteReport {
     strictness: BenchRealStrictnessInfo,
     memory_layout: BenchRealMemoryLayout,
     predictive_policy: BenchRealPredictivePolicy,
+    phase4b_trace_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase4b_trace: Option<crate::phase4b::Phase4bSnapshot>,
     build: BenchRealBuildInfo,
     aggregate: BenchRealAggregate,
     runs: Vec<BenchRealRunReport>,
@@ -2482,6 +2486,8 @@ struct BenchRealRunReport {
     critical_path: BenchRealCriticalPath,
     diagnostic_stage_timings: BenchRealDiagnosticStageTimings,
     demand_miss_fanout: BenchRealDemandFetchTelemetry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase4b_diagnostics: Option<crate::phase4b::Phase4bSnapshot>,
     output_token_ids: Vec<u32>,
     output_text: String,
     stage_timings: std::collections::BTreeMap<String, crate::stage_timing::StageTimingSnapshot>,
@@ -2502,21 +2508,61 @@ struct BenchRealAggregate {
     output_token_parity: bool,
 }
 
+fn phase4b_trace_from_env(
+) -> Result<Option<Arc<crate::phase4b::Phase4bTrace>>, Box<dyn std::error::Error>> {
+    let Some(path) = std::env::var_os("MER_PROMPT2_PHASE4B_TRACE_PATH") else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let max_events = match std::env::var("MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS") {
+        Ok(raw) => raw.parse::<u64>().map_err(|_| {
+            format!(
+                "MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS must be a positive integer, got {raw:?}"
+            )
+        })?,
+        Err(std::env::VarError::NotPresent) => 1_000_000,
+        Err(error) => {
+            return Err(format!(
+                "MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS is not valid Unicode: {error}"
+            )
+            .into())
+        }
+    };
+    if max_events == 0 {
+        return Err("MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS must be greater than zero".into());
+    }
+    let path = PathBuf::from(path);
+    Ok(Some(Arc::new(crate::phase4b::Phase4bTrace::open(
+        &path, max_events,
+    )?)))
+}
+
 async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::Error>> {
     let input = load_bench_real_input(&args)?;
+    let phase4b_trace = phase4b_trace_from_env()?;
     if args.measured_runs == 0 {
         return Err("bench-real requires --measured-runs > 0".into());
     }
 
     if args.cache_reset == BenchRealCacheReset::Keep {
-        let runtime = build_bench_real_runtime(&args.config).await?;
+        let runtime = build_bench_real_runtime(&args.config, phase4b_trace.clone()).await?;
         let context = build_bench_real_report_context(&runtime, &input)?;
         let params = bench_sampling_params(&runtime.cfg, args.greedy);
         for i in 0..args.warmup_runs {
             let _ = with_progress_timeout(
                 format!("bench-real warmup run {i}"),
                 args.progress_watchdog,
-                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i),
+                run_bench_real_once(
+                    &runtime,
+                    &input.prompt_id,
+                    &input.prompt,
+                    input.output_tokens,
+                    params,
+                    i,
+                    false,
+                ),
             )
             .await?;
         }
@@ -2527,7 +2573,15 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
                 with_progress_timeout(
                     format!("bench-real measured run {i}"),
                     args.progress_watchdog,
-                    run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i),
+                    run_bench_real_once(
+                        &runtime,
+                        &input.prompt_id,
+                        &input.prompt,
+                        input.output_tokens,
+                        params,
+                        i,
+                        true,
+                    ),
                 )
                 .await?,
             );
@@ -2536,12 +2590,20 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
         emit_bench_real_report(&args, input, context, runs)?;
     } else {
         for i in 0..args.warmup_runs {
-            let runtime = build_bench_real_runtime(&args.config).await?;
+            let runtime = build_bench_real_runtime(&args.config, phase4b_trace.clone()).await?;
             let params = bench_sampling_params(&runtime.cfg, args.greedy);
             let _ = with_progress_timeout(
                 format!("bench-real warmup run {i}"),
                 args.progress_watchdog,
-                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i),
+                run_bench_real_once(
+                    &runtime,
+                    &input.prompt_id,
+                    &input.prompt,
+                    input.output_tokens,
+                    params,
+                    i,
+                    false,
+                ),
             )
             .await?;
         }
@@ -2549,7 +2611,7 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
         let mut runs = Vec::with_capacity(args.measured_runs);
         let mut context = None;
         for i in 0..args.measured_runs {
-            let runtime = build_bench_real_runtime(&args.config).await?;
+            let runtime = build_bench_real_runtime(&args.config, phase4b_trace.clone()).await?;
             if context.is_none() {
                 context = Some(build_bench_real_report_context(&runtime, &input)?);
             }
@@ -2558,7 +2620,15 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
                 with_progress_timeout(
                     format!("bench-real measured run {i}"),
                     args.progress_watchdog,
-                    run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i),
+                    run_bench_real_once(
+                        &runtime,
+                        &input.prompt_id,
+                        &input.prompt,
+                        input.output_tokens,
+                        params,
+                        i,
+                        true,
+                    ),
                 )
                 .await?,
             );
@@ -3571,6 +3641,7 @@ fn validate_bench_real_policies(cfg: &crate::config::Config) -> Result<(), Strin
 
 async fn build_bench_real_runtime(
     config_path: &Path,
+    phase4b_trace: Option<Arc<crate::phase4b::Phase4bTrace>>,
 ) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
     use crate::config::Config;
     use crate::metrics::Metrics;
@@ -3828,6 +3899,9 @@ async fn build_bench_real_runtime(
             cfg.model.top_k,
         ));
         engine_builder = engine_builder.with_pregate(pregate);
+    }
+    if let Some(trace) = phase4b_trace {
+        engine_builder = engine_builder.with_phase4b_trace(trace);
     }
     let engine = Arc::new(engine_builder.with_metrics(metrics));
 
@@ -4388,11 +4462,17 @@ fn bench_real_demand_fetch_phase(
 
 async fn run_bench_real_once(
     runtime: &BenchRealRuntime,
+    prompt_fixture_id: &str,
     prompt: &str,
     output_tokens: usize,
     params: crate::sampling::SamplingParams,
     run_index: usize,
+    measured: bool,
 ) -> Result<BenchRealRunReport, Box<dyn std::error::Error>> {
+    let phase4b_request =
+        runtime
+            .engine
+            .begin_phase4b_request(prompt_fixture_id, run_index, measured);
     let prompt_ids = runtime.tokenizer.encode(prompt)?;
     if prompt_ids.is_empty() {
         return Err("bench-real prompt encoded to zero tokens".into());
@@ -4570,6 +4650,9 @@ async fn run_bench_real_once(
         ),
     };
 
+    runtime.engine.end_phase4b_request(phase4b_request);
+    let phase4b_diagnostics = runtime.engine.phase4b_snapshot();
+
     Ok(BenchRealRunReport {
         run_index,
         prompt_tokens: prompt_ids.len(),
@@ -4671,6 +4754,7 @@ async fn run_bench_real_once(
             decode: decode_stage_timings,
         },
         demand_miss_fanout,
+        phase4b_diagnostics,
         output_token_ids: completion_ids,
         output_text,
         stage_timings,
@@ -4692,6 +4776,9 @@ fn emit_bench_real_report(
         memory_layout,
         predictive_policy,
     } = context;
+    let phase4b_trace = runs
+        .last()
+        .and_then(|run| run.phase4b_diagnostics.clone());
     let suite = BenchRealSuiteReport {
         schema: BenchRealSchemaInfo {
             name: "mer-bench-real".to_string(),
@@ -4711,6 +4798,8 @@ fn emit_bench_real_report(
         strictness,
         memory_layout,
         predictive_policy,
+        phase4b_trace_enabled: phase4b_trace.is_some(),
+        phase4b_trace,
         build: BenchRealBuildInfo {
             git_commit: execution.git_commit_full.clone(),
             worktree_dirty: execution.worktree_dirty_at_execution,

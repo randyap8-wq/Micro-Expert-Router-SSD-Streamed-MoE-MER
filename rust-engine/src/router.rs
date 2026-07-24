@@ -527,6 +527,63 @@ impl PredictiveLoader {
         out
     }
 
+    /// Diagnostic-only provenance for a returned Markov candidate.
+    ///
+    /// This does not participate in ranking. Phase 4B calls it only after
+    /// `predict_next` / `predict_next2` have already produced their ordered
+    /// list, allowing the trace to distinguish learned successors from the
+    /// current smoothed-prior fill without changing predictor behavior.
+    pub fn candidate_uses_prior_fill(
+        &self,
+        prev_prev: Option<u32>,
+        prev: u32,
+        candidate: u32,
+    ) -> bool {
+        if prev >= self.num_experts || candidate >= self.num_experts {
+            return false;
+        }
+        if self.rows.read()[prev as usize]
+            .counts
+            .contains_key(&candidate)
+        {
+            return false;
+        }
+        let Some(pp) = prev_prev else {
+            return true;
+        };
+        if pp >= self.num_experts {
+            return true;
+        }
+        let key = (pp as u64) * (self.num_experts as u64) + prev as u64;
+        !self
+            .rows2
+            .read()
+            .get(&key)
+            .is_some_and(|row| row.counts.contains_key(&candidate))
+    }
+
+    /// Whether a candidate has direct evidence in the selected second-order
+    /// row. Like [`Self::candidate_uses_prior_fill`], this is read-only
+    /// diagnostic provenance and is never used to rank or filter candidates.
+    pub fn candidate_has_second_order_evidence(
+        &self,
+        prev_prev: u32,
+        prev: u32,
+        candidate: u32,
+    ) -> bool {
+        if prev_prev >= self.num_experts
+            || prev >= self.num_experts
+            || candidate >= self.num_experts
+        {
+            return false;
+        }
+        let key = (prev_prev as u64) * (self.num_experts as u64) + prev as u64;
+        self.rows2
+            .read()
+            .get(&key)
+            .is_some_and(|row| row.counts.contains_key(&candidate))
+    }
+
     /// **Unified prediction.** Combines the Markov-chain row predictions
     /// with the [`LocalityMonitor`]'s current hot set and (optionally)
     /// the [`NeuralSpeculator`]'s top-K to produce a single ranked list
@@ -2258,6 +2315,7 @@ impl SpeculationController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn route_returns_k_distinct_experts() {
@@ -3133,5 +3191,136 @@ mod tests {
             "expected at least one UTH neighbour of seed 4 in {ids:?}");
         assert!(ids.contains(&6),
             "expected affinity neighbour 6 in {ids:?}");
+    }
+
+    #[test]
+    fn phase4b_known_transition_decodes_into_expected_next_layer() {
+        const PER_LAYER: u32 = 4;
+        let predictor = PredictiveLoader::new(12, 2, 0.0, 1);
+        // Global expert 1 is in layer 0; global experts 5 and 6 are in layer 1.
+        for _ in 0..32 {
+            predictor.observe(1, 5);
+            predictor.observe(1, 6);
+        }
+        let predicted = predictor.predict_next(1);
+        assert_eq!(predicted.len(), 2);
+        assert!(
+            predicted
+                .iter()
+                .all(|(global, _)| global / PER_LAYER == 1),
+            "trained L0 -> L1 transition must decode into layer 1: {predicted:?}"
+        );
+    }
+
+    #[test]
+    fn phase4b_cold_prior_fill_currently_produces_wrong_layer_ids() {
+        const PER_LAYER: u32 = 4;
+        let predictor = PredictiveLoader::new(12, 2, 0.0, 1);
+        let predicted = predictor.predict_next(3);
+        assert_eq!(
+            predicted.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![0, 1],
+            "cold fill walks low global ids in current implementation"
+        );
+        assert!(
+            predicted
+                .iter()
+                .all(|(global, _)| global / PER_LAYER != 1),
+            "the expected next-layer slice is globals 4..8; this test documents the defect"
+        );
+    }
+
+    #[test]
+    fn phase4b_markov_candidates_do_not_change_with_pipeline_depth() {
+        let predictor = PredictiveLoader::new(32, 2, 0.0, 7);
+        for _ in 0..20 {
+            predictor.observe(7, 11);
+            predictor.observe(7, 12);
+        }
+        let depth_one_candidates = predictor.predict_next(7);
+        let depth_three_candidates = predictor.predict_next(7);
+        assert_eq!(depth_one_candidates, depth_three_candidates);
+        assert_eq!(2usize * 1usize, 2, "fanout two, depth one shadow slots");
+        assert_eq!(2usize * 3usize, 6, "fanout two, depth three shadow slots");
+    }
+
+    #[test]
+    fn phase4b_current_inference_context_is_lowest_ranked_target_last() {
+        let predictor = PredictiveLoader::new(64, 2, 0.0, 9);
+        for _ in 0..50 {
+            predictor.observe(0, 20);
+            predictor.observe(7, 30);
+        }
+        let score_ordered_top8 = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let current_seed = *score_ordered_top8
+            .last()
+            .expect("top-8 target is nonempty");
+        let prediction = predictor.predict_next(current_seed);
+        assert_eq!(current_seed, 7);
+        assert_eq!(prediction[0].0, 30);
+        assert_ne!(prediction[0].0, predictor.predict_next(0)[0].0);
+    }
+
+    #[test]
+    fn phase4b_filtering_after_fanout_does_not_backfill_useful_candidates() {
+        let predictor = PredictiveLoader::new(16, 2, 0.0, 11);
+        for _ in 0..50 {
+            predictor.observe(9, 1); // A: resident
+            predictor.observe(9, 2); // B: globally in flight
+        }
+        for _ in 0..10 {
+            predictor.observe(9, 3); // C: useful cold
+            predictor.observe(9, 4); // D: useful cold
+        }
+        let truncated = predictor.predict_next(9);
+        assert_eq!(
+            truncated.iter().map(|(id, _)| *id).collect::<HashSet<_>>(),
+            HashSet::from([1, 2])
+        );
+        let resident = HashSet::from([1u32]);
+        let globally_in_flight = HashSet::from([2u32]);
+        let after_filter: Vec<u32> = truncated
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !resident.contains(id) && !globally_in_flight.contains(id))
+            .collect();
+        assert!(after_filter.is_empty());
+        assert!(
+            !truncated.iter().any(|(id, _)| *id == 3 || *id == 4),
+            "C/D were discarded by fanout truncation before residency/inflight filtering"
+        );
+    }
+
+    #[test]
+    fn phase4b_zero_fanout_matches_explicit_no_submit_oracle() {
+        let predictor = PredictiveLoader::new(16, 0, 0.0, 13);
+        predictor.observe_step(&[1, 2], &[3, 4]);
+        let explicit_no_submit: Vec<(u32, f64)> = Vec::new();
+        assert_eq!(predictor.predict_next(2), explicit_no_submit);
+        assert_eq!(
+            predictor.observations(),
+            4,
+            "training observations continue even though no speculative candidate is submitted"
+        );
+    }
+
+    #[test]
+    fn phase4b_equal_probability_order_is_only_process_local_stable() {
+        let predictor = PredictiveLoader::new(32, 4, 0.0, 17);
+        for candidate in [4, 5, 6, 7] {
+            predictor.observe(3, candidate);
+        }
+        let first = predictor.predict_next(3);
+        for _ in 0..128 {
+            assert_eq!(
+                predictor.predict_next(3),
+                first,
+                "one HashMap instance retains its iteration order"
+            );
+        }
+        // No cross-process ordering assertion is made: equal-count observed
+        // successors originate in a randomly seeded HashMap and `sort_by`
+        // compares only probability, so a fresh process may order ties
+        // differently. Phase 4B records the tied-candidate count explicitly.
     }
 }

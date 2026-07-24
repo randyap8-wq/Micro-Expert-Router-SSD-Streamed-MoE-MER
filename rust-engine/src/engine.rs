@@ -28,6 +28,10 @@ use crate::inference::{
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
 use crate::multi_layer_cache::MultiLayerExpertCache;
+use crate::phase4b::{
+    CandidateTicket as Phase4bCandidateTicket, LookupTicket as Phase4bLookupTicket,
+    Phase4bSnapshot, Phase4bTrace, PredictorArm,
+};
 use crate::router::{
     DecayWorkerHandle, LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader,
 };
@@ -1145,6 +1149,10 @@ pub(crate) struct EngineCore {
 pub(crate) struct MarkovHistory {
     pub(crate) ids: Vec<u32>,
     pub(crate) layer: Option<u32>,
+    /// Diagnostic request identity. It is never consulted by the predictor
+    /// policy; Phase 4B uses it only to detect engine-global history crossing
+    /// a benchmark request boundary.
+    pub(crate) request_id: u64,
 }
 
 /// The two-deep Markov history ring (`prev` + `prev_prev`) behind a
@@ -1320,6 +1328,10 @@ pub(crate) struct EngineMetrics {
     /// Optional JSONL trace sink. When set, every `generate` call
     /// appends one record. See [`TraceWriter`] and gist Phase 6.
     pub(super) trace_writer: parking_lot::RwLock<Option<Arc<TraceWriter>>>,
+    /// Prompt 2 Phase 4B collector. This is immutable after engine
+    /// construction, so the disabled hot path is one `Option` check and does
+    /// not take the legacy trace-writer lock.
+    pub(super) phase4b: Option<Arc<Phase4bTrace>>,
 }
 
 impl EngineCore {
@@ -1471,6 +1483,7 @@ impl EngineMetrics {
             tokens_processed: AtomicU64::new(0),
             prom: None,
             trace_writer: parking_lot::RwLock::new(None),
+            phase4b: None,
         }
     }
 }
@@ -1530,6 +1543,17 @@ enum MoeStepResult {
 struct DemandFetchContext {
     layer: Arc<crate::demand_fetch_telemetry::LayerFetchTracker>,
     routed_slot: usize,
+    phase4b_lookup: Option<Phase4bLookupTicket>,
+}
+
+#[derive(Clone, Debug)]
+struct Phase4bPredictionContext {
+    request_id: u64,
+    token_index: u64,
+    source_layer: u32,
+    expected_target_layer: Option<u32>,
+    predictor_context: Vec<u32>,
+    current_target: Vec<u32>,
 }
 
 /// Error taxonomy for a failed real-model MoE step (hardening pass,
@@ -1926,6 +1950,38 @@ impl Engine {
     /// the underlying file. Passing `None` disables tracing.
     pub fn set_trace_writer(&self, writer: Option<Arc<TraceWriter>>) {
         *self.metrics.trace_writer.write() = writer;
+    }
+
+    /// Install the opt-in Prompt 2 Phase 4B diagnostic collector.
+    ///
+    /// This builder is intentionally separate from the legacy `--trace-out`
+    /// routing trace. With no collector installed, every Phase 4B call site
+    /// exits after a single immutable `Option` check.
+    pub fn with_phase4b_trace(mut self, trace: Arc<Phase4bTrace>) -> Self {
+        self.metrics.phase4b = Some(trace);
+        self
+    }
+
+    pub fn begin_phase4b_request(
+        &self,
+        fixture_id: &str,
+        repetition_index: usize,
+        measured: bool,
+    ) -> Option<u64> {
+        self.metrics
+            .phase4b
+            .as_ref()
+            .map(|trace| trace.begin_request(fixture_id, repetition_index, measured))
+    }
+
+    pub fn end_phase4b_request(&self, request_id: Option<u64>) {
+        if let (Some(trace), Some(request_id)) = (self.metrics.phase4b.as_ref(), request_id) {
+            trace.end_request(request_id);
+        }
+    }
+
+    pub fn phase4b_snapshot(&self) -> Option<Phase4bSnapshot> {
+        self.metrics.phase4b.as_ref().map(|trace| trace.snapshot())
     }
 
     /// Install an alias map. Calls to [`Self::generate`] / prefetch will
@@ -2363,6 +2419,12 @@ impl Engine {
             ring.last = MarkovHistory {
                 ids: target.clone(),
                 layer: None,
+                request_id: self
+                    .metrics
+                    .phase4b
+                    .as_ref()
+                    .map(|trace| trace.current_request_id())
+                    .unwrap_or(0),
             };
         }
         // Kick off speculative prefetches for the most-recent expert,
@@ -2392,7 +2454,7 @@ impl Engine {
             // `moe_step`). Synthetic single-layer benchmark path: no
             // layer-qualified id geometry, so no affinity fold.
             let in_flight: HashSet<u32> = target.iter().copied().collect();
-            self.union_prefetch(&s_markov, &m_speculator, &in_flight, None);
+            self.union_prefetch(&s_markov, &m_speculator, &in_flight, None, None);
         }
 
         let had_misses = !miss_handles.is_empty();
@@ -2747,6 +2809,12 @@ impl Engine {
                         .counters
                         .singleflight_followers
                         .fetch_add(1, Ordering::Relaxed);
+                    if let (Some(trace), Some(lookup)) = (
+                        self.metrics.phase4b.as_ref(),
+                        observation.as_ref().and_then(|ctx| ctx.phase4b_lookup),
+                    ) {
+                        trace.lookup_singleflight_follower(lookup);
+                    }
                     return Ok(r);
                 }
                 if self.core.in_flight.contains_key(&id) {
@@ -2765,6 +2833,12 @@ impl Engine {
                             .counters
                             .singleflight_followers
                             .fetch_add(1, Ordering::Relaxed);
+                        if let (Some(trace), Some(lookup)) = (
+                            self.metrics.phase4b.as_ref(),
+                            observation.as_ref().and_then(|ctx| ctx.phase4b_lookup),
+                        ) {
+                            trace.lookup_singleflight_follower(lookup);
+                        }
                         return Ok(r);
                     }
                     // Leader failed. Loop back and contend for the
@@ -2808,6 +2882,12 @@ impl Engine {
                     .counters
                     .singleflight_followers
                     .fetch_add(1, Ordering::Relaxed);
+                if let (Some(trace), Some(lookup)) = (
+                    self.metrics.phase4b.as_ref(),
+                    observation.as_ref().and_then(|ctx| ctx.phase4b_lookup),
+                ) {
+                    trace.lookup_singleflight_follower(lookup);
+                }
                 return Ok(r);
             }
 
@@ -2895,6 +2975,9 @@ impl Engine {
                     .cache_evictions
                     .fetch_add(1, Ordering::Relaxed);
                 debug!(evicted = evicted.id, "evicted LRU to make room");
+                if let Some(trace) = self.metrics.phase4b.as_ref() {
+                    trace.record_eviction(evicted.id);
+                }
                 drop(evicted);
             }
         }
@@ -2910,6 +2993,12 @@ impl Engine {
         // speculation that would otherwise queue ahead of it. No-op when
         // the governor is disabled.
         let _fg = self.core.governor.foreground_guard();
+        let phase4b_read = self
+            .metrics
+            .phase4b
+            .as_ref()
+            .zip(observation.and_then(|ctx| ctx.phase4b_lookup))
+            .map(|(trace, lookup)| trace.demand_read_issued(lookup, buf.len() as u64));
         let read_result = match observation {
             Some(observation) => {
                 let observer = observation.layer.physical_read_observer(
@@ -2925,6 +3014,9 @@ impl Engine {
         };
         match read_result {
             Ok(_) => {
+                if let (Some(trace), Some(read)) = (self.metrics.phase4b.as_ref(), phase4b_read) {
+                    trace.physical_read_completed(read, buf.len() as u64);
+                }
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.metrics.io_hist.lock().record(io_us.max(1));
                 // Track every byte the engine actually pulls off the
@@ -2954,11 +3046,14 @@ impl Engine {
                     self.core.storage.config().block_align,
                 ));
                 match self.core.cache.insert(resident.clone()) {
-                    Ok(Some(_evicted)) => {
+                    Ok(Some(evicted)) => {
                         self.metrics
                             .counters
                             .cache_evictions
                             .fetch_add(1, Ordering::Relaxed);
+                        if let Some(trace) = self.metrics.phase4b.as_ref() {
+                            trace.record_eviction(evicted.id);
+                        }
                         debug!(expert = id, "inserted (with eviction)")
                     }
                     Ok(None) => debug!(expert = id, "inserted"),
@@ -2980,13 +3075,21 @@ impl Engine {
                 Ok(resident)
             }
             Err(e) => {
+                if let (Some(trace), Some(read)) = (self.metrics.phase4b.as_ref(), phase4b_read) {
+                    trace.physical_read_failed(read, &e.to_string());
+                }
                 // The buffer is returned to the pool when `buf` is dropped.
                 Err(FetchOnceError::Io(e.to_string()))
             }
         }
     }
 
-    fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
+    fn spawn_prefetch(
+        self: &Arc<Self>,
+        id: u32,
+        p: f64,
+        phase4b_ticket: Option<Phase4bCandidateTicket>,
+    ) {
         // **Dedup before spending a permit.** `union_prefetch` and
         // `speculate_layer_ahead` can both nominate the same id for one
         // token; without this pre-check each duplicate consumed a
@@ -2996,7 +3099,16 @@ impl Engine {
         // genuinely new one. Racing with a concurrent insert/landing is
         // fine: the post-spawn `contains` re-check and the singleflight
         // entry below stay authoritative.
-        if self.core.cache.contains(id) || self.core.in_flight.contains_key(&id) {
+        if self.core.cache.contains(id) {
+            if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), phase4b_ticket) {
+                trace.transition(ticket, "filtered_resident");
+            }
+            return;
+        }
+        if self.core.in_flight.contains_key(&id) {
+            if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), phase4b_ticket) {
+                trace.transition(ticket, "filtered_global_in_flight");
+            }
             return;
         }
         // **Tier 4 admission gate.** Before spending a semaphore permit
@@ -3016,6 +3128,9 @@ impl Engine {
                 score = p,
                 "governor throttled speculative prefetch"
             );
+            if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), phase4b_ticket) {
+                trace.transition(ticket, "rejected_governor");
+            }
             return;
         }
         // Speculative prefetches are *bounded*: each spawn must hold
@@ -3037,9 +3152,17 @@ impl Engine {
                     expert = id,
                     "skipping prefetch: concurrency ceiling reached"
                 );
+                if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), phase4b_ticket)
+                {
+                    trace.transition(ticket, "rejected_concurrency_limit");
+                }
                 return;
             }
         };
+        if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), phase4b_ticket) {
+            trace.transition(ticket, "admitted");
+            trace.transition(ticket, "task_spawned");
+        }
         let me = self.clone();
         self.metrics
             .counters
@@ -3051,6 +3174,9 @@ impl Engine {
             let _permit = permit;
             // Re-check (could have been loaded by another task in the meantime).
             if me.core.cache.contains(id) {
+                if let (Some(trace), Some(ticket)) = (me.metrics.phase4b.as_ref(), phase4b_ticket) {
+                    trace.transition(ticket, "cache_race_found_resident");
+                }
                 return;
             }
             // **Get-or-wait join (Part 3).** Register this prefetch in
@@ -3067,10 +3193,22 @@ impl Engine {
             // in-flight slot, there is nothing useful to do: they are
             // already fetching this id, so drop.
             let notify = match me.core.in_flight.entry(id) {
-                dashmap::mapref::entry::Entry::Occupied(_) => return,
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    if let (Some(trace), Some(ticket)) =
+                        (me.metrics.phase4b.as_ref(), phase4b_ticket)
+                    {
+                        trace.transition(ticket, "singleflight_follower");
+                    }
+                    return;
+                }
                 dashmap::mapref::entry::Entry::Vacant(vac) => {
                     let n = Arc::new(Notify::new());
                     vac.insert(n.clone());
+                    if let (Some(trace), Some(ticket)) =
+                        (me.metrics.phase4b.as_ref(), phase4b_ticket)
+                    {
+                        trace.transition(ticket, "singleflight_leader");
+                    }
                     n
                 }
             };
@@ -3103,6 +3241,11 @@ impl Engine {
                     Some(b) => b,
                     None => {
                         me.note_prefetch_dropped_pool_starved(id);
+                        if let (Some(trace), Some(ticket)) =
+                            (me.metrics.phase4b.as_ref(), phase4b_ticket)
+                        {
+                            trace.transition(ticket, "rejected_shadow_pool_exhaustion");
+                        }
                         return;
                     }
                 },
@@ -3127,12 +3270,20 @@ impl Engine {
                             recycled = victim.id,
                             "shadow pool starved: recycled LRU shadow-backed resident"
                         );
+                        if let Some(trace) = me.metrics.phase4b.as_ref() {
+                            trace.record_eviction(victim.id);
+                        }
                         drop(victim);
                         me.core.pool.try_acquire_shadow()
                     }) {
                         Some(b) => b,
                         None => {
                             me.note_prefetch_dropped_pool_starved(id);
+                            if let (Some(trace), Some(ticket)) =
+                                (me.metrics.phase4b.as_ref(), phase4b_ticket)
+                            {
+                                trace.transition(ticket, "rejected_shadow_pool_exhaustion");
+                            }
                             return;
                         }
                     }
@@ -3143,8 +3294,17 @@ impl Engine {
             // causality. A foreground issue that overlaps it is reported as
             // shared-device exposure, never as proven speculative delay.
             let _speculative_read = me.metrics.demand_fetch.begin_speculative_read();
+            let phase4b_read = me
+                .metrics
+                .phase4b
+                .as_ref()
+                .zip(phase4b_ticket)
+                .map(|(trace, ticket)| trace.speculative_read_issued(ticket, buf.len() as u64));
             match me.core.storage.read_expert(id, &mut buf).await {
                 Ok(_) => {
+                    if let (Some(trace), Some(read)) = (me.metrics.phase4b.as_ref(), phase4b_read) {
+                        trace.physical_read_completed(read, buf.len() as u64);
+                    }
                     me.metrics
                         .counters
                         .prefetch_completed
@@ -3183,16 +3343,24 @@ impl Engine {
                         buf,
                         me.core.storage.config().block_align,
                     ));
+                    if let (Some(trace), Some(ticket)) =
+                        (me.metrics.phase4b.as_ref(), phase4b_ticket)
+                    {
+                        trace.transition(ticket, "publication_attempted");
+                    }
                     // Prefetches are best-effort: if the cache rejects
                     // the insert (every slot pinned), the resident drops
                     // here and its buffer returns to the shadow pool —
                     // exactly the right behaviour for a speculative load.
                     match me.core.cache.insert(resident.clone()) {
-                        Ok(Some(_evicted)) => {
+                        Ok(Some(evicted)) => {
                             me.metrics
                                 .counters
                                 .cache_evictions
                                 .fetch_add(1, Ordering::Relaxed);
+                            if let Some(trace) = me.metrics.phase4b.as_ref() {
+                                trace.record_eviction(evicted.id);
+                            }
                         }
                         Ok(None) => {}
                         Err(_rejected) => {
@@ -3200,8 +3368,18 @@ impl Engine {
                                 expert = id,
                                 "prefetch dropped: cache full of pinned entries"
                             );
+                            if let (Some(trace), Some(ticket)) =
+                                (me.metrics.phase4b.as_ref(), phase4b_ticket)
+                            {
+                                trace.transition(ticket, "publication_rejected");
+                            }
                             return;
                         }
+                    }
+                    if let (Some(trace), Some(ticket)) =
+                        (me.metrics.phase4b.as_ref(), phase4b_ticket)
+                    {
+                        trace.published(ticket);
                     }
                     // **Eager VRAM promotion.** A speculative prefetch is
                     // a strong "about to be routed" signal, so try to
@@ -3229,7 +3407,12 @@ impl Engine {
                     // and any foreground follower waiting on this id is
                     // woken to re-check the cache — where it now hits.
                 }
-                Err(e) => warn!(expert = id, error = %e, "prefetch failed"),
+                Err(e) => {
+                    if let (Some(trace), Some(read)) = (me.metrics.phase4b.as_ref(), phase4b_read) {
+                        trace.physical_read_failed(read, &e.to_string());
+                    }
+                    warn!(expert = id, error = %e, "prefetch failed")
+                }
             }
         });
     }
@@ -3652,7 +3835,7 @@ impl Engine {
                 if !self.core.cache.contains(canon) {
                     // The shadow-pool bound and prefetch semaphore keep
                     // this windowed look-ahead from over-committing.
-                    self.spawn_prefetch(canon, prob);
+                    self.spawn_prefetch(canon, prob, None);
                 }
             }
         }
@@ -3672,7 +3855,7 @@ impl Engine {
             // experts share the canonical resident copy, then issue the
             // speculative read with the pre-gate's high confidence tag.
             let id = self.resolve_alias(id);
-            self.spawn_prefetch(id, crate::pregate::PREGATE_PREFETCH_PROB);
+            self.spawn_prefetch(id, crate::pregate::PREGATE_PREFETCH_PROB, None);
         }
     }
 
@@ -3700,6 +3883,7 @@ impl Engine {
         m_speculator: &[u32],
         already_in_flight: &HashSet<u32>,
         layer: Option<u32>,
+        phase4b_context: Option<&Phase4bPredictionContext>,
     ) {
         // Locality (L) arm — the monitor's current hot set, or empty.
         let locality_ids: Vec<u32> = self
@@ -3773,14 +3957,71 @@ impl Engine {
         // the fuse/fold above (we only ever skip ids, never reorder). On
         // an alias collision the first (higher-scored) id wins.
         let mut seen: HashSet<u32> = already_in_flight.clone();
-        let mut candidates: Vec<(u32, f64)> = Vec::with_capacity(scored.len());
-        for (id, score) in scored {
+        let mut candidates: Vec<(u32, f64, Option<Phase4bCandidateTicket>)> =
+            Vec::with_capacity(scored.len());
+        let mut combined_list = Vec::with_capacity(scored.len());
+        for (rank, (id, score)) in scored.into_iter().enumerate() {
             let canon = self.resolve_alias(id);
-            if self.core.cache.contains(canon) {
+            let resident = self.core.cache.contains(canon);
+            let current_target = already_in_flight.contains(&canon);
+            let globally_in_flight = self.core.in_flight.contains_key(&canon);
+            let ticket =
+                self.metrics
+                    .phase4b
+                    .as_ref()
+                    .zip(phase4b_context)
+                    .map(|(trace, context)| {
+                        let decoded = self
+                            .core
+                            .storage
+                            .config()
+                            .num_experts_per_layer
+                            .filter(|stride| *stride > 0)
+                            .map(|stride| global_to_layer_local(canon, stride));
+                        let belongs = context
+                            .expected_target_layer
+                            .zip(decoded)
+                            .map(|(expected, (decoded_layer, _))| expected == decoded_layer);
+                        trace.candidate_generated(
+                            context.request_id,
+                            context.token_index,
+                            context.source_layer,
+                            context.expected_target_layer,
+                            &context.predictor_context,
+                            PredictorArm::Combined,
+                            rank,
+                            score as f64,
+                            canon,
+                            decoded.map(|pair| pair.0),
+                            decoded.map(|pair| pair.1),
+                            belongs,
+                            context.current_target.contains(&canon),
+                            resident,
+                            globally_in_flight,
+                        )
+                    });
+            combined_list.push((canon, score as f64));
+            if resident {
+                if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), ticket) {
+                    trace.transition(ticket, "filtered_resident");
+                }
+                continue;
+            }
+            if current_target {
+                if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), ticket) {
+                    trace.transition(ticket, "filtered_current_target");
+                }
                 continue;
             }
             if seen.insert(canon) {
-                candidates.push((canon, score as f64));
+                candidates.push((canon, score as f64, ticket));
+            } else if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), ticket) {
+                trace.transition(ticket, "filtered_global_in_flight");
+            }
+        }
+        if let Some(trace) = self.metrics.phase4b.as_ref() {
+            if phase4b_context.is_some() {
+                trace.finish_candidate_list(PredictorArm::Combined, &combined_list);
             }
         }
         // Truncate to the shadow-slot budget: in-flight speculation can
@@ -3792,10 +4033,17 @@ impl Engine {
         // semaphore alone bounds concurrency — leave the list intact.
         let budget = self.core.pool.shadow_capacity();
         if budget > 0 && candidates.len() > budget {
+            if let Some(trace) = self.metrics.phase4b.as_ref() {
+                for (_, _, ticket) in &candidates[budget..] {
+                    if let Some(ticket) = ticket {
+                        trace.transition(*ticket, "rejected_concurrency_limit");
+                    }
+                }
+            }
             candidates.truncate(budget);
         }
-        for (canon, p) in candidates {
-            self.spawn_prefetch(canon, p);
+        for (canon, p, ticket) in candidates {
+            self.spawn_prefetch(canon, p, ticket);
         }
     }
 
@@ -4127,6 +4375,38 @@ impl Engine {
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids (mirrors `generate`).
         let target: Vec<u32> = experts.iter().map(|&id| self.resolve_alias(id)).collect();
+        let phase4b_identity = self.metrics.phase4b.as_ref().map(|trace| {
+            let request_id = trace.current_request_id();
+            let layers = self.core.cache.num_layers().max(1) as u64;
+            let trace_token_index = if layers > 1 {
+                token_idx / layers
+            } else {
+                token_idx
+            };
+            let per_layer = self.core.storage.config().num_experts_per_layer;
+            let local_experts: Vec<u32> = target
+                .iter()
+                .map(|&id| per_layer.map_or(id, |stride| global_to_layer_local(id, stride).1))
+                .collect();
+            let weights: Vec<f32> = match &output_mode {
+                MoeStepOutputMode::PerExpert => Vec::new(),
+                MoeStepOutputMode::WeightedInto { weights, .. } => weights.to_vec(),
+            };
+            let history_request_id = {
+                let ring = self.speculation.markov_ring.lock();
+                (ring.last.request_id != 0).then_some(ring.last.request_id)
+            };
+            trace.record_routing(
+                request_id,
+                trace_token_index,
+                layer,
+                &target,
+                &local_experts,
+                &weights,
+                history_request_id,
+            );
+            (request_id, trace_token_index)
+        });
 
         // Locality monitor: observe and reconcile pinning. Same
         // semantics as in `generate`.
@@ -4194,11 +4474,82 @@ impl Engine {
             // `markov_layers_contiguous`); otherwise fall back to the
             // 1st-order row keyed on the current seed alone.
             let contiguous = self.markov_layers_contiguous(ring.last.layer, Some(layer));
-            let s_markov = match ring.last.ids.last() {
-                Some(&pp) if contiguous => self.core.predictor.predict_next2(pp, seed),
-                _ => self.core.predictor.predict_next(seed),
+            let previous_context = match ring.last.ids.last() {
+                Some(&pp) if contiguous => Some(pp),
+                _ => None,
+            };
+            let s_markov = match previous_context {
+                Some(pp) => self.core.predictor.predict_next2(pp, seed),
+                None => self.core.predictor.predict_next(seed),
             };
             drop(ring);
+            let phase4b_prediction = phase4b_identity.map(|(request_id, token_index)| {
+                let mut predictor_context = Vec::with_capacity(2);
+                if let Some(pp) = previous_context {
+                    predictor_context.push(pp);
+                }
+                predictor_context.push(seed);
+                let context = Phase4bPredictionContext {
+                    request_id,
+                    token_index,
+                    source_layer: layer,
+                    expected_target_layer: layer
+                        .checked_add(1)
+                        .filter(|next| (*next as usize) < self.core.cache.num_layers()),
+                    predictor_context,
+                    current_target: target.clone(),
+                };
+                if let Some(trace) = self.metrics.phase4b.as_ref() {
+                    let per_layer = self.core.storage.config().num_experts_per_layer;
+                    let mut lists: HashMap<PredictorArm, Vec<(u32, f64)>> = HashMap::new();
+                    for (rank, &(candidate, score)) in s_markov.iter().enumerate() {
+                        let arm = if self.core.predictor.candidate_uses_prior_fill(
+                            previous_context,
+                            seed,
+                            candidate,
+                        ) {
+                            PredictorArm::FallbackPriorFill
+                        } else if previous_context.is_some_and(|pp| {
+                            self.core
+                                .predictor
+                                .candidate_has_second_order_evidence(pp, seed, candidate)
+                        }) {
+                            PredictorArm::SecondOrderMarkov
+                        } else {
+                            PredictorArm::FirstOrderMarkov
+                        };
+                        let decoded = per_layer
+                            .filter(|stride| *stride > 0)
+                            .map(|stride| global_to_layer_local(candidate, stride));
+                        let belongs = context
+                            .expected_target_layer
+                            .zip(decoded)
+                            .map(|(expected, (decoded_layer, _))| expected == decoded_layer);
+                        trace.candidate_generated(
+                            request_id,
+                            token_index,
+                            layer,
+                            context.expected_target_layer,
+                            &context.predictor_context,
+                            arm,
+                            rank,
+                            score,
+                            candidate,
+                            decoded.map(|pair| pair.0),
+                            decoded.map(|pair| pair.1),
+                            belongs,
+                            target.contains(&candidate),
+                            self.core.cache.contains(candidate),
+                            self.core.in_flight.contains_key(&candidate),
+                        );
+                        lists.entry(arm).or_default().push((candidate, score));
+                    }
+                    for (arm, candidates) in lists {
+                        trace.finish_candidate_list(arm, &candidates);
+                    }
+                }
+                context
+            });
             // The gate's own targets are *not* speculative: the miss
             // loop below fetches them into primary (Buffer A) buffers
             // microseconds from now. Passing them as
@@ -4207,7 +4558,13 @@ impl Engine {
             // scarce shadow slots — and from winning the singleflight
             // slot so the foreground miss lands in a shadow buffer.
             let in_flight: HashSet<u32> = target.iter().copied().collect();
-            self.union_prefetch(&s_markov, &m_speculator, &in_flight, Some(layer));
+            self.union_prefetch(
+                &s_markov,
+                &m_speculator,
+                &in_flight,
+                Some(layer),
+                phase4b_prediction.as_ref(),
+            );
         }
 
         // **Layer-ahead look-ahead (Part 1).** Independently of the
@@ -4252,7 +4609,13 @@ impl Engine {
                     gpu_misses_acc += 1;
                 }
             }
-            if let Some(r) = self.core.cache.get(id) {
+            let cached = self.core.cache.get(id);
+            let phase4b_lookup = self.metrics.phase4b.as_ref().zip(phase4b_identity).map(
+                |(trace, (request_id, token_index))| {
+                    trace.initial_lookup(request_id, token_index, layer, i, id, cached.is_some())
+                },
+            );
+            if let Some(r) = cached {
                 self.metrics.counters.hits.fetch_add(1, Ordering::Relaxed);
                 let new_hits = r.record_hit();
                 // Tier 4 precision feedback (mirrors `generate`): a
@@ -4297,13 +4660,20 @@ impl Engine {
                 let observation = DemandFetchContext {
                     layer: tracker.clone(),
                     routed_slot: i,
+                    phase4b_lookup,
                 };
+                let task_phase4b_lookup = phase4b_lookup;
                 miss_handles.push((
                     i,
                     tokio::spawn(async move {
                         let result = me.fetch_with_retry_observed(id, Some(observation)).await;
                         if result.is_ok() {
                             task_tracker.record_available(i);
+                            if let (Some(trace), Some(lookup)) =
+                                (me.metrics.phase4b.as_ref(), task_phase4b_lookup)
+                            {
+                                trace.lookup_available(lookup);
+                            }
                         }
                         result
                     }),
@@ -4426,6 +4796,11 @@ impl Engine {
             io_wait_elapsed,
         );
         let io_wait_us = io_wait_elapsed.as_micros() as u64;
+        if let (Some(trace), Some((request_id, token_index))) =
+            (self.metrics.phase4b.as_ref(), phase4b_identity)
+        {
+            trace.layer_compute_start(request_id, token_index, layer, &target);
+        }
         if let Some(tracker) = layer_fetch_tracker.as_ref() {
             tracker.record_compute_begin();
             tracker.finish_fetch(&self.metrics.demand_fetch);
@@ -4600,6 +4975,11 @@ impl Engine {
         if let Some(tracker) = layer_fetch_tracker.as_ref() {
             tracker.finish_layer(&self.metrics.demand_fetch);
         }
+        if let (Some(trace), Some((request_id, token_index))) =
+            (self.metrics.phase4b.as_ref(), phase4b_identity)
+        {
+            trace.layer_compute_complete(request_id, token_index, layer);
+        }
         self.metrics
             .total_io_wait_us
             .fetch_add(io_wait_us, Ordering::Relaxed);
@@ -4644,6 +5024,12 @@ impl Engine {
             ring.last = MarkovHistory {
                 ids: target.clone(),
                 layer: Some(layer),
+                request_id: self
+                    .metrics
+                    .phase4b
+                    .as_ref()
+                    .map(|trace| trace.current_request_id())
+                    .unwrap_or(0),
             };
         }
 
@@ -5332,6 +5718,125 @@ mod tests {
     use crate::router::{PredictiveLoader, TopKRouter};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn phase4b_disabled_path_has_no_collector_writer_or_event_state() {
+        let metrics = EngineMetrics::new(8);
+        assert!(metrics.phase4b.is_none());
+        // Every production call site is guarded by this immutable option.
+        // With `None`, no Phase4B event value is built, no JSON serializer is
+        // called, and no Phase4B writer/state lock can be reached.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phase4b_tiny_real_moe_smoke_records_routing_lookup_and_demand_io() {
+        let dir = TempDir::new("phase4b-real-moe-smoke");
+        let control_dir = TempDir::new("phase4b-real-moe-control");
+        let trace_path = dir.path.join("trace.jsonl");
+        let trace = Arc::new(crate::phase4b::Phase4bTrace::open(&trace_path, 512).unwrap());
+        let engine = build_engine(
+            &dir.path, /*num_experts=*/ 8, /*d_model=*/ 16, /*d_ff=*/ 32,
+            /*cache_slots=*/ 8, /*top_k=*/ 3, /*predict_fanout=*/ 0,
+            /*seed=*/ 0x4B,
+        );
+        let engine = match Arc::try_unwrap(engine) {
+            Ok(engine) => Arc::new(engine.with_phase4b_trace(trace.clone())),
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        let request = engine.begin_phase4b_request("tiny-fixture", 0, true);
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x4B);
+        let control = build_engine(
+            &control_dir.path,
+            /*num_experts=*/ 8,
+            /*d_model=*/ 16,
+            /*d_ff=*/ 32,
+            /*cache_slots=*/ 8,
+            /*top_k=*/ 3,
+            /*predict_fanout=*/ 0,
+            /*seed=*/ 0x4B,
+        );
+        let control_output = control
+            .moe_step(0, 0, &hidden, &[1, 3, 5])
+            .await
+            .expect("untraced no-submit control");
+        let output = engine
+            .moe_step(0, 0, &hidden, &[1, 3, 5])
+            .await
+            .expect("tiny traced moe step");
+        assert_eq!(output.len(), 3);
+        assert_eq!(output, control_output);
+        engine.end_phase4b_request(request);
+
+        let snapshot = engine.phase4b_snapshot().expect("trace snapshot");
+        assert_eq!(snapshot.initial_lookup.ordinary_miss, 3);
+        assert_eq!(snapshot.read_overlap.demand_physical_reads, 3);
+        assert_eq!(snapshot.lifecycle.physical_read_issued, 0);
+        assert!(snapshot.lifecycle_reconciliation_passed);
+        let traced_report = engine.report();
+        let control_report = control.report();
+        assert_eq!(traced_report.cache_capacity, control_report.cache_capacity);
+        assert_eq!(traced_report.pool_capacity, control_report.pool_capacity);
+        assert_eq!(
+            traced_report.expert_buffer_pool_primary_bytes,
+            control_report.expert_buffer_pool_primary_bytes
+        );
+        assert_eq!(traced_report.expert_buffer_pool_shadow_bytes, 0);
+        assert_eq!(control_report.expert_buffer_pool_shadow_bytes, 0);
+        assert_eq!(traced_report.prefetch_submitted, 0);
+        assert_eq!(control_report.prefetch_submitted, 0);
+        assert_eq!(
+            traced_report.predictor_observations,
+            control_report.predictor_observations
+        );
+        let body = std::fs::read_to_string(trace_path).expect("trace body");
+        assert!(body.contains("\"event_type\":\"routing\""));
+        assert!(body.contains("\"event_type\":\"initial_demand_lookup\""));
+        assert!(body.contains("\"read_classification\":\"demand\""));
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid trace JSONL"))
+            .collect();
+        let routed_ids = events
+            .iter()
+            .find(|event| event["event_type"] == "routing")
+            .expect("routing event")["payload"]["ordered_global_topk_expert_ids"]
+            .as_array()
+            .expect("routed IDs")
+            .iter()
+            .map(|id| id.as_u64().expect("u64 expert id") as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(routed_ids, vec![1, 3, 5]);
+        let demand_read_sequence = events
+            .iter()
+            .filter(|event| {
+                event["event_type"] == "physical_read_issued"
+                    && event["payload"]["read_classification"] == "demand"
+            })
+            .map(|event| {
+                event["payload"]["expert_id"]
+                    .as_u64()
+                    .expect("demand expert id") as u32
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(demand_read_sequence, vec![1, 3, 5]);
+
+        trace.inject_writer_failure();
+        let control_after_failure = control
+            .moe_step(1, 0, &hidden, &[1, 3, 5])
+            .await
+            .expect("untraced control after injected writer failure");
+        let traced_after_failure = engine
+            .moe_step(1, 0, &hidden, &[1, 3, 5])
+            .await
+            .expect("writer failure must not corrupt inference");
+        assert_eq!(traced_after_failure, control_after_failure);
+        assert!(
+            engine
+                .phase4b_snapshot()
+                .expect("failed-writer snapshot")
+                .trace_write_failed
+        );
+    }
 
     /// Self-cleaning unique temp directory for test fixtures.
     struct TempDir {
@@ -6386,7 +6891,7 @@ mod tests {
         // semaphore cap of 1 the vast majority must be refused.
         let burst = 256u32;
         for id in 0..burst {
-            engine.spawn_prefetch(id % num_experts, 0.5);
+            engine.spawn_prefetch(id % num_experts, 0.5, None);
         }
         // Give in-flight prefetches a moment to settle.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -7161,7 +7666,7 @@ mod tests {
 
         // Helper: spawn a prefetch and wait until the id is resident.
         async fn prefetch_and_wait(engine: &Arc<Engine>, id: u32) {
-            engine.spawn_prefetch(id, 0.5);
+            engine.spawn_prefetch(id, 0.5, None);
             for _ in 0..200 {
                 if engine.core.cache.contains(id) {
                     return;
@@ -7188,7 +7693,7 @@ mod tests {
         );
         // A *pinned* shadow-backed resident must never be recycled.
         engine.core.cache.pin(1);
-        engine.spawn_prefetch(2, 0.5);
+        engine.spawn_prefetch(2, 0.5, None);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             engine.core.cache.contains(1),

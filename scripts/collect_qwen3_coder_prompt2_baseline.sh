@@ -28,6 +28,22 @@ case "$MODE_ARG" in
     ;;
 esac
 
+PHASE4B_TRACE_TEMPLATE=${MER_PROMPT2_PHASE4B_TRACE_PATH:-}
+PHASE4B_TRACE_MAX_EVENTS=${MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS:-1000000}
+if [[ -n "$PHASE4B_TRACE_TEMPLATE" ]]; then
+  if [[ "$PHASE4B_TRACE_TEMPLATE" != *'{case}'* ]]; then
+    echo "MER_PROMPT2_PHASE4B_TRACE_PATH must contain {case} for collector runs (one bounded trace per case)" >&2
+    exit 2
+  fi
+  if [[ ! "$PHASE4B_TRACE_MAX_EVENTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS must be a positive integer" >&2
+    exit 2
+  fi
+  PHASE4B_TRACE_ENABLED=true
+else
+  PHASE4B_TRACE_ENABLED=false
+fi
+
 for value in "$MER_QWEN_CONVERTED_DIR" "$TOKENIZER"; do
   if [[ "$value" == *'&'* || "$value" == *'|'* || "$value" == *$'\n'* ]]; then
     echo "benchmark paths must not contain &, |, or a newline: $value" >&2
@@ -104,6 +120,9 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "predict_fanout=$PREDICT_FANOUT"
   echo "pipeline_depth=$PIPELINE_DEPTH"
   echo "prefetch_expected_active=$PREFETCH_EXPECTED_ACTIVE"
+  echo "phase4b_trace_enabled=$PHASE4B_TRACE_ENABLED"
+  echo "phase4b_trace_path_template=$PHASE4B_TRACE_TEMPLATE"
+  echo "phase4b_trace_max_events=$PHASE4B_TRACE_MAX_EVENTS"
 } > "$ARTIFACT_DIR/environment.txt"
 
 uname -a > "$ARTIFACT_DIR/uname.txt"
@@ -228,8 +247,17 @@ run_case() {
   local json="$ARTIFACT_DIR/$stem.json"
   local request="$FIXTURES/prompts/$prompt_id.json"
   local config="$ARTIFACT_DIR/configs/qwen3-coder-q8-$slots.toml"
+  local -a phase4b_env=()
+  if [[ "$PHASE4B_TRACE_ENABLED" == true ]]; then
+    local phase4b_trace_path=${PHASE4B_TRACE_TEMPLATE//\{case\}/$stem}
+    phase4b_env=(
+      env
+      "MER_PROMPT2_PHASE4B_TRACE_PATH=$phase4b_trace_path"
+      "MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS=$PHASE4B_TRACE_MAX_EVENTS"
+    )
+  fi
 
-  /usr/bin/time -v \
+  "${phase4b_env[@]}" /usr/bin/time -v \
     -o "$ARTIFACT_DIR/$stem.time.txt" \
     "$BIN" \
     --rayon-threads 30 \
@@ -257,7 +285,8 @@ run_case() {
     --argjson slots "$slots" \
     --argjson prompt_tokens "$expected_prompt_tokens" \
     --argjson predict_fanout "$PREDICT_FANOUT" \
-    --argjson pipeline_depth "$PIPELINE_DEPTH" '
+    --argjson pipeline_depth "$PIPELINE_DEPTH" \
+    --argjson phase4b_trace_enabled "$PHASE4B_TRACE_ENABLED" '
     .schema == {"name":"mer-bench-real","version":2} and
     .benchmark == "bench-real" and
     .warmup_runs == 1 and
@@ -336,6 +365,51 @@ run_case() {
       "pregate_enabled":false,
       "static_residency_fraction":0
     } and
+    .phase4b_trace_enabled == $phase4b_trace_enabled and
+    (if $phase4b_trace_enabled then
+      .phase4b_trace.schema_name == "mer-prompt2-phase4b-routing-trace" and
+      .phase4b_trace.schema_version == 1 and
+      (.phase4b_trace.trace_path | length) > 0 and
+      .phase4b_trace.max_events > 0 and
+      .phase4b_trace.events_written > 0 and
+      .phase4b_trace.events_dropped >= 0 and
+      (.phase4b_trace.trace_truncated | type) == "boolean" and
+      .phase4b_trace.trace_write_failed == false and
+      .phase4b_trace.lifecycle_reconciliation_passed == true and
+      .phase4b_trace.lifecycle.physical_read_issued ==
+        (.phase4b_trace.lifecycle.physical_read_completed +
+         .phase4b_trace.lifecycle.physical_read_failed +
+         .phase4b_trace.lifecycle.physical_read_inflight_at_sample) and
+      .phase4b_trace.lifecycle.physical_read_completed ==
+        (.phase4b_trace.lifecycle.published +
+         .phase4b_trace.lifecycle.publication_rejected +
+         .phase4b_trace.lifecycle.completion_not_yet_published_at_sample) and
+      .phase4b_trace.lifecycle.published ==
+        (.phase4b_trace.lifecycle.first_use +
+         .phase4b_trace.lifecycle.evicted_before_first_use +
+         .phase4b_trace.lifecycle.still_resident_unused_at_sample) and
+      ([.runs[].phase4b_diagnostics] | all(
+        .schema_name == "mer-prompt2-phase4b-routing-trace" and
+        .schema_version == 1 and
+        .max_events > 0 and
+        .trace_write_failed == false and
+        .lifecycle_reconciliation_passed == true and
+        .lifecycle.physical_read_issued ==
+          (.lifecycle.physical_read_completed +
+           .lifecycle.physical_read_failed +
+           .lifecycle.physical_read_inflight_at_sample) and
+        .lifecycle.physical_read_completed ==
+          (.lifecycle.published +
+           .lifecycle.publication_rejected +
+           .lifecycle.completion_not_yet_published_at_sample) and
+        .lifecycle.published ==
+          (.lifecycle.first_use +
+           .lifecycle.evicted_before_first_use +
+           .lifecycle.still_resident_unused_at_sample)
+      ))
+    else
+      ([.runs[] | has("phase4b_diagnostics")] | all(. == false))
+    end) and
     .aggregate.output_token_parity == true and
     (.runs | length == 5) and
     ([.runs[].prompt_tokens] | all(. == $prompt_tokens)) and

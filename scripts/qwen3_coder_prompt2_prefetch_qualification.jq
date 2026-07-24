@@ -43,4 +43,48 @@
 (if $predict_fanout > 0 then
   .memory_layout.shadow_expert_pool_allocated_bytes > 0 and
   ([.runs[].memory.shadow_expert_pool_allocated_bytes] | all(. > 0))
-else true end)
+else true end) and
+(if (.phase4b_trace_enabled // false) then
+  .phase4b_trace.schema_name == "mer-prompt2-phase4b-routing-trace" and
+  .phase4b_trace.schema_version == 1 and
+  (.phase4b_trace.trace_path | length) > 0 and
+  .phase4b_trace.max_events > 0 and
+  .phase4b_trace.events_written > 0 and
+  .phase4b_trace.events_dropped >= 0 and
+  (.phase4b_trace.trace_truncated | type) == "boolean" and
+  .phase4b_trace.trace_write_failed == false and
+  .phase4b_trace.lifecycle_reconciliation_passed == true and
+  .phase4b_trace.lifecycle.physical_read_issued ==
+    (.phase4b_trace.lifecycle.physical_read_completed +
+     .phase4b_trace.lifecycle.physical_read_failed +
+     .phase4b_trace.lifecycle.physical_read_inflight_at_sample) and
+  .phase4b_trace.lifecycle.physical_read_completed ==
+    (.phase4b_trace.lifecycle.published +
+     .phase4b_trace.lifecycle.publication_rejected +
+     .phase4b_trace.lifecycle.completion_not_yet_published_at_sample) and
+  .phase4b_trace.lifecycle.published ==
+    (.phase4b_trace.lifecycle.first_use +
+     .phase4b_trace.lifecycle.evicted_before_first_use +
+     .phase4b_trace.lifecycle.still_resident_unused_at_sample) and
+  ([.runs[].phase4b_diagnostics] | all(
+    .schema_name == "mer-prompt2-phase4b-routing-trace" and
+    .schema_version == 1 and
+    .max_events > 0 and
+    .trace_write_failed == false and
+    .lifecycle_reconciliation_passed == true and
+    .lifecycle.physical_read_issued ==
+      (.lifecycle.physical_read_completed +
+       .lifecycle.physical_read_failed +
+       .lifecycle.physical_read_inflight_at_sample) and
+    .lifecycle.physical_read_completed ==
+      (.lifecycle.published +
+       .lifecycle.publication_rejected +
+       .lifecycle.completion_not_yet_published_at_sample) and
+    .lifecycle.published ==
+      (.lifecycle.first_use +
+       .lifecycle.evicted_before_first_use +
+       .lifecycle.still_resident_unused_at_sample)
+  ))
+else
+  ([.runs[] | has("phase4b_diagnostics")] | all(. == false))
+end)

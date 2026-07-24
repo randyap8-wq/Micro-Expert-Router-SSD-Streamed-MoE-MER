@@ -94,6 +94,53 @@ jq -e \
   -f "$QUALIFIER" \
   "$TEST_ROOT/no-prefetch-report.json" >/dev/null
 
+jq '
+  def phase4b:
+    {
+      schema_name: "mer-prompt2-phase4b-routing-trace",
+      schema_version: 1,
+      trace_path: "/tmp/phase4b.jsonl",
+      max_events: 100,
+      events_written: 1,
+      events_dropped: 0,
+      trace_truncated: false,
+      trace_write_failed: false,
+      lifecycle_reconciliation_passed: true,
+      lifecycle_reconciliation_errors: [],
+      lifecycle: {
+        physical_read_issued: 0,
+        physical_read_completed: 0,
+        physical_read_failed: 0,
+        physical_read_inflight_at_sample: 0,
+        published: 0,
+        publication_rejected: 0,
+        completion_not_yet_published_at_sample: 0,
+        first_use: 0,
+        evicted_before_first_use: 0,
+        still_resident_unused_at_sample: 0
+      }
+    };
+  .phase4b_trace_enabled = true |
+  .phase4b_trace = phase4b |
+  .runs = [.runs[] | .phase4b_diagnostics = phase4b]
+' "$TEST_ROOT/default-report.json" > "$TEST_ROOT/phase4b-report.json"
+jq -e \
+  --argjson predict_fanout 2 \
+  --argjson pipeline_depth 3 \
+  -f "$QUALIFIER" \
+  "$TEST_ROOT/phase4b-report.json" >/dev/null
+
+jq '.phase4b_trace.lifecycle.published = 1' \
+  "$TEST_ROOT/phase4b-report.json" > "$TEST_ROOT/invalid-phase4b-report.json"
+if jq -e \
+  --argjson predict_fanout 2 \
+  --argjson pipeline_depth 3 \
+  -f "$QUALIFIER" \
+  "$TEST_ROOT/invalid-phase4b-report.json" >/dev/null; then
+  echo "Phase 4B qualification accepted impossible lifecycle arithmetic" >&2
+  exit 1
+fi
+
 jq '.runs[0].cache_io.prefetch_submitted = 1' \
   "$TEST_ROOT/no-prefetch-report.json" > "$TEST_ROOT/nonzero-prefetch-report.json"
 if jq -e \
@@ -137,5 +184,15 @@ assert_rejected_before_output malformed 3 "$TEST_ROOT/malformed-fanout-output"
 assert_rejected_before_output -1 3 "$TEST_ROOT/negative-fanout-output"
 assert_rejected_before_output 2 malformed "$TEST_ROOT/malformed-depth-output"
 assert_rejected_before_output 2 0 "$TEST_ROOT/zero-depth-output"
+
+set +e
+MER_QWEN_CONVERTED_DIR=/does/not/exist \
+MER_EXPECTED_NVME_MOUNT=/does/not/exist \
+MER_PROMPT2_PHASE4B_TRACE_PATH=/tmp/no-case-placeholder.jsonl \
+  bash "$COLLECTOR" "$TEST_ROOT/invalid-phase4b-path-output" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+test ! -e "$TEST_ROOT/invalid-phase4b-path-output"
 
 echo "Prompt 2 Phase 4A collector fixtures: PASS"
