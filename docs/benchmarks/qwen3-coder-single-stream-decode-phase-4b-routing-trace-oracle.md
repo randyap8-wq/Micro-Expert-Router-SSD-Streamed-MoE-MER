@@ -50,25 +50,58 @@ arithmetic remains reconcilable. No events, JSON values, writer lock, or
 diagnostic maps exist when the trace path is unset; the engine performs only
 an `Option` check at observation sites.
 
-The four-case collector accepts a path template containing `{case}`, for
-example:
+Use the collector's explicit `phase4b-diagnostic` mode with a trace path
+template containing `{case}`:
 
 ```bash
 MER_PROMPT2_PHASE4B_TRACE_PATH=/traces/{case}.jsonl \
-MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS=1000000 \
-  scripts/collect_qwen3_coder_prompt2_baseline.sh /artifacts four-case
+MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS=2000000 \
+  scripts/collect_qwen3_coder_prompt2_baseline.sh \
+    /artifacts/phase4b-diagnostic phase4b-diagnostic
 ```
 
-Each case gets a separate trace. An enabled diagnostic collection still has
-to pass all existing Phase 4A qualification gates plus the Phase 4B lifecycle
-invariants. With tracing disabled, the existing Phase 4A qualification logic
-is unchanged.
+The mode initially collects only the 1,536-slot short and medium cases. Each
+case gets a separate bounded trace. It does not collect the 6,144-slot resident
+compute references because full residency is not the intended SSD-streamed
+architecture.
+
+Diagnostic qualification retains the ordinary provenance, platform, release
+feature, model/tokenizer/configuration/prompt identity, strictness, correctness,
+output parity, run/token count, partial-residency memory layout, O_DIRECT,
+prefetch-policy, trace integrity, and lifecycle-reconciliation gates. It does
+not require 95% production critical-path coverage or the existing per-stage
+critical-path qualification flags to be true. Synchronous per-event JSONL
+serialization and writing adds wall time outside the existing production stage
+categories, so those gates do not establish diagnostic validity.
+
+Diagnostic case and collection summaries explicitly report
+`qualification_kind: "phase4b-diagnostic"`,
+`diagnostic_qualification_passed`, and
+`performance_qualification_applicable: false`. They retain the observed prompt
+and decode coverage values, set the ordinary `qualification_passed` performance
+field to `false`, and explain why performance qualification is not applicable.
+A trace-enabled invocation in `four-case` or `resident-only` mode is rejected;
+it cannot be mislabeled as a qualified performance baseline.
+
+With tracing disabled, `four-case` and `resident-only` keep the unchanged
+Phase 4A production qualification, including the 95% prompt/decode coverage
+threshold and every existing critical-path, performance, correctness,
+provenance, memory, and output-parity gate.
+
+The first full 1,536-slot short diagnostic produced approximately 704 MB and
+1.37 million events over roughly 22 minutes. Its trace integrity, lifecycle
+reconciliation, replay, and output-parity gates passed, while observed
+critical-path coverage fell as low as about 22% for prompt and 17% for decode.
+Traced TPS and coverage are therefore not directly comparable with untraced
+Phase 4A performance results.
 
 Trace creation errors stop the diagnostic command before inference begins.
 Write failures are latched, increase the dropped-event count, and do not alter
 model output. The benchmark reports `trace_write_failed`; an enabled
-qualification rejects a failed writer rather than treating a partial trace as
-complete evidence. The trace contains fixture identifiers, numeric token/routing
+diagnostic qualification requires a positive event count, zero dropped events,
+no truncation, no writer failure, and reconciled top-level and per-run
+lifecycles. It rejects a partial trace rather than treating it as complete
+evidence. The trace contains fixture identifiers, numeric token/routing
 identity, scores, lifecycle state, and timing. It never contains model tensor
 contents or prompt text. Use a fixture ID or prompt hash rather than placing
 prompt content in a trace path.

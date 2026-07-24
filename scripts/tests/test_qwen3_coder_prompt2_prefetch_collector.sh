@@ -5,6 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 COLLECTOR="$ROOT/scripts/collect_qwen3_coder_prompt2_baseline.sh"
 CONFIG_HELPER="$ROOT/scripts/qwen3_coder_prompt2_collector_config.sh"
 QUALIFIER="$ROOT/scripts/qwen3_coder_prompt2_prefetch_qualification.jq"
+COLLECTION_QUALIFIER="$ROOT/scripts/qwen3_coder_prompt2_collection_qualification.jq"
 TEMPLATE="$ROOT/benchmarks/qwen3-coder-single-stream/qwen3-coder-q8.toml.in"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/mer-prompt2-phase4a-collector.XXXXXX")
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -130,6 +131,169 @@ jq -e \
   -f "$QUALIFIER" \
   "$TEST_ROOT/phase4b-report.json" >/dev/null
 
+jq -n '
+  def critical($coverage):
+    {
+      wall_seconds: 1,
+      attributed_seconds: $coverage,
+      unattributed_residual_seconds: (1 - $coverage),
+      coverage_ratio: $coverage,
+      non_overlap_invariant_passed: true,
+      coverage_95_percent_passed: ($coverage >= 0.95),
+      qualification_passed: ($coverage >= 0.95),
+      categories: [0, $coverage]
+    };
+  {
+    phase4b_trace_enabled: false,
+    runs: [
+      range(0; 5) | {
+        critical_path: {
+          prompt: critical(0.99),
+          decode: critical(0.98)
+        }
+      }
+    ]
+  }
+' > "$TEST_ROOT/performance-collection.json"
+jq \
+  --arg qualification_kind performance-baseline \
+  -f "$COLLECTION_QUALIFIER" \
+  "$TEST_ROOT/performance-collection.json" \
+  > "$TEST_ROOT/performance-qualification.json"
+jq -e '
+  .qualification_kind == "performance-baseline" and
+  .collection_qualification_valid == true and
+  .qualification_passed == true and
+  .diagnostic_qualification_passed == null and
+  .performance_qualification_applicable == true and
+  .performance_qualification_passed == true
+' "$TEST_ROOT/performance-qualification.json" >/dev/null
+
+jq '
+  .runs[].critical_path.prompt.coverage_ratio = 0.75 |
+  .runs[].critical_path.prompt.coverage_95_percent_passed = false |
+  .runs[].critical_path.prompt.qualification_passed = false
+' "$TEST_ROOT/performance-collection.json" > "$TEST_ROOT/low-coverage-performance.json"
+jq \
+  --arg qualification_kind performance-baseline \
+  -f "$COLLECTION_QUALIFIER" \
+  "$TEST_ROOT/low-coverage-performance.json" \
+  > "$TEST_ROOT/low-coverage-performance-qualification.json"
+jq -e '
+  .collection_qualification_valid == false and
+  .qualification_passed == false and
+  .performance_qualification_applicable == true
+' "$TEST_ROOT/low-coverage-performance-qualification.json" >/dev/null
+
+jq -n '
+  def lifecycle:
+    {
+      physical_read_issued: 1,
+      physical_read_completed: 1,
+      physical_read_failed: 0,
+      physical_read_inflight_at_sample: 0,
+      published: 1,
+      publication_rejected: 0,
+      completion_not_yet_published_at_sample: 0,
+      first_use: 1,
+      evicted_before_first_use: 0,
+      still_resident_unused_at_sample: 0
+    };
+  def phase4b:
+    {
+      schema_name: "mer-prompt2-phase4b-routing-trace",
+      schema_version: 1,
+      trace_path: "/tmp/phase4b.jsonl",
+      max_events: 2000000,
+      events_written: 1368511,
+      events_dropped: 0,
+      trace_truncated: false,
+      trace_write_failed: false,
+      lifecycle_reconciliation_passed: true,
+      lifecycle_reconciliation_errors: [],
+      lifecycle: lifecycle
+    };
+  def critical($coverage):
+    {
+      wall_seconds: 10,
+      attributed_seconds: (10 * $coverage),
+      unattributed_residual_seconds: (10 * (1 - $coverage)),
+      coverage_ratio: $coverage,
+      non_overlap_invariant_passed: true,
+      coverage_95_percent_passed: false,
+      qualification_passed: false,
+      categories: [0, (10 * $coverage)]
+    };
+  {
+    phase4b_trace_enabled: true,
+    phase4b_trace: phase4b,
+    runs: [
+      range(0; 5) | {
+        phase4b_diagnostics: phase4b,
+        critical_path: {
+          prompt: critical([0.7616837846, 0.6142133217, 0.4355608912, 0.3643167004, 0.2229585082][.]),
+          decode: critical([0.4424307114, 0.3213106218, 0.2733205465, 0.1989155920, 0.1656464919][.])
+        }
+      }
+    ]
+  }
+' > "$TEST_ROOT/phase4b-diagnostic-collection.json"
+jq \
+  --arg qualification_kind phase4b-diagnostic \
+  -f "$COLLECTION_QUALIFIER" \
+  "$TEST_ROOT/phase4b-diagnostic-collection.json" \
+  > "$TEST_ROOT/phase4b-diagnostic-qualification.json"
+jq -e '
+  .qualification_kind == "phase4b-diagnostic" and
+  .collection_qualification_valid == true and
+  .diagnostic_qualification_passed == true and
+  .performance_qualification_applicable == false and
+  .performance_qualification_passed == null and
+  .qualification_passed == false and
+  .production_critical_path_coverage_gates_passed == false and
+  (.performance_qualification_reason | contains("not comparable")) and
+  (.observed_critical_path_coverage.prompt | length) == 5 and
+  (.observed_critical_path_coverage.decode | length) == 5 and
+  .observed_critical_path_coverage.prompt_min == 0.2229585082 and
+  .observed_critical_path_coverage.decode_min == 0.1656464919
+' "$TEST_ROOT/phase4b-diagnostic-qualification.json" >/dev/null
+
+assert_diagnostic_rejected() {
+  local fixture=$1
+  local label=$2
+  jq \
+    --arg qualification_kind phase4b-diagnostic \
+    -f "$COLLECTION_QUALIFIER" \
+    "$fixture" > "$TEST_ROOT/$label-qualification.json"
+  jq -e '
+    .collection_qualification_valid == false and
+    .diagnostic_qualification_passed == false and
+    .performance_qualification_applicable == false and
+    .qualification_passed == false
+  ' "$TEST_ROOT/$label-qualification.json" >/dev/null
+}
+
+jq '.phase4b_trace.events_dropped = 1' \
+  "$TEST_ROOT/phase4b-diagnostic-collection.json" \
+  > "$TEST_ROOT/diagnostic-dropped.json"
+assert_diagnostic_rejected "$TEST_ROOT/diagnostic-dropped.json" diagnostic-dropped
+
+jq '.phase4b_trace.trace_truncated = true' \
+  "$TEST_ROOT/phase4b-diagnostic-collection.json" \
+  > "$TEST_ROOT/diagnostic-truncated.json"
+assert_diagnostic_rejected "$TEST_ROOT/diagnostic-truncated.json" diagnostic-truncated
+
+jq '.phase4b_trace.trace_write_failed = true' \
+  "$TEST_ROOT/phase4b-diagnostic-collection.json" \
+  > "$TEST_ROOT/diagnostic-writer-failed.json"
+assert_diagnostic_rejected "$TEST_ROOT/diagnostic-writer-failed.json" diagnostic-writer-failed
+
+jq '.runs[0].phase4b_diagnostics.lifecycle.published = 2' \
+  "$TEST_ROOT/phase4b-diagnostic-collection.json" \
+  > "$TEST_ROOT/diagnostic-lifecycle-invalid.json"
+assert_diagnostic_rejected \
+  "$TEST_ROOT/diagnostic-lifecycle-invalid.json" diagnostic-lifecycle-invalid
+
 jq '.phase4b_trace.lifecycle.published = 1' \
   "$TEST_ROOT/phase4b-report.json" > "$TEST_ROOT/invalid-phase4b-report.json"
 if jq -e \
@@ -195,4 +359,39 @@ set -e
 test "$status" -eq 2
 test ! -e "$TEST_ROOT/invalid-phase4b-path-output"
 
-echo "Prompt 2 Phase 4A collector fixtures: PASS"
+set +e
+MER_QWEN_CONVERTED_DIR=/does/not/exist \
+MER_EXPECTED_NVME_MOUNT=/does/not/exist \
+  bash "$COLLECTOR" \
+    "$TEST_ROOT/missing-phase4b-trace-output" \
+    phase4b-diagnostic >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+test ! -e "$TEST_ROOT/missing-phase4b-trace-output"
+
+set +e
+MER_QWEN_CONVERTED_DIR=/does/not/exist \
+MER_EXPECTED_NVME_MOUNT=/does/not/exist \
+MER_PROMPT2_PHASE4B_TRACE_PATH='/tmp/{case}.jsonl' \
+  bash "$COLLECTOR" \
+    "$TEST_ROOT/traced-performance-output" \
+    four-case >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+test ! -e "$TEST_ROOT/traced-performance-output"
+
+sed -n \
+  '/^RESIDENT_STATUS=0$/,/^elif \[\[ "\$COLLECTOR_MODE" == resident-only \]\]; then$/p' \
+  "$COLLECTOR" > "$TEST_ROOT/diagnostic-case-plan.txt"
+grep -F 'run_case 1536 short 14 "$SHORT_PROMPT_SHA"' \
+  "$TEST_ROOT/diagnostic-case-plan.txt" >/dev/null
+grep -F 'run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"' \
+  "$TEST_ROOT/diagnostic-case-plan.txt" >/dev/null
+if grep -F 'run_case 6144' "$TEST_ROOT/diagnostic-case-plan.txt" >/dev/null; then
+  echo "Phase 4B diagnostic case plan included a resident 6,144-slot run" >&2
+  exit 1
+fi
+
+echo "Prompt 2 collector qualification fixtures: PASS"

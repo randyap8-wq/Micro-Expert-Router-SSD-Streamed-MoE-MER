@@ -5,6 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FIXTURES="$ROOT/benchmarks/qwen3-coder-single-stream"
 TEMPLATE="$FIXTURES/qwen3-coder-q8.toml.in"
 FEATURES="avx512,blas,tokenizer,io_uring,q8-candle-reference"
+COLLECTION_QUALIFIER="$ROOT/scripts/qwen3_coder_prompt2_collection_qualification.jq"
 source "$ROOT/scripts/qwen3_coder_prompt2_collector_config.sh"
 
 : "${MER_QWEN_CONVERTED_DIR:?set MER_QWEN_CONVERTED_DIR to the converted Qwen directory on local NVMe}"
@@ -16,14 +17,27 @@ TOKENIZER=${MER_QWEN_TOKENIZER:-$MER_QWEN_CONVERTED_DIR/tokenizer.json}
 ARTIFACT_DIR=${1:-}
 MODE_ARG=${2:-four-case}
 if [[ -z "$ARTIFACT_DIR" ]]; then
-  echo "usage: $0 ARTIFACT_DIR [four-case|--resident-only]" >&2
+  echo "usage: $0 ARTIFACT_DIR [four-case|phase4b-diagnostic|--resident-only]" >&2
   exit 2
 fi
 case "$MODE_ARG" in
-  four-case) COLLECTOR_MODE=four-case ;;
-  resident-only|--resident-only) COLLECTOR_MODE=resident-only ;;
+  four-case)
+    COLLECTOR_MODE=four-case
+    QUALIFICATION_KIND=performance-baseline
+    EXPERIMENT_NAME=prompt2-phase4a-prefetch-ablation
+    ;;
+  phase4b-diagnostic)
+    COLLECTOR_MODE=phase4b-diagnostic
+    QUALIFICATION_KIND=phase4b-diagnostic
+    EXPERIMENT_NAME=prompt2-phase4b-routing-trace-diagnostic
+    ;;
+  resident-only|--resident-only)
+    COLLECTOR_MODE=resident-only
+    QUALIFICATION_KIND=performance-baseline
+    EXPERIMENT_NAME=prompt2-phase4a-prefetch-ablation
+    ;;
   *)
-    echo "unknown collector mode: $MODE_ARG (expected four-case or --resident-only)" >&2
+    echo "unknown collector mode: $MODE_ARG (expected four-case, phase4b-diagnostic, or --resident-only)" >&2
     exit 2
     ;;
 esac
@@ -42,6 +56,14 @@ if [[ -n "$PHASE4B_TRACE_TEMPLATE" ]]; then
   PHASE4B_TRACE_ENABLED=true
 else
   PHASE4B_TRACE_ENABLED=false
+fi
+if [[ "$COLLECTOR_MODE" == phase4b-diagnostic && "$PHASE4B_TRACE_ENABLED" != true ]]; then
+  echo "phase4b-diagnostic mode requires MER_PROMPT2_PHASE4B_TRACE_PATH with a {case} placeholder" >&2
+  exit 2
+fi
+if [[ "$COLLECTOR_MODE" != phase4b-diagnostic && "$PHASE4B_TRACE_ENABLED" == true ]]; then
+  echo "trace-enabled collector runs must use phase4b-diagnostic mode and cannot qualify as performance baselines" >&2
+  exit 2
 fi
 
 for value in "$MER_QWEN_CONVERTED_DIR" "$TOKENIZER"; do
@@ -116,7 +138,10 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "rust_log=off"
   echo "no_color=1"
   echo "collector_mode=$COLLECTOR_MODE"
-  echo "experiment_name=prompt2-phase4a-prefetch-ablation"
+  if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
+    echo "qualification_kind=$QUALIFICATION_KIND"
+  fi
+  echo "experiment_name=$EXPERIMENT_NAME"
   echo "predict_fanout=$PREDICT_FANOUT"
   echo "pipeline_depth=$PIPELINE_DEPTH"
   echo "prefetch_expected_active=$PREFETCH_EXPECTED_ACTIVE"
@@ -153,12 +178,18 @@ DENSE_MANIFEST_SHA=$(sha256sum "$MODEL_REAL/dense_manifest.json" | awk '{print $
 
 prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-1536.toml" \
   "$MODEL_REAL" "$TOKENIZER_REAL" 1536 "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
-prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-6144.toml" \
-  "$MODEL_REAL" "$TOKENIZER_REAL" 6144 "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
+if [[ "$COLLECTOR_MODE" != phase4b-diagnostic ]]; then
+  prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-6144.toml" \
+    "$MODEL_REAL" "$TOKENIZER_REAL" 6144 "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
+fi
 
 # Physical pool sizing from build_bench_real_runtime:
 # primary=(cache_slots+1), shadow=predict_fanout*pipeline_depth.
-for slots in 1536 6144; do
+POOL_SLOTS=(1536 6144)
+if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
+  POOL_SLOTS=(1536)
+fi
+for slots in "${POOL_SLOTS[@]}"; do
   primary_slots=$((slots + 1))
   shadow_slots=$((PREDICT_FANOUT * PIPELINE_DEPTH))
   primary_bytes=$((primary_slots * 5017600))
@@ -193,7 +224,7 @@ HOSTNAME_VALUE=$(hostname)
 LOGICAL_CPU_COUNT=$(getconf _NPROCESSORS_ONLN)
 EFFECTIVE_CPU_MASK=$(awk -F': ' 'NR == 1 {print $2}' "$ARTIFACT_DIR/collector-effective-cpu-mask.txt")
 jq -n \
-  --arg experiment_name "prompt2-phase4a-prefetch-ablation" \
+  --arg experiment_name "$EXPERIMENT_NAME" \
   --argjson predict_fanout "$PREDICT_FANOUT" \
   --argjson pipeline_depth "$PIPELINE_DEPTH" \
   --argjson prefetch_expected_active "$PREFETCH_EXPECTED_ACTIVE" \
@@ -209,6 +240,7 @@ jq -n \
   --arg cargo_features "$FEATURES" \
   --arg binary_sha256 "$BINARY_SHA" \
   --arg collector_mode "$COLLECTOR_MODE" \
+  --arg qualification_kind "$QUALIFICATION_KIND" \
   --slurpfile model_mount "$ARTIFACT_DIR/model-findmnt.json" '
   {
     schema: {name:"mer-prompt2-phase4a-ablation-provenance", version:1},
@@ -235,7 +267,12 @@ jq -n \
     cargo_features: ($cargo_features | split(",") | sort),
     binary_sha256: $binary_sha256,
     collector_mode: $collector_mode
-  }
+  } +
+  (if $qualification_kind == "phase4b-diagnostic" then
+    {qualification_kind: $qualification_kind}
+  else
+    {}
+  end)
 ' > "$ARTIFACT_DIR/ablation-provenance.json"
 
 run_case() {
@@ -366,50 +403,6 @@ run_case() {
       "static_residency_fraction":0
     } and
     .phase4b_trace_enabled == $phase4b_trace_enabled and
-    (if $phase4b_trace_enabled then
-      .phase4b_trace.schema_name == "mer-prompt2-phase4b-routing-trace" and
-      .phase4b_trace.schema_version == 1 and
-      (.phase4b_trace.trace_path | length) > 0 and
-      .phase4b_trace.max_events > 0 and
-      .phase4b_trace.events_written > 0 and
-      .phase4b_trace.events_dropped >= 0 and
-      (.phase4b_trace.trace_truncated | type) == "boolean" and
-      .phase4b_trace.trace_write_failed == false and
-      .phase4b_trace.lifecycle_reconciliation_passed == true and
-      .phase4b_trace.lifecycle.physical_read_issued ==
-        (.phase4b_trace.lifecycle.physical_read_completed +
-         .phase4b_trace.lifecycle.physical_read_failed +
-         .phase4b_trace.lifecycle.physical_read_inflight_at_sample) and
-      .phase4b_trace.lifecycle.physical_read_completed ==
-        (.phase4b_trace.lifecycle.published +
-         .phase4b_trace.lifecycle.publication_rejected +
-         .phase4b_trace.lifecycle.completion_not_yet_published_at_sample) and
-      .phase4b_trace.lifecycle.published ==
-        (.phase4b_trace.lifecycle.first_use +
-         .phase4b_trace.lifecycle.evicted_before_first_use +
-         .phase4b_trace.lifecycle.still_resident_unused_at_sample) and
-      ([.runs[].phase4b_diagnostics] | all(
-        .schema_name == "mer-prompt2-phase4b-routing-trace" and
-        .schema_version == 1 and
-        .max_events > 0 and
-        .trace_write_failed == false and
-        .lifecycle_reconciliation_passed == true and
-        .lifecycle.physical_read_issued ==
-          (.lifecycle.physical_read_completed +
-           .lifecycle.physical_read_failed +
-           .lifecycle.physical_read_inflight_at_sample) and
-        .lifecycle.physical_read_completed ==
-          (.lifecycle.published +
-           .lifecycle.publication_rejected +
-           .lifecycle.completion_not_yet_published_at_sample) and
-        .lifecycle.published ==
-          (.lifecycle.first_use +
-           .lifecycle.evicted_before_first_use +
-           .lifecycle.still_resident_unused_at_sample)
-      ))
-    else
-      ([.runs[] | has("phase4b_diagnostics")] | all(. == false))
-    end) and
     .aggregate.output_token_parity == true and
     (.runs | length == 5) and
     ([.runs[].prompt_tokens] | all(. == $prompt_tokens)) and
@@ -533,21 +526,19 @@ run_case() {
       .prepared_duplicate_expert_bytes == 0 and
       .external_peak_rss_bytes == null
     )) and
-    ([.runs[].critical_path.prompt, .runs[].critical_path.decode] | all(
-      .wall_seconds > 0 and
-      .attributed_seconds >= 0 and
-      has("unattributed_residual_seconds") and
-      .coverage_ratio >= 0.95 and
-      .non_overlap_invariant_passed == true and
-      .coverage_95_percent_passed == true and
-      .qualification_passed == true and
-      ([.categories[]] | all(type == "number" and . >= 0))
-    )) and
     (if $predict_fanout > 0 then
       .memory_layout.shadow_expert_pool_allocated_bytes > 0 and
       ([.runs[].memory.shadow_expert_pool_allocated_bytes] | all(. > 0))
     else true end)
   ' "$json" >/dev/null
+
+  local collection_qualification
+  collection_qualification=$(jq \
+    --arg qualification_kind "$QUALIFICATION_KIND" \
+    -f "$COLLECTION_QUALIFIER" \
+    "$json")
+  jq -e '.collection_qualification_valid == true' \
+    <<<"$collection_qualification" >/dev/null
 
   jq -e \
     --argjson predict_fanout "$PREDICT_FANOUT" \
@@ -569,6 +560,7 @@ run_case() {
     --argjson peak_rss_bytes "$peak_rss_bytes" \
     --argjson predict_fanout "$PREDICT_FANOUT" \
     --argjson pipeline_depth "$PIPELINE_DEPTH" \
+    --argjson collection_qualification "$collection_qualification" \
     '([.runs[].cache_io] | {
       prefetch_submitted: (map(.prefetch_submitted) | add),
       prefetch_completed: (map(.prefetch_completed) | add),
@@ -602,7 +594,7 @@ run_case() {
       prompt_critical_path_coverage_min: ([.runs[].critical_path.prompt.coverage_ratio] | min),
       decode_critical_path_coverage_min: ([.runs[].critical_path.decode.coverage_ratio] | min),
       output_token_parity: .aggregate.output_token_parity,
-      qualification_passed: true,
+      qualification_passed: $collection_qualification.qualification_passed,
       phase4a_prefetch: {
         requested_predict_fanout: $predict_fanout,
         requested_pipeline_depth: $pipeline_depth,
@@ -702,11 +694,90 @@ run_case() {
           if length == 0 then null else max_by(.sample.critical_path_seconds) end
         )
       }
-    }' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"
+    } +
+    (if $collection_qualification.qualification_kind == "phase4b-diagnostic" then
+      {
+        qualification_kind: $collection_qualification.qualification_kind,
+        diagnostic_qualification_passed:
+          $collection_qualification.diagnostic_qualification_passed,
+        performance_qualification_applicable:
+          $collection_qualification.performance_qualification_applicable,
+        performance_qualification_reason:
+          $collection_qualification.performance_qualification_reason,
+        production_critical_path_coverage_gates_passed:
+          $collection_qualification.production_critical_path_coverage_gates_passed,
+        observed_critical_path_coverage:
+          $collection_qualification.observed_critical_path_coverage
+      }
+    else
+      {}
+    end)' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"
 }
 
 RESIDENT_STATUS=0
-if [[ "$COLLECTOR_MODE" == resident-only ]]; then
+if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
+  run_case 1536 short 14 "$SHORT_PROMPT_SHA"
+  run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"
+
+  jq -s '{
+    schema: {name:"mer-prompt2-phase4b-diagnostic-summary", version:1},
+    qualification_kind: "phase4b-diagnostic",
+    cases: .,
+    diagnostic_qualification_passed:
+      (all(.diagnostic_qualification_passed == true)),
+    performance_qualification_applicable: false,
+    performance_qualification_reason:
+      "synchronous Phase 4B JSONL tracing adds diagnostic wall time outside production critical-path categories; traced TPS and coverage are not comparable with untraced Phase 4A performance baselines",
+    qualification_passed: false,
+    observed_critical_path_coverage: [
+      .[] | {
+        case,
+        prompt: .observed_critical_path_coverage.prompt,
+        decode: .observed_critical_path_coverage.decode,
+        prompt_min: .observed_critical_path_coverage.prompt_min,
+        decode_min: .observed_critical_path_coverage.decode_min,
+        production_critical_path_coverage_gates_passed
+      }
+    ]
+  }' \
+    "$ARTIFACT_DIR/baseline-1536-short.case-summary.json" \
+    "$ARTIFACT_DIR/baseline-1536-medium.case-summary.json" \
+    > "$ARTIFACT_DIR/phase4b-diagnostic-summary.json"
+
+  jq -n \
+    --arg commit "$EXPECTED_COMMIT" \
+    --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --slurpfile diagnostic_summary \
+      "$ARTIFACT_DIR/phase4b-diagnostic-summary.json" \
+    '{
+      schema: {name:"mer-prompt2-qualification", version:1},
+      git_commit_full: $commit,
+      captured_at_utc: $captured_at_utc,
+      qualification_kind: "phase4b-diagnostic",
+      two_required_cases_present: true,
+      schema_and_required_fields_passed: true,
+      provenance_and_backend_gates_passed: true,
+      prompt_identity_gates_passed: true,
+      strictness_and_correctness_gates_passed: true,
+      phase4b_trace_gates_passed: true,
+      prefetch_policy_gates_passed: true,
+      diagnostic_qualification_passed: true,
+      performance_qualification_applicable: false,
+      performance_qualification_reason:
+        "synchronous Phase 4B JSONL tracing adds diagnostic wall time outside production critical-path categories; traced TPS and coverage are not comparable with untraced Phase 4A performance baselines",
+      production_critical_path_coverage_gates_passed: (
+        [$diagnostic_summary[0].observed_critical_path_coverage[] |
+          .production_critical_path_coverage_gates_passed] |
+        all(. == true)
+      ),
+      observed_critical_path_coverage:
+        $diagnostic_summary[0].observed_critical_path_coverage,
+      critical_path_coverage_gates_applicable: false,
+      critical_path_coverage_gates_passed: null,
+      external_peak_rss_present: true,
+      qualification_passed: false
+    }' > "$ARTIFACT_DIR/qualification.json"
+elif [[ "$COLLECTOR_MODE" == resident-only ]]; then
   run_case 6144 short 14 "$SHORT_PROMPT_SHA"
   run_case 6144 medium 65 "$MEDIUM_PROMPT_SHA"
 
@@ -769,5 +840,10 @@ if (( RESIDENT_STATUS == 1 )); then
   exit 1
 fi
 
-echo "QUALIFICATION: PASS"
-echo "$COLLECTOR_MODE instrumented baseline collection completed: $ARTIFACT_DIR"
+if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
+  echo "DIAGNOSTIC QUALIFICATION: PASS"
+  echo "phase4b-diagnostic collection completed; performance qualification is not applicable: $ARTIFACT_DIR"
+else
+  echo "QUALIFICATION: PASS"
+  echo "$COLLECTOR_MODE instrumented baseline collection completed: $ARTIFACT_DIR"
+fi
