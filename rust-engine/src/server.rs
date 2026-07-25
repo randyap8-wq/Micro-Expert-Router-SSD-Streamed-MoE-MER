@@ -2220,6 +2220,7 @@ mod tests {
             real_transformer: crate::config::RealTransformerConfig::default(),
             sampling: crate::config::SamplingConfig::default(),
             predictive: crate::config::PredictiveConfig::default(),
+            prefetch_predictor: crate::router::PredictorAdmissionPolicy::default(),
             security: crate::config::SecurityConfig::default(),
             gpu_cache: crate::config::GpuCacheConfig::default(),
             distributed: crate::config::DistributedConfig::default(),

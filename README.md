@@ -1422,6 +1422,45 @@ counters on `/metrics`. The schema is validated at startup
 num_experts`, `static_residency_fraction` outside `[0, 1]`, a
 `packed_blob` without its `packed_manifest`, etc.
 
+Markov admission can be narrowed independently without changing cache,
+scheduler, I/O, or inference policy:
+
+```toml
+[prefetch_predictor]
+first_order_enabled = false
+second_order_enabled = true
+fallback_prior_fill_enabled = false
+fanout_is_upper_bound = true
+```
+
+Omitting this table preserves the historical combined first/second-order
+behavior and prior fill. With the precision-first settings above, only
+learned second-order candidates in the immediate next-layer expert slice are
+eligible; fanout is a cap, so fewer than `storage.predict_fanout` candidates
+may be admitted.
+
+The Prompt 2 Phase 4C primary matrix is untraced, uses only the 1,536-slot
+short and medium cases, and runs the fixed `demand-only`, `current-f2`,
+`second-only-f2`, and `second-only-f1` configurations:
+
+```bash
+scripts/collect_qwen3_coder_prompt2_phase4c_matrix.sh /path/to/artifacts
+```
+
+After selecting a candidate, the existing diagnostic collector supports the
+required eight-token trace smoke and the full diagnostic trace:
+
+```bash
+MER_PROMPT2_PREFETCH_VARIANT=second-only-f2 \
+MER_PROMPT2_PHASE4B_OUTPUT_TOKENS=8 \
+MER_PROMPT2_PHASE4B_TRACE_PATH='/path/to/smoke-{case}.jsonl' \
+scripts/collect_qwen3_coder_prompt2_baseline.sh /path/to/smoke phase4b-diagnostic
+
+MER_PROMPT2_PREFETCH_VARIANT=second-only-f2 \
+MER_PROMPT2_PHASE4B_TRACE_PATH='/path/to/full-{case}.jsonl' \
+scripts/collect_qwen3_coder_prompt2_baseline.sh /path/to/full phase4b-diagnostic
+```
+
 #### Real-transformer pipeline
 
 By default the server runs the **legacy benchmark generator**: each

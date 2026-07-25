@@ -12,18 +12,31 @@ trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 source "$CONFIG_HELPER"
 
-unset MER_PROMPT2_PREDICT_FANOUT MER_PROMPT2_PIPELINE_DEPTH
+unset \
+  MER_PROMPT2_PREDICT_FANOUT \
+  MER_PROMPT2_PIPELINE_DEPTH \
+  MER_PROMPT2_PREFETCH_VARIANT \
+  MER_PROMPT2_FIRST_ORDER_ENABLED \
+  MER_PROMPT2_SECOND_ORDER_ENABLED \
+  MER_PROMPT2_FALLBACK_PRIOR_FILL_ENABLED \
+  MER_PROMPT2_FANOUT_IS_UPPER_BOUND
 prompt2_resolve_ablation_config
 test "$PREDICT_FANOUT" -eq 2
 test "$PIPELINE_DEPTH" -eq 3
 test "$PREFETCH_EXPECTED_ACTIVE" = true
 prompt2_render_config "$TEMPLATE" "$TEST_ROOT/default.toml" \
   /mnt/localssd/model /mnt/localssd/model/tokenizer.json 1536 \
-  "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
+  "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
+  "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
+  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND"
 grep -Fx 'predict_fanout = 2' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'pipeline_depth = 3' "$TEST_ROOT/default.toml" >/dev/null
-if grep -E '@(PREDICT_FANOUT|PIPELINE_DEPTH)@' "$TEST_ROOT/default.toml" >/dev/null; then
-  echo "default render left a Phase 4A placeholder unresolved" >&2
+grep -Fx 'first_order_enabled = true' "$TEST_ROOT/default.toml" >/dev/null
+grep -Fx 'second_order_enabled = true' "$TEST_ROOT/default.toml" >/dev/null
+grep -Fx 'fallback_prior_fill_enabled = true' "$TEST_ROOT/default.toml" >/dev/null
+grep -Fx 'fanout_is_upper_bound = false' "$TEST_ROOT/default.toml" >/dev/null
+if grep -E '@[A-Z0-9_]+@' "$TEST_ROOT/default.toml" >/dev/null; then
+  echo "default render left a collector placeholder unresolved" >&2
   exit 1
 fi
 
@@ -35,9 +48,47 @@ test "$PIPELINE_DEPTH" -eq 1
 test "$PREFETCH_EXPECTED_ACTIVE" = false
 prompt2_render_config "$TEMPLATE" "$TEST_ROOT/no-prefetch.toml" \
   /mnt/localssd/model /mnt/localssd/model/tokenizer.json 1536 \
-  "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
+  "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
+  "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
+  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND"
 grep -Fx 'predict_fanout = 0' "$TEST_ROOT/no-prefetch.toml" >/dev/null
 grep -Fx 'pipeline_depth = 1' "$TEST_ROOT/no-prefetch.toml" >/dev/null
+
+unset MER_PROMPT2_PREDICT_FANOUT MER_PROMPT2_PIPELINE_DEPTH
+for variant in demand-only current-f2 second-only-f2 second-only-f1; do
+  MER_PROMPT2_PREFETCH_VARIANT=$variant
+  prompt2_resolve_ablation_config
+  test "$PIPELINE_DEPTH" -eq 3
+  case "$variant" in
+    demand-only)
+      test "$PREDICT_FANOUT" -eq 0
+      test "$FIRST_ORDER_ENABLED" = true
+      test "$FALLBACK_PRIOR_FILL_ENABLED" = true
+      test "$FANOUT_IS_UPPER_BOUND" = false
+      ;;
+    current-f2)
+      test "$PREDICT_FANOUT" -eq 2
+      test "$FIRST_ORDER_ENABLED" = true
+      test "$FALLBACK_PRIOR_FILL_ENABLED" = true
+      test "$FANOUT_IS_UPPER_BOUND" = false
+      ;;
+    second-only-f2)
+      test "$PREDICT_FANOUT" -eq 2
+      test "$FIRST_ORDER_ENABLED" = false
+      test "$SECOND_ORDER_ENABLED" = true
+      test "$FALLBACK_PRIOR_FILL_ENABLED" = false
+      test "$FANOUT_IS_UPPER_BOUND" = true
+      ;;
+    second-only-f1)
+      test "$PREDICT_FANOUT" -eq 1
+      test "$FIRST_ORDER_ENABLED" = false
+      test "$SECOND_ORDER_ENABLED" = true
+      test "$FALLBACK_PRIOR_FILL_ENABLED" = false
+      test "$FANOUT_IS_UPPER_BOUND" = true
+      ;;
+  esac
+done
+unset MER_PROMPT2_PREFETCH_VARIANT
 
 jq -n '
   def cache_io:
@@ -350,6 +401,27 @@ assert_rejected_before_output 2 malformed "$TEST_ROOT/malformed-depth-output"
 assert_rejected_before_output 2 0 "$TEST_ROOT/zero-depth-output"
 
 set +e
+MER_PROMPT2_PREFETCH_VARIANT=invalid \
+MER_QWEN_CONVERTED_DIR=/does/not/exist \
+MER_EXPECTED_NVME_MOUNT=/does/not/exist \
+  bash "$COLLECTOR" "$TEST_ROOT/invalid-variant-output" >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+test ! -e "$TEST_ROOT/invalid-variant-output"
+
+set +e
+MER_QWEN_CONVERTED_DIR=/does/not/exist \
+MER_EXPECTED_NVME_MOUNT=/does/not/exist \
+  bash "$COLLECTOR" \
+    "$TEST_ROOT/phase4c-missing-variant-output" \
+    phase4c-untraced >/dev/null 2>&1
+status=$?
+set -e
+test "$status" -eq 2
+test ! -e "$TEST_ROOT/phase4c-missing-variant-output"
+
+set +e
 MER_QWEN_CONVERTED_DIR=/does/not/exist \
 MER_EXPECTED_NVME_MOUNT=/does/not/exist \
 MER_PROMPT2_PHASE4B_TRACE_PATH=/tmp/no-case-placeholder.jsonl \
@@ -389,6 +461,19 @@ grep -F 'run_case 1536 short 14 "$SHORT_PROMPT_SHA"' \
   "$TEST_ROOT/diagnostic-case-plan.txt" >/dev/null
 grep -F 'run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"' \
   "$TEST_ROOT/diagnostic-case-plan.txt" >/dev/null
+
+sed -n \
+  '/^elif \[\[ "\$COLLECTOR_MODE" == phase4c-untraced \]\]; then$/,/^elif \[\[ "\$COLLECTOR_MODE" == resident-only \]\]; then$/p' \
+  "$COLLECTOR" > "$TEST_ROOT/phase4c-case-plan.txt"
+grep -F 'run_case 1536 short 14 "$SHORT_PROMPT_SHA"' \
+  "$TEST_ROOT/phase4c-case-plan.txt" >/dev/null
+grep -F 'run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"' \
+  "$TEST_ROOT/phase4c-case-plan.txt" >/dev/null
+if grep -F 'run_case 6144' "$TEST_ROOT/phase4c-case-plan.txt" >/dev/null; then
+  echo "Phase 4C case plan must not collect a 6144-slot case" >&2
+  exit 1
+fi
+grep -F -- '--output-tokens "$OUTPUT_TOKENS"' "$COLLECTOR" >/dev/null
 if grep -F 'run_case 6144' "$TEST_ROOT/diagnostic-case-plan.txt" >/dev/null; then
   echo "Phase 4B diagnostic case plan included a resident 6,144-slot run" >&2
   exit 1

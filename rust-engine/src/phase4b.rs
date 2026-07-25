@@ -120,6 +120,8 @@ pub struct LifecycleSnapshot {
     pub filtered_resident: u64,
     pub filtered_current_target: u64,
     pub filtered_global_in_flight: u64,
+    pub filtered_duplicate: u64,
+    pub filtered_wrong_target_layer: u64,
     pub rejected_governor: u64,
     pub rejected_concurrency_limit: u64,
     pub rejected_shadow_pool_exhaustion: u64,
@@ -699,6 +701,16 @@ impl Phase4bTrace {
                                 .candidates_lost_after_truncation_to_global_inflight_filter
                                 .saturating_add(1);
                         }
+                    }
+                    "filtered_duplicate" => {
+                        state.lifecycle.filtered_duplicate =
+                            state.lifecycle.filtered_duplicate.saturating_add(1)
+                    }
+                    "filtered_wrong_target_layer" => {
+                        state.lifecycle.filtered_wrong_target_layer = state
+                            .lifecycle
+                            .filtered_wrong_target_layer
+                            .saturating_add(1)
                     }
                     "rejected_governor" => {
                         state.lifecycle.rejected_governor =

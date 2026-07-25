@@ -33,7 +33,8 @@ use crate::phase4b::{
     Phase4bSnapshot, Phase4bTrace, PredictorArm,
 };
 use crate::router::{
-    DecayWorkerHandle, LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader,
+    DecayWorkerHandle, LayeredExpertAffinity, LocalityMonitor, MarkovCandidate,
+    MarkovCandidateArm, NeuralSpeculator, PredictiveLoader,
 };
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
@@ -61,6 +62,14 @@ pub const KV_CACHE_BLOCK_ALIGN: usize = 4096;
 #[inline]
 fn global_to_layer_local(global: u32, per_layer: u32) -> (u32, u32) {
     (global / per_layer, global % per_layer)
+}
+
+fn phase4b_markov_arm(arm: MarkovCandidateArm) -> PredictorArm {
+    match arm {
+        MarkovCandidateArm::FirstOrder => PredictorArm::FirstOrderMarkov,
+        MarkovCandidateArm::SecondOrder => PredictorArm::SecondOrderMarkov,
+        MarkovCandidateArm::FallbackPriorFill => PredictorArm::FallbackPriorFill,
+    }
 }
 
 /// Recompose a `(layer, layer-local)` pair into its **global** expert
@@ -2436,10 +2445,9 @@ impl Engine {
         // into the prefetch set — see [`Engine::union_prefetch`].
         if let Some(&seed) = target.last() {
             let ring = self.speculation.markov_ring.lock();
-            let s_markov = match ring.last_last.ids.last() {
-                Some(&pp) => self.core.predictor.predict_next2(pp, seed),
-                None => self.core.predictor.predict_next(seed),
-            };
+            let previous_context = ring.last_last.ids.last().copied();
+            let s_markov =
+                self.markov_admission_candidates(previous_context, seed, false);
             drop(ring);
             // Speculator: predict + train on the residual-stream
             // hidden state computed at the top of `generate` (when
@@ -3859,6 +3867,35 @@ impl Engine {
         }
     }
 
+    fn markov_admission_candidates(
+        &self,
+        previous_context: Option<u32>,
+        seed: u32,
+        provenance_required: bool,
+    ) -> Vec<MarkovCandidate> {
+        if self.core.predictor.admission_policy().precision_first() || provenance_required {
+            return self
+                .core
+                .predictor
+                .admission_candidates(previous_context, seed);
+        }
+        let legacy = match previous_context {
+            Some(pp) => self.core.predictor.predict_next2(pp, seed),
+            None => self.core.predictor.predict_next(seed),
+        };
+        // Default physical admission uses the historical combined lifecycle.
+        // Avoid extra predictor-row lock lookups for raw arm provenance on
+        // normal untraced runs; Phase 4B asks for provenance explicitly.
+        legacy
+            .into_iter()
+            .map(|(expert_id, score)| MarkovCandidate {
+                expert_id,
+                score,
+                arm: MarkovCandidateArm::FirstOrder,
+            })
+            .collect()
+    }
+
     /// Prefetch every id in the union `S ∪ L ∪ M` (plus the optional
     /// affinity/spatial neighbour fold) that isn't already resident —
     /// the **speculative I/O union-fetch** described in the design spec.
@@ -3879,12 +3916,25 @@ impl Engine {
     /// speculator once this token), so no second forward pass is issued.
     fn union_prefetch(
         self: &Arc<Self>,
-        s_markov: &[(u32, f64)],
+        s_markov: &[MarkovCandidate],
         m_speculator: &[u32],
         already_in_flight: &HashSet<u32>,
         layer: Option<u32>,
         phase4b_context: Option<&Phase4bPredictionContext>,
     ) {
+        let precision_first = self.core.predictor.admission_policy().precision_first();
+        let mut markov_provenance =
+            precision_first.then(|| HashMap::with_capacity(s_markov.len()));
+        let markov_scores: Vec<(u32, f64)> = s_markov
+            .iter()
+            .map(|candidate| {
+                if let Some(provenance) = markov_provenance.as_mut() {
+                    let canon = self.resolve_alias(candidate.expert_id);
+                    provenance.entry(canon).or_insert(*candidate);
+                }
+                (candidate.expert_id, candidate.score)
+            })
+            .collect();
         // Locality (L) arm — the monitor's current hot set, or empty.
         let locality_ids: Vec<u32> = self
             .speculation
@@ -3919,7 +3969,7 @@ impl Engine {
             // Canonicalize Markov ids, keeping the max probability when multiple ids
             // map to the same canonical expert.
             let mut markov: HashMap<u32, f64> = HashMap::new();
-            for &(id, p) in s_markov {
+            for &(id, p) in &markov_scores {
                 let canon = self.resolve_alias(id);
                 markov
                     .entry(canon)
@@ -3933,7 +3983,7 @@ impl Engine {
         } else {
             self.core
                 .predictor
-                .combine_unified_arms(s_markov, &locality_ids, m_speculator)
+                .combine_unified_arms(&markov_scores, &locality_ids, m_speculator)
         };
         // Optional affinity + spatial neighbour fold: for every
         // high-confidence seed, pull its top co-fired (per-layer
@@ -3959,38 +4009,55 @@ impl Engine {
         let mut seen: HashSet<u32> = already_in_flight.clone();
         let mut candidates: Vec<(u32, f64, Option<Phase4bCandidateTicket>)> =
             Vec::with_capacity(scored.len());
-        let mut combined_list = Vec::with_capacity(scored.len());
+        let mut traced_lists: HashMap<PredictorArm, Vec<(u32, f64)>> = HashMap::new();
+        let expected_target_layer = layer.and_then(|source| {
+            source
+                .checked_add(1)
+                .filter(|next| (*next as usize) < self.core.cache.num_layers())
+        });
+        let per_layer = self
+            .core
+            .storage
+            .config()
+            .num_experts_per_layer
+            .filter(|stride| *stride > 0);
         for (rank, (id, score)) in scored.into_iter().enumerate() {
             let canon = self.resolve_alias(id);
             let resident = self.core.cache.contains(canon);
             let current_target = already_in_flight.contains(&canon);
             let globally_in_flight = self.core.in_flight.contains_key(&canon);
+            let decoded = per_layer.map(|stride| global_to_layer_local(canon, stride));
+            let belongs = expected_target_layer
+                .zip(decoded)
+                .map(|(expected, (decoded_layer, _))| expected == decoded_layer);
+            let (trace_arm, trace_score) = if precision_first {
+                markov_provenance
+                    .as_ref()
+                    .expect("precision-first provenance map is present")
+                    .get(&canon)
+                    .copied()
+                    .map(|candidate| {
+                        (phase4b_markov_arm(candidate.arm), candidate.score)
+                    })
+                    .unwrap_or((PredictorArm::Combined, score as f64))
+            } else {
+                (PredictorArm::Combined, score as f64)
+            };
             let ticket =
                 self.metrics
                     .phase4b
                     .as_ref()
                     .zip(phase4b_context)
                     .map(|(trace, context)| {
-                        let decoded = self
-                            .core
-                            .storage
-                            .config()
-                            .num_experts_per_layer
-                            .filter(|stride| *stride > 0)
-                            .map(|stride| global_to_layer_local(canon, stride));
-                        let belongs = context
-                            .expected_target_layer
-                            .zip(decoded)
-                            .map(|(expected, (decoded_layer, _))| expected == decoded_layer);
                         trace.candidate_generated(
                             context.request_id,
                             context.token_index,
                             context.source_layer,
                             context.expected_target_layer,
                             &context.predictor_context,
-                            PredictorArm::Combined,
+                            trace_arm,
                             rank,
-                            score as f64,
+                            trace_score,
                             canon,
                             decoded.map(|pair| pair.0),
                             decoded.map(|pair| pair.1),
@@ -4000,7 +4067,20 @@ impl Engine {
                             globally_in_flight,
                         )
                     });
-            combined_list.push((canon, score as f64));
+            traced_lists
+                .entry(trace_arm)
+                .or_default()
+                .push((canon, trace_score));
+            // A precision-first layer-qualified prediction is admitted only
+            // when it decodes into the immediately following MoE layer.
+            // `None` covers the final layer and malformed/missing geometry;
+            // strict admission fails closed in both cases.
+            if precision_first && layer.is_some() && belongs != Some(true) {
+                if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), ticket) {
+                    trace.transition(ticket, "filtered_wrong_target_layer");
+                }
+                continue;
+            }
             if resident {
                 if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), ticket) {
                     trace.transition(ticket, "filtered_resident");
@@ -4016,12 +4096,21 @@ impl Engine {
             if seen.insert(canon) {
                 candidates.push((canon, score as f64, ticket));
             } else if let (Some(trace), Some(ticket)) = (self.metrics.phase4b.as_ref(), ticket) {
-                trace.transition(ticket, "filtered_global_in_flight");
+                trace.transition(
+                    ticket,
+                    if precision_first {
+                        "filtered_duplicate"
+                    } else {
+                        "filtered_global_in_flight"
+                    },
+                );
             }
         }
         if let Some(trace) = self.metrics.phase4b.as_ref() {
             if phase4b_context.is_some() {
-                trace.finish_candidate_list(PredictorArm::Combined, &combined_list);
+                for (arm, list) in traced_lists {
+                    trace.finish_candidate_list(arm, &list);
+                }
             }
         }
         // Truncate to the shadow-slot budget: in-flight speculation can
@@ -4478,10 +4567,11 @@ impl Engine {
                 Some(&pp) if contiguous => Some(pp),
                 _ => None,
             };
-            let s_markov = match previous_context {
-                Some(pp) => self.core.predictor.predict_next2(pp, seed),
-                None => self.core.predictor.predict_next(seed),
-            };
+            let s_markov = self.markov_admission_candidates(
+                previous_context,
+                seed,
+                phase4b_identity.is_some(),
+            );
             drop(ring);
             let phase4b_prediction = phase4b_identity.map(|(request_id, token_index)| {
                 let mut predictor_context = Vec::with_capacity(2);
@@ -4499,28 +4589,19 @@ impl Engine {
                     predictor_context,
                     current_target: target.clone(),
                 };
-                if let Some(trace) = self.metrics.phase4b.as_ref() {
+                if let Some(trace) = self
+                    .metrics
+                    .phase4b
+                    .as_ref()
+                    .filter(|_| !self.core.predictor.admission_policy().precision_first())
+                {
                     let per_layer = self.core.storage.config().num_experts_per_layer;
                     let mut lists: HashMap<PredictorArm, Vec<(u32, f64)>> = HashMap::new();
-                    for (rank, &(candidate, score)) in s_markov.iter().enumerate() {
-                        let arm = if self.core.predictor.candidate_uses_prior_fill(
-                            previous_context,
-                            seed,
-                            candidate,
-                        ) {
-                            PredictorArm::FallbackPriorFill
-                        } else if previous_context.is_some_and(|pp| {
-                            self.core
-                                .predictor
-                                .candidate_has_second_order_evidence(pp, seed, candidate)
-                        }) {
-                            PredictorArm::SecondOrderMarkov
-                        } else {
-                            PredictorArm::FirstOrderMarkov
-                        };
+                    for (rank, candidate) in s_markov.iter().enumerate() {
+                        let arm = phase4b_markov_arm(candidate.arm);
                         let decoded = per_layer
                             .filter(|stride| *stride > 0)
-                            .map(|stride| global_to_layer_local(candidate, stride));
+                            .map(|stride| global_to_layer_local(candidate.expert_id, stride));
                         let belongs = context
                             .expected_target_layer
                             .zip(decoded)
@@ -4533,16 +4614,19 @@ impl Engine {
                             &context.predictor_context,
                             arm,
                             rank,
-                            score,
-                            candidate,
+                            candidate.score,
+                            candidate.expert_id,
                             decoded.map(|pair| pair.0),
                             decoded.map(|pair| pair.1),
                             belongs,
-                            target.contains(&candidate),
-                            self.core.cache.contains(candidate),
-                            self.core.in_flight.contains_key(&candidate),
+                            target.contains(&candidate.expert_id),
+                            self.core.cache.contains(candidate.expert_id),
+                            self.core.in_flight.contains_key(&candidate.expert_id),
                         );
-                        lists.entry(arm).or_default().push((candidate, score));
+                        lists
+                            .entry(arm)
+                            .or_default()
+                            .push((candidate.expert_id, candidate.score));
                     }
                     for (arm, candidates) in lists {
                         trace.finish_candidate_list(arm, &candidates);
@@ -5715,7 +5799,9 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
-    use crate::router::{PredictiveLoader, TopKRouter};
+    use crate::router::{
+        PredictiveLoader, PredictorAdmissionPolicy, TopKRouter,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -5850,6 +5936,162 @@ mod tests {
                 .phase4b_snapshot()
                 .expect("failed-writer snapshot")
                 .trace_write_failed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phase4c_second_only_dedupes_and_filters_wrong_target_before_io() {
+        let dir = TempDir::new("phase4c-admission");
+        let trace_path = dir.path.join("phase4c.jsonl");
+        let per_layer = 4u32;
+        let num_layers = 3usize;
+        let total_experts = per_layer * num_layers as u32;
+        let d_model = 16usize;
+        let d_ff = 32usize;
+        let seed = 0x4CAu64;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(
+            &dir.path,
+            total_experts,
+            expert_size,
+            d_model,
+            d_ff,
+        )
+        .expect("generate synthetic experts");
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: dir.path.clone(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: Some(per_layer),
+            })
+            .expect("storage init"),
+        );
+        storage
+            .warmup_fds(0..total_experts)
+            .expect("pre-open expert fds");
+        let pool = BufferPool::new_with_shadow(5, 2, expert_size, block_align);
+        let cache = Arc::new(MultiLayerExpertCache::with_capacities(
+            vec![4; num_layers],
+            per_layer,
+        ));
+        let router = Router::Markov(Arc::new(TopKRouter::new(total_experts, 2, seed)));
+        let predictor = Arc::new(PredictiveLoader::new_with_admission_policy(
+            total_experts,
+            2,
+            0.0,
+            seed,
+            PredictorAdmissionPolicy {
+                first_order_enabled: false,
+                second_order_enabled: true,
+                fallback_prior_fill_enabled: false,
+                fanout_is_upper_bound: true,
+            },
+        ));
+        for _ in 0..8 {
+            predictor.observe(1, 2);
+            predictor.observe2(0, 1, 5); // layer 1: eligible from source layer 0
+            predictor.observe2(0, 1, 9); // layer 2: wrong immediate target
+        }
+        let mut candidates = predictor.admission_candidates(Some(0), 1);
+        assert_eq!(candidates.len(), 2);
+        // Exercise cross-arm/input duplication at the admission boundary.
+        candidates.push(candidates[0]);
+
+        let trace = Arc::new(crate::phase4b::Phase4bTrace::open(&trace_path, 256).unwrap());
+        let engine = Arc::new(
+            Engine::new(
+                cache.clone(),
+                pool,
+                storage,
+                router,
+                predictor,
+                ModelShape {
+                    d_model,
+                    d_ff,
+                    hidden_seed: seed,
+                },
+            )
+            .with_phase4b_trace(trace),
+        );
+        let request = engine.begin_phase4b_request("phase4c-admission", 0, true);
+        let request_id = request.expect("Phase 4B trace is installed");
+        let context = Phase4bPredictionContext {
+            request_id,
+            token_index: 0,
+            source_layer: 0,
+            expected_target_layer: Some(1),
+            predictor_context: vec![0, 1],
+            current_target: Vec::new(),
+        };
+        engine.union_prefetch(
+            &[],
+            &[],
+            &HashSet::new(),
+            Some(0),
+            Some(&context),
+        );
+        assert_eq!(
+            engine.report().prefetch_submitted,
+            0,
+            "zero eligible candidates must issue zero speculative reads"
+        );
+        engine.union_prefetch(
+            &candidates,
+            &[5], // duplicate nomination from another predictive arm
+            &HashSet::new(),
+            Some(0),
+            Some(&context),
+        );
+
+        for _ in 0..200 {
+            if engine.report().prefetch_completed == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        engine.end_phase4b_request(request);
+
+        let report = engine.report();
+        assert_eq!(
+            report.prefetch_submitted, 1,
+            "duplicate nominations must produce one admitted prefetch"
+        );
+        assert_eq!(
+            report.prefetch_completed, 1,
+            "duplicate nominations must produce one physical read"
+        );
+        assert!(cache.contains(5), "eligible next-layer expert must land");
+        assert!(
+            !cache.contains(9),
+            "wrong-target-layer expert must be filtered before I/O"
+        );
+
+        let snapshot = engine.phase4b_snapshot().expect("phase4c trace snapshot");
+        assert_eq!(snapshot.lifecycle.filtered_wrong_target_layer, 1);
+        assert_eq!(snapshot.lifecycle.admitted, 1);
+        assert_eq!(snapshot.lifecycle.physical_read_issued, 1);
+        assert!(snapshot.lifecycle_reconciliation_passed);
+        assert!(
+            snapshot
+                .predictor_quality
+                .by_arm
+                .contains_key("second_order_markov")
+        );
+        assert!(
+            !snapshot
+                .predictor_quality
+                .by_arm
+                .contains_key("first_order_markov")
+        );
+        assert!(
+            !snapshot
+                .predictor_quality
+                .by_arm
+                .contains_key("fallback_prior_fill")
         );
     }
 

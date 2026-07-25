@@ -170,6 +170,14 @@ pin_after_observations = 0
 # packed_blob = "./experts.blob"
 # packed_manifest = "./experts.blob.manifest.json"
 
+# Markov predictor-arm admission. These defaults preserve the historical
+# combined predictor and its prior-based fanout fill exactly.
+[prefetch_predictor]
+first_order_enabled = true
+second_order_enabled = true
+fallback_prior_fill_enabled = true
+fanout_is_upper_bound = false
+
 [tokenizer]
 # Path to a HuggingFace `tokenizer.json` (e.g. the one shipped with
 # Mixtral). Comment out / delete to use the byte-level fallback.

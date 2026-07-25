@@ -27,6 +27,7 @@ use parking_lot::RwLock;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -309,6 +310,63 @@ impl Row {
     }
 }
 
+fn predictor_arm_enabled_by_default() -> bool {
+    true
+}
+
+/// Configurable admission policy for the Markov prefetch predictor.
+///
+/// The defaults intentionally describe the historical combined predictor:
+/// first- and second-order evidence are blended, and the smoothed prior fills
+/// any unused fanout slots. Any non-default policy switches the engine to the
+/// precision-first admission path, where candidates retain their arm
+/// provenance and are validated before physical prefetch admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PredictorAdmissionPolicy {
+    #[serde(default = "predictor_arm_enabled_by_default")]
+    pub first_order_enabled: bool,
+    #[serde(default = "predictor_arm_enabled_by_default")]
+    pub second_order_enabled: bool,
+    #[serde(default = "predictor_arm_enabled_by_default")]
+    pub fallback_prior_fill_enabled: bool,
+    #[serde(default)]
+    pub fanout_is_upper_bound: bool,
+}
+
+impl Default for PredictorAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            first_order_enabled: true,
+            second_order_enabled: true,
+            fallback_prior_fill_enabled: true,
+            fanout_is_upper_bound: false,
+        }
+    }
+}
+
+impl PredictorAdmissionPolicy {
+    /// Whether this policy must use the precision-first admission path.
+    pub fn precision_first(self) -> bool {
+        self != Self::default()
+    }
+}
+
+/// Provenance retained for an admission candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkovCandidateArm {
+    FirstOrder,
+    SecondOrder,
+    FallbackPriorFill,
+}
+
+/// A scored Markov candidate before cache/I/O admission filters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkovCandidate {
+    pub expert_id: u32,
+    pub score: f64,
+    pub arm: MarkovCandidateArm,
+}
+
 pub struct PredictiveLoader {
     num_experts: u32,
     /// `rows[from]` — sparse counts of successors of `from` (1st-order).
@@ -326,11 +384,28 @@ pub struct PredictiveLoader {
     min_prob: f64,
     /// Prior added to every transition to smooth the empty-state case.
     prior: u32,
+    admission_policy: PredictorAdmissionPolicy,
     rng: parking_lot::Mutex<StdRng>,
 }
 
 impl PredictiveLoader {
     pub fn new(num_experts: u32, fanout: usize, min_prob: f64, seed: u64) -> Self {
+        Self::new_with_admission_policy(
+            num_experts,
+            fanout,
+            min_prob,
+            seed,
+            PredictorAdmissionPolicy::default(),
+        )
+    }
+
+    pub fn new_with_admission_policy(
+        num_experts: u32,
+        fanout: usize,
+        min_prob: f64,
+        seed: u64,
+        admission_policy: PredictorAdmissionPolicy,
+    ) -> Self {
         let n = num_experts as usize;
         let mut rows = Vec::with_capacity(n);
         for _ in 0..n {
@@ -343,8 +418,13 @@ impl PredictiveLoader {
             fanout,
             min_prob,
             prior: 1,
+            admission_policy,
             rng: parking_lot::Mutex::new(StdRng::seed_from_u64(seed.wrapping_add(0xDEAD))),
         }
+    }
+
+    pub fn admission_policy(&self) -> PredictorAdmissionPolicy {
+        self.admission_policy
     }
 
     /// Record that `to` was activated immediately after `from`.
@@ -483,7 +563,7 @@ impl PredictiveLoader {
             }
         }
 
-        probs.sort_by(|a, b| b.1.total_cmp(&a.1));
+        probs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         probs.truncate(self.fanout);
         probs
     }
@@ -522,9 +602,165 @@ impl PredictiveLoader {
             .into_iter()
             .filter(|&(_, p)| p >= self.min_prob)
             .collect();
-        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out.truncate(self.fanout);
         out
+    }
+
+    /// Produce arm-aware candidates for physical prefetch admission.
+    ///
+    /// The default policy delegates to the legacy predictor methods so
+    /// existing configurations retain their combined/blended behavior. A
+    /// non-default policy ranks only enabled learned arms. Prior candidates
+    /// are manufactured only when fallback fill is enabled *and* fanout is a
+    /// quota; strict upper-bound mode never fills missing slots.
+    pub fn admission_candidates(
+        &self,
+        prev_prev: Option<u32>,
+        prev: u32,
+    ) -> Vec<MarkovCandidate> {
+        if prev >= self.num_experts || self.fanout == 0 {
+            return Vec::new();
+        }
+        if !self.admission_policy.precision_first() {
+            let legacy = match prev_prev {
+                Some(pp) => self.predict_next2(pp, prev),
+                None => self.predict_next(prev),
+            };
+            return legacy
+                .into_iter()
+                .map(|(expert_id, score)| {
+                    let arm = if self.candidate_uses_prior_fill(prev_prev, prev, expert_id) {
+                        MarkovCandidateArm::FallbackPriorFill
+                    } else if prev_prev.is_some_and(|pp| {
+                        self.candidate_has_second_order_evidence(pp, prev, expert_id)
+                    }) {
+                        MarkovCandidateArm::SecondOrder
+                    } else {
+                        MarkovCandidateArm::FirstOrder
+                    };
+                    MarkovCandidate {
+                        expert_id,
+                        score,
+                        arm,
+                    }
+                })
+                .collect();
+        }
+
+        #[derive(Default)]
+        struct Evidence {
+            first_score: Option<f64>,
+            second_score: Option<f64>,
+        }
+
+        let policy = self.admission_policy;
+        let rows = self.rows.read();
+        let first_row = &rows[prev as usize];
+        let first_total = self.effective_total(first_row.total_observed) as f64;
+        let prior_f = self.prior as f64;
+        let mut evidence: HashMap<u32, Evidence> = HashMap::new();
+        if policy.first_order_enabled && first_total > 0.0 {
+            for (&expert_id, &count) in &first_row.counts {
+                let score = (count as f64 + prior_f) / first_total;
+                if score >= self.min_prob {
+                    evidence.entry(expert_id).or_default().first_score = Some(score);
+                }
+            }
+        }
+
+        let rows2 = self.rows2.read();
+        let second_row = prev_prev
+            .filter(|pp| *pp < self.num_experts)
+            .and_then(|pp| {
+                let key = (pp as u64) * (self.num_experts as u64) + prev as u64;
+                rows2.get(&key)
+            })
+            .filter(|row| row.total_observed > 0);
+        let second_total = second_row
+            .map(|row| self.effective_total(row.total_observed) as f64)
+            .unwrap_or(0.0);
+        if policy.second_order_enabled && second_total > 0.0 {
+            for (&expert_id, &count) in &second_row.expect("positive total requires row").counts {
+                let score = (count as f64 + prior_f) / second_total;
+                if score >= self.min_prob {
+                    evidence.entry(expert_id).or_default().second_score = Some(score);
+                }
+            }
+        }
+
+        let blend = policy.first_order_enabled
+            && policy.second_order_enabled
+            && second_row.is_some();
+        let mut candidates: Vec<MarkovCandidate> = evidence
+            .into_iter()
+            .filter_map(|(expert_id, item)| {
+                let score = if blend {
+                    0.5 * item.first_score.unwrap_or(prior_f / first_total)
+                        + 0.5 * item.second_score.unwrap_or(prior_f / second_total)
+                } else {
+                    item.second_score.or(item.first_score).unwrap_or(0.0)
+                };
+                (score >= self.min_prob).then_some(MarkovCandidate {
+                    expert_id,
+                    score,
+                    arm: if item.second_score.is_some() {
+                        MarkovCandidateArm::SecondOrder
+                    } else {
+                        MarkovCandidateArm::FirstOrder
+                    },
+                })
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.expert_id.cmp(&b.expert_id))
+        });
+        candidates.truncate(self.fanout);
+
+        let allow_fill =
+            policy.fallback_prior_fill_enabled && !policy.fanout_is_upper_bound;
+        if allow_fill && candidates.len() < self.fanout {
+            let first_prior = if first_total > 0.0 {
+                prior_f / first_total
+            } else {
+                0.0
+            };
+            let second_prior = if second_total > 0.0 {
+                prior_f / second_total
+            } else {
+                0.0
+            };
+            let fallback_score = if blend {
+                0.5 * first_prior + 0.5 * second_prior
+            } else if policy.second_order_enabled && second_row.is_some() {
+                second_prior
+            } else {
+                first_prior
+            };
+            let mut seen: std::collections::HashSet<u32> =
+                candidates.iter().map(|candidate| candidate.expert_id).collect();
+            for expert_id in 0..self.num_experts {
+                if candidates.len() >= self.fanout {
+                    break;
+                }
+                if seen.insert(expert_id) {
+                    candidates.push(MarkovCandidate {
+                        expert_id,
+                        score: fallback_score,
+                        arm: MarkovCandidateArm::FallbackPriorFill,
+                    });
+                }
+            }
+            candidates.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.expert_id.cmp(&b.expert_id))
+            });
+            candidates.truncate(self.fanout);
+        }
+        candidates
     }
 
     /// Diagnostic-only provenance for a returned Markov candidate.
@@ -3305,22 +3541,220 @@ mod tests {
     }
 
     #[test]
-    fn phase4b_equal_probability_order_is_only_process_local_stable() {
+    fn phase4c_equal_probability_order_is_deterministic_by_expert_id() {
         let predictor = PredictiveLoader::new(32, 4, 0.0, 17);
         for candidate in [4, 5, 6, 7] {
             predictor.observe(3, candidate);
         }
         let first = predictor.predict_next(3);
+        assert_eq!(
+            first.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![4, 5, 6, 7]
+        );
         for _ in 0..128 {
             assert_eq!(
                 predictor.predict_next(3),
                 first,
-                "one HashMap instance retains its iteration order"
+                "equal scores must retain the ascending-id tie break"
             );
         }
-        // No cross-process ordering assertion is made: equal-count observed
-        // successors originate in a randomly seeded HashMap and `sort_by`
-        // compares only probability, so a fresh process may order ties
-        // differently. Phase 4B records the tied-candidate count explicitly.
+    }
+
+    fn second_only_policy() -> PredictorAdmissionPolicy {
+        PredictorAdmissionPolicy {
+            first_order_enabled: false,
+            second_order_enabled: true,
+            fallback_prior_fill_enabled: false,
+            fanout_is_upper_bound: true,
+        }
+    }
+
+    #[test]
+    fn phase4c_default_admission_matches_legacy_combined_predictor() {
+        let predictor = PredictiveLoader::new(16, 2, 0.0, 19);
+        for _ in 0..8 {
+            predictor.observe(2, 5);
+            predictor.observe(2, 6);
+            predictor.observe2(1, 2, 6);
+            predictor.observe2(1, 2, 7);
+        }
+        let legacy = predictor.predict_next2(1, 2);
+        let admitted = predictor.admission_candidates(Some(1), 2);
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|candidate| (candidate.expert_id, candidate.score))
+                .collect::<Vec<_>>(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn phase4c_demand_only_zero_fanout_preserves_zero_admission() {
+        let predictor = PredictiveLoader::new_with_admission_policy(
+            16,
+            0,
+            0.0,
+            21,
+            PredictorAdmissionPolicy::default(),
+        );
+        predictor.observe(2, 5);
+        predictor.observe2(1, 2, 9);
+        assert!(predictor.predict_next2(1, 2).is_empty());
+        assert!(predictor.admission_candidates(Some(1), 2).is_empty());
+        assert_eq!(
+            predictor.observations(),
+            1,
+            "zero fanout disables admission without disabling learning"
+        );
+    }
+
+    #[test]
+    fn phase4c_second_only_excludes_first_order_and_fallback_candidates() {
+        let predictor = PredictiveLoader::new_with_admission_policy(
+            16,
+            2,
+            0.0,
+            23,
+            second_only_policy(),
+        );
+        for _ in 0..20 {
+            predictor.observe(2, 5);
+            predictor.observe2(1, 2, 9);
+        }
+        let admitted = predictor.admission_candidates(Some(1), 2);
+        assert_eq!(admitted.len(), 1, "fanout two is an upper bound");
+        assert_eq!(admitted[0].expert_id, 9);
+        assert_eq!(admitted[0].arm, MarkovCandidateArm::SecondOrder);
+    }
+
+    #[test]
+    fn phase4c_second_only_without_eligible_row_emits_nothing() {
+        let predictor = PredictiveLoader::new_with_admission_policy(
+            16,
+            2,
+            0.0,
+            29,
+            second_only_policy(),
+        );
+        predictor.observe(2, 5);
+        assert!(predictor.admission_candidates(Some(1), 2).is_empty());
+        assert!(predictor.admission_candidates(None, 2).is_empty());
+    }
+
+    #[test]
+    fn phase4c_first_order_control_is_independent_of_second_order() {
+        let predictor = PredictiveLoader::new_with_admission_policy(
+            16,
+            2,
+            0.0,
+            30,
+            PredictorAdmissionPolicy {
+                first_order_enabled: true,
+                second_order_enabled: false,
+                fallback_prior_fill_enabled: false,
+                fanout_is_upper_bound: true,
+            },
+        );
+        predictor.observe(2, 5);
+        predictor.observe2(1, 2, 9);
+        let admitted = predictor.admission_candidates(Some(1), 2);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].expert_id, 5);
+        assert_eq!(admitted[0].arm, MarkovCandidateArm::FirstOrder);
+    }
+
+    #[test]
+    fn phase4c_fallback_fill_control_is_independent_and_explicit() {
+        let predictor = PredictiveLoader::new_with_admission_policy(
+            8,
+            2,
+            0.0,
+            31,
+            PredictorAdmissionPolicy {
+                first_order_enabled: false,
+                second_order_enabled: false,
+                fallback_prior_fill_enabled: true,
+                fanout_is_upper_bound: false,
+            },
+        );
+        let admitted = predictor.admission_candidates(None, 3);
+        assert_eq!(admitted.len(), 2);
+        assert!(
+            admitted
+                .iter()
+                .all(|candidate| candidate.arm == MarkovCandidateArm::FallbackPriorFill)
+        );
+    }
+
+    #[test]
+    fn phase4c_upper_bound_never_manufactures_fallback_candidates() {
+        let predictor = PredictiveLoader::new_with_admission_policy(
+            8,
+            2,
+            0.0,
+            32,
+            PredictorAdmissionPolicy {
+                first_order_enabled: false,
+                second_order_enabled: false,
+                fallback_prior_fill_enabled: true,
+                fanout_is_upper_bound: true,
+            },
+        );
+        assert!(
+            predictor.admission_candidates(None, 3).is_empty(),
+            "upper-bound admission must not fill unused fanout slots"
+        );
+    }
+
+    #[test]
+    fn phase4c_fanout_one_selects_highest_ranked_second_order_candidate() {
+        let predictor = PredictiveLoader::new_with_admission_policy(
+            16,
+            1,
+            0.0,
+            31,
+            second_only_policy(),
+        );
+        for _ in 0..12 {
+            predictor.observe2(1, 2, 9);
+        }
+        for _ in 0..3 {
+            predictor.observe2(1, 2, 8);
+        }
+        let admitted = predictor.admission_candidates(Some(1), 2);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].expert_id, 9);
+    }
+
+    #[test]
+    fn phase4c_second_order_ties_are_deterministic_and_deduplicated() {
+        let predictor = PredictiveLoader::new_with_admission_policy(
+            16,
+            2,
+            0.0,
+            37,
+            second_only_policy(),
+        );
+        for _ in 0..4 {
+            predictor.observe2(1, 2, 9);
+            predictor.observe2(1, 2, 8);
+        }
+        let admitted = predictor.admission_candidates(Some(1), 2);
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|candidate| candidate.expert_id)
+                .collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|candidate| candidate.expert_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            admitted.len()
+        );
     }
 }

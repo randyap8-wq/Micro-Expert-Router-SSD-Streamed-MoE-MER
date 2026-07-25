@@ -40,6 +40,12 @@ predict_min_prob = 0.0
 partial_load_fraction = 1.0
 pin_after_observations = 0
 
+[prefetch_predictor]
+first_order_enabled = @FIRST_ORDER_ENABLED@
+second_order_enabled = @SECOND_ORDER_ENABLED@
+fallback_prior_fill_enabled = @FALLBACK_PRIOR_FILL_ENABLED@
+fanout_is_upper_bound = @FANOUT_IS_UPPER_BOUND@
+
 [tokenizer]
 path = "@TOKENIZER_PATH@"
 

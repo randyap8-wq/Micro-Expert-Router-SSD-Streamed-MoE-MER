@@ -17,7 +17,7 @@ TOKENIZER=${MER_QWEN_TOKENIZER:-$MER_QWEN_CONVERTED_DIR/tokenizer.json}
 ARTIFACT_DIR=${1:-}
 MODE_ARG=${2:-four-case}
 if [[ -z "$ARTIFACT_DIR" ]]; then
-  echo "usage: $0 ARTIFACT_DIR [four-case|phase4b-diagnostic|--resident-only]" >&2
+  echo "usage: $0 ARTIFACT_DIR [four-case|phase4c-untraced|phase4b-diagnostic|--resident-only]" >&2
   exit 2
 fi
 case "$MODE_ARG" in
@@ -25,6 +25,15 @@ case "$MODE_ARG" in
     COLLECTOR_MODE=four-case
     QUALIFICATION_KIND=performance-baseline
     EXPERIMENT_NAME=prompt2-phase4a-prefetch-ablation
+    ;;
+  phase4c-untraced)
+    COLLECTOR_MODE=phase4c-untraced
+    QUALIFICATION_KIND=performance-baseline
+    EXPERIMENT_NAME=prompt2-phase4c-precision-first-prefetch
+    if [[ "$PREFETCH_VARIANT" == custom ]]; then
+      echo "phase4c-untraced requires MER_PROMPT2_PREFETCH_VARIANT=demand-only, current-f2, second-only-f2, or second-only-f1" >&2
+      exit 2
+    fi
     ;;
   phase4b-diagnostic)
     COLLECTOR_MODE=phase4b-diagnostic
@@ -37,10 +46,19 @@ case "$MODE_ARG" in
     EXPERIMENT_NAME=prompt2-phase4a-prefetch-ablation
     ;;
   *)
-    echo "unknown collector mode: $MODE_ARG (expected four-case, phase4b-diagnostic, or --resident-only)" >&2
+    echo "unknown collector mode: $MODE_ARG (expected four-case, phase4c-untraced, phase4b-diagnostic, or --resident-only)" >&2
     exit 2
     ;;
 esac
+
+OUTPUT_TOKENS=128
+if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
+  OUTPUT_TOKENS=${MER_PROMPT2_PHASE4B_OUTPUT_TOKENS-128}
+  if [[ ! "$OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MER_PROMPT2_PHASE4B_OUTPUT_TOKENS must be a positive integer" >&2
+    exit 2
+  fi
+fi
 
 PHASE4B_TRACE_TEMPLATE=${MER_PROMPT2_PHASE4B_TRACE_PATH:-}
 PHASE4B_TRACE_MAX_EVENTS=${MER_PROMPT2_PHASE4B_TRACE_MAX_EVENTS:-1000000}
@@ -144,6 +162,12 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "experiment_name=$EXPERIMENT_NAME"
   echo "predict_fanout=$PREDICT_FANOUT"
   echo "pipeline_depth=$PIPELINE_DEPTH"
+  echo "prefetch_variant=$PREFETCH_VARIANT"
+  echo "first_order_enabled=$FIRST_ORDER_ENABLED"
+  echo "second_order_enabled=$SECOND_ORDER_ENABLED"
+  echo "fallback_prior_fill_enabled=$FALLBACK_PRIOR_FILL_ENABLED"
+  echo "fanout_is_upper_bound=$FANOUT_IS_UPPER_BOUND"
+  echo "output_tokens=$OUTPUT_TOKENS"
   echo "prefetch_expected_active=$PREFETCH_EXPECTED_ACTIVE"
   echo "phase4b_trace_enabled=$PHASE4B_TRACE_ENABLED"
   echo "phase4b_trace_path_template=$PHASE4B_TRACE_TEMPLATE"
@@ -177,16 +201,20 @@ CONFIG_SHA=$(sha256sum "$MODEL_REAL/config.json" | awk '{print $1}')
 DENSE_MANIFEST_SHA=$(sha256sum "$MODEL_REAL/dense_manifest.json" | awk '{print $1}')
 
 prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-1536.toml" \
-  "$MODEL_REAL" "$TOKENIZER_REAL" 1536 "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
-if [[ "$COLLECTOR_MODE" != phase4b-diagnostic ]]; then
+  "$MODEL_REAL" "$TOKENIZER_REAL" 1536 "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
+  "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
+  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND"
+if [[ "$COLLECTOR_MODE" != phase4b-diagnostic && "$COLLECTOR_MODE" != phase4c-untraced ]]; then
   prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-6144.toml" \
-    "$MODEL_REAL" "$TOKENIZER_REAL" 6144 "$PREDICT_FANOUT" "$PIPELINE_DEPTH"
+    "$MODEL_REAL" "$TOKENIZER_REAL" 6144 "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
+    "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
+    "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND"
 fi
 
 # Physical pool sizing from build_bench_real_runtime:
 # primary=(cache_slots+1), shadow=predict_fanout*pipeline_depth.
 POOL_SLOTS=(1536 6144)
-if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
+if [[ "$COLLECTOR_MODE" == phase4b-diagnostic || "$COLLECTOR_MODE" == phase4c-untraced ]]; then
   POOL_SLOTS=(1536)
 fi
 for slots in "${POOL_SLOTS[@]}"; do
@@ -227,6 +255,12 @@ jq -n \
   --arg experiment_name "$EXPERIMENT_NAME" \
   --argjson predict_fanout "$PREDICT_FANOUT" \
   --argjson pipeline_depth "$PIPELINE_DEPTH" \
+  --arg prefetch_variant "$PREFETCH_VARIANT" \
+  --argjson first_order_enabled "$FIRST_ORDER_ENABLED" \
+  --argjson second_order_enabled "$SECOND_ORDER_ENABLED" \
+  --argjson fallback_prior_fill_enabled "$FALLBACK_PRIOR_FILL_ENABLED" \
+  --argjson fanout_is_upper_bound "$FANOUT_IS_UPPER_BOUND" \
+  --argjson output_tokens "$OUTPUT_TOKENS" \
   --argjson prefetch_expected_active "$PREFETCH_EXPECTED_ACTIVE" \
   --arg git_commit_full "$EXPECTED_COMMIT" \
   --arg config_json_sha256 "$CONFIG_SHA" \
@@ -247,6 +281,14 @@ jq -n \
     experiment_name: $experiment_name,
     predict_fanout: $predict_fanout,
     pipeline_depth: $pipeline_depth,
+    prefetch_variant: $prefetch_variant,
+    prefetch_predictor: {
+      first_order_enabled: $first_order_enabled,
+      second_order_enabled: $second_order_enabled,
+      fallback_prior_fill_enabled: $fallback_prior_fill_enabled,
+      fanout_is_upper_bound: $fanout_is_upper_bound
+    },
+    output_tokens: $output_tokens,
     prefetch_expected_active: $prefetch_expected_active,
     git_commit_full: $git_commit_full,
     model_hashes: {
@@ -302,7 +344,7 @@ run_case() {
     bench-real \
     --config "$config" \
     --request-json "$request" \
-    --output-tokens 128 \
+    --output-tokens "$OUTPUT_TOKENS" \
     --warmup-runs 1 \
     --measured-runs 5 \
     --cache-reset keep \
@@ -323,6 +365,11 @@ run_case() {
     --argjson prompt_tokens "$expected_prompt_tokens" \
     --argjson predict_fanout "$PREDICT_FANOUT" \
     --argjson pipeline_depth "$PIPELINE_DEPTH" \
+    --argjson first_order_enabled "$FIRST_ORDER_ENABLED" \
+    --argjson second_order_enabled "$SECOND_ORDER_ENABLED" \
+    --argjson fallback_prior_fill_enabled "$FALLBACK_PRIOR_FILL_ENABLED" \
+    --argjson fanout_is_upper_bound "$FANOUT_IS_UPPER_BOUND" \
+    --argjson output_tokens "$OUTPUT_TOKENS" \
     --argjson phase4b_trace_enabled "$PHASE4B_TRACE_ENABLED" '
     .schema == {"name":"mer-bench-real","version":2} and
     .benchmark == "bench-real" and
@@ -369,7 +416,7 @@ run_case() {
     .model.expert_dtype == "q8_0" and
     .prompt_identity.fixture_identifier == $prompt_id and
     .prompt_identity.sha256 == $prompt_sha and
-    .prompt_identity.requested_completion_tokens == 128 and
+    .prompt_identity.requested_completion_tokens == $output_tokens and
     .storage.active_expert_io_backend == "pread-odirect" and
     .storage.direct_io_enabled == true and
     .storage.io_uring_compiled == true and
@@ -394,6 +441,10 @@ run_case() {
     .predictive_policy == {
       "markov_prefetch_fanout":$predict_fanout,
       "pipeline_depth":$pipeline_depth,
+      "first_order_enabled":$first_order_enabled,
+      "second_order_enabled":$second_order_enabled,
+      "fallback_prior_fill_enabled":$fallback_prior_fill_enabled,
+      "fanout_is_upper_bound":$fanout_is_upper_bound,
       "locality_enabled":false,
       "speculator_enabled":false,
       "affinity_enabled":false,
@@ -406,8 +457,8 @@ run_case() {
     .aggregate.output_token_parity == true and
     (.runs | length == 5) and
     ([.runs[].prompt_tokens] | all(. == $prompt_tokens)) and
-    ([.runs[].completion_tokens] | all(. == 128)) and
-    ([.runs[].total_api_tokens] | all(. == ($prompt_tokens + 128))) and
+    ([.runs[].completion_tokens] | all(. == $output_tokens)) and
+    ([.runs[].total_api_tokens] | all(. == ($prompt_tokens + $output_tokens))) and
     ([.runs[].output_token_ids] | unique | length == 1) and
     ([.runs[].correctness] | all(
       .strict_weights == true and
@@ -560,6 +611,11 @@ run_case() {
     --argjson peak_rss_bytes "$peak_rss_bytes" \
     --argjson predict_fanout "$PREDICT_FANOUT" \
     --argjson pipeline_depth "$PIPELINE_DEPTH" \
+    --arg prefetch_variant "$PREFETCH_VARIANT" \
+    --argjson first_order_enabled "$FIRST_ORDER_ENABLED" \
+    --argjson second_order_enabled "$SECOND_ORDER_ENABLED" \
+    --argjson fallback_prior_fill_enabled "$FALLBACK_PRIOR_FILL_ENABLED" \
+    --argjson fanout_is_upper_bound "$FANOUT_IS_UPPER_BOUND" \
     --argjson collection_qualification "$collection_qualification" \
     '([.runs[].cache_io] | {
       prefetch_submitted: (map(.prefetch_submitted) | add),
@@ -613,6 +669,13 @@ run_case() {
         decode_demand_reads_issued_while_speculative_reads_active: (
           [.runs[].demand_miss_fanout.decode.demand_reads_issued_while_speculative_reads_active] | add
         )
+      },
+      phase4c_predictor: {
+        variant: $prefetch_variant,
+        first_order_enabled: $first_order_enabled,
+        second_order_enabled: $second_order_enabled,
+        fallback_prior_fill_enabled: $fallback_prior_fill_enabled,
+        fanout_is_upper_bound: $fanout_is_upper_bound
       },
       phase3a_decode: {
         routed_layers_observed: ([.runs[].demand_miss_fanout.decode.routed_layers_observed] | add),
@@ -776,6 +839,45 @@ if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
       critical_path_coverage_gates_passed: null,
       external_peak_rss_present: true,
       qualification_passed: false
+    }' > "$ARTIFACT_DIR/qualification.json"
+elif [[ "$COLLECTOR_MODE" == phase4c-untraced ]]; then
+  run_case 1536 short 14 "$SHORT_PROMPT_SHA"
+  run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"
+
+  jq -s \
+    --arg variant "$PREFETCH_VARIANT" \
+    '{
+      schema: {name:"mer-prompt2-phase4c-variant-summary", version:1},
+      variant: $variant,
+      cache_slots: 1536,
+      traced: false,
+      cases: .,
+      qualification_passed: (all(.qualification_passed == true))
+    }' \
+    "$ARTIFACT_DIR/baseline-1536-short.case-summary.json" \
+    "$ARTIFACT_DIR/baseline-1536-medium.case-summary.json" \
+    > "$ARTIFACT_DIR/phase4c-variant-summary.json"
+
+  jq -n \
+    --arg commit "$EXPECTED_COMMIT" \
+    --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg variant "$PREFETCH_VARIANT" \
+    '{
+      schema: {name:"mer-prompt2-qualification", version:1},
+      git_commit_full: $commit,
+      captured_at_utc: $captured_at_utc,
+      qualification_kind: "performance-baseline",
+      phase4c_variant: $variant,
+      two_required_1536_cases_present: true,
+      no_6144_cases_collected: true,
+      trace_disabled: true,
+      schema_and_required_fields_passed: true,
+      provenance_and_backend_gates_passed: true,
+      prompt_identity_gates_passed: true,
+      strictness_and_correctness_gates_passed: true,
+      critical_path_coverage_gates_passed: true,
+      external_peak_rss_present: true,
+      qualification_passed: true
     }' > "$ARTIFACT_DIR/qualification.json"
 elif [[ "$COLLECTOR_MODE" == resident-only ]]; then
   run_case 6144 short 14 "$SHORT_PROMPT_SHA"

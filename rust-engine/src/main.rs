@@ -2301,6 +2301,10 @@ struct BenchRealMemoryLayout {
 struct BenchRealPredictivePolicy {
     markov_prefetch_fanout: usize,
     pipeline_depth: u32,
+    first_order_enabled: bool,
+    second_order_enabled: bool,
+    fallback_prior_fill_enabled: bool,
+    fanout_is_upper_bound: bool,
     locality_enabled: bool,
     speculator_enabled: bool,
     affinity_enabled: bool,
@@ -3744,11 +3748,12 @@ async fn build_bench_real_runtime(
     let total_experts: u32 = (cfg.model.num_layers as u32)
         .saturating_mul(cfg.model.num_experts)
         .max(cfg.model.num_experts);
-    let predictor = Arc::new(PredictiveLoader::new(
+    let predictor = Arc::new(PredictiveLoader::new_with_admission_policy(
         total_experts,
         cfg.storage.predict_fanout,
         resolve_predict_min_prob(cfg.storage.predict_min_prob, total_experts),
         0xC0FFEE,
+        cfg.prefetch_predictor,
     ));
 
     let rt = &cfg.real_transformer;
@@ -4406,6 +4411,13 @@ fn build_bench_real_report_context(
         predictive_policy: BenchRealPredictivePolicy {
             markov_prefetch_fanout: runtime.cfg.storage.predict_fanout,
             pipeline_depth: runtime.cfg.storage.pipeline_depth,
+            first_order_enabled: runtime.cfg.prefetch_predictor.first_order_enabled,
+            second_order_enabled: runtime.cfg.prefetch_predictor.second_order_enabled,
+            fallback_prior_fill_enabled: runtime
+                .cfg
+                .prefetch_predictor
+                .fallback_prior_fill_enabled,
+            fanout_is_upper_bound: runtime.cfg.prefetch_predictor.fanout_is_upper_bound,
             locality_enabled: runtime.cfg.predictive.locality_enabled,
             speculator_enabled: runtime.cfg.predictive.speculator_enabled,
             affinity_enabled: runtime.cfg.predictive.affinity_enabled,
@@ -5509,11 +5521,12 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         .saturating_mul(cfg.model.num_experts)
         .max(cfg.model.num_experts);
 
-    let predictor = Arc::new(PredictiveLoader::new(
+    let predictor = Arc::new(PredictiveLoader::new_with_admission_policy(
         total_experts,
         cfg.storage.predict_fanout,
         resolve_predict_min_prob(cfg.storage.predict_min_prob, total_experts),
         0xC0FFEE,
+        cfg.prefetch_predictor,
     ));
 
     // Build the real transformer (if enabled) *before* the engine so
@@ -8126,6 +8139,7 @@ mod tests {
             },
             sampling: crate::config::SamplingConfig::default(),
             predictive: crate::config::PredictiveConfig::default(),
+            prefetch_predictor: crate::router::PredictorAdmissionPolicy::default(),
             security: crate::config::SecurityConfig::default(),
             gpu_cache: crate::config::GpuCacheConfig::default(),
             distributed: crate::config::DistributedConfig::default(),
@@ -8517,6 +8531,7 @@ mod tests {
             real_transformer: RealTransformerConfig::default(),
             sampling: SamplingConfig::default(),
             predictive: PredictiveConfig::default(),
+            prefetch_predictor: crate::router::PredictorAdmissionPolicy::default(),
             security: SecurityConfig::default(),
             gpu_cache: GpuCacheConfig::default(),
             distributed: DistributedConfig::default(),

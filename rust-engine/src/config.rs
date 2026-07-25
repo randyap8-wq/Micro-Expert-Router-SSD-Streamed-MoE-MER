@@ -976,6 +976,10 @@ pub struct Config {
     pub sampling: SamplingConfig,
     #[serde(default)]
     pub predictive: PredictiveConfig,
+    /// Markov predictor-arm admission controls. When omitted, all three
+    /// historical arms remain enabled and fanout remains a fill target.
+    #[serde(default)]
+    pub prefetch_predictor: crate::router::PredictorAdmissionPolicy,
     /// Optional API-key gate, rate limit, and TLS configuration.
     /// Defaults are fully permissive (no auth, no rate limit, plain
     /// HTTP) to preserve the legacy behaviour bit-for-bit.
@@ -1500,6 +1504,7 @@ mod tests {
             real_transformer: RealTransformerConfig::default(),
             sampling: SamplingConfig::default(),
             predictive: PredictiveConfig::default(),
+            prefetch_predictor: crate::router::PredictorAdmissionPolicy::default(),
             security: SecurityConfig::default(),
             gpu_cache: GpuCacheConfig::default(),
             distributed: DistributedConfig::default(),
@@ -1826,6 +1831,33 @@ mod tests {
         assert!(!c.predictive.locality_enabled);
         assert!(!c.predictive.speculator_enabled);
         c.validate().expect("disabled predictive section is valid");
+    }
+
+    #[test]
+    fn prefetch_predictor_defaults_preserve_combined_behavior() {
+        let c = minimal_cfg();
+        assert_eq!(
+            c.prefetch_predictor,
+            crate::router::PredictorAdmissionPolicy::default()
+        );
+        assert!(!c.prefetch_predictor.precision_first());
+    }
+
+    #[test]
+    fn prefetch_predictor_partial_table_keeps_legacy_field_defaults() {
+        let policy: crate::router::PredictorAdmissionPolicy = toml::from_str(
+            r#"
+            first_order_enabled = false
+            fallback_prior_fill_enabled = false
+            fanout_is_upper_bound = true
+            "#,
+        )
+        .expect("partial predictor policy table should parse");
+        assert!(!policy.first_order_enabled);
+        assert!(policy.second_order_enabled);
+        assert!(!policy.fallback_prior_fill_enabled);
+        assert!(policy.fanout_is_upper_bound);
+        assert!(policy.precision_first());
     }
 
     #[test]
