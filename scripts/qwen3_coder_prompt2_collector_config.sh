@@ -2,51 +2,84 @@
 
 prompt2_resolve_ablation_config() {
   PREFETCH_VARIANT=${MER_PROMPT2_PREFETCH_VARIANT-custom}
+  NEURAL_SPECULATOR_ENABLED=false
+  PREFETCH_GOVERNOR_PRECISION_FLOOR=0.05
+  PREFETCH_GOVERNOR_CONTENTION_WEIGHT=1.0
   local predict_fanout_raw
   local pipeline_depth_raw
   case "$PREFETCH_VARIANT" in
     custom)
+      PREDICTOR_MODE=custom
       predict_fanout_raw=${MER_PROMPT2_PREDICT_FANOUT-2}
       pipeline_depth_raw=${MER_PROMPT2_PIPELINE_DEPTH-3}
       FIRST_ORDER_ENABLED=${MER_PROMPT2_FIRST_ORDER_ENABLED-true}
       SECOND_ORDER_ENABLED=${MER_PROMPT2_SECOND_ORDER_ENABLED-true}
       FALLBACK_PRIOR_FILL_ENABLED=${MER_PROMPT2_FALLBACK_PRIOR_FILL_ENABLED-true}
       FANOUT_IS_UPPER_BOUND=${MER_PROMPT2_FANOUT_IS_UPPER_BOUND-false}
+      PREFETCH_GOVERNOR_ENABLED=${MER_PROMPT2_PREFETCH_GOVERNOR_ENABLED-false}
       ;;
     demand-only)
+      PREDICTOR_MODE=demand-only
       predict_fanout_raw=0
       pipeline_depth_raw=3
       FIRST_ORDER_ENABLED=true
       SECOND_ORDER_ENABLED=true
       FALLBACK_PRIOR_FILL_ENABLED=true
       FANOUT_IS_UPPER_BOUND=false
+      PREFETCH_GOVERNOR_ENABLED=false
       ;;
     current-f2)
+      PREDICTOR_MODE=legacy-combined
       predict_fanout_raw=2
       pipeline_depth_raw=3
       FIRST_ORDER_ENABLED=true
       SECOND_ORDER_ENABLED=true
       FALLBACK_PRIOR_FILL_ENABLED=true
       FANOUT_IS_UPPER_BOUND=false
+      PREFETCH_GOVERNOR_ENABLED=false
+      ;;
+    current-f2-governed)
+      PREDICTOR_MODE=legacy-combined
+      predict_fanout_raw=2
+      pipeline_depth_raw=3
+      FIRST_ORDER_ENABLED=true
+      SECOND_ORDER_ENABLED=true
+      FALLBACK_PRIOR_FILL_ENABLED=true
+      FANOUT_IS_UPPER_BOUND=false
+      PREFETCH_GOVERNOR_ENABLED=true
       ;;
     second-only-f2)
+      PREDICTOR_MODE=second-order-only
       predict_fanout_raw=2
       pipeline_depth_raw=3
       FIRST_ORDER_ENABLED=false
       SECOND_ORDER_ENABLED=true
       FALLBACK_PRIOR_FILL_ENABLED=false
       FANOUT_IS_UPPER_BOUND=true
+      PREFETCH_GOVERNOR_ENABLED=false
       ;;
     second-only-f1)
+      PREDICTOR_MODE=second-order-only
       predict_fanout_raw=1
       pipeline_depth_raw=3
       FIRST_ORDER_ENABLED=false
       SECOND_ORDER_ENABLED=true
       FALLBACK_PRIOR_FILL_ENABLED=false
       FANOUT_IS_UPPER_BOUND=true
+      PREFETCH_GOVERNOR_ENABLED=false
+      ;;
+    second-only-f1-governed)
+      PREDICTOR_MODE=second-order-only
+      predict_fanout_raw=1
+      pipeline_depth_raw=3
+      FIRST_ORDER_ENABLED=false
+      SECOND_ORDER_ENABLED=true
+      FALLBACK_PRIOR_FILL_ENABLED=false
+      FANOUT_IS_UPPER_BOUND=true
+      PREFETCH_GOVERNOR_ENABLED=true
       ;;
     *)
-      echo "MER_PROMPT2_PREFETCH_VARIANT must be custom, demand-only, current-f2, second-only-f2, or second-only-f1; found: $PREFETCH_VARIANT" >&2
+      echo "MER_PROMPT2_PREFETCH_VARIANT must be custom, demand-only, current-f2, current-f2-governed, second-only-f2, second-only-f1, or second-only-f1-governed; found: $PREFETCH_VARIANT" >&2
       return 2
       ;;
   esac
@@ -71,7 +104,9 @@ prompt2_resolve_ablation_config() {
     FIRST_ORDER_ENABLED \
     SECOND_ORDER_ENABLED \
     FALLBACK_PRIOR_FILL_ENABLED \
-    FANOUT_IS_UPPER_BOUND; do
+    FANOUT_IS_UPPER_BOUND \
+    PREFETCH_GOVERNOR_ENABLED \
+    NEURAL_SPECULATOR_ENABLED; do
     if [[ "${!boolean_name}" != true && "${!boolean_name}" != false ]]; then
       echo "$boolean_name must resolve to true or false; found: ${!boolean_name}" >&2
       return 2
@@ -96,6 +131,7 @@ prompt2_render_config() {
   local second_order_enabled=$9
   local fallback_prior_fill_enabled=${10}
   local fanout_is_upper_bound=${11}
+  local prefetch_governor_enabled=${12}
 
   sed \
     -e "s|@MODEL_DIR@|$model_dir|g" \
@@ -107,5 +143,6 @@ prompt2_render_config() {
     -e "s|@SECOND_ORDER_ENABLED@|$second_order_enabled|g" \
     -e "s|@FALLBACK_PRIOR_FILL_ENABLED@|$fallback_prior_fill_enabled|g" \
     -e "s|@FANOUT_IS_UPPER_BOUND@|$fanout_is_upper_bound|g" \
+    -e "s|@PREFETCH_GOVERNOR_ENABLED@|$prefetch_governor_enabled|g" \
     "$template" > "$output"
 }

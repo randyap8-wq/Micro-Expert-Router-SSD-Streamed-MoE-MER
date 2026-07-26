@@ -31,7 +31,7 @@ case "$MODE_ARG" in
     QUALIFICATION_KIND=performance-baseline
     EXPERIMENT_NAME=prompt2-phase4c-precision-first-prefetch
     if [[ "$PREFETCH_VARIANT" == custom ]]; then
-      echo "phase4c-untraced requires MER_PROMPT2_PREFETCH_VARIANT=demand-only, current-f2, second-only-f2, or second-only-f1" >&2
+      echo "phase4c-untraced requires a named Phase 4C matrix variant" >&2
       exit 2
     fi
     ;;
@@ -163,10 +163,15 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "predict_fanout=$PREDICT_FANOUT"
   echo "pipeline_depth=$PIPELINE_DEPTH"
   echo "prefetch_variant=$PREFETCH_VARIANT"
+  echo "predictor_mode=$PREDICTOR_MODE"
   echo "first_order_enabled=$FIRST_ORDER_ENABLED"
   echo "second_order_enabled=$SECOND_ORDER_ENABLED"
   echo "fallback_prior_fill_enabled=$FALLBACK_PRIOR_FILL_ENABLED"
   echo "fanout_is_upper_bound=$FANOUT_IS_UPPER_BOUND"
+  echo "prefetch_governor_enabled=$PREFETCH_GOVERNOR_ENABLED"
+  echo "prefetch_governor_precision_floor=$PREFETCH_GOVERNOR_PRECISION_FLOOR"
+  echo "prefetch_governor_contention_weight=$PREFETCH_GOVERNOR_CONTENTION_WEIGHT"
+  echo "neural_speculator_enabled=$NEURAL_SPECULATOR_ENABLED"
   echo "output_tokens=$OUTPUT_TOKENS"
   echo "prefetch_expected_active=$PREFETCH_EXPECTED_ACTIVE"
   echo "phase4b_trace_enabled=$PHASE4B_TRACE_ENABLED"
@@ -203,12 +208,14 @@ DENSE_MANIFEST_SHA=$(sha256sum "$MODEL_REAL/dense_manifest.json" | awk '{print $
 prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-1536.toml" \
   "$MODEL_REAL" "$TOKENIZER_REAL" 1536 "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
   "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
-  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND"
+  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND" \
+  "$PREFETCH_GOVERNOR_ENABLED"
 if [[ "$COLLECTOR_MODE" != phase4b-diagnostic && "$COLLECTOR_MODE" != phase4c-untraced ]]; then
   prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-6144.toml" \
     "$MODEL_REAL" "$TOKENIZER_REAL" 6144 "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
     "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
-    "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND"
+    "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND" \
+    "$PREFETCH_GOVERNOR_ENABLED"
 fi
 
 # Physical pool sizing from build_bench_real_runtime:
@@ -256,10 +263,15 @@ jq -n \
   --argjson predict_fanout "$PREDICT_FANOUT" \
   --argjson pipeline_depth "$PIPELINE_DEPTH" \
   --arg prefetch_variant "$PREFETCH_VARIANT" \
+  --arg predictor_mode "$PREDICTOR_MODE" \
   --argjson first_order_enabled "$FIRST_ORDER_ENABLED" \
   --argjson second_order_enabled "$SECOND_ORDER_ENABLED" \
   --argjson fallback_prior_fill_enabled "$FALLBACK_PRIOR_FILL_ENABLED" \
   --argjson fanout_is_upper_bound "$FANOUT_IS_UPPER_BOUND" \
+  --argjson prefetch_governor_enabled "$PREFETCH_GOVERNOR_ENABLED" \
+  --argjson prefetch_governor_precision_floor "$PREFETCH_GOVERNOR_PRECISION_FLOOR" \
+  --argjson prefetch_governor_contention_weight "$PREFETCH_GOVERNOR_CONTENTION_WEIGHT" \
+  --argjson neural_speculator_enabled "$NEURAL_SPECULATOR_ENABLED" \
   --argjson output_tokens "$OUTPUT_TOKENS" \
   --argjson prefetch_expected_active "$PREFETCH_EXPECTED_ACTIVE" \
   --arg git_commit_full "$EXPECTED_COMMIT" \
@@ -282,12 +294,21 @@ jq -n \
     predict_fanout: $predict_fanout,
     pipeline_depth: $pipeline_depth,
     prefetch_variant: $prefetch_variant,
+    predictor_mode: $predictor_mode,
     prefetch_predictor: {
       first_order_enabled: $first_order_enabled,
       second_order_enabled: $second_order_enabled,
       fallback_prior_fill_enabled: $fallback_prior_fill_enabled,
       fanout_is_upper_bound: $fanout_is_upper_bound
     },
+    prefetch_governor: {
+      enabled: $prefetch_governor_enabled,
+      precision_floor: $prefetch_governor_precision_floor,
+      contention_weight: $prefetch_governor_contention_weight,
+      runtime_default_precision_alpha: 0.2,
+      runtime_default_base_threshold: 0.02
+    },
+    neural_speculator_enabled: $neural_speculator_enabled,
     output_tokens: $output_tokens,
     prefetch_expected_active: $prefetch_expected_active,
     git_commit_full: $git_commit_full,
@@ -369,6 +390,8 @@ run_case() {
     --argjson second_order_enabled "$SECOND_ORDER_ENABLED" \
     --argjson fallback_prior_fill_enabled "$FALLBACK_PRIOR_FILL_ENABLED" \
     --argjson fanout_is_upper_bound "$FANOUT_IS_UPPER_BOUND" \
+    --argjson prefetch_governor_enabled "$PREFETCH_GOVERNOR_ENABLED" \
+    --argjson neural_speculator_enabled "$NEURAL_SPECULATOR_ENABLED" \
     --argjson output_tokens "$OUTPUT_TOKENS" \
     --argjson phase4b_trace_enabled "$PHASE4B_TRACE_ENABLED" '
     .schema == {"name":"mer-bench-real","version":2} and
@@ -446,9 +469,9 @@ run_case() {
       "fallback_prior_fill_enabled":$fallback_prior_fill_enabled,
       "fanout_is_upper_bound":$fanout_is_upper_bound,
       "locality_enabled":false,
-      "speculator_enabled":false,
+      "speculator_enabled":$neural_speculator_enabled,
       "affinity_enabled":false,
-      "prefetch_governor_enabled":false,
+      "prefetch_governor_enabled":$prefetch_governor_enabled,
       "cost_aware_eviction_enabled":false,
       "pregate_enabled":false,
       "static_residency_fraction":0
@@ -495,7 +518,11 @@ run_case() {
       .unused_prefetch_bytes_at_sample >= 0 and
       .prefetch_dropped_concurrency >= 0 and
       .prefetch_dropped_pool_starved >= 0 and
-      .prefetch_dropped_governor == 0 and
+      (if $prefetch_governor_enabled then
+        .prefetch_dropped_governor >= 0
+      else
+        .prefetch_dropped_governor == 0
+      end) and
       .prefetch_dropped_bytes == 0 and
       (if $predict_fanout == 0 then
         .prefetch_submitted == 0 and
@@ -594,6 +621,7 @@ run_case() {
   jq -e \
     --argjson predict_fanout "$PREDICT_FANOUT" \
     --argjson pipeline_depth "$PIPELINE_DEPTH" \
+    --argjson prefetch_governor_enabled "$PREFETCH_GOVERNOR_ENABLED" \
     -f "$ROOT/scripts/qwen3_coder_prompt2_prefetch_qualification.jq" \
     "$json" >/dev/null
 
@@ -612,10 +640,15 @@ run_case() {
     --argjson predict_fanout "$PREDICT_FANOUT" \
     --argjson pipeline_depth "$PIPELINE_DEPTH" \
     --arg prefetch_variant "$PREFETCH_VARIANT" \
+    --arg predictor_mode "$PREDICTOR_MODE" \
     --argjson first_order_enabled "$FIRST_ORDER_ENABLED" \
     --argjson second_order_enabled "$SECOND_ORDER_ENABLED" \
     --argjson fallback_prior_fill_enabled "$FALLBACK_PRIOR_FILL_ENABLED" \
     --argjson fanout_is_upper_bound "$FANOUT_IS_UPPER_BOUND" \
+    --argjson prefetch_governor_enabled "$PREFETCH_GOVERNOR_ENABLED" \
+    --argjson prefetch_governor_precision_floor "$PREFETCH_GOVERNOR_PRECISION_FLOOR" \
+    --argjson prefetch_governor_contention_weight "$PREFETCH_GOVERNOR_CONTENTION_WEIGHT" \
+    --argjson neural_speculator_enabled "$NEURAL_SPECULATOR_ENABLED" \
     --argjson collection_qualification "$collection_qualification" \
     '([.runs[].cache_io] | {
       prefetch_submitted: (map(.prefetch_submitted) | add),
@@ -629,6 +662,50 @@ run_case() {
       prefetch_dropped_governor: (map(.prefetch_dropped_governor) | add),
       prefetch_dropped_bytes: (map(.prefetch_dropped_bytes) | add)
     }) as $prefetch_counters |
+    ([.runs[] | {
+      run_index,
+      governor_enabled: $prefetch_governor_enabled,
+      neural_speculator_enabled: $neural_speculator_enabled,
+      candidates_rejected_by_governor: .cache_io.prefetch_dropped_governor,
+      speculative_work_admitted: .cache_io.prefetch_submitted,
+      governor_admitted_candidates_derived:
+        (if $prefetch_governor_enabled then
+          (.cache_io.prefetch_submitted + .cache_io.prefetch_dropped_concurrency)
+        else
+          0
+        end),
+      governor_admission_derivation:
+        "prefetch_submitted + prefetch_dropped_concurrency; governor admission precedes the concurrency gate",
+      speculative_work_completed: .cache_io.prefetch_completed,
+      speculative_work_used: .cache_io.prefetch_used,
+      speculative_work_dropped_by_concurrency:
+        .cache_io.prefetch_dropped_concurrency,
+      speculative_work_dropped_by_pool_pressure:
+        .cache_io.prefetch_dropped_pool_starved,
+      demand_read_activity_while_speculation_active: {
+        prompt:
+          .demand_miss_fanout.prompt.demand_reads_issued_while_speculative_reads_active,
+        decode:
+          .demand_miss_fanout.decode.demand_reads_issued_while_speculative_reads_active,
+        total:
+          (.demand_miss_fanout.prompt.demand_reads_issued_while_speculative_reads_active +
+           .demand_miss_fanout.decode.demand_reads_issued_while_speculative_reads_active)
+      },
+      foreground_pressure: {
+        prompt_peak_foreground_physical_reads_in_flight:
+          .demand_miss_fanout.prompt.peak_foreground_physical_reads_in_flight,
+        decode_peak_foreground_physical_reads_in_flight:
+          .demand_miss_fanout.decode.peak_foreground_physical_reads_in_flight,
+        prompt_average_foreground_physical_read_concurrency:
+          .demand_miss_fanout.prompt.average_foreground_physical_read_concurrency,
+        decode_average_foreground_physical_read_concurrency:
+          .demand_miss_fanout.decode.average_foreground_physical_read_concurrency,
+        prompt_foreground_physical_read_active_seconds:
+          .demand_miss_fanout.prompt.foreground_physical_read_active_seconds,
+        decode_foreground_physical_read_active_seconds:
+          .demand_miss_fanout.decode.foreground_physical_read_active_seconds
+      }
+    }]) as $governor_runs |
     {
       schema: {name:"mer-prompt2-case-summary", version:1},
       case: $case,
@@ -672,10 +749,41 @@ run_case() {
       },
       phase4c_predictor: {
         variant: $prefetch_variant,
+        predictor_mode: $predictor_mode,
+        predict_fanout: $predict_fanout,
+        pipeline_depth: $pipeline_depth,
         first_order_enabled: $first_order_enabled,
         second_order_enabled: $second_order_enabled,
         fallback_prior_fill_enabled: $fallback_prior_fill_enabled,
-        fanout_is_upper_bound: $fanout_is_upper_bound
+        fanout_is_upper_bound: $fanout_is_upper_bound,
+        governor_enabled: $prefetch_governor_enabled,
+        neural_speculator_enabled: $neural_speculator_enabled
+      },
+      phase4c_governor: {
+        configuration: {
+          enabled: $prefetch_governor_enabled,
+          precision_floor: $prefetch_governor_precision_floor,
+          contention_weight: $prefetch_governor_contention_weight,
+          runtime_default_precision_alpha: 0.2,
+          runtime_default_base_threshold: 0.02
+        },
+        counters_by_run: $governor_runs,
+        totals: {
+          candidates_rejected_by_governor:
+            ($governor_runs | map(.candidates_rejected_by_governor) | add),
+          speculative_work_admitted:
+            ($governor_runs | map(.speculative_work_admitted) | add),
+          governor_admitted_candidates_derived:
+            ($governor_runs | map(.governor_admitted_candidates_derived) | add),
+          speculative_work_dropped_by_concurrency:
+            ($governor_runs | map(.speculative_work_dropped_by_concurrency) | add),
+          speculative_work_dropped_by_pool_pressure:
+            ($governor_runs | map(.speculative_work_dropped_by_pool_pressure) | add),
+          demand_reads_observed_while_speculation_active:
+            ($governor_runs |
+             map(.demand_read_activity_while_speculation_active.total) |
+             add)
+        }
       },
       phase3a_decode: {
         routed_layers_observed: ([.runs[].demand_miss_fanout.decode.routed_layers_observed] | add),
@@ -851,8 +959,22 @@ elif [[ "$COLLECTOR_MODE" == phase4c-untraced ]]; then
       variant: $variant,
       cache_slots: 1536,
       traced: false,
+      metadata: .[0].phase4c_predictor,
+      governor_configuration: .[0].phase4c_governor.configuration,
+      governor_counters_by_case:
+        [ .[] | {
+            case,
+            prompt_fixture,
+            counters_by_run: .phase4c_governor.counters_by_run,
+            totals: .phase4c_governor.totals
+          }
+        ],
       cases: .,
-      qualification_passed: (all(.qualification_passed == true))
+      qualification_passed:
+        (all(.qualification_passed == true) and
+         all(.phase4c_predictor.neural_speculator_enabled == false) and
+         all(.phase4c_predictor.variant == $variant) and
+         all((.phase4c_governor.counters_by_run | length) == 5))
     }' \
     "$ARTIFACT_DIR/baseline-1536-short.case-summary.json" \
     "$ARTIFACT_DIR/baseline-1536-medium.case-summary.json" \
@@ -862,12 +984,18 @@ elif [[ "$COLLECTOR_MODE" == phase4c-untraced ]]; then
     --arg commit "$EXPECTED_COMMIT" \
     --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg variant "$PREFETCH_VARIANT" \
+    --arg predictor_mode "$PREDICTOR_MODE" \
+    --argjson prefetch_governor_enabled "$PREFETCH_GOVERNOR_ENABLED" \
+    --argjson neural_speculator_enabled "$NEURAL_SPECULATOR_ENABLED" \
     '{
       schema: {name:"mer-prompt2-qualification", version:1},
       git_commit_full: $commit,
       captured_at_utc: $captured_at_utc,
       qualification_kind: "performance-baseline",
       phase4c_variant: $variant,
+      predictor_mode: $predictor_mode,
+      prefetch_governor_enabled: $prefetch_governor_enabled,
+      neural_speculator_enabled: $neural_speculator_enabled,
       two_required_1536_cases_present: true,
       no_6144_cases_collected: true,
       trace_disabled: true,

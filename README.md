@@ -1440,12 +1440,30 @@ eligible; fanout is a cap, so fewer than `storage.predict_fanout` candidates
 may be admitted.
 
 The Prompt 2 Phase 4C primary matrix is untraced, uses only the 1,536-slot
-short and medium cases, and runs the fixed `demand-only`, `current-f2`,
-`second-only-f2`, and `second-only-f1` configurations:
+short and medium cases, and runs exactly these six configurations:
+
+1. `demand-only`
+2. `current-f2`
+3. `current-f2-governed`
+4. `second-only-f2`
+5. `second-only-f1`
+6. `second-only-f1-governed`
 
 ```bash
 scripts/collect_qwen3_coder_prompt2_phase4c_matrix.sh /path/to/artifacts
 ```
+
+Both governed cases use the existing governor configuration unchanged:
+`prefetch_precision_floor = 0.05`,
+`prefetch_contention_weight = 1.0`, runtime-default precision alpha `0.2`,
+and runtime-default base threshold `0.02`. The neural speculator remains
+disabled in all six cases. Each case summary records the complete predictor
+and governor policy plus per-run governor rejections, admitted/submitted
+speculation, concurrency and pool-pressure drops, demand/speculation overlap,
+and available foreground-read concurrency metrics. The matrix summary emits
+the four direct causal comparisons between each governed/ungoverned pair and
+between the combined and second-order-only fanout-1 policies at matching
+governor state.
 
 After selecting a candidate, the existing diagnostic collector supports the
 required eight-token trace smoke and the full diagnostic trace:
