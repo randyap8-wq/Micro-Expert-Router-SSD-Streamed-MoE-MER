@@ -19,7 +19,8 @@ unset \
   MER_PROMPT2_FIRST_ORDER_ENABLED \
   MER_PROMPT2_SECOND_ORDER_ENABLED \
   MER_PROMPT2_FALLBACK_PRIOR_FILL_ENABLED \
-  MER_PROMPT2_FANOUT_IS_UPPER_BOUND
+  MER_PROMPT2_FANOUT_IS_UPPER_BOUND \
+  MER_PROMPT2_PREFETCH_GOVERNOR_ENABLED
 prompt2_resolve_ablation_config
 test "$PREDICT_FANOUT" -eq 2
 test "$PIPELINE_DEPTH" -eq 3
@@ -28,13 +29,18 @@ prompt2_render_config "$TEMPLATE" "$TEST_ROOT/default.toml" \
   /mnt/localssd/model /mnt/localssd/model/tokenizer.json 1536 \
   "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
   "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
-  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND"
+  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND" \
+  "$PREFETCH_GOVERNOR_ENABLED"
 grep -Fx 'predict_fanout = 2' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'pipeline_depth = 3' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'first_order_enabled = true' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'second_order_enabled = true' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'fallback_prior_fill_enabled = true' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'fanout_is_upper_bound = false' "$TEST_ROOT/default.toml" >/dev/null
+grep -Fx 'prefetch_governor = false' "$TEST_ROOT/default.toml" >/dev/null
+grep -Fx 'prefetch_precision_floor = 0.05' "$TEST_ROOT/default.toml" >/dev/null
+grep -Fx 'prefetch_contention_weight = 1.0' "$TEST_ROOT/default.toml" >/dev/null
+grep -Fx 'speculator_enabled = false' "$TEST_ROOT/default.toml" >/dev/null
 if grep -E '@[A-Z0-9_]+@' "$TEST_ROOT/default.toml" >/dev/null; then
   echo "default render left a collector placeholder unresolved" >&2
   exit 1
@@ -50,44 +56,97 @@ prompt2_render_config "$TEMPLATE" "$TEST_ROOT/no-prefetch.toml" \
   /mnt/localssd/model /mnt/localssd/model/tokenizer.json 1536 \
   "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
   "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
-  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND"
+  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND" \
+  "$PREFETCH_GOVERNOR_ENABLED"
 grep -Fx 'predict_fanout = 0' "$TEST_ROOT/no-prefetch.toml" >/dev/null
 grep -Fx 'pipeline_depth = 1' "$TEST_ROOT/no-prefetch.toml" >/dev/null
 
 unset MER_PROMPT2_PREDICT_FANOUT MER_PROMPT2_PIPELINE_DEPTH
-for variant in demand-only current-f2 second-only-f2 second-only-f1; do
+for variant in \
+  demand-only \
+  current-f2 \
+  current-f2-governed \
+  second-only-f2 \
+  second-only-f1 \
+  second-only-f1-governed; do
   MER_PROMPT2_PREFETCH_VARIANT=$variant
   prompt2_resolve_ablation_config
   test "$PIPELINE_DEPTH" -eq 3
+  test "$NEURAL_SPECULATOR_ENABLED" = false
   case "$variant" in
     demand-only)
       test "$PREDICT_FANOUT" -eq 0
+      test "$PREDICTOR_MODE" = demand-only
       test "$FIRST_ORDER_ENABLED" = true
       test "$FALLBACK_PRIOR_FILL_ENABLED" = true
       test "$FANOUT_IS_UPPER_BOUND" = false
+      test "$PREFETCH_GOVERNOR_ENABLED" = false
       ;;
     current-f2)
       test "$PREDICT_FANOUT" -eq 2
+      test "$PREDICTOR_MODE" = legacy-combined
       test "$FIRST_ORDER_ENABLED" = true
       test "$FALLBACK_PRIOR_FILL_ENABLED" = true
       test "$FANOUT_IS_UPPER_BOUND" = false
+      test "$PREFETCH_GOVERNOR_ENABLED" = false
+      ;;
+    current-f2-governed)
+      test "$PREDICT_FANOUT" -eq 2
+      test "$PREDICTOR_MODE" = legacy-combined
+      test "$FIRST_ORDER_ENABLED" = true
+      test "$SECOND_ORDER_ENABLED" = true
+      test "$FALLBACK_PRIOR_FILL_ENABLED" = true
+      test "$FANOUT_IS_UPPER_BOUND" = false
+      test "$PREFETCH_GOVERNOR_ENABLED" = true
       ;;
     second-only-f2)
       test "$PREDICT_FANOUT" -eq 2
+      test "$PREDICTOR_MODE" = second-order-only
       test "$FIRST_ORDER_ENABLED" = false
       test "$SECOND_ORDER_ENABLED" = true
       test "$FALLBACK_PRIOR_FILL_ENABLED" = false
       test "$FANOUT_IS_UPPER_BOUND" = true
+      test "$PREFETCH_GOVERNOR_ENABLED" = false
       ;;
     second-only-f1)
       test "$PREDICT_FANOUT" -eq 1
+      test "$PREDICTOR_MODE" = second-order-only
       test "$FIRST_ORDER_ENABLED" = false
       test "$SECOND_ORDER_ENABLED" = true
       test "$FALLBACK_PRIOR_FILL_ENABLED" = false
       test "$FANOUT_IS_UPPER_BOUND" = true
+      test "$PREFETCH_GOVERNOR_ENABLED" = false
+      ;;
+    second-only-f1-governed)
+      test "$PREDICT_FANOUT" -eq 1
+      test "$PREDICTOR_MODE" = second-order-only
+      test "$FIRST_ORDER_ENABLED" = false
+      test "$SECOND_ORDER_ENABLED" = true
+      test "$FALLBACK_PRIOR_FILL_ENABLED" = false
+      test "$FANOUT_IS_UPPER_BOUND" = true
+      test "$PREFETCH_GOVERNOR_ENABLED" = true
       ;;
   esac
+  prompt2_render_config "$TEMPLATE" "$TEST_ROOT/$variant.toml" \
+    /mnt/localssd/model /mnt/localssd/model/tokenizer.json 1536 \
+    "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
+    "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
+    "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND" \
+    "$PREFETCH_GOVERNOR_ENABLED"
+  grep -Fx 'speculator_enabled = false' "$TEST_ROOT/$variant.toml" >/dev/null
 done
+diff -u \
+  <(grep -v '^prefetch_governor = ' "$TEST_ROOT/current-f2.toml") \
+  <(grep -v '^prefetch_governor = ' "$TEST_ROOT/current-f2-governed.toml") \
+  >/dev/null
+diff -u \
+  <(grep -v '^prefetch_governor = ' "$TEST_ROOT/second-only-f1.toml") \
+  <(grep -v '^prefetch_governor = ' "$TEST_ROOT/second-only-f1-governed.toml") \
+  >/dev/null
+grep -Fx 'prefetch_governor = false' "$TEST_ROOT/current-f2.toml" >/dev/null
+grep -Fx 'prefetch_governor = true' "$TEST_ROOT/current-f2-governed.toml" >/dev/null
+grep -Fx 'prefetch_governor = false' "$TEST_ROOT/second-only-f1.toml" >/dev/null
+grep -Fx 'prefetch_governor = true' "$TEST_ROOT/second-only-f1-governed.toml" >/dev/null
 unset MER_PROMPT2_PREFETCH_VARIANT
 
 jq -n '
@@ -108,7 +167,12 @@ jq -n '
   def phase:
     {demand_reads_issued_while_speculative_reads_active: 0};
   {
-    predictive_policy: {markov_prefetch_fanout: 0, pipeline_depth: 1},
+    predictive_policy: {
+      markov_prefetch_fanout: 0,
+      pipeline_depth: 1,
+      prefetch_governor_enabled: false,
+      speculator_enabled: false
+    },
     memory_layout: {
       primary_expert_pool_allocated_bytes: 5017600,
       shadow_expert_pool_allocated_bytes: 0,
@@ -127,7 +191,12 @@ jq -n '
 ' > "$TEST_ROOT/no-prefetch-report.json"
 
 jq '
-  .predictive_policy = {markov_prefetch_fanout: 2, pipeline_depth: 3} |
+  .predictive_policy = {
+    markov_prefetch_fanout: 2,
+    pipeline_depth: 3,
+    prefetch_governor_enabled: false,
+    speculator_enabled: false
+  } |
   .memory_layout.shadow_expert_pool_allocated_bytes = 30105600 |
   .memory_layout.total_expert_pool_allocated_bytes = 35123200 |
   .runs[0].memory.shadow_expert_pool_allocated_bytes = 30105600 |
@@ -137,14 +206,36 @@ jq '
 jq -e \
   --argjson predict_fanout 2 \
   --argjson pipeline_depth 3 \
+  --argjson prefetch_governor_enabled false \
   -f "$QUALIFIER" \
   "$TEST_ROOT/default-report.json" >/dev/null
 
 jq -e \
   --argjson predict_fanout 0 \
   --argjson pipeline_depth 1 \
+  --argjson prefetch_governor_enabled false \
   -f "$QUALIFIER" \
   "$TEST_ROOT/no-prefetch-report.json" >/dev/null
+
+jq '
+  .predictive_policy.prefetch_governor_enabled = true |
+  .runs[0].cache_io.prefetch_dropped_governor = 2
+' "$TEST_ROOT/default-report.json" > "$TEST_ROOT/governed-report.json"
+jq -e \
+  --argjson predict_fanout 2 \
+  --argjson pipeline_depth 3 \
+  --argjson prefetch_governor_enabled true \
+  -f "$QUALIFIER" \
+  "$TEST_ROOT/governed-report.json" >/dev/null
+if jq -e \
+  --argjson predict_fanout 2 \
+  --argjson pipeline_depth 3 \
+  --argjson prefetch_governor_enabled false \
+  -f "$QUALIFIER" \
+  "$TEST_ROOT/governed-report.json" >/dev/null; then
+  echo "ungoverned qualification accepted governor-enabled metadata" >&2
+  exit 1
+fi
 
 jq '
   def phase4b:
@@ -179,6 +270,7 @@ jq '
 jq -e \
   --argjson predict_fanout 2 \
   --argjson pipeline_depth 3 \
+  --argjson prefetch_governor_enabled false \
   -f "$QUALIFIER" \
   "$TEST_ROOT/phase4b-report.json" >/dev/null
 
@@ -350,6 +442,7 @@ jq '.phase4b_trace.lifecycle.published = 1' \
 if jq -e \
   --argjson predict_fanout 2 \
   --argjson pipeline_depth 3 \
+  --argjson prefetch_governor_enabled false \
   -f "$QUALIFIER" \
   "$TEST_ROOT/invalid-phase4b-report.json" >/dev/null; then
   echo "Phase 4B qualification accepted impossible lifecycle arithmetic" >&2
@@ -361,6 +454,7 @@ jq '.runs[0].cache_io.prefetch_submitted = 1' \
 if jq -e \
   --argjson predict_fanout 0 \
   --argjson pipeline_depth 1 \
+  --argjson prefetch_governor_enabled false \
   -f "$QUALIFIER" \
   "$TEST_ROOT/nonzero-prefetch-report.json" >/dev/null; then
   echo "fanout=0 qualification accepted a nonzero prefetch counter" >&2
@@ -372,6 +466,7 @@ jq '.runs[0].demand_miss_fanout.decode.demand_reads_issued_while_speculative_rea
 if jq -e \
   --argjson predict_fanout 0 \
   --argjson pipeline_depth 1 \
+  --argjson prefetch_governor_enabled false \
   -f "$QUALIFIER" \
   "$TEST_ROOT/nonzero-overlap-report.json" >/dev/null; then
   echo "fanout=0 qualification accepted speculative overlap" >&2

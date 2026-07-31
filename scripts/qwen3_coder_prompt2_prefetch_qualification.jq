@@ -1,5 +1,7 @@
 .predictive_policy.markov_prefetch_fanout == $predict_fanout and
 .predictive_policy.pipeline_depth == $pipeline_depth and
+.predictive_policy.prefetch_governor_enabled == $prefetch_governor_enabled and
+.predictive_policy.speculator_enabled == false and
 .memory_layout.primary_expert_pool_allocated_bytes > 0 and
 .memory_layout.shadow_expert_pool_allocated_bytes >= 0 and
 .memory_layout.total_expert_pool_allocated_bytes ==
@@ -20,7 +22,11 @@
   .unused_prefetch_bytes_at_sample >= 0 and
   .prefetch_dropped_concurrency >= 0 and
   .prefetch_dropped_pool_starved >= 0 and
-  .prefetch_dropped_governor == 0 and
+  (if $prefetch_governor_enabled then
+    .prefetch_dropped_governor >= 0
+  else
+    .prefetch_dropped_governor == 0
+  end) and
   .prefetch_dropped_bytes == 0 and
   (if $predict_fanout == 0 then
     .prefetch_submitted == 0 and
