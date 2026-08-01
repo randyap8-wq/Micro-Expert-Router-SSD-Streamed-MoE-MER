@@ -74,6 +74,8 @@ elif $qualification_kind == "phase4b-diagnostic" then
   diagnostic_collection_valid
 elif $qualification_kind == "phase4d-governor-screening" then
   screening_collection_valid
+elif $qualification_kind == "phase4d-b-score-calibration-diagnostic" then
+  screening_collection_valid
 else
   false
 end) as $collection_valid |
@@ -100,6 +102,12 @@ end) as $collection_valid |
     else null
     end
   ),
+  score_calibration_collection_valid: (
+    if $qualification_kind == "phase4d-b-score-calibration-diagnostic"
+    then $collection_valid
+    else null
+    end
+  ),
   performance_qualification_applicable: ($qualification_kind == "performance-baseline"),
   performance_qualification_passed: (
     if $qualification_kind == "performance-baseline"
@@ -112,6 +120,8 @@ end) as $collection_valid |
       "synchronous Phase 4B JSONL tracing adds diagnostic wall time outside production critical-path categories; traced TPS and coverage are not comparable with untraced Phase 4A performance baselines"
     elif $qualification_kind == "phase4d-governor-screening" then
       "Phase 4D-A uses one warmup and two measured short-prompt runs for calibration screening; it is diagnostic evidence and not a qualified production performance baseline"
+    elif $qualification_kind == "phase4d-b-score-calibration-diagnostic" then
+      "Phase 4D-B records bounded governor score and threshold distributions from one warmup and two measured short-prompt runs; it is diagnostic evidence and not a qualified production performance baseline"
     else
       null
     end

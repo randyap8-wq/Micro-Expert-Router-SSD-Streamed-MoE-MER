@@ -2435,6 +2435,8 @@ struct BenchRealRunCacheIo {
     governor_rejected_candidates: u64,
     governor_total_decisions: u64,
     governor_admission_rate: f64,
+    governor_score_diagnostics: crate::prefetch_governor::GovernorDecisionDiagnosticsSnapshot,
+    governor_score_diagnostics_reconcile: bool,
     /// Final controller state sampled after this measured run.
     governor_precision_ewma_final: f64,
     governor_foreground_inflight_final: i64,
@@ -2546,6 +2548,8 @@ struct BenchRealAggregate {
     hit_rate: f64,
     ssd_bytes_total: u64,
     output_token_parity: bool,
+    governor_score_diagnostics: crate::prefetch_governor::GovernorDecisionDiagnosticsSnapshot,
+    governor_score_diagnostics_reconcile: bool,
 }
 
 fn phase4b_trace_from_env(
@@ -4538,6 +4542,7 @@ async fn run_bench_real_once(
     if !runtime.engine.reset_demand_fetch_telemetry() {
         return Err("cannot reset Phase 3A telemetry while a foreground read is active".into());
     }
+    let governor_decisions_before = runtime.engine.reset_governor_score_diagnostics();
     let pre = runtime.engine.report();
     let truncated_payload_uses_before = crate::inference::truncated_expert_payload_uses();
     let nonfinite_attention_before = crate::transformer::nonfinite_softmax_fallbacks();
@@ -4684,11 +4689,28 @@ async fn run_bench_real_once(
         governor_total_decisions,
         governor_admission_rate,
     ) = bench_real_governor_decision_delta(
-        pre.governor_admitted,
+        governor_decisions_before.0,
         post.governor_admitted,
-        pre.governor_throttled,
+        governor_decisions_before.1,
         post.governor_throttled,
     );
+    let governor_score_diagnostics = post.governor_score_diagnostics.clone();
+    let governor_score_diagnostics_reconcile = bench_real_governor_score_reconciles(
+        governor_admitted_candidates,
+        governor_rejected_candidates,
+        &governor_score_diagnostics,
+    );
+    if !governor_score_diagnostics_reconcile {
+        return Err(format!(
+            "bench-real governor score diagnostics do not reconcile: direct admitted={} rejected={}, diagnostic admitted={} rejected={} total={}",
+            governor_admitted_candidates,
+            governor_rejected_candidates,
+            governor_score_diagnostics.admitted,
+            governor_score_diagnostics.rejected,
+            governor_score_diagnostics.total_decisions,
+        )
+        .into());
+    }
     let useful_prefetch_bytes = prefetch_used
         .saturating_mul(runtime.cfg.model.expert_size as u64)
         .min(prefetch_bytes);
@@ -4799,6 +4821,8 @@ async fn run_bench_real_once(
             governor_rejected_candidates,
             governor_total_decisions,
             governor_admission_rate,
+            governor_score_diagnostics,
+            governor_score_diagnostics_reconcile,
             governor_precision_ewma_final: post.governor_precision,
             governor_foreground_inflight_final: post.governor_foreground_inflight,
             // All three drop counters fire before a storage read is issued.
@@ -4992,6 +5016,30 @@ fn aggregate_bench_real(runs: &[BenchRealRunReport]) -> BenchRealAggregate {
     let output_token_parity = runs
         .windows(2)
         .all(|pair| pair[0].output_token_ids == pair[1].output_token_ids);
+    let governor_score_run_snapshots: Vec<_> = runs
+        .iter()
+        .map(|run| run.cache_io.governor_score_diagnostics.clone())
+        .collect();
+    let governor_score_diagnostics =
+        crate::prefetch_governor::GovernorDecisionDiagnosticsSnapshot::merge(
+            &governor_score_run_snapshots,
+        );
+    let governor_admitted_candidates: u64 = runs
+        .iter()
+        .map(|run| run.cache_io.governor_admitted_candidates)
+        .sum();
+    let governor_rejected_candidates: u64 = runs
+        .iter()
+        .map(|run| run.cache_io.governor_rejected_candidates)
+        .sum();
+    let governor_score_diagnostics_reconcile = runs
+        .iter()
+        .all(|run| run.cache_io.governor_score_diagnostics_reconcile)
+        && bench_real_governor_score_reconciles(
+            governor_admitted_candidates,
+            governor_rejected_candidates,
+            &governor_score_diagnostics,
+        );
     BenchRealAggregate {
         prompt_seconds_mean: runs.iter().map(|r| r.prompt_seconds).sum::<f64>() / n,
         prompt_tps_mean: runs.iter().map(|r| r.prompt_tps).sum::<f64>() / n,
@@ -5004,7 +5052,19 @@ fn aggregate_bench_real(runs: &[BenchRealRunReport]) -> BenchRealAggregate {
         hit_rate,
         ssd_bytes_total: runs.iter().map(|r| r.ssd_bytes).sum(),
         output_token_parity,
+        governor_score_diagnostics,
+        governor_score_diagnostics_reconcile,
     }
+}
+
+fn bench_real_governor_score_reconciles(
+    admitted: u64,
+    rejected: u64,
+    diagnostics: &crate::prefetch_governor::GovernorDecisionDiagnosticsSnapshot,
+) -> bool {
+    diagnostics.total_decisions == admitted.saturating_add(rejected)
+        && diagnostics.admitted == admitted
+        && diagnostics.rejected == rejected
 }
 
 fn bench_real_governor_decision_delta(
@@ -8580,6 +8640,28 @@ mod tests {
         let (admitted, rejected, total, rate) = bench_real_governor_decision_delta(10, 10, 20, 20);
         assert_eq!((admitted, rejected, total), (0, 0, 0));
         assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn bench_real_governor_score_diagnostics_reconcile_with_direct_counters() {
+        let governor = crate::prefetch_governor::PrefetchGovernor::new(
+            true,
+            crate::prefetch_governor::GovernorConfig::default(),
+        );
+        assert!(governor.admit(1.0));
+        assert!(!governor.admit(0.0));
+        let (admitted, rejected) = governor.decisions();
+        let diagnostics = governor.decision_diagnostics();
+        assert!(bench_real_governor_score_reconciles(
+            admitted,
+            rejected,
+            &diagnostics
+        ));
+        assert!(!bench_real_governor_score_reconciles(
+            admitted + 1,
+            rejected,
+            &diagnostics
+        ));
     }
 
     #[test]
