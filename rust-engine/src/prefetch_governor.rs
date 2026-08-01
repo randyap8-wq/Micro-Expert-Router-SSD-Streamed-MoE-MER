@@ -404,4 +404,17 @@ mod tests {
         g.refresh();
         assert!(g.precision() <= 1.0);
     }
+
+    #[test]
+    fn direct_decision_counters_reconcile() {
+        let g = PrefetchGovernor::new(true, GovernorConfig::default());
+        assert!(g.admit(1.0));
+        assert!(!g.admit(0.0));
+        assert!(g.admit(1.0));
+        let (admitted, rejected) = g.decisions();
+        let total = admitted + rejected;
+        assert_eq!(admitted, 2);
+        assert_eq!(rejected, 1);
+        assert_eq!(total, 3);
+    }
 }

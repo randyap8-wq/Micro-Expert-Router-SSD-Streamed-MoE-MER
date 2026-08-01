@@ -970,6 +970,10 @@ pub struct EngineOptions {
     /// applies to its admission threshold. Higher values make
     /// speculation back off harder while real misses are in flight.
     pub prefetch_contention_weight: f64,
+    /// Base admission threshold for the prefetch governor. The
+    /// prediction-probability × precision score must clear this value
+    /// after foreground-contention scaling.
+    pub prefetch_governor_base_threshold: f64,
     /// **Tier 4 — cost-aware eviction.** When `true`, the RAM expert
     /// cache evicts the non-pinned resident with the lowest *decaying
     /// heat score* (frequency of use, aged over time) rather than the
@@ -1045,6 +1049,7 @@ impl Default for EngineOptions {
             prefetch_governor: false,
             prefetch_precision_floor: 0.05,
             prefetch_contention_weight: 1.0,
+            prefetch_governor_base_threshold: 0.02,
             cost_aware_eviction: false,
             pregate_enabled: false,
             collect_route_profile: false,
@@ -1408,6 +1413,7 @@ impl EngineCore {
             crate::prefetch_governor::GovernorConfig {
                 precision_floor: options.prefetch_precision_floor,
                 contention_weight: options.prefetch_contention_weight,
+                base_threshold: options.prefetch_governor_base_threshold,
                 ..crate::prefetch_governor::GovernorConfig::default()
             },
         ));
@@ -5377,6 +5383,7 @@ impl Engine {
             governor_precision: self.core.governor.precision(),
             governor_admitted: self.core.governor.decisions().0,
             governor_throttled: self.core.governor.decisions().1,
+            governor_foreground_inflight: self.core.governor.foreground_inflight(),
             pregate_enabled: self.speculation.pregate.is_some(),
             pregate_accuracy: self
                 .speculation
@@ -5746,6 +5753,9 @@ pub struct EngineReport {
     /// **Tier 4.** Cumulative speculative prefetches the governor
     /// throttled (declined).
     pub governor_throttled: u64,
+    /// **Tier 4.** Foreground reads still in flight when this report was
+    /// sampled. A completed benchmark run should normally report zero.
+    pub governor_foreground_inflight: i64,
     /// **Tier 3.** Whether the per-layer pre-gate predictor is enabled.
     pub pregate_enabled: bool,
     /// **Tier 3.** Fraction of scored pre-gate predictions that
@@ -5804,6 +5814,14 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn engine_options_governor_base_threshold_default_is_unchanged() {
+        assert_eq!(
+            EngineOptions::default().prefetch_governor_base_threshold,
+            0.02
+        );
+    }
 
     #[test]
     fn phase4b_disabled_path_has_no_collector_writer_or_event_state() {

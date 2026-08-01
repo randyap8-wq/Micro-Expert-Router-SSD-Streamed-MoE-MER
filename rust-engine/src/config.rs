@@ -732,6 +732,11 @@ pub struct PredictiveConfig {
     /// while real misses are in flight.
     #[serde(default = "default_prefetch_contention_weight")]
     pub prefetch_contention_weight: f64,
+    /// Base admission threshold for the governor's
+    /// `(prediction probability * measured precision)` score. The
+    /// default remains `0.02`; lowering it admits more speculative work.
+    #[serde(default = "default_prefetch_governor_base_threshold")]
+    pub prefetch_governor_base_threshold: f64,
 
     /// **Tier 4 — cost-aware eviction.** When `true`, the RAM expert
     /// cache evicts the non-pinned resident with the lowest decaying
@@ -780,6 +785,9 @@ fn default_prefetch_precision_floor() -> f64 {
 fn default_prefetch_contention_weight() -> f64 {
     1.0
 }
+fn default_prefetch_governor_base_threshold() -> f64 {
+    0.02
+}
 
 fn default_locality_window() -> usize {
     256
@@ -812,6 +820,7 @@ impl Default for PredictiveConfig {
             prefetch_governor: false,
             prefetch_precision_floor: default_prefetch_precision_floor(),
             prefetch_contention_weight: default_prefetch_contention_weight(),
+            prefetch_governor_base_threshold: default_prefetch_governor_base_threshold(),
             cost_aware_eviction: false,
             pregate_enabled: false,
             static_residency_fraction: 0.0,
@@ -1116,10 +1125,20 @@ impl Config {
                 self.predictive.prefetch_precision_floor
             )));
         }
-        if self.predictive.prefetch_contention_weight < 0.0 {
+        if !self.predictive.prefetch_contention_weight.is_finite()
+            || self.predictive.prefetch_contention_weight < 0.0
+        {
             return Err(ConfigError::Invalid(format!(
-                "predictive.prefetch_contention_weight ({}) must be >= 0.0",
+                "predictive.prefetch_contention_weight ({}) must be finite and >= 0.0",
                 self.predictive.prefetch_contention_weight
+            )));
+        }
+        if !self.predictive.prefetch_governor_base_threshold.is_finite()
+            || self.predictive.prefetch_governor_base_threshold < 0.0
+        {
+            return Err(ConfigError::Invalid(format!(
+                "predictive.prefetch_governor_base_threshold ({}) must be finite and >= 0.0",
+                self.predictive.prefetch_governor_base_threshold
             )));
         }
         // [gpu_cache] validation — only meaningful when enabled.
@@ -1904,9 +1923,59 @@ mod tests {
     }
 
     #[test]
-    fn predictive_rejects_negative_contention_weight() {
+    fn prefetch_contention_weight_validation() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            let mut c = minimal_cfg();
+            c.predictive.prefetch_contention_weight = invalid;
+            assert!(
+                c.validate().is_err(),
+                "invalid contention weight was accepted: {invalid}"
+            );
+        }
+        for valid in [0.0, 0.25, 1.0] {
+            let mut c = minimal_cfg();
+            c.predictive.prefetch_contention_weight = valid;
+            c.validate()
+                .unwrap_or_else(|error| panic!("valid contention weight {valid} failed: {error}"));
+        }
+    }
+
+    #[test]
+    fn governor_base_threshold_defaults_to_point_zero_two() {
+        let c = minimal_cfg();
+        assert_eq!(c.predictive.prefetch_governor_base_threshold, 0.02);
+        c.validate().expect("default governor threshold is valid");
+    }
+
+    #[test]
+    fn governor_base_threshold_plumbs_through_toml() {
         let mut c = minimal_cfg();
-        c.predictive.prefetch_contention_weight = -0.1;
-        assert!(c.validate().is_err());
+        c.predictive.prefetch_governor_base_threshold = 0.01;
+        let encoded = toml::to_string(&c).expect("serialize config");
+        let decoded: Config = toml::from_str(&encoded).expect("deserialize config");
+        assert_eq!(decoded.predictive.prefetch_governor_base_threshold, 0.01);
+        decoded.validate().expect("configured threshold is valid");
+    }
+
+    #[test]
+    fn predictive_rejects_invalid_governor_base_threshold() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.001] {
+            let mut c = minimal_cfg();
+            c.predictive.prefetch_governor_base_threshold = invalid;
+            assert!(
+                c.validate().is_err(),
+                "invalid governor base threshold was accepted: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_governor_base_threshold_toml_is_rejected() {
+        let encoded = toml::to_string(&minimal_cfg()).expect("serialize config");
+        let malformed = encoded.replace(
+            "prefetch_governor_base_threshold = 0.02",
+            "prefetch_governor_base_threshold = \"not-a-number\"",
+        );
+        assert!(toml::from_str::<Config>(&malformed).is_err());
     }
 }
