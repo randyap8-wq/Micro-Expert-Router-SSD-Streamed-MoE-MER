@@ -356,6 +356,28 @@ jq -e '
   .qualification_passed == false
 ' "$TEST_ROOT/counter-mismatch-summary.json" >/dev/null
 
+jq '.governor_counters_by_run[0].governor_score_diagnostics.enabled = false' \
+  "$TEST_ROOT/current.json" > "$TEST_ROOT/run-enabled-mismatch.json"
+render_summary "$TEST_ROOT/demand.json" "$TEST_ROOT/second.json" \
+  "$TEST_ROOT/run-enabled-mismatch.json" "$TEST_ROOT/low.json" \
+  "$TEST_ROOT/run-enabled-mismatch-summary.json"
+jq -e '
+  .gates.diagnostic_decision_counters_reconcile == false and
+  .diagnostic_gates_passed == false and
+  .qualification_passed == false
+' "$TEST_ROOT/run-enabled-mismatch-summary.json" >/dev/null
+
+jq '.governor_score_diagnostics.enabled = false' \
+  "$TEST_ROOT/current.json" > "$TEST_ROOT/aggregate-enabled-mismatch.json"
+render_summary "$TEST_ROOT/demand.json" "$TEST_ROOT/second.json" \
+  "$TEST_ROOT/aggregate-enabled-mismatch.json" "$TEST_ROOT/low.json" \
+  "$TEST_ROOT/aggregate-enabled-mismatch-summary.json"
+jq -e '
+  .gates.diagnostic_decision_counters_reconcile == false and
+  .diagnostic_gates_passed == false and
+  .qualification_passed == false
+' "$TEST_ROOT/aggregate-enabled-mismatch-summary.json" >/dev/null
+
 jq '.governor_score_diagnostics.candidate_score.mean = "NaN"' \
   "$TEST_ROOT/current.json" > "$TEST_ROOT/nonfinite.json"
 render_summary "$TEST_ROOT/demand.json" "$TEST_ROOT/second.json" \

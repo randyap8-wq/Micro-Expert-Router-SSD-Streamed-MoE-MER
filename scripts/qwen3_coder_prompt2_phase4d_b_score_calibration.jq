@@ -126,11 +126,16 @@ def direct_counters_reconcile:
      .governor_totals.governor_rejected_candidates);
 
 def diagnostic_counters_reconcile:
+  .governor_configuration.enabled as $governor_enabled |
+  .governor_totals as $governor_totals |
   ([.governor_counters_by_run[] |
+    . as $run |
     .governor_score_diagnostics_reconcile == true and
-    (.governor_score_diagnostics |
-     diagnostics_valid(.enabled;
-       .total_decisions; .admitted; .rejected)) and
+    ($run.governor_score_diagnostics |
+     diagnostics_valid($governor_enabled;
+       $run.governor_total_decisions;
+       $run.governor_admitted_candidates;
+       $run.governor_rejected_candidates)) and
     .governor_score_diagnostics.total_decisions ==
       .governor_total_decisions and
     .governor_score_diagnostics.admitted ==
@@ -139,8 +144,10 @@ def diagnostic_counters_reconcile:
       .governor_rejected_candidates] | all) and
   .governor_score_diagnostics_reconcile == true and
   (.governor_score_diagnostics |
-   diagnostics_valid(.enabled;
-     .total_decisions; .admitted; .rejected)) and
+   diagnostics_valid($governor_enabled;
+     $governor_totals.governor_total_decisions;
+     $governor_totals.governor_admitted_candidates;
+     $governor_totals.governor_rejected_candidates)) and
   .governor_score_diagnostics.total_decisions ==
     .governor_totals.governor_total_decisions and
   .governor_score_diagnostics.admitted ==
