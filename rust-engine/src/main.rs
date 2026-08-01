@@ -667,8 +667,20 @@ enum Cmd {
         /// Per-outstanding-foreground-read multiplier on the governor's
         /// admission threshold (with `--prefetch-governor`). Higher ⇒
         /// speculation backs off harder while real misses are in flight.
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(
+            long,
+            default_value_t = 1.0,
+            value_parser = parse_finite_nonnegative_f64_value
+        )]
         prefetch_contention_weight: f64,
+        /// Idle-device admission threshold for the governor's
+        /// prediction-probability × measured-precision score.
+        #[arg(
+            long,
+            default_value_t = 0.02,
+            value_parser = parse_finite_nonnegative_f64_value
+        )]
+        prefetch_governor_base_threshold: f64,
         /// **Tier 4 — cost-aware eviction.** Evict the coldest resident
         /// by decaying heat score instead of strict LRU, so a hot expert
         /// that briefly fell to the LRU tail isn't dumped ahead of a
@@ -1021,6 +1033,17 @@ fn parse_positive_f64_value(s: &str) -> Result<f64, String> {
         Ok(n)
     } else {
         Err("value must be a finite number > 0".to_string())
+    }
+}
+
+fn parse_finite_nonnegative_f64_value(s: &str) -> Result<f64, String> {
+    let n = s
+        .parse::<f64>()
+        .map_err(|_| format!("expected a finite nonnegative number, got {s:?}"))?;
+    if n.is_finite() && n >= 0.0 {
+        Ok(n)
+    } else {
+        Err("value must be a finite number >= 0".to_string())
     }
 }
 
@@ -1759,6 +1782,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prefetch_governor,
                     prefetch_precision_floor,
                     prefetch_contention_weight,
+                    prefetch_governor_base_threshold,
                     cost_aware_eviction,
                     pregate,
                     static_residency_fraction,
@@ -1826,6 +1850,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             prefetch_governor,
                             prefetch_precision_floor,
                             prefetch_contention_weight,
+                            prefetch_governor_base_threshold,
                             cost_aware_eviction,
                             pregate,
                             static_residency_fraction,
@@ -2309,6 +2334,9 @@ struct BenchRealPredictivePolicy {
     speculator_enabled: bool,
     affinity_enabled: bool,
     prefetch_governor_enabled: bool,
+    prefetch_governor_precision_floor: f64,
+    prefetch_governor_contention_weight: f64,
+    prefetch_governor_base_threshold: f64,
     cost_aware_eviction_enabled: bool,
     pregate_enabled: bool,
     static_residency_fraction: f64,
@@ -2402,6 +2430,14 @@ struct BenchRealRunCacheIo {
     prefetch_dropped_concurrency: u64,
     prefetch_dropped_pool_starved: u64,
     prefetch_dropped_governor: u64,
+    /// Direct admission-controller decisions for this measured run.
+    governor_admitted_candidates: u64,
+    governor_rejected_candidates: u64,
+    governor_total_decisions: u64,
+    governor_admission_rate: f64,
+    /// Final controller state sampled after this measured run.
+    governor_precision_ewma_final: f64,
+    governor_foreground_inflight_final: i64,
     prefetch_dropped_bytes: u64,
     expert_read_failures: u64,
 }
@@ -3844,6 +3880,7 @@ async fn build_bench_real_runtime(
             prefetch_governor: cfg.predictive.prefetch_governor,
             prefetch_precision_floor: cfg.predictive.prefetch_precision_floor,
             prefetch_contention_weight: cfg.predictive.prefetch_contention_weight,
+            prefetch_governor_base_threshold: cfg.predictive.prefetch_governor_base_threshold,
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
             collect_route_profile: false,
@@ -4422,6 +4459,12 @@ fn build_bench_real_report_context(
             speculator_enabled: runtime.cfg.predictive.speculator_enabled,
             affinity_enabled: runtime.cfg.predictive.affinity_enabled,
             prefetch_governor_enabled: runtime.cfg.predictive.prefetch_governor,
+            prefetch_governor_precision_floor: runtime.cfg.predictive.prefetch_precision_floor,
+            prefetch_governor_contention_weight: runtime.cfg.predictive.prefetch_contention_weight,
+            prefetch_governor_base_threshold: runtime
+                .cfg
+                .predictive
+                .prefetch_governor_base_threshold,
             cost_aware_eviction_enabled: runtime.cfg.predictive.cost_aware_eviction,
             pregate_enabled: runtime.cfg.predictive.pregate_enabled,
             static_residency_fraction: runtime.cfg.predictive.static_residency_fraction,
@@ -4635,6 +4678,17 @@ async fn run_bench_real_once(
         .prefetch_bytes_read
         .saturating_sub(pre.prefetch_bytes_read);
     let prefetch_used = post.prefetch_used.saturating_sub(pre.prefetch_used);
+    let (
+        governor_admitted_candidates,
+        governor_rejected_candidates,
+        governor_total_decisions,
+        governor_admission_rate,
+    ) = bench_real_governor_decision_delta(
+        pre.governor_admitted,
+        post.governor_admitted,
+        pre.governor_throttled,
+        post.governor_throttled,
+    );
     let useful_prefetch_bytes = prefetch_used
         .saturating_mul(runtime.cfg.model.expert_size as u64)
         .min(prefetch_bytes);
@@ -4741,6 +4795,12 @@ async fn run_bench_real_once(
             prefetch_dropped_governor: post
                 .prefetch_dropped_governor
                 .saturating_sub(pre.prefetch_dropped_governor),
+            governor_admitted_candidates,
+            governor_rejected_candidates,
+            governor_total_decisions,
+            governor_admission_rate,
+            governor_precision_ewma_final: post.governor_precision,
+            governor_foreground_inflight_final: post.governor_foreground_inflight,
             // All three drop counters fire before a storage read is issued.
             prefetch_dropped_bytes: 0,
             expert_read_failures,
@@ -4945,6 +5005,23 @@ fn aggregate_bench_real(runs: &[BenchRealRunReport]) -> BenchRealAggregate {
         ssd_bytes_total: runs.iter().map(|r| r.ssd_bytes).sum(),
         output_token_parity,
     }
+}
+
+fn bench_real_governor_decision_delta(
+    admitted_before: u64,
+    admitted_after: u64,
+    rejected_before: u64,
+    rejected_after: u64,
+) -> (u64, u64, u64, f64) {
+    let admitted = admitted_after.saturating_sub(admitted_before);
+    let rejected = rejected_after.saturating_sub(rejected_before);
+    let total = admitted + rejected;
+    let admission_rate = if total == 0 {
+        0.0
+    } else {
+        admitted as f64 / total as f64
+    };
+    (admitted, rejected, total, admission_rate)
 }
 
 fn bench_real_expected_forward_evaluations(
@@ -5758,6 +5835,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             prefetch_governor: cfg.predictive.prefetch_governor,
             prefetch_precision_floor: cfg.predictive.prefetch_precision_floor,
             prefetch_contention_weight: cfg.predictive.prefetch_contention_weight,
+            prefetch_governor_base_threshold: cfg.predictive.prefetch_governor_base_threshold,
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
             collect_route_profile: false,
@@ -6451,6 +6529,7 @@ struct RunArgs {
     prefetch_governor: bool,
     prefetch_precision_floor: f64,
     prefetch_contention_weight: f64,
+    prefetch_governor_base_threshold: f64,
     cost_aware_eviction: bool,
     pregate: bool,
     static_residency_fraction: f64,
@@ -6835,6 +6914,7 @@ async fn cmd_run(
                 prefetch_governor: args.prefetch_governor,
                 prefetch_precision_floor: args.prefetch_precision_floor,
                 prefetch_contention_weight: args.prefetch_contention_weight,
+                prefetch_governor_base_threshold: args.prefetch_governor_base_threshold,
                 cost_aware_eviction: args.cost_aware_eviction,
                 pregate_enabled: args.pregate,
                 collect_route_profile: args.profile_out.is_some(),
@@ -8015,6 +8095,86 @@ mod tests {
     }
 
     #[test]
+    fn cli_prefetch_governor_base_threshold_validation() {
+        let default_cli = <Cli as clap::Parser>::try_parse_from(["micro-expert-router", "run"])
+            .expect("default run command should parse");
+        let Cmd::Run {
+            prefetch_governor_base_threshold,
+            ..
+        } = default_cli.cmd
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(prefetch_governor_base_threshold, 0.02);
+
+        for (raw, expected) in [("0", 0.0), ("0.005", 0.005), ("0.02", 0.02), ("1.0", 1.0)] {
+            let cli = <Cli as clap::Parser>::try_parse_from([
+                "micro-expert-router".to_string(),
+                "run".to_string(),
+                format!("--prefetch-governor-base-threshold={raw}"),
+            ])
+            .unwrap_or_else(|error| panic!("valid threshold {raw:?} was rejected: {error}"));
+            let Cmd::Run {
+                prefetch_governor_base_threshold,
+                ..
+            } = cli.cmd
+            else {
+                panic!("expected run command");
+            };
+            assert_eq!(prefetch_governor_base_threshold, expected);
+        }
+
+        for raw in ["-0.1", "NaN", "nan", "inf", "-inf", "Infinity", "malformed"] {
+            let result = <Cli as clap::Parser>::try_parse_from([
+                "micro-expert-router".to_string(),
+                "run".to_string(),
+                format!("--prefetch-governor-base-threshold={raw}"),
+            ]);
+            assert!(result.is_err(), "invalid threshold {raw:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn cli_prefetch_contention_weight_validation() {
+        let default_cli = <Cli as clap::Parser>::try_parse_from(["micro-expert-router", "run"])
+            .expect("default run command should parse");
+        let Cmd::Run {
+            prefetch_contention_weight,
+            ..
+        } = default_cli.cmd
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(prefetch_contention_weight, 1.0);
+
+        for (raw, expected) in [("0", 0.0), ("0.25", 0.25), ("1.0", 1.0), ("3.5", 3.5)] {
+            let cli = <Cli as clap::Parser>::try_parse_from([
+                "micro-expert-router".to_string(),
+                "run".to_string(),
+                format!("--prefetch-contention-weight={raw}"),
+            ])
+            .unwrap_or_else(|error| panic!("valid contention weight {raw:?} was rejected: {error}"));
+            let Cmd::Run {
+                prefetch_contention_weight,
+                ..
+            } = cli.cmd
+            else {
+                panic!("expected run command");
+            };
+            assert_eq!(prefetch_contention_weight, expected);
+        }
+
+        for raw in ["-0.1", "NaN", "nan", "inf", "-inf", "Infinity", "malformed"] {
+            let result = <Cli as clap::Parser>::try_parse_from([
+                "micro-expert-router".to_string(),
+                "run".to_string(),
+                format!("--prefetch-contention-weight={raw}"),
+            ]);
+            assert!(result.is_err(), "invalid contention weight {raw:?} was accepted");
+        }
+    }
+
+    #[test]
     fn low_confidence_rayon_profile_is_not_reused_without_opt_in() {
         let dir = tempdir_unique("rayon-low-confidence-profile");
         std::fs::create_dir_all(&dir).unwrap();
@@ -8407,6 +8567,19 @@ mod tests {
         assert_eq!(percentile_us(&values, 0.95), 500);
         assert_eq!(percentile_us(&values, 1.0), 500);
         assert_eq!(percentile_us_to_ms(&values, 0.50), 0.3);
+    }
+
+    #[test]
+    fn bench_real_direct_governor_decision_counters_reconcile() {
+        let (admitted, rejected, total, rate) = bench_real_governor_decision_delta(10, 14, 20, 26);
+        assert_eq!(admitted, 4);
+        assert_eq!(rejected, 6);
+        assert_eq!(total, admitted + rejected);
+        assert_eq!(rate, 0.4);
+
+        let (admitted, rejected, total, rate) = bench_real_governor_decision_delta(10, 10, 20, 20);
+        assert_eq!((admitted, rejected, total), (0, 0, 0));
+        assert_eq!(rate, 0.0);
     }
 
     #[test]

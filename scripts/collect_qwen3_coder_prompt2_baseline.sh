@@ -17,7 +17,7 @@ TOKENIZER=${MER_QWEN_TOKENIZER:-$MER_QWEN_CONVERTED_DIR/tokenizer.json}
 ARTIFACT_DIR=${1:-}
 MODE_ARG=${2:-four-case}
 if [[ -z "$ARTIFACT_DIR" ]]; then
-  echo "usage: $0 ARTIFACT_DIR [four-case|phase4c-untraced|phase4b-diagnostic|--resident-only]" >&2
+  echo "usage: $0 ARTIFACT_DIR [four-case|phase4c-untraced|phase4d-screening|phase4b-diagnostic|--resident-only]" >&2
   exit 2
 fi
 case "$MODE_ARG" in
@@ -40,24 +40,40 @@ case "$MODE_ARG" in
     QUALIFICATION_KIND=phase4b-diagnostic
     EXPERIMENT_NAME=prompt2-phase4b-routing-trace-diagnostic
     ;;
+  phase4d-screening)
+    COLLECTOR_MODE=phase4d-screening
+    QUALIFICATION_KIND=phase4d-governor-screening
+    EXPERIMENT_NAME=prompt2-phase4d-governor-screening
+    case "$PREFETCH_VARIANT" in
+      demand-only|second-only-f1|second-only-f1-governed-current|second-only-f1-governed-cw025|second-only-f1-governed-bt010-cw025|second-only-f1-governed-bt005-cw000) ;;
+      *)
+        echo "phase4d-screening requires a named Phase 4D-A screening variant; found: $PREFETCH_VARIANT" >&2
+        exit 2
+        ;;
+    esac
+    ;;
   resident-only|--resident-only)
     COLLECTOR_MODE=resident-only
     QUALIFICATION_KIND=performance-baseline
     EXPERIMENT_NAME=prompt2-phase4a-prefetch-ablation
     ;;
   *)
-    echo "unknown collector mode: $MODE_ARG (expected four-case, phase4c-untraced, phase4b-diagnostic, or --resident-only)" >&2
+    echo "unknown collector mode: $MODE_ARG (expected four-case, phase4c-untraced, phase4d-screening, phase4b-diagnostic, or --resident-only)" >&2
     exit 2
     ;;
 esac
 
 OUTPUT_TOKENS=128
+MEASURED_RUNS=5
 if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
   OUTPUT_TOKENS=${MER_PROMPT2_PHASE4B_OUTPUT_TOKENS-128}
   if [[ ! "$OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
     echo "MER_PROMPT2_PHASE4B_OUTPUT_TOKENS must be a positive integer" >&2
     exit 2
   fi
+fi
+if [[ "$COLLECTOR_MODE" == phase4d-screening ]]; then
+  MEASURED_RUNS=2
 fi
 
 PHASE4B_TRACE_TEMPLATE=${MER_PROMPT2_PHASE4B_TRACE_PATH:-}
@@ -128,9 +144,14 @@ command -v taskset >/dev/null
 command -v sha256sum >/dev/null
 test -x /usr/bin/time
 
-if [[ -n "$(git -C "$ROOT" status --short)" && "${MER_ALLOW_DIRTY:-0}" != 1 ]]; then
+WORKTREE_STATUS=$(git -C "$ROOT" status --short)
+if [[ -n "$WORKTREE_STATUS" &&
+      ("$COLLECTOR_MODE" == phase4d-screening || "${MER_ALLOW_DIRTY:-0}" != 1) ]]; then
   echo "refusing a baseline from a dirty worktree; commit/stash changes or set MER_ALLOW_DIRTY=1 for a non-qualifying diagnostic" >&2
-  git -C "$ROOT" status --short >&2
+  if [[ "$COLLECTOR_MODE" == phase4d-screening ]]; then
+    echo "Phase 4D-A screening always requires a clean worktree" >&2
+  fi
+  printf '%s\n' "$WORKTREE_STATUS" >&2
   exit 1
 fi
 
@@ -156,7 +177,7 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "rust_log=off"
   echo "no_color=1"
   echo "collector_mode=$COLLECTOR_MODE"
-  if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
+  if [[ "$QUALIFICATION_KIND" != performance-baseline ]]; then
     echo "qualification_kind=$QUALIFICATION_KIND"
   fi
   echo "experiment_name=$EXPERIMENT_NAME"
@@ -171,8 +192,10 @@ exec 2> >(tee -a "$ARTIFACT_DIR/collector.stderr.log" >&2)
   echo "prefetch_governor_enabled=$PREFETCH_GOVERNOR_ENABLED"
   echo "prefetch_governor_precision_floor=$PREFETCH_GOVERNOR_PRECISION_FLOOR"
   echo "prefetch_governor_contention_weight=$PREFETCH_GOVERNOR_CONTENTION_WEIGHT"
+  echo "prefetch_governor_base_threshold=$PREFETCH_GOVERNOR_BASE_THRESHOLD"
   echo "neural_speculator_enabled=$NEURAL_SPECULATOR_ENABLED"
   echo "output_tokens=$OUTPUT_TOKENS"
+  echo "measured_runs=$MEASURED_RUNS"
   echo "prefetch_expected_active=$PREFETCH_EXPECTED_ACTIVE"
   echo "phase4b_trace_enabled=$PHASE4B_TRACE_ENABLED"
   echo "phase4b_trace_path_template=$PHASE4B_TRACE_TEMPLATE"
@@ -204,13 +227,15 @@ MEDIUM_PROMPT_SHA=$(awk '{print $1}' "$ARTIFACT_DIR/prompt-medium.sha256")
 sha256sum "$MODEL_REAL/config.json" "$MODEL_REAL/dense_manifest.json" > "$ARTIFACT_DIR/checkpoint-metadata.sha256"
 CONFIG_SHA=$(sha256sum "$MODEL_REAL/config.json" | awk '{print $1}')
 DENSE_MANIFEST_SHA=$(sha256sum "$MODEL_REAL/dense_manifest.json" | awk '{print $1}')
+sha256sum "$TOKENIZER_REAL" > "$ARTIFACT_DIR/tokenizer.sha256"
+TOKENIZER_SHA=$(awk '{print $1}' "$ARTIFACT_DIR/tokenizer.sha256")
 
 prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-1536.toml" \
   "$MODEL_REAL" "$TOKENIZER_REAL" 1536 "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
   "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
   "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND" \
   "$PREFETCH_GOVERNOR_ENABLED"
-if [[ "$COLLECTOR_MODE" != phase4b-diagnostic && "$COLLECTOR_MODE" != phase4c-untraced ]]; then
+if [[ "$COLLECTOR_MODE" != phase4b-diagnostic && "$COLLECTOR_MODE" != phase4c-untraced && "$COLLECTOR_MODE" != phase4d-screening ]]; then
   prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-6144.toml" \
     "$MODEL_REAL" "$TOKENIZER_REAL" 6144 "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
     "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
@@ -221,7 +246,7 @@ fi
 # Physical pool sizing from build_bench_real_runtime:
 # primary=(cache_slots+1), shadow=predict_fanout*pipeline_depth.
 POOL_SLOTS=(1536 6144)
-if [[ "$COLLECTOR_MODE" == phase4b-diagnostic || "$COLLECTOR_MODE" == phase4c-untraced ]]; then
+if [[ "$COLLECTOR_MODE" == phase4b-diagnostic || "$COLLECTOR_MODE" == phase4c-untraced || "$COLLECTOR_MODE" == phase4d-screening ]]; then
   POOL_SLOTS=(1536)
 fi
 for slots in "${POOL_SLOTS[@]}"; do
@@ -271,12 +296,15 @@ jq -n \
   --argjson prefetch_governor_enabled "$PREFETCH_GOVERNOR_ENABLED" \
   --argjson prefetch_governor_precision_floor "$PREFETCH_GOVERNOR_PRECISION_FLOOR" \
   --argjson prefetch_governor_contention_weight "$PREFETCH_GOVERNOR_CONTENTION_WEIGHT" \
+  --argjson prefetch_governor_base_threshold "$PREFETCH_GOVERNOR_BASE_THRESHOLD" \
   --argjson neural_speculator_enabled "$NEURAL_SPECULATOR_ENABLED" \
   --argjson output_tokens "$OUTPUT_TOKENS" \
   --argjson prefetch_expected_active "$PREFETCH_EXPECTED_ACTIVE" \
   --arg git_commit_full "$EXPECTED_COMMIT" \
   --arg config_json_sha256 "$CONFIG_SHA" \
   --arg dense_manifest_sha256 "$DENSE_MANIFEST_SHA" \
+  --arg tokenizer_path "$TOKENIZER_REAL" \
+  --arg tokenizer_sha256 "$TOKENIZER_SHA" \
   --arg short_prompt_sha256 "$SHORT_PROMPT_SHA" \
   --arg medium_prompt_sha256 "$MEDIUM_PROMPT_SHA" \
   --arg hostname "$HOSTNAME_VALUE" \
@@ -305,6 +333,7 @@ jq -n \
       enabled: $prefetch_governor_enabled,
       precision_floor: $prefetch_governor_precision_floor,
       contention_weight: $prefetch_governor_contention_weight,
+      base_threshold: $prefetch_governor_base_threshold,
       runtime_default_precision_alpha: 0.2,
       runtime_default_base_threshold: 0.02
     },
@@ -315,6 +344,10 @@ jq -n \
     model_hashes: {
       config_json_sha256: $config_json_sha256,
       dense_manifest_sha256: $dense_manifest_sha256
+    },
+    tokenizer_identity: {
+      path: $tokenizer_path,
+      sha256: $tokenizer_sha256
     },
     prompt_hashes: {
       short_sha256: $short_prompt_sha256,
@@ -331,7 +364,7 @@ jq -n \
     binary_sha256: $binary_sha256,
     collector_mode: $collector_mode
   } +
-  (if $qualification_kind == "phase4b-diagnostic" then
+  (if $qualification_kind != "performance-baseline" then
     {qualification_kind: $qualification_kind}
   else
     {}
@@ -367,7 +400,7 @@ run_case() {
     --request-json "$request" \
     --output-tokens "$OUTPUT_TOKENS" \
     --warmup-runs 1 \
-    --measured-runs 5 \
+    --measured-runs "$MEASURED_RUNS" \
     --cache-reset keep \
     --greedy \
     --format json \
@@ -391,13 +424,17 @@ run_case() {
     --argjson fallback_prior_fill_enabled "$FALLBACK_PRIOR_FILL_ENABLED" \
     --argjson fanout_is_upper_bound "$FANOUT_IS_UPPER_BOUND" \
     --argjson prefetch_governor_enabled "$PREFETCH_GOVERNOR_ENABLED" \
+    --argjson prefetch_governor_precision_floor "$PREFETCH_GOVERNOR_PRECISION_FLOOR" \
+    --argjson prefetch_governor_contention_weight "$PREFETCH_GOVERNOR_CONTENTION_WEIGHT" \
+    --argjson prefetch_governor_base_threshold "$PREFETCH_GOVERNOR_BASE_THRESHOLD" \
     --argjson neural_speculator_enabled "$NEURAL_SPECULATOR_ENABLED" \
     --argjson output_tokens "$OUTPUT_TOKENS" \
+    --argjson measured_runs "$MEASURED_RUNS" \
     --argjson phase4b_trace_enabled "$PHASE4B_TRACE_ENABLED" '
     .schema == {"name":"mer-bench-real","version":2} and
     .benchmark == "bench-real" and
     .warmup_runs == 1 and
-    .measured_runs == 5 and
+    .measured_runs == $measured_runs and
     .cache_reset == "keep" and
     .greedy == true and
     .execution.git_commit_full == $commit and
@@ -472,13 +509,16 @@ run_case() {
       "speculator_enabled":$neural_speculator_enabled,
       "affinity_enabled":false,
       "prefetch_governor_enabled":$prefetch_governor_enabled,
+      "prefetch_governor_precision_floor":$prefetch_governor_precision_floor,
+      "prefetch_governor_contention_weight":$prefetch_governor_contention_weight,
+      "prefetch_governor_base_threshold":$prefetch_governor_base_threshold,
       "cost_aware_eviction_enabled":false,
       "pregate_enabled":false,
       "static_residency_fraction":0
     } and
     .phase4b_trace_enabled == $phase4b_trace_enabled and
     .aggregate.output_token_parity == true and
-    (.runs | length == 5) and
+    (.runs | length == $measured_runs) and
     ([.runs[].prompt_tokens] | all(. == $prompt_tokens)) and
     ([.runs[].completion_tokens] | all(. == $output_tokens)) and
     ([.runs[].total_api_tokens] | all(. == ($prompt_tokens + $output_tokens))) and
@@ -519,10 +559,27 @@ run_case() {
       .prefetch_dropped_concurrency >= 0 and
       .prefetch_dropped_pool_starved >= 0 and
       (if $prefetch_governor_enabled then
-        .prefetch_dropped_governor >= 0
+        .prefetch_dropped_governor >= 0 and
+        .governor_rejected_candidates == .prefetch_dropped_governor
       else
-        .prefetch_dropped_governor == 0
+        .prefetch_dropped_governor == 0 and
+        .governor_admitted_candidates == 0 and
+        .governor_rejected_candidates == 0 and
+        .governor_total_decisions == 0
       end) and
+      .governor_admitted_candidates >= 0 and
+      .governor_rejected_candidates >= 0 and
+      .governor_total_decisions ==
+        (.governor_admitted_candidates + .governor_rejected_candidates) and
+      .governor_admission_rate >= 0 and
+      .governor_admission_rate <= 1 and
+      .governor_admission_rate ==
+        (if .governor_total_decisions == 0 then 0
+         else (.governor_admitted_candidates / .governor_total_decisions)
+         end) and
+      .governor_precision_ewma_final >= 0 and
+      .governor_precision_ewma_final <= 1 and
+      .governor_foreground_inflight_final == 0 and
       .prefetch_dropped_bytes == 0 and
       (if $predict_fanout == 0 then
         .prefetch_submitted == 0 and
@@ -648,6 +705,7 @@ run_case() {
     --argjson prefetch_governor_enabled "$PREFETCH_GOVERNOR_ENABLED" \
     --argjson prefetch_governor_precision_floor "$PREFETCH_GOVERNOR_PRECISION_FLOOR" \
     --argjson prefetch_governor_contention_weight "$PREFETCH_GOVERNOR_CONTENTION_WEIGHT" \
+    --argjson prefetch_governor_base_threshold "$PREFETCH_GOVERNOR_BASE_THRESHOLD" \
     --argjson neural_speculator_enabled "$NEURAL_SPECULATOR_ENABLED" \
     --argjson collection_qualification "$collection_qualification" \
     '([.runs[].cache_io] | {
@@ -666,7 +724,20 @@ run_case() {
       run_index,
       governor_enabled: $prefetch_governor_enabled,
       neural_speculator_enabled: $neural_speculator_enabled,
-      candidates_rejected_by_governor: .cache_io.prefetch_dropped_governor,
+      candidates_rejected_by_governor: .cache_io.governor_rejected_candidates,
+      governor_admitted_candidates: .cache_io.governor_admitted_candidates,
+      governor_rejected_candidates: .cache_io.governor_rejected_candidates,
+      governor_total_decisions: .cache_io.governor_total_decisions,
+      governor_admission_rate: .cache_io.governor_admission_rate,
+      governor_precision_ewma_final: .cache_io.governor_precision_ewma_final,
+      governor_foreground_inflight_final:
+        .cache_io.governor_foreground_inflight_final,
+      direct_governor_decisions: {
+        admitted_candidates: .cache_io.governor_admitted_candidates,
+        rejected_candidates: .cache_io.governor_rejected_candidates,
+        total_decisions: .cache_io.governor_total_decisions,
+        admission_rate: .cache_io.governor_admission_rate
+      },
       speculative_work_admitted: .cache_io.prefetch_submitted,
       governor_admitted_candidates_derived:
         (if $prefetch_governor_enabled then
@@ -676,6 +747,16 @@ run_case() {
         end),
       governor_admission_derivation:
         "prefetch_submitted + prefetch_dropped_concurrency; governor admission precedes the concurrency gate",
+      derived_governor_admission: {
+        admitted_candidates:
+          (if $prefetch_governor_enabled then
+            (.cache_io.prefetch_submitted + .cache_io.prefetch_dropped_concurrency)
+          else
+            0
+          end),
+        derivation:
+          "prefetch_submitted + prefetch_dropped_concurrency; governor admission precedes the concurrency gate"
+      },
       speculative_work_completed: .cache_io.prefetch_completed,
       speculative_work_used: .cache_io.prefetch_used,
       speculative_work_dropped_by_concurrency:
@@ -764,6 +845,7 @@ run_case() {
           enabled: $prefetch_governor_enabled,
           precision_floor: $prefetch_governor_precision_floor,
           contention_weight: $prefetch_governor_contention_weight,
+          base_threshold: $prefetch_governor_base_threshold,
           runtime_default_precision_alpha: 0.2,
           runtime_default_base_threshold: 0.02
         },
@@ -771,6 +853,20 @@ run_case() {
         totals: {
           candidates_rejected_by_governor:
             ($governor_runs | map(.candidates_rejected_by_governor) | add),
+          governor_admitted_candidates:
+            ($governor_runs | map(.governor_admitted_candidates) | add),
+          governor_rejected_candidates:
+            ($governor_runs | map(.governor_rejected_candidates) | add),
+          governor_total_decisions:
+            ($governor_runs | map(.governor_total_decisions) | add),
+          governor_admission_rate:
+            (($governor_runs | map(.governor_admitted_candidates) | add) as $admitted |
+             ($governor_runs | map(.governor_total_decisions) | add) as $decisions |
+             if $decisions == 0 then 0 else ($admitted / $decisions) end),
+          governor_precision_ewma_final:
+            ($governor_runs | last | .governor_precision_ewma_final),
+          governor_foreground_inflight_final:
+            ($governor_runs | last | .governor_foreground_inflight_final),
           speculative_work_admitted:
             ($governor_runs | map(.speculative_work_admitted) | add),
           governor_admitted_candidates_derived:
@@ -880,6 +976,19 @@ run_case() {
         observed_critical_path_coverage:
           $collection_qualification.observed_critical_path_coverage
       }
+    elif $collection_qualification.qualification_kind == "phase4d-governor-screening" then
+      {
+        qualification_kind: $collection_qualification.qualification_kind,
+        screening_collection_valid:
+          $collection_qualification.screening_collection_valid,
+        performance_qualification_applicable: false,
+        performance_qualification_reason:
+          $collection_qualification.performance_qualification_reason,
+        production_critical_path_coverage_gates_passed:
+          $collection_qualification.production_critical_path_coverage_gates_passed,
+        observed_critical_path_coverage:
+          $collection_qualification.observed_critical_path_coverage
+      }
     else
       {}
     end)' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"
@@ -948,6 +1057,84 @@ if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
       external_peak_rss_present: true,
       qualification_passed: false
     }' > "$ARTIFACT_DIR/qualification.json"
+# BEGIN PHASE4D_SCREENING_COLLECTION
+elif [[ "$COLLECTOR_MODE" == phase4d-screening ]]; then
+  run_case 1536 short 14 "$SHORT_PROMPT_SHA"
+
+  jq -n \
+    --arg variant "$PREFETCH_VARIANT" \
+    --slurpfile case_summary \
+      "$ARTIFACT_DIR/baseline-1536-short.case-summary.json" \
+    --slurpfile provenance "$ARTIFACT_DIR/ablation-provenance.json" \
+    --slurpfile raw "$ARTIFACT_DIR/baseline-1536-short.json" '
+    $case_summary[0] as $case |
+    $provenance[0] as $provenance |
+    {
+      schema: {name:"mer-prompt2-phase4d-screening-variant", version:1},
+      qualification_kind: "phase4d-governor-screening",
+      variant: $variant,
+      cache_slots: 1536,
+      prompt_fixture: "short",
+      output_tokens: 128,
+      warmup_runs: 1,
+      measured_runs: 2,
+      greedy: true,
+      traced: false,
+      metadata: $case.phase4c_predictor,
+      governor_configuration: $case.phase4c_governor.configuration,
+      governor_counters_by_run: $case.phase4c_governor.counters_by_run,
+      governor_totals: $case.phase4c_governor.totals,
+      prefetch_counters: $case.phase4a_prefetch.counters,
+      provenance: {
+        git_commit_full: $provenance.git_commit_full,
+        binary_sha256: $provenance.binary_sha256,
+        model_hashes: $provenance.model_hashes,
+        tokenizer_identity: $provenance.tokenizer_identity,
+        target_host: $provenance.host,
+        model_mount_identity: $provenance.model_mount_identity,
+        cargo_features: $provenance.cargo_features,
+        prompt_hashes: $provenance.prompt_hashes
+      },
+      decode_tps_mean: $case.decode_tps_mean,
+      ssd_bytes: $case.ssd_bytes_total,
+      demand_read_service_mean_seconds:
+        $case.phase3a_decode.physical_read_issue_to_completion_mean_seconds,
+      demand_reads_observed_while_speculation_active:
+        ($case.phase4a_prefetch.prompt_demand_reads_issued_while_speculative_reads_active +
+         $case.phase4a_prefetch.decode_demand_reads_issued_while_speculative_reads_active),
+      output_token_ids: $raw[0].runs[0].output_token_ids,
+      output_parity_within_variant: $raw[0].aggregate.output_token_parity,
+      screening_collection_valid: $case.screening_collection_valid,
+      performance_qualification_applicable: false,
+      performance_qualification_reason: $case.performance_qualification_reason,
+      qualification_passed: false
+    }
+  ' > "$ARTIFACT_DIR/phase4d-screening-variant-summary.json"
+
+  jq -n \
+    --arg commit "$EXPECTED_COMMIT" \
+    --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg variant "$PREFETCH_VARIANT" \
+    --slurpfile variant_summary \
+      "$ARTIFACT_DIR/phase4d-screening-variant-summary.json" '
+    {
+      schema: {name:"mer-prompt2-qualification", version:1},
+      git_commit_full: $commit,
+      captured_at_utc: $captured_at_utc,
+      qualification_kind: "phase4d-governor-screening",
+      phase4d_variant: $variant,
+      one_required_1536_short_case_present: true,
+      no_6144_cases_collected: true,
+      trace_disabled: true,
+      screening_collection_valid:
+        $variant_summary[0].screening_collection_valid,
+      performance_qualification_applicable: false,
+      performance_qualification_reason:
+        "Phase 4D-A uses one warmup and two measured short-prompt runs for calibration screening; it is diagnostic evidence and not a qualified production performance baseline",
+      qualification_passed: false
+    }
+  ' > "$ARTIFACT_DIR/qualification.json"
+# END PHASE4D_SCREENING_COLLECTION
 elif [[ "$COLLECTOR_MODE" == phase4c-untraced ]]; then
   run_case 1536 short 14 "$SHORT_PROMPT_SHA"
   run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"

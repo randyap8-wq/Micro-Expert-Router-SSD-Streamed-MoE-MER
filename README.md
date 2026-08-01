@@ -1394,6 +1394,7 @@ affinity_decay_epoch   = 100000 # cumulative observations before a decay right-s
 prefetch_governor              = false  # Tier 4: throttle low-value speculation
 prefetch_precision_floor       = 0.05   # governor precision floor / EWMA seed, [0,1]
 prefetch_contention_weight     = 1.0    # governor backoff per in-flight foreground read
+prefetch_governor_base_threshold = 0.02 # idle probability * precision admission bar
 cost_aware_eviction            = false  # Tier 4: evict coldest heat score, not strict LRU
 pregate_enabled                = false  # Tier 3: layer-L→L+1 next-layer prefetch
 static_residency_fraction      = 0.0    # Tier 1: pin hottest fraction of the namespace
@@ -1464,6 +1465,31 @@ and available foreground-read concurrency metrics. The matrix summary emits
 the four direct causal comparisons between each governed/ungoverned pair and
 between the combined and second-order-only fanout-1 policies at matching
 governor state.
+
+Phase 4D-A adds a separate, non-qualifying governor-calibration screen. It
+uses only the 1,536-slot short prompt, one warmup, two measured runs, greedy
+decoding, no neural speculator, and no synchronous trace. The screen includes
+two controls: `demand-only` and ungoverned `second-only-f1`. The four governed
+variants otherwise hold the second-order-only, fanout-1 predictor configuration
+constant while screening contention weight and base threshold.
+
+```bash
+scripts/collect_qwen3_coder_prompt2_phase4d_screening.sh /path/to/artifacts
+```
+
+The final `phase4d-governor-screening-summary.json` is explicitly labeled
+`phase4d-governor-screening`; it reports direct governor decisions alongside
+the backward-compatible derived admission estimate and can never qualify as a
+production performance baseline. The collector also accepts validated
+`MER_PROMPT2_PREFETCH_GOVERNOR_PRECISION_FLOOR`,
+`MER_PROMPT2_PREFETCH_GOVERNOR_CONTENTION_WEIGHT`, and
+`MER_PROMPT2_PREFETCH_GOVERNOR_BASE_THRESHOLD` overrides.
+
+Because the screen keeps one engine and cache across warmup and measured runs,
+`measured_window_prefetch_used_per_completed` is an operational ratio of the
+two measured-window counter deltas, not exact lifecycle-cohort precision. Raw
+completed and used counts remain available, and the governor's adaptive signal
+is reported separately as `governor_precision_ewma_final`.
 
 After selecting a candidate, the existing diagnostic collector supports the
 required eight-token trace smoke and the full diagnostic trace:

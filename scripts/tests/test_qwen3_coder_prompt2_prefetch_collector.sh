@@ -20,11 +20,17 @@ unset \
   MER_PROMPT2_SECOND_ORDER_ENABLED \
   MER_PROMPT2_FALLBACK_PRIOR_FILL_ENABLED \
   MER_PROMPT2_FANOUT_IS_UPPER_BOUND \
-  MER_PROMPT2_PREFETCH_GOVERNOR_ENABLED
+  MER_PROMPT2_PREFETCH_GOVERNOR_ENABLED \
+  MER_PROMPT2_PREFETCH_GOVERNOR_PRECISION_FLOOR \
+  MER_PROMPT2_PREFETCH_GOVERNOR_CONTENTION_WEIGHT \
+  MER_PROMPT2_PREFETCH_GOVERNOR_BASE_THRESHOLD
 prompt2_resolve_ablation_config
 test "$PREDICT_FANOUT" -eq 2
 test "$PIPELINE_DEPTH" -eq 3
 test "$PREFETCH_EXPECTED_ACTIVE" = true
+test "$PREFETCH_GOVERNOR_PRECISION_FLOOR" = 0.05
+test "$PREFETCH_GOVERNOR_CONTENTION_WEIGHT" = 1.0
+test "$PREFETCH_GOVERNOR_BASE_THRESHOLD" = 0.02
 prompt2_render_config "$TEMPLATE" "$TEST_ROOT/default.toml" \
   /mnt/localssd/model /mnt/localssd/model/tokenizer.json 1536 \
   "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
@@ -40,11 +46,63 @@ grep -Fx 'fanout_is_upper_bound = false' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'prefetch_governor = false' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'prefetch_precision_floor = 0.05' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'prefetch_contention_weight = 1.0' "$TEST_ROOT/default.toml" >/dev/null
+grep -Fx 'prefetch_governor_base_threshold = 0.02' "$TEST_ROOT/default.toml" >/dev/null
 grep -Fx 'speculator_enabled = false' "$TEST_ROOT/default.toml" >/dev/null
 if grep -E '@[A-Z0-9_]+@' "$TEST_ROOT/default.toml" >/dev/null; then
   echo "default render left a collector placeholder unresolved" >&2
   exit 1
 fi
+
+MER_PROMPT2_PREFETCH_GOVERNOR_PRECISION_FLOOR=0.125
+MER_PROMPT2_PREFETCH_GOVERNOR_CONTENTION_WEIGHT=0.25
+MER_PROMPT2_PREFETCH_GOVERNOR_BASE_THRESHOLD=0.005
+prompt2_resolve_ablation_config
+test "$PREFETCH_GOVERNOR_PRECISION_FLOOR" = 0.125
+test "$PREFETCH_GOVERNOR_CONTENTION_WEIGHT" = 0.25
+test "$PREFETCH_GOVERNOR_BASE_THRESHOLD" = 0.005
+prompt2_render_config "$TEMPLATE" "$TEST_ROOT/governor-overrides.toml" \
+  /mnt/localssd/model /mnt/localssd/model/tokenizer.json 1536 \
+  "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
+  "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
+  "$FALLBACK_PRIOR_FILL_ENABLED" "$FANOUT_IS_UPPER_BOUND" \
+  "$PREFETCH_GOVERNOR_ENABLED"
+grep -Fx 'prefetch_precision_floor = 0.125' \
+  "$TEST_ROOT/governor-overrides.toml" >/dev/null
+grep -Fx 'prefetch_contention_weight = 0.25' \
+  "$TEST_ROOT/governor-overrides.toml" >/dev/null
+grep -Fx 'prefetch_governor_base_threshold = 0.005' \
+  "$TEST_ROOT/governor-overrides.toml" >/dev/null
+unset \
+  MER_PROMPT2_PREFETCH_GOVERNOR_PRECISION_FLOOR \
+  MER_PROMPT2_PREFETCH_GOVERNOR_CONTENTION_WEIGHT \
+  MER_PROMPT2_PREFETCH_GOVERNOR_BASE_THRESHOLD
+
+assert_invalid_governor_override() {
+  local name=$1
+  local value=$2
+  if (
+    unset \
+      MER_PROMPT2_PREFETCH_GOVERNOR_PRECISION_FLOOR \
+      MER_PROMPT2_PREFETCH_GOVERNOR_CONTENTION_WEIGHT \
+      MER_PROMPT2_PREFETCH_GOVERNOR_BASE_THRESHOLD
+    export "$name=$value"
+    prompt2_resolve_ablation_config >/dev/null 2>&1
+  ); then
+    echo "$name accepted invalid value: $value" >&2
+    exit 1
+  fi
+}
+
+for value in malformed NaN Infinity -0.1 1.1; do
+  assert_invalid_governor_override \
+    MER_PROMPT2_PREFETCH_GOVERNOR_PRECISION_FLOOR "$value"
+done
+for value in malformed NaN Infinity -0.1; do
+  assert_invalid_governor_override \
+    MER_PROMPT2_PREFETCH_GOVERNOR_CONTENTION_WEIGHT "$value"
+  assert_invalid_governor_override \
+    MER_PROMPT2_PREFETCH_GOVERNOR_BASE_THRESHOLD "$value"
+done
 
 MER_PROMPT2_PREDICT_FANOUT=0
 MER_PROMPT2_PIPELINE_DEPTH=1
@@ -311,6 +369,24 @@ jq -e '
   .performance_qualification_applicable == true and
   .performance_qualification_passed == true
 ' "$TEST_ROOT/performance-qualification.json" >/dev/null
+
+jq '.runs = .runs[:2]' "$TEST_ROOT/performance-collection.json" \
+  > "$TEST_ROOT/phase4d-screening-collection.json"
+jq \
+  --arg qualification_kind phase4d-governor-screening \
+  -f "$COLLECTION_QUALIFIER" \
+  "$TEST_ROOT/phase4d-screening-collection.json" \
+  > "$TEST_ROOT/phase4d-screening-qualification.json"
+jq -e '
+  .qualification_kind == "phase4d-governor-screening" and
+  .collection_qualification_valid == true and
+  .screening_collection_valid == true and
+  .diagnostic_qualification_passed == null and
+  .performance_qualification_applicable == false and
+  .performance_qualification_passed == null and
+  .qualification_passed == false and
+  (.performance_qualification_reason | contains("not a qualified production performance baseline"))
+' "$TEST_ROOT/phase4d-screening-qualification.json" >/dev/null
 
 jq '
   .runs[].critical_path.prompt.coverage_ratio = 0.75 |

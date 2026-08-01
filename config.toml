@@ -313,6 +313,9 @@ prefetch_precision_floor = 0.05
 # admission threshold. Higher ⇒ speculation backs off harder while
 # real misses are in flight.
 prefetch_contention_weight = 1.0
+# Idle-device admission threshold for probability * precision. The
+# contention multiplier raises this bar while foreground reads are active.
+prefetch_governor_base_threshold = 0.02
 
 # -- Tier 4: cost-aware eviction -------------------------------------
 # Evict the coldest resident by decaying heat score instead of strict
