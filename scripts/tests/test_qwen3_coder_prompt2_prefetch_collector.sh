@@ -650,4 +650,81 @@ if grep -F 'run_case 6144' "$TEST_ROOT/diagnostic-case-plan.txt" >/dev/null; the
   exit 1
 fi
 
+for spec in \
+  second-only-f1-governed-bt001-cw000:0.001 \
+  second-only-f1-governed-bt0005-cw000:0.0005 \
+  second-only-f1-governed-bt00025-cw000:0.00025; do
+  IFS=: read -r variant threshold <<<"$spec"
+  MER_PROMPT2_PREFETCH_VARIANT=$variant prompt2_resolve_ablation_config
+  test "$PREDICTOR_MODE" = second-order-only
+  test "$PREDICT_FANOUT" -eq 1
+  test "$PREFETCH_GOVERNOR_ENABLED" = true
+  test "$PREFETCH_GOVERNOR_PRECISION_FLOOR" = 0.05
+  test "$PREFETCH_GOVERNOR_CONTENTION_WEIGHT" = 0.0
+  test "$PREFETCH_GOVERNOR_BASE_THRESHOLD" = "$threshold"
+  prompt2_render_config "$TEMPLATE" "$TEST_ROOT/$variant.toml" \
+    /mnt/localssd/model /mnt/localssd/model/tokenizer.json 1536 \
+    "$PREDICT_FANOUT" "$PIPELINE_DEPTH" "$FIRST_ORDER_ENABLED" \
+    "$SECOND_ORDER_ENABLED" "$FALLBACK_PRIOR_FILL_ENABLED" \
+    "$FANOUT_IS_UPPER_BOUND" "$PREFETCH_GOVERNOR_ENABLED"
+  grep -Fx "prefetch_governor_base_threshold = $threshold" "$TEST_ROOT/$variant.toml" >/dev/null
+  grep -Fx 'prefetch_precision_floor = 0.05' "$TEST_ROOT/$variant.toml" >/dev/null
+  grep -Fx 'prefetch_contention_weight = 0.0' "$TEST_ROOT/$variant.toml" >/dev/null
+done
+
+grep -F 'QUALIFICATION_KIND=phase4d-c-sparse-admission-screening' "$COLLECTOR" >/dev/null
+grep -F 'EXPERIMENT_NAME=prompt2-phase4d-c-sparse-admission' "$COLLECTOR" >/dev/null
+grep -F 'phase4d-c-sparse-admission-variant-summary.json' "$COLLECTOR" >/dev/null
+grep -F 'Phase 4D-C sparse admission screening always requires a clean worktree' "$COLLECTOR" >/dev/null
+
+phase4d_c_case_augmentation=$(sed -n \
+  '/"phase4d-c-sparse-admission-screening" then/,/^    else$/p' "$COLLECTOR")
+phase4d_c_case_augmentation=$(tr '\n' ' ' <<<"$phase4d_c_case_augmentation" | tr -s '[:space:]' ' ')
+for field in \
+  qualification_kind \
+  sparse_admission_collection_valid \
+  performance_qualification_applicable \
+  performance_qualification_reason \
+  production_critical_path_coverage_gates_passed \
+  observed_critical_path_coverage; do
+  grep -F "$field: \$collection_qualification.$field" \
+    <<<"$phase4d_c_case_augmentation" >/dev/null
+done
+grep -F 'screening_collection_valid: $case.sparse_admission_collection_valid' \
+  "$COLLECTOR" >/dev/null
+
+set +e
+MER_PROMPT2_PREFETCH_VARIANT=second-only-f1-governed-bt001-cw000 \
+MER_QWEN_CONVERTED_DIR=/does/not/exist MER_EXPECTED_NVME_MOUNT=/does/not/exist \
+  bash "$COLLECTOR" "$TEST_ROOT/phase4d-c-accepted" \
+    phase4d-c-sparse-admission >/dev/null 2>&1
+accepted_status=$?
+MER_PROMPT2_PREFETCH_VARIANT=current-f2 \
+MER_QWEN_CONVERTED_DIR=/does/not/exist MER_EXPECTED_NVME_MOUNT=/does/not/exist \
+  bash "$COLLECTOR" "$TEST_ROOT/phase4d-c-rejected" \
+    phase4d-c-sparse-admission >/dev/null 2>&1
+rejected_status=$?
+MER_PROMPT2_PREFETCH_VARIANT=second-only-f1-governed-bt001-cw000 \
+MER_QWEN_CONVERTED_DIR=/does/not/exist MER_EXPECTED_NVME_MOUNT=/does/not/exist \
+MER_PROMPT2_PHASE4B_TRACE_PATH='/tmp/{case}.jsonl' \
+  bash "$COLLECTOR" "$TEST_ROOT/phase4d-c-traced" \
+    phase4d-c-sparse-admission >/dev/null 2>&1
+traced_status=$?
+set -e
+test "$accepted_status" -ne 2
+test "$rejected_status" -eq 2
+test "$traced_status" -eq 2
+test ! -e "$TEST_ROOT/phase4d-c-accepted"
+test ! -e "$TEST_ROOT/phase4d-c-rejected"
+test ! -e "$TEST_ROOT/phase4d-c-traced"
+
+jq --arg qualification_kind phase4d-c-sparse-admission-screening \
+  -f "$COLLECTION_QUALIFIER" "$TEST_ROOT/phase4d-screening-collection.json" \
+  > "$TEST_ROOT/phase4d-c-qualification.json"
+jq -e '.qualification_kind == "phase4d-c-sparse-admission-screening" and
+  .collection_qualification_valid == true and
+  .sparse_admission_collection_valid == true and
+  .performance_qualification_applicable == false and
+  .qualification_passed == false' "$TEST_ROOT/phase4d-c-qualification.json" >/dev/null
+
 echo "Prompt 2 collector qualification fixtures: PASS"

@@ -158,6 +158,42 @@ prompt2_resolve_ablation_config() {
       governor_base_threshold_default=0.005
       governor_contention_weight_default=0.0
       ;;
+    second-only-f1-governed-bt001-cw000)
+      PREDICTOR_MODE=second-order-only
+      predict_fanout_raw=1
+      pipeline_depth_raw=3
+      FIRST_ORDER_ENABLED=false
+      SECOND_ORDER_ENABLED=true
+      FALLBACK_PRIOR_FILL_ENABLED=false
+      FANOUT_IS_UPPER_BOUND=true
+      PREFETCH_GOVERNOR_ENABLED=true
+      governor_base_threshold_default=0.001
+      governor_contention_weight_default=0.0
+      ;;
+    second-only-f1-governed-bt0005-cw000)
+      PREDICTOR_MODE=second-order-only
+      predict_fanout_raw=1
+      pipeline_depth_raw=3
+      FIRST_ORDER_ENABLED=false
+      SECOND_ORDER_ENABLED=true
+      FALLBACK_PRIOR_FILL_ENABLED=false
+      FANOUT_IS_UPPER_BOUND=true
+      PREFETCH_GOVERNOR_ENABLED=true
+      governor_base_threshold_default=0.0005
+      governor_contention_weight_default=0.0
+      ;;
+    second-only-f1-governed-bt00025-cw000)
+      PREDICTOR_MODE=second-order-only
+      predict_fanout_raw=1
+      pipeline_depth_raw=3
+      FIRST_ORDER_ENABLED=false
+      SECOND_ORDER_ENABLED=true
+      FALLBACK_PRIOR_FILL_ENABLED=false
+      FANOUT_IS_UPPER_BOUND=true
+      PREFETCH_GOVERNOR_ENABLED=true
+      governor_base_threshold_default=0.00025
+      governor_contention_weight_default=0.0
+      ;;
     *)
       echo "MER_PROMPT2_PREFETCH_VARIANT is not a supported Prompt 2 variant; found: $PREFETCH_VARIANT" >&2
       return 2

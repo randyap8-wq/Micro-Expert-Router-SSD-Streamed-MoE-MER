@@ -1514,6 +1514,26 @@ shows how close the best rejection came to admission; a minimum admitted ratio
 at or above `1` identifies the weakest admitted candidate, and remains `null`
 when no candidate was admitted.
 
+Phase 4D-C uses the Phase 4D-B score evidence to screen lower thresholds for
+sparse, measurable admissions without changing the formula, precision
+behavior, predictor, fanout, cache, or production defaults. Its exact order is
+`demand-only`, `second-only-f1`, then governed
+`second-only-f1-governed-bt001-cw000`,
+`second-only-f1-governed-bt0005-cw000`, and
+`second-only-f1-governed-bt00025-cw000`. The governed base thresholds are
+respectively `0.001`, `0.0005`, and `0.00025`; all use precision floor `0.05`
+and contention weight `0.0`.
+
+```bash
+scripts/collect_qwen3_coder_prompt2_phase4d_c_sparse_admission.sh /path/to/artifacts
+```
+
+The resulting `phase4d-c-sparse-admission-summary.json` reports every
+measurement and treats admission-count and admission-rate monotonicity only as
+observations. This two-run, short-prompt screen is explicitly non-qualifying:
+it identifies a threshold candidate for a later fully qualified benchmark and
+does not select or hard-code a winner.
+
 After selecting a candidate, the existing diagnostic collector supports the
 required eight-token trace smoke and the full diagnostic trace:
 

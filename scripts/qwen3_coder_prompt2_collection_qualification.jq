@@ -76,6 +76,8 @@ elif $qualification_kind == "phase4d-governor-screening" then
   screening_collection_valid
 elif $qualification_kind == "phase4d-b-score-calibration-diagnostic" then
   screening_collection_valid
+elif $qualification_kind == "phase4d-c-sparse-admission-screening" then
+  screening_collection_valid
 else
   false
 end) as $collection_valid |
@@ -108,6 +110,12 @@ end) as $collection_valid |
     else null
     end
   ),
+  sparse_admission_collection_valid: (
+    if $qualification_kind == "phase4d-c-sparse-admission-screening"
+    then $collection_valid
+    else null
+    end
+  ),
   performance_qualification_applicable: ($qualification_kind == "performance-baseline"),
   performance_qualification_passed: (
     if $qualification_kind == "performance-baseline"
@@ -122,6 +130,8 @@ end) as $collection_valid |
       "Phase 4D-A uses one warmup and two measured short-prompt runs for calibration screening; it is diagnostic evidence and not a qualified production performance baseline"
     elif $qualification_kind == "phase4d-b-score-calibration-diagnostic" then
       "Phase 4D-B records bounded governor score and threshold distributions from one warmup and two measured short-prompt runs; it is diagnostic evidence and not a qualified production performance baseline"
+    elif $qualification_kind == "phase4d-c-sparse-admission-screening" then
+      "Phase 4D-C screens sparse governor admissions with one warmup and two measured short-prompt runs; it identifies a candidate for later qualification and is not a qualified production performance baseline"
     else
       null
     end
