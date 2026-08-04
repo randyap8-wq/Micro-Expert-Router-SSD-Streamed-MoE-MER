@@ -1491,6 +1491,29 @@ two measured-window counter deltas, not exact lifecycle-cohort precision. Raw
 completed and used counts remain available, and the governor's adaptive signal
 is reported separately as `governor_precision_ewma_final`.
 
+Phase 4D-B is a separate diagnostic follow-up to Phase 4D-A's observation that
+every governed screen admitted zero candidates, including the `0.005` base
+threshold with zero contention weight. It measures the candidate-probability,
+effective-precision, score, effective-threshold, and score-to-threshold-ratio
+distributions without changing the governor formula, predictor, or runtime
+defaults. It runs only `demand-only`, ungoverned `second-only-f1`, and the
+governed `0.02/1.0` and `0.005/0.0` cases:
+
+```bash
+scripts/collect_qwen3_coder_prompt2_phase4d_b_score_calibration.sh /path/to/artifacts
+```
+
+The final `phase4d-b-governor-score-calibration-summary.json` is diagnostic and
+non-qualifying by design. Counts, means, extrema, decision boundaries, and
+foreground splits cover every decision in each reset window. Percentiles are
+nearest-rank values over a deterministic ring of the most recent 512 finite
+decisions; no per-candidate event stream is retained. Empty populations use
+`null` statistics and disabled controls report zero decisions rather than
+fabricated scores. A maximum rejected score-to-threshold ratio just below `1`
+shows how close the best rejection came to admission; a minimum admitted ratio
+at or above `1` identifies the weakest admitted candidate, and remains `null`
+when no candidate was admitted.
+
 After selecting a candidate, the existing diagnostic collector supports the
 required eight-token trace smoke and the full diagnostic trace:
 

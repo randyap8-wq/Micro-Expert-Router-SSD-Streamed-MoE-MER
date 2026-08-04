@@ -5217,6 +5217,8 @@ impl Engine {
     }
 
     pub fn report(&self) -> EngineReport {
+        let (governor_decisions, governor_score_diagnostics) =
+            self.core.governor.decisions_and_diagnostics();
         let cycle = self.metrics.cycle_hist.lock();
         let io = self.metrics.io_hist.lock();
         let compute = self.metrics.compute_hist.lock();
@@ -5381,9 +5383,10 @@ impl Engine {
                 .load(Ordering::Relaxed),
             governor_enabled: self.core.governor.is_enabled(),
             governor_precision: self.core.governor.precision(),
-            governor_admitted: self.core.governor.decisions().0,
-            governor_throttled: self.core.governor.decisions().1,
+            governor_admitted: governor_decisions.0,
+            governor_throttled: governor_decisions.1,
             governor_foreground_inflight: self.core.governor.foreground_inflight(),
+            governor_score_diagnostics,
             pregate_enabled: self.speculation.pregate.is_some(),
             pregate_accuracy: self
                 .speculation
@@ -5422,6 +5425,14 @@ impl Engine {
             q8_down_kernel_seconds: crate::inference::q8_down_kernel_seconds(),
             demand_fetch: self.metrics.demand_fetch.snapshot(),
         }
+    }
+
+    /// Reset only the bounded governor score diagnostic window. Admission
+    /// state, precision EWMA, direct counters, and foreground accounting are
+    /// preserved. Bench-real calls this before each warmup/measured run so its
+    /// per-run distributions reconcile with direct counter deltas.
+    pub fn reset_governor_score_diagnostics(&self) -> (u64, u64) {
+        self.core.governor.reset_decision_diagnostics()
     }
 
     pub fn print_summary(&self) {
@@ -5756,6 +5767,9 @@ pub struct EngineReport {
     /// **Tier 4.** Foreground reads still in flight when this report was
     /// sampled. A completed benchmark run should normally report zero.
     pub governor_foreground_inflight: i64,
+    /// Bounded score/threshold distribution diagnostics since the most recent
+    /// diagnostic reset.
+    pub governor_score_diagnostics: crate::prefetch_governor::GovernorDecisionDiagnosticsSnapshot,
     /// **Tier 3.** Whether the per-layer pre-gate predictor is enabled.
     pub pregate_enabled: bool,
     /// **Tier 3.** Fraction of scored pre-gate predictions that

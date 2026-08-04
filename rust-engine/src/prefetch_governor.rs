@@ -31,7 +31,17 @@
 //! default `false`) so existing deployments and benchmarks are
 //! bit-for-bit unchanged until they enable it.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use serde::Serialize;
+use std::sync::{
+    atomic::{AtomicI64, AtomicU64, Ordering},
+    Mutex,
+};
+
+/// Maximum number of exact decision samples retained for percentile
+/// calculation. Counts, means, extrema, and decision-boundary values are
+/// accumulated over every decision in the window; only percentile samples
+/// are bounded to the most recent entries.
+pub const GOVERNOR_SCORE_SAMPLE_CAPACITY: usize = 512;
 
 /// Pack/unpack an `f64` into the bits of an `AtomicU64` so the EWMA can
 /// be read on the hot admission path with a single relaxed load.
@@ -42,6 +52,617 @@ fn load_f64(a: &AtomicU64) -> f64 {
 #[inline]
 fn store_f64(a: &AtomicU64, v: f64) {
     a.store(v.to_bits(), Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GovernorDecision {
+    candidate_probability: f64,
+    effective_precision: f64,
+    candidate_score: f64,
+    base_threshold: f64,
+    foreground_inflight: u64,
+    contention_weight: f64,
+    effective_threshold: f64,
+    admitted: bool,
+    score_minus_threshold_margin: f64,
+    score_to_threshold_ratio: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GovernorDecisionSample {
+    candidate_probability: f64,
+    effective_precision: f64,
+    candidate_score: f64,
+    effective_threshold: f64,
+    score_to_threshold_ratio: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RunningStats {
+    count: u64,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+    mean: f64,
+}
+
+impl RunningStats {
+    fn record(&mut self, value: f64) {
+        debug_assert!(value.is_finite());
+        self.count = self.count.saturating_add(1);
+        self.minimum = Some(self.minimum.map_or(value, |current| current.min(value)));
+        self.maximum = Some(self.maximum.map_or(value, |current| current.max(value)));
+        self.mean += (value - self.mean) / self.count as f64;
+    }
+}
+
+/// Finite distribution summary. Every value is `null` when `count == 0`.
+/// Percentiles use nearest-rank selection over the bounded decision sample.
+#[derive(Clone, Debug, Serialize)]
+pub struct GovernorDistributionSummary {
+    pub count: u64,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub mean: Option<f64>,
+    pub p50: Option<f64>,
+    pub p90: Option<f64>,
+    pub p95: Option<f64>,
+    pub p99: Option<f64>,
+}
+
+impl GovernorDistributionSummary {
+    fn empty() -> Self {
+        Self {
+            count: 0,
+            minimum: None,
+            maximum: None,
+            mean: None,
+            p50: None,
+            p90: None,
+            p95: None,
+            p99: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct GovernorDecisionBoundary {
+    pub maximum_rejected_candidate_score: Option<f64>,
+    pub maximum_rejected_score_to_threshold_ratio: Option<f64>,
+    pub minimum_admitted_candidate_score: Option<f64>,
+    pub minimum_admitted_score_to_threshold_ratio: Option<f64>,
+    pub closest_rejected_score_minus_threshold_margin: Option<f64>,
+    pub closest_admitted_score_minus_threshold_margin: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct GovernorForegroundDecisionCounts {
+    pub foreground_inflight_zero: u64,
+    pub foreground_inflight_zero_admitted: u64,
+    pub foreground_inflight_zero_rejected: u64,
+    pub foreground_inflight_positive: u64,
+    pub foreground_inflight_positive_admitted: u64,
+    pub foreground_inflight_positive_rejected: u64,
+}
+
+/// Bounded Phase 4D-B governor score diagnostics for one reset window.
+///
+/// Exact counters and running statistics cover every decision. Percentiles are
+/// nearest-rank values over a deterministic ring containing the most recent
+/// [`GOVERNOR_SCORE_SAMPLE_CAPACITY`] finite decisions. The private sample is
+/// retained only so measured-run snapshots can be merged without serializing
+/// per-decision events.
+#[derive(Clone, Debug, Serialize)]
+pub struct GovernorDecisionDiagnosticsSnapshot {
+    pub semantics: &'static str,
+    pub enabled: bool,
+    pub sample_capacity: usize,
+    pub sampled_decisions: usize,
+    pub total_decisions: u64,
+    pub admitted: u64,
+    pub rejected: u64,
+    pub invalid_numeric_decisions: u64,
+    pub ratio_undefined_decisions: u64,
+    pub base_threshold: f64,
+    pub contention_weight: f64,
+    pub candidate_probability: GovernorDistributionSummary,
+    pub effective_precision: GovernorDistributionSummary,
+    pub candidate_score: GovernorDistributionSummary,
+    pub effective_threshold: GovernorDistributionSummary,
+    pub score_to_threshold_ratio: GovernorDistributionSummary,
+    pub decision_boundary: GovernorDecisionBoundary,
+    pub foreground_inflight_decisions: GovernorForegroundDecisionCounts,
+    #[serde(skip)]
+    samples: Vec<GovernorDecisionSample>,
+}
+
+#[derive(Debug, Default)]
+struct GovernorDecisionDiagnostics {
+    total_decisions: u64,
+    admitted: u64,
+    rejected: u64,
+    invalid_numeric_decisions: u64,
+    ratio_undefined_decisions: u64,
+    candidate_probability: RunningStats,
+    effective_precision: RunningStats,
+    candidate_score: RunningStats,
+    effective_threshold: RunningStats,
+    score_to_threshold_ratio: RunningStats,
+    decision_boundary: GovernorDecisionBoundary,
+    foreground_inflight_decisions: GovernorForegroundDecisionCounts,
+    samples: Vec<GovernorDecisionSample>,
+    next_sample: usize,
+}
+
+impl GovernorDecisionDiagnostics {
+    fn record(&mut self, decision: GovernorDecision) {
+        self.total_decisions = self.total_decisions.saturating_add(1);
+        if decision.admitted {
+            self.admitted = self.admitted.saturating_add(1);
+        } else {
+            self.rejected = self.rejected.saturating_add(1);
+        }
+
+        let foreground = &mut self.foreground_inflight_decisions;
+        if decision.foreground_inflight == 0 {
+            foreground.foreground_inflight_zero =
+                foreground.foreground_inflight_zero.saturating_add(1);
+            if decision.admitted {
+                foreground.foreground_inflight_zero_admitted = foreground
+                    .foreground_inflight_zero_admitted
+                    .saturating_add(1);
+            } else {
+                foreground.foreground_inflight_zero_rejected = foreground
+                    .foreground_inflight_zero_rejected
+                    .saturating_add(1);
+            }
+        } else {
+            foreground.foreground_inflight_positive =
+                foreground.foreground_inflight_positive.saturating_add(1);
+            if decision.admitted {
+                foreground.foreground_inflight_positive_admitted = foreground
+                    .foreground_inflight_positive_admitted
+                    .saturating_add(1);
+            } else {
+                foreground.foreground_inflight_positive_rejected = foreground
+                    .foreground_inflight_positive_rejected
+                    .saturating_add(1);
+            }
+        }
+
+        let required_values = [
+            decision.candidate_probability,
+            decision.effective_precision,
+            decision.candidate_score,
+            decision.base_threshold,
+            decision.contention_weight,
+            decision.effective_threshold,
+            decision.score_minus_threshold_margin,
+        ];
+        if required_values.iter().any(|value| !value.is_finite()) {
+            self.invalid_numeric_decisions = self.invalid_numeric_decisions.saturating_add(1);
+            return;
+        }
+
+        self.candidate_probability
+            .record(decision.candidate_probability);
+        self.effective_precision
+            .record(decision.effective_precision);
+        self.candidate_score.record(decision.candidate_score);
+        self.effective_threshold
+            .record(decision.effective_threshold);
+        if let Some(ratio) = decision.score_to_threshold_ratio {
+            if ratio.is_finite() {
+                self.score_to_threshold_ratio.record(ratio);
+            } else {
+                self.ratio_undefined_decisions = self.ratio_undefined_decisions.saturating_add(1);
+            }
+        } else {
+            self.ratio_undefined_decisions = self.ratio_undefined_decisions.saturating_add(1);
+        }
+
+        let boundary = &mut self.decision_boundary;
+        if decision.admitted {
+            boundary.minimum_admitted_candidate_score = Some(
+                boundary
+                    .minimum_admitted_candidate_score
+                    .map_or(decision.candidate_score, |current| {
+                        current.min(decision.candidate_score)
+                    }),
+            );
+            boundary.closest_admitted_score_minus_threshold_margin = Some(
+                boundary
+                    .closest_admitted_score_minus_threshold_margin
+                    .map_or(decision.score_minus_threshold_margin, |current| {
+                        current.min(decision.score_minus_threshold_margin)
+                    }),
+            );
+            if let Some(ratio) = decision.score_to_threshold_ratio.filter(|v| v.is_finite()) {
+                boundary.minimum_admitted_score_to_threshold_ratio = Some(
+                    boundary
+                        .minimum_admitted_score_to_threshold_ratio
+                        .map_or(ratio, |current| current.min(ratio)),
+                );
+            }
+        } else {
+            boundary.maximum_rejected_candidate_score = Some(
+                boundary
+                    .maximum_rejected_candidate_score
+                    .map_or(decision.candidate_score, |current| {
+                        current.max(decision.candidate_score)
+                    }),
+            );
+            boundary.closest_rejected_score_minus_threshold_margin = Some(
+                boundary
+                    .closest_rejected_score_minus_threshold_margin
+                    .map_or(decision.score_minus_threshold_margin, |current| {
+                        current.max(decision.score_minus_threshold_margin)
+                    }),
+            );
+            if let Some(ratio) = decision.score_to_threshold_ratio.filter(|v| v.is_finite()) {
+                boundary.maximum_rejected_score_to_threshold_ratio = Some(
+                    boundary
+                        .maximum_rejected_score_to_threshold_ratio
+                        .map_or(ratio, |current| current.max(ratio)),
+                );
+            }
+        }
+
+        let sample = GovernorDecisionSample {
+            candidate_probability: decision.candidate_probability,
+            effective_precision: decision.effective_precision,
+            candidate_score: decision.candidate_score,
+            effective_threshold: decision.effective_threshold,
+            score_to_threshold_ratio: decision
+                .score_to_threshold_ratio
+                .filter(|value| value.is_finite()),
+        };
+        if self.samples.len() < GOVERNOR_SCORE_SAMPLE_CAPACITY {
+            self.samples.push(sample);
+        } else {
+            self.samples[self.next_sample] = sample;
+            self.next_sample = (self.next_sample + 1) % GOVERNOR_SCORE_SAMPLE_CAPACITY;
+        }
+    }
+
+    fn chronological_samples(&self) -> Vec<GovernorDecisionSample> {
+        if self.samples.len() < GOVERNOR_SCORE_SAMPLE_CAPACITY || self.next_sample == 0 {
+            return self.samples.clone();
+        }
+        let mut samples = Vec::with_capacity(GOVERNOR_SCORE_SAMPLE_CAPACITY);
+        samples.extend_from_slice(&self.samples[self.next_sample..]);
+        samples.extend_from_slice(&self.samples[..self.next_sample]);
+        samples
+    }
+}
+
+fn nearest_rank(values: &mut [f64], quantile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let rank = (quantile * values.len() as f64).ceil().max(1.0) as usize;
+    values.get(rank.saturating_sub(1)).copied()
+}
+
+fn distribution_summary(
+    stats: RunningStats,
+    samples: &[GovernorDecisionSample],
+    select: fn(&GovernorDecisionSample) -> Option<f64>,
+) -> GovernorDistributionSummary {
+    if stats.count == 0 {
+        return GovernorDistributionSummary::empty();
+    }
+    let sampled: Vec<f64> = samples.iter().filter_map(select).collect();
+    let percentile = |quantile| {
+        let mut values = sampled.clone();
+        nearest_rank(&mut values, quantile)
+    };
+    GovernorDistributionSummary {
+        count: stats.count,
+        minimum: stats.minimum,
+        maximum: stats.maximum,
+        mean: Some(stats.mean),
+        p50: percentile(0.50),
+        p90: percentile(0.90),
+        p95: percentile(0.95),
+        p99: percentile(0.99),
+    }
+}
+
+fn merge_distribution(
+    summaries: impl Iterator<Item = GovernorDistributionSummary>,
+    samples: &[GovernorDecisionSample],
+    select: fn(&GovernorDecisionSample) -> Option<f64>,
+) -> GovernorDistributionSummary {
+    let mut merged = RunningStats::default();
+    for summary in summaries {
+        if summary.count == 0 {
+            continue;
+        }
+        let prior_count = merged.count;
+        let next_count = prior_count.saturating_add(summary.count);
+        let summary_mean = summary
+            .mean
+            .expect("non-empty governor distribution has a mean");
+        merged.mean = if prior_count == 0 {
+            summary_mean
+        } else {
+            merged.mean + (summary_mean - merged.mean) * (summary.count as f64 / next_count as f64)
+        };
+        merged.count = next_count;
+        if let Some(minimum) = summary.minimum {
+            merged.minimum = Some(
+                merged
+                    .minimum
+                    .map_or(minimum, |current| current.min(minimum)),
+            );
+        }
+        if let Some(maximum) = summary.maximum {
+            merged.maximum = Some(
+                merged
+                    .maximum
+                    .map_or(maximum, |current| current.max(maximum)),
+            );
+        }
+    }
+    distribution_summary(merged, samples, select)
+}
+
+fn push_bounded_sample(
+    samples: &mut Vec<GovernorDecisionSample>,
+    next_sample: &mut usize,
+    sample: GovernorDecisionSample,
+) {
+    if samples.len() < GOVERNOR_SCORE_SAMPLE_CAPACITY {
+        samples.push(sample);
+    } else {
+        samples[*next_sample] = sample;
+        *next_sample = (*next_sample + 1) % GOVERNOR_SCORE_SAMPLE_CAPACITY;
+    }
+}
+
+fn optional_max(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    values.flatten().reduce(|current, value| current.max(value))
+}
+
+fn optional_min(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    values.flatten().reduce(|current, value| current.min(value))
+}
+
+impl GovernorDecisionDiagnosticsSnapshot {
+    fn from_state(
+        enabled: bool,
+        base_threshold: f64,
+        contention_weight: f64,
+        state: &GovernorDecisionDiagnostics,
+    ) -> Self {
+        let samples = state.chronological_samples();
+        Self {
+            semantics: "exact all-decision counts, running means, extrema, boundaries, and foreground splits; nearest-rank percentiles over a deterministic ring of the most recent 512 finite decisions since reset; ratio is undefined and excluded when the effective threshold is zero or division is nonfinite",
+            enabled,
+            sample_capacity: GOVERNOR_SCORE_SAMPLE_CAPACITY,
+            sampled_decisions: samples.len(),
+            total_decisions: state.total_decisions,
+            admitted: state.admitted,
+            rejected: state.rejected,
+            invalid_numeric_decisions: state.invalid_numeric_decisions,
+            ratio_undefined_decisions: state.ratio_undefined_decisions,
+            base_threshold,
+            contention_weight,
+            candidate_probability: distribution_summary(
+                state.candidate_probability,
+                &samples,
+                |sample| Some(sample.candidate_probability),
+            ),
+            effective_precision: distribution_summary(
+                state.effective_precision,
+                &samples,
+                |sample| Some(sample.effective_precision),
+            ),
+            candidate_score: distribution_summary(
+                state.candidate_score,
+                &samples,
+                |sample| Some(sample.candidate_score),
+            ),
+            effective_threshold: distribution_summary(
+                state.effective_threshold,
+                &samples,
+                |sample| Some(sample.effective_threshold),
+            ),
+            score_to_threshold_ratio: distribution_summary(
+                state.score_to_threshold_ratio,
+                &samples,
+                |sample| sample.score_to_threshold_ratio,
+            ),
+            decision_boundary: state.decision_boundary.clone(),
+            foreground_inflight_decisions: state.foreground_inflight_decisions.clone(),
+            samples,
+        }
+    }
+
+    /// Merge measured-run diagnostics. Exact summaries are merged by count;
+    /// percentiles use the same bounded ring semantics over the retained run
+    /// samples, in run order.
+    pub fn merge(snapshots: &[Self]) -> Self {
+        let default = GovernorConfig::default();
+        let enabled = snapshots.iter().any(|snapshot| snapshot.enabled);
+        let base_threshold = snapshots
+            .first()
+            .map(|snapshot| snapshot.base_threshold)
+            .unwrap_or(default.base_threshold);
+        let contention_weight = snapshots
+            .first()
+            .map(|snapshot| snapshot.contention_weight)
+            .unwrap_or(default.contention_weight);
+        let mut samples = Vec::with_capacity(GOVERNOR_SCORE_SAMPLE_CAPACITY);
+        let mut next_sample = 0;
+        for snapshot in snapshots {
+            for &sample in &snapshot.samples {
+                push_bounded_sample(&mut samples, &mut next_sample, sample);
+            }
+        }
+        if samples.len() == GOVERNOR_SCORE_SAMPLE_CAPACITY && next_sample > 0 {
+            samples.rotate_left(next_sample);
+        }
+        let total_decisions = snapshots
+            .iter()
+            .map(|snapshot| snapshot.total_decisions)
+            .sum();
+        let admitted = snapshots.iter().map(|snapshot| snapshot.admitted).sum();
+        let rejected = snapshots.iter().map(|snapshot| snapshot.rejected).sum();
+        let invalid_numeric_decisions = snapshots
+            .iter()
+            .map(|snapshot| snapshot.invalid_numeric_decisions)
+            .sum();
+        let ratio_undefined_decisions = snapshots
+            .iter()
+            .map(|snapshot| snapshot.ratio_undefined_decisions)
+            .sum();
+        let foreground_inflight_decisions = GovernorForegroundDecisionCounts {
+            foreground_inflight_zero: snapshots
+                .iter()
+                .map(|snapshot| {
+                    snapshot
+                        .foreground_inflight_decisions
+                        .foreground_inflight_zero
+                })
+                .sum(),
+            foreground_inflight_zero_admitted: snapshots
+                .iter()
+                .map(|snapshot| {
+                    snapshot
+                        .foreground_inflight_decisions
+                        .foreground_inflight_zero_admitted
+                })
+                .sum(),
+            foreground_inflight_zero_rejected: snapshots
+                .iter()
+                .map(|snapshot| {
+                    snapshot
+                        .foreground_inflight_decisions
+                        .foreground_inflight_zero_rejected
+                })
+                .sum(),
+            foreground_inflight_positive: snapshots
+                .iter()
+                .map(|snapshot| {
+                    snapshot
+                        .foreground_inflight_decisions
+                        .foreground_inflight_positive
+                })
+                .sum(),
+            foreground_inflight_positive_admitted: snapshots
+                .iter()
+                .map(|snapshot| {
+                    snapshot
+                        .foreground_inflight_decisions
+                        .foreground_inflight_positive_admitted
+                })
+                .sum(),
+            foreground_inflight_positive_rejected: snapshots
+                .iter()
+                .map(|snapshot| {
+                    snapshot
+                        .foreground_inflight_decisions
+                        .foreground_inflight_positive_rejected
+                })
+                .sum(),
+        };
+        Self {
+            semantics: "exact merged measured-run counts, weighted running means, extrema, boundaries, and foreground splits; nearest-rank percentiles over a deterministic ring of the most recent 512 retained finite decision samples in run order; ratio excludes zero-threshold or nonfinite divisions",
+            enabled,
+            sample_capacity: GOVERNOR_SCORE_SAMPLE_CAPACITY,
+            sampled_decisions: samples.len(),
+            total_decisions,
+            admitted,
+            rejected,
+            invalid_numeric_decisions,
+            ratio_undefined_decisions,
+            base_threshold,
+            contention_weight,
+            candidate_probability: merge_distribution(
+                snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.candidate_probability.clone()),
+                &samples,
+                |sample| Some(sample.candidate_probability),
+            ),
+            effective_precision: merge_distribution(
+                snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.effective_precision.clone()),
+                &samples,
+                |sample| Some(sample.effective_precision),
+            ),
+            candidate_score: merge_distribution(
+                snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.candidate_score.clone()),
+                &samples,
+                |sample| Some(sample.candidate_score),
+            ),
+            effective_threshold: merge_distribution(
+                snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.effective_threshold.clone()),
+                &samples,
+                |sample| Some(sample.effective_threshold),
+            ),
+            score_to_threshold_ratio: merge_distribution(
+                snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.score_to_threshold_ratio.clone()),
+                &samples,
+                |sample| sample.score_to_threshold_ratio,
+            ),
+            decision_boundary: GovernorDecisionBoundary {
+                maximum_rejected_candidate_score: optional_max(
+                    snapshots.iter().map(|snapshot| {
+                        snapshot
+                            .decision_boundary
+                            .maximum_rejected_candidate_score
+                    }),
+                ),
+                maximum_rejected_score_to_threshold_ratio: optional_max(
+                    snapshots.iter().map(|snapshot| {
+                        snapshot
+                            .decision_boundary
+                            .maximum_rejected_score_to_threshold_ratio
+                    }),
+                ),
+                minimum_admitted_candidate_score: optional_min(
+                    snapshots.iter().map(|snapshot| {
+                        snapshot
+                            .decision_boundary
+                            .minimum_admitted_candidate_score
+                    }),
+                ),
+                minimum_admitted_score_to_threshold_ratio: optional_min(
+                    snapshots.iter().map(|snapshot| {
+                        snapshot
+                            .decision_boundary
+                            .minimum_admitted_score_to_threshold_ratio
+                    }),
+                ),
+                closest_rejected_score_minus_threshold_margin: optional_max(
+                    snapshots.iter().map(|snapshot| {
+                        snapshot
+                            .decision_boundary
+                            .closest_rejected_score_minus_threshold_margin
+                    }),
+                ),
+                closest_admitted_score_minus_threshold_margin: optional_min(
+                    snapshots.iter().map(|snapshot| {
+                        snapshot
+                            .decision_boundary
+                            .closest_admitted_score_minus_threshold_margin
+                    }),
+                ),
+            },
+            foreground_inflight_decisions,
+            samples,
+        }
+    }
 }
 
 /// Tunables for [`PrefetchGovernor`]. All values have safe, conservative
@@ -78,9 +699,9 @@ impl Default for GovernorConfig {
     }
 }
 
-/// Lock-free adaptive prefetch admission controller. Cheap to share
-/// behind an `Arc`: every field is a single atomic and the hot
-/// [`Self::admit`] path performs only relaxed loads.
+/// Adaptive prefetch admission controller. The decision inputs and direct
+/// counters remain atomic; enabled Phase 4D-B diagnostics add one bounded
+/// telemetry lock after the decision has been computed.
 #[derive(Debug)]
 pub struct PrefetchGovernor {
     enabled: bool,
@@ -109,6 +730,11 @@ pub struct PrefetchGovernor {
     throttled: AtomicU64,
     /// Telemetry: prefetches the governor admitted.
     admitted: AtomicU64,
+
+    /// Bounded score/threshold diagnostics. This lock never participates in
+    /// the admission calculation; poisoning is recovered so telemetry cannot
+    /// change a decision or fail the request path.
+    decision_diagnostics: Mutex<GovernorDecisionDiagnostics>,
 }
 
 /// RAII token for foreground-read accounting. Dropping the guard always
@@ -149,6 +775,7 @@ impl PrefetchGovernor {
             window_used: AtomicU64::new(0),
             throttled: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
+            decision_diagnostics: Mutex::new(GovernorDecisionDiagnostics::default()),
         };
         // Seed the EWMA optimistically at `max(floor, 0.5)` so a freshly
         // started engine gives speculation a fair chance to prove itself
@@ -187,17 +814,48 @@ impl PrefetchGovernor {
         if !self.enabled {
             return true;
         }
-        let precision = load_f64(&self.precision_ewma).max(self.precision_floor);
-        let inflight = self.foreground_inflight.load(Ordering::Relaxed).max(0) as f64;
-        let value = prob.max(0.0) * precision;
-        let bar = self.base_threshold * (1.0 + self.contention_weight * inflight);
-        let ok = value >= bar;
-        if ok {
+        let decision = self.evaluate(prob);
+        let mut diagnostics = self
+            .decision_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if decision.admitted {
             self.admitted.fetch_add(1, Ordering::Relaxed);
         } else {
             self.throttled.fetch_add(1, Ordering::Relaxed);
         }
-        ok
+        diagnostics.record(decision);
+        decision.admitted
+    }
+
+    #[inline]
+    fn evaluate(&self, prob: f64) -> GovernorDecision {
+        let precision = load_f64(&self.precision_ewma).max(self.precision_floor);
+        let foreground_inflight = self.foreground_inflight.load(Ordering::Relaxed).max(0) as u64;
+        let candidate_probability = prob.max(0.0);
+        let candidate_score = candidate_probability * precision;
+        let effective_threshold =
+            self.base_threshold * (1.0 + self.contention_weight * foreground_inflight as f64);
+        let admitted = candidate_score >= effective_threshold;
+        let score_minus_threshold_margin = candidate_score - effective_threshold;
+        let score_to_threshold_ratio = if effective_threshold > 0.0 {
+            let ratio = candidate_score / effective_threshold;
+            ratio.is_finite().then_some(ratio)
+        } else {
+            None
+        };
+        GovernorDecision {
+            candidate_probability,
+            effective_precision: precision,
+            candidate_score,
+            base_threshold: self.base_threshold,
+            foreground_inflight,
+            contention_weight: self.contention_weight,
+            effective_threshold,
+            admitted,
+            score_minus_threshold_margin,
+            score_to_threshold_ratio,
+        }
     }
 
     /// RAII-free gauge bump: a foreground (blocking) read has started.
@@ -282,6 +940,58 @@ impl PrefetchGovernor {
             self.throttled.load(Ordering::Relaxed),
         )
     }
+
+    /// Snapshot bounded governor score diagnostics since the most recent
+    /// reset. Disabled governors return zero decisions and null distributions.
+    pub fn decision_diagnostics(&self) -> GovernorDecisionDiagnosticsSnapshot {
+        let diagnostics = self
+            .decision_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GovernorDecisionDiagnosticsSnapshot::from_state(
+            self.enabled,
+            self.base_threshold,
+            self.contention_weight,
+            &diagnostics,
+        )
+    }
+
+    /// Atomically observe direct counters and their matching bounded
+    /// diagnostic window. Admission updates both while holding the same lock,
+    /// so the two views cannot straddle a decision.
+    pub fn decisions_and_diagnostics(&self) -> ((u64, u64), GovernorDecisionDiagnosticsSnapshot) {
+        let diagnostics = self
+            .decision_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let decisions = (
+            self.admitted.load(Ordering::Relaxed),
+            self.throttled.load(Ordering::Relaxed),
+        );
+        let snapshot = GovernorDecisionDiagnosticsSnapshot::from_state(
+            self.enabled,
+            self.base_threshold,
+            self.contention_weight,
+            &diagnostics,
+        );
+        (decisions, snapshot)
+    }
+
+    /// Start a fresh bounded diagnostic window without changing governor
+    /// precision, direct counters, foreground accounting, or admission policy.
+    /// The returned direct-counter boundary is sampled under the same lock as
+    /// the reset so subsequent deltas reconcile exactly with the new window.
+    pub fn reset_decision_diagnostics(&self) -> (u64, u64) {
+        let mut diagnostics = self
+            .decision_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *diagnostics = GovernorDecisionDiagnostics::default();
+        (
+            self.admitted.load(Ordering::Relaxed),
+            self.throttled.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl Default for PrefetchGovernor {
@@ -293,6 +1003,13 @@ impl Default for PrefetchGovernor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1e-12,
+            "expected {expected}, got {actual}"
+        );
+    }
 
     #[test]
     fn disabled_governor_admits_everything() {
@@ -416,5 +1133,263 @@ mod tests {
         assert_eq!(admitted, 2);
         assert_eq!(rejected, 1);
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn governor_score_diagnostics_use_exact_admission_values() {
+        let cfg = GovernorConfig {
+            precision_floor: 0.4,
+            contention_weight: 0.5,
+            base_threshold: 0.2,
+            ..GovernorConfig::default()
+        };
+        let g = PrefetchGovernor::new(true, cfg);
+        store_f64(&g.precision_ewma, 0.4);
+        g.begin_foreground();
+        g.begin_foreground();
+
+        let decision = g.evaluate(0.75);
+        assert_close(decision.candidate_probability, 0.75);
+        assert_close(decision.effective_precision, 0.4);
+        assert_close(decision.candidate_score, 0.3);
+        assert_close(decision.base_threshold, 0.2);
+        assert_eq!(decision.foreground_inflight, 2);
+        assert_close(decision.contention_weight, 0.5);
+        assert_close(decision.effective_threshold, 0.4);
+        assert!(!decision.admitted);
+        assert_close(decision.score_minus_threshold_margin, -0.1);
+        assert_close(decision.score_to_threshold_ratio.unwrap(), 0.75);
+
+        assert!(!g.admit(0.75));
+        let diagnostics = g.decision_diagnostics();
+        assert_eq!(diagnostics.total_decisions, 1);
+        assert_eq!(diagnostics.rejected, 1);
+        assert_close(diagnostics.candidate_score.mean.unwrap(), 0.3);
+        assert_close(diagnostics.effective_threshold.mean.unwrap(), 0.4);
+        assert_close(diagnostics.score_to_threshold_ratio.mean.unwrap(), 0.75);
+        assert_close(
+            diagnostics
+                .decision_boundary
+                .closest_rejected_score_minus_threshold_margin
+                .unwrap(),
+            -0.1,
+        );
+        assert_eq!(
+            diagnostics
+                .foreground_inflight_decisions
+                .foreground_inflight_positive_rejected,
+            1
+        );
+    }
+
+    #[test]
+    fn governor_score_diagnostics_cover_admission_and_foreground_groups() {
+        let cfg = GovernorConfig {
+            precision_floor: 1.0,
+            base_threshold: 0.2,
+            contention_weight: 1.0,
+            ..GovernorConfig::default()
+        };
+        let g = PrefetchGovernor::new(true, cfg);
+        store_f64(&g.precision_ewma, 1.0);
+        assert!(g.admit(0.3));
+        g.begin_foreground();
+        assert!(!g.admit(0.3));
+        let diagnostics = g.decision_diagnostics();
+        assert_eq!(diagnostics.total_decisions, 2);
+        assert_eq!(diagnostics.admitted, 1);
+        assert_eq!(diagnostics.rejected, 1);
+        assert_eq!(diagnostics.candidate_probability.count, 2);
+        assert_close(diagnostics.effective_threshold.minimum.unwrap(), 0.2);
+        assert_close(diagnostics.effective_threshold.maximum.unwrap(), 0.4);
+        assert_eq!(
+            diagnostics
+                .foreground_inflight_decisions
+                .foreground_inflight_zero_admitted,
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .foreground_inflight_decisions
+                .foreground_inflight_positive_rejected,
+            1
+        );
+        assert_close(
+            diagnostics
+                .decision_boundary
+                .minimum_admitted_candidate_score
+                .unwrap(),
+            0.3,
+        );
+        assert_close(
+            diagnostics
+                .decision_boundary
+                .maximum_rejected_score_to_threshold_ratio
+                .unwrap(),
+            0.75,
+        );
+    }
+
+    #[test]
+    fn governor_score_empty_and_zero_threshold_semantics_are_explicit() {
+        let disabled = PrefetchGovernor::disabled().decision_diagnostics();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.total_decisions, 0);
+        assert!(disabled.candidate_score.mean.is_none());
+        assert!(disabled.score_to_threshold_ratio.p99.is_none());
+        assert!(disabled
+            .decision_boundary
+            .minimum_admitted_candidate_score
+            .is_none());
+
+        let g = PrefetchGovernor::new(
+            true,
+            GovernorConfig {
+                base_threshold: 0.0,
+                ..GovernorConfig::default()
+            },
+        );
+        assert!(g.admit(0.0));
+        let diagnostics = g.decision_diagnostics();
+        assert_eq!(diagnostics.total_decisions, 1);
+        assert_eq!(diagnostics.ratio_undefined_decisions, 1);
+        assert_eq!(diagnostics.score_to_threshold_ratio.count, 0);
+        assert!(diagnostics.score_to_threshold_ratio.mean.is_none());
+    }
+
+    #[test]
+    fn governor_score_percentiles_are_nearest_rank_and_memory_is_bounded() {
+        let g = PrefetchGovernor::new(
+            true,
+            GovernorConfig {
+                precision_floor: 1.0,
+                base_threshold: 0.1,
+                ..GovernorConfig::default()
+            },
+        );
+        store_f64(&g.precision_ewma, 1.0);
+        for value in 1..=10 {
+            g.admit(value as f64 / 10.0);
+        }
+        let percentiles = g.decision_diagnostics();
+        assert_close(percentiles.candidate_probability.p50.unwrap(), 0.5);
+        assert_close(percentiles.candidate_probability.p90.unwrap(), 0.9);
+        assert_close(percentiles.candidate_probability.p95.unwrap(), 1.0);
+        assert_close(percentiles.candidate_probability.p99.unwrap(), 1.0);
+
+        g.reset_decision_diagnostics();
+        for index in 0..(GOVERNOR_SCORE_SAMPLE_CAPACITY + 73) {
+            g.admit((index % 101) as f64 / 100.0);
+        }
+        let bounded = g.decision_diagnostics();
+        assert_eq!(
+            bounded.total_decisions,
+            (GOVERNOR_SCORE_SAMPLE_CAPACITY + 73) as u64
+        );
+        assert_eq!(bounded.sample_capacity, GOVERNOR_SCORE_SAMPLE_CAPACITY);
+        assert_eq!(bounded.sampled_decisions, GOVERNOR_SCORE_SAMPLE_CAPACITY);
+        assert_eq!(bounded.samples.len(), GOVERNOR_SCORE_SAMPLE_CAPACITY);
+    }
+
+    #[test]
+    fn governor_score_outputs_are_finite_and_counters_reconcile() {
+        let g = PrefetchGovernor::new(true, GovernorConfig::default());
+        for probability in [0.0, 0.01, 0.1, 0.5, 1.0] {
+            g.admit(probability);
+        }
+        let diagnostics = g.decision_diagnostics();
+        let (admitted, rejected) = g.decisions();
+        assert_eq!(diagnostics.total_decisions, admitted + rejected);
+        assert_eq!(diagnostics.admitted, admitted);
+        assert_eq!(diagnostics.rejected, rejected);
+        assert_eq!(diagnostics.invalid_numeric_decisions, 0);
+        for distribution in [
+            &diagnostics.candidate_probability,
+            &diagnostics.effective_precision,
+            &diagnostics.candidate_score,
+            &diagnostics.effective_threshold,
+            &diagnostics.score_to_threshold_ratio,
+        ] {
+            for value in [
+                distribution.minimum,
+                distribution.maximum,
+                distribution.mean,
+                distribution.p50,
+                distribution.p90,
+                distribution.p95,
+                distribution.p99,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(value.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn governor_score_reset_returns_exact_direct_counter_boundary() {
+        let g = PrefetchGovernor::new(true, GovernorConfig::default());
+        assert!(g.admit(1.0));
+        let boundary = g.reset_decision_diagnostics();
+        assert_eq!(boundary, (1, 0));
+
+        assert!(!g.admit(0.0));
+        let (direct, diagnostics) = g.decisions_and_diagnostics();
+        assert_eq!(direct, (1, 1));
+        assert_eq!(
+            diagnostics.total_decisions,
+            direct.0.saturating_sub(boundary.0) + direct.1.saturating_sub(boundary.1)
+        );
+        assert_eq!(diagnostics.admitted, 0);
+        assert_eq!(diagnostics.rejected, 1);
+    }
+
+    #[test]
+    fn governor_score_measured_run_snapshots_merge_with_exact_counts() {
+        let g = PrefetchGovernor::new(true, GovernorConfig::default());
+        assert!(g.admit(1.0));
+        assert!(!g.admit(0.0));
+        let first = g.decision_diagnostics();
+        g.reset_decision_diagnostics();
+        assert!(g.admit(0.5));
+        let second = g.decision_diagnostics();
+        let merged = GovernorDecisionDiagnosticsSnapshot::merge(&[first, second]);
+        assert_eq!(merged.total_decisions, 3);
+        assert_eq!(merged.admitted, 2);
+        assert_eq!(merged.rejected, 1);
+        assert_eq!(merged.sampled_decisions, 3);
+        assert_eq!(merged.candidate_score.count, 3);
+        assert_eq!(
+            merged
+                .foreground_inflight_decisions
+                .foreground_inflight_zero,
+            3
+        );
+        assert!(merged.candidate_score.mean.unwrap().is_finite());
+    }
+
+    #[test]
+    fn governor_score_decision_matches_pre_diagnostic_formula() {
+        let cfg = GovernorConfig {
+            precision_floor: 0.25,
+            base_threshold: 0.05,
+            contention_weight: 0.75,
+            ..GovernorConfig::default()
+        };
+        let g = PrefetchGovernor::new(true, cfg);
+        store_f64(&g.precision_ewma, 0.3);
+        for inflight in 0..=3 {
+            while g.foreground_inflight() < inflight {
+                g.begin_foreground();
+            }
+            for probability in [-0.5_f64, 0.0, 0.1, 0.5, 1.0] {
+                let precision = load_f64(&g.precision_ewma).max(g.precision_floor);
+                let foreground = g.foreground_inflight().max(0) as f64;
+                let legacy = probability.max(0.0) * precision
+                    >= g.base_threshold * (1.0 + g.contention_weight * foreground);
+                assert_eq!(g.evaluate(probability).admitted, legacy);
+            }
+        }
     }
 }
