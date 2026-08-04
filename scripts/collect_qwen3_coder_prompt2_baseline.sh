@@ -1072,6 +1072,21 @@ run_case() {
         observed_critical_path_coverage:
           $collection_qualification.observed_critical_path_coverage
       }
+    elif $collection_qualification.qualification_kind ==
+         "phase4d-c-sparse-admission-screening" then
+      {
+        qualification_kind: $collection_qualification.qualification_kind,
+        sparse_admission_collection_valid:
+          $collection_qualification.sparse_admission_collection_valid,
+        performance_qualification_applicable:
+          $collection_qualification.performance_qualification_applicable,
+        performance_qualification_reason:
+          $collection_qualification.performance_qualification_reason,
+        production_critical_path_coverage_gates_passed:
+          $collection_qualification.production_critical_path_coverage_gates_passed,
+        observed_critical_path_coverage:
+          $collection_qualification.observed_critical_path_coverage
+      }
     else
       {}
     end)' "$json" > "$ARTIFACT_DIR/$stem.case-summary.json"

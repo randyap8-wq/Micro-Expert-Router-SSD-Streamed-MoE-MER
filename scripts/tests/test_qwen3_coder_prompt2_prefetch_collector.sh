@@ -677,6 +677,22 @@ grep -F 'EXPERIMENT_NAME=prompt2-phase4d-c-sparse-admission' "$COLLECTOR" >/dev/
 grep -F 'phase4d-c-sparse-admission-variant-summary.json' "$COLLECTOR" >/dev/null
 grep -F 'Phase 4D-C sparse admission screening always requires a clean worktree' "$COLLECTOR" >/dev/null
 
+phase4d_c_case_augmentation=$(sed -n \
+  '/"phase4d-c-sparse-admission-screening" then/,/^    else$/p' "$COLLECTOR")
+phase4d_c_case_augmentation=$(tr '\n' ' ' <<<"$phase4d_c_case_augmentation" | tr -s '[:space:]' ' ')
+for field in \
+  qualification_kind \
+  sparse_admission_collection_valid \
+  performance_qualification_applicable \
+  performance_qualification_reason \
+  production_critical_path_coverage_gates_passed \
+  observed_critical_path_coverage; do
+  grep -F "$field: \$collection_qualification.$field" \
+    <<<"$phase4d_c_case_augmentation" >/dev/null
+done
+grep -F 'screening_collection_valid: $case.sparse_admission_collection_valid' \
+  "$COLLECTOR" >/dev/null
+
 set +e
 MER_PROMPT2_PREFETCH_VARIANT=second-only-f1-governed-bt001-cw000 \
 MER_QWEN_CONVERTED_DIR=/does/not/exist MER_EXPECTED_NVME_MOUNT=/does/not/exist \
