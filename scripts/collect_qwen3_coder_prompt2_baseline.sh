@@ -17,7 +17,7 @@ TOKENIZER=${MER_QWEN_TOKENIZER:-$MER_QWEN_CONVERTED_DIR/tokenizer.json}
 ARTIFACT_DIR=${1:-}
 MODE_ARG=${2:-four-case}
 if [[ -z "$ARTIFACT_DIR" ]]; then
-  echo "usage: $0 ARTIFACT_DIR [four-case|phase4c-untraced|phase4d-screening|phase4d-b-score-calibration|phase4b-diagnostic|--resident-only]" >&2
+  echo "usage: $0 ARTIFACT_DIR [four-case|phase4c-untraced|phase4d-screening|phase4d-b-score-calibration|phase4d-c-sparse-admission|phase4b-diagnostic|--resident-only]" >&2
   exit 2
 fi
 case "$MODE_ARG" in
@@ -64,13 +64,25 @@ case "$MODE_ARG" in
         ;;
     esac
     ;;
+  phase4d-c-sparse-admission)
+    COLLECTOR_MODE=phase4d-c-sparse-admission
+    QUALIFICATION_KIND=phase4d-c-sparse-admission-screening
+    EXPERIMENT_NAME=prompt2-phase4d-c-sparse-admission
+    case "$PREFETCH_VARIANT" in
+      demand-only|second-only-f1|second-only-f1-governed-bt001-cw000|second-only-f1-governed-bt0005-cw000|second-only-f1-governed-bt00025-cw000) ;;
+      *)
+        echo "phase4d-c-sparse-admission requires a named Phase 4D-C screening variant; found: $PREFETCH_VARIANT" >&2
+        exit 2
+        ;;
+    esac
+    ;;
   resident-only|--resident-only)
     COLLECTOR_MODE=resident-only
     QUALIFICATION_KIND=performance-baseline
     EXPERIMENT_NAME=prompt2-phase4a-prefetch-ablation
     ;;
   *)
-    echo "unknown collector mode: $MODE_ARG (expected four-case, phase4c-untraced, phase4d-screening, phase4d-b-score-calibration, phase4b-diagnostic, or --resident-only)" >&2
+    echo "unknown collector mode: $MODE_ARG (expected four-case, phase4c-untraced, phase4d-screening, phase4d-b-score-calibration, phase4d-c-sparse-admission, phase4b-diagnostic, or --resident-only)" >&2
     exit 2
     ;;
 esac
@@ -85,7 +97,8 @@ if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ]]; then
   fi
 fi
 if [[ "$COLLECTOR_MODE" == phase4d-screening ||
-      "$COLLECTOR_MODE" == phase4d-b-score-calibration ]]; then
+      "$COLLECTOR_MODE" == phase4d-b-score-calibration ||
+      "$COLLECTOR_MODE" == phase4d-c-sparse-admission ]]; then
   MEASURED_RUNS=2
 fi
 
@@ -161,12 +174,15 @@ WORKTREE_STATUS=$(git -C "$ROOT" status --short)
 if [[ -n "$WORKTREE_STATUS" &&
       ("$COLLECTOR_MODE" == phase4d-screening ||
        "$COLLECTOR_MODE" == phase4d-b-score-calibration ||
+       "$COLLECTOR_MODE" == phase4d-c-sparse-admission ||
        "${MER_ALLOW_DIRTY:-0}" != 1) ]]; then
   echo "refusing a baseline from a dirty worktree; commit/stash changes or set MER_ALLOW_DIRTY=1 for a non-qualifying diagnostic" >&2
   if [[ "$COLLECTOR_MODE" == phase4d-screening ]]; then
     echo "Phase 4D-A screening always requires a clean worktree" >&2
   elif [[ "$COLLECTOR_MODE" == phase4d-b-score-calibration ]]; then
     echo "Phase 4D-B score calibration always requires a clean worktree" >&2
+  elif [[ "$COLLECTOR_MODE" == phase4d-c-sparse-admission ]]; then
+    echo "Phase 4D-C sparse admission screening always requires a clean worktree" >&2
   fi
   printf '%s\n' "$WORKTREE_STATUS" >&2
   exit 1
@@ -255,7 +271,8 @@ prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-1536.tom
 if [[ "$COLLECTOR_MODE" != phase4b-diagnostic &&
       "$COLLECTOR_MODE" != phase4c-untraced &&
       "$COLLECTOR_MODE" != phase4d-screening &&
-      "$COLLECTOR_MODE" != phase4d-b-score-calibration ]]; then
+      "$COLLECTOR_MODE" != phase4d-b-score-calibration &&
+      "$COLLECTOR_MODE" != phase4d-c-sparse-admission ]]; then
   prompt2_render_config "$TEMPLATE" "$ARTIFACT_DIR/configs/qwen3-coder-q8-6144.toml" \
     "$MODEL_REAL" "$TOKENIZER_REAL" 6144 "$PREDICT_FANOUT" "$PIPELINE_DEPTH" \
     "$FIRST_ORDER_ENABLED" "$SECOND_ORDER_ENABLED" \
@@ -269,7 +286,8 @@ POOL_SLOTS=(1536 6144)
 if [[ "$COLLECTOR_MODE" == phase4b-diagnostic ||
       "$COLLECTOR_MODE" == phase4c-untraced ||
       "$COLLECTOR_MODE" == phase4d-screening ||
-      "$COLLECTOR_MODE" == phase4d-b-score-calibration ]]; then
+      "$COLLECTOR_MODE" == phase4d-b-score-calibration ||
+      "$COLLECTOR_MODE" == phase4d-c-sparse-admission ]]; then
   POOL_SLOTS=(1536)
 fi
 for slots in "${POOL_SLOTS[@]}"; do
@@ -1296,6 +1314,86 @@ elif [[ "$COLLECTOR_MODE" == phase4d-b-score-calibration ]]; then
     }
   ' > "$ARTIFACT_DIR/qualification.json"
 # END PHASE4D_B_SCORE_CALIBRATION_COLLECTION
+# BEGIN PHASE4D_C_SPARSE_ADMISSION_COLLECTION
+elif [[ "$COLLECTOR_MODE" == phase4d-c-sparse-admission ]]; then
+  run_case 1536 short 14 "$SHORT_PROMPT_SHA"
+
+  jq -n \
+    --arg variant "$PREFETCH_VARIANT" \
+    --slurpfile case_summary "$ARTIFACT_DIR/baseline-1536-short.case-summary.json" \
+    --slurpfile provenance "$ARTIFACT_DIR/ablation-provenance.json" \
+    --slurpfile raw "$ARTIFACT_DIR/baseline-1536-short.json" '
+    $case_summary[0] as $case |
+    $provenance[0] as $provenance |
+    $raw[0] as $raw |
+    {
+      schema: {name:"mer-prompt2-phase4d-c-sparse-admission-variant", version:1},
+      qualification_kind: "phase4d-c-sparse-admission-screening",
+      variant: $variant,
+      cache_slots: 1536,
+      prompt_fixture: "short",
+      output_tokens: 128,
+      warmup_runs: 1,
+      measured_runs: 2,
+      cache_reset: "keep",
+      greedy: true,
+      traced: false,
+      metadata: $case.phase4c_predictor,
+      governor_configuration: $case.phase4c_governor.configuration,
+      governor_counters_by_run: $case.phase4c_governor.counters_by_run,
+      governor_totals: $case.phase4c_governor.totals,
+      governor_score_diagnostics_by_run: $case.phase4c_governor.score_diagnostics_by_run,
+      governor_score_diagnostics: $case.phase4c_governor.score_diagnostics_aggregate,
+      governor_score_diagnostics_reconcile: $case.phase4c_governor.score_diagnostics_aggregate_reconcile,
+      foreground_accounting: {
+        final_by_run: [$case.phase4c_governor.counters_by_run[] | .governor_foreground_inflight_final],
+        final_aggregate: $case.phase4c_governor.totals.governor_foreground_inflight_final
+      },
+      prefetch_counters: $case.phase4a_prefetch.counters,
+      provenance: {
+        git_commit_full: $provenance.git_commit_full,
+        binary_sha256: $provenance.binary_sha256,
+        model_hashes: $provenance.model_hashes,
+        tokenizer_identity: $provenance.tokenizer_identity,
+        target_host: $provenance.host,
+        model_mount_identity: $provenance.model_mount_identity,
+        cargo_features: $provenance.cargo_features,
+        prompt_hashes: $provenance.prompt_hashes
+      },
+      decode_tps_mean: $case.decode_tps_mean,
+      ssd_bytes: $case.ssd_bytes_total,
+      demand_read_service_mean_seconds: $case.phase3a_decode.physical_read_issue_to_completion_mean_seconds,
+      output_token_ids: $raw.runs[0].output_token_ids,
+      output_parity_within_variant: $raw.aggregate.output_token_parity,
+      screening_collection_valid: $case.sparse_admission_collection_valid,
+      performance_qualification_applicable: false,
+      performance_qualification_reason: $case.performance_qualification_reason,
+      qualification_passed: false
+    }
+  ' > "$ARTIFACT_DIR/phase4d-c-sparse-admission-variant-summary.json"
+
+  jq -n \
+    --arg commit "$EXPECTED_COMMIT" \
+    --arg captured_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg variant "$PREFETCH_VARIANT" \
+    --slurpfile variant_summary "$ARTIFACT_DIR/phase4d-c-sparse-admission-variant-summary.json" '
+    {
+      schema: {name:"mer-prompt2-qualification", version:1},
+      git_commit_full: $commit,
+      captured_at_utc: $captured_at_utc,
+      qualification_kind: "phase4d-c-sparse-admission-screening",
+      phase4d_c_variant: $variant,
+      one_required_1536_short_case_present: true,
+      no_6144_cases_collected: true,
+      trace_disabled: true,
+      screening_collection_valid: $variant_summary[0].screening_collection_valid,
+      governor_score_diagnostics_reconcile: $variant_summary[0].governor_score_diagnostics_reconcile,
+      performance_qualification_applicable: false,
+      performance_qualification_reason: "Phase 4D-C screens sparse admissions to identify a candidate for a later qualified benchmark",
+      qualification_passed: false
+    }
+  ' > "$ARTIFACT_DIR/qualification.json"
+# END PHASE4D_C_SPARSE_ADMISSION_COLLECTION
 elif [[ "$COLLECTOR_MODE" == phase4c-untraced ]]; then
   run_case 1536 short 14 "$SHORT_PROMPT_SHA"
   run_case 1536 medium 65 "$MEDIUM_PROMPT_SHA"
