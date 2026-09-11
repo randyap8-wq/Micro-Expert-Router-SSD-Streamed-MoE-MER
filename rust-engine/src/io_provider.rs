@@ -4456,3 +4456,148 @@ mod hma1c_d_portable_tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+
+// Diagnostic-only full-schedule fixture. The only injected operation is fd
+// validation: this exercises actual helpers, but supplies no O_DIRECT/GPU proof.
+#[cfg(test)]
+mod hma1c_e_portable_tests {
+    use super::*;
+    use crate::aligned_buffer::AlignedBuffer;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_to_upload_copy_elision_e_256_proofs_delayed_crossover_real_helpers() {
+        let path = std::env::temp_dir().join(format!(
+            "mer-hma1ce-io-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let full = 2_658_304;
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: path.clone(),
+            expert_size: full,
+            block_align: 4096,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap()
+        .with_max_open_files(256);
+        let universe: Vec<u32> = (0..256).map(|i| i * 6143 / 255).collect();
+        let mut identities = Vec::new();
+        for &id in &universe {
+            let f = File::create(path.join(format!("expert_{id}.bin"))).unwrap();
+            f.set_len(full as u64).unwrap();
+            f.write_at(&id.to_le_bytes(), 0).unwrap();
+            f.write_at(&id.to_le_bytes(), (full - 4) as u64).unwrap();
+            let fd = storage.fd_for(id).unwrap();
+            storage
+                .prove_source_upload_fd_with(id, &fd, |f| {
+                    validate_source_upload_fd(full as u64, || Ok(true), || Ok(f.metadata()?.len()))
+                })
+                .unwrap();
+            identities.push(fd);
+        }
+        let counts = |requests, hits, misses| SourceUploadFdProofSnapshot {
+            source_upload_fd_proof_requests: requests,
+            source_upload_fd_proof_hits: hits,
+            source_upload_fd_proof_misses: misses,
+            ..SourceUploadFdProofSnapshot::default()
+        };
+        assert_eq!(
+            storage.source_upload_fd_proof_snapshot(),
+            counts(256, 0, 256)
+        );
+        let mut arena = AlignedBuffer::new(full * 8, 4096);
+        let mut expected = vec![0; full];
+        // Regenerated independently: no diagnostic schedule/types are imported.
+        let sequences = [[0, 1, 3, 2], [1, 2, 0, 3], [2, 3, 1, 0], [3, 0, 2, 1]];
+        let mut previous: Vec<std::collections::BTreeSet<u32>> = Vec::new();
+        let mut matched = std::collections::BTreeMap::<(usize, usize, usize), Vec<[u8; 32]>>::new();
+        for (warmup, requests, sets) in [(true, 560, 28), (false, 2240, 112)] {
+            storage.reset_source_upload_fd_proof_telemetry();
+            assert_eq!(storage.source_upload_fd_proof_snapshot(), counts(0, 0, 0));
+            let mut helper_calls = [0; 4];
+            let mut slots = [0; 4];
+            let mut source_bytes = [0; 4];
+            for block in 0..sets {
+                let family = if warmup { 28 + block } else { block % 28 };
+                let q = if warmup { 0 } else { block / 28 };
+                let w = family % 7;
+                let width = w + 2;
+                let g = (family / 7) % 4;
+                let phi = [0, 2, 3, 1];
+                let exec = q ^ g ^ (w & 3);
+                let rot = q ^ phi[g] ^ phi[w & 3];
+                let roles: [Vec<u32>; 4] = std::array::from_fn(|role| {
+                    (0..width)
+                        .map(|j| universe[(family * 17 + 64 * role + 13 * j) % 256])
+                        .collect()
+                });
+                let all: std::collections::BTreeSet<_> = roles.iter().flatten().copied().collect();
+                assert_eq!(all.len(), 4 * width);
+                for earlier in previous.iter().rev().take(2) {
+                    assert!(all.is_disjoint(earlier));
+                }
+                previous.push(all);
+                for cell in sequences[exec] {
+                    let role = (cell + rot) % 4;
+                    let ids = &roles[role];
+                    let mut dst: Vec<_> = arena.as_mut_slice()[..width * full]
+                        .chunks_exact_mut(full)
+                        .collect();
+                    helper_calls[cell] += 1;
+                    slots[cell] += width;
+                    let n = if cell < 2 {
+                        storage
+                            .read_experts_serial_into_aligned_slices(ids, &mut dst)
+                            .await
+                    } else {
+                        storage
+                            .read_experts_batch_into_aligned_slices(ids, &mut dst)
+                            .await
+                    }
+                    .unwrap();
+                    assert_eq!(n, width * full);
+                    source_bytes[cell] += n;
+                    let mut hashes = Vec::new();
+                    for (&id, bytes) in ids.iter().zip(dst) {
+                        expected[..4].copy_from_slice(&id.to_le_bytes());
+                        expected[full - 4..].copy_from_slice(&id.to_le_bytes());
+                        assert_eq!(bytes, expected.as_slice());
+                        hashes.push(Sha256::digest(bytes).into());
+                    }
+                    if !warmup {
+                        assert!(matched.insert((family, role, cell), hashes).is_none());
+                    }
+                }
+            }
+            assert_eq!(slots, [if warmup { 140 } else { 560 }; 4]);
+            assert_eq!(
+                source_bytes,
+                [if warmup { 372_162_560 } else { 1_488_650_240 }; 4]
+            );
+            assert_eq!(helper_calls, [sets; 4]);
+            assert_eq!(
+                storage.source_upload_fd_proof_snapshot(),
+                counts(requests, requests, 0)
+            );
+            for (&id, original) in universe.iter().zip(&identities) {
+                assert!(Arc::ptr_eq(original, &storage.fd_for(id).unwrap()));
+            }
+        }
+        assert_eq!(matched.len(), 448);
+        for family in 0..28 {
+            for role in 0..4 {
+                for cell in 1..4 {
+                    assert_eq!(matched[&(family, role, 0)], matched[&(family, role, cell)]);
+                }
+            }
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
