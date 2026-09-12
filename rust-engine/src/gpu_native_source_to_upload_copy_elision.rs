@@ -1578,7 +1578,7 @@ async fn execute(report: &mut Report) -> Result<()> {
 }
 
 pub(crate) async fn run_command(args: Args) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    hma1c_b::hma1c_c::hma1c_e::run_command(args).await
+    hma1c_b::hma1c_c::hma1c_f::run_command(args).await
 }
 
 // A's schema and runner remain version-separated test evidence. The CLI runs B.
@@ -6740,7 +6740,7 @@ mod hma1c_b {
                     exec.find("preprove_source_upload_fds(").unwrap()
                         < exec.find("c_phase(&mut report.warmup").unwrap()
                 );
-                assert!(whole.contains("hma1c_b::hma1c_c::hma1c_e::run_command(args).await"));
+                assert!(whole.contains("hma1c_b::hma1c_c::hma1c_f::run_command(args).await"));
             }
             #[test]
             fn source_to_upload_copy_elision_c_exact_arena_geometry_and_remap_alignment() {
@@ -8850,6 +8850,10 @@ mod hma1c_b {
                     std::fs::remove_dir_all(dir).unwrap();
                 }
             }
+        }
+        // F owns a source-only cycle runner; inherited diagnostics stay frozen.
+        pub(crate) mod hma1c_f {
+            include!("gpu_native_mapped_memory_local_paired_concurrent.rs");
         }
         // E reuses the inherited C cell runners without changing D or C.
         pub(crate) mod hma1c_e {

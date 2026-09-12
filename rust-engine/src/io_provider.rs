@@ -4601,3 +4601,151 @@ mod hma1c_e_portable_tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+// Diagnostic-only F fixture: ordinary files and host allocations stand in for
+// both destinations. Injected fd validation cannot establish O_DIRECT/GPU or
+// performance authority. The real concurrent source helper is unchanged.
+#[cfg(test)]
+mod hma1c_f_portable_tests {
+    use super::*;
+    use crate::aligned_buffer::AlignedBuffer;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hma1c_f_two_pass_distinct_destinations_real_helper_exact_full_stream() {
+        let path = std::env::temp_dir().join(format!(
+            "mer-hma1cf-io-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let full = 2_658_304;
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: path.clone(),
+            expert_size: full,
+            block_align: 4096,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap()
+        .with_max_open_files(256);
+        let universe: Vec<u32> = (0..256).map(|i| i * 6143 / 255).collect();
+        let mut identities = Vec::new();
+        for &id in &universe {
+            let f = File::create(path.join(format!("expert_{id}.bin"))).unwrap();
+            f.set_len(full as u64).unwrap();
+            f.write_at(&id.to_le_bytes(), 0).unwrap();
+            f.write_at(&id.to_le_bytes(), (full - 4) as u64).unwrap();
+            let fd = storage.fd_for(id).unwrap();
+            storage
+                .prove_source_upload_fd_with(id, &fd, |f| {
+                    validate_source_upload_fd(full as u64, || Ok(true), || Ok(f.metadata()?.len()))
+                })
+                .unwrap();
+            identities.push(fd);
+        }
+        let counts = |requests, hits, misses| SourceUploadFdProofSnapshot {
+            source_upload_fd_proof_requests: requests,
+            source_upload_fd_proof_hits: hits,
+            source_upload_fd_proof_misses: misses,
+            ..Default::default()
+        };
+        assert_eq!(
+            storage.source_upload_fd_proof_snapshot(),
+            counts(256, 0, 256)
+        );
+        let mut previous: Vec<Vec<u32>> = Vec::new();
+        let mut expected = vec![0u8; full];
+        let mut global_call = 0;
+        for (measured, cycles, calls_per_arm, slots_per_arm, bytes_per_arm, proofs) in [
+            (false, 4, 28, 140, 372_162_560, 280),
+            (true, 16, 112, 560, 1_488_650_240, 1120),
+        ] {
+            storage.reset_source_upload_fd_proof_telemetry();
+            assert_eq!(storage.source_upload_fd_proof_snapshot(), counts(0, 0, 0));
+            let mut helper_calls = [0; 2];
+            let mut slots = [0; 2];
+            let mut bytes = [0; 2];
+            for c in 0..cycles {
+                let g = c % 4;
+                let r = if measured { c / 4 } else { 0 };
+                let ids: Vec<Vec<u32>> = (0..7)
+                    .map(|p| {
+                        let w = (p + c) % 7;
+                        let f = if measured { 0 } else { 28 } + 7 * g + w;
+                        (0..w + 2)
+                            .map(|j| universe[(17 * f + 64 * r + 13 * j) % 256])
+                            .collect()
+                    })
+                    .collect();
+                let hc_first = (g + r) % 2 == 0;
+                // Prepare every allocation and slice before the entire window.
+                let mut arenas: Vec<_> = (0..14)
+                    .map(|i| AlignedBuffer::new(ids[i % 7].len() * full, 4096))
+                    .collect();
+                let addresses: std::collections::BTreeSet<_> = arenas
+                    .iter()
+                    .map(|a| a.as_slice().as_ptr() as usize)
+                    .collect();
+                assert_eq!(addresses.len(), 14);
+                let mut destinations: Vec<Vec<_>> = arenas
+                    .iter_mut()
+                    .map(|a| a.as_mut_slice().chunks_exact_mut(full).collect())
+                    .collect();
+                let mut results: [Option<io::Result<usize>>; 14] = std::array::from_fn(|_| None);
+                for i in 0..14 {
+                    results[i] = Some(
+                        storage
+                            .read_experts_batch_into_aligned_slices(
+                                &ids[i % 7],
+                                &mut destinations[i],
+                            )
+                            .await,
+                    );
+                }
+                // No destination has been reused: verify only after all calls.
+                for i in 0..14 {
+                    let arm = if (i < 7) == hc_first { 0 } else { 1 };
+                    let set = &ids[i % 7];
+                    let n = results[i].take().unwrap().unwrap();
+                    assert_eq!(n, set.len() * full);
+                    helper_calls[arm] += 1;
+                    slots[arm] += set.len();
+                    bytes[arm] += n;
+                    for prior in previous.iter().rev().take(2) {
+                        assert!(set.iter().all(|id| !prior.contains(id)));
+                    }
+                    previous.push(set.clone());
+                    global_call += 1;
+                    for (&id, source) in set.iter().zip(&destinations[i]) {
+                        expected[..4].copy_from_slice(&id.to_le_bytes());
+                        expected[full - 4..].copy_from_slice(&id.to_le_bytes());
+                        assert_eq!(&source[..], expected.as_slice());
+                    }
+                }
+                for p in 0..7 {
+                    for (a, b) in destinations[p].iter().zip(&destinations[p + 7]) {
+                        assert_eq!(&a[..], &b[..]);
+                        assert_eq!(Sha256::digest(a), Sha256::digest(b));
+                        assert_eq!(Sha256::digest(&a[4096..]), Sha256::digest(&b[4096..]));
+                    }
+                }
+            }
+            assert_eq!(helper_calls, [calls_per_arm; 2]);
+            assert_eq!(slots, [slots_per_arm; 2]);
+            assert_eq!(bytes, [bytes_per_arm; 2]);
+            assert_eq!(
+                storage.source_upload_fd_proof_snapshot(),
+                counts(proofs, proofs, 0)
+            );
+            for (&id, fd) in universe.iter().zip(&identities) {
+                assert!(Arc::ptr_eq(fd, &storage.fd_for(id).unwrap()));
+            }
+        }
+        assert_eq!(global_call, 280);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
