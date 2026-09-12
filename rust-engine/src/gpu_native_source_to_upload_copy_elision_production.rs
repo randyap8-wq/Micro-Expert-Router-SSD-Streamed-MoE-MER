@@ -370,6 +370,8 @@ struct Performance {
 
 #[derive(Clone, Debug, Serialize)]
 struct Report {
+    #[serde(skip)]
+    decomposition: Option<Vec<crate::gpu_native_source_path_decomposition::StoreSnapshot>>,
     schema: &'static str,
     mode: &'static str,
     control: Option<UploadArmReport>,
@@ -434,6 +436,34 @@ fn qualification_pass(reconciliation_pass: bool, gates: &Gates) -> bool {
 }
 
 pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_command_inner(args, false).await
+}
+
+pub(crate) async fn run_decomposition_command(
+    args: CommandArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_command_inner(args, true).await
+}
+
+fn emit_run_report(
+    report: &Report,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(stores) = &report.decomposition {
+        let envelope = crate::gpu_native_source_path_decomposition::Envelope::new(
+            serde_json::to_value(report)?,
+            stores.clone(),
+        );
+        emit_report(&envelope, output)
+    } else {
+        emit_report(report, output)
+    }
+}
+
+async fn run_command_inner(
+    args: CommandArgs,
+    decomposition: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = prepare(&args)?;
     let mut timing_definitions = concurrency_timing_definitions();
     timing_definitions.common.physical_install_total_us = "both arms: sum of each post-reservation physical stage plus ordered commit service; excludes reservation time";
@@ -441,6 +471,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     timing_definitions.common.mapping_publication_us =
         "both arms: ordered logical mapping Queue::write_buffer time after staging; treatment additionally submits the fused copy set before publication";
     let mut report = Report {
+        decomposition: decomposition.then(Vec::new),
         schema: SCHEMA,
         mode: MODE,
         control: None,
@@ -471,20 +502,26 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     };
     let (control_arm, treatment_arm) = qualification_arms();
     for arm in [control_arm, treatment_arm] {
-        let result = run_physical_install_arm(
+        let result = run_physical_install_arm_inner(
             &prepared,
             &args,
             PhysicalInstallQualificationRun::SourceToUpload(arm),
+            decomposition.then_some(crate::gpu_native_source_path_decomposition::MODE),
         )
         .await;
         let run = match result {
             Ok(run) => run,
             Err(failure) => {
                 report.failure = Some(failure.clone());
-                emit_report(&report, &args.report_out)?;
+                emit_run_report(&report, &args.report_out)?;
                 return Err(failure.to_string().into());
             }
         };
+        if let (Some(stores), Some(observation)) =
+            (&mut report.decomposition, run.source_decomposition)
+        {
+            stores.push(observation);
+        }
         let failure = run.common.failure.clone();
         let arm_report = UploadArmReport {
             run: ConcurrencyArmReport {
@@ -526,7 +563,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             })
         }) {
             report.failure = Some(failure.clone());
-            emit_report(&report, &args.report_out)?;
+            emit_run_report(&report, &args.report_out)?;
             return Err(failure.to_string().into());
         }
     }
@@ -692,7 +729,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         Err(failure) => {
             report.qualification_pass = false;
             report.failure = Some(failure.clone());
-            emit_report(&report, &args.report_out)?;
+            emit_run_report(&report, &args.report_out)?;
             return Err(failure.to_string().into());
         }
     }
@@ -701,7 +738,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         report.failure.is_some(),
         report.qualification_pass,
     );
-    emit_report(&report, &args.report_out)?;
+    emit_run_report(&report, &args.report_out)?;
     if report.qualification_pass {
         Ok(())
     } else {

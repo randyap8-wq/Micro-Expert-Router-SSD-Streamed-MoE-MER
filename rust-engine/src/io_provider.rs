@@ -992,157 +992,184 @@ impl NvmeStorage {
         expert_id: u32,
         offset: u64,
         dst: &mut [u8],
+        mut timing: Option<&mut crate::gpu_native_source_path_decomposition::RawRead>,
     ) -> io::Result<usize> {
-        // Fast path: per-drive breaker is tripped. Drive failures
-        // are sticky and affect every expert sharded onto this
-        // drive, so we short-circuit before even consulting
-        // `is_expert_unavailable` — *unless* the half-open probe
-        // gate admits exactly one recovery read. Without that gate
-        // the breaker could never reach the read path that calls
-        // `note_read_success`, leaving a recovered drive offline
-        // forever. Gist Phase 3.
-        let drive_index = self.drive_index_for(expert_id);
-        if self.is_drive_unavailable(expert_id) {
-            let db = &self.drive_breakers[drive_index];
-            if !Self::try_admit_probe(&db.tripped_at_ms) {
-                let cf = db.consecutive_failures.load(Ordering::Acquire);
-                return Err(HardwareFailure::DriveUnavailable {
-                    drive_index,
-                    consecutive_failures: cf,
-                }
-                .into());
-            }
-            tracing::info!(
-                drive_index,
-                "drive circuit breaker half-open — admitting one probe read"
-            );
+        if let Some(t) = timing.as_deref_mut() {
+            t.start = Some(std::time::Instant::now());
         }
-        // Fast path: per-expert breaker is tripped. Same half-open
-        // probe gate applies so a recovered expert can clear it.
-        if self.is_expert_unavailable(expert_id) {
-            let b = self.breaker(expert_id);
-            if !Self::try_admit_probe(&b.tripped_at_ms) {
-                let cf = b.consecutive_failures.load(Ordering::Acquire);
-                return Err(HardwareFailure::ExpertUnavailable {
+        let result = (|| {
+            // Fast path: per-drive breaker is tripped. Drive failures
+            // are sticky and affect every expert sharded onto this
+            // drive, so we short-circuit before even consulting
+            // `is_expert_unavailable` — *unless* the half-open probe
+            // gate admits exactly one recovery read. Without that gate
+            // the breaker could never reach the read path that calls
+            // `note_read_success`, leaving a recovered drive offline
+            // forever. Gist Phase 3.
+            let drive_index = self.drive_index_for(expert_id);
+            if self.is_drive_unavailable(expert_id) {
+                if let Some(t) = timing.as_deref_mut() {
+                    t.breaker_event = true;
+                }
+                let db = &self.drive_breakers[drive_index];
+                if !Self::try_admit_probe(&db.tripped_at_ms) {
+                    let cf = db.consecutive_failures.load(Ordering::Acquire);
+                    return Err(HardwareFailure::DriveUnavailable {
+                        drive_index,
+                        consecutive_failures: cf,
+                    }
+                    .into());
+                }
+                tracing::info!(
+                    drive_index,
+                    "drive circuit breaker half-open — admitting one probe read"
+                );
+            }
+            // Fast path: per-expert breaker is tripped. Same half-open
+            // probe gate applies so a recovered expert can clear it.
+            if self.is_expert_unavailable(expert_id) {
+                if let Some(t) = timing.as_deref_mut() {
+                    t.breaker_event = true;
+                }
+                let b = self.breaker(expert_id);
+                if !Self::try_admit_probe(&b.tripped_at_ms) {
+                    let cf = b.consecutive_failures.load(Ordering::Acquire);
+                    return Err(HardwareFailure::ExpertUnavailable {
+                        expert_id,
+                        consecutive_failures: cf,
+                    }
+                    .into());
+                }
+                tracing::info!(
+                    expert_id,
+                    "expert circuit breaker half-open — admitting one probe read"
+                );
+            }
+            let mut last_err: Option<io::Error> = None;
+            let mut backoff = STORAGE_RETRY_BACKOFF;
+            for attempt in 0..STORAGE_RETRY_ATTEMPTS {
+                if let Some(t) = timing.as_deref_mut() {
+                    t.attempt_starts[attempt as usize] = Some(std::time::Instant::now());
+                }
+                let attempt_result = file.read_at(dst, offset);
+                if let Some(t) = timing.as_deref_mut() {
+                    t.attempt_ends[attempt as usize] = Some(std::time::Instant::now());
+                }
+                match attempt_result {
+                    Ok(n) if n == dst.len() => {
+                        self.note_read_success(expert_id);
+                        return Ok(n);
+                    }
+                    Ok(n) => {
+                        // Short read — almost certainly a permanently
+                        // truncated file. Not worth retrying (the file
+                        // isn't going to grow back in 50 ms); count it
+                        // against the breaker and surface fast.
+                        let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
+                        let err = io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "short read on expert {expert_id}: got {n} bytes, expected {}",
+                                dst.len()
+                            ),
+                        );
+                        if drive_tripped {
+                            return Err(HardwareFailure::DriveUnavailable {
+                                drive_index: self.drive_index_for(expert_id),
+                                consecutive_failures: dcf,
+                            }
+                            .into());
+                        }
+                        if tripped {
+                            return Err(HardwareFailure::ExpertUnavailable {
+                                expert_id,
+                                consecutive_failures: cf,
+                            }
+                            .into());
+                        }
+                        return Err(err);
+                    }
+                    Err(e) if is_transient_io_error(&e) => {
+                        if let Some(t) = timing.as_deref_mut() {
+                            t.transient_events += 1;
+                        }
+                        tracing::warn!(
+                            expert_id,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "transient I/O error; retrying"
+                        );
+                        last_err = Some(e);
+                    }
+                    Err(e) => {
+                        // Fatal error (permission, broken pipe, etc.): no
+                        // point retrying. We still record one logical
+                        // failure per `read_at_with_retries` *call* (not
+                        // per retry within a call), so a hot fd that
+                        // keeps returning the same fatal error trips the
+                        // breaker after `STORAGE_BREAKER_THRESHOLD`
+                        // *invocations* — i.e. once the layer above has
+                        // attempted the expert that many times.
+                        let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
+                        if drive_tripped {
+                            return Err(HardwareFailure::DriveUnavailable {
+                                drive_index: self.drive_index_for(expert_id),
+                                consecutive_failures: dcf,
+                            }
+                            .into());
+                        }
+                        if tripped {
+                            return Err(HardwareFailure::ExpertUnavailable {
+                                expert_id,
+                                consecutive_failures: cf,
+                            }
+                            .into());
+                        }
+                        return Err(e);
+                    }
+                }
+                // Exponential backoff between retries. We don't sleep
+                // after the last attempt — the error is about to bubble
+                // up anyway.
+                if attempt + 1 < STORAGE_RETRY_ATTEMPTS {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(STORAGE_RETRY_MAX_BACKOFF);
+                }
+            }
+            let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
+            // `last_err` is always Some here: the only way to fall out of
+            // the loop without returning is via the transient-error branch
+            // (which sets `last_err`). The `unwrap_or_else` is a
+            // defence-in-depth fallback for an impossible state.
+            let err = last_err.unwrap_or_else(|| {
+                io::Error::other("retry loop exited without recording a transient error (bug)")
+            });
+            if drive_tripped {
+                Err(HardwareFailure::DriveUnavailable {
+                    drive_index: self.drive_index_for(expert_id),
+                    consecutive_failures: dcf,
+                }
+                .into())
+            } else if tripped {
+                Err(HardwareFailure::ExpertUnavailable {
                     expert_id,
                     consecutive_failures: cf,
                 }
-                .into());
+                .into())
+            } else {
+                Err(HardwareFailure::Transient {
+                    expert_id,
+                    attempts: STORAGE_RETRY_ATTEMPTS,
+                    last_error: err,
+                }
+                .into())
             }
-            tracing::info!(
-                expert_id,
-                "expert circuit breaker half-open — admitting one probe read"
-            );
+        })();
+        if let Some(t) = timing {
+            t.end = Some(std::time::Instant::now());
+            t.success = result.is_ok();
         }
-        let mut last_err: Option<io::Error> = None;
-        let mut backoff = STORAGE_RETRY_BACKOFF;
-        for attempt in 0..STORAGE_RETRY_ATTEMPTS {
-            match file.read_at(dst, offset) {
-                Ok(n) if n == dst.len() => {
-                    self.note_read_success(expert_id);
-                    return Ok(n);
-                }
-                Ok(n) => {
-                    // Short read — almost certainly a permanently
-                    // truncated file. Not worth retrying (the file
-                    // isn't going to grow back in 50 ms); count it
-                    // against the breaker and surface fast.
-                    let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
-                    let err = io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "short read on expert {expert_id}: got {n} bytes, expected {}",
-                            dst.len()
-                        ),
-                    );
-                    if drive_tripped {
-                        return Err(HardwareFailure::DriveUnavailable {
-                            drive_index: self.drive_index_for(expert_id),
-                            consecutive_failures: dcf,
-                        }
-                        .into());
-                    }
-                    if tripped {
-                        return Err(HardwareFailure::ExpertUnavailable {
-                            expert_id,
-                            consecutive_failures: cf,
-                        }
-                        .into());
-                    }
-                    return Err(err);
-                }
-                Err(e) if is_transient_io_error(&e) => {
-                    tracing::warn!(
-                        expert_id,
-                        attempt = attempt + 1,
-                        error = %e,
-                        "transient I/O error; retrying"
-                    );
-                    last_err = Some(e);
-                }
-                Err(e) => {
-                    // Fatal error (permission, broken pipe, etc.): no
-                    // point retrying. We still record one logical
-                    // failure per `read_at_with_retries` *call* (not
-                    // per retry within a call), so a hot fd that
-                    // keeps returning the same fatal error trips the
-                    // breaker after `STORAGE_BREAKER_THRESHOLD`
-                    // *invocations* — i.e. once the layer above has
-                    // attempted the expert that many times.
-                    let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
-                    if drive_tripped {
-                        return Err(HardwareFailure::DriveUnavailable {
-                            drive_index: self.drive_index_for(expert_id),
-                            consecutive_failures: dcf,
-                        }
-                        .into());
-                    }
-                    if tripped {
-                        return Err(HardwareFailure::ExpertUnavailable {
-                            expert_id,
-                            consecutive_failures: cf,
-                        }
-                        .into());
-                    }
-                    return Err(e);
-                }
-            }
-            // Exponential backoff between retries. We don't sleep
-            // after the last attempt — the error is about to bubble
-            // up anyway.
-            if attempt + 1 < STORAGE_RETRY_ATTEMPTS {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(STORAGE_RETRY_MAX_BACKOFF);
-            }
-        }
-        let (tripped, cf, drive_tripped, dcf) = self.note_read_failure(expert_id);
-        // `last_err` is always Some here: the only way to fall out of
-        // the loop without returning is via the transient-error branch
-        // (which sets `last_err`). The `unwrap_or_else` is a
-        // defence-in-depth fallback for an impossible state.
-        let err = last_err.unwrap_or_else(|| {
-            io::Error::other("retry loop exited without recording a transient error (bug)")
-        });
-        if drive_tripped {
-            Err(HardwareFailure::DriveUnavailable {
-                drive_index: self.drive_index_for(expert_id),
-                consecutive_failures: dcf,
-            }
-            .into())
-        } else if tripped {
-            Err(HardwareFailure::ExpertUnavailable {
-                expert_id,
-                consecutive_failures: cf,
-            }
-            .into())
-        } else {
-            Err(HardwareFailure::Transient {
-                expert_id,
-                attempts: STORAGE_RETRY_ATTEMPTS,
-                last_error: err,
-            }
-            .into())
-        }
+        result
     }
 
     /// Warm the fd cache by pre-opening expert fds, taking the `open()`
@@ -1169,46 +1196,83 @@ impl NvmeStorage {
     /// Returns the number of bytes actually read (which equals `expert_size`
     /// on success — short reads are surfaced as an `UnexpectedEof` error).
     pub async fn read_expert(&self, expert_id: u32, buf: &mut PooledBuffer) -> io::Result<usize> {
-        debug_assert_eq!(buf.len(), self.cfg.expert_size);
-        // Tier 2 packed path: source the bytes from the shared blob fd at
-        // the expert's recorded offset. The fault-tolerant retry +
-        // circuit-breaker wrapper is reused unchanged — only the (file,
-        // offset) pair differs from the per-file path.
-        if let Some(packed) = &self.packed {
-            let entry = packed.entry(expert_id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("expert {expert_id} is not present in the packed blob manifest"),
-                )
-            })?;
-            let file = packed.file().clone();
+        self.read_expert_observed(expert_id, buf, None).await
+    }
+
+    pub(crate) async fn read_expert_observed(
+        &self,
+        expert_id: u32,
+        buf: &mut PooledBuffer,
+        mut observation: Option<&mut crate::gpu_native_source_path_decomposition::RawBatch>,
+    ) -> io::Result<usize> {
+        if let Some(t) = observation.as_deref_mut() {
+            t.start = Some(std::time::Instant::now());
+        }
+        let result = async {
+            debug_assert_eq!(buf.len(), self.cfg.expert_size);
+            // Tier 2 packed path: source the bytes from the shared blob fd at
+            // the expert's recorded offset. The fault-tolerant retry +
+            // circuit-breaker wrapper is reused unchanged — only the (file,
+            // offset) pair differs from the per-file path.
+            if let Some(packed) = &self.packed {
+                let entry = packed.entry(expert_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("expert {expert_id} is not present in the packed blob manifest"),
+                    )
+                })?;
+                let file = packed.file().clone();
+                let dst_len = buf.len();
+                let n = tokio::task::block_in_place(|| {
+                    self.read_at_with_retries(
+                        &file,
+                        expert_id,
+                        entry.offset,
+                        &mut buf.as_mut_slice()[..dst_len],
+                        None,
+                    )
+                })?;
+                return Ok(n);
+            }
+            // Note: the breaker fast-fail used to live here for symmetry
+            // with `read_at_with_retries`, but that bypassed the
+            // half-open probe gate (a tripped breaker could never reach
+            // the read path that calls `note_read_success`). The
+            // short-circuit + probe-gate logic now lives only in
+            // `read_at_with_retries`, which we always go through below.
+            let file = self.fd_for(expert_id)?;
+            if let Some(t) = observation.as_deref_mut() {
+                t.fd_end = Some(std::time::Instant::now());
+            }
+            // `read_at_with_retries` already enforces `dst.len()` and surfaces
+            // short reads as transient errors that retry, so no extra
+            // length check is needed here. Each expert is stored as its
+            // own file, so the read always starts at byte 0.
             let dst_len = buf.len();
+            if let Some(t) = observation.as_deref_mut() {
+                t.scheduler_start = Some(std::time::Instant::now());
+            }
+            let read_timing = observation.as_deref_mut().map(|t| &mut t.reads[0]);
             let n = tokio::task::block_in_place(|| {
                 self.read_at_with_retries(
                     &file,
                     expert_id,
-                    entry.offset,
+                    0,
                     &mut buf.as_mut_slice()[..dst_len],
+                    read_timing,
                 )
-            })?;
-            return Ok(n);
+            });
+            if let Some(t) = observation.as_deref_mut() {
+                t.scheduler_end = Some(std::time::Instant::now());
+            }
+            let n = n?;
+            Ok(n)
         }
-        // Note: the breaker fast-fail used to live here for symmetry
-        // with `read_at_with_retries`, but that bypassed the
-        // half-open probe gate (a tripped breaker could never reach
-        // the read path that calls `note_read_success`). The
-        // short-circuit + probe-gate logic now lives only in
-        // `read_at_with_retries`, which we always go through below.
-        let file = self.fd_for(expert_id)?;
-        // `read_at_with_retries` already enforces `dst.len()` and surfaces
-        // short reads as transient errors that retry, so no extra
-        // length check is needed here. Each expert is stored as its
-        // own file, so the read always starts at byte 0.
-        let dst_len = buf.len();
-        let n = tokio::task::block_in_place(|| {
-            self.read_at_with_retries(&file, expert_id, 0, &mut buf.as_mut_slice()[..dst_len])
-        })?;
-        Ok(n)
+        .await;
+        if let Some(t) = observation {
+            t.end = Some(std::time::Instant::now());
+        }
+        result
     }
 
     /// Diagnostic-only arbitrary destination seam. Validate before resolving
@@ -1240,7 +1304,9 @@ impl NvmeStorage {
         } else {
             (self.fd_for(expert_id)?, 0)
         };
-        tokio::task::block_in_place(|| self.read_at_with_retries(&file, expert_id, offset, dst))
+        tokio::task::block_in_place(|| {
+            self.read_at_with_retries(&file, expert_id, offset, dst, None)
+        })
     }
 
     /// Inspect the actual cached per-file fd used by the standalone diagnostic.
@@ -1379,94 +1445,125 @@ impl NvmeStorage {
         &self,
         ids: &[u32],
         bufs: &mut [&mut PooledBuffer],
+        mut observation: Option<&mut crate::gpu_native_source_path_decomposition::RawBatch>,
     ) -> io::Result<usize> {
-        assert_eq!(
-            ids.len(),
-            bufs.len(),
-            "read_experts_batch: ids and bufs must have the same length"
-        );
-        if ids.is_empty() {
-            return Ok(0);
+        if let Some(t) = observation.as_deref_mut() {
+            t.start = Some(std::time::Instant::now());
         }
-        // Tier 2 packed path: coalesce physically-adjacent experts into
-        // single vectored `preadv` syscalls. Distinct ids ⇒ disjoint
-        // destination buffers, so the scatter is sound.
-        if self.packed.is_some() {
-            return self.read_experts_batch_packed(ids, bufs).await;
-        }
-        // Resolve all fds before donating the worker — `fd_for` takes a
-        // (rare) write lock the first time it sees an id, and we don't
-        // want to hold that lock across `block_in_place`.
-        let mut files: Vec<Arc<File>> = Vec::with_capacity(ids.len());
-        for &id in ids {
-            files.push(self.fd_for(id)?);
-        }
-        let expert_size = self.cfg.expert_size;
-        for buf in bufs.iter() {
-            debug_assert_eq!(buf.len(), expert_size);
-        }
+        let result = async {
+            assert_eq!(
+                ids.len(),
+                bufs.len(),
+                "read_experts_batch: ids and bufs must have the same length"
+            );
+            if ids.is_empty() {
+                return Ok(0);
+            }
+            // Tier 2 packed path: coalesce physically-adjacent experts into
+            // single vectored `preadv` syscalls. Distinct ids ⇒ disjoint
+            // destination buffers, so the scatter is sound.
+            if self.packed.is_some() {
+                return self.read_experts_batch_packed(ids, bufs).await;
+            }
+            // Resolve all fds before donating the worker — `fd_for` takes a
+            // (rare) write lock the first time it sees an id, and we don't
+            // want to hold that lock across `block_in_place`.
+            let mut files: Vec<Arc<File>> = Vec::with_capacity(ids.len());
+            for &id in ids {
+                files.push(self.fd_for(id)?);
+            }
+            if let Some(t) = observation.as_deref_mut() {
+                t.fd_end = Some(std::time::Instant::now());
+            }
+            let expert_size = self.cfg.expert_size;
+            for buf in bufs.iter() {
+                debug_assert_eq!(buf.len(), expert_size);
+            }
 
-        // Single donation: all K reads dispatched **concurrently** via
-        // scoped threads, so the NVMe actually sees queue depth K
-        // instead of an effective queue depth of 1 (sequential preads
-        // never let the device overlap commands — prefetch reads then
-        // queue behind foreground reads). Spawning K-1 short-lived
-        // threads costs tens of microseconds; a serialized NVMe read
-        // costs hundreds, so the break-even is immediate for K > 1.
-        // Each read still passes through the per-expert
-        // fault-tolerant path so a single bad drive can't wedge the
-        // whole batch — it surfaces as a `HardwareFailure` for that
-        // expert id and the engine's higher-level cache code routes
-        // around it. The first error (by slot order) is returned.
-        let id_vec: Vec<u32> = ids.to_vec();
-        let total = tokio::task::block_in_place(|| -> io::Result<usize> {
-            if id_vec.len() == 1 {
-                // Fast path: no thread spawn for the common single-miss case.
-                let buf = &mut *bufs[0];
-                return self.read_at_with_retries(
-                    &files[0],
-                    id_vec[0],
-                    0,
-                    &mut buf.as_mut_slice()[..expert_size],
-                );
+            // Single donation: all K reads dispatched **concurrently** via
+            // scoped threads, so the NVMe actually sees queue depth K
+            // instead of an effective queue depth of 1 (sequential preads
+            // never let the device overlap commands — prefetch reads then
+            // queue behind foreground reads). Spawning K-1 short-lived
+            // threads costs tens of microseconds; a serialized NVMe read
+            // costs hundreds, so the break-even is immediate for K > 1.
+            // Each read still passes through the per-expert
+            // fault-tolerant path so a single bad drive can't wedge the
+            // whole batch — it surfaces as a `HardwareFailure` for that
+            // expert id and the engine's higher-level cache code routes
+            // around it. The first error (by slot order) is returned.
+            let id_vec: Vec<u32> = ids.to_vec();
+            if let Some(t) = observation.as_deref_mut() {
+                t.scheduler_start = Some(std::time::Instant::now());
             }
-            let results: Vec<io::Result<usize>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = files
-                    .iter()
-                    .zip(bufs.iter_mut())
-                    .zip(id_vec.iter())
-                    .map(|((file, buf), &id)| {
-                        let buf: &mut PooledBuffer = &mut *buf;
-                        scope.spawn(move || {
-                            debug_assert_eq!(buf.len(), expert_size);
-                            self.read_at_with_retries(
-                                file,
-                                id,
-                                0,
-                                &mut buf.as_mut_slice()[..expert_size],
-                            )
+            let slots = observation.as_deref_mut().map(|t| t.reads.as_mut_slice());
+            let mut timings = slots
+                .into_iter()
+                .flatten()
+                .map(Some)
+                .chain(std::iter::repeat_with(|| None));
+            let scheduled = tokio::task::block_in_place(|| -> io::Result<usize> {
+                if id_vec.len() == 1 {
+                    let read_timing = timings.next().flatten();
+                    // Fast path: no thread spawn for the common single-miss case.
+                    let buf = &mut *bufs[0];
+                    return self.read_at_with_retries(
+                        &files[0],
+                        id_vec[0],
+                        0,
+                        &mut buf.as_mut_slice()[..expert_size],
+                        read_timing,
+                    );
+                }
+                let results: Vec<io::Result<usize>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = files
+                        .iter()
+                        .zip(bufs.iter_mut())
+                        .zip(id_vec.iter())
+                        .map(|((file, buf), &id)| {
+                            let read_timing = timings.next().flatten();
+                            let buf: &mut PooledBuffer = &mut *buf;
+                            scope.spawn(move || {
+                                debug_assert_eq!(buf.len(), expert_size);
+                                self.read_at_with_retries(
+                                    file,
+                                    id,
+                                    0,
+                                    &mut buf.as_mut_slice()[..expert_size],
+                                    read_timing,
+                                )
+                            })
                         })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .zip(id_vec.iter())
-                    .map(|(h, &id)| {
-                        h.join().unwrap_or_else(|_| {
-                            Err(io::Error::other(format!(
-                                "read_experts_batch worker panicked reading expert {id}"
-                            )))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .zip(id_vec.iter())
+                        .map(|(h, &id)| {
+                            h.join().unwrap_or_else(|_| {
+                                Err(io::Error::other(format!(
+                                    "read_experts_batch worker panicked reading expert {id}"
+                                )))
+                            })
                         })
-                    })
-                    .collect()
+                        .collect()
+                });
+                let mut total = 0usize;
+                for r in results {
+                    total += r?;
+                }
+                Ok(total)
             });
-            let mut total = 0usize;
-            for r in results {
-                total += r?;
+            if let Some(t) = observation.as_deref_mut() {
+                t.scheduler_end = Some(std::time::Instant::now());
             }
+            let total = scheduled?;
             Ok(total)
-        })?;
-        Ok(total)
+        }
+        .await;
+        if let Some(t) = observation {
+            t.end = Some(std::time::Instant::now());
+        }
+        result
     }
 
     /// Source/upload external destinations with the production per-file scheduler:
@@ -1477,66 +1574,103 @@ impl NvmeStorage {
         &self,
         ids: &[u32],
         destinations: &mut [&mut [u8]],
+        mut observation: Option<&mut crate::gpu_native_source_path_decomposition::RawBatch>,
     ) -> io::Result<usize> {
-        if self.is_packed()
-            || ids.len() != destinations.len()
-            || self.cfg.expert_size != 2_658_304
-            || self.cfg.block_align != 4096
-            || destinations.iter().any(|dst| {
-                dst.len() != self.cfg.expert_size
-                    || dst.len() % self.cfg.block_align != 0
-                    || dst.as_ptr() as usize % self.cfg.block_align != 0
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "source/upload requires unpacked full-file 4096-aligned external destinations",
-            ));
+        if let Some(t) = observation.as_deref_mut() {
+            t.start = Some(std::time::Instant::now());
         }
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let mut files: Vec<Arc<File>> = Vec::with_capacity(ids.len());
-        for &id in ids {
-            files.push(self.fd_for(id)?);
-        }
-        // Prove the exact resolved Arc once; retain resolution and error order.
-        for (&id, file) in ids.iter().zip(&files) {
-            self.prove_source_upload_fd(id, file)?;
-        }
-        let id_vec: Vec<u32> = ids.to_vec();
-        tokio::task::block_in_place(|| -> io::Result<usize> {
-            if id_vec.len() == 1 {
-                return self.read_at_with_retries(&files[0], id_vec[0], 0, destinations[0]);
+        let result = async {
+            if self.is_packed()
+                || ids.len() != destinations.len()
+                || self.cfg.expert_size != 2_658_304
+                || self.cfg.block_align != 4096
+                || destinations.iter().any(|dst| {
+                    dst.len() != self.cfg.expert_size
+                        || dst.len() % self.cfg.block_align != 0
+                        || dst.as_ptr() as usize % self.cfg.block_align != 0
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "source/upload requires unpacked full-file 4096-aligned external destinations",
+                ));
             }
-            let results: Vec<io::Result<usize>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = files
-                    .iter()
-                    .zip(destinations.iter_mut())
-                    .zip(id_vec.iter())
-                    .map(|((file, dst), &id)| {
-                        let dst: &mut [u8] = dst;
-                        scope.spawn(move || self.read_at_with_retries(file, id, 0, dst))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .zip(id_vec.iter())
-                    .map(|(h, &id)| {
-                        h.join().unwrap_or_else(|_| {
-                            Err(io::Error::other(format!(
-                                "read_experts_batch worker panicked reading expert {id}"
-                            )))
+            if ids.is_empty() {
+                return Ok(0);
+            }
+            let mut files: Vec<Arc<File>> = Vec::with_capacity(ids.len());
+            for &id in ids {
+                files.push(self.fd_for(id)?);
+            }
+            // Prove the exact resolved Arc once; retain resolution and error order.
+            for (&id, file) in ids.iter().zip(&files) {
+                self.prove_source_upload_fd(id, file)?;
+            }
+            if let Some(t) = observation.as_deref_mut() {
+                t.fd_end = Some(std::time::Instant::now());
+            }
+            let id_vec: Vec<u32> = ids.to_vec();
+            if let Some(t) = observation.as_deref_mut() {
+                t.scheduler_start = Some(std::time::Instant::now());
+            }
+            let slots = observation.as_deref_mut().map(|t| t.reads.as_mut_slice());
+            let mut timings = slots
+                .into_iter()
+                .flatten()
+                .map(Some)
+                .chain(std::iter::repeat_with(|| None));
+            let scheduled = tokio::task::block_in_place(|| -> io::Result<usize> {
+                if id_vec.len() == 1 {
+                    let read_timing = timings.next().flatten();
+                    return self.read_at_with_retries(
+                        &files[0],
+                        id_vec[0],
+                        0,
+                        destinations[0],
+                        read_timing,
+                    );
+                }
+                let results: Vec<io::Result<usize>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = files
+                        .iter()
+                        .zip(destinations.iter_mut())
+                        .zip(id_vec.iter())
+                        .map(|((file, dst), &id)| {
+                            let read_timing = timings.next().flatten();
+                            let dst: &mut [u8] = dst;
+                            scope.spawn(move || {
+                                self.read_at_with_retries(file, id, 0, dst, read_timing)
+                            })
                         })
-                    })
-                    .collect()
+                        .collect();
+                    handles
+                        .into_iter()
+                        .zip(id_vec.iter())
+                        .map(|(h, &id)| {
+                            h.join().unwrap_or_else(|_| {
+                                Err(io::Error::other(format!(
+                                    "read_experts_batch worker panicked reading expert {id}"
+                                )))
+                            })
+                        })
+                        .collect()
+                });
+                let mut total = 0usize;
+                for result in results {
+                    total += result?;
+                }
+                Ok(total)
             });
-            let mut total = 0usize;
-            for result in results {
-                total += result?;
+            if let Some(t) = observation.as_deref_mut() {
+                t.scheduler_end = Some(std::time::Instant::now());
             }
-            Ok(total)
-        })
+            scheduled
+        }
+        .await;
+        if let Some(t) = observation {
+            t.end = Some(std::time::Instant::now());
+        }
+        result
     }
 
     /// **Tier 2.** Packed-blob sibling of [`Self::read_experts_batch`].
@@ -1627,7 +1761,7 @@ impl NvmeStorage {
                 // bytes for the duration of this call.
                 let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
                 let off = self.packed_offset(id);
-                total += self.read_at_with_retries(file, id, off, slice)?;
+                total += self.read_at_with_retries(file, id, off, slice, None)?;
             }
             return Ok(total);
         }
@@ -1689,7 +1823,7 @@ impl NvmeStorage {
             // SAFETY: see the singleton branch above.
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
             let off = self.packed_offset(id);
-            total += self.read_at_with_retries(file, id, off, slice)?;
+            total += self.read_at_with_retries(file, id, off, slice, None)?;
         }
         Ok(total)
     }
@@ -2734,7 +2868,7 @@ mod tests {
         let ids: Vec<u32> = (0..num_experts).collect();
         let mut buf_refs: Vec<&mut crate::buffer_pool::PooledBuffer> = bufs.iter_mut().collect();
         let total = storage
-            .read_experts_batch(&ids, &mut buf_refs)
+            .read_experts_batch(&ids, &mut buf_refs, None)
             .await
             .unwrap();
         assert_eq!(total, expert_size * num_experts as usize);
@@ -2823,7 +2957,7 @@ mod tests {
         }
         let mut buf_refs: Vec<&mut crate::buffer_pool::PooledBuffer> = bufs.iter_mut().collect();
         let total = packed
-            .read_experts_batch(&ids, &mut buf_refs)
+            .read_experts_batch(&ids, &mut buf_refs, None)
             .await
             .unwrap();
         assert_eq!(total, expert_size * ids.len());
@@ -3577,13 +3711,13 @@ mod source_to_upload_tests {
         for (offset, len) in [(0, 2_658_303), (1, 2_658_304), (0, 2_654_208)] {
             let mut destinations = vec![&mut buffer.as_mut_slice()[offset..offset + len]];
             let error = storage
-                .read_experts_batch_into_aligned_slices(&[999], &mut destinations)
+                .read_experts_batch_into_aligned_slices(&[999], &mut destinations, None)
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
         let error = storage
-            .read_experts_batch_into_aligned_slices(&[1], &mut [])
+            .read_experts_batch_into_aligned_slices(&[1], &mut [], None)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -3787,11 +3921,13 @@ mod source_to_upload_tests {
         let mut a = pool.try_acquire().unwrap();
         let mut b = pool.try_acquire().unwrap();
         assert_eq!(
-            s.read_experts_batch(&[17], &mut [&mut a]).await.unwrap(),
+            s.read_experts_batch(&[17], &mut [&mut a], None)
+                .await
+                .unwrap(),
             4096
         );
         assert_eq!(
-            s.read_experts_batch(&[18, 17], &mut [&mut a, &mut b])
+            s.read_experts_batch(&[18, 17], &mut [&mut a, &mut b], None)
                 .await
                 .unwrap(),
             8192
@@ -3873,9 +4009,13 @@ mod source_to_upload_tests {
         let mut destination = AlignedBuffer::new(full, 4096);
         for _ in 0..2 {
             assert_eq!(
-                s.read_experts_batch_into_aligned_slices(&[17], &mut [destination.as_mut_slice()])
-                    .await
-                    .unwrap(),
+                s.read_experts_batch_into_aligned_slices(
+                    &[17],
+                    &mut [destination.as_mut_slice()],
+                    None
+                )
+                .await
+                .unwrap(),
                 full
             );
             assert!(destination.as_slice().iter().all(|v| *v == 17));
@@ -3883,13 +4023,217 @@ mod source_to_upload_tests {
         proof_counts(&s, 2, 1, 1, 0);
         std::fs::write(path.join("expert_18.bin"), vec![0; full + 4096]).unwrap();
         assert_eq!(
-            s.read_experts_batch_into_aligned_slices(&[18], &mut [destination.as_mut_slice()])
-                .await
-                .unwrap_err()
-                .kind(),
+            s.read_experts_batch_into_aligned_slices(
+                &[18],
+                &mut [destination.as_mut_slice()],
+                None
+            )
+            .await
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidInput
         );
         proof_counts(&s, 3, 1, 2, 1);
         std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hma1d_io_tests {
+    use super::*;
+    use crate::buffer_pool::BufferPool;
+    use crate::gpu_native_source_path_decomposition::{RawBatch, WIDTH};
+
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "mer-hma1d-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn storage(&self, full: usize) -> NvmeStorage {
+            NvmeStorage::new(StorageConfig {
+                base_path: self.0.clone(),
+                expert_size: full,
+                block_align: 4096,
+                use_direct_io: false,
+                num_experts_per_layer: None,
+            })
+            .unwrap()
+        }
+        fn file(&self, id: u32, full: usize) {
+            std::fs::write(
+                self.0.join(format!("expert_{id}.bin")),
+                vec![id as u8; full],
+            )
+            .unwrap();
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hma1d_actual_control_single_and_batch_disabled_equivalence() {
+        let fixture = Fixture::new();
+        let full = 4096;
+        for id in 0..WIDTH as u32 {
+            fixture.file(id, full);
+        }
+        let storage = fixture.storage(full);
+        let pool = BufferPool::new(WIDTH, full, 4096);
+        let ids: Vec<u32> = (0..WIDTH as u32).rev().collect();
+        let mut buffers: Vec<_> = (0..WIDTH).map(|_| pool.try_acquire().unwrap()).collect();
+        for enabled in [false, true] {
+            let mut raw = RawBatch::default();
+            let mut refs = buffers.iter_mut().collect::<Vec<_>>();
+            assert_eq!(
+                storage
+                    .read_experts_batch(&ids, &mut refs, enabled.then_some(&mut raw))
+                    .await
+                    .unwrap(),
+                full * WIDTH
+            );
+            for (id, buf) in ids.iter().zip(&buffers) {
+                assert!(buf.as_slice().iter().all(|v| *v == *id as u8));
+            }
+            if enabled {
+                let (t, reads) = raw.reconstruct(WIDTH).unwrap();
+                assert_eq!(
+                    t.helper_total_ns,
+                    t.fd_resolve_proof_ns
+                        + t.read_critical_span_ns
+                        + t.scheduler_shell_ns
+                        + t.residual_helper_ns
+                );
+                assert!(reads.iter().all(|r| r.success
+                    && r.retry_attempt_count == 0
+                    && r.attempt_wall_ns[0].is_some()));
+                assert!(
+                    t.read_critical_span_ns
+                        >= reads.iter().map(|r| r.wrapper_wall_ns).max().unwrap()
+                );
+            } else {
+                assert!(raw.start.is_none());
+            }
+            assert_eq!(
+                storage.source_upload_fd_proof_snapshot(),
+                SourceUploadFdProofSnapshot::default()
+            );
+        }
+        let mut raw = RawBatch::default();
+        assert_eq!(
+            storage
+                .read_expert_observed(3, &mut buffers[0], Some(&mut raw))
+                .await
+                .unwrap(),
+            full
+        );
+        let (t, reads) = raw.reconstruct(1).unwrap();
+        assert_eq!(t.read_critical_span_ns, reads[0].wrapper_wall_ns);
+        assert_eq!(storage.read_expert(3, &mut buffers[0]).await.unwrap(), full);
+        assert!(buffers[0].as_slice().iter().all(|v| *v == 3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hma1d_actual_treatment_workers_portable_preproved_fixture() {
+        // Buffered fixture ONLY: seed the existing proof cache via its test
+        // seam. This exercises safe timing borrows, not Linux/O_DIRECT or GPU
+        // authority; real production proof and opening code are unchanged.
+        let fixture = Fixture::new();
+        let full = 2_658_304;
+        for id in 0..WIDTH as u32 {
+            fixture.file(id, full);
+        }
+        let storage = fixture.storage(full);
+        let files: Vec<_> = (0..WIDTH as u32)
+            .map(|id| storage.fd_for(id).unwrap())
+            .collect();
+        for (id, file) in files.iter().enumerate() {
+            storage
+                .prove_source_upload_fd_with(id as u32, file, |f| {
+                    validate_source_upload_fd(full as u64, || Ok(true), || Ok(f.metadata()?.len()))
+                })
+                .unwrap();
+        }
+        let pool = BufferPool::new(WIDTH, full, 4096);
+        let mut buffers: Vec<_> = (0..WIDTH).map(|_| pool.try_acquire().unwrap()).collect();
+        for width in [1, 2, WIDTH] {
+            let ids: Vec<_> = (0..width as u32).rev().collect();
+            for enabled in [false, true] {
+                storage.reset_source_upload_fd_proof_telemetry();
+                let mut raw = RawBatch::default();
+                let mut destinations: Vec<_> = buffers[..width]
+                    .iter_mut()
+                    .map(|b| b.as_mut_slice())
+                    .collect();
+                let caller_start = std::time::Instant::now();
+                assert_eq!(
+                    storage
+                        .read_experts_batch_into_aligned_slices(
+                            &ids,
+                            &mut destinations,
+                            enabled.then_some(&mut raw)
+                        )
+                        .await
+                        .unwrap(),
+                    width * full
+                );
+                let caller_ns = caller_start.elapsed().as_nanos();
+                for (id, dst) in ids.iter().zip(&destinations) {
+                    assert!(dst.iter().all(|v| *v == *id as u8));
+                }
+                let proof = storage.source_upload_fd_proof_snapshot();
+                assert_eq!(proof.source_upload_fd_proof_requests, width as u64);
+                assert_eq!(proof.source_upload_fd_proof_hits, width as u64);
+                assert_eq!(proof.source_upload_fd_proof_misses, 0);
+                assert_eq!(proof.source_upload_fd_proof_failures, 0);
+                if enabled {
+                    let (t, reads) = raw.reconstruct(width).unwrap();
+                    assert!(u128::from(t.helper_total_ns) <= caller_ns);
+                    assert!(reads[..width]
+                        .iter()
+                        .all(|r| r.success && r.retry_attempt_count == 0));
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hma1d_error_order_and_failed_wrapper_capture_preserve_retry_semantics() {
+        let fixture = Fixture::new();
+        fixture.file(4, 4095);
+        fixture.file(2, 4094);
+        let pool = BufferPool::new(2, 4096, 4096);
+        let mut a = pool.try_acquire().unwrap();
+        let mut b = pool.try_acquire().unwrap();
+        let mut messages = Vec::new();
+        for enabled in [false, true] {
+            let storage = fixture.storage(4096);
+            let mut raw = RawBatch::default();
+            let err = storage
+                .read_experts_batch(&[4, 2], &mut [&mut a, &mut b], enabled.then_some(&mut raw))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            messages.push(err.to_string());
+            if enabled {
+                let (_, reads) = raw.reconstruct(2).unwrap();
+                assert!(reads[..2].iter().all(|r| !r.success
+                    && r.retry_attempt_count == 0
+                    && r.attempt_wall_ns[0].is_some()));
+            }
+        }
+        assert_eq!(messages[0], messages[1]);
+        assert!(messages[0].contains("expert 4"));
     }
 }

@@ -1119,10 +1119,13 @@ mod tests {
     #[test]
     fn q4_route_parallel_source_residency_and_configuration_remain_frozen() {
         use sha2::Digest;
+        // HMA-1D adds qualification-only source observations to these two
+        // files. Retain the whole-file guard at the reviewed instrumented
+        // source; residency/configuration and the Q4 mechanism stay frozen.
         for (source, expected) in [
             (
                 include_str!("engine.rs"),
-                "dd51bbad5d85a06950a1d8c82d7e43aff3d0231c128dcd7e09e0addff8134d8c",
+                "e748e3902b441ec1b83b1f6b8b6619e51b3bafddc8d38ffc5abdd20031dae04d",
             ),
             (
                 include_str!("gpu_native_residency.rs"),
@@ -1134,7 +1137,7 @@ mod tests {
             ),
             (
                 include_str!("gpu_native_physical_install_staging.rs"),
-                "6f65b3704f5e64a8dc22a696251b9a0d284a7780fd57c42996e807998249cc52",
+                "28b4bdda34cf23caff4c6f8ecba8eeb66dbbb408803e28243b8fed216cc29612",
             ),
         ] {
             assert_eq!(

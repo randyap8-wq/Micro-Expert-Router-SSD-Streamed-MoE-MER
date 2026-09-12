@@ -5073,6 +5073,27 @@ impl Engine {
         Ok(())
     }
 
+    /// Only the opt-in HMA-1D runner calls this at the idle arm boundary.
+    pub(crate) fn enable_source_decomposition(
+        &self,
+        capacity: usize,
+    ) -> Result<Arc<crate::gpu_native_source_path_decomposition::Observer>, String> {
+        let state = self
+            .gpu_native_demand_source_qualification()
+            .ok_or("missing source qualification")?;
+        let upload = state
+            .source_upload
+            .as_ref()
+            .ok_or("missing source/upload qualification")?;
+        let observer =
+            crate::gpu_native_source_path_decomposition::Observer::new(upload.arm, capacity);
+        upload
+            .source_decomposition
+            .set(observer.clone())
+            .map_err(|_| "source decomposition already enabled")?;
+        Ok(observer)
+    }
+
     pub(crate) fn gpu_native_source_upload_snapshot(
         &self,
     ) -> Option<crate::gpu_native_source_upload::Snapshot> {
@@ -6457,23 +6478,22 @@ impl Engine {
                 .await;
         }
 
-        let reservation_outcome =
-            match self.core.cache.try_reserve_exact_demand(&unresolved) {
-                Ok(reservation) => reservation,
-                Err(_) => {
-                    telemetry
-                        .fallback_reservation
-                        .fetch_add(1, Ordering::Relaxed);
-                    drop(leadership);
-                    return self
-                        .gpu_native_sequential_source_physical_missing_set(
-                            global_ids,
-                            residents,
-                            source_upload.clone(),
-                        )
-                        .await;
-                }
-            };
+        let reservation_outcome = match self.core.cache.try_reserve_exact_demand(&unresolved) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                telemetry
+                    .fallback_reservation
+                    .fetch_add(1, Ordering::Relaxed);
+                drop(leadership);
+                return self
+                    .gpu_native_sequential_source_physical_missing_set(
+                        global_ids,
+                        residents,
+                        source_upload.clone(),
+                    )
+                    .await;
+            }
+        };
         let reserved_slots = reservation_outcome.reservation.remaining();
         telemetry
             .cache_slots_reserved
@@ -6564,10 +6584,30 @@ impl Engine {
             }
         } else {
             let mut refs = buffers.iter_mut().collect::<Vec<_>>();
-            self.core
+            let observer = upload.as_ref().and_then(|u| u.source_decomposition.get());
+            let mut observation =
+                observer.map(|_| crate::gpu_native_source_path_decomposition::RawBatch::default());
+            let started = observer.map(|_| Instant::now());
+            let result = self
+                .core
                 .storage
-                .read_experts_batch(&unresolved, &mut refs)
-                .await
+                .read_experts_batch(&unresolved, &mut refs, observation.as_mut())
+                .await;
+            let ended = observer.map(|_| Instant::now());
+            if let (Some(observer), Some(raw), Some(started), Some(ended)) =
+                (observer, observation.as_ref(), started, ended)
+            {
+                observer.commit(
+                    &unresolved,
+                    crate::gpu_native_source_path_decomposition::Helper::ControlBatchScopedFileExt,
+                    raw,
+                    started,
+                    ended,
+                    &result,
+                    None,
+                );
+            }
+            result
         };
         drop(_foreground);
         let batch_wall_us = qualification_elapsed_us(batch_started);
@@ -7125,10 +7165,8 @@ impl Engine {
         let production_fusion_eligible = upload.as_ref().is_some_and(|state| {
             state.arm == SourceUploadArm::Treatment
                 && (!state.is_production_owned()
-                    || state.can_fuse_source_set(
-                        &[id],
-                        self.execution_context().gpu_expert_cache(),
-                    ))
+                    || state
+                        .can_fuse_source_set(&[id], self.execution_context().gpu_expert_cache()))
         });
         if upload.as_ref().is_some_and(|state| {
             state.arm == SourceUploadArm::Treatment
@@ -7160,10 +7198,35 @@ impl Engine {
                 Err(error) => Err(std::io::Error::other(error)),
             }
         } else {
-            self.core
-                .storage
-                .read_expert(id, ordinary_buffer.as_mut().expect("production buffer"))
-                .await
+            if let Some(observer) = upload.as_ref().and_then(|u| u.source_decomposition.get()) {
+                let mut raw = crate::gpu_native_source_path_decomposition::RawBatch::default();
+                let started = Instant::now();
+                let result = self
+                    .core
+                    .storage
+                    .read_expert_observed(
+                        id,
+                        ordinary_buffer.as_mut().expect("production buffer"),
+                        Some(&mut raw),
+                    )
+                    .await;
+                let ended = Instant::now();
+                observer.commit(
+                    &[id],
+                    crate::gpu_native_source_path_decomposition::Helper::ControlSingleFileExt,
+                    &raw,
+                    started,
+                    ended,
+                    &result,
+                    None,
+                );
+                result
+            } else {
+                self.core
+                    .storage
+                    .read_expert(id, ordinary_buffer.as_mut().expect("production buffer"))
+                    .await
+            }
         };
         match read_result {
             Ok(_) => {
@@ -7202,18 +7265,14 @@ impl Engine {
                 });
                 match self.core.cache.insert(resident.clone()) {
                     Ok(Some(evicted)) => {
-                        if let Some(qualification) =
-                            self.gpu_native_demand_source_qualification()
-                        {
+                        if let Some(qualification) = self.gpu_native_demand_source_qualification() {
                             qualification.record_cache_insert(id);
                             qualification.record_cache_eviction(evicted.id);
                         }
                         debug!(expert = id, "inserted (with eviction)")
                     }
                     Ok(None) => {
-                        if let Some(qualification) =
-                            self.gpu_native_demand_source_qualification()
-                        {
+                        if let Some(qualification) = self.gpu_native_demand_source_qualification() {
                             qualification.record_cache_insert(id);
                         }
                         debug!(expert = id, "inserted")
@@ -13662,6 +13721,73 @@ mod tests {
             upload.snapshot().ordered_nvme_ids_sha256,
             expected.snapshot().ordered_nvme_ids_sha256
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hma1d_diagnostic_disabled_engine_source_scheduler_cache_and_work_equivalence() {
+        let mut evidence = Vec::new();
+        for enabled in [false, true] {
+            let dir = TempDir::new(if enabled {
+                "hma1d-observed"
+            } else {
+                "hma1d-disabled"
+            });
+            let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 124);
+            let upload = SourceUploadState::cpu_test_state(SourceUploadArm::Control);
+            let observer = crate::gpu_native_source_path_decomposition::Observer::new(
+                SourceUploadArm::Control,
+                8,
+            );
+            if enabled {
+                assert!(upload.source_decomposition.set(observer.clone()).is_ok());
+                observer.begin_request(
+                    crate::gpu_native_source_path_decomposition::Phase::Warmup,
+                    0,
+                );
+            }
+            *engine.gpu_native_demand_source_qualification.write() = Some(Arc::new(
+                GpuNativeDemandSourceQualification::new_source_upload(
+                    upload.clone(),
+                    engine.core.pool.capacity(),
+                    0,
+                ),
+            ));
+            let mut residents = HashMap::new();
+            for ids in [&[2, 0][..], &[2, 0][..], &[3][..]] {
+                engine
+                    .gpu_native_source_physical_missing_set(
+                        ids,
+                        &mut residents,
+                        Some(upload.clone()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            evidence.push((
+                serde_json::to_value(engine.production_demand_source_snapshot()).unwrap(),
+                upload.snapshot().ordered_nvme_ids_sha256,
+                engine.report().bytes_read,
+                engine.core.storage.source_upload_fd_proof_snapshot(),
+            ));
+            assert_eq!(
+                engine.report().bytes_read,
+                3 * engine.core.storage.config().expert_size as u64
+            );
+            let recorded = observer.snapshot();
+            if enabled {
+                assert_eq!(recorded.records.len(), 2); // repeated resident set causes no source replay
+                assert_eq!(recorded.records[0].source_set_width, 2);
+                assert_eq!(&recorded.records[0].ordered_expert_ids[..2], &[2, 0]);
+                assert_eq!(
+                    recorded.records[1].helper,
+                    crate::gpu_native_source_path_decomposition::Helper::ControlSingleFileExt
+                );
+                assert_eq!(recorded.records[1].ordered_expert_ids[0], 3);
+                assert!(recorded.records.iter().all(|r| r.timing_error.is_none()));
+            } else {
+                assert!(recorded.records.is_empty());
+            }
+        }
+        assert_eq!(evidence[0], evidence[1]);
     }
 }
 // end mod engine::tests

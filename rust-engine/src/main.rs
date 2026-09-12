@@ -155,6 +155,7 @@ pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
+pub(crate) mod gpu_native_source_path_decomposition;
 pub(crate) mod gpu_native_source_to_upload_copy_elision;
 pub(crate) mod gpu_native_source_upload;
 pub(crate) mod gpu_native_spanish_first_token_attribution;
@@ -1043,6 +1044,29 @@ enum Cmd {
         config: PathBuf,
         #[arg(long)]
         expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// HMA-1D: observe the unchanged single-pass production-v2 qualifier.
+    #[command(name = "qualify-gpu-native-source-path-decomposition-production")]
+    QualifyGpuNativeSourcePathDecompositionProduction {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// Offline HMA-1D authority audit from an immutable report and the complete
+    /// external stdout/stderr transcript, after the source process has exited.
+    #[command(name = "audit-gpu-native-source-path-decomposition-production")]
+    AuditGpuNativeSourcePathDecompositionProduction {
+        #[arg(long)]
+        report_in: PathBuf,
+        #[arg(long)]
+        completed_run_log: PathBuf,
         #[arg(long)]
         report_out: PathBuf,
     },
@@ -2047,6 +2071,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalZeroFillProduction { config, .. }
         | Cmd::QualifyGpuNativeSourceToUploadCopyElisionProduction { config, .. }
+        | Cmd::QualifyGpuNativeSourcePathDecompositionProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2641,6 +2666,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
+        Cmd::QualifyGpuNativeSourcePathDecompositionProduction {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_physical_install_staging::source_to_upload_production::run_decomposition_command(
+                crate::gpu_native_physical_install_staging::CommandArgs { config, expected_adapter_name, report_out, progress_watchdog }))
+        }
+        Cmd::AuditGpuNativeSourcePathDecompositionProduction {
+            report_in,
+            completed_run_log,
+            report_out,
+        } => crate::gpu_native_source_path_decomposition::audit_command(
+            &report_in,
+            &completed_run_log,
+            &report_out,
+        ),
         Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
             config,
             expected_adapter_name,

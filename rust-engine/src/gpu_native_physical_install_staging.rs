@@ -861,6 +861,7 @@ enum PhysicalInstallQualificationRun {
 }
 
 struct PhysicalInstallArmRun {
+    source_decomposition: Option<crate::gpu_native_source_path_decomposition::StoreSnapshot>,
     common: ArmReport,
     warmup_upload: Option<crate::gpu_native_source_upload::Snapshot>,
     upload: Option<crate::gpu_native_source_upload::Snapshot>,
@@ -989,6 +990,34 @@ async fn run_physical_install_arm_inner(
         PhysicalInstallQualificationRun::ZeroFillProduction(_) => zero_fill_production::MODE,
         PhysicalInstallQualificationRun::SourceToUpload(_) => source_to_upload_production::MODE,
     });
+    let decomposition_capacity =
+        if diagnostic_mode == Some(crate::gpu_native_source_path_decomposition::MODE) {
+            if !matches!(run, PhysicalInstallQualificationRun::SourceToUpload(_)) {
+                return Err(BenchmarkFailure::new(
+                    "startup",
+                    "invalid-decomposition-arm",
+                    "HMA-1D requires production-v2 source/upload arms",
+                ));
+            }
+            Some(
+                prepared
+                    .prompt_ids
+                    .len()
+                    .checked_add(FROZEN_OUTPUT_TOKENS)
+                    .and_then(|n| n.checked_mul(48))
+                    .and_then(|n| n.checked_mul(crate::gpu_native_source_path_decomposition::WIDTH))
+                    .and_then(|n| n.checked_mul(FROZEN_WARMUP_RUNS + FROZEN_MEASURED_RUNS))
+                    .ok_or_else(|| {
+                        BenchmarkFailure::new(
+                            "startup",
+                            "decomposition-capacity-overflow",
+                            "frozen workload source bound overflow",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
     let mut benchmark = benchmark_report(prepared);
     let runtime = crate::gpu_native_real_benchmark::construct_runtime(
         &prepared.spec,
@@ -1007,9 +1036,16 @@ async fn run_physical_install_arm_inner(
             .enable_gpu_native_physical_install_staging_qualification(arm),
         PhysicalInstallQualificationRun::Concurrency(arm)
         | PhysicalInstallQualificationRun::ZeroFillProduction(arm) => runtime
-        .engine
+            .engine
             .enable_gpu_native_physical_install_concurrency_qualification(arm),
     };
+    let mut source_observer = None;
+    let enable_result = enable_result.and_then(|()| {
+        if let Some(capacity) = decomposition_capacity {
+            source_observer = Some(runtime.engine.enable_source_decomposition(capacity)?);
+        }
+        Ok(())
+    });
     if let Err(error) = enable_result {
         let failure = BenchmarkFailure::new("startup", "qualification-arm-enable-failed", error);
         let _ = crate::gpu_native_real_benchmark::shutdown_runtime(
@@ -1055,6 +1091,12 @@ async fn run_physical_install_arm_inner(
     };
     if execution_failure.is_none() {
         for index in 0..FROZEN_WARMUP_RUNS {
+            if let Some(observer) = &source_observer {
+                observer.begin_request(
+                    crate::gpu_native_source_path_decomposition::Phase::Warmup,
+                    index,
+                );
+            }
             let result = crate::with_progress_timeout(
                 format!("{mode_name} {arm_name} warmup {index}"),
                 args.progress_watchdog,
@@ -1066,6 +1108,14 @@ async fn run_physical_install_arm_inner(
                 ),
             )
             .await;
+            if let Some(observer) = &source_observer {
+                observer.finish_request(
+                    runtime
+                        .engine
+                        .gpu_native_source_upload_snapshot()
+                        .map(|s| s.ordered_nvme_ids_sha256),
+                );
+            }
             match result {
                 Ok(run) => {
                     warmup_results.push(WarmupEvidence {
@@ -1098,9 +1148,9 @@ async fn run_physical_install_arm_inner(
     if execution_failure.is_none() {
         match run {
             PhysicalInstallQualificationRun::Staging(_) => {
-        warmup_source = runtime
-            .engine
-            .gpu_native_physical_install_staging_qualification_snapshot();
+                warmup_source = runtime
+                    .engine
+                    .gpu_native_physical_install_staging_qualification_snapshot();
             }
             PhysicalInstallQualificationRun::Concurrency(_)
             | PhysicalInstallQualificationRun::ZeroFillProduction(_)
@@ -1176,6 +1226,12 @@ async fn run_physical_install_arm_inner(
 
     if execution_failure.is_none() {
         for index in 0..FROZEN_MEASURED_RUNS {
+            if let Some(observer) = &source_observer {
+                observer.begin_request(
+                    crate::gpu_native_source_path_decomposition::Phase::Measured,
+                    index,
+                );
+            }
             let result = crate::with_progress_timeout(
                 format!("{mode_name} {arm_name} measured {index}"),
                 args.progress_watchdog,
@@ -1187,6 +1243,14 @@ async fn run_physical_install_arm_inner(
                 ),
             )
             .await;
+            if let Some(observer) = &source_observer {
+                observer.finish_request(
+                    runtime
+                        .engine
+                        .gpu_native_source_upload_snapshot()
+                        .map(|s| s.ordered_nvme_ids_sha256),
+                );
+            }
             match result {
                 Ok(run) => benchmark.per_run_results.push(run),
                 Err(error) => {
@@ -1204,7 +1268,7 @@ async fn run_physical_install_arm_inner(
     let (source, concurrency) = match run {
         PhysicalInstallQualificationRun::Staging(_) => (
             runtime
-        .engine
+                .engine
                 .gpu_native_physical_install_staging_qualification_snapshot(),
             None,
         ),
@@ -1265,24 +1329,25 @@ async fn run_physical_install_arm_inner(
         benchmark.fail(failure.clone());
     }
     Ok(PhysicalInstallArmRun {
+        source_decomposition: source_observer.map(|observer| observer.snapshot()),
         warmup_upload,
         upload,
         common: ArmReport {
-        arm,
-        complete: execution_failure.is_none(),
-        failure: execution_failure,
-        isolated_runtime: true,
-        warmup_results,
-        warmup_source,
-        warmup_production_physical_install,
-        warmup_production,
-        warmup_ram_cache_state_sha256,
-        warmup_work,
-        source,
-        production_physical_install,
-        production,
-        work,
-        benchmark,
+            arm,
+            complete: execution_failure.is_none(),
+            failure: execution_failure,
+            isolated_runtime: true,
+            warmup_results,
+            warmup_source,
+            warmup_production_physical_install,
+            warmup_production,
+            warmup_ram_cache_state_sha256,
+            warmup_work,
+            source,
+            production_physical_install,
+            production,
+            work,
+            benchmark,
         },
         warmup_concurrency,
         concurrency,

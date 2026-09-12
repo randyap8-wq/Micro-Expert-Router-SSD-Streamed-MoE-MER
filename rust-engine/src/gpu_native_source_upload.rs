@@ -20,7 +20,7 @@ pub(crate) const ALIGN: usize = 4096;
 pub(crate) const CAPACITY: usize = 16;
 pub(crate) const UPLOAD_BYTES: usize = FULL + ALIGN;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum GpuNativeSourceToUploadCopyElisionQualificationArm {
     Control,
@@ -149,6 +149,8 @@ pub(crate) struct State {
     production_demand_gate: Arc<Semaphore>,
     ring: Option<Ring>,
     pub(crate) metrics: Mutex<Metrics>,
+    pub(crate) source_decomposition:
+        std::sync::OnceLock<Arc<crate::gpu_native_source_path_decomposition::Observer>>,
     pending: Mutex<HashMap<u32, Lease>>,
     nvme_ids: Mutex<Sha256>,
     logical_ids: Mutex<Sha256>,
@@ -220,6 +222,7 @@ impl State {
             production_demand_gate: Arc::new(Semaphore::new(1)),
             ring,
             metrics: Mutex::new(Metrics::default()),
+            source_decomposition: std::sync::OnceLock::new(),
             pending: Mutex::new(HashMap::new()),
             nvme_ids: Mutex::new(Sha256::new()),
             logical_ids: Mutex::new(Sha256::new()),
@@ -245,6 +248,7 @@ impl State {
             production_demand_gate: Arc::new(Semaphore::new(1)),
             ring: None,
             metrics: Mutex::new(Metrics::default()),
+            source_decomposition: std::sync::OnceLock::new(),
             pending: Mutex::new(HashMap::new()),
             nvme_ids: Mutex::new(Sha256::new()),
             logical_ids: Mutex::new(Sha256::new()),
@@ -370,13 +374,15 @@ impl State {
         let mut metrics = self.metrics.lock();
         metrics.high_water = metrics.high_water.max(active);
         drop(metrics);
-        let lease = Lease {
+        let mut lease = Lease {
             state: self.clone(),
             index,
             id,
             offset: 0,
             payload: None,
             consumed: false,
+            observed_remap: false,
+            observed_map_wait_us: 0,
         };
         let slot = &ring.slots[index];
         let remap = *slot.ever_mapped.lock();
@@ -420,6 +426,10 @@ impl State {
             self.add(|m| &mut m.remap_completions, 1);
         }
         *slot.ever_mapped.lock() = true;
+        // Existing acquire facts, outside every source-helper timer; no counter,
+        // fd probe, or device operation is added to obtain them.
+        lease.observed_remap = remap;
+        lease.observed_map_wait_us = wait_us;
         Ok(lease)
     }
     pub(crate) async fn read_source(
@@ -468,11 +478,42 @@ impl State {
             .zip(&offsets)
             .map(|(v, &o)| &mut v[o..o + FULL])
             .collect::<Vec<_>>();
+        let observer = self.source_decomposition.get();
+        let treatment_pre_helper = observer.map(|_| {
+            let mut state = crate::gpu_native_source_path_decomposition::TreatmentState {
+                active_slots: self.active_leases(),
+                source_set_width: ids.len(),
+                mapped_leases_complete: true,
+                ..Default::default()
+            };
+            for (i, lease) in leases
+                .iter()
+                .enumerate()
+                .take(crate::gpu_native_source_path_decomposition::WIDTH)
+            {
+                state.slot_indices[i] = Some(lease.index);
+                state.first_map[i] = Some(!lease.observed_remap);
+                state.map_wait_us += lease.observed_map_wait_us;
+                if lease.observed_remap {
+                    state.remap_wait_us += lease.observed_map_wait_us;
+                }
+            }
+            state
+        });
+        let mut observation =
+            observer.map(|_| crate::gpu_native_source_path_decomposition::RawBatch::default());
         let started = Instant::now();
         let result = storage
-            .read_experts_batch_into_aligned_slices(ids, &mut destinations)
+            .read_experts_batch_into_aligned_slices(ids, &mut destinations, observation.as_mut())
             .await;
+        let caller_end = observer.map(|_| Instant::now());
         self.add(|m| &mut m.fused_source_us, elapsed(started));
+        if let (Some(observer), Some(raw), Some(ended)) =
+            (observer, observation.as_ref(), caller_end)
+        {
+            observer.commit(ids, crate::gpu_native_source_path_decomposition::Helper::TreatmentAlignedBatchScopedFileExt,
+                raw, started, ended, &result, treatment_pre_helper);
+        }
         drop(destinations);
         let bytes = result.map_err(|e| {
             self.add(|m| &mut m.source_failures, 1);
@@ -593,6 +634,8 @@ pub(crate) struct Lease {
     offset: usize,
     payload: Option<Arc<[u8]>>,
     consumed: bool,
+    observed_remap: bool,
+    observed_map_wait_us: u64,
 }
 
 /// One encoder for the physical install set. Concurrent stage jobs append
