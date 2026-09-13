@@ -155,6 +155,7 @@ pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
+pub(crate) mod gpu_native_source_order_straggler_production;
 pub(crate) mod gpu_native_source_to_upload_copy_elision;
 pub(crate) mod gpu_native_source_upload;
 pub(crate) mod gpu_native_spanish_first_token_attribution;
@@ -1043,6 +1044,29 @@ enum Cmd {
         config: PathBuf,
         #[arg(long)]
         expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// HMA-1E: reversed Treatment then Control production source straggler qualifier.
+    #[command(name = "qualify-gpu-native-source-order-straggler-production")]
+    QualifyGpuNativeSourceOrderStragglerProduction {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// Offline HMA-1E authority audit from an immutable report and the complete
+    /// external stdout/stderr transcript, after the source process has exited.
+    #[command(name = "audit-gpu-native-source-order-straggler-production")]
+    AuditGpuNativeSourceOrderStragglerProduction {
+        #[arg(long)]
+        report_in: PathBuf,
+        #[arg(long)]
+        completed_run_log: PathBuf,
         #[arg(long)]
         report_out: PathBuf,
     },
@@ -2047,6 +2071,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalZeroFillProduction { config, .. }
         | Cmd::QualifyGpuNativeSourceToUploadCopyElisionProduction { config, .. }
+        | Cmd::QualifyGpuNativeSourceOrderStragglerProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2641,6 +2666,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
+        Cmd::QualifyGpuNativeSourceOrderStragglerProduction {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_physical_install_staging::source_to_upload_production::run_order_straggler_command(
+                crate::gpu_native_physical_install_staging::CommandArgs { config, expected_adapter_name, report_out, progress_watchdog }))
+        }
+        Cmd::AuditGpuNativeSourceOrderStragglerProduction {
+            report_in,
+            completed_run_log,
+            report_out,
+        } => crate::gpu_native_source_order_straggler_production::audit_command(
+            &report_in,
+            &completed_run_log,
+            &report_out,
+        ),
         Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
             config,
             expected_adapter_name,

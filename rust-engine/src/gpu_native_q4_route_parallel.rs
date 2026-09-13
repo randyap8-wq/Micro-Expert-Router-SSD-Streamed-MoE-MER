@@ -1122,7 +1122,7 @@ mod tests {
         for (source, expected) in [
             (
                 include_str!("engine.rs"),
-                "dd51bbad5d85a06950a1d8c82d7e43aff3d0231c128dcd7e09e0addff8134d8c",
+                "c7af75fc6bb93dcc79bf586ef7fa4dfdc148e6c868bcb0c972ec65b947c5d951",
             ),
             (
                 include_str!("gpu_native_residency.rs"),
@@ -1134,7 +1134,7 @@ mod tests {
             ),
             (
                 include_str!("gpu_native_physical_install_staging.rs"),
-                "6f65b3704f5e64a8dc22a696251b9a0d284a7780fd57c42996e807998249cc52",
+                "aa05b07efa30b283de1671f594c39489542168ede288d1eb432a0ae5d809974e",
             ),
         ] {
             assert_eq!(

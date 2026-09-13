@@ -85,7 +85,7 @@ pub(crate) struct WarmupEvidence {
     generated_text_sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct ArmWorkEvidence {
     token_loop: GpuNativeTokenLoopSnapshot,
     recovery: GpuNativeRecoverySnapshot,
@@ -118,7 +118,7 @@ pub(crate) struct ArmReport {
     benchmark: BenchmarkReport,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct Reconciliation {
     generated_tokens_exact: bool,
     generated_token_hashes_exact: bool,
@@ -215,7 +215,7 @@ pub(crate) struct MetricComparison {
     delta_percent: f64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct ProductionReconciliation {
     common: Reconciliation,
     warmup_production_cache_reservation_leaks_zero: bool,
@@ -861,6 +861,8 @@ enum PhysicalInstallQualificationRun {
 }
 
 struct PhysicalInstallArmRun {
+    source_order_observer:
+        Option<crate::gpu_native_source_order_straggler_production::StoreSnapshot>,
     common: ArmReport,
     warmup_upload: Option<crate::gpu_native_source_upload::Snapshot>,
     upload: Option<crate::gpu_native_source_upload::Snapshot>,
@@ -989,6 +991,36 @@ async fn run_physical_install_arm_inner(
         PhysicalInstallQualificationRun::ZeroFillProduction(_) => zero_fill_production::MODE,
         PhysicalInstallQualificationRun::SourceToUpload(_) => source_to_upload_production::MODE,
     });
+    let order_straggler_capacity =
+        if diagnostic_mode == Some(crate::gpu_native_source_order_straggler_production::MODE) {
+            if !matches!(run, PhysicalInstallQualificationRun::SourceToUpload(_)) {
+                return Err(BenchmarkFailure::new(
+                    "startup",
+                    "invalid-order_straggler-arm",
+                    "HMA-1E requires production-v2 source/upload arms",
+                ));
+            }
+            Some(
+                prepared
+                    .prompt_ids
+                    .len()
+                    .checked_add(FROZEN_OUTPUT_TOKENS)
+                    .and_then(|n| n.checked_mul(48))
+                    .and_then(|n| {
+                        n.checked_mul(crate::gpu_native_source_order_straggler_production::WIDTH)
+                    })
+                    .and_then(|n| n.checked_mul(FROZEN_WARMUP_RUNS + FROZEN_MEASURED_RUNS))
+                    .ok_or_else(|| {
+                        BenchmarkFailure::new(
+                            "startup",
+                            "order_straggler-capacity-overflow",
+                            "frozen workload source bound overflow",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
     let mut benchmark = benchmark_report(prepared);
     let runtime = crate::gpu_native_real_benchmark::construct_runtime(
         &prepared.spec,
@@ -1010,6 +1042,13 @@ async fn run_physical_install_arm_inner(
         .engine
             .enable_gpu_native_physical_install_concurrency_qualification(arm),
     };
+    let mut source_observer = None;
+    let enable_result = enable_result.and_then(|()| {
+        if let Some(capacity) = order_straggler_capacity {
+            source_observer = Some(runtime.engine.enable_source_order_observer(capacity)?);
+        }
+        Ok(())
+    });
     if let Err(error) = enable_result {
         let failure = BenchmarkFailure::new("startup", "qualification-arm-enable-failed", error);
         let _ = crate::gpu_native_real_benchmark::shutdown_runtime(
@@ -1055,6 +1094,12 @@ async fn run_physical_install_arm_inner(
     };
     if execution_failure.is_none() {
         for index in 0..FROZEN_WARMUP_RUNS {
+            if let Some(observer) = &source_observer {
+                observer.begin_request(
+                    crate::gpu_native_source_order_straggler_production::Phase::Warmup,
+                    index,
+                );
+            }
             let result = crate::with_progress_timeout(
                 format!("{mode_name} {arm_name} warmup {index}"),
                 args.progress_watchdog,
@@ -1066,6 +1111,14 @@ async fn run_physical_install_arm_inner(
                 ),
             )
             .await;
+            if let Some(observer) = &source_observer {
+                observer.finish_request(
+                    runtime
+                        .engine
+                        .gpu_native_source_upload_snapshot()
+                        .map(|s| s.ordered_nvme_ids_sha256),
+                );
+            }
             match result {
                 Ok(run) => {
                     warmup_results.push(WarmupEvidence {
@@ -1176,6 +1229,12 @@ async fn run_physical_install_arm_inner(
 
     if execution_failure.is_none() {
         for index in 0..FROZEN_MEASURED_RUNS {
+            if let Some(observer) = &source_observer {
+                observer.begin_request(
+                    crate::gpu_native_source_order_straggler_production::Phase::Measured,
+                    index,
+                );
+            }
             let result = crate::with_progress_timeout(
                 format!("{mode_name} {arm_name} measured {index}"),
                 args.progress_watchdog,
@@ -1187,6 +1246,14 @@ async fn run_physical_install_arm_inner(
                 ),
             )
             .await;
+            if let Some(observer) = &source_observer {
+                observer.finish_request(
+                    runtime
+                        .engine
+                        .gpu_native_source_upload_snapshot()
+                        .map(|s| s.ordered_nvme_ids_sha256),
+                );
+            }
             match result {
                 Ok(run) => benchmark.per_run_results.push(run),
                 Err(error) => {
@@ -1265,6 +1332,7 @@ async fn run_physical_install_arm_inner(
         benchmark.fail(failure.clone());
     }
     Ok(PhysicalInstallArmRun {
+        source_order_observer: source_observer.map(|observer| observer.snapshot()),
         warmup_upload,
         upload,
         common: ArmReport {

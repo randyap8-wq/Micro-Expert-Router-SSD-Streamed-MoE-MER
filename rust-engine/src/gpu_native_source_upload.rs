@@ -20,7 +20,7 @@ pub(crate) const ALIGN: usize = 4096;
 pub(crate) const CAPACITY: usize = 16;
 pub(crate) const UPLOAD_BYTES: usize = FULL + ALIGN;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum GpuNativeSourceToUploadCopyElisionQualificationArm {
     Control,
@@ -28,7 +28,7 @@ pub(crate) enum GpuNativeSourceToUploadCopyElisionQualificationArm {
 }
 pub(crate) use GpuNativeSourceToUploadCopyElisionQualificationArm as Arm;
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct Metrics {
     pub(crate) acquisition_attempts: u64,
     pub(crate) acquisition_waits: u64,
@@ -91,7 +91,7 @@ impl Metrics {
         }
     }
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct Snapshot {
     /// Additive diagnostic, sampled from storage at the idle engine boundary.
     pub(crate) source_upload_fd_proof: Option<crate::io_provider::SourceUploadFdProofSnapshot>,
@@ -149,6 +149,8 @@ pub(crate) struct State {
     production_demand_gate: Arc<Semaphore>,
     ring: Option<Ring>,
     pub(crate) metrics: Mutex<Metrics>,
+    pub(crate) source_order_observer:
+        std::sync::OnceLock<Arc<crate::gpu_native_source_order_straggler_production::Observer>>,
     pending: Mutex<HashMap<u32, Lease>>,
     nvme_ids: Mutex<Sha256>,
     logical_ids: Mutex<Sha256>,
@@ -220,6 +222,7 @@ impl State {
             production_demand_gate: Arc::new(Semaphore::new(1)),
             ring,
             metrics: Mutex::new(Metrics::default()),
+            source_order_observer: std::sync::OnceLock::new(),
             pending: Mutex::new(HashMap::new()),
             nvme_ids: Mutex::new(Sha256::new()),
             logical_ids: Mutex::new(Sha256::new()),
@@ -245,6 +248,7 @@ impl State {
             production_demand_gate: Arc::new(Semaphore::new(1)),
             ring: None,
             metrics: Mutex::new(Metrics::default()),
+            source_order_observer: std::sync::OnceLock::new(),
             pending: Mutex::new(HashMap::new()),
             nvme_ids: Mutex::new(Sha256::new()),
             logical_ids: Mutex::new(Sha256::new()),
@@ -468,11 +472,21 @@ impl State {
             .zip(&offsets)
             .map(|(v, &o)| &mut v[o..o + FULL])
             .collect::<Vec<_>>();
+        let observer = self.source_order_observer.get();
+        let mut observation = observer
+            .map(|_| crate::gpu_native_source_order_straggler_production::RawBatch::default());
         let started = Instant::now();
         let result = storage
-            .read_experts_batch_into_aligned_slices(ids, &mut destinations)
+            .read_experts_batch_into_aligned_slices(ids, &mut destinations, observation.as_mut())
             .await;
+        let caller_end = observer.map(|_| Instant::now());
         self.add(|m| &mut m.fused_source_us, elapsed(started));
+        if let (Some(observer), Some(raw), Some(ended)) =
+            (observer, observation.as_ref(), caller_end)
+        {
+            observer.commit(ids, crate::gpu_native_source_order_straggler_production::Helper::TreatmentAlignedBatchScopedFileExt,
+                raw, started, ended, &result);
+        }
         drop(destinations);
         let bytes = result.map_err(|e| {
             self.add(|m| &mut m.source_failures, 1);

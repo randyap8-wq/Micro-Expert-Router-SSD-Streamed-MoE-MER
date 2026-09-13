@@ -10,7 +10,7 @@ const SLOT_STRIDE_BYTES: u64 = 2_654_212;
 const EPOCH_BYTES: u64 = 4;
 use crate::gpu_native_source_upload::{Arm, Snapshot as UploadSnapshot, CAPACITY, FULL, PAYLOAD};
 
-const fn qualification_arms() -> (Arm, Arm) {
+pub(crate) const fn qualification_arms() -> (Arm, Arm) {
     (Arm::Control, Arm::Treatment)
 }
 
@@ -370,6 +370,9 @@ struct Performance {
 
 #[derive(Clone, Debug, Serialize)]
 struct Report {
+    #[serde(skip)]
+    order_straggler:
+        Option<Vec<crate::gpu_native_source_order_straggler_production::StoreSnapshot>>,
     schema: &'static str,
     mode: &'static str,
     control: Option<UploadArmReport>,
@@ -434,6 +437,38 @@ fn qualification_pass(reconciliation_pass: bool, gates: &Gates) -> bool {
 }
 
 pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_command_inner(args, false).await
+}
+
+pub(crate) async fn run_order_straggler_command(
+    args: CommandArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.expected_adapter_name != "NVIDIA L4" {
+        return Err("HMA-1E requires the frozen NVIDIA L4 adapter".into());
+    }
+    crate::gpu_native_source_order_straggler_production::begin_transcript();
+    run_command_inner(args, true).await
+}
+
+fn emit_run_report(
+    report: &Report,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(stores) = &report.order_straggler {
+        let envelope = crate::gpu_native_source_order_straggler_production::Envelope::new(
+            serde_json::to_value(report)?,
+            stores.clone(),
+        );
+        envelope.emit(output)
+    } else {
+        emit_report(report, output)
+    }
+}
+
+async fn run_command_inner(
+    args: CommandArgs,
+    order_straggler: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let prepared = prepare(&args)?;
     let mut timing_definitions = concurrency_timing_definitions();
     timing_definitions.common.physical_install_total_us = "both arms: sum of each post-reservation physical stage plus ordered commit service; excludes reservation time";
@@ -441,6 +476,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     timing_definitions.common.mapping_publication_us =
         "both arms: ordered logical mapping Queue::write_buffer time after staging; treatment additionally submits the fused copy set before publication";
     let mut report = Report {
+        order_straggler: order_straggler.then(Vec::new),
         schema: SCHEMA,
         mode: MODE,
         control: None,
@@ -470,21 +506,32 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         failure: None,
     };
     let (control_arm, treatment_arm) = qualification_arms();
-    for arm in [control_arm, treatment_arm] {
-        let result = run_physical_install_arm(
+    let execution_order = if order_straggler {
+        crate::gpu_native_source_order_straggler_production::qualification_arms()
+    } else {
+        [control_arm, treatment_arm]
+    };
+    for arm in execution_order {
+        let result = run_physical_install_arm_inner(
             &prepared,
             &args,
             PhysicalInstallQualificationRun::SourceToUpload(arm),
+            order_straggler.then_some(crate::gpu_native_source_order_straggler_production::MODE),
         )
         .await;
         let run = match result {
             Ok(run) => run,
             Err(failure) => {
                 report.failure = Some(failure.clone());
-                emit_report(&report, &args.report_out)?;
+                emit_run_report(&report, &args.report_out)?;
                 return Err(failure.to_string().into());
             }
         };
+        if let (Some(stores), Some(observation)) =
+            (&mut report.order_straggler, run.source_order_observer)
+        {
+            stores.push(observation);
+        }
         let failure = run.common.failure.clone();
         let arm_report = UploadArmReport {
             run: ConcurrencyArmReport {
@@ -526,7 +573,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             })
         }) {
             report.failure = Some(failure.clone());
-            emit_report(&report, &args.report_out)?;
+            emit_run_report(&report, &args.report_out)?;
             return Err(failure.to_string().into());
         }
     }
@@ -692,7 +739,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         Err(failure) => {
             report.qualification_pass = false;
             report.failure = Some(failure.clone());
-            emit_report(&report, &args.report_out)?;
+            emit_run_report(&report, &args.report_out)?;
             return Err(failure.to_string().into());
         }
     }
@@ -701,7 +748,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         report.failure.is_some(),
         report.qualification_pass,
     );
-    emit_report(&report, &args.report_out)?;
+    emit_run_report(&report, &args.report_out)?;
     if report.qualification_pass {
         Ok(())
     } else {
@@ -1163,4 +1210,507 @@ mod tests {
         assert_eq!(workload.cache_reset, "keep");
         assert_eq!(workload.sampling, "greedy");
     }
+    pub(super) fn order_straggler_fixture(mut p: serde_json::Value) -> serde_json::Value {
+        use serde_json::{json, Value};
+        let mut reconciliation = serde_json::to_value(Reconciliation::default()).unwrap();
+        for v in reconciliation.as_object_mut().unwrap().values_mut() {
+            *v = Value::Bool(true);
+        }
+        let reconciliation = ProductionReconciliation {
+            common: serde_json::from_value(reconciliation).unwrap(),
+            warmup_production_cache_reservation_leaks_zero: true,
+            warmup_production_batch_commit_violations_zero: true,
+            warmup_stale_singleflight_entries_zero: true,
+            production_cache_reservation_leaks_zero: true,
+            production_batch_commit_violations_zero: true,
+            stale_singleflight_entries_zero: true,
+            all_invariants_pass: true,
+        };
+        let (behavioral, work_equivalence) = common_gates(&reconciliation.common);
+        p["reconciliation"] = serde_json::to_value(reconciliation).unwrap();
+        p["gates"]["behavioral"] = serde_json::to_value(behavioral).unwrap();
+        p["gates"]["work_equivalence"] = serde_json::to_value(work_equivalence).unwrap();
+        for key in [
+            "warmup_and_measured_work_exact",
+            "token_ids_text_and_routes_exact",
+            "stale_generation_and_install_errors_zero",
+            "physical_installs_reconcile_with_residency",
+            "source_bytes_and_logical_admissions_reconcile",
+            "passed",
+        ] {
+            p["gates"][key] = json!(true);
+        }
+        p["mode"] = json!(MODE);
+        p["failure"] = Value::Null;
+        p["frozen_workload"] = serde_json::to_value(frozen_workload("NVIDIA L4".into())).unwrap();
+        for (key, b) in [
+            ("both_arms_same_reservation_and_commit", true),
+            ("source_scheduler_changed", false),
+            ("staging_byte_count_changed", false),
+            ("queue_ordering_changed", true),
+            (
+                "no_zero_requires_complete_coverage_before_first_write",
+                true,
+            ),
+        ] {
+            p[key] = json!(b);
+        }
+        for (key, n) in [
+            ("payload_offset_bytes", EPOCH_BYTES),
+            ("logical_expert_bytes", LOGICAL_EXPERT_BYTES),
+            ("slot_stride_bytes", SLOT_STRIDE_BYTES),
+            ("tail_padding_bytes", 0),
+        ] {
+            p[key] = json!(n);
+        }
+        p["provenance"] = json!({"build":{"dirty":false,"git_sha":"a".repeat(40)},"executable_sha256":"b".repeat(64),"artifacts":{"config":{"sha256":FROZEN_CONFIG_SHA256}}});
+        let mut all_uploads = Vec::new();
+        for prefix in ["warmup_", ""] {
+            let uk = format!("{prefix}upload");
+            let pk = format!("{prefix}production");
+            let wk = format!("{prefix}work");
+            let mk = if prefix.is_empty() {
+                "mechanism"
+            } else {
+                "warmup_mechanism"
+            };
+            let mut arms = Vec::new();
+            for (arm, key) in [(Arm::Control, "control"), (Arm::Treatment, "treatment")] {
+                let n = p[key][mk]["source_nvme_reads"].as_u64().unwrap();
+                assert_eq!(n % 2, 0);
+                let factor = n / 2;
+                let (s, pi, u) = fixture(arm);
+                let scale = |value: Value| -> Value {
+                    let mut value = value;
+                    for (k, v) in value.as_object_mut().unwrap() {
+                        if [
+                            "ring_capacity",
+                            "high_water",
+                            "install_set_width_min",
+                            "install_set_width_max",
+                            "rayon_num_threads",
+                            "max_in_flight_physical_staging",
+                            "primary_pool_capacity",
+                            "shadow_pool_capacity",
+                        ]
+                        .contains(&k.as_str())
+                        {
+                            continue;
+                        }
+                        if let Some(n) = v.as_u64() {
+                            *v = json!(n * factor);
+                        }
+                    }
+                    value
+                };
+                let mut s = scale(serde_json::to_value(s).unwrap());
+                let pi: GpuNativeProductionPhysicalInstallSnapshot =
+                    serde_json::from_value(scale(serde_json::to_value(pi).unwrap())).unwrap();
+                let mut u = scale(serde_json::to_value(u).unwrap());
+                u["ordered_nvme_ids_sha256"] = p[key][&uk]["ordered_nvme_ids_sha256"].clone();
+                u["fused_source_us"] = if arm == Arm::Treatment {
+                    p[key][&uk]["fused_source_us"].clone()
+                } else {
+                    json!(0)
+                };
+                u["source_upload_fd_proof"] = serde_json::to_value(if arm == Arm::Control {
+                    crate::io_provider::SourceUploadFdProofSnapshot::default()
+                } else {
+                    crate::io_provider::SourceUploadFdProofSnapshot {
+                        source_upload_fd_proof_requests: n,
+                        source_upload_fd_proof_hits: if prefix.is_empty() { n } else { 0 },
+                        source_upload_fd_proof_misses: if prefix.is_empty() { 0 } else { n },
+                        source_upload_fd_proof_failures: 0,
+                    }
+                })
+                .unwrap();
+                let u: UploadSnapshot = serde_json::from_value(u).unwrap();
+                s["source_nvme_reads"] = json!(n);
+                s["source_nvme_bytes"] = json!(n * FULL as u64);
+                let s: Snapshot = serde_json::from_value(s).unwrap();
+                p[key][format!("{prefix}source")] =
+                    serde_json::to_value(concurrency_common_snapshot(&s)).unwrap();
+                let mut source = serde_json::to_value(source_fixture()).unwrap();
+                for (k, v) in p[key][&pk].as_object().unwrap() {
+                    source[k] = v.clone();
+                }
+                let source: ProductionDemandSourceSnapshot =
+                    serde_json::from_value(source).unwrap();
+                let mut work = ArmWorkEvidence {
+                    token_loop: Default::default(),
+                    recovery: Default::default(),
+                    routed_execution: Default::default(),
+                    engine_storage: Default::default(),
+                    gpu_expert_io: Default::default(),
+                    gpu_expert_memory_before: Default::default(),
+                    gpu_expert_memory_after: Default::default(),
+                    gpu_native_residency: Default::default(),
+                };
+                work.gpu_native_residency.ram_to_vram_installs = s.physical_install_completions;
+                work.gpu_native_residency
+                    .logical_admissions_for_physical_misses = u.metrics.logical_admissions;
+                work.engine_storage.nvme_bytes_read = n * FULL as u64;
+                work.engine_storage.nvme_read_operations =
+                    n - source.production_batch_experts + source.production_batch_successes;
+                p[key][&wk] = serde_json::to_value(work).unwrap();
+                p[key][mk] = serde_json::to_value(&s).unwrap();
+                p[key][&uk] = serde_json::to_value(&u).unwrap();
+                p[key][&pk] = serde_json::to_value(&source).unwrap();
+                p[key][format!("{prefix}production_physical_install")] =
+                    serde_json::to_value(&pi).unwrap();
+                arms.push((s, pi, u, source));
+            }
+            let (c, cp, cu, cs) = &arms[0];
+            let (t, tp, tu, ts) = &arms[1];
+            let gate = pair_mechanism_gate(c, t, cp, tp, cu, tu, cs, ts);
+            assert!(gate.passed, "{gate:?}");
+            p["gates"][mk] = serde_json::to_value(gate).unwrap();
+            all_uploads.push((cu.clone(), tu.clone()));
+        }
+        p["gates"]["source_upload_fd_proof"] = serde_json::to_value(source_upload_fd_proof_gate(
+            &all_uploads[0].0,
+            &all_uploads[0].1,
+            &all_uploads[1].0,
+            &all_uploads[1].1,
+        ))
+        .unwrap();
+        for key in ["control", "treatment"] {
+            p[key]["complete"] = json!(true);
+            p[key]["isolated_runtime"] = json!(true);
+            p[key]["failure"] = Value::Null;
+            p[key]["warmup_ram_cache_state_sha256"] = json!("e".repeat(64));
+            p[key]["warmup_results"] = json!([{"run_index":0,"generated_tokens":128,"generated_token_ids_sha256":"f".repeat(64),"generated_text_sha256":"c".repeat(64)}]);
+            let provenance = p["provenance"].clone();
+            let b = &mut p[key]["benchmark"];
+            b["provenance"] = provenance;
+            b["benchmark_complete"] = json!(true);
+            b["failure"] = Value::Null;
+            b["warmup_runs"] = json!(1);
+            b["warmup_runs_completed"] = json!(1);
+            b["measured_runs"] = json!(3);
+            b["cache_reset"] = json!("keep");
+            b["request"] = json!({"greedy":true,"requested_output_tokens":128});
+            b["hardware"] = json!({"name":"NVIDIA L4","vendor_id":0x10de,"device_type":"DiscreteGpu","wgpu_backend":"vulkan","compute_plane":"wgpu-vulkan","software_adapter":false});
+            b["runtime_shutdowns"] = json!([{"phase":key,"evidence":{"controlled_shutdown_requested":true,"all_runtime_resources_released":true}}]);
+            for field in [
+                "runtime_contract",
+                "model_load",
+                "model_identity",
+                "production_configuration",
+                "production_semantics",
+            ] {
+                b[field] = json!({});
+            }
+            for (field, value) in crate::gpu_native_real_benchmark::hma1e_test_runtime()
+                .as_object()
+                .unwrap()
+            {
+                b[field] = value.clone();
+            }
+            for run in b["per_run_results"].as_array_mut().unwrap() {
+                let ids = vec![17u32; 128];
+                run["generated_tokens"] = json!(128);
+                run["generated_token_ids_sha256"] =
+                    json!(crate::greedy_parity::token_ids_sha256(&ids));
+                run["generated_token_ids"] = json!(ids);
+                run["generated_text_sha256"] = json!("c".repeat(64));
+            }
+        }
+        p
+    }
+}
+
+/// Offline validation of HMA-1E's embedded production-v2 evidence. Reuse the
+/// production pair/work/fd gates on typed snapshots, including all counter
+/// fields; serialized PASS flags cannot override a failed reconstruction.
+pub(crate) fn validate_recorded_authority(
+    p: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use serde_json::Value;
+    fn require(ok: bool, message: &'static str) -> Result<(), Box<dyn std::error::Error>> {
+        if ok {
+            Ok(())
+        } else {
+            Err(message.into())
+        }
+    }
+    fn all_true(v: &Value) -> bool {
+        match v {
+            Value::Bool(b) => *b,
+            Value::Object(m) => !m.is_empty() && m.values().all(all_true),
+            _ => false,
+        }
+    }
+    fn hash(v: &Value) -> bool {
+        v.as_str()
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+    }
+    require(
+        p["schema"] == SCHEMA
+            && p["mode"] == MODE
+            && p["qualification_pass"] == true
+            && p["benchmark_complete"] == true
+            && p.get("failure") == Some(&Value::Null),
+        "production-v2 incomplete/schema/mode/failure",
+    )?;
+    require(
+        p["frozen_workload"] == serde_json::to_value(frozen_workload("NVIDIA L4".into()))?,
+        "frozen workload mismatch",
+    )?;
+    for (key, expected) in [
+        ("both_arms_same_reservation_and_commit", true),
+        ("source_scheduler_changed", false),
+        ("staging_byte_count_changed", false),
+        ("queue_ordering_changed", true),
+        (
+            "no_zero_requires_complete_coverage_before_first_write",
+            true,
+        ),
+    ] {
+        require(p[key] == expected, "production semantics mismatch")?;
+    }
+    for (key, expected) in [
+        ("payload_offset_bytes", EPOCH_BYTES),
+        ("logical_expert_bytes", LOGICAL_EXPERT_BYTES),
+        ("slot_stride_bytes", SLOT_STRIDE_BYTES),
+        ("tail_padding_bytes", 0),
+    ] {
+        require(p[key] == expected, "production geometry mismatch")?;
+    }
+    // Deserialize the complete reconciliation shape; missing fields fail closed.
+    let reconciliation: ProductionReconciliation =
+        serde_json::from_value(p["reconciliation"].clone())?;
+    require(
+        all_true(&serde_json::to_value(&reconciliation)?),
+        "production behavioral/work reconciliation failed",
+    )?;
+    let (behavioral, work_equivalence) = common_gates(&reconciliation.common);
+    require(
+        p["gates"]["behavioral"] == serde_json::to_value(behavioral)?
+            && p["gates"]["work_equivalence"] == serde_json::to_value(work_equivalence)?,
+        "behavioral/work gate mismatch",
+    )?;
+    for key in [
+        "warmup_and_measured_work_exact",
+        "token_ids_text_and_routes_exact",
+        "stale_generation_and_install_errors_zero",
+        "physical_installs_reconcile_with_residency",
+        "source_bytes_and_logical_admissions_reconcile",
+        "passed",
+    ] {
+        require(p["gates"][key] == true, "production gate failed/missing")?;
+    }
+    require(
+        hash(&p["provenance"]["executable_sha256"])
+            && p["provenance"]["build"]["dirty"] == false
+            && p["provenance"]["build"]["git_sha"]
+                .as_str()
+                .is_some_and(|s| s.len() == 40),
+        "missing clean production build provenance",
+    )?;
+    require(
+        p["provenance"]["artifacts"]["config"]["sha256"] == FROZEN_CONFIG_SHA256,
+        "config artifact hash mismatch",
+    )?;
+    let mut uploads = Vec::new();
+    for warmup in [true, false] {
+        let prefix = if warmup { "warmup_" } else { "" };
+        let mechanism_key = if warmup {
+            "warmup_mechanism"
+        } else {
+            "mechanism"
+        };
+        let work_key = format!("{prefix}work");
+        let upload_key = format!("{prefix}upload");
+        let physical_key = format!("{prefix}production_physical_install");
+        let source_key = format!("{prefix}production");
+        let c: Snapshot = serde_json::from_value(p["control"][mechanism_key].clone())?;
+        let t: Snapshot = serde_json::from_value(p["treatment"][mechanism_key].clone())?;
+        let cp: GpuNativeProductionPhysicalInstallSnapshot =
+            serde_json::from_value(p["control"][&physical_key].clone())?;
+        let tp: GpuNativeProductionPhysicalInstallSnapshot =
+            serde_json::from_value(p["treatment"][&physical_key].clone())?;
+        let cu: UploadSnapshot = serde_json::from_value(p["control"][&upload_key].clone())?;
+        let tu: UploadSnapshot = serde_json::from_value(p["treatment"][&upload_key].clone())?;
+        let cs: ProductionDemandSourceSnapshot =
+            serde_json::from_value(p["control"][&source_key].clone())?;
+        let ts: ProductionDemandSourceSnapshot =
+            serde_json::from_value(p["treatment"][&source_key].clone())?;
+        let cw: ArmWorkEvidence = serde_json::from_value(p["control"][&work_key].clone())?;
+        let tw: ArmWorkEvidence = serde_json::from_value(p["treatment"][&work_key].clone())?;
+        require(
+            p["control"][format!("{prefix}source")]
+                == serde_json::to_value(concurrency_common_snapshot(&c))?
+                && p["treatment"][format!("{prefix}source")]
+                    == serde_json::to_value(concurrency_common_snapshot(&t))?,
+            "common source/mechanism snapshot mismatch",
+        )?;
+        let gate = pair_mechanism_gate(&c, &t, &cp, &tp, &cu, &tu, &cs, &ts);
+        require(
+            gate.passed && p["gates"][mechanism_key] == serde_json::to_value(&gate)?,
+            "production mechanism reconstruction failed",
+        )?;
+        require(
+            work_pair_exact(&cw, &tw)
+                && work_errors_zero(&cw)
+                && work_errors_zero(&tw)
+                && arm_all_speculative_work_zero(&cw)
+                && arm_all_speculative_work_zero(&tw),
+            "production work/recovery/speculation reconstruction failed",
+        )?;
+        // Additional common reconciliation operands (work_pair_exact deliberately
+        // leaves these to the shared production reconciliation).
+        require(
+            cw.gpu_expert_io.expert_weight_upload_bytes
+                == tw.gpu_expert_io.expert_weight_upload_bytes
+                && cw.gpu_native_residency.vram_hits == tw.gpu_native_residency.vram_hits
+                && cw.gpu_native_residency.vram_misses == tw.gpu_native_residency.vram_misses
+                && c.primary_pool_capacity == t.primary_pool_capacity,
+            "production common work mismatch",
+        )?;
+        for (work, mechanism, upload, source) in [(&cw, &c, &cu, &cs), (&tw, &t, &tu, &ts)] {
+            require(
+                work.gpu_native_residency.ram_to_vram_installs
+                    == mechanism.physical_install_completions
+                    && work
+                        .gpu_native_residency
+                        .logical_admissions_for_physical_misses
+                        == upload.metrics.logical_admissions
+                    && work.engine_storage.nvme_bytes_read == mechanism.source_nvme_bytes
+                    && mechanism
+                        .source_nvme_reads
+                        .checked_sub(source.production_batch_experts)
+                        .and_then(|n| n.checked_add(source.production_batch_successes))
+                        == Some(work.engine_storage.nvme_read_operations),
+                "production source/install/work accounting mismatch",
+            )?;
+            require(
+                source.ordinary_production_path_exercised
+                    && source.production_cache_reservation_leaks == 0
+                    && source.production_batch_commit_violations == 0
+                    && source.stale_singleflight_entries == 0
+                    && source.production_sequential_fallback_batch_read_error == 0,
+                "production scheduler failure",
+            )?;
+        }
+        uploads.push((cu, tu));
+    }
+    let proof =
+        source_upload_fd_proof_gate(&uploads[0].0, &uploads[0].1, &uploads[1].0, &uploads[1].1);
+    require(
+        proof.passed && p["gates"]["source_upload_fd_proof"] == serde_json::to_value(proof)?,
+        "fd proof reconstruction failed",
+    )?;
+    let c = &p["control"];
+    let t = &p["treatment"];
+    require(
+        hash(&c["warmup_ram_cache_state_sha256"])
+            && c["warmup_ram_cache_state_sha256"] == t["warmup_ram_cache_state_sha256"],
+        "warmup cache identity mismatch",
+    )?;
+    for key in ["control", "treatment"] {
+        let arm = &p[key];
+        let b = &arm["benchmark"];
+        require(
+            arm["complete"] == true
+                && arm.get("failure") == Some(&Value::Null)
+                && arm["isolated_runtime"] == true,
+            "arm incomplete/not isolated",
+        )?;
+        require(
+            b["benchmark_complete"] == true
+                && b.get("failure") == Some(&Value::Null)
+                && b["provenance"] == p["provenance"],
+            "benchmark/provenance incomplete",
+        )?;
+        require(
+            b["warmup_runs"] == 1
+                && b["warmup_runs_completed"] == 1
+                && b["measured_runs"] == 3
+                && b["cache_reset"] == "keep"
+                && b["request"]["greedy"] == true
+                && b["request"]["requested_output_tokens"] == 128,
+            "benchmark workload mismatch",
+        )?;
+        require(
+            b["hardware"]["name"] == "NVIDIA L4"
+                && b["hardware"]["wgpu_backend"] == "vulkan"
+                && b["hardware"]["device_type"] == "DiscreteGpu"
+                && b["hardware"]["vendor_id"] == 0x10de
+                && b["hardware"]["software_adapter"] == false
+                && b["hardware"]["compute_plane"] == "wgpu-vulkan",
+            "non-authoritative hardware identity",
+        )?;
+        crate::gpu_native_real_benchmark::audit_recorded_runtime(b)?;
+        let shutdowns = b["runtime_shutdowns"]
+            .as_array()
+            .ok_or("missing shutdown evidence")?;
+        require(
+            shutdowns.len() == 1
+                && shutdowns[0]["phase"] == key
+                && shutdowns[0]["evidence"]["controlled_shutdown_requested"] == true
+                && shutdowns[0]["evidence"]["all_runtime_resources_released"] == true,
+            "runtime shutdown incomplete",
+        )?;
+    }
+    for field in [
+        "request",
+        "production_configuration",
+        "production_semantics",
+        "model_identity",
+        "hardware",
+        "runtime_contract",
+    ] {
+        require(
+            c["benchmark"][field].is_object() && c["benchmark"][field] == t["benchmark"][field],
+            "arm runtime/config/model contract mismatch",
+        )?;
+    }
+    for (key, len) in [("warmup_results", 1), ("measured", 3)] {
+        let runs = |a: &Value| -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+            let v = if key == "measured" {
+                &a["benchmark"]["per_run_results"]
+            } else {
+                &a[key]
+            };
+            Ok(v.as_array().ok_or("missing generated runs")?.clone())
+        };
+        let cr = runs(c)?;
+        let tr = runs(t)?;
+        require(
+            cr.len() == len && tr.len() == len,
+            "generated run count mismatch",
+        )?;
+        for (i, (a, b)) in cr.iter().zip(&tr).enumerate() {
+            require(
+                a["run_index"] == i
+                    && b["run_index"] == i
+                    && a["generated_tokens"] == 128
+                    && b["generated_tokens"] == 128,
+                "generated run index/token count mismatch",
+            )?;
+            for field in ["generated_token_ids_sha256", "generated_text_sha256"] {
+                require(
+                    hash(&a[field]) && a[field] == b[field],
+                    "generated IDs/text mismatch",
+                )?;
+            }
+            if key == "measured" {
+                let ids: Vec<u32> = serde_json::from_value(a["generated_token_ids"].clone())?;
+                require(
+                    ids.len() == 128
+                        && a["generated_token_ids"] == b["generated_token_ids"]
+                        && a["generated_token_ids_sha256"]
+                            == crate::greedy_parity::token_ids_sha256(&ids),
+                    "generated token stream/hash corruption",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn hma1e_test_production(p: serde_json::Value) -> serde_json::Value {
+    tests::order_straggler_fixture(p)
 }
