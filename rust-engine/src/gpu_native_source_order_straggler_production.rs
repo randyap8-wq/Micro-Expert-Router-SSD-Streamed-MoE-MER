@@ -1,5 +1,8 @@
 //! HMA-1E qualification-only observations of the existing production stream.
 //! Timestamp capture never owns storage, a GPU, a lock, or a source scheduler.
+use crate::gpu_native_physical_install_staging::source_to_upload_production::{
+    validate_recorded_authority_with_measured_gate_key, MeasuredMechanismGateKey,
+};
 use crate::gpu_native_source_upload::Arm;
 use serde::Serialize;
 use std::time::Instant;
@@ -946,8 +949,17 @@ fn non_authoritative() -> Analysis {
     }
 }
 fn reconstruct(stores: &[StoreSnapshot], production: &serde_json::Value) -> Analysis {
+    reconstruct_with_measured_gate_key(stores, production, MeasuredMechanismGateKey::Legacy)
+}
+fn reconstruct_with_measured_gate_key(
+    stores: &[StoreSnapshot],
+    production: &serde_json::Value,
+    measured_gate_key: MeasuredMechanismGateKey,
+) -> Analysis {
     let mut result = non_authoritative();
-    if let Err(e) = crate::gpu_native_physical_install_staging::source_to_upload_production::validate_recorded_authority(production) {
+    if let Err(e) =
+        validate_recorded_authority_with_measured_gate_key(production, measured_gate_key)
+    {
         result.errors.push(e.to_string());
     }
     match validate_streams(stores, production) {
@@ -965,7 +977,6 @@ fn reconstruct(stores: &[StoreSnapshot], production: &serde_json::Value) -> Anal
     }
     result
 }
-
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Envelope {
@@ -1050,12 +1061,23 @@ struct AuditedReport {
     analysis: Analysis,
 }
 fn audit_bytes(bytes: &[u8], transcript: &[u8]) -> AuditedReport {
+    audit_bytes_with_measured_gate_key(bytes, transcript, MeasuredMechanismGateKey::Legacy)
+}
+fn audit_bytes_with_measured_gate_key(
+    bytes: &[u8],
+    transcript: &[u8],
+    measured_gate_key: MeasuredMechanismGateKey,
+) -> AuditedReport {
     let source_report_sha256 = format!("{:x}", Sha256::digest(bytes));
     let mut a = non_authoritative();
     match serde_json::from_slice::<Envelope>(bytes) {
         Err(e) => a.errors.push(format!("raw report structure: {e}")),
         Ok(raw) => {
-            a = reconstruct(&raw.observations, &raw.production_v2);
+            a = reconstruct_with_measured_gate_key(
+                &raw.observations,
+                &raw.production_v2,
+                measured_gate_key,
+            );
             if raw.schema != SCHEMA
                 || raw.mode != MODE
                 || raw.execution_order != qualification_arms()
@@ -1067,6 +1089,8 @@ fn audit_bytes(bytes: &[u8], transcript: &[u8]) -> AuditedReport {
             }
             // Validate ALL retained cached reconstruction, including strata,
             // raw NON_AUTHORITATIVE disposition, decision and pending status.
+            // Cached raw analysis ALWAYS belongs to the legacy reconstruction,
+            // including when this shared auditor reconstructs corrected authority.
             let expected = Envelope::new(raw.production_v2.clone(), raw.observations.clone());
             let expected_json: serde_json::Value = serde_json::from_slice(
                 &serde_json::to_vec(&expected.analysis).expect("analysis serialization"),
@@ -1125,7 +1149,6 @@ fn audit_bytes(bytes: &[u8], transcript: &[u8]) -> AuditedReport {
         analysis: a,
     }
 }
-
 /// Offline only: read once into bytes, hash and deserialize that exact report
 /// snapshot; scan the complete external transcript, including any trailing
 /// shutdown/errors. No runtime, model loading, config reads or GPU construction.
@@ -1149,6 +1172,221 @@ pub(crate) fn audit_command(
     file.write_all(b"\n")?;
     if report.analysis.disposition == "NON_AUTHORITATIVE" {
         return Err("HMA-1E remains NON_AUTHORITATIVE; see audited report".into());
+    }
+    Ok(())
+}
+const REPAIR_SCHEMA: &str = "mer.gpu-native-source-order-straggler-production.audit-repair.v1";
+const REPAIR_MODE: &str = "repair-audit-gpu-native-source-order-straggler-production";
+const HISTORICAL_ERROR: &str = "production mechanism reconstruction failed";
+const EVIDENCE_CHILD: &str = "66e73d921c6eb2bbe1e7ba7eebde743553078a67";
+const EVIDENCE_PARENT: &str = "cbc9f4b7e5fd34dbed6315206c0d578e848c96ee";
+const EVIDENCE_TREE: &str = "9eb50b1bacedb40b8777fff43791c3001830d9d9";
+
+struct EvidenceHashes<'a> {
+    raw: &'a str,
+    transcript: &'a str,
+    original_audit: &'a str,
+}
+const CONSUMED_FIRST: EvidenceHashes<'static> = EvidenceHashes {
+    raw: "0737f4c8258614df7e2a13fa40c5cce47dbaa7af2ab84558e0a2db9fd5894cfd",
+    transcript: "d09f527da2cc299aca5097b940811298d6269f2d19b090e0dacca6e7d49c9db0",
+    original_audit: "6c942ab83a4e907c2be1a3726a0c4807d7a7ec8b9b83635fd80e8f06d5e80ebf",
+};
+
+#[derive(Serialize)]
+struct ArtifactIdentity {
+    sha256: String,
+    bytes: usize,
+}
+impl ArtifactIdentity {
+    fn of(bytes: &[u8]) -> Self {
+        Self {
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            bytes: bytes.len(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RepairReport {
+    schema: &'static str,
+    mode: &'static str,
+    evidence_child_sha: &'static str,
+    evidence_parent_sha: &'static str,
+    evidence_tree_sha: &'static str,
+    raw_report: ArtifactIdentity,
+    completed_transcript: ArtifactIdentity,
+    original_audit: ArtifactIdentity,
+    legacy_reproduction_pass: bool,
+    defect: &'static str,
+    legacy_lookup: &'static str,
+    corrected_lookup: &'static str,
+    original_disposition: Option<String>,
+    original_errors: Option<Vec<String>>,
+    corrected_analysis_origin: &'static str,
+    // None means Stage 1 refused the evidence; correction never ran.
+    corrected_analysis: Option<Analysis>,
+    corrected_disposition: Option<String>,
+    corrected_errors: Option<Vec<String>>,
+    #[serde(flatten)]
+    result: Analysis,
+    hardware_rerun_performed: bool,
+    runtime_constructed: bool,
+    model_loaded: bool,
+    gpu_constructed: bool,
+}
+
+/// Only repair_audit_command supplies production bindings, always CONSUMED_FIRST.
+/// The private parameter lets unit tests exercise both stages on synthetic bytes
+/// without accepting replacement evidence through a CLI, environment or config.
+fn repair_bytes(
+    raw: &[u8],
+    transcript: &[u8],
+    original_audit: &[u8],
+    expected: &EvidenceHashes<'_>,
+) -> RepairReport {
+    let mut report = RepairReport {
+        schema: REPAIR_SCHEMA,
+        mode: REPAIR_MODE,
+        evidence_child_sha: EVIDENCE_CHILD,
+        evidence_parent_sha: EVIDENCE_PARENT,
+        evidence_tree_sha: EVIDENCE_TREE,
+        raw_report: ArtifactIdentity::of(raw),
+        completed_transcript: ArtifactIdentity::of(transcript),
+        original_audit: ArtifactIdentity::of(original_audit),
+        legacy_reproduction_pass: false,
+        defect: "MEASURED_MECHANISM_GATE_KEY",
+        legacy_lookup: "mechanism",
+        corrected_lookup: "measured_mechanism",
+        original_disposition: None,
+        original_errors: None,
+        corrected_analysis_origin: "Separate offline repair reconstruction over the immutable consumed FIRST; cached raw analysis is validated only against legacy reconstruction.",
+        corrected_analysis: None,
+        corrected_disposition: None,
+        corrected_errors: None,
+        result: non_authoritative(),
+        hardware_rerun_performed: false,
+        runtime_constructed: false,
+        model_loaded: false,
+        gpu_constructed: false,
+    };
+    // Bind every exact byte snapshot BEFORE deserialization or reconstruction.
+    for (actual, expected, label) in [
+        (&report.raw_report.sha256, expected.raw, "raw report"),
+        (
+            &report.completed_transcript.sha256,
+            expected.transcript,
+            "transcript",
+        ),
+        (
+            &report.original_audit.sha256,
+            expected.original_audit,
+            "original audit",
+        ),
+    ] {
+        if actual != expected {
+            report
+                .result
+                .errors
+                .push(format!("consumed FIRST {label} SHA-256 mismatch"));
+        }
+    }
+    if !report.result.errors.is_empty() {
+        return report;
+    }
+    let original: serde_json::Value = match serde_json::from_slice(original_audit) {
+        Ok(value) => value,
+        Err(e) => {
+            report
+                .result
+                .errors
+                .push(format!("original audit structure: {e}"));
+            return report;
+        }
+    };
+    report.original_disposition = original["analysis"]["disposition"]
+        .as_str()
+        .map(str::to_owned);
+    report.original_errors = serde_json::from_value(original["analysis"]["errors"].clone()).ok();
+
+    // Stage 1 invokes the historical auditor itself. Its checks include exact
+    // cached legacy analysis, envelope definitions, all streams and transcript
+    // marker/order/hash/retry binding. Compare the ENTIRE canonical audit value,
+    // including schema, mode, byte counts and every authority-bearing field.
+    let legacy = audit_bytes(raw, transcript);
+    report.result = legacy.analysis.clone();
+    let known_failure = report.original_disposition.as_deref() == Some("NON_AUTHORITATIVE")
+        && report.original_errors.as_deref() == Some(&[HISTORICAL_ERROR.to_string()][..])
+        && legacy.analysis.disposition == "NON_AUTHORITATIVE"
+        && legacy.analysis.errors == [HISTORICAL_ERROR]
+        && legacy.analysis.external_retry_warning_occurrences == Some(0)
+        && legacy.analysis.external_existing_breaker_retry_events == Some(0);
+    if !known_failure {
+        report.result.errors.push("legacy audit must contain only the historical measured mechanism error and zero retry/breaker events".into());
+    }
+    // Compare the historical SERIALIZED result, parsed identically on both
+    // sides (as cached raw analysis already does). Direct to_value retains
+    // in-memory f64 representations that can differ after JSON parsing.
+    // This is exact semantic equality, with no numeric tolerance or rounding.
+    let legacy_json = serde_json::to_vec(&legacy)
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes));
+    if legacy_json.ok().as_ref() != Some(&original) {
+        report
+            .result
+            .errors
+            .push("legacy audited result does not exactly reproduce original audit".into());
+    }
+    if !known_failure || report.result.errors != [HISTORICAL_ERROR] {
+        report.result.disposition = "NON_AUTHORITATIVE".into();
+        report.result.decision = decision("NON_AUTHORITATIVE").into();
+        return report;
+    }
+    report.legacy_reproduction_pass = true;
+
+    // Stage 2 uses the SAME byte snapshots and shared checks/classifier. The
+    // sole semantic correction is gates.measured_mechanism. Cached analysis
+    // remains checked against LEGACY, never against this corrected result.
+    let corrected =
+        audit_bytes_with_measured_gate_key(raw, transcript, MeasuredMechanismGateKey::Repaired);
+    report.corrected_disposition = Some(corrected.analysis.disposition.clone());
+    report.corrected_errors = Some(corrected.analysis.errors.clone());
+    report.corrected_analysis = Some(corrected.analysis.clone());
+    report.result = corrected.analysis;
+    report
+}
+
+/// Read each evidence artifact once, then hash/parse/reconstruct those bytes.
+/// No production runner, storage object, runtime, config, model or GPU exists.
+pub(crate) fn repair_audit_command(
+    input: &std::path::Path,
+    log: &std::path::Path,
+    original_audit: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Any existing entry is forbidden, including hard links, symlinks (also
+    // dangling ones), directories and alternate spellings of an input path.
+    if [input, log, original_audit].contains(&output) {
+        return Err("repair output must be distinct from all inputs".into());
+    }
+    match std::fs::symlink_metadata(output) {
+        Ok(_) => return Err("repair output must be a new artifact path".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let raw = std::fs::read(input)?;
+    let transcript = std::fs::read(log)?;
+    let original = std::fs::read(original_audit)?;
+    let report = repair_bytes(&raw, &transcript, &original, &CONSUMED_FIRST);
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    file.write_all(&serde_json::to_vec_pretty(&report)?)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    if report.result.disposition == "NON_AUTHORITATIVE" {
+        return Err("HMA-1E repair remains NON_AUTHORITATIVE; see new repaired audit".into());
     }
     Ok(())
 }
@@ -1868,5 +2106,559 @@ mod tests {
         assert_eq!(s.request_begins.len(), 4);
         assert_eq!(s.request_source_id_witnesses.len(), 4);
         assert!(s.context_errors > 0);
+    }
+
+    mod repair_tests {
+        use super::*;
+        use crate::gpu_native_physical_install_staging::source_to_upload_production::validate_recorded_authority;
+
+        fn repaired_fixture() -> (Vec<StoreSnapshot>, serde_json::Value) {
+            let (stores, mut p) = fixture();
+            // Match the actual production-v2 serialized gate shape, independently
+            // of the historical fixture (whose arm snapshots remain unchanged).
+            let gate = p["gates"]
+                .as_object_mut()
+                .unwrap()
+                .remove("mechanism")
+                .unwrap();
+            p["gates"]["measured_mechanism"] = gate;
+            (stores, p)
+        }
+        fn repaired_validator(p: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+            validate_recorded_authority_with_measured_gate_key(
+                p,
+                MeasuredMechanismGateKey::Repaired,
+            )
+        }
+        fn evidence() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            let (stores, p) = repaired_fixture();
+            let raw = serde_json::to_vec(&Envelope::new(p, stores)).unwrap();
+            let log = complete_log(&raw);
+            let original = serde_json::to_vec(&audit_bytes(&raw, &log)).unwrap();
+            (raw, log, original)
+        }
+        fn bound_repair(raw: &[u8], log: &[u8], original: &[u8]) -> RepairReport {
+            let r = ArtifactIdentity::of(raw);
+            let t = ArtifactIdentity::of(log);
+            let o = ArtifactIdentity::of(original);
+            repair_bytes(
+                raw,
+                log,
+                original,
+                &EvidenceHashes {
+                    raw: &r.sha256,
+                    transcript: &t.sha256,
+                    original_audit: &o.sha256,
+                },
+            )
+        }
+        fn stage1_rejected(report: RepairReport) {
+            assert!(!report.legacy_reproduction_pass);
+            assert!(report.corrected_analysis.is_none());
+            assert!(report.corrected_disposition.is_none());
+            assert_eq!(report.result.disposition, "NON_AUTHORITATIVE");
+            assert!(!report.result.errors.is_empty());
+        }
+
+        #[test]
+        fn hma1e_repair_valid_measured_gate_and_historical_failure() {
+            let (_, p) = repaired_fixture();
+            repaired_validator(&p).unwrap();
+            assert_eq!(
+                validate_recorded_authority(&p).unwrap_err().to_string(),
+                HISTORICAL_ERROR
+            );
+            let (raw, log, original) = evidence();
+            assert_eq!(audit_bytes(&raw, &log).analysis.errors, [HISTORICAL_ERROR]);
+            let report = bound_repair(&raw, &log, &original);
+            assert!(report.legacy_reproduction_pass);
+            assert_eq!(report.result.disposition, "DIRECTIONAL_ORDER_ROBUST");
+            assert!(report.result.errors.is_empty());
+            assert_eq!(report.original_errors.unwrap(), [HISTORICAL_ERROR]);
+            assert_eq!(report.original_disposition.unwrap(), "NON_AUTHORITATIVE");
+            assert_eq!(report.result.external_retry_warning_occurrences, Some(0));
+            assert_eq!(
+                report.result.external_existing_breaker_retry_events,
+                Some(0)
+            );
+            assert!(
+                !report.hardware_rerun_performed
+                    && !report.runtime_constructed
+                    && !report.model_loaded
+                    && !report.gpu_constructed
+            );
+        }
+        #[test]
+        fn hma1e_repair_missing_measured_gate_rejected_even_with_legacy_gate() {
+            let (_, p) = fixture();
+            validate_recorded_authority(&p).unwrap();
+            assert_eq!(
+                repaired_validator(&p).unwrap_err().to_string(),
+                HISTORICAL_ERROR
+            );
+        }
+        #[test]
+        fn hma1e_repair_corrupt_serialized_measured_gate_rejected() {
+            let (_, mut p) = repaired_fixture();
+            p["gates"]["measured_mechanism"]["passed"] = json!(false);
+            assert_eq!(
+                repaired_validator(&p).unwrap_err().to_string(),
+                HISTORICAL_ERROR
+            );
+        }
+        #[test]
+        fn hma1e_repair_serialized_pass_cannot_override_reconstructed_failure() {
+            let (_, mut p) = repaired_fixture();
+            p["treatment"]["upload"]["accounting_errors"] = json!(1);
+            assert_eq!(p["gates"]["measured_mechanism"]["passed"], true);
+            assert_eq!(
+                repaired_validator(&p).unwrap_err().to_string(),
+                HISTORICAL_ERROR
+            );
+        }
+        #[test]
+        fn hma1e_repair_warmup_still_requires_warmup_mechanism() {
+            let (_, mut p) = repaired_fixture();
+            p["gates"]
+                .as_object_mut()
+                .unwrap()
+                .remove("warmup_mechanism");
+            assert_eq!(
+                repaired_validator(&p).unwrap_err().to_string(),
+                HISTORICAL_ERROR
+            );
+            let (_, mut p) = repaired_fixture();
+            p["treatment"]["warmup_upload"]["accounting_errors"] = json!(1);
+            assert_eq!(
+                repaired_validator(&p).unwrap_err().to_string(),
+                HISTORICAL_ERROR
+            );
+        }
+        #[test]
+        fn hma1e_repair_cached_analysis_is_legacy_and_required() {
+            let (raw, _, _) = evidence();
+            let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(
+                value["analysis"]["errors"],
+                json!([
+                    HISTORICAL_ERROR,
+                    "completed external transcript audit pending"
+                ])
+            );
+            value["analysis"]["strata"][0]["key"] = json!(999);
+            let raw = serde_json::to_vec(&value).unwrap();
+            let log = complete_log(&raw);
+            let original = serde_json::to_vec(&audit_bytes(&raw, &log)).unwrap();
+            let report = bound_repair(&raw, &log, &original);
+            assert!(report
+                .result
+                .errors
+                .iter()
+                .any(|s| s == "raw analysis/primary/strata reconstruction mismatch"));
+            stage1_rejected(report);
+        }
+        #[test]
+        fn hma1e_repair_corrected_analysis_never_compared_to_cached_legacy() {
+            let (raw, log, original) = evidence();
+            let raw_before = raw.clone();
+            let raw_value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let report = bound_repair(&raw, &log, &original);
+            assert!(report.legacy_reproduction_pass);
+            let corrected = report.corrected_analysis.unwrap();
+            assert!(corrected.errors.is_empty());
+            assert_ne!(
+                raw_value["analysis"],
+                serde_json::to_value(&corrected).unwrap()
+            );
+            assert_eq!(raw, raw_before);
+        }
+        #[test]
+        fn hma1e_repair_each_exact_input_hash_is_mandatory() {
+            let (raw, log, original) = evidence();
+            let r = ArtifactIdentity::of(&raw);
+            let t = ArtifactIdentity::of(&log);
+            let o = ArtifactIdentity::of(&original);
+            for field in 0..3 {
+                let mut expected = EvidenceHashes {
+                    raw: &r.sha256,
+                    transcript: &t.sha256,
+                    original_audit: &o.sha256,
+                };
+                match field {
+                    0 => expected.raw = CONSUMED_FIRST.raw,
+                    1 => expected.transcript = CONSUMED_FIRST.transcript,
+                    _ => expected.original_audit = CONSUMED_FIRST.original_audit,
+                }
+                let report = repair_bytes(&raw, &log, &original, &expected);
+                assert_eq!(report.result.errors.len(), 1);
+                assert!(report.result.errors[0]
+                    .contains(["raw report", "transcript", "original audit"][field]));
+                stage1_rejected(report);
+            }
+            stage1_rejected(repair_bytes(&raw, &log, &original, &CONSUMED_FIRST));
+        }
+        #[test]
+        fn hma1e_repair_original_extra_missing_or_different_error_rejected() {
+            let (raw, log, original) = evidence();
+            for errors in [
+                json!([]),
+                json!(["other"]),
+                json!([HISTORICAL_ERROR, "other"]),
+                json!([HISTORICAL_ERROR, HISTORICAL_ERROR]),
+            ] {
+                let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+                value["analysis"]["errors"] = errors;
+                stage1_rejected(bound_repair(
+                    &raw,
+                    &log,
+                    &serde_json::to_vec(&value).unwrap(),
+                ));
+            }
+        }
+        #[test]
+        fn hma1e_repair_original_entire_canonical_result_must_match() {
+            let (raw, log, original) = evidence();
+            for pointer in [
+                "/schema",
+                "/mode",
+                "/source_report_sha256",
+                "/completed_transcript_sha256",
+                "/source_report_bytes",
+                "/completed_transcript_bytes",
+                "/analysis/disposition",
+                "/analysis/decision",
+                "/analysis/primary",
+                "/analysis/streams",
+                "/analysis/strata",
+                "/analysis/external_retry_warning_occurrences",
+                "/analysis/external_existing_breaker_retry_events",
+            ] {
+                let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+                *value.pointer_mut(pointer).unwrap() = json!("corrupt");
+                stage1_rejected(bound_repair(
+                    &raw,
+                    &log,
+                    &serde_json::to_vec(&value).unwrap(),
+                ));
+            }
+            let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            value["unrecognized_authority"] = json!(true);
+            stage1_rejected(bound_repair(
+                &raw,
+                &log,
+                &serde_json::to_vec(&value).unwrap(),
+            ));
+            // Whitespace/key ordering are not authority fields; semantics are.
+            let value = audit_bytes(&raw, &log);
+            assert!(
+                bound_repair(&raw, &log, &serde_json::to_vec_pretty(&value).unwrap())
+                    .legacy_reproduction_pass
+            );
+        }
+        #[test]
+        fn hma1e_repair_retry_and_all_breaker_fetch_retry_contamination_rejected() {
+            let (raw, log, _) = evidence();
+            for warning in [
+                "transient I/O error; retrying",
+                "expert fetch recovered after retry",
+                "expert fetch failed; will retry",
+                "circuit breaker",
+            ] {
+                // Trailing warnings after COMPLETE still invalidate authority.
+                let mut log = log.clone();
+                log.extend_from_slice(warning.as_bytes());
+                let original = serde_json::to_vec(&audit_bytes(&raw, &log)).unwrap();
+                stage1_rejected(bound_repair(&raw, &log, &original));
+            }
+        }
+        #[test]
+        fn hma1e_repair_begin_end_order_and_completion_hash_mandatory() {
+            let (raw, log, _) = evidence();
+            let end = format!("{END}{:x}", Sha256::digest(&raw));
+            for log in [
+                format!("{end}\n"),
+                format!("{BEGIN}\n"),
+                format!("{end}\n{BEGIN}\n"),
+                format!("{BEGIN}\n{BEGIN}\n{end}\n"),
+                format!("{BEGIN}\n{end}\n{end}\n"),
+                format!("{BEGIN}\n{END}{}\n", "0".repeat(64)),
+                String::from_utf8(log)
+                    .unwrap()
+                    .replace(BEGIN, "HMA1E_QUALIFIER_BEGIN order=control,treatment"),
+            ] {
+                let original = serde_json::to_vec(&audit_bytes(&raw, log.as_bytes())).unwrap();
+                let report = bound_repair(&raw, log.as_bytes(), &original);
+                assert!(report
+                    .result
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("completed transcript evidence")));
+                stage1_rejected(report);
+            }
+        }
+        #[test]
+        fn hma1e_repair_raw_schema_mode_order_endpoints_mandatory() {
+            let (raw, _, _) = evidence();
+            for key in [
+                "schema",
+                "mode",
+                "primary_definition",
+                "ordinal_half_definition",
+                "execution_order",
+            ] {
+                let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                value[key] = if key == "execution_order" {
+                    json!(["control", "treatment"])
+                } else {
+                    json!("corrupt")
+                };
+                let raw = serde_json::to_vec(&value).unwrap();
+                let log = complete_log(&raw);
+                let original = serde_json::to_vec(&audit_bytes(&raw, &log)).unwrap();
+                stage1_rejected(bound_repair(&raw, &log, &original));
+            }
+        }
+        #[test]
+        fn hma1e_repair_later_authority_failure_survives_legacy_reproduction() {
+            // The old key failure short-circuits the validator. A later hidden
+            // failure MUST still invalidate Stage 2 after legacy proof succeeds.
+            let (stores, mut p) = repaired_fixture();
+            p["control"]["warmup_ram_cache_state_sha256"] = json!("corrupt");
+            let raw = serde_json::to_vec(&Envelope::new(p, stores)).unwrap();
+            let log = complete_log(&raw);
+            let original = serde_json::to_vec(&audit_bytes(&raw, &log)).unwrap();
+            let report = bound_repair(&raw, &log, &original);
+            assert!(report.legacy_reproduction_pass);
+            assert_eq!(report.result.disposition, "NON_AUTHORITATIVE");
+            assert_eq!(
+                report.corrected_errors.unwrap(),
+                ["warmup cache identity mismatch"]
+            );
+        }
+        #[test]
+        fn hma1e_repair_all_other_production_authority_checks_retained() {
+            for (pointer, bad) in [
+                ("/schema", json!("bad")),
+                ("/mode", json!("bad")),
+                ("/failure", json!("failed")),
+                ("/qualification_pass", json!(false)),
+                ("/benchmark_complete", json!(false)),
+                ("/frozen_workload/measured_runs", json!(2)),
+                ("/source_scheduler_changed", json!(true)),
+                ("/slot_stride_bytes", json!(1)),
+                ("/reconciliation/all_invariants_pass", json!(false)),
+                ("/gates/behavioral", json!({})),
+                ("/gates/work_equivalence", json!({})),
+                ("/provenance/build/dirty", json!(true)),
+                ("/provenance/artifacts/config/sha256", json!("bad")),
+                ("/control/warmup_mechanism", json!({})),
+                ("/control/mechanism", json!({})),
+                ("/control/source", json!({})),
+                ("/treatment/work/token_loop/fatal_failures", json!(1)),
+                ("/treatment/work/engine_storage/nvme_bytes_read", json!(0)),
+                (
+                    "/treatment/production/production_batch_commit_violations",
+                    json!(1),
+                ),
+                ("/gates/source_upload_fd_proof", json!({})),
+                ("/control/warmup_ram_cache_state_sha256", json!("bad")),
+                ("/control/complete", json!(false)),
+                ("/control/isolated_runtime", json!(false)),
+                ("/control/benchmark/benchmark_complete", json!(false)),
+                ("/control/benchmark/failure", json!("failed")),
+                ("/control/benchmark/runtime_shutdowns", json!([])),
+                ("/control/benchmark/hardware/name", json!("other")),
+                ("/control/benchmark/runtime_contract", json!({})),
+                ("/control/benchmark/model_identity", json!({"corrupt":true})),
+                (
+                    "/control/benchmark/production_configuration",
+                    json!({"corrupt":true}),
+                ),
+                (
+                    "/control/benchmark/per_run_results/0/generated_token_ids/0",
+                    json!(999),
+                ),
+                (
+                    "/control/benchmark/per_run_results/0/generated_text_sha256",
+                    json!("bad"),
+                ),
+            ] {
+                let (_, mut p) = repaired_fixture();
+                *p.pointer_mut(pointer)
+                    .unwrap_or_else(|| panic!("missing fixture {pointer}")) = bad;
+                assert!(repaired_validator(&p).is_err(), "accepted {pointer}");
+            }
+        }
+        #[test]
+        fn hma1e_repair_frozen_classifier_exact_boundaries() {
+            for (delta, expected) in [
+                (-3_000_001, "ORDER_DOMINATED_REVERSAL"),
+                (-3_000_000, "ORDER_DOMINATED_REVERSAL"),
+                (-2_999_999, "AMBIGUOUS_ORDER_INTERACTION"),
+                (-1_000_000, "AMBIGUOUS_ORDER_INTERACTION"),
+                (-999_999, "STRAGGLER_NOT_REPRODUCED"),
+                (999_999, "STRAGGLER_NOT_REPRODUCED"),
+                (1_000_000, "DIRECTIONAL_ORDER_ROBUST"),
+                (2_999_999, "DIRECTIONAL_ORDER_ROBUST"),
+                (3_000_000, "ORDER_ROBUST_STRAGGLER"),
+                (3_000_001, "ORDER_ROBUST_STRAGGLER"),
+            ] {
+                let mut p = point(delta, delta);
+                // Deliberately lie in display floats; integer thresholds win.
+                p.dcrit_percent_of_control = Some(999.0);
+                p.dmax_percent_of_control = Some(-999.0);
+                assert_eq!(classify(&p, &consistent(&p)).unwrap(), expected);
+            }
+        }
+        #[test]
+        fn hma1e_repair_output_aliases_existing_links_and_dangling_links_rejected() {
+            let dir =
+                std::env::temp_dir().join(format!("hma1e-repair-paths-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let paths = [dir.join("raw"), dir.join("log"), dir.join("original")];
+            for (i, path) in paths.iter().enumerate() {
+                std::fs::write(path, format!("immutable-{i}")).unwrap();
+            }
+            let call =
+                |out: &std::path::Path| repair_audit_command(&paths[0], &paths[1], &paths[2], out);
+            for path in &paths {
+                assert!(call(path).is_err());
+                assert!(call(&dir.join(".").join(path.file_name().unwrap())).is_err());
+                let hard = dir.join("hard");
+                std::fs::hard_link(path, &hard).unwrap();
+                assert!(call(&hard).is_err());
+                std::fs::remove_file(hard).unwrap();
+                #[cfg(unix)]
+                {
+                    let link = dir.join("link");
+                    std::os::unix::fs::symlink(path, &link).unwrap();
+                    assert!(call(&link).is_err());
+                    std::fs::remove_file(link).unwrap();
+                }
+            }
+            let out = dir.join("existing");
+            std::fs::write(&out, b"preserve").unwrap();
+            assert!(call(&out).is_err());
+            assert_eq!(std::fs::read(&out).unwrap(), b"preserve");
+            #[cfg(unix)]
+            {
+                let link = dir.join("dangling");
+                std::os::unix::fs::symlink(dir.join("absent"), &link).unwrap();
+                assert!(call(&link).is_err());
+                assert!(!dir.join("absent").exists());
+            }
+            for (i, path) in paths.iter().enumerate() {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    format!("immutable-{i}").as_bytes()
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        #[test]
+        fn hma1e_repair_command_frozen_binding_and_create_new_failure_artifact() {
+            let dir =
+                std::env::temp_dir().join(format!("hma1e-repair-command-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let (raw, log, original) = evidence();
+            for (name, bytes) in [("raw", &raw), ("log", &log), ("original", &original)] {
+                std::fs::write(dir.join(name), bytes).unwrap();
+            }
+            let out = dir.join("new");
+            let run = || {
+                repair_audit_command(
+                    &dir.join("raw"),
+                    &dir.join("log"),
+                    &dir.join("original"),
+                    &out,
+                )
+            };
+            assert!(run().is_err()); // Synthetic data cannot pass production pins.
+            let first = std::fs::read(&out).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
+            assert_eq!(value["schema"], REPAIR_SCHEMA);
+            assert_eq!(value["disposition"], "NON_AUTHORITATIVE");
+            assert_eq!(value["errors"].as_array().unwrap().len(), 3);
+            assert_eq!(value["legacy_reproduction_pass"], false);
+            assert!(value["corrected_analysis"].is_null());
+            assert!(run().is_err());
+            assert_eq!(std::fs::read(&out).unwrap(), first);
+            for (name, bytes) in [("raw", &raw), ("log", &log), ("original", &original)] {
+                assert_eq!(&std::fs::read(dir.join(name)).unwrap(), bytes);
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        #[test]
+        fn hma1e_repair_cli_parsing_and_pre_startup_offline_source_proof() {
+            use clap::Parser;
+            let cli = crate::Cli::try_parse_from([
+                "mer",
+                REPAIR_MODE,
+                "--report-in",
+                "raw",
+                "--completed-run-log",
+                "log",
+                "--original-audit-in",
+                "original",
+                "--report-out",
+                "new",
+            ])
+            .unwrap();
+            assert!(crate::startup_config_path(&cli.cmd).is_none());
+            assert!(matches!(
+                cli.cmd,
+                crate::Cmd::RepairAuditGpuNativeSourceOrderStragglerProduction { .. }
+            ));
+            let main = include_str!("main.rs")
+                .split("fn main() ->")
+                .nth(1)
+                .unwrap();
+            let early = main.split("let worker_protocol_stdout").next().unwrap();
+            assert!(early.contains(
+                "return crate::gpu_native_source_order_straggler_production::repair_audit_command("
+            ));
+            let source = include_str!("gpu_native_source_order_straggler_production.rs");
+            let repair = source
+                .split("fn repair_bytes(")
+                .nth(1)
+                .unwrap()
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap();
+            assert!(repair.contains("&CONSUMED_FIRST"));
+            assert!(repair.contains(".create_new(true)"));
+            assert_eq!(repair.matches("std::fs::read(").count(), 3);
+            let production = include_str!("gpu_native_source_to_upload_copy_elision_production.rs");
+            let validator = production
+                .split("pub(crate) fn validate_recorded_authority(")
+                .nth(1)
+                .unwrap()
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap();
+            for region in [early, repair, validator] {
+                for forbidden in [
+                    "run_command(",
+                    "run_order_straggler_command(",
+                    "construct_runtime(",
+                    "Config::from_file(",
+                    "new_multi_thread(",
+                    "install_default(",
+                    "RealModel::",
+                    "from_dir(",
+                    "NvmeStorage::",
+                    "read_expert(",
+                    "execute_request(",
+                    "wgpu::",
+                    "request_adapter(",
+                    "request_device(",
+                ] {
+                    assert!(
+                        !region.contains(forbidden),
+                        "offline path contains {forbidden}"
+                    );
+                }
+            }
+        }
     }
 }

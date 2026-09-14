@@ -1426,6 +1426,29 @@ mod tests {
 pub(crate) fn validate_recorded_authority(
     p: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_recorded_authority_with_measured_gate_key(p, MeasuredMechanismGateKey::Legacy)
+}
+
+/// The repair changes only the measured *gate* lookup. Arm snapshot keys and
+/// every reconstructed authority operand remain identical to the legacy audit.
+#[derive(Clone, Copy)]
+pub(crate) enum MeasuredMechanismGateKey {
+    Legacy,
+    Repaired,
+}
+impl MeasuredMechanismGateKey {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Legacy => "mechanism",
+            Self::Repaired => "measured_mechanism",
+        }
+    }
+}
+
+pub(crate) fn validate_recorded_authority_with_measured_gate_key(
+    p: &serde_json::Value,
+    measured_gate_key: MeasuredMechanismGateKey,
+) -> Result<(), Box<dyn std::error::Error>> {
     use serde_json::Value;
     fn require(ok: bool, message: &'static str) -> Result<(), Box<dyn std::error::Error>> {
         if ok {
@@ -1546,8 +1569,13 @@ pub(crate) fn validate_recorded_authority(
             "common source/mechanism snapshot mismatch",
         )?;
         let gate = pair_mechanism_gate(&c, &t, &cp, &tp, &cu, &tu, &cs, &ts);
+        let gate_key = if warmup {
+            mechanism_key
+        } else {
+            measured_gate_key.key()
+        };
         require(
-            gate.passed && p["gates"][mechanism_key] == serde_json::to_value(&gate)?,
+            gate.passed && p["gates"][gate_key] == serde_json::to_value(&gate)?,
             "production mechanism reconstruction failed",
         )?;
         require(

@@ -1071,6 +1071,19 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// Offline repair of the exact consumed HMA-1E FIRST's measured gate audit.
+    #[command(name = "repair-audit-gpu-native-source-order-straggler-production")]
+    RepairAuditGpuNativeSourceOrderStragglerProduction {
+        #[arg(long)]
+        report_in: PathBuf,
+        #[arg(long)]
+        completed_run_log: PathBuf,
+        #[arg(long)]
+        original_audit_in: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Diagnostic host-copy discriminator plus frozen one-arm production attribution.
     #[command(name = "diagnose-gpu-native-physical-staging-payload-copy")]
     DiagnoseGpuNativePhysicalStagingPayloadCopy {
@@ -2096,6 +2109,22 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::parse();
+    // Evidence-only repair returns before logging/placement/autotune, config
+    // loading, worker pools, backend installation or any runtime construction.
+    if let Cmd::RepairAuditGpuNativeSourceOrderStragglerProduction {
+        report_in,
+        completed_run_log,
+        original_audit_in,
+        report_out,
+    } = &cli.cmd
+    {
+        return crate::gpu_native_source_order_straggler_production::repair_audit_command(
+            report_in,
+            completed_run_log,
+            original_audit_in,
+            report_out,
+        );
+    }
     let worker_protocol_stdout = matches!(
         cli.cmd,
         Cmd::GreedyParityHybridWorkerInternal { .. }
@@ -2686,6 +2715,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &completed_run_log,
             &report_out,
         ),
+        Cmd::RepairAuditGpuNativeSourceOrderStragglerProduction { .. } => {
+            unreachable!("offline repair returned before runtime startup")
+        }
         Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
             config,
             expected_adapter_name,
