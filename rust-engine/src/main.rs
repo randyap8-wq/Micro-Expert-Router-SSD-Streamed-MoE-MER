@@ -1084,6 +1084,21 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// Offline context-id authority repair of the exact consumed HMA-1E evidence.
+    #[command(name = "repair2-audit-gpu-native-source-order-straggler-production")]
+    Repair2AuditGpuNativeSourceOrderStragglerProduction {
+        #[arg(long)]
+        report_in: PathBuf,
+        #[arg(long)]
+        completed_run_log: PathBuf,
+        #[arg(long)]
+        original_audit_in: PathBuf,
+        #[arg(long)]
+        repair1_audit_in: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Diagnostic host-copy discriminator plus frozen one-arm production attribution.
     #[command(name = "diagnose-gpu-native-physical-staging-payload-copy")]
     DiagnoseGpuNativePhysicalStagingPayloadCopy {
@@ -2125,6 +2140,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             report_out,
         );
     }
+    if let Cmd::Repair2AuditGpuNativeSourceOrderStragglerProduction {
+        report_in,
+        completed_run_log,
+        original_audit_in,
+        repair1_audit_in,
+        report_out,
+    } = &cli.cmd
+    {
+        return crate::gpu_native_source_order_straggler_production::repair2_audit_command(
+            report_in,
+            completed_run_log,
+            original_audit_in,
+            repair1_audit_in,
+            report_out,
+        );
+    }
     let worker_protocol_stdout = matches!(
         cli.cmd,
         Cmd::GreedyParityHybridWorkerInternal { .. }
@@ -2717,6 +2748,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         Cmd::RepairAuditGpuNativeSourceOrderStragglerProduction { .. } => {
             unreachable!("offline repair returned before runtime startup")
+        }
+        Cmd::Repair2AuditGpuNativeSourceOrderStragglerProduction { .. } => {
+            unreachable!("offline repair2 returned before runtime startup")
         }
         Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
             config,

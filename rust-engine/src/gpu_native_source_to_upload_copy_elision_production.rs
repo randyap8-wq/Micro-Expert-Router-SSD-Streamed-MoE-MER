@@ -1449,6 +1449,47 @@ pub(crate) fn validate_recorded_authority_with_measured_gate_key(
     p: &serde_json::Value,
     measured_gate_key: MeasuredMechanismGateKey,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_recorded_authority_with_contract_equality(
+        p,
+        measured_gate_key,
+        ArmContractEquality::Exact,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ArmContractEquality {
+    Exact,
+    // Only the evidence-bound repair2 path may select this comparison.
+    IsolatedContextId,
+}
+
+/// Compare complete objects after removing exactly one instance-identity leaf.
+/// Missing objects/leaves fail closed; no other field is normalized or omitted.
+pub(crate) fn runtime_contracts_equal_except_context_id(
+    control: &serde_json::Value,
+    treatment: &serde_json::Value,
+) -> bool {
+    let (mut c, mut t) = (control.clone(), treatment.clone());
+    for value in [&mut c, &mut t] {
+        let Some(plan) = value
+            .as_object_mut()
+            .and_then(|v| v.get_mut("legacy_execution_plan"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return false;
+        };
+        if plan.remove("context_id").is_none() {
+            return false;
+        }
+    }
+    c == t
+}
+
+pub(crate) fn validate_recorded_authority_with_contract_equality(
+    p: &serde_json::Value,
+    measured_gate_key: MeasuredMechanismGateKey,
+    contract_equality: ArmContractEquality,
+) -> Result<(), Box<dyn std::error::Error>> {
     use serde_json::Value;
     fn require(ok: bool, message: &'static str) -> Result<(), Box<dyn std::error::Error>> {
         if ok {
@@ -1690,7 +1731,17 @@ pub(crate) fn validate_recorded_authority_with_measured_gate_key(
         "runtime_contract",
     ] {
         require(
-            c["benchmark"][field].is_object() && c["benchmark"][field] == t["benchmark"][field],
+            c["benchmark"][field].is_object()
+                && if field == "runtime_contract"
+                    && contract_equality == ArmContractEquality::IsolatedContextId
+                {
+                    runtime_contracts_equal_except_context_id(
+                        &c["benchmark"][field],
+                        &t["benchmark"][field],
+                    )
+                } else {
+                    c["benchmark"][field] == t["benchmark"][field]
+                },
             "arm runtime/config/model contract mismatch",
         )?;
     }
