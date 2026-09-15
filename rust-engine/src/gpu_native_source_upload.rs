@@ -20,7 +20,7 @@ pub(crate) const ALIGN: usize = 4096;
 pub(crate) const CAPACITY: usize = 16;
 pub(crate) const UPLOAD_BYTES: usize = FULL + ALIGN;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum GpuNativeSourceToUploadCopyElisionQualificationArm {
     Control,
@@ -28,7 +28,7 @@ pub(crate) enum GpuNativeSourceToUploadCopyElisionQualificationArm {
 }
 pub(crate) use GpuNativeSourceToUploadCopyElisionQualificationArm as Arm;
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct Metrics {
     pub(crate) acquisition_attempts: u64,
     pub(crate) acquisition_waits: u64,
@@ -91,7 +91,7 @@ impl Metrics {
         }
     }
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct Snapshot {
     /// Additive diagnostic, sampled from storage at the idle engine boundary.
     pub(crate) source_upload_fd_proof: Option<crate::io_provider::SourceUploadFdProofSnapshot>,
@@ -146,6 +146,7 @@ struct Ring {
 pub(crate) struct State {
     pub(crate) arm: Arm,
     production_owned: bool,
+    mapped_lock_observer: std::sync::OnceLock<Arc<crate::gpu_native_mapped_lock::Observer>>,
     production_demand_gate: Arc<Semaphore>,
     ring: Option<Ring>,
     pub(crate) metrics: Mutex<Metrics>,
@@ -217,6 +218,7 @@ impl State {
         Ok(Arc::new(Self {
             arm,
             production_owned,
+            mapped_lock_observer: std::sync::OnceLock::new(),
             production_demand_gate: Arc::new(Semaphore::new(1)),
             ring,
             metrics: Mutex::new(Metrics::default()),
@@ -242,6 +244,7 @@ impl State {
         Arc::new(Self {
             arm,
             production_owned,
+            mapped_lock_observer: std::sync::OnceLock::new(),
             production_demand_gate: Arc::new(Semaphore::new(1)),
             ring: None,
             metrics: Mutex::new(Metrics::default()),
@@ -250,6 +253,13 @@ impl State {
             logical_ids: Mutex::new(Sha256::new()),
             generations: Mutex::new(Sha256::new()),
         })
+    }
+
+    pub(crate) fn enable_mapped_lock_observer(&self, observer: Arc<crate::gpu_native_mapped_lock::Observer>) -> Result<(), String> {
+        if !self.production_owned || self.arm != Arm::Treatment || self.active_leases() != 0 || !self.pending.lock().is_empty() {
+            return Err("HMA-1F requires idle production-owned mapped treatment".into());
+        }
+        self.mapped_lock_observer.set(observer).map_err(|_| "HMA-1F observer already installed".into())
     }
 
     pub(crate) fn is_production_owned(&self) -> bool {
@@ -429,6 +439,9 @@ impl State {
         buffers: Vec<PooledBuffer>,
         logical: &GpuExpertCache,
     ) -> Result<Vec<Arc<ExpertResident>>, String> {
+        if self.mapped_lock_observer.get().is_some_and(|o| o.failed()) {
+            return Err("HMA-1F observer is failed closed; no subsequent source read authorized".into());
+        }
         if self.arm != Arm::Treatment || ids.len() != buffers.len() || ids.len() > CAPACITY {
             return Err("invalid qualification source set".into());
         }
@@ -468,11 +481,43 @@ impl State {
             .zip(&offsets)
             .map(|(v, &o)| &mut v[o..o + FULL])
             .collect::<Vec<_>>();
+        // Qualification-only intervention. All mappings/views/ranges precede locks.
+        // The ordinary constructor leaves this OnceLock empty and supplies None.
+        let observer = self.mapped_lock_observer.get();
+        let mut evidence = observer.map(|o| crate::gpu_native_mapped_lock::LockEvidence::new(o.mode,
+            destinations.iter().map(|d| crate::gpu_native_mapped_lock::Range { pointer: d.as_ptr() as usize, length: d.len() }).collect()));
+        let mut raw = observer.map(|_| crate::gpu_native_mapped_lock::RawBatch::default());
+        let mut guard = match (observer, evidence.as_mut()) {
+            (Some(o), Some(e)) => {
+                // SAFETY: destinations borrow live WGPU views; guard is dropped
+                // before destinations/views/leases on every return and unwind.
+                let acquired = unsafe { crate::gpu_native_mapped_lock::LockGuard::acquire(o.mode, &crate::gpu_native_mapped_lock::SystemLocks, e) };
+                if acquired.is_err() {
+                    let error = acquired.err().unwrap();
+                    o.record(ids, 0, 0, None, evidence.as_ref().unwrap().clone(), Some(error.clone()));
+                    return Err(error);
+                }
+                Some(acquired.unwrap())
+            }
+            _ => None,
+        };
         let started = Instant::now();
         let result = storage
-            .read_experts_batch_into_aligned_slices(ids, &mut destinations)
+            .read_experts_batch_into_aligned_slices(ids, &mut destinations, raw.as_mut())
             .await;
         self.add(|m| &mut m.fused_source_us, elapsed(started));
+        let stopped = observer.map(|_| Instant::now());
+        let unlock = guard.as_mut().map(|g| g.release()).transpose();
+        drop(guard); // Includes a cleanup retry on unlock failure; authority still fails.
+        if let Some(o) = observer {
+            let caller_ns = stopped.unwrap().duration_since(started).as_nanos() as u64;
+            let timing = raw.as_ref().unwrap().reconstruct(ids.len(), started, stopped.unwrap());
+            let failure = result.as_ref().err().map(ToString::to_string)
+                .or_else(|| unlock.as_ref().err().cloned()).or_else(|| timing.as_ref().err().cloned());
+            o.record(ids, result.as_ref().copied().unwrap_or(0), caller_ns, timing.ok(), evidence.unwrap(), failure.clone());
+            if let Some(error) = failure { return Err(error); }
+        }
+        unlock?;
         drop(destinations);
         let bytes = result.map_err(|e| {
             self.add(|m| &mut m.source_failures, 1);

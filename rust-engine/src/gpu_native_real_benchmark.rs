@@ -125,7 +125,7 @@ pub(crate) struct RequestEvidence {
     pub(crate) greedy: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct CacheResidencyConfiguration {
     pub(crate) ram_cache_slots: usize,
     pub(crate) block_align: usize,
@@ -143,7 +143,7 @@ pub(crate) struct CacheResidencyConfiguration {
     pub(crate) gpu_native_max_seq_len: usize,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct PredictorPrefetchConfiguration {
     pub(crate) predict_fanout: usize,
     pub(crate) predict_min_prob: f64,
@@ -168,7 +168,7 @@ pub(crate) struct PredictorPrefetchConfiguration {
     pub(crate) static_residency_profile: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct ProductionConfiguration {
     pub(crate) q4_dtype: String,
     pub(crate) q4_layout: Option<String>,
@@ -672,7 +672,7 @@ pub(crate) fn gpu_io_delta(
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct EngineStorageSnapshot {
     pub(crate) ram_hits: u64,
     pub(crate) ram_misses: u64,
@@ -720,7 +720,7 @@ impl EngineStorageSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, serde::Deserialize)]
 pub(crate) struct GpuNativeResidencyDelta {
     pub(crate) vram_hits: u64,
     pub(crate) vram_misses: u64,
@@ -2252,6 +2252,39 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     }
 }
 
+/// Reconstruct the existing strict runtime gate from retained JSON without
+/// constructing a runtime. HMA-1F uses this in its offline authority audit.
+pub(crate) fn audit_recorded_runtime(
+    b: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let c = &b["runtime_contract"];
+    let input = RuntimeContractInput {
+        real_transformer_enabled: serde_json::from_value(c["real_transformer_enabled"].clone())?,
+        real_transformer_gpu_native: serde_json::from_value(
+            c["real_transformer_gpu_native"].clone(),
+        )?,
+        compute_offload: serde_json::from_value(c["compute_offload"].clone())?,
+        legacy_execution_plan: serde_json::from_value(c["legacy_execution_plan"].clone())?,
+        token_loop_geometry: serde_json::from_value(c["token_loop_geometry"].clone())?,
+        authoritative_device: serde_json::from_value(b["hardware"].clone())?,
+        model_load: serde_json::from_value(b["model_load"].clone())?,
+        routed_failure_policy: if c["strict_fail_closed_routed_experts"] == true {
+            crate::engine::RoutedExpertGpuFailurePolicy::StrictFailClosed
+        } else {
+            return Err("strict routed-expert evidence missing/false".into());
+        },
+    };
+    let (contract, device) = validate_runtime_contract(&input, "NVIDIA L4")?;
+    if serde_json::to_value(contract)? != *c || serde_json::to_value(device)? != b["hardware"] {
+        return Err("runtime contract reconstruction mismatch".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+pub(crate) fn hma1f_test_runtime() -> serde_json::Value {
+    tests::hma1f_runtime_fixture()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2316,6 +2349,12 @@ mod tests {
             optional_loaded: 0,
             seeded_fallback_remained: false,
         }
+    }
+
+    pub(super) fn hma1f_runtime_fixture() -> serde_json::Value {
+        let input = runtime_contract();
+        let (contract, device) = validate_runtime_contract(&input, "NVIDIA L4").unwrap();
+        serde_json::json!({"runtime_contract": contract, "hardware": device, "model_load": input.model_load})
     }
 
     fn runtime_contract() -> RuntimeContractInput {

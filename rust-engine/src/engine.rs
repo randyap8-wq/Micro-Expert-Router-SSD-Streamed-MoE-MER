@@ -535,7 +535,7 @@ enum GpuNativeQualificationPurpose {
     SourceToUpload(SourceUploadArm),
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct GpuNativePhysicalInstallStagingQualificationSnapshot {
     pub(crate) arm: GpuNativePhysicalInstallStagingQualificationArm,
     pub(crate) qualification_telemetry_only: bool,
@@ -589,7 +589,7 @@ pub(crate) struct GpuNativePhysicalInstallStagingQualificationSnapshot {
     pub(crate) physical_install_total_us: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
     pub(crate) arm: GpuNativePhysicalInstallConcurrencyQualificationArm,
     pub(crate) production_physical_install_concurrency_changed: bool,
@@ -683,7 +683,7 @@ pub(crate) struct GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
 /// Cumulative production-path evidence. These atomics are always present and
 /// add no per-token logging; the dedicated v2 qualifier resets them between
 /// warmup and measured arms and records exact snapshots.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct ProductionDemandSourceSnapshot {
     pub(crate) ordinary_production_path_exercised: bool,
     pub(crate) production_source_sets: u64,
@@ -5071,6 +5071,15 @@ impl Engine {
         self.production_demand_source.reset();
         manager.reset_production_physical_install_telemetry();
         Ok(())
+    }
+
+    /// HMA-1F only: called after enabling source/upload qualification on an idle isolated runtime.
+    pub(crate) fn enable_mapped_lock_observer(&self, observer: Arc<crate::gpu_native_mapped_lock::Observer>) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() || self.core.cache.reserved_slots() != 0 {
+            return Err("HMA-1F observer requires idle runtime".into());
+        }
+        let state = self.gpu_native_demand_source_qualification().ok_or("missing source/upload qualification")?;
+        state.source_upload.as_ref().ok_or("missing mapped upload state")?.enable_mapped_lock_observer(observer)
     }
 
     pub(crate) fn gpu_native_source_upload_snapshot(

@@ -85,7 +85,7 @@ pub(crate) struct WarmupEvidence {
     generated_text_sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub(crate) struct ArmWorkEvidence {
     token_loop: GpuNativeTokenLoopSnapshot,
     recovery: GpuNativeRecoverySnapshot,
@@ -951,6 +951,16 @@ async fn run_physical_install_arm_inner(
     run: PhysicalInstallQualificationRun,
     diagnostic_mode: Option<&'static str>,
 ) -> Result<PhysicalInstallArmRun, BenchmarkFailure> {
+    run_physical_install_arm_observed(prepared, args, run, diagnostic_mode, None).await
+}
+
+async fn run_physical_install_arm_observed(
+    prepared: &Prepared,
+    args: &CommandArgs,
+    run: PhysicalInstallQualificationRun,
+    diagnostic_mode: Option<&'static str>,
+    mapped_observer: Option<Arc<crate::gpu_native_mapped_lock::Observer>>,
+) -> Result<PhysicalInstallArmRun, BenchmarkFailure> {
     use crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm as ConcurrentArm;
     let (arm_name, arm) = match run {
         PhysicalInstallQualificationRun::SourceToUpload(arm) => match arm {
@@ -1010,6 +1020,10 @@ async fn run_physical_install_arm_inner(
         .engine
             .enable_gpu_native_physical_install_concurrency_qualification(arm),
     };
+    let enable_result = enable_result.and_then(|()| match &mapped_observer {
+        Some(observer) => runtime.engine.enable_mapped_lock_observer(observer.clone()),
+        None => Ok(()),
+    });
     if let Err(error) = enable_result {
         let failure = BenchmarkFailure::new("startup", "qualification-arm-enable-failed", error);
         let _ = crate::gpu_native_real_benchmark::shutdown_runtime(
@@ -1055,6 +1069,7 @@ async fn run_physical_install_arm_inner(
     };
     if execution_failure.is_none() {
         for index in 0..FROZEN_WARMUP_RUNS {
+            if let Some(observer) = &mapped_observer { observer.begin_request(false, index); }
             let result = crate::with_progress_timeout(
                 format!("{mode_name} {arm_name} warmup {index}"),
                 args.progress_watchdog,
@@ -1176,6 +1191,7 @@ async fn run_physical_install_arm_inner(
 
     if execution_failure.is_none() {
         for index in 0..FROZEN_MEASURED_RUNS {
+            if let Some(observer) = &mapped_observer { observer.begin_request(true, index); }
             let result = crate::with_progress_timeout(
                 format!("{mode_name} {arm_name} measured {index}"),
                 args.progress_watchdog,

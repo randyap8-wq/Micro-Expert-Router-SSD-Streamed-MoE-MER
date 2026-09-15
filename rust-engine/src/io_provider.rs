@@ -421,7 +421,7 @@ impl From<HardwareFailure> for io::Error {
 
 /// Source-upload proof activity only. Read/reset at an idle qualification boundary;
 /// relaxed atomic loads are not a coherent snapshot while proofs are in flight.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SourceUploadFdProofSnapshot {
     pub(crate) source_upload_fd_proof_requests: u64,
     pub(crate) source_upload_fd_proof_hits: u64,
@@ -1477,8 +1477,10 @@ impl NvmeStorage {
         &self,
         ids: &[u32],
         destinations: &mut [&mut [u8]],
+        observation: Option<&mut crate::gpu_native_mapped_lock::RawBatch>,
     ) -> io::Result<usize> {
-        if self.is_packed()
+        if observation.as_ref().is_some_and(|_| ids.len() > crate::gpu_native_mapped_lock::WIDTH)
+            || self.is_packed()
             || ids.len() != destinations.len()
             || self.cfg.expert_size != 2_658_304
             || self.cfg.block_align != 4096
@@ -1505,18 +1507,37 @@ impl NvmeStorage {
             self.prove_source_upload_fd(id, file)?;
         }
         let id_vec: Vec<u32> = ids.to_vec();
+        // Exclusive slots are prepared before donation; None allocates no storage.
+        let mut timing_slots = observation.into_iter().flat_map(|o| o.reads.iter_mut())
+            .map(Some).chain(std::iter::repeat_with(|| None));
         tokio::task::block_in_place(|| -> io::Result<usize> {
             if id_vec.len() == 1 {
-                return self.read_at_with_retries(&files[0], id_vec[0], 0, destinations[0]);
+                let timing = timing_slots.next().flatten();
+                let start = timing.as_ref().map(|_| std::time::Instant::now());
+                let result = self.read_at_with_retries(&files[0], id_vec[0], 0, destinations[0]);
+                let end = timing.as_ref().map(|_| std::time::Instant::now());
+                if let Some(slot) = timing {
+                    *slot = crate::gpu_native_mapped_lock::RawRead { start, end, success: result.is_ok() };
+                }
+                return result;
             }
             let results: Vec<io::Result<usize>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = files
                     .iter()
                     .zip(destinations.iter_mut())
                     .zip(id_vec.iter())
-                    .map(|((file, dst), &id)| {
+                    .zip(timing_slots)
+                    .map(|(((file, dst), &id), timing)| {
                         let dst: &mut [u8] = dst;
-                        scope.spawn(move || self.read_at_with_retries(file, id, 0, dst))
+                        scope.spawn(move || {
+                            let start = timing.as_ref().map(|_| std::time::Instant::now());
+                            let result = self.read_at_with_retries(file, id, 0, dst);
+                            let end = timing.as_ref().map(|_| std::time::Instant::now());
+                            if let Some(slot) = timing {
+                                *slot = crate::gpu_native_mapped_lock::RawRead { start, end, success: result.is_ok() };
+                            }
+                            result
+                        })
                     })
                     .collect();
                 handles
@@ -3577,13 +3598,13 @@ mod source_to_upload_tests {
         for (offset, len) in [(0, 2_658_303), (1, 2_658_304), (0, 2_654_208)] {
             let mut destinations = vec![&mut buffer.as_mut_slice()[offset..offset + len]];
             let error = storage
-                .read_experts_batch_into_aligned_slices(&[999], &mut destinations)
+                .read_experts_batch_into_aligned_slices(&[999], &mut destinations, None)
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         }
         let error = storage
-            .read_experts_batch_into_aligned_slices(&[1], &mut [])
+            .read_experts_batch_into_aligned_slices(&[1], &mut [], None)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -3873,7 +3894,7 @@ mod source_to_upload_tests {
         let mut destination = AlignedBuffer::new(full, 4096);
         for _ in 0..2 {
             assert_eq!(
-                s.read_experts_batch_into_aligned_slices(&[17], &mut [destination.as_mut_slice()])
+                s.read_experts_batch_into_aligned_slices(&[17], &mut [destination.as_mut_slice()], None)
                     .await
                     .unwrap(),
                 full
@@ -3883,7 +3904,7 @@ mod source_to_upload_tests {
         proof_counts(&s, 2, 1, 1, 0);
         std::fs::write(path.join("expert_18.bin"), vec![0; full + 4096]).unwrap();
         assert_eq!(
-            s.read_experts_batch_into_aligned_slices(&[18], &mut [destination.as_mut_slice()])
+            s.read_experts_batch_into_aligned_slices(&[18], &mut [destination.as_mut_slice()], None)
                 .await
                 .unwrap_err()
                 .kind(),
@@ -3891,5 +3912,71 @@ mod source_to_upload_tests {
         );
         proof_counts(&s, 3, 1, 2, 1);
         std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hma1f_wrapper_tests {
+    use super::*;
+    use crate::aligned_buffer::AlignedBuffer;
+    use crate::gpu_native_mapped_lock::{RawBatch, WIDTH};
+    const FULL:usize=2_658_304;
+    struct Fixture { path:PathBuf, storage:NvmeStorage }
+    impl Fixture {
+        fn new(short:bool)->Self {
+            let path=std::env::temp_dir().join(format!("hma1f-portable-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            std::fs::create_dir(&path).unwrap();
+            for id in 0..WIDTH {std::fs::write(path.join(format!("expert_{id}.bin")),vec![id as u8;FULL]).unwrap();}
+            let storage=NvmeStorage::new(StorageConfig{base_path:path.clone(),expert_size:FULL,block_align:4096,use_direct_io:false,num_experts_per_layer:None}).unwrap();
+            // Portable buffered fixture only. Seed the existing test proof seam;
+            // this does not exercise or claim O_DIRECT/hardware capability.
+            for id in 0..WIDTH as u32 {
+                let file=storage.fd_for(id).unwrap();
+                storage.prove_source_upload_fd_with(id,&file,|f|validate_source_upload_fd(FULL as u64,||Ok(true),||Ok(f.metadata()?.len()))).unwrap();
+            }
+            if short {for id in 0..WIDTH {std::fs::OpenOptions::new().write(true).open(path.join(format!("expert_{id}.bin"))).unwrap().set_len(4096+id as u64).unwrap();}}
+            storage.reset_source_upload_fd_proof_telemetry();
+            Self{path,storage}
+        }
+    }
+    impl Drop for Fixture {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.path);}}
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn hma1f_observer_disabled_and_enabled_identical_work_bytes_proof(){
+        for width in [1,2,WIDTH] {
+            let f=Fixture::new(false);let ids:Vec<_>=(0..width as u32).rev().collect();let mut observations=Vec::new();
+            for enabled in [false,true] {
+                f.storage.reset_source_upload_fd_proof_telemetry();
+                let mut buffers:Vec<_>=(0..width).map(|_|AlignedBuffer::new(FULL,4096)).collect();
+                let mut destinations:Vec<_>=buffers.iter_mut().map(|b|b.as_mut_slice()).collect();let mut raw=RawBatch::default();let start=std::time::Instant::now();
+                let result=f.storage.read_experts_batch_into_aligned_slices(&ids,&mut destinations,enabled.then_some(&mut raw)).await.unwrap();let end=std::time::Instant::now();
+                assert_eq!(result,width*FULL);for (&id,dst) in ids.iter().zip(&destinations){assert!(dst.iter().all(|&b|b==id as u8));}
+                observations.push(f.storage.source_upload_fd_proof_snapshot());
+                if enabled {let t=raw.reconstruct(width,start,end).unwrap();assert!(t.reads.iter().all(|r|r.success));assert_eq!(raw.reads.iter().filter(|r|r.start.is_some()).count(),width);assert_eq!(raw.reads.iter().filter(|r|r.end.is_some()).count(),width);} else {assert!(raw.reads.iter().all(|r|r.start.is_none()&&r.end.is_none()));}
+            }
+            assert_eq!(observations[0],observations[1]);assert_eq!(observations[0].source_upload_fd_proof_hits,width as u64);
+        }
+    }
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn hma1f_observer_preserves_first_error_by_source_slot(){
+        for width in [1,2,WIDTH] {
+            let ids:Vec<_>=(0..width as u32).rev().collect();let mut errors=Vec::new();
+            for enabled in [false,true] {
+                let f=Fixture::new(true);let mut buffers:Vec<_>=(0..width).map(|_|AlignedBuffer::new(FULL,4096)).collect();let mut destinations:Vec<_>=buffers.iter_mut().map(|b|b.as_mut_slice()).collect();let mut raw=RawBatch::default();
+                let result=f.storage.read_experts_batch_into_aligned_slices(&ids,&mut destinations,enabled.then_some(&mut raw)).await.unwrap_err();
+                assert_eq!(result.kind(),io::ErrorKind::UnexpectedEof);assert!(result.to_string().contains(&format!("expert {}",ids[0])));errors.push(result.to_string());
+                if enabled {assert!(raw.reads[..width].iter().all(|r|r.start.is_some()&&r.end.is_some()&&!r.success));}
+            }
+            assert_eq!(errors[0],errors[1]);
+        }
+    }
+    #[test]
+    fn hma1f_worker_topology_and_arguments_are_protected(){
+        let src=include_str!("io_provider.rs");let body=src.split("pub(crate) async fn read_experts_batch_into_aligned_slices(").nth(1).unwrap().split("/// **Tier 2.**").next().unwrap();
+        for (pattern,n) in [("tokio::task::block_in_place",1),("std::thread::scope",1),("scope.spawn",1),(".join()",1),("std::time::Instant::now()",4)] {assert_eq!(body.matches(pattern).count(),n,"{pattern}");}
+        assert!(body.contains("self.read_at_with_retries(&files[0], id_vec[0], 0, destinations[0])"));assert!(body.contains("self.read_at_with_retries(file, id, 0, dst)"));
+        assert!(body.find("self.fd_for(id)").unwrap()<body.find("block_in_place").unwrap());assert!(body.find("self.prove_source_upload_fd(id, file)").unwrap()<body.find("block_in_place").unwrap());
+        let worker=body.split("scope.spawn(move || {").nth(1).unwrap().split(".collect();").next().unwrap();
+        for p in ["Mutex","RwLock","channel","Vec","HashMap","tracing", "mlock", "munlock", "/proc", "Atomic", "RawRead::default", "attempt_starts"] {assert!(!worker.contains(p),"worker contains {p}");}
+        assert!(!body.contains("gpu_native_source_order_straggler_production"));
     }
 }

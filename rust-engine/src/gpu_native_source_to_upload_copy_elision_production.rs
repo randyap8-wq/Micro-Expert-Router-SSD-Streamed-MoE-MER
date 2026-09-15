@@ -1,5 +1,8 @@
 //! Qualification-only real-inference A/B of single-read source/upload fusion.
 //! Reuses physical-install workload, isolated runtime, observation and teardown.
+#[path = "gpu_native_source_mapped_lock_production.rs"]
+pub(crate) mod mapped_lock;
+
 use super::*;
 use crate::engine::GpuNativePhysicalInstallConcurrencyQualificationSnapshot as Snapshot;
 
@@ -776,7 +779,7 @@ mod tests {
         (s, p)
     }
 
-    fn source_fixture() -> ProductionDemandSourceSnapshot {
+    pub(super) fn source_fixture() -> ProductionDemandSourceSnapshot {
         ProductionDemandSourceSnapshot {
             ordinary_production_path_exercised: true,
             production_source_sets: 0,
@@ -805,7 +808,7 @@ mod tests {
         }
     }
 
-    fn fixture(
+    pub(super) fn fixture(
         arm: Arm,
     ) -> (
         Snapshot,

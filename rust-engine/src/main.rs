@@ -157,6 +157,7 @@ pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
 pub(crate) mod gpu_native_source_to_upload_copy_elision;
 pub(crate) mod gpu_native_source_upload;
+mod gpu_native_mapped_lock;
 pub(crate) mod gpu_native_spanish_first_token_attribution;
 pub(crate) mod gpu_native_v2_holdout_failure_attribution;
 
@@ -1066,6 +1067,38 @@ enum Cmd {
         iterations: usize,
         #[arg(long, default_value_t = 3)]
         warmup_iterations: usize,
+    },
+
+    /// HMA-1F capability only: one mapped L4/Vulkan upload buffer; no model/storage/inference.
+    ProbeGpuNativeMappedDestinationLock {
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+    /// Frozen HMA-1F four-arm mapped baseline/locked crossover, NVIDIA L4/Vulkan.
+    /// Creates a bound complete transcript; hardware execution requires separate authorization.
+    QualifyGpuNativeSourceMappedLockProduction {
+        #[arg(long, default_value = "/home/randyap8/slice11-qwen3-coder-gpu-native.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+        #[arg(long)]
+        transcript_out: PathBuf,
+    },
+    /// Offline HMA-1F authority, work, lock and exact integer classifier reconstruction.
+    AuditGpuNativeSourceMappedLockProduction {
+        #[arg(long)]
+        raw_report: PathBuf,
+        #[arg(long)]
+        transcript: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+    #[command(name = "hma1f-worker-internal", hide = true)]
+    Hma1fWorkerInternal {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
     },
 
     /// Standalone full-file O_DIRECT into mapped WGPU upload feasibility.
@@ -2047,6 +2080,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalZeroFillProduction { config, .. }
         | Cmd::QualifyGpuNativeSourceToUploadCopyElisionProduction { config, .. }
+        | Cmd::Hma1fWorkerInternal { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2071,6 +2105,18 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::parse();
+    // HMA-1F offline audit, capability probe and transcript launcher must dispatch
+    // before logging, config, affinity, worker pools, model or runtime construction.
+    match &cli.cmd {
+        Cmd::AuditGpuNativeSourceMappedLockProduction { raw_report, transcript, report_out } =>
+            return crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_lock::audit_command(raw_report, transcript, report_out),
+        Cmd::ProbeGpuNativeMappedDestinationLock { report_out } =>
+            return crate::gpu_native_mapped_lock::probe_command(report_out),
+        Cmd::QualifyGpuNativeSourceMappedLockProduction { config, report_out, transcript_out } =>
+            return crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_lock::launch(config, report_out, transcript_out, &raw_args),
+        _ => {}
+    }
+
     let worker_protocol_stdout = matches!(
         cli.cmd,
         Cmd::GreedyParityHybridWorkerInternal { .. }
@@ -2622,6 +2668,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
+        Cmd::Hma1fWorkerInternal { config, report_out } => {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_lock::run_worker(
+                crate::gpu_native_physical_install_staging::CommandArgs { config, expected_adapter_name: "NVIDIA L4".into(), report_out, progress_watchdog }
+            ))
+        }
+        Cmd::AuditGpuNativeSourceMappedLockProduction { .. }
+        | Cmd::ProbeGpuNativeMappedDestinationLock { .. }
+        | Cmd::QualifyGpuNativeSourceMappedLockProduction { .. } => unreachable!("HMA-1F early dispatch"),
         Cmd::QualifyGpuNativeSourceToUploadCopyElisionProduction {
             config,
             expected_adapter_name,
