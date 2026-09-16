@@ -553,10 +553,17 @@ impl State {
         let result = storage
             .read_experts_batch_into_aligned_slices(ids, &mut destinations, raw.as_mut())
             .await;
-        let stopped = Instant::now();
+        let stopped = pin_observer.map(|_| Instant::now());
         let pin_cleanup = pin_guard.as_mut().map(|g| g.finish()).transpose();
         drop(pin_guard);
-        self.add(|m| &mut m.fused_source_us, if pin_observer.is_some() { stopped.duration_since(started).as_micros() as u64 } else { elapsed(started) });
+        if let Some(stopped) = stopped {
+            self.add(
+                |m| &mut m.fused_source_us,
+                stopped.duration_since(started).as_micros() as u64,
+            );
+        } else {
+            self.add(|m| &mut m.fused_source_us, elapsed(started));
+        }
         let lock_stopped = observer.map(|_| Instant::now());
         let unlock = guard.as_mut().map(|g| g.release()).transpose();
         drop(guard); // Includes a cleanup retry on unlock failure; authority still fails.
@@ -570,6 +577,7 @@ impl State {
         }
         unlock?;
         if let Some(o) = pin_observer {
+            let stopped = stopped.expect("pin observer always captures the helper stop timestamp");
             let caller_ns = stopped.duration_since(started).as_nanos() as u64;
             let timing = raw.as_ref().unwrap().reconstruct(ids.len(), started, stopped);
             let evidence = pin_evidence.unwrap();

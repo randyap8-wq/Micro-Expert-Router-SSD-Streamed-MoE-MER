@@ -13,6 +13,8 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 BASE = '29d0ce6d2085a9e0dff4680b91e4aff93f8ace8b'
 TREE = '69ff4937d7fe7c4541c07c505b0c5da7b5f4ab69'
+ACCEPTED = '3069ceb9d46e072304180c18e2c29951491f31fb'
+ACCEPTED_TREE = '01bf945d6427b44f752b5117485e4b38edef1df6'
 PREFIX = 'rust-engine/src/'
 EXISTING = {PREFIX+p for p in ['main.rs', 'engine.rs', 'gpu_native_source_upload.rs',
     'gpu_native_physical_install_staging.rs', 'gpu_native_source_to_upload_copy_elision_production.rs',
@@ -58,10 +60,16 @@ def prove(child=None):
     def body(name, fn):
         return function(read(PREFIX+name), fn).decode()
     check('exact base tree', git('rev-parse', BASE+'^{tree}').decode().strip() == TREE)
+    check('accepted implementation remains exact child of frozen base', git('rev-list', '--parents', '-n', '1', ACCEPTED).decode().split() == [ACCEPTED, BASE])
+    check('accepted implementation tree unchanged', git('rev-parse', ACCEPTED+'^{tree}').decode().strip() == ACCEPTED_TREE)
     if child:
-        check('exact single child of frozen base', git('rev-list', '--parents', '-n', '1', child).decode().split() == [child, BASE])
+        check('exact single repair child of accepted implementation', git('rev-list', '--parents', '-n', '1', child).decode().split() == [child, ACCEPTED])
     else:
-        check('worktree HEAD remains exact base before commit', git('rev-parse', 'HEAD').decode().strip() == BASE)
+        check('worktree HEAD remains accepted implementation before repair commit', git('rev-parse', 'HEAD').decode().strip() == ACCEPTED)
+    repair_changed = set(git('diff', '--name-only', ACCEPTED, *([child] if child else [])).decode().splitlines())
+    if not child:
+        repair_changed.update(git('ls-files', '--others', '--exclude-standard').decode().splitlines())
+    check('repair changes only source upload and this proof', repair_changed == {PREFIX+'gpu_native_source_upload.rs', 'scripts/hma1fb-pin-source-proof.py'})
     changed = set(git('diff', '--name-only', BASE, *([child] if child else [])).decode().splitlines())
     if not child:
         changed.update(git('ls-files', '--others', '--exclude-standard').decode().splitlines())
@@ -114,13 +122,38 @@ def prove(child=None):
     check('unregister failure cannot bypass ring drop', 'unregister.and(cleanup)' in finish and '.record(ring.unregister())?' not in finish)
     check('unwind fallback explicit cleanup','if !self.finished' in pin and 'let _ = self.finish();' in pin)
     check('one unchanged source helper call',source.count('.read_experts_batch_into_aligned_slices(')==1)
-    timed=source.split('let started = Instant::now();',1)[1].split('let stopped = Instant::now();',1)[0]
+    pin_stop='let stopped = pin_observer.map(|_| Instant::now());'
+    source_compact=compact(source)
+    timed=source.partition('let started = Instant::now();')[2].partition(pin_stop)[0]
     expected='let result = storage.read_experts_batch_into_aligned_slices(ids, &mut destinations, raw.as_mut()).await;'
     check('only existing helper between start and stop',compact(timed)==compact(expected))
-    ordered=['let mut leases','let mut views','let offsets','let mut destinations','PinGuard::<','let started = Instant::now();','let stopped = Instant::now();','g.finish()','drop(pin_guard)','drop(destinations)','self.materialize_source_payload','drop(views)','lease.unmap()']
+    check('no unconditional HMA-1F-B stop timestamp',not re.search(r'let\s+stopped\s*=\s*Instant\s*::\s*now\s*\(\s*\)\s*;', source))
+    check('pin stop conditional only on pin observer',source_compact.count(compact(pin_stop))==1)
+    check('conditional pin stop immediately after unchanged helper',compact(expected+pin_stop) in source_compact)
+    ordered=['let mut leases','let mut views','let offsets','let mut destinations','PinGuard::<','let started = Instant::now();',pin_stop,'g.finish()','drop(pin_guard)','drop(destinations)','self.materialize_source_payload','drop(views)','lease.unmap()']
     positions=[{'step':s,'offset':source.find(s)} for s in ordered]
     check('mapped lifetime and timing boundaries',all(x['offset']>=0 for x in positions) and [x['offset'] for x in positions]==sorted(x['offset'] for x in positions))
-    check('unregister immediately after stop before accounting',compact(source).split('letstopped=Instant::now();',1)[1].startswith('letpin_cleanup=pin_guard.as_mut().map(|g|g.finish()).transpose();'))
+    check('unregister immediately after stop before accounting',source_compact.partition(compact(pin_stop))[2].startswith('letpin_cleanup=pin_guard.as_mut().map(|g|g.finish()).transpose();'))
+    accounting='''if let Some(stopped) = stopped {
+        self.add(|m| &mut m.fused_source_us, stopped.duration_since(started).as_micros() as u64,);
+    } else {
+        self.add(|m| &mut m.fused_source_us, elapsed(started));
+    }
+    let lock_stopped = observer.map(|_| Instant::now());'''
+    check('pin accounting uses captured helper interval and disabled path uses historical elapsed',compact(accounting) in source_compact)
+    post_helper=source_compact.partition(compact(expected))[2].partition('letunlock=')[0]
+    cleanup='let pin_cleanup = pin_guard.as_mut().map(|g| g.finish()).transpose(); drop(pin_guard);'
+    check('post-helper sequence contains only conditional stop cleanup accounting and historical lock stop',post_helper==compact(pin_stop+cleanup+accounting))
+    before_source=function(old(PREFIX+'gpu_native_source_upload.rs'),'read_source').decode()
+    historical='self.add(|m| &mut m.fused_source_us, elapsed(started)); let stopped = observer.map(|_| Instant::now());'
+    check('disabled accounting then lock stop equals frozen historical sequence',compact(historical) in compact(before_source) and compact('else { '+historical.replace('let stopped = observer', '} let lock_stopped = observer')) in source_compact)
+    pin_record=source.partition('if let Some(o) = pin_observer {')[2].partition('let evidence = pin_evidence.unwrap();')[0]
+    expected_record='''let stopped = stopped.expect("pin observer always captures the helper stop timestamp");
+        let caller_ns = stopped.duration_since(started).as_nanos() as u64;
+        let timing = raw.as_ref().unwrap().reconstruct(ids.len(), started, stopped);'''
+    check('pin record caller and RawBatch use the same necessarily present conditional stop',compact(pin_record)==compact(expected_record))
+    post_stop=source.partition(pin_stop)[2].partition('drop(destinations);')[0]
+    check('no later synthesized pin timestamp',compact(post_stop).count('Instant::now()')==1 and 'letlock_stopped=observer.map(|_|Instant::now());' in compact(post_stop))
     check('read errors handled after explicit cleanup',source.find('g.finish()')<source.find('result.as_ref().err()'))
     check('shared original RawBatch timing','crate::gpu_native_mapped_lock::RawBatch::default' in source)
     check('pin observer absent in all constructors',upload.count('mapped_pin_observer: std::sync::OnceLock::new()')==2)
