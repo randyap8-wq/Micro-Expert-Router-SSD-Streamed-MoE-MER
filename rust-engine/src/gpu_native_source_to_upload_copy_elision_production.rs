@@ -3,6 +3,9 @@
 #[path = "gpu_native_source_mapped_lock_production.rs"]
 pub(crate) mod mapped_lock;
 
+#[path = "gpu_native_source_mapped_pin_production.rs"]
+pub(crate) mod mapped_pin;
+
 use super::*;
 use crate::engine::GpuNativePhysicalInstallConcurrencyQualificationSnapshot as Snapshot;
 

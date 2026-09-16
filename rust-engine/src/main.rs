@@ -158,6 +158,7 @@ pub(crate) mod gpu_native_semantic_parity_v2;
 pub(crate) mod gpu_native_source_to_upload_copy_elision;
 pub(crate) mod gpu_native_source_upload;
 mod gpu_native_mapped_lock;
+mod gpu_native_mapped_pin;
 mod gpu_native_mapped_fixed_buffer;
 mod gpu_native_mapped_vma;
 pub(crate) mod gpu_native_spanish_first_token_attribution;
@@ -1107,6 +1108,33 @@ enum Cmd {
     },
     #[command(name = "hma1f-worker-internal", hide = true)]
     Hma1fWorkerInternal {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// Frozen HMA-1F-B four-arm mapped baseline/pinned crossover, NVIDIA L4/Vulkan.
+    /// Creates a bound complete transcript; hardware execution requires separate authorization.
+    QualifyGpuNativeSourceMappedPinProduction {
+        #[arg(long, default_value = "/home/randyap8/slice11-qwen3-coder-gpu-native.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+        #[arg(long)]
+        transcript_out: PathBuf,
+    },
+    /// Offline HMA-1F-B authority, work, pin and exact integer classifier reconstruction.
+    AuditGpuNativeSourceMappedPinProduction {
+        #[arg(long)]
+        raw_report: PathBuf,
+        #[arg(long)]
+        transcript: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+    #[command(name = "hma1fb-worker-internal", hide = true)]
+    Hma1fbWorkerInternal {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -2120,6 +2148,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HMA-1F offline audit, probes and transcript launcher must dispatch
     // before logging, config, affinity, worker pools, model or runtime construction.
     match &cli.cmd {
+        Cmd::AuditGpuNativeSourceMappedPinProduction { raw_report, transcript, report_out } =>
+            return crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_pin::audit_command(raw_report, transcript, report_out),
+        Cmd::QualifyGpuNativeSourceMappedPinProduction { config, report_out, transcript_out } =>
+            return crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_pin::launch(config, report_out, transcript_out, &raw_args),
+        Cmd::Hma1fbWorkerInternal { .. } => crate::gpu_native_mapped_pin::require_platform()?,
         Cmd::ProbeGpuNativeMappedDestinationFixedBuffer { report_out } =>
             return crate::gpu_native_mapped_fixed_buffer::probe_command(report_out),
         Cmd::ProbeGpuNativeMappedDestinationVma { report_out } =>
@@ -2684,6 +2717,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
+        Cmd::Hma1fbWorkerInternal { config, report_out } => {
+            crate::gpu_native_mapped_pin::require_platform()?;
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_pin::run_worker(
+                crate::gpu_native_physical_install_staging::CommandArgs { config, expected_adapter_name: "NVIDIA L4".into(), report_out, progress_watchdog }
+            ))
+        }
+        Cmd::AuditGpuNativeSourceMappedPinProduction { .. }
+        | Cmd::QualifyGpuNativeSourceMappedPinProduction { .. } => unreachable!("HMA-1F-B early dispatch"),
         Cmd::Hma1fWorkerInternal { config, report_out } => {
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
             rt.block_on(crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_lock::run_worker(

@@ -147,6 +147,8 @@ pub(crate) struct State {
     pub(crate) arm: Arm,
     production_owned: bool,
     mapped_lock_observer: std::sync::OnceLock<Arc<crate::gpu_native_mapped_lock::Observer>>,
+    mapped_pin_observer: std::sync::OnceLock<Arc<crate::gpu_native_mapped_pin::Observer>>,
+    qualification_observer_install: Mutex<()>,
     production_demand_gate: Arc<Semaphore>,
     ring: Option<Ring>,
     pub(crate) metrics: Mutex<Metrics>,
@@ -219,6 +221,8 @@ impl State {
             arm,
             production_owned,
             mapped_lock_observer: std::sync::OnceLock::new(),
+            mapped_pin_observer: std::sync::OnceLock::new(),
+            qualification_observer_install: Mutex::new(()),
             production_demand_gate: Arc::new(Semaphore::new(1)),
             ring,
             metrics: Mutex::new(Metrics::default()),
@@ -245,6 +249,8 @@ impl State {
             arm,
             production_owned,
             mapped_lock_observer: std::sync::OnceLock::new(),
+            mapped_pin_observer: std::sync::OnceLock::new(),
+            qualification_observer_install: Mutex::new(()),
             production_demand_gate: Arc::new(Semaphore::new(1)),
             ring: None,
             metrics: Mutex::new(Metrics::default()),
@@ -256,10 +262,32 @@ impl State {
     }
 
     pub(crate) fn enable_mapped_lock_observer(&self, observer: Arc<crate::gpu_native_mapped_lock::Observer>) -> Result<(), String> {
+        let _install = self.qualification_observer_install.lock();
+        if self.mapped_pin_observer.get().is_some() { return Err("pin observer already installed".into()); }
         if !self.production_owned || self.arm != Arm::Treatment || self.active_leases() != 0 || !self.pending.lock().is_empty() {
             return Err("HMA-1F requires idle production-owned mapped treatment".into());
         }
         self.mapped_lock_observer.set(observer).map_err(|_| "HMA-1F observer already installed".into())
+    }
+
+    pub(crate) fn enable_mapped_pin_observer(
+        &self,
+        observer: Arc<crate::gpu_native_mapped_pin::Observer>,
+    ) -> Result<(), String> {
+        let _install = self.qualification_observer_install.lock();
+        if self.mapped_lock_observer.get().is_some() {
+            return Err("lock observer already installed".into());
+        }
+        if !self.production_owned
+            || self.arm != Arm::Treatment
+            || self.active_leases() != 0
+            || !self.pending.lock().is_empty()
+        {
+            return Err("HMA-1F-B requires idle production-owned mapped treatment".into());
+        }
+        self.mapped_pin_observer
+            .set(observer)
+            .map_err(|_| "HMA-1F-B observer already installed".into())
     }
 
     pub(crate) fn is_production_owned(&self) -> bool {
@@ -439,6 +467,9 @@ impl State {
         buffers: Vec<PooledBuffer>,
         logical: &GpuExpertCache,
     ) -> Result<Vec<Arc<ExpertResident>>, String> {
+        if self.mapped_pin_observer.get().is_some_and(|o| o.failed()) {
+            return Err("HMA-1F-B observer is failed closed; no subsequent source read authorized".into());
+        }
         if self.mapped_lock_observer.get().is_some_and(|o| o.failed()) {
             return Err("HMA-1F observer is failed closed; no subsequent source read authorized".into());
         }
@@ -486,7 +517,10 @@ impl State {
         let observer = self.mapped_lock_observer.get();
         let mut evidence = observer.map(|o| crate::gpu_native_mapped_lock::LockEvidence::new(o.mode,
             destinations.iter().map(|d| crate::gpu_native_mapped_lock::Range { pointer: d.as_ptr() as usize, length: d.len() }).collect()));
-        let mut raw = observer.map(|_| crate::gpu_native_mapped_lock::RawBatch::default());
+        let pin_observer = self.mapped_pin_observer.get();
+        let mut pin_evidence = pin_observer.map(|o| crate::gpu_native_mapped_pin::PinEvidence::new(o.mode,
+            destinations.iter().map(|d| crate::gpu_native_mapped_pin::Range::new(d.as_ptr() as usize, d.len())).collect()));
+        let mut raw = (observer.is_some() || pin_observer.is_some()).then(crate::gpu_native_mapped_lock::RawBatch::default);
         let mut guard = match (observer, evidence.as_mut()) {
             (Some(o), Some(e)) => {
                 // SAFETY: destinations borrow live WGPU views; guard is dropped
@@ -501,23 +535,53 @@ impl State {
             }
             _ => None,
         };
+        let mut pin_guard = match (pin_observer, pin_evidence.as_mut()) {
+            (Some(o), Some(e)) => {
+                // SAFETY: exact destination slices borrow live views. The ring
+                // is closed before destinations, views, or upload leases drop.
+                let acquired = unsafe { crate::gpu_native_mapped_pin::PinGuard::<crate::gpu_native_mapped_pin::SystemRegistration>::acquire(e) };
+                if acquired.is_err() {
+                    let error = acquired.err().unwrap();
+                    o.record(ids, 0, 0, None, pin_evidence.as_ref().unwrap().clone(), Some(error.clone()));
+                    return Err(error);
+                }
+                Some(acquired.unwrap())
+            }
+            _ => None,
+        };
         let started = Instant::now();
         let result = storage
             .read_experts_batch_into_aligned_slices(ids, &mut destinations, raw.as_mut())
             .await;
-        self.add(|m| &mut m.fused_source_us, elapsed(started));
-        let stopped = observer.map(|_| Instant::now());
+        let stopped = Instant::now();
+        let pin_cleanup = pin_guard.as_mut().map(|g| g.finish()).transpose();
+        drop(pin_guard);
+        self.add(|m| &mut m.fused_source_us, if pin_observer.is_some() { stopped.duration_since(started).as_micros() as u64 } else { elapsed(started) });
+        let lock_stopped = observer.map(|_| Instant::now());
         let unlock = guard.as_mut().map(|g| g.release()).transpose();
         drop(guard); // Includes a cleanup retry on unlock failure; authority still fails.
         if let Some(o) = observer {
-            let caller_ns = stopped.unwrap().duration_since(started).as_nanos() as u64;
-            let timing = raw.as_ref().unwrap().reconstruct(ids.len(), started, stopped.unwrap());
+            let caller_ns = lock_stopped.unwrap().duration_since(started).as_nanos() as u64;
+            let timing = raw.as_ref().unwrap().reconstruct(ids.len(), started, lock_stopped.unwrap());
             let failure = result.as_ref().err().map(ToString::to_string)
                 .or_else(|| unlock.as_ref().err().cloned()).or_else(|| timing.as_ref().err().cloned());
             o.record(ids, result.as_ref().copied().unwrap_or(0), caller_ns, timing.ok(), evidence.unwrap(), failure.clone());
             if let Some(error) = failure { return Err(error); }
         }
         unlock?;
+        if let Some(o) = pin_observer {
+            let caller_ns = stopped.duration_since(started).as_nanos() as u64;
+            let timing = raw.as_ref().unwrap().reconstruct(ids.len(), started, stopped);
+            let evidence = pin_evidence.unwrap();
+            let authority = evidence.validate(o.mode, ids.len());
+            let failure = result.as_ref().err().map(ToString::to_string)
+                .or_else(|| pin_cleanup.as_ref().err().cloned())
+                .or_else(|| authority.err()).or_else(|| timing.as_ref().err().cloned())
+                .or_else(|| (result.as_ref().copied().ok() != Some(ids.len() * FULL)).then(|| "short direct source set".into()));
+            o.record(ids, result.as_ref().copied().unwrap_or(0), caller_ns, timing.ok(), evidence, failure.clone());
+            if let Some(error) = failure { return Err(error); }
+        }
+        pin_cleanup?;
         drop(destinations);
         let bytes = result.map_err(|e| {
             self.add(|m| &mut m.source_failures, 1);
@@ -799,6 +863,70 @@ fn checked_payload(source: &[u8]) -> Result<&[u8], String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hma1fb_observers_absent_and_reject_nonproduction_or_control() {
+        for state in [
+            State::cpu_test_state(Arm::Control),
+            State::cpu_test_state(Arm::Treatment),
+            State::cpu_test_state_with_ownership(Arm::Control, true),
+        ] {
+            assert!(state.mapped_pin_observer.get().is_none());
+            assert!(state.mapped_lock_observer.get().is_none());
+            assert!(state
+                .enable_mapped_pin_observer(Arc::new(crate::gpu_native_mapped_pin::Observer::new(
+                    crate::gpu_native_mapped_pin::Mode::MappedPinned
+                )))
+                .is_err());
+        }
+    }
+    #[test]
+    fn hma1fb_pin_and_lock_observers_exclude_both_orders_and_duplicates() {
+        use crate::gpu_native_mapped_pin::{Mode, Observer};
+        let state = State::cpu_test_production_state();
+        assert!(state.mapped_pin_observer.get().is_none());
+        assert!(state.mapped_lock_observer.get().is_none());
+        state
+            .enable_mapped_pin_observer(Arc::new(Observer::new(Mode::MappedPinned)))
+            .unwrap();
+        assert!(state
+            .enable_mapped_pin_observer(Arc::new(Observer::new(Mode::MappedBaseline)))
+            .is_err());
+        assert!(state
+            .enable_mapped_lock_observer(Arc::new(crate::gpu_native_mapped_lock::Observer::new(
+                crate::gpu_native_mapped_lock::Mode::MappedBaseline
+            )))
+            .is_err());
+        let state = State::cpu_test_production_state();
+        state
+            .enable_mapped_lock_observer(Arc::new(crate::gpu_native_mapped_lock::Observer::new(
+                crate::gpu_native_mapped_lock::Mode::MappedBaseline,
+            )))
+            .unwrap();
+        assert!(state
+            .enable_mapped_pin_observer(Arc::new(Observer::new(Mode::MappedPinned)))
+            .is_err());
+    }
+    #[test]
+    fn hma1fb_concurrent_observer_installation_is_mutually_exclusive() {
+        let state = State::cpu_test_production_state();
+        let successes = std::thread::scope(|scope| {
+            let pin = scope.spawn(|| {
+                state.enable_mapped_pin_observer(Arc::new(crate::gpu_native_mapped_pin::Observer::new(
+                    crate::gpu_native_mapped_pin::Mode::MappedPinned,
+                )))
+            });
+            let lock = scope.spawn(|| {
+                state.enable_mapped_lock_observer(Arc::new(
+                    crate::gpu_native_mapped_lock::Observer::new(
+                        crate::gpu_native_mapped_lock::Mode::MappedBaseline,
+                    ),
+                ))
+            });
+            usize::from(pin.join().unwrap().is_ok()) + usize::from(lock.join().unwrap().is_ok())
+        });
+        assert_eq!(successes, 1);
+    }
     use super::*;
     #[test]
     fn source_upload_fresh_source_materializes_logical_host_payload_exactly_once() {

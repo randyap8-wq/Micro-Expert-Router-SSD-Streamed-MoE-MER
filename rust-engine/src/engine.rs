@@ -5082,6 +5082,24 @@ impl Engine {
         state.source_upload.as_ref().ok_or("missing mapped upload state")?.enable_mapped_lock_observer(observer)
     }
 
+    /// HMA-1F-B only: called after enabling source/upload qualification on an idle isolated runtime.
+    pub(crate) fn enable_mapped_pin_observer(
+        &self,
+        observer: Arc<crate::gpu_native_mapped_pin::Observer>,
+    ) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() || self.core.cache.reserved_slots() != 0 {
+            return Err("HMA-1F-B observer requires idle runtime".into());
+        }
+        let state = self
+            .gpu_native_demand_source_qualification()
+            .ok_or("missing source/upload qualification")?;
+        state
+            .source_upload
+            .as_ref()
+            .ok_or("missing mapped upload state")?
+            .enable_mapped_pin_observer(observer)
+    }
+
     pub(crate) fn gpu_native_source_upload_snapshot(
         &self,
     ) -> Option<crate::gpu_native_source_upload::Snapshot> {
