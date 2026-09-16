@@ -158,6 +158,7 @@ pub(crate) mod gpu_native_semantic_parity_v2;
 pub(crate) mod gpu_native_source_to_upload_copy_elision;
 pub(crate) mod gpu_native_source_upload;
 mod gpu_native_mapped_lock;
+mod gpu_native_mapped_fixed_buffer;
 mod gpu_native_mapped_vma;
 pub(crate) mod gpu_native_spanish_first_token_attribution;
 pub(crate) mod gpu_native_v2_holdout_failure_attribution;
@@ -1070,6 +1071,11 @@ enum Cmd {
         warmup_iterations: usize,
     },
 
+    /// Capability only: register one mapped L4/Vulkan range; no I/O. Requires Linux + io_uring.
+    ProbeGpuNativeMappedDestinationFixedBuffer {
+        #[arg(long)]
+        report_out: PathBuf,
+    },
     /// Read-only smaps characterization of one mapped L4/Vulkan upload buffer.
     ProbeGpuNativeMappedDestinationVma {
         #[arg(long)]
@@ -2114,6 +2120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HMA-1F offline audit, probes and transcript launcher must dispatch
     // before logging, config, affinity, worker pools, model or runtime construction.
     match &cli.cmd {
+        Cmd::ProbeGpuNativeMappedDestinationFixedBuffer { report_out } =>
+            return crate::gpu_native_mapped_fixed_buffer::probe_command(report_out),
         Cmd::ProbeGpuNativeMappedDestinationVma { report_out } =>
             return crate::gpu_native_mapped_vma::probe_command(report_out),
         Cmd::AuditGpuNativeSourceMappedLockProduction { raw_report, transcript, report_out } =>
@@ -2683,6 +2691,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         }
         Cmd::AuditGpuNativeSourceMappedLockProduction { .. }
+        | Cmd::ProbeGpuNativeMappedDestinationFixedBuffer { .. }
         | Cmd::ProbeGpuNativeMappedDestinationVma { .. }
         | Cmd::ProbeGpuNativeMappedDestinationLock { .. }
         | Cmd::QualifyGpuNativeSourceMappedLockProduction { .. } => unreachable!("HMA-1F early dispatch"),
