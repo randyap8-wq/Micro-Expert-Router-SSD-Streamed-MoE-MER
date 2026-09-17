@@ -972,6 +972,67 @@ async fn run_physical_install_arm_observed(
     .await
 }
 
+/// HMA-1G can retain startup evidence; old callers see only `historical()`.
+/// The generic values let portable tests prove ownership-preserving projection.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+enum ObservedShutdown {
+    NotAttempted,
+    Succeeded,
+    Failed { failure: BenchmarkFailure },
+}
+impl ObservedShutdown {
+    fn from_result(result: Result<(), BenchmarkFailure>) -> Self {
+        match result {
+            Ok(()) => Self::Succeeded,
+            Err(failure) => Self::Failed { failure },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ObservedStartupFailure<B = BenchmarkReport> {
+    primary: BenchmarkFailure,
+    benchmark: B,
+    construction_completed: bool,
+    qualification_enable_completed: bool,
+    runtime_validation_completed: bool,
+    shutdown: ObservedShutdown,
+}
+impl<B> ObservedStartupFailure<B> {
+    fn historical(self) -> BenchmarkFailure {
+        // Enable errors historically discard a shutdown error. Validation
+        // errors combine it, with the original Display spelling and order.
+        if self.qualification_enable_completed {
+            if let ObservedShutdown::Failed { failure } = self.shutdown {
+                return BenchmarkFailure::new(
+                    "postcondition",
+                    "runtime-validation-and-shutdown-failed",
+                    format!("{}; {failure}", self.primary),
+                );
+            }
+        }
+        self.primary
+    }
+}
+
+enum ObservedArmOutcome<R = PhysicalInstallArmRun, B = BenchmarkReport> {
+    Run {
+        run: R,
+        primary_failure: Option<BenchmarkFailure>,
+        shutdown: ObservedShutdown,
+    },
+    StartupFailed(Box<ObservedStartupFailure<B>>),
+}
+impl<R, B> ObservedArmOutcome<R, B> {
+    fn historical(self) -> Result<R, BenchmarkFailure> {
+        match self {
+            Self::Run { run, .. } => Ok(run),
+            Self::StartupFailed(failure) => Err(failure.historical()),
+        }
+    }
+}
+
 async fn run_physical_install_arm_observed_inner(
     prepared: &Prepared,
     args: &CommandArgs,
@@ -980,6 +1041,26 @@ async fn run_physical_install_arm_observed_inner(
     mapped_observer: Option<Arc<crate::gpu_native_mapped_lock::Observer>>,
     pin_observer: Option<Arc<crate::gpu_native_mapped_pin::Observer>>,
 ) -> Result<PhysicalInstallArmRun, BenchmarkFailure> {
+    run_physical_install_arm_observed_outcome(
+        prepared,
+        args,
+        run,
+        diagnostic_mode,
+        mapped_observer,
+        pin_observer,
+    )
+    .await
+    .historical()
+}
+
+async fn run_physical_install_arm_observed_outcome(
+    prepared: &Prepared,
+    args: &CommandArgs,
+    run: PhysicalInstallQualificationRun,
+    diagnostic_mode: Option<&'static str>,
+    mapped_observer: Option<Arc<crate::gpu_native_mapped_lock::Observer>>,
+    pin_observer: Option<Arc<crate::gpu_native_mapped_pin::Observer>>,
+) -> ObservedArmOutcome {
     use crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm as ConcurrentArm;
     let (arm_name, arm) = match run {
         PhysicalInstallQualificationRun::SourceToUpload(arm) => match arm {
@@ -1019,14 +1100,27 @@ async fn run_physical_install_arm_observed_inner(
         PhysicalInstallQualificationRun::SourceToUpload(_) => source_to_upload_production::MODE,
     });
     let mut benchmark = benchmark_report(prepared);
-    let runtime = crate::gpu_native_real_benchmark::construct_runtime(
+    let runtime = match crate::gpu_native_real_benchmark::construct_runtime(
         &prepared.spec,
         prepared.tokenizer.clone(),
         arm_name,
         None,
         &mut benchmark,
     )
-    .await?;
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(primary) => {
+            return ObservedArmOutcome::StartupFailed(Box::new(ObservedStartupFailure {
+                primary,
+                benchmark,
+                construction_completed: false,
+                qualification_enable_completed: false,
+                runtime_validation_completed: false,
+                shutdown: ObservedShutdown::NotAttempted,
+            }))
+        }
+    };
     let enable_result = match run {
         PhysicalInstallQualificationRun::SourceToUpload(arm) => runtime
             .engine
@@ -1036,7 +1130,7 @@ async fn run_physical_install_arm_observed_inner(
             .enable_gpu_native_physical_install_staging_qualification(arm),
         PhysicalInstallQualificationRun::Concurrency(arm)
         | PhysicalInstallQualificationRun::ZeroFillProduction(arm) => runtime
-        .engine
+            .engine
             .enable_gpu_native_physical_install_concurrency_qualification(arm),
     };
     let enable_result = enable_result.and_then(|()| match &mapped_observer {
@@ -1049,14 +1143,21 @@ async fn run_physical_install_arm_observed_inner(
     });
     if let Err(error) = enable_result {
         let failure = BenchmarkFailure::new("startup", "qualification-arm-enable-failed", error);
-        let _ = crate::gpu_native_real_benchmark::shutdown_runtime(
+        let shutdown = crate::gpu_native_real_benchmark::shutdown_runtime(
             runtime,
             arm_name,
             None,
             &mut benchmark,
         )
         .await;
-        return Err(failure);
+        return ObservedArmOutcome::StartupFailed(Box::new(ObservedStartupFailure {
+            primary: failure,
+            benchmark,
+            construction_completed: true,
+            qualification_enable_completed: false,
+            runtime_validation_completed: false,
+            shutdown: ObservedShutdown::from_result(shutdown),
+        }));
     }
     if let Err(validation_error) = crate::gpu_native_real_benchmark::validate_and_record_runtime(
         &runtime,
@@ -1071,14 +1172,14 @@ async fn run_physical_install_arm_observed_inner(
             &mut benchmark,
         )
         .await;
-        return match shutdown {
-            Ok(()) => Err(validation_error),
-            Err(shutdown_error) => Err(BenchmarkFailure::new(
-                "postcondition",
-                "runtime-validation-and-shutdown-failed",
-                format!("{validation_error}; {shutdown_error}"),
-            )),
-        };
+        return ObservedArmOutcome::StartupFailed(Box::new(ObservedStartupFailure {
+            primary: validation_error,
+            benchmark,
+            construction_completed: true,
+            qualification_enable_completed: true,
+            runtime_validation_completed: false,
+            shutdown: ObservedShutdown::from_result(shutdown),
+        }));
     }
 
     let mut warmup_results = Vec::with_capacity(FROZEN_WARMUP_RUNS);
@@ -1092,8 +1193,12 @@ async fn run_physical_install_arm_observed_inner(
     };
     if execution_failure.is_none() {
         for index in 0..FROZEN_WARMUP_RUNS {
-            if let Some(observer) = &mapped_observer { observer.begin_request(false, index); }
-            if let Some(observer) = &pin_observer { observer.begin_request(false, index); }
+            if let Some(observer) = &mapped_observer {
+                observer.begin_request(false, index);
+            }
+            if let Some(observer) = &pin_observer {
+                observer.begin_request(false, index);
+            }
             let result = crate::with_progress_timeout(
                 format!("{mode_name} {arm_name} warmup {index}"),
                 args.progress_watchdog,
@@ -1137,9 +1242,9 @@ async fn run_physical_install_arm_observed_inner(
     if execution_failure.is_none() {
         match run {
             PhysicalInstallQualificationRun::Staging(_) => {
-        warmup_source = runtime
-            .engine
-            .gpu_native_physical_install_staging_qualification_snapshot();
+                warmup_source = runtime
+                    .engine
+                    .gpu_native_physical_install_staging_qualification_snapshot();
             }
             PhysicalInstallQualificationRun::Concurrency(_)
             | PhysicalInstallQualificationRun::ZeroFillProduction(_)
@@ -1215,8 +1320,12 @@ async fn run_physical_install_arm_observed_inner(
 
     if execution_failure.is_none() {
         for index in 0..FROZEN_MEASURED_RUNS {
-            if let Some(observer) = &mapped_observer { observer.begin_request(true, index); }
-            if let Some(observer) = &pin_observer { observer.begin_request(true, index); }
+            if let Some(observer) = &mapped_observer {
+                observer.begin_request(true, index);
+            }
+            if let Some(observer) = &pin_observer {
+                observer.begin_request(true, index);
+            }
             let result = crate::with_progress_timeout(
                 format!("{mode_name} {arm_name} measured {index}"),
                 args.progress_watchdog,
@@ -1245,7 +1354,7 @@ async fn run_physical_install_arm_observed_inner(
     let (source, concurrency) = match run {
         PhysicalInstallQualificationRun::Staging(_) => (
             runtime
-        .engine
+                .engine
                 .gpu_native_physical_install_staging_qualification_snapshot(),
             None,
         ),
@@ -1283,9 +1392,11 @@ async fn run_physical_install_arm_observed_inner(
         None
     };
 
+    let primary_failure = execution_failure.clone();
     let shutdown =
         crate::gpu_native_real_benchmark::shutdown_runtime(runtime, arm_name, None, &mut benchmark)
             .await;
+    let observed_shutdown = ObservedShutdown::from_result(shutdown.clone());
     if let Err(error) = shutdown {
         execution_failure = Some(match execution_failure {
             Some(previous) => BenchmarkFailure::new(
@@ -1305,29 +1416,33 @@ async fn run_physical_install_arm_observed_inner(
     if let Some(failure) = execution_failure.clone() {
         benchmark.fail(failure.clone());
     }
-    Ok(PhysicalInstallArmRun {
-        warmup_upload,
-        upload,
-        common: ArmReport {
-        arm,
-        complete: execution_failure.is_none(),
-        failure: execution_failure,
-        isolated_runtime: true,
-        warmup_results,
-        warmup_source,
-        warmup_production_physical_install,
-        warmup_production,
-        warmup_ram_cache_state_sha256,
-        warmup_work,
-        source,
-        production_physical_install,
-        production,
-        work,
-        benchmark,
+    ObservedArmOutcome::Run {
+        primary_failure,
+        shutdown: observed_shutdown,
+        run: PhysicalInstallArmRun {
+            warmup_upload,
+            upload,
+            common: ArmReport {
+                arm,
+                complete: execution_failure.is_none(),
+                failure: execution_failure,
+                isolated_runtime: true,
+                warmup_results,
+                warmup_source,
+                warmup_production_physical_install,
+                warmup_production,
+                warmup_ram_cache_state_sha256,
+                warmup_work,
+                source,
+                production_physical_install,
+                production,
+                work,
+                benchmark,
+            },
+            warmup_concurrency,
+            concurrency,
         },
-        warmup_concurrency,
-        concurrency,
-    })
+    }
 }
 
 async fn run_arm(

@@ -1134,7 +1134,7 @@ mod tests {
             ),
             (
                 include_str!("gpu_native_physical_install_staging.rs"),
-                "5bbdc6664794c9fe4fa46a7a43c91c8d3765b397d7767744abf115f6830a9f21",
+                "89e4ef237ed07dab30e50751a9b3f90fa23194420a1f20090cf589753ef80115",
             ),
         ] {
             assert_eq!(

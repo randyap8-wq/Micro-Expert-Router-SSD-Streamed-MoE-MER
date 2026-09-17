@@ -1,5 +1,8 @@
 //! Frozen HMA-1F-B: four fresh mapped production arms and an offline auditor.
 //! Reuses production-v2 preparation, request execution, runtime gate and teardown.
+#[path = "gpu_native_baseline_runtime_lifecycle.rs"]
+pub(crate) mod baseline_lifecycle;
+
 use super::*;
 use crate::gpu_native_mapped_pin::{Mode, Observer, ProcessMemory, Record, ORDER, WIDTH};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -1209,7 +1212,13 @@ mod hma1fb_tests {
     use super::*;
     use crate::gpu_native_mapped_lock::{Read, Timing};
     use crate::gpu_native_mapped_pin::{PinEvidence, Range};
-    fn record(mode: Mode, measured: bool, request_index: usize, width: usize, wall: u64) -> Record {
+    pub(super) fn record(
+        mode: Mode,
+        measured: bool,
+        request_index: usize,
+        width: usize,
+        wall: u64,
+    ) -> Record {
         let ranges = (1..=width)
             .map(|i| Range::new(i * (FULL + 4096), FULL))
             .collect();
@@ -1281,7 +1290,7 @@ mod hma1fb_tests {
         }
         v
     }
-    fn fixture() -> Payload {
+    pub(super) fn fixture() -> Payload {
         let mut arms = Vec::new();
         for (position, mode) in ORDER.into_iter().enumerate() {
             let mut records = vec![record(mode, false, 0, 2, 100)];
