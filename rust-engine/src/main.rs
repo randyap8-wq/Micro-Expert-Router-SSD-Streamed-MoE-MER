@@ -1141,6 +1141,37 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// HMA-1H: four fresh child processes; binds worker evidence and transcript.
+    QualifyGpuNativeFreshProcessLifecycle {
+        #[arg(
+            long,
+            default_value = "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
+        )]
+        config: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+        #[arg(long)]
+        transcript_out: PathBuf,
+    },
+    /// CPU-only HMA-1H lifecycle and timing audit.
+    AuditGpuNativeFreshProcessLifecycle {
+        #[arg(long)]
+        raw_report: PathBuf,
+        #[arg(long)]
+        transcript: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+    #[command(name = "hma1h-worker-internal", hide = true)]
+    Hma1hWorkerInternal {
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3))]
+        arm_index: u8,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// HMA-1G: four isolated baseline runtimes; binds worker evidence and transcript.
     QualifyGpuNativeBaselineRuntimeLifecycle {
         #[arg(
@@ -2177,6 +2208,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HMA-1F offline audit, probes and transcript launcher must dispatch
     // before logging, config, affinity, worker pools, model or runtime construction.
     match &cli.cmd {
+        Cmd::AuditGpuNativeFreshProcessLifecycle { raw_report, transcript, report_out } =>
+            return crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_pin::baseline_lifecycle::fresh_process_lifecycle::audit_command(raw_report, transcript, report_out),
+        Cmd::QualifyGpuNativeFreshProcessLifecycle { config, report_out, transcript_out } =>
+            return crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_pin::baseline_lifecycle::fresh_process_lifecycle::launch(config, report_out, transcript_out, &raw_args),
+        Cmd::Hma1hWorkerInternal { .. } => crate::gpu_native_mapped_pin::require_platform()?,
         Cmd::AuditGpuNativeBaselineRuntimeLifecycle { raw_report, transcript, report_out } =>
             return crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_pin::baseline_lifecycle::audit_command(raw_report, transcript, report_out),
         Cmd::QualifyGpuNativeBaselineRuntimeLifecycle { config, report_out, transcript_out } =>
@@ -2750,6 +2786,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 ),
             )
+        }
+        Cmd::Hma1hWorkerInternal {
+            config,
+            report_out,
+            arm_index,
+        } => {
+            crate::gpu_native_mapped_pin::require_platform()?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_physical_install_staging::source_to_upload_production::mapped_pin::baseline_lifecycle::fresh_process_lifecycle::run_worker(
+                crate::gpu_native_physical_install_staging::CommandArgs { config, expected_adapter_name: "NVIDIA L4".into(), report_out, progress_watchdog }, usize::from(arm_index)
+            ))
+        }
+        Cmd::AuditGpuNativeFreshProcessLifecycle { .. }
+        | Cmd::QualifyGpuNativeFreshProcessLifecycle { .. } => {
+            unreachable!("HMA-1H early dispatch")
         }
         Cmd::Hma1gWorkerInternal { config, report_out } => {
             crate::gpu_native_mapped_pin::require_platform()?;

@@ -1,5 +1,8 @@
 //! HMA-1G: baseline-only lifecycle/order diagnosis. No low-level source logic.
 //! The worker reuses HMA-1F-B's observer; the auditor is entirely offline.
+#[path = "gpu_native_fresh_process_lifecycle.rs"]
+pub(crate) mod fresh_process_lifecycle;
+
 use super::*;
 
 pub(crate) const SCHEMA: &str = "mer.gpu-native-baseline-runtime-lifecycle.v1";
