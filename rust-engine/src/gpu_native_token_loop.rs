@@ -35,6 +35,120 @@ use crate::gpu_native_residency::GpuNativeTieredResidencyManager;
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;
 
+use crate::predictor_v2::{
+    AccountingError as PredictorV2AccountingError, ModelMetadata as PredictorV2ModelMetadata,
+    ObservationConfig as PredictorV2ObservationConfig,
+    PositionIdentity as PredictorV2PositionIdentity, ReconciliationSnapshot as PredictorV2Snapshot,
+    RequestIdentity as PredictorV2RequestIdentity, RequestObserver as PredictorV2RequestObserver,
+    RequestPhase as PredictorV2RequestPhase,
+};
+
+// Namespace and request counters fail closed without becoming an execution
+// dependency. Exhaustion disables attribution; it never fails native inference.
+static PREDICTOR_V2_RUNTIME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn predictor_v2_checked_sequence(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .ok()
+        .and_then(|n| n.checked_add(1))
+}
+
+struct PredictorV2RequestAllocator {
+    runtime_namespace: Option<u64>,
+    request_sequence: AtomicU64,
+}
+
+impl PredictorV2RequestAllocator {
+    fn new() -> Self {
+        Self {
+            runtime_namespace: predictor_v2_checked_sequence(&PREDICTOR_V2_RUNTIME_SEQUENCE),
+            request_sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn allocate(&self) -> PredictorV2RequestObservation {
+        let identity = self.runtime_namespace.and_then(|runtime_namespace| {
+            predictor_v2_checked_sequence(&self.request_sequence).map(|request_sequence| {
+                PredictorV2RequestIdentity {
+                    runtime_namespace,
+                    request_sequence,
+                    phase: PredictorV2RequestPhase::Serving,
+                    phase_run_index: 0,
+                }
+            })
+        });
+        PredictorV2RequestObservation {
+            identity,
+            enabled: None,
+        }
+    }
+}
+
+// Stored by value in GpuNativeRequestState; no runtime/Engine-owned predecessor.
+// The disabled representation contains only bounded identity bookkeeping.
+struct PredictorV2RequestObservation {
+    identity: Option<PredictorV2RequestIdentity>,
+    enabled: Option<Box<(PredictorV2ObservationConfig, PredictorV2RequestObserver)>>,
+}
+
+impl PredictorV2RequestObservation {
+    fn enable(
+        &mut self,
+        committed_position: usize,
+        model: PredictorV2ModelMetadata,
+        config: PredictorV2ObservationConfig,
+    ) -> Result<(), PredictorV2AccountingError> {
+        if committed_position != 0 || self.enabled.is_some() || config.prompt_length == 0 {
+            return Err(PredictorV2AccountingError::InvalidTransition);
+        }
+        let mut identity = self.identity.ok_or(PredictorV2AccountingError::Overflow)?;
+        identity.phase = config.phase;
+        identity.phase_run_index = config.phase_run_index;
+        let observer =
+            PredictorV2RequestObserver::new(identity, model, config.capacity_per_collection)?;
+        self.identity = Some(identity);
+        self.enabled = Some(Box::new((config, observer)));
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Option<Result<PredictorV2Snapshot, PredictorV2AccountingError>> {
+        self.enabled
+            .as_deref()
+            .map(|(_, observer)| observer.snapshot())
+    }
+}
+
+/// One CPU-only sink for the existing clean, committed completion authority.
+/// There is no callback, result mutation, or error propagated to execution.
+fn observe_predictor_v2_completed_position(
+    observation: &mut PredictorV2RequestObservation,
+    position: usize,
+    model: PredictorV2ModelMetadata,
+    report: &GpuNativeBoundaryReport,
+) {
+    let Some((config, observer)) = observation.enabled.as_deref_mut() else {
+        return;
+    };
+    if report.final_status != 0
+        || report.layer_statuses.len() != model.num_layers
+        || report.layer_statuses.iter().any(|status| *status != 0)
+    {
+        observer.mark_incomplete(PredictorV2AccountingError::InvalidIdentity);
+        return;
+    }
+    let Some(identity) = observation.identity else {
+        observer.mark_incomplete(PredictorV2AccountingError::InvalidIdentity);
+        return;
+    };
+    match PredictorV2PositionIdentity::from_prompt_length(position, config.prompt_length) {
+        Ok(position) => {
+            observer.observe_completed_position(identity, position, model, &report.selected_ids)
+        }
+        Err(error) => observer.mark_incomplete(error),
+    }
+}
+
 // Only explicit qualification control may select the frozen serial encoder.
 fn q4_uses_frozen_serial_control(arm: Option<Q4QualificationArm>) -> bool {
     matches!(arm, Some(Q4QualificationArm::Control))
@@ -1076,6 +1190,7 @@ pub struct GpuNativeTokenLoop {
     recovery_counters: GpuNativeRecoveryCounters,
     execution_guard: TokioMutex<()>,
     q4_qualification: std::sync::OnceLock<Arc<Q4QualificationObservation>>,
+    predictor_v2_requests: PredictorV2RequestAllocator,
 }
 
 impl GpuNativeTokenLoop {
@@ -1413,6 +1528,7 @@ impl GpuNativeTokenLoop {
             recovery_counters: GpuNativeRecoveryCounters::default(),
             q4_qualification: std::sync::OnceLock::new(),
             execution_guard: TokioMutex::new(()),
+            predictor_v2_requests: PredictorV2RequestAllocator::new(),
         }))
     }
 
@@ -1563,6 +1679,7 @@ impl GpuNativeTokenLoop {
             staging_buffer,
             committed_position: 0,
             max_seq_len: self.model_geometry.max_seq_len,
+            predictor_v2_observation: self.predictor_v2_requests.allocate(),
         })
     }
 
@@ -2534,6 +2651,17 @@ impl GpuNativeTokenLoop {
                     .map_err(GpuNativeTokenLoopError::OracleScheduleFailed)?;
             }
 
+            observe_predictor_v2_completed_position(
+                &mut request.predictor_v2_observation,
+                position,
+                PredictorV2ModelMetadata {
+                    num_layers: self.model_geometry.num_layers,
+                    num_experts: self.model_geometry.num_experts,
+                    top_k: self.model_geometry.top_k,
+                },
+                report,
+            );
+
             return Ok(GpuNativeStepOutput {
                 sampled_token: if sample {
                     Some(report.sampled_token)
@@ -3405,9 +3533,51 @@ pub struct GpuNativeRequestState {
     pub staging_buffer: wgpu::Buffer,
     pub committed_position: usize,
     pub max_seq_len: usize,
+    predictor_v2_observation: PredictorV2RequestObservation,
 }
 
 impl GpuNativeRequestState {
+    /// Internal typed opt-in only, before the first committed position. Native
+    /// model geometry is supplied by the owning loop, never by a router facade.
+    #[allow(dead_code)]
+    pub(crate) fn enable_predictor_v2_observation(
+        &mut self,
+        token_loop: &GpuNativeTokenLoop,
+        config: PredictorV2ObservationConfig,
+    ) -> Result<(), PredictorV2AccountingError> {
+        if self
+            .predictor_v2_observation
+            .identity
+            .map(|id| id.runtime_namespace)
+            != token_loop.predictor_v2_requests.runtime_namespace
+        {
+            return Err(PredictorV2AccountingError::InvalidIdentity);
+        }
+        self.predictor_v2_observation.enable(
+            self.committed_position,
+            PredictorV2ModelMetadata {
+                num_layers: token_loop.model_geometry.num_layers,
+                num_experts: token_loop.model_geometry.num_experts,
+                top_k: token_loop.model_geometry.top_k,
+            },
+            config,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn predictor_v2_snapshot(
+        &self,
+    ) -> Option<Result<PredictorV2Snapshot, PredictorV2AccountingError>> {
+        self.predictor_v2_observation.snapshot()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn finish_predictor_v2_observation(&mut self, cancelled: bool) {
+        if let Some((_, observer)) = self.predictor_v2_observation.enabled.as_deref_mut() {
+            observer.finish(cancelled);
+        }
+    }
+
     pub fn committed_position(&self) -> usize {
         self.committed_position
     }
@@ -5065,5 +5235,353 @@ pub(crate) mod tests {
         assert_eq!(boundary.authorize_layer_once(4), Ok(()));
         assert!(boundary.authorize_layer_once(4).is_err());
         assert_eq!(boundary.authorize_layer_once(5), Ok(()));
+    }
+
+    fn predictor_v2_fixture_model() -> PredictorV2ModelMetadata {
+        PredictorV2ModelMetadata {
+            num_layers: 4,
+            num_experts: 8,
+            top_k: 2,
+        }
+    }
+
+    fn predictor_v2_fixture_observer(
+        enabled: bool,
+        capacity: usize,
+    ) -> PredictorV2RequestObservation {
+        let allocator = PredictorV2RequestAllocator::new();
+        let mut observation = allocator.allocate();
+        if enabled {
+            observation
+                .enable(
+                    0,
+                    predictor_v2_fixture_model(),
+                    PredictorV2ObservationConfig {
+                        phase: PredictorV2RequestPhase::Fixture,
+                        phase_run_index: 0,
+                        prompt_length: 2,
+                        capacity_per_collection: capacity,
+                    },
+                )
+                .unwrap();
+        }
+        observation
+    }
+
+    fn predictor_v2_fixture_report() -> GpuNativeBoundaryReport {
+        GpuNativeBoundaryReport {
+            layer_statuses: vec![0; 4],
+            selected_ids: vec![vec![1, 2]; 4],
+            final_status: 0,
+            sampled_token: 37,
+        }
+    }
+
+    #[test]
+    fn disabled_observer_is_inert() {
+        let mut observation = predictor_v2_fixture_observer(false, 0);
+        let identity = observation.identity;
+        let report = predictor_v2_fixture_report();
+        let original = report.clone();
+        for position in [0, 1, usize::MAX] {
+            observe_predictor_v2_completed_position(
+                &mut observation,
+                position,
+                predictor_v2_fixture_model(),
+                &report,
+            );
+        }
+        assert_eq!(report, original);
+        assert_eq!(observation.identity, identity);
+        assert!(observation.enabled.is_none());
+        assert!(observation.snapshot().is_none());
+        assert_eq!(
+            std::mem::size_of_val(&observation.enabled),
+            std::mem::size_of::<usize>()
+        );
+        // Disabled returns before validation/sink invocation, even for malformed
+        // metadata. There is no callback or movement witness to invoke.
+        let invalid = GpuNativeBoundaryReport {
+            layer_statuses: vec![],
+            selected_ids: vec![],
+            final_status: u32::MAX,
+            sampled_token: u32::MAX,
+        };
+        observe_predictor_v2_completed_position(
+            &mut observation,
+            usize::MAX,
+            PredictorV2ModelMetadata {
+                num_layers: 0,
+                num_experts: 0,
+                top_k: 0,
+            },
+            &invalid,
+        );
+        assert!(observation.enabled.is_none());
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct PredictorV2ControlResult {
+        result: Result<Option<u32>, String>,
+        reports: Vec<GpuNativeBoundaryReport>,
+        order: Vec<&'static str>,
+        segments: Vec<GpuNativeExecutionSegment>,
+        committed: usize,
+    }
+
+    // Drive the actual CPU recovery planner/status classifier using supplied
+    // reports. No executor, model weights, device, or physical buffers exist.
+    fn predictor_v2_control_fixture(
+        observation: &mut PredictorV2RequestObservation,
+        miss: bool,
+        fatal: bool,
+        sample: bool,
+    ) -> PredictorV2ControlResult {
+        let model = predictor_v2_fixture_model();
+        let mut fixture = PredictorV2ControlResult {
+            result: Ok(None),
+            reports: vec![],
+            order: vec![],
+            segments: vec![],
+            committed: 0,
+        };
+        let mut recovery: Option<GpuNativeRecoveryCursor> = None;
+        loop {
+            let segment = recovery
+                .as_ref()
+                .map(|cursor| cursor.plan(model.num_layers).unwrap())
+                .unwrap_or_else(|| GpuNativeExecutionSegment::fresh(model.num_layers).unwrap());
+            fixture.segments.push(segment.clone());
+            fixture.order.push("submit");
+            let mut report = predictor_v2_fixture_report();
+            if fixture.reports.is_empty() && miss {
+                report.layer_statuses[0] = GPU_NATIVE_STATUS_RETRYABLE_MASK;
+            }
+            if segment.completes_token && fatal {
+                report.final_status = GPU_NATIVE_STATUS_LM_HEAD_NUMERICAL_FAILURE;
+            }
+            fixture.order.push("boundary-parsed");
+            fixture.reports.push(report.clone());
+            if let Some(layer) = report
+                .first_failure_layer_in(segment.attempted_layers.clone())
+                .unwrap()
+            {
+                assert_eq!(
+                    classify_gpu_native_status(report.layer_statuses[layer], Some(layer)).unwrap(),
+                    GpuNativeStatusDisposition::RetryableResidencyMiss
+                );
+                fixture.order.push("demand-service");
+                recovery = Some(
+                    GpuNativeRecoveryCursor::after_serviced_miss(
+                        model.num_layers,
+                        GpuNativeMissSignature {
+                            layer_index: layer,
+                            selected_ids: report.selected_ids[layer].clone(),
+                        },
+                    )
+                    .unwrap(),
+                );
+                if let Some((_, observer)) = observation.enabled.as_deref() {
+                    assert_eq!(observer.completed_positions(), 0);
+                }
+                continue;
+            }
+            if let Some(cursor) = recovery.as_mut() {
+                assert_eq!(
+                    cursor
+                        .record_clean_segment(&segment, model.num_layers)
+                        .unwrap(),
+                    segment.completes_token
+                );
+            }
+            if !segment.completes_token {
+                fixture.order.push("continue-recovery");
+                if let Some((_, observer)) = observation.enabled.as_deref() {
+                    assert_eq!(observer.completed_positions(), 0);
+                }
+                continue;
+            }
+            if let Err(error) = classify_gpu_native_status(report.final_status, None) {
+                fixture.result = Err(error.to_string());
+                fixture.order.push("fatal");
+                return fixture;
+            }
+            fixture.committed += 1;
+            fixture.order.push("commit");
+            fixture.order.push("legacy-route-observation");
+            observe_predictor_v2_completed_position(observation, 0, model, &report);
+            fixture.result = Ok(if sample {
+                Some(report.sampled_token)
+            } else {
+                None
+            });
+            fixture.order.push("return");
+            return fixture;
+        }
+    }
+
+    #[test]
+    fn completion_hook_preserves_results_and_recovery_order() {
+        for miss in [false, true] {
+            for fatal in [false, true] {
+                for sample in [false, true] {
+                    let mut off = predictor_v2_fixture_observer(false, 256);
+                    let expected = predictor_v2_control_fixture(&mut off, miss, fatal, sample);
+                    for capacity in [0, 256] {
+                        let mut on = predictor_v2_fixture_observer(true, capacity);
+                        let observed = predictor_v2_control_fixture(&mut on, miss, fatal, sample);
+                        assert_eq!(observed, expected);
+                        let (_, observer) = on.enabled.as_deref().unwrap();
+                        assert_eq!(
+                            observer.completed_positions(),
+                            u64::from(!fatal && capacity > 0)
+                        );
+                        let snap = observer.snapshot().unwrap();
+                        assert_eq!(
+                            (
+                                snap.emitted,
+                                snap.source_leaders,
+                                snap.reservations,
+                                snap.install_owners,
+                                snap.direct_matching_demand_credits
+                            ),
+                            (0, 0, 0, 0, 0)
+                        );
+                    }
+                }
+            }
+        }
+        // This assertion binds the CPU fixture to the real completion call site:
+        // exactly one hook, after commit, legacy observation, and ORACLE errors.
+        let source = include_str!("gpu_native_token_loop.rs");
+        let production = source
+            .split("#[cfg(test)]\npub(crate) mod tests")
+            .next()
+            .unwrap();
+        let body = production
+            .split("async fn step_token_unified_inner(")
+            .nth(1)
+            .unwrap()
+            .split("/// Encode and execute one single attempt")
+            .next()
+            .unwrap();
+        assert_eq!(
+            body.matches("observe_predictor_v2_completed_position(")
+                .count(),
+            1
+        );
+        let hook = body
+            .find("observe_predictor_v2_completed_position(")
+            .unwrap();
+        for authority in [
+            "if !segment.completes_token",
+            "classify_gpu_native_status(report.final_status",
+            "request.committed_position += 1",
+            "engine.record_gpu_native_actual_routes",
+            ".map_err(GpuNativeTokenLoopError::OracleScheduleFailed)?",
+        ] {
+            assert!(body.find(authority).unwrap() < hook);
+        }
+        assert!(hook < body.find("return Ok(GpuNativeStepOutput").unwrap());
+        let after_hook = &body[hook..];
+        for forbidden in [
+            ".await",
+            "queue.submit",
+            "device.poll",
+            "ensure_gpu_native",
+            "readback",
+        ] {
+            assert!(!after_hook.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn predictor_v2_native_identity_and_prompt_extent_are_checked() {
+        let allocator = PredictorV2RequestAllocator::new();
+        let first = allocator.allocate();
+        let second = allocator.allocate();
+        assert_ne!(first.identity, second.identity);
+        assert_eq!(
+            first.identity.unwrap().runtime_namespace,
+            second.identity.unwrap().runtime_namespace
+        );
+        let other = PredictorV2RequestAllocator::new().allocate();
+        assert_ne!(
+            first.identity.unwrap().runtime_namespace,
+            other.identity.unwrap().runtime_namespace
+        );
+        let mut observation = predictor_v2_fixture_observer(true, 256);
+        let report = predictor_v2_fixture_report();
+        for position in 0..4 {
+            observe_predictor_v2_completed_position(
+                &mut observation,
+                position,
+                predictor_v2_fixture_model(),
+                &report,
+            );
+        }
+        assert_eq!(
+            observation
+                .enabled
+                .as_ref()
+                .unwrap()
+                .1
+                .completed_positions(),
+            4
+        );
+        assert_eq!(observation.snapshot().unwrap().unwrap().incomplete, None);
+        let config = observation.enabled.as_deref().unwrap().0;
+        assert_eq!(
+            PredictorV2PositionIdentity::from_prompt_length(1, config.prompt_length)
+                .unwrap()
+                .position_kind,
+            crate::predictor_v2::PositionKind::Prompt
+        );
+        assert_eq!(
+            PredictorV2PositionIdentity::from_prompt_length(2, config.prompt_length)
+                .unwrap()
+                .decode_index,
+            Some(0)
+        );
+        assert!(observation
+            .enable(0, predictor_v2_fixture_model(), config)
+            .is_err());
+        let mut restarted = allocator.allocate();
+        restarted
+            .enable(0, predictor_v2_fixture_model(), config)
+            .unwrap();
+        assert_eq!(
+            restarted
+                .enabled
+                .as_deref()
+                .unwrap()
+                .1
+                .completed_positions(),
+            0
+        );
+    }
+
+    #[test]
+    fn predictor_v2_native_overflow_is_not_an_execution_error() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(predictor_v2_checked_sequence(&counter), Some(u64::MAX));
+        assert_eq!(predictor_v2_checked_sequence(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        let allocator = PredictorV2RequestAllocator {
+            runtime_namespace: Some(1),
+            request_sequence: AtomicU64::new(u64::MAX),
+        };
+        let mut observation = allocator.allocate();
+        assert!(observation.identity.is_none());
+        let result = predictor_v2_control_fixture(&mut observation, true, false, true);
+        assert_eq!(result.result, Ok(Some(37)));
+        assert_eq!(result.committed, 1);
+        assert!(observation.snapshot().is_none());
+        let no_namespace = PredictorV2RequestAllocator {
+            runtime_namespace: None,
+            request_sequence: AtomicU64::new(0),
+        };
+        assert!(no_namespace.allocate().identity.is_none());
+        assert_eq!(no_namespace.request_sequence.load(Ordering::Relaxed), 0);
     }
 }

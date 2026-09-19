@@ -161,6 +161,7 @@ pub(crate) mod gpu_native_spanish_first_token_attribution;
 pub(crate) mod gpu_native_v2_holdout_failure_attribution;
 
 pub(crate) mod gpu_native_token_loop;
+mod predictor_v2;
 #[cfg(feature = "grpc")]
 mod grpc;
 #[cfg(feature = "grpc")]
