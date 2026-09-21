@@ -2673,6 +2673,16 @@ pub(crate) enum P1jPublication {
     OrdinaryWins,
 }
 
+/// Diagnostic surface only; claim ordering and ownership remain P1J.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum P1jClaimRefusal {
+    LockBusy,
+    Occupied,
+    IdentityRejected,
+    EpochExhausted,
+    WriterSequenceExhausted,
+}
+
 #[derive(Debug, Default)]
 struct P1jSidecarState {
     last_epoch: u32,
@@ -2691,12 +2701,21 @@ impl P1jSidecarState {
         &mut self,
         candidate: crate::predictor_v2::p1e::Candidate,
         generation: u64,
-    ) -> Option<crate::predictor_v2::P1jIdentity> {
-        if self.occupant.is_some() || generation == 0 {
-            return None;
+    ) -> Result<crate::predictor_v2::P1jIdentity, P1jClaimRefusal> {
+        if self.occupant.is_some() {
+            return Err(P1jClaimRefusal::Occupied);
         }
-        let epoch = self.last_epoch.checked_add(1)?;
-        let writer_sequence = self.last_writer.checked_add(1)?;
+        if generation == 0 {
+            return Err(P1jClaimRefusal::IdentityRejected);
+        }
+        let epoch = self
+            .last_epoch
+            .checked_add(1)
+            .ok_or(P1jClaimRefusal::EpochExhausted)?;
+        let writer_sequence = self
+            .last_writer
+            .checked_add(1)
+            .ok_or(P1jClaimRefusal::WriterSequenceExhausted)?;
         let id = crate::predictor_v2::P1jIdentity {
             candidate,
             logical_generation: generation,
@@ -2708,7 +2727,7 @@ impl P1jSidecarState {
         self.occupant = Some((id, P1jPhase::Writing));
         self.terminal_requested = None;
         self.mapping_owned = false;
-        Some(id)
+        Ok(id)
     }
 
     fn close(&mut self, id: crate::predictor_v2::P1jIdentity, success: bool) {
@@ -3600,8 +3619,9 @@ impl<B> GpuNativeQ4ExpertArena<B> {
         &self,
         candidate: crate::predictor_v2::p1e::Candidate,
         generation: u64,
-    ) -> Option<crate::predictor_v2::P1jIdentity> {
-        p1j_binding_layout(self.plan, self.layer_index, true).ok()?;
+    ) -> Result<crate::predictor_v2::P1jIdentity, P1jClaimRefusal> {
+        p1j_binding_layout(self.plan, self.layer_index, true)
+            .map_err(|_| P1jClaimRefusal::IdentityRejected)?;
         if candidate.namespace.context != self.context_id
             || candidate.namespace.arena != self as *const Self as usize
             || candidate.namespace.runtime != candidate.request.runtime_namespace
@@ -3613,9 +3633,13 @@ impl<B> GpuNativeQ4ExpertArena<B> {
             || candidate.sequence == 0
             || candidate.generation == 0
         {
-            return None;
+            return Err(P1jClaimRefusal::IdentityRejected);
         }
-        self.state.try_lock()?.p1j.claim(candidate, generation)
+        self.state
+            .try_lock()
+            .ok_or(P1jClaimRefusal::LockBusy)?
+            .p1j
+            .claim(candidate, generation)
     }
 
     pub(crate) fn close_p1j_writer(&self, id: crate::predictor_v2::P1jIdentity, success: bool) {
@@ -11548,7 +11572,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn p1j_arena() -> Box<GpuNativeQ4ExpertArena<()>> {
+    pub(crate) fn p1j_arena() -> Box<GpuNativeQ4ExpertArena<()>> {
         let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
         let limits = supported_expert_limits();
         let layout = GpuNativeQ4ExpertArenaLayout::try_new(geometry, 8, &limits).unwrap();
@@ -11568,7 +11592,9 @@ pub(crate) mod tests {
             state,
         ))
     }
-    fn p1j_candidate(arena: &GpuNativeQ4ExpertArena<()>) -> crate::predictor_v2::p1e::Candidate {
+    pub(crate) fn p1j_candidate(
+        arena: &GpuNativeQ4ExpertArena<()>,
+    ) -> crate::predictor_v2::p1e::Candidate {
         use crate::predictor_v2::{
             p1e, ModelMetadata, PositionIdentity, RequestIdentity, RequestPhase,
         };
@@ -11693,7 +11719,7 @@ pub(crate) mod tests {
     fn p1j_live_writer_prevents_second_claim_without_backlog() {
         let arena = p1j_arena();
         let id = p1j_claim(&arena);
-        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_err());
         assert_eq!(arena.try_p1j_phase(id), Some(P1jPhase::Writing));
         assert_eq!(arena.state.lock().p1j.last_writer, 1);
     }
@@ -11707,7 +11733,7 @@ pub(crate) mod tests {
         // Held by this same thread: an accidental blocking lock would deadlock.
         assert!(!arena.try_close_p1j_writer(id, false));
         drop(lock);
-        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_err());
         assert!(arena.try_close_p1j_writer(id, false));
         assert_eq!(
             arena.try_p1j_phase(id),
@@ -11823,7 +11849,7 @@ pub(crate) mod tests {
             )),
             Some(false)
         );
-        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_err());
         // The old writer may STILL enqueue, but nobody may reuse its destination.
         arena.close_p1j_writer(id, true);
         assert_eq!(
@@ -11849,7 +11875,7 @@ pub(crate) mod tests {
             panic!("injected fill failure");
         }));
         assert!(failure.is_err() && enqueued.get());
-        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_err());
         arena.close_p1j_writer(id, false);
         assert_eq!(
             arena.try_p1j_phase(id),
@@ -11857,7 +11883,7 @@ pub(crate) mod tests {
                 crate::predictor_v2::P1jTerminal::WriteFailure
             ))
         );
-        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_some());
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_ok());
     }
     #[test]
     fn p1j_recovery_uses_exact_published_residency_without_ordinary_slot_or_rewrite() {
@@ -12007,13 +12033,84 @@ pub(crate) mod tests {
         assert!(arena.p1j_current().is_none());
     }
     #[test]
+    fn p1m_claim_typed_refusals_preserve_identity_order_and_state() {
+        let arena = p1j_arena();
+        let candidate = p1j_candidate(&arena);
+        {
+            let held = arena.state.lock();
+            assert_eq!(
+                arena.try_claim_p1j(candidate, 11),
+                Err(P1jClaimRefusal::LockBusy)
+            );
+            let mut wrong = candidate;
+            wrong.namespace.context += 1;
+            assert_eq!(
+                arena.try_claim_p1j(wrong, 11),
+                Err(P1jClaimRefusal::IdentityRejected)
+            );
+            assert_eq!((held.p1j.last_epoch, held.p1j.last_writer), (0, 0));
+        }
+        for mutate in [
+            (|c: &mut crate::predictor_v2::p1e::Candidate| c.namespace.arena += 1)
+                as fn(&mut crate::predictor_v2::p1e::Candidate),
+            |c| c.namespace.runtime += 1,
+            |c| c.namespace.layer = 46,
+            |c| c.namespace.capacity = 9,
+            |c| c.source_layer = 46,
+            |c| c.target_layer = 46,
+            |c| c.expert = 128,
+            |c| c.sequence = 0,
+            |c| c.generation = 0,
+        ] {
+            let mut wrong = candidate;
+            mutate(&mut wrong);
+            assert_eq!(
+                arena.try_claim_p1j(wrong, 11),
+                Err(P1jClaimRefusal::IdentityRejected)
+            );
+        }
+        assert_eq!(
+            arena.try_claim_p1j(candidate, 0),
+            Err(P1jClaimRefusal::IdentityRejected)
+        );
+        arena.state.lock().p1j.last_epoch = u32::MAX;
+        arena.state.lock().p1j.last_writer = u64::MAX;
+        assert_eq!(
+            arena.try_claim_p1j(candidate, 11),
+            Err(P1jClaimRefusal::EpochExhausted)
+        );
+        arena.state.lock().p1j.last_epoch = 0;
+        assert_eq!(
+            arena.try_claim_p1j(candidate, 11),
+            Err(P1jClaimRefusal::WriterSequenceExhausted)
+        );
+        assert_eq!(arena.state.lock().p1j.last_epoch, 0);
+        assert!(arena.state.lock().p1j.occupant.is_none());
+        arena.state.lock().p1j.last_writer = 0;
+        let id = arena.try_claim_p1j(candidate, 11).unwrap();
+        assert_eq!((id.epoch, id.writer_sequence), (1, 1));
+        assert_eq!(
+            arena.try_claim_p1j(candidate, 11),
+            Err(P1jClaimRefusal::Occupied)
+        );
+        assert_eq!(arena.try_p1j_phase(id), Some(P1jPhase::Writing));
+        assert!(!arena.state.lock().p1j.mapping_owned);
+        let mut invalid_layout = p1j_arena();
+        invalid_layout.layer_index = 46;
+        assert_eq!(
+            invalid_layout.try_claim_p1j(candidate, 11),
+            Err(P1jClaimRefusal::IdentityRejected)
+        );
+    }
+
+    #[test]
     fn p1j_epoch_and_writer_exhaustion_fail_closed() {
         let arena = p1j_arena();
         arena.state.lock().p1j.last_epoch = u32::MAX;
-        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_err());
         arena.state.lock().p1j.last_epoch = 0;
         arena.state.lock().p1j.last_writer = u64::MAX;
-        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_err());
         assert!(arena.state.lock().p1j.occupant.is_none());
     }
 

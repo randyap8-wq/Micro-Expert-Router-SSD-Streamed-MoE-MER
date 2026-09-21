@@ -33,7 +33,7 @@ use crate::dense_tensor::DenseDType;
 use crate::engine::{Engine, GpuNativeDemandResidencyError};
 use crate::gating::ScoringFunc;
 use crate::gpu_native_residency::GpuNativeTieredResidencyManager;
-use crate::gpu_native_residency::P1jSidecarOwner;
+use crate::gpu_native_residency::{P1jPrepareRefusal, P1jSidecarOwner};
 use crate::model::RealModel;
 use crate::predictor_v2::{P1jIdentity, P1jTerminal, PhysicalInstallIdentity};
 use crate::sampling::SamplingParams;
@@ -96,6 +96,273 @@ struct PredictorV2RequestObservation {
     identity: Option<PredictorV2RequestIdentity>,
     enabled: Option<Box<(PredictorV2ObservationConfig, PredictorV2RequestObserver)>>,
     p1e_clock: Option<Instant>,
+}
+
+// Fixed scalar diagnostics, dormant unless the request explicitly enables P1J.
+// Snapshot only at quiescent request boundaries; no telemetry lock or token log.
+macro_rules! p1m_launch_counters {
+    ($($field:ident),+ $(,)?) => {
+        #[derive(Default)]
+        struct P1jLaunchCounters {
+            $($field: AtomicU64,)+
+            incomplete: std::sync::atomic::AtomicBool,
+        }
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+        pub(crate) struct P1jLaunchSnapshot {
+            $(pub(crate) $field: u64,)+
+            pub(crate) incomplete: bool,
+        }
+        impl P1jLaunchCounters {
+            fn count(&self, counter: &AtomicU64) {
+                if predictor_v2_checked_sequence(counter).is_none() {
+                    self.incomplete.store(true, Ordering::Relaxed);
+                }
+            }
+            fn snapshot(&self) -> P1jLaunchSnapshot {
+                P1jLaunchSnapshot {
+                    $($field: self.$field.load(Ordering::Relaxed),)+
+                    incomplete: self.incomplete.load(Ordering::Relaxed),
+                }
+            }
+        }
+        impl P1jLaunchSnapshot {
+            pub(crate) fn checked_delta(self, before: Self) -> Option<Self> {
+                if self.incomplete || before.incomplete { return None; }
+                Some(Self {
+                    $($field: self.$field.checked_sub(before.$field)?,)+
+                    incomplete: false,
+                })
+            }
+        }
+    };
+}
+p1m_launch_counters!(
+    launch_considered,
+    source_first_attempt_clean,
+    source_checkpoint_recovered_clean,
+    source_not_eligible,
+    p1j_not_ready,
+    no_pending_freeze,
+    pending_sidecar_existing,
+    retirement_busy,
+    candidate_identity_invalid,
+    freeze_incomplete,
+    candidate_already_current_at_f,
+    physical_evidence_missing_or_invalid,
+    not_logical_materialized,
+    missing_logical_generation,
+    host_lease_busy,
+    host_lease_missing,
+    host_lease_stale,
+    host_lease_wrong_payload_kind,
+    host_lease_wrong_dtype,
+    host_lease_wrong_length,
+    sidecar_lock_busy,
+    sidecar_occupied,
+    sidecar_identity_rejected,
+    sidecar_epoch_exhausted,
+    sidecar_writer_sequence_exhausted,
+    p0_acquire_failed,
+    writer_spawned,
+);
+impl P1jLaunchSnapshot {
+    pub(crate) fn reconciled(&self) -> bool {
+        let sources = self
+            .source_first_attempt_clean
+            .checked_add(self.source_checkpoint_recovered_clean)
+            .and_then(|n| n.checked_add(self.source_not_eligible));
+        let terminals = [
+            self.source_not_eligible,
+            self.p1j_not_ready,
+            self.no_pending_freeze,
+            self.pending_sidecar_existing,
+            self.retirement_busy,
+            self.candidate_identity_invalid,
+            self.freeze_incomplete,
+            self.candidate_already_current_at_f,
+            self.physical_evidence_missing_or_invalid,
+            self.not_logical_materialized,
+            self.missing_logical_generation,
+            self.host_lease_busy,
+            self.host_lease_missing,
+            self.host_lease_stale,
+            self.host_lease_wrong_payload_kind,
+            self.host_lease_wrong_dtype,
+            self.host_lease_wrong_length,
+            self.sidecar_lock_busy,
+            self.sidecar_occupied,
+            self.sidecar_identity_rejected,
+            self.sidecar_epoch_exhausted,
+            self.sidecar_writer_sequence_exhausted,
+            self.p0_acquire_failed,
+            self.writer_spawned,
+        ]
+        .into_iter()
+        .try_fold(0u64, |sum, n| sum.checked_add(n));
+        !self.incomplete
+            && sources == Some(self.launch_considered)
+            && terminals == Some(self.launch_considered)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum P1mSourceClass {
+    FirstAttemptCleanCommitted,
+    CheckpointRecoveredCleanCommitted,
+    NotEligible,
+}
+
+// Intentionally non-Copy: one final completion is consumed by one launch decision.
+struct P1mSourceCompletion {
+    position: usize,
+    class: P1mSourceClass,
+}
+impl P1mSourceCompletion {
+    // The sole production call is below the existing final clean commit branch.
+    fn after_commit(
+        position: usize,
+        committed_before: usize,
+        committed_after: usize,
+        attempts: usize,
+        recovery: Option<&GpuNativeRecoveryCursor>,
+        segment: &GpuNativeExecutionSegment,
+        report: &GpuNativeBoundaryReport,
+        full_token_replay: bool,
+    ) -> Self {
+        let consistent = !full_token_replay
+            && committed_before == position
+            && position.checked_add(1) == Some(committed_after)
+            && segment.completes_token
+            && report.final_status == 0
+            && !report.layer_statuses.is_empty()
+            && report.layer_statuses.iter().all(|&status| status == 0);
+        let class = if !consistent {
+            P1mSourceClass::NotEligible
+        } else {
+            match recovery {
+                None if attempts == 1 && segment.attempt_start == GpuNativeAttemptStart::Fresh => {
+                    P1mSourceClass::FirstAttemptCleanCommitted
+                }
+                Some(cursor)
+                    if attempts > 1
+                        && segment.attempt_start != GpuNativeAttemptStart::Fresh
+                        && cursor.next_layer == report.layer_statuses.len()
+                        && cursor.pending_resume_layer.is_none()
+                        && cursor.residency_services > 0
+                        && cursor.clean_segments > 0 =>
+                {
+                    P1mSourceClass::CheckpointRecoveredCleanCommitted
+                }
+                _ => P1mSourceClass::NotEligible,
+            }
+        };
+        Self { position, class }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum P1mLaunchTerminal {
+    SourceNotEligible,
+    P1jNotReady,
+    NoPendingFreeze,
+    PendingSidecarExisting,
+    Prepare(P1jPrepareRefusal),
+    P0AcquireFailed,
+    WriterSpawned,
+}
+impl P1jLaunchCounters {
+    fn terminal(&self, terminal: P1mLaunchTerminal) {
+        let counter = match terminal {
+            P1mLaunchTerminal::SourceNotEligible => &self.source_not_eligible,
+            P1mLaunchTerminal::P1jNotReady => &self.p1j_not_ready,
+            P1mLaunchTerminal::NoPendingFreeze => &self.no_pending_freeze,
+            P1mLaunchTerminal::PendingSidecarExisting => &self.pending_sidecar_existing,
+            P1mLaunchTerminal::P0AcquireFailed => &self.p0_acquire_failed,
+            P1mLaunchTerminal::WriterSpawned => &self.writer_spawned,
+            P1mLaunchTerminal::Prepare(reason) => match reason {
+                P1jPrepareRefusal::RetirementBusy => &self.retirement_busy,
+                P1jPrepareRefusal::CandidateIdentityInvalid => &self.candidate_identity_invalid,
+                P1jPrepareRefusal::FreezeIncomplete => &self.freeze_incomplete,
+                P1jPrepareRefusal::CandidateAlreadyCurrentAtF => {
+                    &self.candidate_already_current_at_f
+                }
+                P1jPrepareRefusal::PhysicalEvidenceMissingOrInvalid => {
+                    &self.physical_evidence_missing_or_invalid
+                }
+                P1jPrepareRefusal::NotLogicalMaterialized => &self.not_logical_materialized,
+                P1jPrepareRefusal::MissingLogicalGeneration => &self.missing_logical_generation,
+                P1jPrepareRefusal::HostLeaseBusy => &self.host_lease_busy,
+                P1jPrepareRefusal::HostLeaseMissing => &self.host_lease_missing,
+                P1jPrepareRefusal::HostLeaseStale => &self.host_lease_stale,
+                P1jPrepareRefusal::HostLeaseWrongPayloadKind => &self.host_lease_wrong_payload_kind,
+                P1jPrepareRefusal::HostLeaseWrongDtype => &self.host_lease_wrong_dtype,
+                P1jPrepareRefusal::HostLeaseWrongLength => &self.host_lease_wrong_length,
+                P1jPrepareRefusal::SidecarLockBusy => &self.sidecar_lock_busy,
+                P1jPrepareRefusal::SidecarOccupied => &self.sidecar_occupied,
+                P1jPrepareRefusal::SidecarIdentityRejected => &self.sidecar_identity_rejected,
+                P1jPrepareRefusal::SidecarEpochExhausted => &self.sidecar_epoch_exhausted,
+                P1jPrepareRefusal::SidecarWriterSequenceExhausted => {
+                    &self.sidecar_writer_sequence_exhausted
+                }
+            },
+        };
+        self.count(counter);
+    }
+}
+
+// Production and CPU fixtures share this no-wait decision flow. Only the
+// existing preparation, physical retirement and dispatch capabilities enter.
+fn p1m_launch<W>(
+    diagnostics: &P1jLaunchCounters,
+    source: P1mSourceCompletion,
+    pending: bool,
+    observer: Option<&mut PredictorV2RequestObserver>,
+    prepare: impl FnOnce(p1e::Freeze) -> Result<(P1jIdentity, W), P1jPrepareRefusal>,
+    retire: impl FnOnce(P1jIdentity),
+    spawn: impl FnOnce(W, P1jIdentity, PhysicalInstallIdentity),
+) {
+    diagnostics.count(&diagnostics.launch_considered);
+    match source.class {
+        P1mSourceClass::FirstAttemptCleanCommitted => {
+            diagnostics.count(&diagnostics.source_first_attempt_clean)
+        }
+        P1mSourceClass::CheckpointRecoveredCleanCommitted => {
+            diagnostics.count(&diagnostics.source_checkpoint_recovered_clean)
+        }
+        P1mSourceClass::NotEligible => {
+            diagnostics.terminal(P1mLaunchTerminal::SourceNotEligible);
+            return;
+        }
+    }
+    let terminal = (|| {
+        if pending {
+            return P1mLaunchTerminal::PendingSidecarExisting;
+        }
+        let Some(observer) = observer else {
+            return P1mLaunchTerminal::P1jNotReady;
+        };
+        if !observer.p1j_ready() {
+            return P1mLaunchTerminal::P1jNotReady;
+        }
+        let Some(target) = source.position.checked_add(1) else {
+            return P1mLaunchTerminal::NoPendingFreeze;
+        };
+        let Some(freeze) = observer.temporal().and_then(|t| t.pending_freeze(target)) else {
+            return P1mLaunchTerminal::NoPendingFreeze;
+        };
+        let (id, writer) = match prepare(freeze) {
+            Ok(prepared) => prepared,
+            Err(reason) => return P1mLaunchTerminal::Prepare(reason),
+        };
+        let Ok(install) = observer.p1j_acquired(id) else {
+            retire(id);
+            return P1mLaunchTerminal::P0AcquireFailed;
+            // The undispatched writer guard still closes safely on drop.
+        };
+        spawn(writer, id, install);
+        P1mLaunchTerminal::WriterSpawned
+    })();
+    diagnostics.terminal(terminal);
 }
 
 struct P1jCleanup {
@@ -1312,55 +1579,53 @@ pub struct GpuNativeTokenLoop {
     execution_guard: TokioMutex<()>,
     q4_qualification: std::sync::OnceLock<Arc<Q4QualificationObservation>>,
     predictor_v2_requests: PredictorV2RequestAllocator,
+    p1j_launch: P1jLaunchCounters,
 }
 
 impl GpuNativeTokenLoop {
+    pub(crate) fn p1j_launch_snapshot(&self) -> P1jLaunchSnapshot {
+        self.p1j_launch.snapshot()
+    }
+
     fn launch_p1j_at_freeze(
         &self,
         request: &mut GpuNativeRequestState,
-        position: usize,
-        clean_first_attempt: bool,
+        source: P1mSourceCompletion,
     ) {
         let Some(movement) = request.p1j.as_mut() else {
             return;
         };
-        if !clean_first_attempt || movement.pending.is_some() {
-            return;
-        }
-        let Some((_, observer)) = request.predictor_v2_observation.enabled.as_deref_mut() else {
-            return;
-        };
-        if !observer.p1j_ready() {
-            return;
-        }
-        let Some(target) = position.checked_add(1) else {
-            return;
-        };
-        let Some(freeze) = observer.temporal().and_then(|t| t.pending_freeze(target)) else {
-            return;
-        };
-        let Some(writer) = movement
-            .owner
-            .try_prepare(freeze, self.residency_manager.gpu_cache())
-        else {
-            return;
-        };
-        let id = writer.id;
-        let Ok(install) = observer.p1j_acquired(id) else {
-            movement.owner.retire(id, P1jTerminal::Cancelled);
-            return; // Writer guard structurally closes before the resource can recycle.
-        };
-        movement.pending = Some(P1jPending {
-            cleanup: P1jCleanup {
-                owner: movement.owner.clone(),
-                id,
-                armed: true,
+        let owner = &movement.owner;
+        let pending = &mut movement.pending;
+        p1m_launch(
+            &self.p1j_launch,
+            source,
+            pending.is_some(),
+            request
+                .predictor_v2_observation
+                .enabled
+                .as_deref_mut()
+                .map(|(_, o)| o),
+            |freeze| {
+                owner
+                    .try_prepare(freeze, self.residency_manager.gpu_cache())
+                    .map(|writer| (writer.id, writer))
             },
-            install,
-            published: false,
-            terminal: None,
-        });
-        writer.spawn();
+            |id| owner.retire(id, P1jTerminal::Cancelled),
+            |writer, id, install| {
+                *pending = Some(P1jPending {
+                    cleanup: P1jCleanup {
+                        owner: owner.clone(),
+                        id,
+                        armed: true,
+                    },
+                    install,
+                    published: false,
+                    terminal: None,
+                });
+                writer.spawn();
+            },
+        );
     }
 
     fn publish_p1j_at_deadline(&self, request: &mut GpuNativeRequestState, position: usize) {
@@ -1839,6 +2104,7 @@ impl GpuNativeTokenLoop {
             q4_qualification: std::sync::OnceLock::new(),
             execution_guard: TokioMutex::new(()),
             predictor_v2_requests: PredictorV2RequestAllocator::new(),
+            p1j_launch: P1jLaunchCounters::default(),
         }))
     }
 
@@ -2789,6 +3055,7 @@ impl GpuNativeTokenLoop {
         )>,
         oracle_hook: Option<&dyn GpuNativeOracleScheduleHook>,
     ) -> Result<GpuNativeStepOutput, GpuNativeTokenLoopError> {
+        let committed_before = request.committed_position;
         let max_attempts = gpu_native_attempt_bound(self.layers.len())?;
         let mut attempts = 0usize;
         let mut recovery: Option<GpuNativeRecoveryCursor> = None;
@@ -3035,6 +3302,16 @@ impl GpuNativeTokenLoop {
             }
 
             request.committed_position += 1;
+            let source_completion = P1mSourceCompletion::after_commit(
+                position,
+                committed_before,
+                request.committed_position,
+                attempts,
+                recovery.as_ref(),
+                &segment,
+                report,
+                false,
+            );
             self.counters
                 .tokens_completed
                 .fetch_add(1, Ordering::Relaxed);
@@ -3073,7 +3350,7 @@ impl GpuNativeTokenLoop {
                 report.selected_ids.get(p1e::LAYER).map(Vec::as_slice),
             );
             self.observe_p1e_completed(engine, request, position);
-            self.launch_p1j_at_freeze(request, position, attempts == 1 && recovery.is_none());
+            self.launch_p1j_at_freeze(request, source_completion);
 
             return Ok(GpuNativeStepOutput {
                 sampled_token: if sample {
@@ -5953,13 +6230,20 @@ pub(crate) mod tests {
         ] {
             assert!(!movement.contains(forbidden), "{forbidden}");
         }
-        assert!(movement.contains("if !clean_first_attempt || movement.pending.is_some()"));
-        assert!(movement.contains("t.pending_freeze(target)"));
+        let decision = source
+            .split("fn p1m_launch<W>(")
+            .nth(1)
+            .unwrap()
+            .split("struct P1jCleanup")
+            .next()
+            .unwrap();
+        assert!(decision.contains("if pending"));
+        assert!(decision.contains("t.pending_freeze(target)"));
         assert!(movement.contains("o.p1j_ready()"));
         assert!(movement.find(".try_prepare(").unwrap() < movement.find("writer.spawn()").unwrap());
         assert!(
-            movement.find("observer.p1j_acquired(id)").unwrap()
-                < movement.find("writer.spawn()").unwrap()
+            decision.find("observer.p1j_acquired(id)").unwrap()
+                < decision.find("spawn(writer, id, install)").unwrap()
         );
         let hook = source
             .find("self.publish_p1j_at_deadline(request, position)")
@@ -5978,9 +6262,7 @@ pub(crate) mod tests {
             "!full_token_replay && segment.attempt_start == GpuNativeAttemptStart::Fresh"
         ));
         assert_eq!(source.matches("self.launch_p1j_at_freeze(").count(), 1);
-        assert!(source.contains(
-            "self.launch_p1j_at_freeze(request, position, attempts == 1 && recovery.is_none())"
-        ));
+        assert!(source.contains("self.launch_p1j_at_freeze(request, source_completion)"));
     }
 
     #[test]
@@ -6076,6 +6358,683 @@ pub(crate) mod tests {
         ] {
             assert!(!recovery.contains(forbidden), "{forbidden}");
         }
+    }
+
+    fn p1m_fixture(
+        recovered: bool,
+    ) -> (
+        P1mSourceCompletion,
+        PredictorV2RequestObserver,
+        Box<crate::backend::gpu_native::GpuNativeQ4ExpertArena<()>>,
+        crate::expert_cache::GpuExpertCache,
+    ) {
+        use crate::expert_cache::{GpuExpertCache, GpuResident, HOST_BACKED_Q4_BYTES};
+        let arena = crate::backend::gpu_native::tests::p1j_arena();
+        let candidate = crate::backend::gpu_native::tests::p1j_candidate(&arena);
+        let cache = GpuExpertCache::new(HOST_BACKED_Q4_BYTES * 2, 0.0, 0);
+        let global = 47 * 128 + 8;
+        assert!(cache.promote_sync(Arc::new(GpuResident::new_with_dtype(
+            global,
+            vec![19; HOST_BACKED_Q4_BYTES],
+            crate::inference::WeightDtype::Q4_0,
+        ))));
+        let mut observer =
+            PredictorV2RequestObserver::new(candidate.request, candidate.model, 100_000).unwrap();
+        observer.enable_temporal(candidate.namespace).unwrap();
+        let mut source = None;
+        let mut committed = 0;
+        for (position, first) in [0, 8, 0].into_iter().enumerate() {
+            let mut report = GpuNativeBoundaryReport {
+                layer_statuses: vec![0; 48],
+                selected_ids: vec![(first..first + 8).collect(); 48],
+                final_status: 0,
+                sampled_token: 100,
+            };
+            let mut segment = GpuNativeExecutionSegment::fresh(48).unwrap();
+            let mut attempts = 1;
+            let mut recovery = None;
+            if position == 2 && recovered {
+                report.layer_statuses[0] = GPU_NATIVE_STATUS_RETRYABLE_MASK;
+                assert_eq!(report.first_failure_layer_in(0..48).unwrap(), Some(0));
+                let mut cursor = GpuNativeRecoveryCursor::after_serviced_miss(
+                    48,
+                    GpuNativeMissSignature {
+                        layer_index: 0,
+                        selected_ids: report.selected_ids[0].clone(),
+                    },
+                )
+                .unwrap();
+                report.layer_statuses[0] = 0; // Ordinary demand service and exact checkpoint resume.
+                loop {
+                    segment = cursor.plan(48).unwrap();
+                    attempts += 1;
+                    let complete = cursor.record_clean_segment(&segment, 48).unwrap();
+                    assert_eq!(complete, segment.completes_token);
+                    // Neither partial nor even final-but-uncommitted recovery can launch.
+                    assert_eq!(
+                        P1mSourceCompletion::after_commit(
+                            position,
+                            committed,
+                            committed,
+                            attempts,
+                            Some(&cursor),
+                            &segment,
+                            &report,
+                            false
+                        )
+                        .class,
+                        P1mSourceClass::NotEligible
+                    );
+                    if complete {
+                        break;
+                    }
+                }
+                recovery = Some(cursor);
+                assert!(attempts > 2);
+            }
+            let before = committed;
+            committed += 1;
+            let completion = P1mSourceCompletion::after_commit(
+                position,
+                before,
+                committed,
+                attempts,
+                recovery.as_ref(),
+                &segment,
+                &report,
+                false,
+            );
+            let previous = PredictorV2PositionIdentity::from_prompt_length(position, 10).unwrap();
+            let target = PredictorV2PositionIdentity::from_prompt_length(position + 1, 10).unwrap();
+            observer.observe_completed_position(
+                candidate.request,
+                previous,
+                candidate.model,
+                &report.selected_ids,
+            );
+            if let Some(c) = observer.prepare_temporal(previous, target) {
+                observer.temporal_mut().unwrap().freeze(
+                    c,
+                    100 + position as u64,
+                    Ok(p1e::PhysicalEvidence {
+                        snapshot: p1e::PhysicalSnapshot {
+                            namespace: candidate.namespace,
+                            residents: [None; 8],
+                        },
+                        event_cutoff: 0,
+                        committed_installs: 0,
+                        physical_victims: 0,
+                    }),
+                    p1e::HostSource {
+                        logical_generation: cache.current_generation(global),
+                        logical_materialized: true,
+                        ram_resident: false,
+                        permanence: p1e::Permanence::Unknown,
+                    },
+                );
+            }
+            source = Some(completion);
+        }
+        assert_eq!(committed, 3);
+        let freeze = observer.temporal().unwrap().pending_freeze(3).unwrap();
+        assert_eq!(freeze.candidate.expert, 8);
+        assert_eq!(freeze.current, Some(false));
+        assert!(freeze.source.logical_materialized);
+        assert!(freeze.physical.is_some());
+        assert_eq!(observer.snapshot().unwrap().emitted, 0);
+        (source.unwrap(), observer, arena, cache)
+    }
+
+    #[test]
+    fn p1m_p1k_recovered_committed_regression_and_first_attempt_reach_real_prepare_p0_spawn() {
+        for recovered in [false, true] {
+            let (source, mut observer, arena, cache) = p1m_fixture(recovered);
+            let expected = if recovered {
+                P1mSourceClass::CheckpointRecoveredCleanCommitted
+            } else {
+                P1mSourceClass::FirstAttemptCleanCommitted
+            };
+            assert_eq!(source.class, expected);
+            let diag = P1jLaunchCounters::default();
+            let spawned = std::cell::Cell::new(0);
+            p1m_launch(
+                &diag,
+                source,
+                false,
+                Some(&mut observer),
+                |f| {
+                    crate::gpu_native_residency::p1j_prepare_source(
+                        false,
+                        f.candidate.namespace,
+                        f,
+                        &cache,
+                        |c, g| arena.try_claim_p1j(c, g),
+                    )
+                },
+                |_| panic!("unexpected retirement"),
+                |lease, id, install| {
+                    assert_eq!(install.logical_generation, lease.generation());
+                    assert_eq!(arena.try_p1j_phase(id), Some(P1jPhase::Writing));
+                    spawned.set(spawned.get() + 1);
+                    arena.close_p1j_writer(id, true);
+                    drop(lease);
+                },
+            );
+            let d = diag.snapshot();
+            assert_eq!(d.launch_considered, 1);
+            assert_eq!(d.writer_spawned, 1);
+            assert_eq!(d.source_checkpoint_recovered_clean, u64::from(recovered));
+            assert_eq!(d.source_first_attempt_clean, u64::from(!recovered));
+            assert!(d.reconciled());
+            assert_eq!(spawned.get(), 1);
+            let p0 = observer.snapshot().unwrap();
+            assert_eq!((p0.emitted, p0.accepted, p0.source_completed), (1, 1, 1));
+            assert_eq!(cache.host_backed_lease_snapshot().active, 0);
+        }
+    }
+
+    #[test]
+    fn p1m_rejects_replay_uncommitted_inconsistent_partial_failed_sources() {
+        let report = GpuNativeBoundaryReport {
+            layer_statuses: vec![0; 48],
+            selected_ids: vec![vec![0, 1, 2, 3, 4, 5, 6, 7]; 48],
+            final_status: 0,
+            sampled_token: 0,
+        };
+        let fresh = GpuNativeExecutionSegment::fresh(48).unwrap();
+        for (before, after, attempts, replay) in [
+            (2, 2, 1, false),
+            (2, 4, 1, false),
+            (1, 3, 1, false),
+            (2, 3, 2, false),
+            (2, 3, 0, false),
+            (2, 3, 1, true),
+        ] {
+            assert_eq!(
+                P1mSourceCompletion::after_commit(
+                    2, before, after, attempts, None, &fresh, &report, replay
+                )
+                .class,
+                P1mSourceClass::NotEligible
+            );
+        }
+        let mut partial = fresh.clone();
+        partial.completes_token = false;
+        assert_eq!(
+            P1mSourceCompletion::after_commit(2, 2, 3, 1, None, &partial, &report, false).class,
+            P1mSourceClass::NotEligible
+        );
+        for status in [
+            GPU_NATIVE_STATUS_FATAL_MASK,
+            GPU_NATIVE_STATUS_RETRYABLE_MASK,
+            u32::MAX,
+        ] {
+            let mut failed = report.clone();
+            failed.final_status = status;
+            assert_eq!(
+                P1mSourceCompletion::after_commit(2, 2, 3, 1, None, &fresh, &failed, false).class,
+                P1mSourceClass::NotEligible
+            );
+            failed.final_status = 0;
+            failed.layer_statuses[47] = status;
+            assert_eq!(
+                P1mSourceCompletion::after_commit(2, 2, 3, 1, None, &fresh, &failed, false).class,
+                P1mSourceClass::NotEligible
+            );
+        }
+    }
+
+    #[test]
+    fn p1m_early_refusals_are_terminal_and_do_not_prepare_or_spawn() {
+        for case in 0..6 {
+            let (mut source, mut observer, _, _) = p1m_fixture(true);
+            let diag = P1jLaunchCounters::default();
+            if case == 0 {
+                source.class = P1mSourceClass::NotEligible;
+            }
+            if case == 3 {
+                source.position = 99;
+            }
+            if case == 4 {
+                observer.finish(true);
+            } // Cancelled/closed accounting.
+            if case == 5 {
+                observer
+                    .temporal_mut()
+                    .unwrap()
+                    .mark_incomplete(p1e::Error::Incomplete);
+            }
+            p1m_launch::<()>(
+                &diag,
+                source,
+                case == 1,
+                if case == 2 { None } else { Some(&mut observer) },
+                |_| panic!("refusal reached prepare"),
+                |_| panic!("unclaimed retirement"),
+                |_, _, _| panic!("refusal spawned"),
+            );
+            let d = diag.snapshot();
+            assert!(d.reconciled());
+            assert_eq!(d.writer_spawned, 0);
+            match case {
+                0 => assert_eq!(d.source_not_eligible, 1),
+                1 => assert_eq!(d.pending_sidecar_existing, 1),
+                3 => assert_eq!(d.no_pending_freeze, 1),
+                _ => assert_eq!(d.p1j_not_ready, 1),
+            }
+        }
+    }
+
+    #[test]
+    fn p1m_p0_failure_retires_without_spawn_and_releases_lease() {
+        let (source, mut observer, arena, cache) = p1m_fixture(true);
+        let diag = P1jLaunchCounters::default();
+        let retired = std::cell::Cell::new(0);
+        p1m_launch(
+            &diag,
+            source,
+            false,
+            Some(&mut observer),
+            |f| {
+                let (mut id, lease) = crate::gpu_native_residency::p1j_prepare_source(
+                    false,
+                    f.candidate.namespace,
+                    f,
+                    &cache,
+                    |c, g| arena.try_claim_p1j(c, g),
+                )
+                .unwrap();
+                id.candidate.sequence += 1; // Exact frozen candidate mismatch, rejected by real P0.
+                Ok((id, lease))
+            },
+            |_| retired.set(retired.get() + 1),
+            |_, _, _| panic!("P0 failure spawned"),
+        );
+        let d = diag.snapshot();
+        assert_eq!(d.p0_acquire_failed, 1);
+        assert_eq!(d.writer_spawned, 0);
+        assert_eq!(retired.get(), 1);
+        assert!(d.reconciled());
+        assert_eq!(cache.host_backed_lease_snapshot().active, 0);
+    }
+
+    #[test]
+    fn p1m_scalar_overflow_and_delta_underflow_fail_closed_without_affecting_dispatch() {
+        let (source, mut observer, arena, cache) = p1m_fixture(true);
+        let diag = P1jLaunchCounters::default();
+        diag.launch_considered.store(u64::MAX, Ordering::Relaxed);
+        let spawned = std::cell::Cell::new(false);
+        p1m_launch(
+            &diag,
+            source,
+            false,
+            Some(&mut observer),
+            |f| {
+                crate::gpu_native_residency::p1j_prepare_source(
+                    false,
+                    f.candidate.namespace,
+                    f,
+                    &cache,
+                    |c, g| arena.try_claim_p1j(c, g),
+                )
+            },
+            |_| panic!("telemetry blocked acquisition"),
+            |lease, _, _| {
+                spawned.set(true);
+                drop(lease);
+            },
+        );
+        assert!(spawned.get());
+        let after = diag.snapshot();
+        assert!(after.incomplete);
+        assert!(!after.reconciled());
+        assert_eq!(after.launch_considered, u64::MAX);
+        assert_eq!(after.writer_spawned, 1);
+        assert!(after.checked_delta(Default::default()).is_none());
+        let before = P1jLaunchSnapshot {
+            launch_considered: 1,
+            ..Default::default()
+        };
+        assert!(P1jLaunchSnapshot::default().checked_delta(before).is_none());
+        assert!(!before.reconciled());
+        assert_eq!(
+            P1jLaunchSnapshot::default().checked_delta(Default::default()),
+            Some(Default::default())
+        );
+    }
+
+    #[test]
+    fn p1m_every_prepare_refusal_is_one_exact_terminal() {
+        for (reason, field) in [
+            (P1jPrepareRefusal::RetirementBusy, "retirement_busy"),
+            (
+                P1jPrepareRefusal::CandidateIdentityInvalid,
+                "candidate_identity_invalid",
+            ),
+            (P1jPrepareRefusal::FreezeIncomplete, "freeze_incomplete"),
+            (
+                P1jPrepareRefusal::CandidateAlreadyCurrentAtF,
+                "candidate_already_current_at_f",
+            ),
+            (
+                P1jPrepareRefusal::PhysicalEvidenceMissingOrInvalid,
+                "physical_evidence_missing_or_invalid",
+            ),
+            (
+                P1jPrepareRefusal::NotLogicalMaterialized,
+                "not_logical_materialized",
+            ),
+            (
+                P1jPrepareRefusal::MissingLogicalGeneration,
+                "missing_logical_generation",
+            ),
+            (P1jPrepareRefusal::HostLeaseBusy, "host_lease_busy"),
+            (P1jPrepareRefusal::HostLeaseMissing, "host_lease_missing"),
+            (P1jPrepareRefusal::HostLeaseStale, "host_lease_stale"),
+            (
+                P1jPrepareRefusal::HostLeaseWrongPayloadKind,
+                "host_lease_wrong_payload_kind",
+            ),
+            (
+                P1jPrepareRefusal::HostLeaseWrongDtype,
+                "host_lease_wrong_dtype",
+            ),
+            (
+                P1jPrepareRefusal::HostLeaseWrongLength,
+                "host_lease_wrong_length",
+            ),
+            (P1jPrepareRefusal::SidecarLockBusy, "sidecar_lock_busy"),
+            (P1jPrepareRefusal::SidecarOccupied, "sidecar_occupied"),
+            (
+                P1jPrepareRefusal::SidecarIdentityRejected,
+                "sidecar_identity_rejected",
+            ),
+            (
+                P1jPrepareRefusal::SidecarEpochExhausted,
+                "sidecar_epoch_exhausted",
+            ),
+            (
+                P1jPrepareRefusal::SidecarWriterSequenceExhausted,
+                "sidecar_writer_sequence_exhausted",
+            ),
+        ] {
+            let (source, mut observer, _, _) = p1m_fixture(true);
+            let diag = P1jLaunchCounters::default();
+            p1m_launch::<()>(
+                &diag,
+                source,
+                false,
+                Some(&mut observer),
+                |_| Err(reason),
+                |_| panic!("refusal retired"),
+                |_, _, _| panic!("refusal spawned"),
+            );
+            let d = diag.snapshot();
+            assert_eq!(d.launch_considered, 1);
+            assert!(d.reconciled(), "{reason:?}");
+            let value = serde_json::to_value(d).unwrap();
+            assert_eq!(value[field], 1, "{reason:?}");
+            assert_eq!(d.writer_spawned, 0);
+            assert_eq!(observer.snapshot().unwrap().emitted, 0);
+        }
+    }
+
+    #[test]
+    fn p1m_prepare_preserves_freeze_source_generation_checks_and_order() {
+        use P1jPrepareRefusal::*;
+        let (_, observer, _, cache) = p1m_fixture(true);
+        let freeze = observer.temporal().unwrap().pending_freeze(3).unwrap();
+        let ns = freeze.candidate.namespace;
+        let mutations: &[(fn(&mut p1e::Freeze), P1jPrepareRefusal)] = &[
+            (
+                |f| f.candidate.namespace.context += 1,
+                CandidateIdentityInvalid,
+            ),
+            (|f| f.candidate.source_layer = 46, CandidateIdentityInvalid),
+            (|f| f.candidate.target_layer = 46, CandidateIdentityInvalid),
+            (
+                |f| f.candidate.position_distance = 2,
+                CandidateIdentityInvalid,
+            ),
+            (
+                |f| f.candidate.target_position.absolute_position += 1,
+                CandidateIdentityInvalid,
+            ),
+            (
+                |f| f.incomplete = Some(p1e::Error::Incomplete),
+                FreezeIncomplete,
+            ),
+            (|f| f.current = None, FreezeIncomplete),
+            (|f| f.current = Some(true), CandidateAlreadyCurrentAtF),
+            (
+                |f| f.source.logical_materialized = false,
+                NotLogicalMaterialized,
+            ),
+            (|f| f.physical = None, PhysicalEvidenceMissingOrInvalid),
+            (
+                |f| f.physical.as_mut().unwrap().snapshot.namespace.context += 1,
+                PhysicalEvidenceMissingOrInvalid,
+            ),
+            (
+                |f| {
+                    f.physical.as_mut().unwrap().snapshot.residents[0] = Some(p1e::Resident {
+                        expert: f.candidate.expert,
+                        generation: 1,
+                        bank: 0,
+                        slot: 0,
+                        epoch: 1,
+                    })
+                },
+                PhysicalEvidenceMissingOrInvalid,
+            ),
+            (
+                |f| f.source.logical_generation = None,
+                MissingLogicalGeneration,
+            ),
+        ];
+        let leases_before = cache.host_backed_lease_snapshot();
+        for (mutate, expected) in mutations {
+            let mut f = freeze;
+            mutate(&mut f);
+            assert_eq!(
+                crate::gpu_native_residency::p1j_prepare_generation(ns, f),
+                Err(*expected)
+            );
+            let result =
+                crate::gpu_native_residency::p1j_prepare_source(false, ns, f, &cache, |_, _| {
+                    panic!("invalid F reached claim")
+                });
+            assert!(matches!(result, Err(actual) if actual == *expected));
+            let result =
+                crate::gpu_native_residency::p1j_prepare_source(true, ns, f, &cache, |_, _| {
+                    panic!("retirement reached claim")
+                });
+            assert!(matches!(result, Err(RetirementBusy)));
+        }
+        assert_eq!(cache.host_backed_lease_snapshot(), leases_before);
+        assert_eq!(
+            crate::gpu_native_residency::p1j_prepare_generation(ns, freeze),
+            freeze
+                .source
+                .logical_generation
+                .ok_or(MissingLogicalGeneration)
+        );
+    }
+
+    #[test]
+    fn p1m_terminal_counter_and_reconciliation_sum_overflow_are_incomplete() {
+        let diag = P1jLaunchCounters::default();
+        diag.writer_spawned.store(u64::MAX, Ordering::Relaxed);
+        diag.terminal(P1mLaunchTerminal::WriterSpawned);
+        assert!(diag.snapshot().incomplete);
+        assert_eq!(diag.snapshot().writer_spawned, u64::MAX);
+        let bad = P1jLaunchSnapshot {
+            launch_considered: u64::MAX,
+            source_first_attempt_clean: u64::MAX,
+            source_checkpoint_recovered_clean: 1,
+            writer_spawned: u64::MAX,
+            ..Default::default()
+        };
+        assert!(!bad.reconciled());
+        let bad = P1jLaunchSnapshot {
+            source_checkpoint_recovered_clean: 0,
+            no_pending_freeze: 1,
+            ..bad
+        };
+        assert!(!bad.reconciled());
+    }
+
+    #[test]
+    fn p1m_only_final_commit_constructs_source_and_ordinary_execution_never_replays() {
+        let source = p1j_production_source();
+        let body = source
+            .split("    async fn step_token_p1e_observed_inner(")
+            .nth(1)
+            .unwrap()
+            .split("    /// Encode and execute one single attempt")
+            .next()
+            .unwrap();
+        assert_eq!(
+            source.matches("P1mSourceCompletion::after_commit(").count(),
+            1
+        );
+        assert_eq!(body.matches("request.committed_position += 1").count(), 1);
+        assert_eq!(body.matches("self.launch_p1j_at_freeze(").count(), 1);
+        let ordered = [
+            "report.first_failure_layer_in(",
+            "GpuNativeTokenLoopError::NoProgress",
+            "cursor.record_clean_segment(",
+            "if !segment.completes_token",
+            "match classify_gpu_native_status(report.final_status, None)",
+            "request.committed_position += 1",
+            "P1mSourceCompletion::after_commit(",
+            "engine.record_gpu_native_actual_routes(",
+            "observe_predictor_v2_completed_position(",
+            "self.finish_p1j_target(",
+            "self.observe_p1e_completed(",
+            "self.launch_p1j_at_freeze(",
+            "return Ok(GpuNativeStepOutput",
+        ];
+        for pair in ordered.windows(2) {
+            assert!(
+                body.find(pair[0]).unwrap() < body.find(pair[1]).unwrap(),
+                "{pair:?}"
+            );
+        }
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact
+                .matches("self.execute_token_attempt_unified(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            compact
+                .matches("self.execute_token_segment_unified(")
+                .count(),
+            1
+        );
+        assert!(compact.contains(
+            "self.execute_token_attempt_unified(request,token_id,position,sample,false,"
+        ));
+        assert!(compact.contains(
+            "self.execute_token_segment_unified(request,token_id,position,sample,false,&segment,"
+        ));
+        assert!(compact.contains("P1mSourceCompletion::after_commit(position,committed_before,request.committed_position,attempts,recovery.as_ref(),&segment,report,false,)"));
+        assert!(!body.contains("full_token_replay"));
+        assert!(!body.contains("execute_token_attempt("));
+        assert!(!body.contains("execute_token_segment("));
+        let launch = source
+            .split("    fn launch_p1j_at_freeze(")
+            .nth(1)
+            .unwrap()
+            .split("    fn publish_p1j_at_deadline(")
+            .next()
+            .unwrap();
+        assert!(
+            launch
+                .find("let Some(movement) = request.p1j.as_mut() else")
+                .unwrap()
+                < launch.find("p1m_launch(").unwrap()
+        );
+        assert!(!launch
+            .split("p1m_launch(")
+            .next()
+            .unwrap()
+            .contains(".count("));
+        assert!(
+            launch.find("*pending = Some(P1jPending").unwrap()
+                < launch.find("writer.spawn()").unwrap()
+        );
+    }
+
+    #[test]
+    fn p1m_telemetry_is_scalar_only_and_has_no_source_cache_lru_io_or_waits() {
+        let source = p1j_production_source();
+        let diagnostics = source
+            .split("macro_rules! p1m_launch_counters")
+            .nth(1)
+            .unwrap()
+            .split("struct P1jCleanup")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "Vec<",
+            "Vec::",
+            "vec![",
+            ".lock(",
+            ".await",
+            ".join(",
+            ".poll(",
+            ".submit(",
+            "read_expert",
+            "fetch_with_retry",
+            "std::fs",
+            "lru.",
+            "cache.",
+            "loop {",
+            "while ",
+            "std::env",
+            "println!",
+            "tracing::",
+        ] {
+            assert!(!diagnostics.contains(forbidden), "{forbidden}");
+        }
+        let zero = P1jLaunchCounters::default().snapshot();
+        assert_eq!(zero, P1jLaunchSnapshot::default());
+        assert!(zero.reconciled());
+    }
+
+    #[test]
+    fn p1m_frozen_publish_p1j_at_deadline_bytes() {
+        use sha2::{Digest, Sha256};
+        let body = p1j_production_source()
+            .split("    fn publish_p1j_at_deadline(")
+            .nth(1)
+            .unwrap()
+            .split("    fn finish_p1j_target(")
+            .next()
+            .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(body.as_bytes())),
+            "615db1099bd0b6eecd10054b769b0b331b7703370af9b65ac178d47c43976edd"
+        );
+    }
+
+    #[test]
+    fn p1m_frozen_execute_token_segment_unified_bytes() {
+        use sha2::{Digest, Sha256};
+        let body = p1j_production_source()
+            .split("    fn execute_token_segment_unified(")
+            .nth(1)
+            .unwrap()
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(body.as_bytes())),
+            "e20501fe8ba70cf63d8138e310dda98573579fcd931b1f22d621757592e750c2"
+        );
     }
 
     fn p1e_fixture_observation(enabled: bool, capacity: usize) -> PredictorV2RequestObservation {

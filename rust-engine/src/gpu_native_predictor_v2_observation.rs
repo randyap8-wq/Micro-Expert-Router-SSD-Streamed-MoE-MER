@@ -1588,7 +1588,7 @@ mod tests {
             ),
             (
                 include_str!("gpu_native_token_loop.rs"),
-                "023fc0dbe9c95070ae578479365aa6f04990208d41a1e8983f45f325fd049ad5",
+                "b6e1769508d8ed219d411c77318d28fa08752895ca03f947c55b7422106a8a0e",
             ),
             (
                 include_str!("config.rs"),

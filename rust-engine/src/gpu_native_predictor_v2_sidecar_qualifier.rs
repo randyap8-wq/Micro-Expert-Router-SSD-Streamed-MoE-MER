@@ -2,6 +2,7 @@
 //! No tuning or serving activation. Existing production stepping owns all work.
 
 use crate::gpu_native_real_benchmark as evidence;
+use crate::gpu_native_token_loop::P1jLaunchSnapshot;
 use crate::predictor_v2::{
     p1e, ObservationConfig, ReconciliationSnapshot, RequestPhase, TerminalReason,
 };
@@ -10,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-const SCHEMA: &str = "mer.predictor-v2-p1k-sidecar-runtime-qualifier.v1";
+const SCHEMA: &str = "mer.predictor-v2-p1k-sidecar-runtime-qualifier.v2";
 const MAX_POSITIONS: usize = 4096;
 
 #[derive(Clone, Debug, clap::Args, Serialize)]
@@ -365,6 +366,9 @@ struct ArmReport {
     raw_p1e_report: Option<p1e::Report>,
     normalized_p1e: Option<NormalizedP1e>,
     predictor_v2_snapshot: Option<ReconciliationSnapshot>,
+    p1j_launch_before: Option<P1jLaunchSnapshot>,
+    p1j_launch_after: Option<P1jLaunchSnapshot>,
+    p1j_launch_delta: Option<P1jLaunchSnapshot>,
     runtime_counters: Option<evidence::RequestSnapshots>,
     runtime_shutdown: Option<crate::greedy_parity::BackgroundShutdownEvidence>,
     errors: Vec<String>,
@@ -388,6 +392,9 @@ impl ArmReport {
             raw_p1e_report: None,
             normalized_p1e: None,
             predictor_v2_snapshot: None,
+            p1j_launch_before: None,
+            p1j_launch_after: None,
+            p1j_launch_delta: None,
             runtime_counters: None,
             runtime_shutdown: None,
             errors: Vec::new(),
@@ -547,6 +554,49 @@ fn compare(control: &ArmReport, treatment: &ArmReport) -> Parity {
         mismatch_details,
     }
 }
+// v2 requires auditable before/after/delta diagnostics. These checks can only
+// add failures; the original parity/P0/mechanism gates remain authoritative.
+fn launch_diagnostics_gate(report: &ArmReport) -> Vec<String> {
+    let mut errors = Vec::new();
+    match (
+        report.p1j_launch_before,
+        report.p1j_launch_after,
+        report.p1j_launch_delta,
+    ) {
+        (Some(before), Some(after), Some(delta)) => {
+            if after.checked_delta(before) != Some(delta)
+                || !before.reconciled()
+                || !after.reconciled()
+                || !delta.reconciled()
+            {
+                errors.push(format!(
+                    "{:?} P1J launch diagnostics incomplete or unreconciled",
+                    report.arm
+                ));
+            }
+            if report.arm == Arm::Control
+                && [before, after, delta]
+                    .iter()
+                    .any(|s| *s != P1jLaunchSnapshot::default())
+            {
+                errors.push("control P1J launch diagnostics must be entirely zero".into());
+            }
+        }
+        _ => errors.push(format!(
+            "{:?} P1J launch diagnostics unavailable",
+            report.arm
+        )),
+    }
+    errors
+}
+
+fn finish_launch_diagnostics(report: &mut ArmReport, after: P1jLaunchSnapshot) {
+    report.p1j_launch_after = Some(after);
+    report.p1j_launch_delta = report
+        .p1j_launch_before
+        .and_then(|before| after.checked_delta(before));
+}
+
 fn finish_report(report: &mut Report) {
     report.parity = compare(&report.control, &report.treatment);
     let control_errors = report
@@ -565,6 +615,7 @@ fn finish_report(report: &mut Report) {
     errors.extend(treatment_errors.iter().cloned());
     errors.extend(report.parity.mismatch_details.iter().cloned());
     for arm in [&report.control, &report.treatment] {
+        errors.extend(launch_diagnostics_gate(arm));
         if !arm.ordinary_invariants_pass {
             errors.push(format!("{:?} ordinary invariants failed", arm.arm));
         }
@@ -717,6 +768,7 @@ async fn execute_control(
         .ok_or("missing token loop")?;
     let config = observation_config(prompt.len(), output_tokens)?;
     report.observation_capacity_per_collection = config.capacity_per_collection;
+    report.p1j_launch_before = Some(token_loop.p1j_launch_snapshot());
     let snapshots = evidence::RequestSnapshotStart::capture(runtime)?;
     let mut request = token_loop.create_request_state()?;
     let enable = request
@@ -743,6 +795,7 @@ async fn execute_treatment(
         .ok_or("missing token loop")?;
     let config = observation_config(prompt.len(), output_tokens)?;
     report.observation_capacity_per_collection = config.capacity_per_collection;
+    report.p1j_launch_before = Some(token_loop.p1j_launch_snapshot());
     let snapshots = evidence::RequestSnapshotStart::capture(runtime)?;
     let mut request = token_loop.create_request_state()?;
     let execution: Result<()> = async {
@@ -811,6 +864,9 @@ fn finish_snapshots(
     runtime: &crate::BenchRealRuntime,
     report: &mut ArmReport,
 ) {
+    if let Some(token_loop) = runtime.gpu_native_token_loop.as_ref() {
+        finish_launch_diagnostics(report, token_loop.p1j_launch_snapshot());
+    }
     match snapshots.finish(runtime) {
         Ok(s) => report.runtime_counters = Some(s),
         Err(e) => report.errors.push(e.to_string()),
@@ -1295,6 +1351,19 @@ mod p1k_tests {
         } else {
             successful_p0()
         });
+        r.p1j_launch_before = Some(P1jLaunchSnapshot::default());
+        let after = if arm == Arm::Control {
+            P1jLaunchSnapshot::default()
+        } else {
+            P1jLaunchSnapshot {
+                launch_considered: 2,
+                source_first_attempt_clean: 1,
+                source_checkpoint_recovered_clean: 1,
+                writer_spawned: 2,
+                ..Default::default()
+            }
+        };
+        finish_launch_diagnostics(&mut r, after);
         r.ordinary_invariants_pass = true;
         r
     }
@@ -1676,6 +1745,88 @@ mod p1k_tests {
         assert!(treatment_gate(&p).is_empty());
     }
     #[test]
+    fn p1m_v2_serializes_complete_diagnostics_and_checked_deltas_for_both_arms() {
+        let mut r = report();
+        finish_report(&mut r);
+        assert!(r.qualification_pass);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["schema"],
+            "mer.predictor-v2-p1k-sidecar-runtime-qualifier.v2"
+        );
+        for point in ["p1j_launch_before", "p1j_launch_after", "p1j_launch_delta"] {
+            assert_eq!(
+                v["control"][point],
+                serde_json::to_value(P1jLaunchSnapshot::default()).unwrap()
+            );
+        }
+        let d = &v["treatment"]["p1j_launch_delta"];
+        assert_eq!(d["launch_considered"], 2);
+        assert_eq!(d["source_checkpoint_recovered_clean"], 1);
+        assert_eq!(d["writer_spawned"], 2);
+        assert_eq!(
+            d.as_object().unwrap().len(),
+            serde_json::to_value(P1jLaunchSnapshot::default())
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len()
+        );
+        for field in [
+            "host_lease_wrong_length",
+            "sidecar_lock_busy",
+            "candidate_identity_invalid",
+            "p0_acquire_failed",
+            "incomplete",
+        ] {
+            assert!(d.get(field).is_some(), "{field}");
+        }
+    }
+    #[test]
+    fn p1m_diagnostics_never_rescue_failed_mechanism_and_invalid_or_control_activity_fails() {
+        for mutation in 0..7 {
+            let mut r = report();
+            match mutation {
+                0 => r.treatment.predictor_v2_snapshot.as_mut().unwrap().emitted = 0,
+                1 => {
+                    r.treatment
+                        .predictor_v2_snapshot
+                        .as_mut()
+                        .unwrap()
+                        .direct_matching_demand_credits = 0
+                }
+                2 => {
+                    r.treatment
+                        .p1j_launch_delta
+                        .as_mut()
+                        .unwrap()
+                        .writer_spawned = 0
+                }
+                3 => {
+                    r.treatment
+                        .p1j_launch_before
+                        .as_mut()
+                        .unwrap()
+                        .writer_spawned = 3
+                }
+                4 => r.treatment.p1j_launch_after.as_mut().unwrap().incomplete = true,
+                5 => {
+                    r.control.p1j_launch_after = r.treatment.p1j_launch_after;
+                    r.control.p1j_launch_delta = r.treatment.p1j_launch_delta;
+                }
+                _ => r.treatment.p1j_launch_delta = None,
+            }
+            finish_report(&mut r);
+            assert!(!r.qualification_pass, "mutation {mutation}");
+        }
+        let mut a = arm(Arm::Treatment);
+        a.p1j_launch_before.as_mut().unwrap().writer_spawned = 3;
+        let after = a.p1j_launch_after.unwrap();
+        finish_launch_diagnostics(&mut a, after);
+        assert!(a.p1j_launch_delta.is_none());
+    }
+
+    #[test]
     fn performance_boundary_is_permanently_unauthorized() {
         let mut r = report();
         for failed in [false, true] {
@@ -1887,7 +2038,8 @@ mod p1k_tests {
             "async fn execute_treatment(",
         );
         assert!(s.contains("enable_predictor_v2_p1e_observation("));
-        assert!(!s.contains("p1j"));
+        assert!(!s.contains("enable_predictor_v2_p1j_sidecar"));
+        assert!(s.contains("p1j_launch_snapshot()"));
         assert!(!s.contains("sidecar"));
         assert!(!s.contains("create_buffer"));
     }

@@ -14,7 +14,7 @@ use crate::backend::gpu_native::{
     GpuNativeQ4ExpertKey, GpuNativeQ4ExpertPreparedInstall, GpuNativeQ4ExpertResidency,
     GpuNativeQ4ExpertRetire, GpuNativeQ4ExpertVramPlan,
 };
-use crate::backend::gpu_native::{GpuNativeP1jSidecar, P1jPhase, P1jPublication};
+use crate::backend::gpu_native::{GpuNativeP1jSidecar, P1jClaimRefusal, P1jPhase, P1jPublication};
 use crate::expert_cache::{
     ExpertResident, GpuAdmission, GpuExpertCache, HostBackedLease, HostBackedLeaseResult,
 };
@@ -755,6 +755,115 @@ impl P1jRetirement {
     }
 }
 
+/// Existing prepare stages, in their original evaluation order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum P1jPrepareRefusal {
+    RetirementBusy,
+    CandidateIdentityInvalid,
+    FreezeIncomplete,
+    CandidateAlreadyCurrentAtF,
+    PhysicalEvidenceMissingOrInvalid,
+    NotLogicalMaterialized,
+    MissingLogicalGeneration,
+    HostLeaseBusy,
+    HostLeaseMissing,
+    HostLeaseStale,
+    HostLeaseWrongPayloadKind,
+    HostLeaseWrongDtype,
+    HostLeaseWrongLength,
+    SidecarLockBusy,
+    SidecarOccupied,
+    SidecarIdentityRejected,
+    SidecarEpochExhausted,
+    SidecarWriterSequenceExhausted,
+}
+
+impl From<P1jClaimRefusal> for P1jPrepareRefusal {
+    fn from(value: P1jClaimRefusal) -> Self {
+        match value {
+            P1jClaimRefusal::LockBusy => Self::SidecarLockBusy,
+            P1jClaimRefusal::Occupied => Self::SidecarOccupied,
+            P1jClaimRefusal::IdentityRejected => Self::SidecarIdentityRejected,
+            P1jClaimRefusal::EpochExhausted => Self::SidecarEpochExhausted,
+            P1jClaimRefusal::WriterSequenceExhausted => Self::SidecarWriterSequenceExhausted,
+        }
+    }
+}
+
+fn p1j_host_lease(result: HostBackedLeaseResult) -> Result<HostBackedLease, P1jPrepareRefusal> {
+    match result {
+        HostBackedLeaseResult::Acquired(lease) => Ok(lease),
+        HostBackedLeaseResult::Busy => Err(P1jPrepareRefusal::HostLeaseBusy),
+        HostBackedLeaseResult::Missing => Err(P1jPrepareRefusal::HostLeaseMissing),
+        HostBackedLeaseResult::Stale => Err(P1jPrepareRefusal::HostLeaseStale),
+        HostBackedLeaseResult::WrongPayloadKind => {
+            Err(P1jPrepareRefusal::HostLeaseWrongPayloadKind)
+        }
+        HostBackedLeaseResult::WrongDtype => Err(P1jPrepareRefusal::HostLeaseWrongDtype),
+        HostBackedLeaseResult::WrongLength => Err(P1jPrepareRefusal::HostLeaseWrongLength),
+    }
+}
+
+// Scalar-only validation shared by production and CPU fixtures. Keep the
+// original F/source/physical/generation order; never acquire a source here.
+pub(crate) fn p1j_prepare_generation(
+    namespace: p1e::Namespace,
+    freeze: p1e::Freeze,
+) -> Result<u64, P1jPrepareRefusal> {
+    use P1jPrepareRefusal::*;
+    let c = freeze.candidate;
+    if c.namespace != namespace
+        || c.source_layer != 47
+        || c.target_layer != 47
+        || c.position_distance != 1
+        || c.source_position.absolute_position.checked_add(1)
+            != Some(c.target_position.absolute_position)
+    {
+        return Err(CandidateIdentityInvalid);
+    }
+    if freeze.incomplete.is_some() || freeze.current.is_none() {
+        return Err(FreezeIncomplete);
+    }
+    if freeze.current != Some(false) {
+        return Err(CandidateAlreadyCurrentAtF);
+    }
+    if !freeze.source.logical_materialized {
+        return Err(NotLogicalMaterialized);
+    }
+    let physical = freeze.physical.ok_or(PhysicalEvidenceMissingOrInvalid)?;
+    if physical
+        .snapshot
+        .current(c.namespace, c.expert)
+        .map_err(|_| PhysicalEvidenceMissingOrInvalid)?
+    {
+        return Err(PhysicalEvidenceMissingOrInvalid);
+    }
+    freeze
+        .source
+        .logical_generation
+        .ok_or(MissingLogicalGeneration)
+}
+
+// The exact real prepare gates also accept a CPU arena claim in software tests.
+pub(crate) fn p1j_prepare_source(
+    retirement_busy: bool,
+    namespace: p1e::Namespace,
+    freeze: p1e::Freeze,
+    cache: &GpuExpertCache,
+    claim: impl FnOnce(p1e::Candidate, u64) -> Result<P1jIdentity, P1jClaimRefusal>,
+) -> Result<(P1jIdentity, HostBackedLease), P1jPrepareRefusal> {
+    if retirement_busy {
+        return Err(P1jPrepareRefusal::RetirementBusy);
+    }
+    let c = freeze.candidate;
+    let generation = p1j_prepare_generation(namespace, freeze)?;
+    let lease = p1j_host_lease(cache.try_lease_host_backed((47 * 128) + c.expert, generation))?;
+    let id = claim(c, generation)?;
+    debug_assert_eq!(lease.global_id(), id.global_id());
+    debug_assert_eq!(lease.generation(), id.logical_generation);
+    Ok((id, lease))
+}
+
 pub(crate) struct P1jWriter {
     owner: Arc<P1jSidecarOwner>,
     pub(crate) id: P1jIdentity,
@@ -837,39 +946,15 @@ impl P1jSidecarOwner {
         self: &Arc<Self>,
         freeze: p1e::Freeze,
         cache: &GpuExpertCache,
-    ) -> Option<P1jWriter> {
-        if self.retirement.running.load(Ordering::Acquire) {
-            return None;
-        }
-        let c = freeze.candidate;
-        if c.namespace != self.namespace
-            || c.source_layer != 47
-            || c.target_layer != 47
-            || c.position_distance != 1
-            || c.source_position.absolute_position.checked_add(1)
-                != Some(c.target_position.absolute_position)
-            || freeze.incomplete.is_some()
-            || freeze.current != Some(false)
-            || !freeze.source.logical_materialized
-            || freeze.physical.is_none()
-            || freeze
-                .physical?
-                .snapshot
-                .current(c.namespace, c.expert)
-                .ok()?
-        {
-            return None;
-        }
-        let generation = freeze.source.logical_generation?;
-        let HostBackedLeaseResult::Acquired(lease) =
-            cache.try_lease_host_backed((47 * 128) + c.expert, generation)
-        else {
-            return None;
-        };
-        let id = self.arena.try_claim_p1j(c, generation)?;
-        debug_assert_eq!(lease.global_id(), id.global_id());
-        debug_assert_eq!(lease.generation(), id.logical_generation);
-        Some(P1jWriter {
+    ) -> Result<P1jWriter, P1jPrepareRefusal> {
+        let (id, lease) = p1j_prepare_source(
+            self.retirement.running.load(Ordering::Acquire),
+            self.namespace,
+            freeze,
+            cache,
+            |c, generation| self.arena.try_claim_p1j(c, generation),
+        )?;
+        Ok(P1jWriter {
             owner: self.clone(),
             id,
             lease: Some(lease),
@@ -2480,6 +2565,79 @@ pub(crate) fn validate_qualification_physical_source_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn p1m_every_host_lease_and_claim_refusal_maps_exactly() {
+        use HostBackedLeaseResult as H;
+        use P1jPrepareRefusal as P;
+        for (input, expected) in [
+            (H::Busy, P::HostLeaseBusy),
+            (H::Missing, P::HostLeaseMissing),
+            (H::Stale, P::HostLeaseStale),
+            (H::WrongPayloadKind, P::HostLeaseWrongPayloadKind),
+            (H::WrongDtype, P::HostLeaseWrongDtype),
+            (H::WrongLength, P::HostLeaseWrongLength),
+        ] {
+            assert!(matches!(p1j_host_lease(input), Err(actual) if actual == expected));
+        }
+        for (input, expected) in [
+            (P1jClaimRefusal::LockBusy, P::SidecarLockBusy),
+            (P1jClaimRefusal::Occupied, P::SidecarOccupied),
+            (
+                P1jClaimRefusal::IdentityRejected,
+                P::SidecarIdentityRejected,
+            ),
+            (P1jClaimRefusal::EpochExhausted, P::SidecarEpochExhausted),
+            (
+                P1jClaimRefusal::WriterSequenceExhausted,
+                P::SidecarWriterSequenceExhausted,
+            ),
+        ] {
+            assert_eq!(P::from(input), expected);
+        }
+    }
+
+    #[test]
+    fn p1m_real_host_payload_length_diagnosed_and_lease_retained_without_lru_touch() {
+        use crate::expert_cache::{GpuResident, HOST_BACKED_Q4_BYTES};
+        for len in [HOST_BACKED_Q4_BYTES - 1, HOST_BACKED_Q4_BYTES] {
+            let cache = GpuExpertCache::new(HOST_BACKED_Q4_BYTES * 2, 0.0, 0);
+            assert!(cache.promote_sync(Arc::new(GpuResident::new_with_dtype(
+                47 * 128 + 8,
+                vec![0; len],
+                crate::inference::WeightDtype::Q4_0,
+            ))));
+            // A newer resident lets subsequent eviction expose any lease LRU touch.
+            assert!(cache.promote_sync(Arc::new(GpuResident::new_with_dtype(
+                47 * 128 + 9,
+                vec![0; HOST_BACKED_Q4_BYTES],
+                crate::inference::WeightDtype::Q4_0,
+            ))));
+            let generation = cache.current_generation(47 * 128 + 8).unwrap();
+            let result = p1j_host_lease(cache.try_lease_host_backed(47 * 128 + 8, generation));
+            if len != HOST_BACKED_Q4_BYTES {
+                assert!(matches!(
+                    result,
+                    Err(P1jPrepareRefusal::HostLeaseWrongLength)
+                ));
+                assert_eq!(cache.host_backed_lease_snapshot().active, 0);
+            } else {
+                let lease = result.unwrap_or_else(|e| panic!("{e:?}"));
+                assert_eq!(lease.generation(), generation);
+                assert_eq!(cache.host_backed_lease_snapshot().active, 1);
+                drop(lease);
+                assert_eq!(cache.host_backed_lease_snapshot().active, 0);
+            }
+            assert_eq!(cache.current_generation(47 * 128 + 8), Some(generation));
+            assert!(cache.promote_sync(Arc::new(GpuResident::new_with_dtype(
+                47 * 128 + 10,
+                vec![0; HOST_BACKED_Q4_BYTES],
+                crate::inference::WeightDtype::Q4_0,
+            ))));
+            assert!(cache.current_generation(47 * 128 + 8).is_none());
+            assert!(cache.current_generation(47 * 128 + 9).is_some());
+        }
+    }
+
     #[test]
     fn p1j_spawn_blocking_writer_enqueues_closes_then_releases_exact_source() {
         use crate::expert_cache::{GpuResident, HOST_BACKED_Q4_BYTES};
