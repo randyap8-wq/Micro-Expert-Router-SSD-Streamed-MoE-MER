@@ -1584,11 +1584,11 @@ mod tests {
         for (source, digest) in [
             (
                 include_str!("predictor_v2.rs"),
-                "2d7202e76059e23593e98e8fc07b90d34b2dc26d255f9c48ad0a15b8022518a9",
+                "bd534f6252b6a059a8b773e88151c35b2e8f2a35734a2bec4584b1b59c3a236e",
             ),
             (
                 include_str!("gpu_native_token_loop.rs"),
-                "e88c54265b794015eb4f1ee910ccfc379efd824545d865a90c475ddd0e7a2376",
+                "023fc0dbe9c95070ae578479365aa6f04990208d41a1e8983f45f325fd049ad5",
             ),
             (
                 include_str!("config.rs"),

@@ -14,7 +14,11 @@ use crate::backend::gpu_native::{
     GpuNativeQ4ExpertKey, GpuNativeQ4ExpertPreparedInstall, GpuNativeQ4ExpertResidency,
     GpuNativeQ4ExpertRetire, GpuNativeQ4ExpertVramPlan,
 };
-use crate::expert_cache::{ExpertResident, GpuAdmission, GpuExpertCache};
+use crate::backend::gpu_native::{GpuNativeP1jSidecar, P1jPhase, P1jPublication};
+use crate::expert_cache::{
+    ExpertResident, GpuAdmission, GpuExpertCache, HostBackedLease, HostBackedLeaseResult,
+};
+use crate::predictor_v2::{p1e, P1jIdentity, P1jTerminal};
 use lru::LruCache;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
@@ -28,10 +32,7 @@ fn qualification_elapsed_us(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-fn post_reservation_physical_install_total_us(
-    individual_stage_us: u64,
-    commit_us: u64,
-) -> u64 {
+fn post_reservation_physical_install_total_us(individual_stage_us: u64, commit_us: u64) -> u64 {
     individual_stage_us.saturating_add(commit_us)
 }
 
@@ -679,6 +680,260 @@ pub(crate) struct GpuNativeTieredResidencyManager {
     plan: GpuNativeModelExpertVramPlan,
     layers: Vec<LayerResidency>,
     counters: TieredResidencyCounters,
+    p1j: std::sync::OnceLock<Result<Arc<P1jSidecarOwner>, String>>,
+}
+
+/// One model-owned resource. No request history or ordinary capacity lives here.
+pub(crate) struct P1jSidecarOwner {
+    executor: Arc<GpuNativeExecutorContext>,
+    arena: Arc<GpuNativeQ4ExpertArena>,
+    resource: GpuNativeP1jSidecar,
+    namespace: p1e::Namespace,
+    runtime: tokio::runtime::Handle,
+    retirement: P1jRetirement,
+}
+
+/// One latest scalar cleanup request, not a queue of predictions. Epochs are
+/// unique for this model resource, so an older cancellation cannot replace it.
+#[derive(Default)]
+struct P1jRetirement {
+    requested: AtomicU64,
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl P1jRetirement {
+    fn request(&self, epoch: u32, reason: P1jTerminal) {
+        let code = match reason {
+            P1jTerminal::UsedMatching => 1,
+            P1jTerminal::Unused => 2,
+            P1jTerminal::StaleLogicalGeneration => 3,
+            P1jTerminal::OrdinarySuperseded => 4,
+            P1jTerminal::Cancelled => 5,
+            P1jTerminal::RequestEnded => 6,
+            P1jTerminal::WriteFailure => 7,
+        };
+        let packed = (u64::from(epoch) << 8) | code;
+        let _ = self
+            .requested
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                (old >> 8 < u64::from(epoch)).then_some(packed)
+            });
+    }
+
+    fn cancelled(&self, epoch: u32) -> bool {
+        self.requested.load(Ordering::Acquire) >> 8 >= u64::from(epoch)
+    }
+
+    fn start(&self) -> bool {
+        self.running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Called only by a blocking worker. Clearing the dispatch flag before
+    /// rechecking the request closes the lost-wakeup window: either this worker
+    /// handles a newer cancellation or its caller owns the next dispatch.
+    fn drain(&self, mut retire: impl FnMut(u32, P1jTerminal)) {
+        loop {
+            let packed = self.requested.load(Ordering::Acquire);
+            let reason = match packed & 0xff {
+                1 => P1jTerminal::UsedMatching,
+                2 => P1jTerminal::Unused,
+                3 => P1jTerminal::StaleLogicalGeneration,
+                4 => P1jTerminal::OrdinarySuperseded,
+                5 => P1jTerminal::Cancelled,
+                6 => P1jTerminal::RequestEnded,
+                7 => P1jTerminal::WriteFailure,
+                _ => unreachable!("cleanup dispatch follows a retirement request"),
+            };
+            retire((packed >> 8) as u32, reason);
+            self.running.store(false, Ordering::Release);
+            if self.requested.load(Ordering::Acquire) == packed || !self.start() {
+                break;
+            }
+        }
+    }
+}
+
+pub(crate) struct P1jWriter {
+    owner: Arc<P1jSidecarOwner>,
+    pub(crate) id: P1jIdentity,
+    lease: Option<HostBackedLease>,
+    closed: bool,
+}
+
+/// Shared by the real worker and CPU queue doubles. Even an unwinding write
+/// drops its view before closure is published, then relinquishes the source.
+fn p1j_stage_lease(
+    lease: HostBackedLease,
+    write: impl FnOnce(&[u8]) -> Result<(), GpuNativeBootstrapError>,
+    close: impl FnOnce(bool),
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(lease.data())));
+    close(matches!(result, Ok(Ok(()))));
+    drop(lease);
+}
+
+impl P1jWriter {
+    pub(crate) fn spawn(self) {
+        let runtime = self.owner.runtime.clone();
+        // Claim and lease already exist before dispatch. There is no prediction queue.
+        runtime.spawn_blocking(move || {
+            let mut writer = self;
+            let lease = writer.lease.take().expect("writer owns source");
+            let owner = &writer.owner;
+            p1j_stage_lease(
+                lease,
+                |payload| {
+                    owner
+                        .executor
+                        .write_p1j_payload(&owner.resource, writer.id, payload)
+                },
+                |success| {
+                    if !success {
+                        owner
+                            .retirement
+                            .request(writer.id.epoch, P1jTerminal::WriteFailure);
+                    }
+                    owner.arena.close_p1j_writer(writer.id, success);
+                },
+            );
+            writer.closed = true;
+        });
+    }
+    fn close(&mut self, success: bool) {
+        if self.closed {
+            return;
+        }
+        if !success {
+            self.owner
+                .retirement
+                .request(self.id.epoch, P1jTerminal::WriteFailure);
+        }
+        if !self.owner.arena.try_close_p1j_writer(self.id, success) {
+            // A never-dispatched writer can be dropped on the foreground path.
+            // Its enqueue capability is gone; keep WRITING claimed until this
+            // scalar-only closer runs. There can be only one such closer.
+            let owner = self.owner.clone();
+            let id = self.id;
+            self.owner.runtime.spawn_blocking(move || {
+                owner.arena.close_p1j_writer(id, success);
+            });
+        }
+        // No code may access source bytes after ENQUEUED_CLOSED. Drop immediately.
+        drop(self.lease.take());
+        self.closed = true;
+    }
+}
+
+impl Drop for P1jWriter {
+    fn drop(&mut self) {
+        self.close(false);
+    }
+}
+
+impl P1jSidecarOwner {
+    pub(crate) fn try_prepare(
+        self: &Arc<Self>,
+        freeze: p1e::Freeze,
+        cache: &GpuExpertCache,
+    ) -> Option<P1jWriter> {
+        if self.retirement.running.load(Ordering::Acquire) {
+            return None;
+        }
+        let c = freeze.candidate;
+        if c.namespace != self.namespace
+            || c.source_layer != 47
+            || c.target_layer != 47
+            || c.position_distance != 1
+            || c.source_position.absolute_position.checked_add(1)
+                != Some(c.target_position.absolute_position)
+            || freeze.incomplete.is_some()
+            || freeze.current != Some(false)
+            || !freeze.source.logical_materialized
+            || freeze.physical.is_none()
+            || freeze
+                .physical?
+                .snapshot
+                .current(c.namespace, c.expert)
+                .ok()?
+        {
+            return None;
+        }
+        let generation = freeze.source.logical_generation?;
+        let HostBackedLeaseResult::Acquired(lease) =
+            cache.try_lease_host_backed((47 * 128) + c.expert, generation)
+        else {
+            return None;
+        };
+        let id = self.arena.try_claim_p1j(c, generation)?;
+        debug_assert_eq!(lease.global_id(), id.global_id());
+        debug_assert_eq!(lease.generation(), id.logical_generation);
+        Some(P1jWriter {
+            owner: self.clone(),
+            id,
+            lease: Some(lease),
+            closed: false,
+        })
+    }
+
+    pub(crate) fn try_publish(&self, id: P1jIdentity, cache: &GpuExpertCache) -> P1jPublication {
+        if id.candidate.namespace != self.namespace || self.cancelled(id) {
+            return P1jPublication::IdentityMismatch;
+        }
+        cache
+            .try_with_host_generation(id.global_id(), id.logical_generation, |current| {
+                self.executor.try_publish_p1j(&self.arena, id, current)
+            })
+            .unwrap_or(P1jPublication::Busy)
+    }
+
+    pub(crate) fn cancelled(&self, id: P1jIdentity) -> bool {
+        self.retirement.cancelled(id.epoch)
+    }
+
+    pub(crate) fn phase(&self, id: P1jIdentity) -> Option<P1jPhase> {
+        self.arena.try_p1j_phase(id)
+    }
+    pub(crate) fn resource(&self) -> &GpuNativeP1jSidecar {
+        &self.resource
+    }
+
+    /// Foreground cleanup never waits. At most one deferred cleanup may exist
+    /// while this exact occupant prevents destination reuse; it performs only
+    /// conditional unpublication, never payload writes or mapping publication.
+    pub(crate) fn retire(self: &Arc<Self>, id: P1jIdentity, reason: P1jTerminal) {
+        if id.candidate.namespace != self.namespace {
+            return;
+        }
+        self.retirement.request(id.epoch, reason);
+        if self
+            .executor
+            .retire_p1j(&self.arena, id, reason, true)
+            .is_some()
+        {
+            return;
+        }
+        if !self.retirement.start() {
+            return;
+        }
+        let owner = self.clone();
+        self.runtime.spawn_blocking(move || {
+            owner.retirement.drain(|epoch, reason| {
+                owner
+                    .executor
+                    .retire_p1j_epoch(&owner.arena, owner.namespace, epoch, reason);
+            });
+        });
+    }
+
+    fn current(&self, global: u32) -> Option<(P1jIdentity, GpuNativeQ4ExpertResidency)> {
+        let (id, residency) = self.arena.p1j_current()?;
+        (id.global_id() == global
+            && id.candidate.namespace == self.namespace
+            && !self.cancelled(id))
+        .then_some((id, residency))
+    }
 }
 
 impl GpuNativeTieredResidencyManager {
@@ -710,7 +965,69 @@ impl GpuNativeTieredResidencyManager {
             plan,
             layers,
             counters: TieredResidencyCounters::default(),
+            p1j: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Explicit internal future-qualification opt-in. No ordinary constructor,
+    /// observer, CLI, environment variable or serving path calls this method.
+    pub(crate) fn enable_p1j_sidecar(&self, runtime: u64) -> Result<Arc<P1jSidecarOwner>, String> {
+        let namespace = self.p1e_namespace(runtime).map_err(|e| format!("{e:?}"))?;
+        let result = self.p1j.get_or_init(|| {
+            let handle = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
+            let arena = self.layers[47].arena.clone();
+            let resource = self
+                .executor
+                .create_p1j_sidecar(&arena)
+                .map_err(|e| e.to_string())?;
+            Ok(Arc::new(P1jSidecarOwner {
+                executor: self.executor.clone(),
+                arena,
+                resource,
+                namespace,
+                runtime: handle,
+                retirement: P1jRetirement::default(),
+            }))
+        });
+        let owner = result.as_ref().map_err(Clone::clone)?;
+        if owner.namespace != namespace {
+            return Err("P1J model/runtime namespace mismatch".into());
+        }
+        Ok(owner.clone())
+    }
+
+    fn p1j_current(&self, global: u32) -> Option<(P1jIdentity, GpuNativeQ4ExpertResidency)> {
+        if global / 128 != 47 {
+            return None;
+        }
+        self.p1j.get()?.as_ref().ok()?.current(global)
+    }
+
+    /// Nonblocking variant only for the opted-in P1J D seam. P1E's ordinary
+    /// observation path remains unchanged. A busy read marks evidence unavailable.
+    pub(crate) fn try_observe_p1j_physical(
+        &self,
+        namespace: p1e::Namespace,
+    ) -> Result<p1e::PhysicalEvidence, p1e::Error> {
+        if self.p1e_namespace(namespace.runtime)? != namespace {
+            return Err(p1e::Error::Identity);
+        }
+        let layer = &self.layers[47];
+        let mut state = layer.state.try_lock().ok_or(p1e::Error::PhysicalEvidence)?;
+        let actual = copy_p1e_snapshot(
+            namespace,
+            &state.residents,
+            state.residents.len(),
+            |_, record| Some(p1e_resident(*record)),
+        )?;
+        if layer.arena.try_p1j_verify_snapshot(&actual) != Some(true) {
+            return Err(p1e::Error::PhysicalEvidence);
+        }
+        state
+            .p1e_shadow
+            .as_deref_mut()
+            .ok_or(p1e::Error::Incomplete)?
+            .evidence(actual)
     }
 
     pub(crate) fn executor(&self) -> &Arc<GpuNativeExecutorContext> {
@@ -874,7 +1191,8 @@ impl GpuNativeTieredResidencyManager {
         let mut state = layer.state.lock();
         Ok(self
             .current_record_locked(global_id, layer, &mut state, false)?
-            .is_some())
+            .is_some()
+            || self.p1j_current(global_id).is_some())
     }
 
     pub(crate) fn record_physical_source_acquisition(&self) {
@@ -974,7 +1292,9 @@ impl GpuNativeTieredResidencyManager {
         {
             return Err(GpuNativeTieredResidencyError::Backend(
                 GpuNativeBootstrapError::QualificationSourceUpload {
-                    detail: "observed source/upload state must be the production-owned treatment state".into(),
+                    detail:
+                        "observed source/upload state must be the production-owned treatment state"
+                            .into(),
                 },
             ));
         }
@@ -1168,12 +1488,25 @@ impl GpuNativeTieredResidencyManager {
                 .fetch_add(demands.len() as u64, Ordering::Relaxed);
         }
         let mut state = layer.state.lock();
+        let sidecar = demands
+            .iter()
+            .find_map(|d| self.p1j_current(d.global_id()))
+            .map(|(_, residency)| {
+                p1e_resident(PhysicalRecord {
+                    key: residency.key(),
+                    residency,
+                })
+            });
         if let Some(shadow) = state.p1e_shadow.as_deref_mut() {
             let local_ids = demands
                 .iter()
                 .map(|d| d.global_id() % self.plan.geometry().num_experts() as u32)
                 .collect::<Vec<_>>();
-            shadow.demand(&local_ids);
+            if sidecar.is_some() {
+                shadow.demand_with_sidecar(&local_ids, sidecar);
+            } else {
+                shadow.demand(&local_ids);
+            }
         }
         let mut resolved = vec![None; demands.len()];
         let mut misses = Vec::new();
@@ -1185,6 +1518,14 @@ impl GpuNativeTieredResidencyManager {
                     .physical_current_hits
                     .fetch_add(1, Ordering::Relaxed);
                 resolved[index] = Some(record.residency);
+            } else if let Some((_, residency)) = self.p1j_current(global_id) {
+                // The token loop's execution guard spans this target recovery.
+                // No logical acquisition, ordinary LRU touch or payload rewrite.
+                self.counters.vram_hits.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .physical_current_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                resolved[index] = Some(residency);
             } else {
                 self.counters.vram_misses.fetch_add(1, Ordering::Relaxed);
                 match demand {
@@ -2139,6 +2480,211 @@ pub(crate) fn validate_qualification_physical_source_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn p1j_spawn_blocking_writer_enqueues_closes_then_releases_exact_source() {
+        use crate::expert_cache::{GpuResident, HOST_BACKED_Q4_BYTES};
+        let cache = Arc::new(GpuExpertCache::new(HOST_BACKED_Q4_BYTES, 0.0, 0));
+        let resident = Arc::new(GpuResident::new_with_dtype(
+            47 * 128 + 8,
+            vec![19; HOST_BACKED_Q4_BYTES],
+            crate::inference::WeightDtype::Q4_0,
+        ));
+        let ptr = resident.data().as_ptr() as usize;
+        assert!(cache.promote_sync(resident));
+        let id = 47 * 128 + 8;
+        let HostBackedLeaseResult::Acquired(lease) =
+            cache.try_lease_host_backed(id, cache.current_generation(id).unwrap())
+        else {
+            panic!("lease");
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let copy_events = events.clone();
+        let copy_cache = cache.clone();
+        let task = runtime.spawn_blocking(move || {
+            p1j_stage_lease(
+                lease,
+                |bytes| {
+                    assert_eq!(bytes.as_ptr() as usize, ptr);
+                    assert_eq!(bytes.len(), HOST_BACKED_Q4_BYTES);
+                    copy_events.lock().push("payload-enqueue");
+                    Ok(())
+                },
+                |success| {
+                    assert!(success);
+                    assert_eq!(copy_cache.host_backed_lease_snapshot().active, 1);
+                    copy_events.lock().push("closed");
+                },
+            );
+            assert_eq!(copy_cache.host_backed_lease_snapshot().retained_bytes, 0);
+            copy_events.lock().push("released");
+        });
+        runtime.block_on(task).unwrap(); // CPU test only; never the D path.
+        assert_eq!(*events.lock(), ["payload-enqueue", "closed", "released"]);
+        assert_eq!(cache.host_backed_lease_snapshot().releases, 1);
+    }
+
+    #[test]
+    fn p1j_contended_cleanup_coalesces_newer_cancellation_without_losing_it() {
+        let fence = P1jRetirement::default();
+        fence.request(1, P1jTerminal::Cancelled);
+        assert!(fence.start());
+        let mut seen = Vec::new();
+        fence.drain(|epoch, reason| {
+            seen.push((epoch, reason));
+            if epoch == 1 {
+                // A stale cleanup worker was already dispatched when the next
+                // occupant's foreground cleanup hit contention.
+                fence.request(2, P1jTerminal::UsedMatching);
+                assert!(!fence.start());
+            }
+        });
+        assert_eq!(
+            seen,
+            [(1, P1jTerminal::Cancelled), (2, P1jTerminal::UsedMatching)]
+        );
+        assert!(!fence.running.load(Ordering::Acquire));
+        assert!(fence.cancelled(2));
+        assert!(!fence.cancelled(3));
+    }
+
+    #[test]
+    fn p1j_stale_or_duplicate_cleanup_preserves_latest_epoch_and_first_terminal_reason() {
+        let fence = P1jRetirement::default();
+        fence.request(2, P1jTerminal::Unused);
+        fence.request(1, P1jTerminal::Cancelled);
+        fence.request(2, P1jTerminal::Cancelled);
+        assert!(fence.start());
+        let mut seen = Vec::new();
+        fence.drain(|epoch, reason| seen.push((epoch, reason)));
+        assert_eq!(seen, [(2, P1jTerminal::Unused)]);
+        fence.request(3, P1jTerminal::RequestEnded);
+        assert!(fence.start());
+        fence.drain(|epoch, reason| seen.push((epoch, reason)));
+        assert_eq!(seen[1], (3, P1jTerminal::RequestEnded));
+    }
+    #[test]
+    fn p1j_writer_panic_closes_after_view_drop_and_releases_lease() {
+        use crate::expert_cache::{GpuResident, HOST_BACKED_Q4_BYTES};
+        let cache = GpuExpertCache::new(HOST_BACKED_Q4_BYTES, 0.0, 0);
+        assert!(cache.promote_sync(Arc::new(GpuResident::new_with_dtype(
+            1,
+            vec![0; HOST_BACKED_Q4_BYTES],
+            crate::inference::WeightDtype::Q4_0
+        ))));
+        let HostBackedLeaseResult::Acquired(lease) =
+            cache.try_lease_host_backed(1, cache.current_generation(1).unwrap())
+        else {
+            panic!("lease");
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        struct View<'a>(&'a std::cell::RefCell<Vec<&'static str>>);
+        impl Drop for View<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("payload-enqueue");
+            }
+        }
+        p1j_stage_lease(
+            lease,
+            |_| {
+                let _view = View(&events);
+                panic!("injected staging panic");
+            },
+            |success| {
+                assert!(!success);
+                events.borrow_mut().push("failure-closed");
+            },
+        );
+        assert_eq!(*events.borrow(), ["payload-enqueue", "failure-closed"]);
+        assert_eq!(
+            (
+                cache.host_backed_lease_snapshot().active,
+                cache.host_backed_lease_snapshot().releases
+            ),
+            (0, 1)
+        );
+    }
+    #[test]
+    fn p1j_launch_and_writer_have_no_source_io_or_demand_buffer_capability() {
+        let source = include_str!("gpu_native_residency.rs");
+        let body = source
+            .split("impl P1jSidecarOwner {")
+            .nth(1)
+            .unwrap()
+            .split("impl GpuNativeTieredResidencyManager {")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "ExpertResident",
+            "gpu_native_source_upload",
+            "engine.",
+            "fetch_with_retry",
+            "read_expert",
+            "Nvme",
+            "Semaphore",
+            ".to_vec(",
+        ] {
+            assert!(!body.contains(forbidden), "{forbidden}");
+        }
+        let backend = include_str!("backend/gpu_native.rs");
+        let writer = backend
+            .split("pub(crate) fn write_p1j_payload(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn try_publish_p1j(")
+            .next()
+            .unwrap();
+        assert!(writer.contains("CheckedPhysicalQ4ExpertSlot::new"));
+        assert!(writer.contains("drop(view)"));
+        for forbidden in [
+            "arena.mapping",
+            ".submit(",
+            ".poll(",
+            "Vec::",
+            "vec![",
+            ".to_vec(",
+            "ExpertResident",
+        ] {
+            assert!(!writer.contains(forbidden), "{forbidden}");
+        }
+    }
+    #[test]
+    fn p1j_allocation_is_internal_once_and_ordinary_model_plan_stays_frozen() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        let plan =
+            GpuNativeModelExpertVramPlan::try_new(48, geometry, 2048 * 1024 * 1024, &limits())
+                .unwrap();
+        assert_eq!(plan.layer_plans()[47].slot_capacity(), 8);
+        let source = include_str!("gpu_native_residency.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(source.matches(".create_p1j_sidecar(").count(), 1);
+        let setup = source
+            .split("pub(crate) fn enable_p1j_sidecar(")
+            .nth(1)
+            .unwrap()
+            .split("fn p1j_current(")
+            .next()
+            .unwrap();
+        assert!(setup.contains("get_or_init"));
+        let backend = include_str!("backend/gpu_native.rs");
+        let allocation = backend
+            .split("pub(crate) fn create_p1j_sidecar(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn write_p1j_payload(")
+            .next()
+            .unwrap();
+        assert!(
+            allocation.find("validate_startup_buffer").unwrap()
+                < allocation
+                    .find("let buffer = create_startup_buffer")
+                    .unwrap()
+        );
+    }
     #[test]
     fn p1e_frozen_plan_has_exactly_eight_layer47_slots_without_device_construction() {
         let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();

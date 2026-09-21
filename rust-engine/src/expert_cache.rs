@@ -845,6 +845,99 @@ pub(crate) struct LogicalHostObservation {
     pub(crate) host_payload_present: bool,
 }
 
+pub(crate) const HOST_BACKED_Q4_BYTES: usize = 2_654_208;
+
+#[derive(Default)]
+struct HostBackedLeaseAccounting {
+    acquisitions: AtomicU64,
+    busy: AtomicU64,
+    missing: AtomicU64,
+    stale: AtomicU64,
+    wrong_kind: AtomicU64,
+    wrong_dtype: AtomicU64,
+    wrong_length: AtomicU64,
+    active: AtomicBool,
+    retained_bytes: AtomicU64,
+    high_water_active: AtomicU64,
+    high_water_bytes: AtomicU64,
+    releases: AtomicU64,
+    incomplete: AtomicBool,
+}
+
+impl HostBackedLeaseAccounting {
+    fn count(&self, counter: &AtomicU64) -> bool {
+        let ok = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .is_ok();
+        if !ok {
+            self.incomplete.store(true, Ordering::Release);
+        }
+        ok
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostBackedLeaseSnapshot {
+    pub acquisitions: u64,
+    pub busy: u64,
+    pub missing: u64,
+    pub stale: u64,
+    pub wrong_kind: u64,
+    pub wrong_dtype: u64,
+    pub wrong_length: u64,
+    pub active: u64,
+    pub retained_bytes: u64,
+    pub high_water_active: u64,
+    pub high_water_bytes: u64,
+    pub releases: u64,
+    pub incomplete: bool,
+}
+
+pub(crate) enum HostBackedLeaseResult {
+    Acquired(HostBackedLease),
+    Missing,
+    Stale,
+    Busy,
+    WrongPayloadKind,
+    WrongDtype,
+    WrongLength,
+}
+
+/// A single external lifetime extension, not an ordinary cache pin or byte charge.
+/// Non-cloneable: the accounting permit and exact admission have one owner.
+pub(crate) struct HostBackedLease {
+    admission: Option<GpuAdmission>,
+    accounting: Arc<HostBackedLeaseAccounting>,
+}
+
+impl HostBackedLease {
+    pub(crate) fn global_id(&self) -> u32 {
+        self.admission.as_ref().unwrap().resident.id
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.admission.as_ref().unwrap().generation
+    }
+    pub(crate) fn data(&self) -> &[u8] {
+        match &self.admission.as_ref().unwrap().resident.payload {
+            GpuResidentHostPayload::Materialized(bytes) => bytes,
+            GpuResidentHostPayload::QualificationShared(bytes) => bytes,
+            GpuResidentHostPayload::QualificationLogicalOnly { .. } => {
+                unreachable!("lease rejects logical-only payloads")
+            }
+        }
+    }
+}
+
+impl Drop for HostBackedLease {
+    fn drop(&mut self) {
+        // Release the bytes BEFORE another lease may claim the retention permit.
+        drop(self.admission.take());
+        self.accounting.retained_bytes.store(0, Ordering::Relaxed);
+        self.accounting.count(&self.accounting.releases);
+        self.accounting.active.store(false, Ordering::Release);
+    }
+}
+
 impl GpuAdmission {
     #[inline]
     pub fn resident(&self) -> &Arc<GpuResident> {
@@ -1029,6 +1122,7 @@ impl std::error::Error for GpuDemandAdmissionError {}
 ///   payload bytes, not physical wgpu allocation bytes.
 pub struct GpuExpertCache {
     inner: Mutex<GpuExpertCacheInner>,
+    host_backed_leases: Arc<HostBackedLeaseAccounting>,
     /// Logical host-payload capacity of the **Anchor Core**, in bytes.
     anchor_capacity_bytes: usize,
     /// Capacity of the **LRU Edge**, in bytes.
@@ -1180,6 +1274,7 @@ impl GpuExpertCache {
                 promotion_rearm: HashSet::new(),
                 demand_protections: HashMap::new(),
             }),
+            host_backed_leases: Arc::default(),
             anchor_capacity_bytes,
             lru_capacity_bytes,
             promote_after_hits,
@@ -1250,6 +1345,97 @@ impl GpuExpertCache {
     pub fn current_admission(&self, id: u32) -> Option<GpuAdmission> {
         let g = self.inner.lock();
         g.anchor.get(&id).or_else(|| g.lru.peek(&id)).cloned()
+    }
+
+    pub(crate) fn try_lease_host_backed(
+        &self,
+        id: u32,
+        expected_generation: u64,
+    ) -> HostBackedLeaseResult {
+        use HostBackedLeaseResult::*;
+        let a = &self.host_backed_leases;
+        let Some(g) = self.inner.try_lock() else {
+            a.count(&a.busy);
+            return Busy;
+        };
+        let Some(admission) = g.anchor.get(&id).or_else(|| g.lru.peek(&id)) else {
+            a.count(&a.missing);
+            return Missing;
+        };
+        if admission.generation != expected_generation || expected_generation == 0 {
+            a.count(&a.stale);
+            return Stale;
+        }
+        if matches!(
+            &admission.resident.payload,
+            GpuResidentHostPayload::QualificationLogicalOnly { .. }
+        ) {
+            a.count(&a.wrong_kind);
+            return WrongPayloadKind;
+        }
+        if admission.resident.dtype != crate::inference::WeightDtype::Q4_0 {
+            a.count(&a.wrong_dtype);
+            return WrongDtype;
+        }
+        if admission.byte_len() != HOST_BACKED_Q4_BYTES {
+            a.count(&a.wrong_length);
+            return WrongLength;
+        }
+        if a.incomplete.load(Ordering::Acquire)
+            || a.active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            a.count(&a.busy);
+            return Busy;
+        }
+        if !a.count(&a.acquisitions) {
+            a.active.store(false, Ordering::Release);
+            return Busy;
+        }
+        a.retained_bytes
+            .store(HOST_BACKED_Q4_BYTES as u64, Ordering::Relaxed);
+        a.high_water_active.store(1, Ordering::Relaxed);
+        a.high_water_bytes
+            .store(HOST_BACKED_Q4_BYTES as u64, Ordering::Relaxed);
+        Acquired(HostBackedLease {
+            admission: Some(admission.clone()),
+            accounting: a.clone(),
+        })
+    }
+
+    /// Hold a non-touching generation check through the foreground mapping
+    /// transaction. Its callback must use only nonblocking physical acquisition.
+    pub(crate) fn try_with_host_generation<R>(
+        &self,
+        id: u32,
+        generation: u64,
+        f: impl FnOnce(bool) -> R,
+    ) -> Option<R> {
+        let g = self.inner.try_lock()?;
+        let current = g.anchor.get(&id).or_else(|| g.lru.peek(&id));
+        Some(f(current.is_some_and(|a| {
+            a.generation == generation && generation != 0
+        })))
+    }
+
+    pub(crate) fn host_backed_lease_snapshot(&self) -> HostBackedLeaseSnapshot {
+        let a = &self.host_backed_leases;
+        HostBackedLeaseSnapshot {
+            acquisitions: a.acquisitions.load(Ordering::Relaxed),
+            busy: a.busy.load(Ordering::Relaxed),
+            missing: a.missing.load(Ordering::Relaxed),
+            stale: a.stale.load(Ordering::Relaxed),
+            wrong_kind: a.wrong_kind.load(Ordering::Relaxed),
+            wrong_dtype: a.wrong_dtype.load(Ordering::Relaxed),
+            wrong_length: a.wrong_length.load(Ordering::Relaxed),
+            active: u64::from(a.active.load(Ordering::Acquire)),
+            retained_bytes: a.retained_bytes.load(Ordering::Relaxed),
+            high_water_active: a.high_water_active.load(Ordering::Relaxed),
+            high_water_bytes: a.high_water_bytes.load(Ordering::Relaxed),
+            releases: a.releases.load(Ordering::Relaxed),
+            incomplete: a.incomplete.load(Ordering::Acquire),
+        }
     }
 
     /// P1E non-touching source classification. No admission/payload is cloned,
@@ -2273,6 +2459,230 @@ mod tests {
         // buffer that `make(2, ...)` consumed, the pool should have
         // strictly more free slots than it did at the rejection.
         assert!(pool.try_acquire().is_some());
+    }
+
+    fn p1j_host_fixture(shared: bool) -> (GpuExpertCache, Arc<GpuResident>, u64) {
+        use crate::inference::WeightDtype;
+        let cache = GpuExpertCache::new(HOST_BACKED_Q4_BYTES, 0.0, 0);
+        let resident = Arc::new(if shared {
+            GpuResident::new_qualification_shared(
+                7,
+                Arc::from(vec![53; HOST_BACKED_Q4_BYTES]),
+                WeightDtype::Q4_0,
+            )
+        } else {
+            GpuResident::new_with_dtype(7, vec![53; HOST_BACKED_Q4_BYTES], WeightDtype::Q4_0)
+        });
+        assert!(cache.promote_sync(resident.clone()));
+        let generation = cache.current_generation(7).unwrap();
+        (cache, resident, generation)
+    }
+    fn p1j_lease(cache: &GpuExpertCache, generation: u64) -> HostBackedLease {
+        match cache.try_lease_host_backed(7, generation) {
+            HostBackedLeaseResult::Acquired(lease) => lease,
+            _ => panic!("expected exact host lease"),
+        }
+    }
+    #[test]
+    fn p1j_materialized_lease_exact_identity_and_no_copy() {
+        let (cache, resident, generation) = p1j_host_fixture(false);
+        let lease = p1j_lease(&cache, generation);
+        assert_eq!((lease.global_id(), lease.generation()), (7, generation));
+        assert_eq!(lease.data().as_ptr(), resident.data().as_ptr());
+        assert_eq!(lease.data().len(), HOST_BACKED_Q4_BYTES);
+        assert_eq!(Arc::strong_count(&resident), 3);
+    }
+    #[test]
+    fn p1j_shared_lease_retains_exact_admission_without_copy() {
+        let (cache, resident, generation) = p1j_host_fixture(true);
+        let lease = p1j_lease(&cache, generation);
+        assert_eq!(
+            lease.data().as_ptr(),
+            resident.qualification_shared_payload().unwrap().as_ptr()
+        );
+        assert_eq!(
+            Arc::strong_count(resident.qualification_shared_payload().unwrap()),
+            1
+        );
+    }
+    #[test]
+    fn p1j_logical_only_rejected_without_data_access() {
+        let audit = Arc::new(AtomicU64::new(0));
+        let cache = GpuExpertCache::new(HOST_BACKED_Q4_BYTES, 0.0, 0);
+        assert!(
+            cache.promote_sync(Arc::new(GpuResident::new_qualification_logical_only(
+                7,
+                HOST_BACKED_Q4_BYTES,
+                crate::inference::WeightDtype::Q4_0,
+                audit.clone()
+            )))
+        );
+        assert!(matches!(
+            cache.try_lease_host_backed(7, cache.current_generation(7).unwrap()),
+            HostBackedLeaseResult::WrongPayloadKind
+        ));
+        assert_eq!(audit.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.host_backed_lease_snapshot().wrong_kind, 1);
+    }
+    #[test]
+    fn p1j_missing_stale_dtype_and_length_are_separate_refusals() {
+        let (cache, _, generation) = p1j_host_fixture(false);
+        assert!(matches!(
+            cache.try_lease_host_backed(99, generation),
+            HostBackedLeaseResult::Missing
+        ));
+        assert!(matches!(
+            cache.try_lease_host_backed(7, generation + 1),
+            HostBackedLeaseResult::Stale
+        ));
+        assert_eq!(
+            (
+                cache.host_backed_lease_snapshot().missing,
+                cache.host_backed_lease_snapshot().stale
+            ),
+            (1, 1)
+        );
+        for (dtype, length, wrong_dtype) in [
+            (
+                crate::inference::WeightDtype::F32,
+                HOST_BACKED_Q4_BYTES,
+                true,
+            ),
+            (
+                crate::inference::WeightDtype::Q4_0,
+                HOST_BACKED_Q4_BYTES - 1,
+                false,
+            ),
+        ] {
+            let c = GpuExpertCache::new(HOST_BACKED_Q4_BYTES, 0.0, 0);
+            assert!(c.promote_sync(Arc::new(GpuResident::new_with_dtype(
+                7,
+                vec![0; length],
+                dtype
+            ))));
+            let result = c.try_lease_host_backed(7, c.current_generation(7).unwrap());
+            assert!(if wrong_dtype {
+                matches!(result, HostBackedLeaseResult::WrongDtype)
+            } else {
+                matches!(result, HostBackedLeaseResult::WrongLength)
+            });
+            assert_eq!(c.host_backed_lease_snapshot().active, 0);
+        }
+    }
+    #[test]
+    fn p1j_lease_lookup_preserves_lru_telemetry_and_protections() {
+        let cache = GpuExpertCache::new(HOST_BACKED_Q4_BYTES * 2, 0.0, 0);
+        for id in [7, 8] {
+            assert!(cache.promote_sync(Arc::new(GpuResident::new_with_dtype(
+                id,
+                vec![0; HOST_BACKED_Q4_BYTES],
+                crate::inference::WeightDtype::Q4_0
+            ))));
+        }
+        let state = || {
+            let g = cache.inner.lock();
+            (
+                g.lru
+                    .iter()
+                    .map(|(id, a)| (*id, a.generation()))
+                    .collect::<Vec<_>>(),
+                g.demand_protections.clone(),
+                g.promotion_pending.clone(),
+                g.promotion_rearm.clone(),
+                g.next_generation,
+                cache.hits(),
+                cache.misses(),
+                cache.used_bytes(),
+                cache.promotions(),
+            )
+        };
+        let before = state();
+        let lease = p1j_lease(&cache, cache.current_generation(7).unwrap());
+        assert_eq!(state(), before);
+        drop(lease);
+        assert_eq!(state(), before);
+    }
+    #[test]
+    fn p1j_cache_eviction_does_not_invalidate_retained_bytes_or_inflate_cache_charge() {
+        let (cache, resident, generation) = p1j_host_fixture(false);
+        let weak = Arc::downgrade(&resident);
+        let lease = p1j_lease(&cache, generation);
+        drop(resident);
+        assert!(cache.promote_sync(Arc::new(GpuResident::new_with_dtype(
+            8,
+            vec![0; HOST_BACKED_Q4_BYTES],
+            crate::inference::WeightDtype::Q4_0
+        ))));
+        assert!(!cache.contains(7));
+        assert_eq!(cache.used_bytes(), HOST_BACKED_Q4_BYTES as u64);
+        assert_eq!(lease.data(), &[53; HOST_BACKED_Q4_BYTES]);
+        assert_eq!(weak.strong_count(), 1);
+        drop(lease);
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn p1j_one_active_lease_and_byte_high_water_bound() {
+        let (cache, _, generation) = p1j_host_fixture(false);
+        let first = p1j_lease(&cache, generation);
+        assert!(matches!(
+            cache.try_lease_host_backed(7, generation),
+            HostBackedLeaseResult::Busy
+        ));
+        let snapshot = cache.host_backed_lease_snapshot();
+        assert_eq!(
+            (snapshot.active, snapshot.high_water_active, snapshot.busy),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (snapshot.retained_bytes, snapshot.high_water_bytes),
+            (HOST_BACKED_Q4_BYTES as u64, HOST_BACKED_Q4_BYTES as u64)
+        );
+        drop(first);
+        drop(p1j_lease(&cache, generation));
+        assert_eq!(cache.host_backed_lease_snapshot().high_water_active, 1);
+    }
+    #[test]
+    fn p1j_release_accounting_and_overflow_fail_closed() {
+        let (cache, _, generation) = p1j_host_fixture(false);
+        drop(p1j_lease(&cache, generation));
+        let s = cache.host_backed_lease_snapshot();
+        assert_eq!(
+            (s.acquisitions, s.releases, s.active, s.retained_bytes),
+            (1, 1, 0, 0)
+        );
+        cache
+            .host_backed_leases
+            .acquisitions
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(matches!(
+            cache.try_lease_host_backed(7, generation),
+            HostBackedLeaseResult::Busy
+        ));
+        assert!(cache.host_backed_lease_snapshot().incomplete);
+        assert_eq!(cache.host_backed_lease_snapshot().active, 0);
+    }
+    #[test]
+    fn p1j_cache_contention_is_immediate_busy_including_deadline_check() {
+        let (cache, _, generation) = p1j_host_fixture(false);
+        let _lock = cache.inner.lock();
+        assert!(matches!(
+            cache.try_lease_host_backed(7, generation),
+            HostBackedLeaseResult::Busy
+        ));
+        assert_eq!(
+            cache.try_with_host_generation(7, generation, |_| panic!("busy callback")),
+            None::<()>
+        );
+        assert_eq!(cache.host_backed_lease_snapshot().busy, 1);
+    }
+    #[test]
+    fn p1j_host_lease_is_send_sync_and_does_not_retain_cache() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<HostBackedLease>();
+        let (cache, _, generation) = p1j_host_fixture(false);
+        let lease = p1j_lease(&cache, generation);
+        drop(cache);
+        assert_eq!(lease.data().len(), HOST_BACKED_Q4_BYTES);
     }
 
     #[test]

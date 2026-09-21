@@ -2621,6 +2621,8 @@ struct GpuNativeQ4ExpertArenaState {
     latest_generations: Vec<Option<u64>>,
     next_install_ticket: u64,
     counters: GpuNativeQ4ExpertResidencyCounters,
+    // Separate scalar ownership only; never a ninth ordinary slot.
+    p1j: P1jSidecarState,
 }
 
 impl GpuNativeQ4ExpertArenaState {
@@ -2644,8 +2646,203 @@ impl GpuNativeQ4ExpertArenaState {
             latest_generations: vec![None; geometry.num_experts],
             next_install_ticket: 1,
             counters: GpuNativeQ4ExpertResidencyCounters::default(),
+            p1j: P1jSidecarState::default(),
         })
     }
+}
+
+pub(crate) const P1J_PAYLOAD_BYTES: usize = 2_654_208;
+pub(crate) const P1J_STRIDE_BYTES: usize = 2_654_212;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum P1jPhase {
+    Writing,
+    EnqueuedClosed,
+    Published,
+    Terminal(crate::predictor_v2::P1jTerminal),
+    Retiring,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum P1jPublication {
+    Published,
+    Busy,
+    NotReady,
+    IdentityMismatch,
+    Stale,
+    OrdinaryWins,
+}
+
+#[derive(Debug, Default)]
+struct P1jSidecarState {
+    last_epoch: u32,
+    last_writer: u64,
+    occupant: Option<(crate::predictor_v2::P1jIdentity, P1jPhase)>,
+    terminal_requested: Option<crate::predictor_v2::P1jTerminal>,
+    mapping_owned: bool,
+    last_terminal: Option<(
+        crate::predictor_v2::P1jIdentity,
+        crate::predictor_v2::P1jTerminal,
+    )>,
+}
+
+impl P1jSidecarState {
+    fn claim(
+        &mut self,
+        candidate: crate::predictor_v2::p1e::Candidate,
+        generation: u64,
+    ) -> Option<crate::predictor_v2::P1jIdentity> {
+        if self.occupant.is_some() || generation == 0 {
+            return None;
+        }
+        let epoch = self.last_epoch.checked_add(1)?;
+        let writer_sequence = self.last_writer.checked_add(1)?;
+        let id = crate::predictor_v2::P1jIdentity {
+            candidate,
+            logical_generation: generation,
+            epoch,
+            writer_sequence,
+        };
+        self.last_epoch = epoch;
+        self.last_writer = writer_sequence;
+        self.occupant = Some((id, P1jPhase::Writing));
+        self.terminal_requested = None;
+        self.mapping_owned = false;
+        Some(id)
+    }
+
+    fn close(&mut self, id: crate::predictor_v2::P1jIdentity, success: bool) {
+        if self.occupant != Some((id, P1jPhase::Writing)) {
+            return;
+        }
+        // Called only after the staging view has dropped (including unwind).
+        // Unlock is Release; D's successful try_lock is the matching Acquire.
+        let terminal = self
+            .terminal_requested
+            .or((!success).then_some(crate::predictor_v2::P1jTerminal::WriteFailure));
+        self.occupant = Some((
+            id,
+            terminal
+                .map(P1jPhase::Terminal)
+                .unwrap_or(P1jPhase::EnqueuedClosed),
+        ));
+    }
+
+    fn publish(
+        &mut self,
+        id: crate::predictor_v2::P1jIdentity,
+        generation_current: bool,
+        ordinary_owned: bool,
+        mapping: impl FnOnce(GpuNativeQ4ExpertMappingEntry),
+    ) -> P1jPublication {
+        use crate::predictor_v2::P1jTerminal;
+        let Some((current, phase)) = self.occupant else {
+            return P1jPublication::IdentityMismatch;
+        };
+        if current != id {
+            return P1jPublication::IdentityMismatch;
+        }
+        if phase != P1jPhase::EnqueuedClosed {
+            return P1jPublication::NotReady;
+        }
+        if ordinary_owned {
+            self.occupant = Some((id, P1jPhase::Terminal(P1jTerminal::OrdinarySuperseded)));
+            return P1jPublication::OrdinaryWins;
+        }
+        if !generation_current {
+            self.occupant = Some((id, P1jPhase::Terminal(P1jTerminal::StaleLogicalGeneration)));
+            return P1jPublication::Stale;
+        }
+        mapping(
+            p1j_residency(id)
+                .mapping_entry()
+                .expect("claimed nonzero epoch and bank1/slot0"),
+        );
+        self.mapping_owned = true;
+        self.occupant = Some((id, P1jPhase::Published));
+        P1jPublication::Published
+    }
+
+    fn ordinary_won(&mut self, expert: u32) {
+        if let Some((id, P1jPhase::Published)) = self.occupant {
+            if id.candidate.expert == expert {
+                self.mapping_owned = false;
+                self.occupant = Some((
+                    id,
+                    P1jPhase::Terminal(crate::predictor_v2::P1jTerminal::OrdinarySuperseded),
+                ));
+            }
+        }
+    }
+
+    fn retire(
+        &mut self,
+        id: crate::predictor_v2::P1jIdentity,
+        reason: crate::predictor_v2::P1jTerminal,
+        unpublish: impl FnOnce(),
+    ) -> bool {
+        let Some((current, phase)) = self.occupant else {
+            return false;
+        };
+        if current != id {
+            return false;
+        }
+        if phase == P1jPhase::Writing {
+            self.terminal_requested.get_or_insert(reason);
+            return false; // An old writer still owns the only enqueue capability.
+        }
+        let reason = if let P1jPhase::Terminal(previous) = phase {
+            previous
+        } else {
+            reason
+        };
+        self.occupant = Some((id, P1jPhase::Terminal(reason)));
+        self.last_terminal = Some((id, reason));
+        self.occupant = Some((id, P1jPhase::Retiring));
+        if self.mapping_owned {
+            unpublish();
+        }
+        self.mapping_owned = false;
+        self.occupant = None;
+        self.terminal_requested = None;
+        true
+    }
+}
+
+pub(crate) fn p1j_residency(id: crate::predictor_v2::P1jIdentity) -> GpuNativeQ4ExpertResidency {
+    GpuNativeQ4ExpertResidency {
+        key: GpuNativeQ4ExpertKey::new(47, id.candidate.expert, id.logical_generation),
+        location: GpuNativeQ4ExpertLocation { bank: 1, slot: 0 },
+        slot_epoch: id.epoch,
+    }
+}
+
+/// Allocation is exclusively through the internal opt-in, outside the VRAM plan.
+pub(crate) struct GpuNativeP1jSidecar {
+    context_id: u64,
+    arena_identity: usize,
+    geometry: GpuNativeQ4ExpertGeometry,
+    buffer: wgpu::Buffer,
+}
+
+pub(crate) fn p1j_binding_layout(
+    plan: GpuNativeQ4ExpertVramPlan,
+    layer: usize,
+    published: bool,
+) -> Result<(u32, [u32; 4]), GpuNativeBootstrapError> {
+    let banks = plan.layout.banks.map(|b| b.slot_capacity as u32);
+    if !published {
+        return Ok((plan.active_banks() as u32, banks));
+    }
+    if layer != 47
+        || plan.active_banks() != 1
+        || banks != [8, 0, 0, 0]
+        || plan.geometry.logical_expert_bytes != P1J_PAYLOAD_BYTES
+        || plan.slot_stride_bytes() != P1J_STRIDE_BYTES
+    {
+        return Err(GpuNativeBootstrapError::ForeignExpertArena);
+    }
+    Ok((2, [8, 1, 0, 0]))
 }
 
 /// One setup-time placement. The logical generation is supplied by the
@@ -3399,6 +3596,174 @@ pub(crate) struct GpuNativeQ4ExpertArena<B = wgpu::Buffer> {
 }
 
 impl<B> GpuNativeQ4ExpertArena<B> {
+    pub(crate) fn try_claim_p1j(
+        &self,
+        candidate: crate::predictor_v2::p1e::Candidate,
+        generation: u64,
+    ) -> Option<crate::predictor_v2::P1jIdentity> {
+        p1j_binding_layout(self.plan, self.layer_index, true).ok()?;
+        if candidate.namespace.context != self.context_id
+            || candidate.namespace.arena != self as *const Self as usize
+            || candidate.namespace.runtime != candidate.request.runtime_namespace
+            || candidate.namespace.layer != 47
+            || candidate.namespace.capacity != 8
+            || candidate.target_layer != 47
+            || candidate.source_layer != 47
+            || candidate.expert >= 128
+            || candidate.sequence == 0
+            || candidate.generation == 0
+        {
+            return None;
+        }
+        self.state.try_lock()?.p1j.claim(candidate, generation)
+    }
+
+    pub(crate) fn close_p1j_writer(&self, id: crate::predictor_v2::P1jIdentity, success: bool) {
+        let mut state = self.state.lock();
+        Self::close_p1j_writer_locked(&mut state, id, success);
+    }
+
+    pub(crate) fn try_close_p1j_writer(
+        &self,
+        id: crate::predictor_v2::P1jIdentity,
+        success: bool,
+    ) -> bool {
+        let Some(mut state) = self.state.try_lock() else {
+            return false;
+        };
+        Self::close_p1j_writer_locked(&mut state, id, success);
+        true
+    }
+
+    fn close_p1j_writer_locked(
+        state: &mut GpuNativeQ4ExpertArenaState,
+        id: crate::predictor_v2::P1jIdentity,
+        success: bool,
+    ) {
+        state.p1j.close(id, success);
+        if let Some((owner, P1jPhase::Terminal(reason))) = state.p1j.occupant {
+            if owner == id && !state.p1j.mapping_owned {
+                state.p1j.retire(id, reason, || {
+                    unreachable!("unpublished writer cannot own a mapping")
+                });
+            }
+        }
+    }
+
+    pub(crate) fn try_p1j_phase(&self, id: crate::predictor_v2::P1jIdentity) -> Option<P1jPhase> {
+        let state = self.state.try_lock()?;
+        state
+            .p1j
+            .occupant
+            .filter(|(owner, _)| *owner == id)
+            .map(|(_, phase)| phase)
+            .or_else(|| {
+                state
+                    .p1j
+                    .last_terminal
+                    .filter(|(owner, _)| *owner == id)
+                    .map(|(_, reason)| P1jPhase::Terminal(reason))
+            })
+    }
+
+    pub(crate) fn p1j_current(
+        &self,
+    ) -> Option<(crate::predictor_v2::P1jIdentity, GpuNativeQ4ExpertResidency)> {
+        let state = self.state.lock();
+        let (id, phase) = state.p1j.occupant?;
+        (phase == P1jPhase::Published && state.p1j.mapping_owned).then(|| (id, p1j_residency(id)))
+    }
+
+    pub(crate) fn try_p1j_verify_snapshot(
+        &self,
+        snapshot: &crate::predictor_v2::p1e::PhysicalSnapshot,
+    ) -> Option<bool> {
+        let state = self.state.try_lock()?;
+        let residents = state.slots.iter().filter_map(|slot| match slot.owner {
+            GpuNativeQ4ExpertSlotOwner::Resident(r) => Some(r),
+            _ => None,
+        });
+        let count = residents.clone().count();
+        Some(
+            count == snapshot.residents.iter().flatten().count()
+                && residents.into_iter().all(|r| {
+                    snapshot.residents.iter().flatten().any(|v| {
+                        v.expert == r.key.expert_id
+                            && v.generation == r.key.logical_generation
+                            && v.bank == r.location.bank
+                            && v.slot == r.location.slot
+                            && v.epoch == r.slot_epoch
+                    })
+                }),
+        )
+    }
+
+    fn try_publish_p1j_with(
+        &self,
+        id: crate::predictor_v2::P1jIdentity,
+        generation_current: bool,
+        mapping: impl FnOnce(u64, GpuNativeQ4ExpertMappingEntry),
+    ) -> P1jPublication {
+        let Some(mut state) = self.state.try_lock() else {
+            return P1jPublication::Busy;
+        };
+        let Some(ordinary) = state.logical_slots.get(id.candidate.expert as usize) else {
+            return P1jPublication::IdentityMismatch;
+        };
+        let ordinary_owned = ordinary.is_some();
+        state
+            .p1j
+            .publish(id, generation_current, ordinary_owned, |entry| {
+                mapping(
+                    u64::from(id.candidate.expert) * GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64,
+                    entry,
+                );
+            })
+    }
+
+    fn retire_p1j_with(
+        &self,
+        id: crate::predictor_v2::P1jIdentity,
+        reason: crate::predictor_v2::P1jTerminal,
+        nonblocking: bool,
+        unpublish: impl FnOnce(u64, GpuNativeQ4ExpertMappingEntry),
+    ) -> Option<bool> {
+        let mut state = if nonblocking {
+            self.state.try_lock()?
+        } else {
+            self.state.lock()
+        };
+        Some(state.p1j.retire(id, reason, || {
+            unpublish(
+                u64::from(id.candidate.expert) * GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64,
+                GpuNativeQ4ExpertMappingEntry::UNMAPPED,
+            );
+        }))
+    }
+
+    fn retire_p1j_epoch_with(
+        &self,
+        namespace: crate::predictor_v2::p1e::Namespace,
+        epoch: u32,
+        reason: crate::predictor_v2::P1jTerminal,
+        unpublish: impl FnOnce(u64, GpuNativeQ4ExpertMappingEntry),
+    ) {
+        let mut state = self.state.lock();
+        let Some((id, _)) = state.p1j.occupant else {
+            return;
+        };
+        // The model assigns each nonzero epoch exactly once. Recover the full
+        // immutable identity under the same lock as conditional unpublication.
+        if id.epoch != epoch || id.candidate.namespace != namespace {
+            return;
+        }
+        state.p1j.retire(id, reason, || {
+            unpublish(
+                u64::from(id.candidate.expert) * GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64,
+                GpuNativeQ4ExpertMappingEntry::UNMAPPED,
+            );
+        });
+    }
     fn from_buffers(
         context_id: u64,
         layer_index: usize,
@@ -3935,6 +4300,7 @@ impl<'arena, B> GpuNativeQ4ExpertInstallPermit<'arena, B> {
         }
 
         physical_write(self.residency.location.bank, physical_offset)?;
+        state.p1j.ordinary_won(self.key.expert_id);
         mapping_write(mapping_offset, mapping);
         state.slots[self.flat_slot].owner = GpuNativeQ4ExpertSlotOwner::Resident(self.residency);
         state.slots[self.flat_slot].ever_installed = true;
@@ -3977,6 +4343,7 @@ impl<B> GpuNativeQ4ExpertPreparedInstall<'_, B> {
             return Err(GpuNativeBootstrapError::ExpertInstallReservationLost);
         }
 
+        state.p1j.ordinary_won(self.permit.key.expert_id);
         mapping_write(self.mapping_offset, self.mapping);
         state.slots[self.permit.flat_slot].owner =
             GpuNativeQ4ExpertSlotOwner::Resident(self.permit.residency);
@@ -6822,6 +7189,129 @@ pub(crate) struct GpuNativeExecutorContext {
 }
 
 impl GpuNativeExecutorContext {
+    pub(crate) fn create_p1j_sidecar(
+        &self,
+        arena: &GpuNativeQ4ExpertArena,
+    ) -> Result<GpuNativeP1jSidecar, GpuNativeBootstrapError> {
+        p1j_binding_layout(arena.plan, arena.layer_index, true)?;
+        if arena.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignExpertArena);
+        }
+        let gpu = self.authoritative_gpu()?;
+        let usage = GpuNativeQ4ExpertArenaLayout::weight_usage();
+        super::validate_startup_buffer(
+            "predictor_v2_layer47_sidecar",
+            P1J_STRIDE_BYTES as u64,
+            usage,
+            &gpu.device.limits(),
+        )?;
+        let buffer = create_startup_buffer(
+            &gpu.device,
+            "predictor_v2_layer47_sidecar",
+            P1J_STRIDE_BYTES as u64,
+            usage,
+        )?;
+        Ok(GpuNativeP1jSidecar {
+            context_id: self.context_id,
+            arena_identity: arena as *const _ as usize,
+            geometry: arena.geometry,
+            buffer,
+        })
+    }
+
+    /// Background payload-only write: no mapping, resident wrapper or full Vec.
+    pub(crate) fn write_p1j_payload(
+        &self,
+        sidecar: &GpuNativeP1jSidecar,
+        id: crate::predictor_v2::P1jIdentity,
+        payload: &[u8],
+    ) -> Result<(), GpuNativeBootstrapError> {
+        if sidecar.context_id != self.context_id
+            || sidecar.arena_identity != id.candidate.namespace.arena
+            || payload.len() != P1J_PAYLOAD_BYTES
+        {
+            return Err(GpuNativeBootstrapError::ForeignExpertArena);
+        }
+        let checked = CheckedPhysicalQ4ExpertSlot::new(
+            sidecar.geometry,
+            id.candidate.expert,
+            id.epoch,
+            payload,
+        )?;
+        let gpu = self.authoritative_gpu()?;
+        let size = wgpu::BufferSize::new(P1J_STRIDE_BYTES as u64).unwrap();
+        let mut view = gpu
+            .queue
+            .write_buffer_with(&sidecar.buffer, 0, size)
+            .ok_or(GpuNativeBootstrapError::ExpertDirectStagingUnavailable {
+                bank: 1,
+                offset: 0,
+                bytes: P1J_STRIDE_BYTES as u64,
+            })?;
+        checked.fill_complete_overwrite_no_zero(view.as_mut())?;
+        drop(view); // Enqueue precedes host ENQUEUED_CLOSED; not GPU completion.
+        Ok(())
+    }
+
+    pub(crate) fn try_publish_p1j(
+        &self,
+        arena: &GpuNativeQ4ExpertArena,
+        id: crate::predictor_v2::P1jIdentity,
+        generation_current: bool,
+    ) -> P1jPublication {
+        if arena.context_id != self.context_id {
+            return P1jPublication::IdentityMismatch;
+        }
+        // No device-loss mutex acquisition at D. Normal execution owns device error handling.
+        let BackendBox::Gpu(gpu) = self.authoritative_backend.as_ref() else {
+            return P1jPublication::NotReady;
+        };
+        arena.try_publish_p1j_with(id, generation_current, |offset, entry| {
+            gpu.queue
+                .write_buffer(&arena.mapping, offset, bytemuck::bytes_of(&entry));
+        })
+    }
+
+    /// Exact UNMAPPED cleanup only; ordinary mapping ownership is serialized
+    /// with this transaction by the same arena mutex used by ordinary commits.
+    pub(crate) fn retire_p1j(
+        &self,
+        arena: &GpuNativeQ4ExpertArena,
+        id: crate::predictor_v2::P1jIdentity,
+        reason: crate::predictor_v2::P1jTerminal,
+        nonblocking: bool,
+    ) -> Option<bool> {
+        if arena.context_id != self.context_id {
+            return Some(false);
+        }
+        let BackendBox::Gpu(gpu) = self.authoritative_backend.as_ref() else {
+            return Some(false);
+        };
+        arena.retire_p1j_with(id, reason, nonblocking, |offset, entry| {
+            gpu.queue
+                .write_buffer(&arena.mapping, offset, bytemuck::bytes_of(&entry));
+        })
+    }
+
+    pub(crate) fn retire_p1j_epoch(
+        &self,
+        arena: &GpuNativeQ4ExpertArena,
+        namespace: crate::predictor_v2::p1e::Namespace,
+        epoch: u32,
+        reason: crate::predictor_v2::P1jTerminal,
+    ) {
+        if arena.context_id != self.context_id {
+            return;
+        }
+        let BackendBox::Gpu(gpu) = self.authoritative_backend.as_ref() else {
+            return;
+        };
+        arena.retire_p1j_epoch_with(namespace, epoch, reason, |offset, entry| {
+            gpu.queue
+                .write_buffer(&arena.mapping, offset, bytemuck::bytes_of(&entry));
+        });
+    }
+
     pub(super) fn try_new(
         authoritative_backend: Arc<BackendBox>,
         d_model: usize,
@@ -11058,6 +11548,475 @@ pub(crate) mod tests {
         }
     }
 
+    fn p1j_arena() -> Box<GpuNativeQ4ExpertArena<()>> {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        let limits = supported_expert_limits();
+        let layout = GpuNativeQ4ExpertArenaLayout::try_new(geometry, 8, &limits).unwrap();
+        let plan = GpuNativeQ4ExpertVramPlan::try_new(
+            geometry,
+            layout.total_allocation_bytes().unwrap(),
+            &limits,
+        )
+        .unwrap();
+        let state = GpuNativeQ4ExpertArenaState::new(geometry, plan.layout).unwrap();
+        Box::new(GpuNativeQ4ExpertArena::from_buffers(
+            7,
+            47,
+            plan,
+            [(); 4],
+            (),
+            state,
+        ))
+    }
+    fn p1j_candidate(arena: &GpuNativeQ4ExpertArena<()>) -> crate::predictor_v2::p1e::Candidate {
+        use crate::predictor_v2::{
+            p1e, ModelMetadata, PositionIdentity, RequestIdentity, RequestPhase,
+        };
+        p1e::Candidate {
+            request: RequestIdentity {
+                runtime_namespace: 1,
+                request_sequence: 1,
+                phase: RequestPhase::Fixture,
+                phase_run_index: 0,
+            },
+            model: ModelMetadata {
+                num_layers: 48,
+                num_experts: 128,
+                top_k: 8,
+            },
+            namespace: p1e::Namespace {
+                runtime: 1,
+                context: 7,
+                arena: arena as *const _ as usize,
+                layer: 47,
+                capacity: 8,
+            },
+            source_position: PositionIdentity::from_prompt_length(2, 10).unwrap(),
+            target_position: PositionIdentity::from_prompt_length(3, 10).unwrap(),
+            source_layer: 47,
+            target_layer: 47,
+            position_distance: 1,
+            nominal_layer_lead: 47,
+            source_set: [0, 1, 2, 3, 4, 5, 6, 7],
+            expert: 8,
+            score: 8,
+            signal_revision: 1,
+            generation: 1,
+            sequence: 1,
+            committed_position_cutoff: 3,
+            table_update_cutoff: 2,
+        }
+    }
+    fn p1j_claim(arena: &GpuNativeQ4ExpertArena<()>) -> crate::predictor_v2::P1jIdentity {
+        arena.try_claim_p1j(p1j_candidate(arena), 11).unwrap()
+    }
+    fn p1j_publish(arena: &GpuNativeQ4ExpertArena<()>, id: crate::predictor_v2::P1jIdentity) {
+        arena.close_p1j_writer(id, true);
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |_, _| {}),
+            P1jPublication::Published
+        );
+    }
+    fn p1j_ordinary_install(
+        arena: &GpuNativeQ4ExpertArena<()>,
+        expert: u32,
+        generation: u64,
+        mapping: impl FnMut(u64, GpuNativeQ4ExpertMappingEntry),
+    ) -> GpuNativeQ4ExpertResidency {
+        let permit = expect_expert_install(
+            arena
+                .acquire_with_unpublish(
+                    GpuNativeQ4ExpertKey::new(47, expert, generation),
+                    |_, _| {},
+                )
+                .unwrap(),
+        );
+        permit
+            .install_with_prepared_physical_writer(|_, _| Ok(()), mapping)
+            .unwrap()
+    }
+
+    #[test]
+    fn p1j_inactive_layout_and_ordinary_capacity_remain_eight() {
+        let arena = p1j_arena();
+        assert_eq!(
+            p1j_binding_layout(arena.plan, 47, false).unwrap(),
+            (1, [8, 0, 0, 0])
+        );
+        assert_eq!(arena.slot_capacity(), 8);
+        assert_eq!(arena.state.lock().slots.len(), 8);
+        assert!(arena.state.lock().p1j.occupant.is_none());
+    }
+    #[test]
+    fn p1j_published_binding_view_does_not_mutate_the_ordinary_plan() {
+        let arena = p1j_arena();
+        let before = arena.vram_plan();
+        let id = p1j_claim(&arena);
+        p1j_publish(&arena, id);
+        assert_eq!(
+            p1j_binding_layout(arena.plan, 47, true).unwrap(),
+            (2, [8, 1, 0, 0])
+        );
+        assert_eq!(arena.vram_plan(), before);
+        assert!(p1j_binding_layout(arena.plan, 46, true).is_err());
+    }
+    #[test]
+    fn p1j_bank1_slot0_nonzero_epoch_mapping_and_exact_payload_geometry() {
+        let arena = p1j_arena();
+        assert_eq!(
+            (
+                arena.geometry.logical_expert_bytes,
+                arena.geometry.payload_offset_bytes(),
+                arena.geometry.slot_stride_bytes
+            ),
+            (P1J_PAYLOAD_BYTES, 4, P1J_STRIDE_BYTES)
+        );
+        let id = p1j_claim(&arena);
+        let r = p1j_residency(id);
+        let mapping = r.mapping_entry().unwrap();
+        assert_eq!(
+            GpuNativeQ4ExpertLocation::unpack(mapping.location()),
+            Some(GpuNativeQ4ExpertLocation { bank: 1, slot: 0 })
+        );
+        assert_eq!(mapping.slot_epoch(), id.epoch);
+        assert_ne!(id.epoch, 0);
+        let payload = vec![17; P1J_PAYLOAD_BYTES];
+        let mut destination = vec![255; P1J_STRIDE_BYTES];
+        CheckedPhysicalQ4ExpertSlot::new(arena.geometry, 8, id.epoch, &payload)
+            .unwrap()
+            .fill_complete_overwrite_no_zero(&mut destination)
+            .unwrap();
+        assert_eq!(&destination[..4], &id.epoch.to_le_bytes());
+        assert_eq!(&destination[4..], payload.as_slice());
+    }
+    #[test]
+    fn p1j_live_writer_prevents_second_claim_without_backlog() {
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert_eq!(arena.try_p1j_phase(id), Some(P1jPhase::Writing));
+        assert_eq!(arena.state.lock().p1j.last_writer, 1);
+    }
+
+    #[test]
+    fn p1j_abandoned_writer_closure_is_nonblocking_and_preserves_claim_until_closed() {
+        use crate::predictor_v2::P1jTerminal;
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        let lock = arena.state.lock();
+        // Held by this same thread: an accidental blocking lock would deadlock.
+        assert!(!arena.try_close_p1j_writer(id, false));
+        drop(lock);
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert!(arena.try_close_p1j_writer(id, false));
+        assert_eq!(
+            arena.try_p1j_phase(id),
+            Some(P1jPhase::Terminal(P1jTerminal::WriteFailure))
+        );
+        let next = p1j_claim(&arena);
+        assert!(next.epoch > id.epoch);
+        assert!(arena.try_close_p1j_writer(id, false));
+        assert_eq!(arena.try_p1j_phase(next), Some(P1jPhase::Writing));
+    }
+    #[test]
+    fn p1j_d_while_writing_falls_back_without_mapping() {
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |_, _| panic!("late payload")),
+            P1jPublication::NotReady
+        );
+    }
+    #[test]
+    fn p1j_d_lock_contention_is_nonblocking_and_never_publishes() {
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        arena.close_p1j_writer(id, true);
+        let _lock = arena.state.lock();
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |_, _| panic!("busy publication")),
+            P1jPublication::Busy
+        );
+        assert_eq!(arena.try_p1j_phase(id), None);
+    }
+    #[test]
+    fn p1j_exact_d_queue_order_is_payload_closed_mapping_encoding_normal_submit() {
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        let events = std::cell::RefCell::new(Vec::new());
+        // A fake staging view, like the real view, enqueues only on Drop.
+        struct View<'a>(&'a std::cell::RefCell<Vec<&'static str>>);
+        impl Drop for View<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("payload-enqueue");
+            }
+        }
+        drop(View(&events));
+        arena.close_p1j_writer(id, true);
+        events.borrow_mut().push("closed");
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |offset, mapping| {
+                assert_eq!(offset, 8 * GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64);
+                assert_eq!(mapping.slot_epoch(), id.epoch);
+                events.borrow_mut().push("mapping");
+            }),
+            P1jPublication::Published
+        );
+        events
+            .borrow_mut()
+            .extend(["layer47-encode", "normal-submit"]);
+        assert_eq!(
+            *events.borrow(),
+            [
+                "payload-enqueue",
+                "closed",
+                "mapping",
+                "layer47-encode",
+                "normal-submit"
+            ]
+        );
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|&&e| e == "normal-submit")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn p1j_ordinary_current_at_d_wins_without_sidecar_publication() {
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        arena.close_p1j_writer(id, true);
+        let ordinary = p1j_ordinary_install(&arena, 8, 11, |_, _| {});
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |_, _| panic!("ordinary wins")),
+            P1jPublication::OrdinaryWins
+        );
+        assert!(arena.contains_exact_residency(7, ordinary));
+    }
+    #[test]
+    fn p1j_stale_generation_at_d_never_publishes() {
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        arena.close_p1j_writer(id, true);
+        assert_eq!(
+            arena.try_publish_p1j_with(id, false, |_, _| panic!("stale")),
+            P1jPublication::Stale
+        );
+        assert_eq!(
+            arena.try_p1j_phase(id),
+            Some(P1jPhase::Terminal(
+                crate::predictor_v2::P1jTerminal::StaleLogicalGeneration
+            ))
+        );
+    }
+    #[test]
+    fn p1j_request_cancellation_cannot_reuse_before_old_writer_closes() {
+        use crate::predictor_v2::P1jTerminal;
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        assert_eq!(
+            arena.retire_p1j_with(id, P1jTerminal::Cancelled, true, |_, _| panic!(
+                "not mapped"
+            )),
+            Some(false)
+        );
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        // The old writer may STILL enqueue, but nobody may reuse its destination.
+        arena.close_p1j_writer(id, true);
+        assert_eq!(
+            arena.try_p1j_phase(id),
+            Some(P1jPhase::Terminal(P1jTerminal::Cancelled))
+        );
+        let next = p1j_claim(&arena);
+        assert!(next.epoch > id.epoch && next.writer_sequence > id.writer_sequence);
+    }
+    #[test]
+    fn p1j_writer_failure_recycles_only_after_structural_closure() {
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        let enqueued = std::cell::Cell::new(false);
+        struct View<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for View<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _view = View(&enqueued);
+            panic!("injected fill failure");
+        }));
+        assert!(failure.is_err() && enqueued.get());
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        arena.close_p1j_writer(id, false);
+        assert_eq!(
+            arena.try_p1j_phase(id),
+            Some(P1jPhase::Terminal(
+                crate::predictor_v2::P1jTerminal::WriteFailure
+            ))
+        );
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_some());
+    }
+    #[test]
+    fn p1j_recovery_uses_exact_published_residency_without_ordinary_slot_or_rewrite() {
+        let arena = p1j_arena();
+        let before = arena.residency_snapshot();
+        let id = p1j_claim(&arena);
+        p1j_publish(&arena, id);
+        for _ in 0..4 {
+            assert_eq!(arena.p1j_current(), Some((id, p1j_residency(id))));
+        }
+        assert_eq!(arena.residency_snapshot(), before);
+        assert!(arena.state.lock().logical_slots.iter().all(Option::is_none));
+    }
+    #[test]
+    fn p1j_ordinary_supersession_prevents_stale_unpublication() {
+        use crate::predictor_v2::P1jTerminal;
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        p1j_publish(&arena, id);
+        let ordinary = p1j_ordinary_install(&arena, 8, 12, |_, _| {});
+        assert_eq!(
+            arena.try_p1j_phase(id),
+            Some(P1jPhase::Terminal(P1jTerminal::OrdinarySuperseded))
+        );
+        assert_eq!(
+            arena.retire_p1j_with(id, P1jTerminal::Unused, true, |_, _| panic!(
+                "must not unmap ordinary owner"
+            )),
+            Some(true)
+        );
+        assert!(arena.contains_exact_residency(7, ordinary));
+        assert!(arena.p1j_current().is_none());
+    }
+    #[test]
+    fn p1j_old_cleanup_cannot_unpublish_same_expert_new_epoch() {
+        use crate::predictor_v2::P1jTerminal;
+        let arena = p1j_arena();
+        let old = p1j_claim(&arena);
+        p1j_publish(&arena, old);
+        assert_eq!(
+            arena.retire_p1j_with(old, P1jTerminal::Unused, true, |_, _| {}),
+            Some(true)
+        );
+        let next = p1j_claim(&arena);
+        p1j_publish(&arena, next);
+        assert_eq!(
+            arena.retire_p1j_with(old, P1jTerminal::Cancelled, true, |_, _| panic!(
+                "ABA cleanup"
+            )),
+            Some(false)
+        );
+        assert_eq!(arena.p1j_current(), Some((next, p1j_residency(next))));
+    }
+    #[test]
+    fn p1j_wrong_request_candidate_position_and_namespace_cannot_publish_or_clean() {
+        use crate::predictor_v2::P1jTerminal;
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        arena.close_p1j_writer(id, true);
+        for field in 0..7 {
+            let mut wrong = id;
+            match field {
+                0 => wrong.candidate.request.request_sequence += 1,
+                1 => wrong.candidate.sequence += 1,
+                2 => wrong.candidate.target_position.absolute_position += 1,
+                3 => wrong.candidate.namespace.context += 1,
+                4 => wrong.logical_generation += 1,
+                5 => wrong.epoch += 1,
+                _ => wrong.writer_sequence += 1,
+            }
+            assert_eq!(
+                arena.try_publish_p1j_with(wrong, true, |_, _| panic!("wrong identity")),
+                P1jPublication::IdentityMismatch
+            );
+            assert_eq!(
+                arena.retire_p1j_with(wrong, P1jTerminal::Cancelled, true, |_, _| panic!(
+                    "wrong cleanup"
+                )),
+                Some(false)
+            );
+        }
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |_, _| {}),
+            P1jPublication::Published
+        );
+    }
+    #[test]
+    fn p1j_unused_retirement_unpublishes_exactly_once() {
+        use crate::predictor_v2::P1jTerminal;
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        p1j_publish(&arena, id);
+        let writes = std::cell::Cell::new(0);
+        assert_eq!(
+            arena.retire_p1j_with(id, P1jTerminal::Unused, true, |_, entry| {
+                assert_eq!(entry, GpuNativeQ4ExpertMappingEntry::UNMAPPED);
+                writes.set(writes.get() + 1);
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            arena.retire_p1j_with(id, P1jTerminal::Unused, true, |_, _| panic!(
+                "duplicate cleanup"
+            )),
+            Some(false)
+        );
+        assert_eq!(writes.get(), 1);
+        assert_eq!(
+            arena.try_p1j_phase(id),
+            Some(P1jPhase::Terminal(P1jTerminal::Unused))
+        );
+    }
+
+    #[test]
+    fn p1j_deferred_cleanup_resolves_full_identity_only_for_exact_model_epoch() {
+        use crate::predictor_v2::P1jTerminal;
+        let arena = p1j_arena();
+        let old = p1j_claim(&arena);
+        p1j_publish(&arena, old);
+        arena.retire_p1j_epoch_with(
+            old.candidate.namespace,
+            old.epoch,
+            P1jTerminal::Unused,
+            |_, _| {},
+        );
+        let next = p1j_claim(&arena);
+        p1j_publish(&arena, next);
+        arena.retire_p1j_epoch_with(
+            old.candidate.namespace,
+            old.epoch,
+            P1jTerminal::Cancelled,
+            |_, _| panic!("old epoch must not unpublish new owner"),
+        );
+        let mut foreign = next.candidate.namespace;
+        foreign.runtime += 1;
+        arena.retire_p1j_epoch_with(foreign, next.epoch, P1jTerminal::Cancelled, |_, _| {
+            panic!("foreign model must not unpublish")
+        });
+        assert_eq!(arena.p1j_current(), Some((next, p1j_residency(next))));
+        p1j_ordinary_install(&arena, next.candidate.expert, 12, |_, _| {});
+        arena.retire_p1j_epoch_with(
+            next.candidate.namespace,
+            next.epoch,
+            P1jTerminal::Unused,
+            |_, _| panic!("ordinary mapping must survive deferred cleanup"),
+        );
+        assert!(arena.p1j_current().is_none());
+    }
+    #[test]
+    fn p1j_epoch_and_writer_exhaustion_fail_closed() {
+        let arena = p1j_arena();
+        arena.state.lock().p1j.last_epoch = u32::MAX;
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        arena.state.lock().p1j.last_epoch = 0;
+        arena.state.lock().p1j.last_writer = u64::MAX;
+        assert!(arena.try_claim_p1j(p1j_candidate(&arena), 11).is_none());
+        assert!(arena.state.lock().p1j.occupant.is_none());
+    }
+
     fn test_mutable_expert_arena(slot_capacity: usize) -> GpuNativeQ4ExpertArena<()> {
         let geometry = GpuNativeQ4ExpertGeometry::try_new(32, 32, 128, 1).unwrap();
         let limits = supported_expert_limits();
@@ -12172,9 +13131,8 @@ pub(crate) mod tests {
 
             let mut control_residencies = Vec::with_capacity(width);
             for &key in &keys {
-                let permit = expect_expert_install(
-                    control.acquire_with_unpublish(key, |_, _| {}).unwrap(),
-                );
+                let permit =
+                    expect_expert_install(control.acquire_with_unpublish(key, |_, _| {}).unwrap());
                 control_residencies.push(
                     permit
                         .install_with_checked_physical_writer(
@@ -12193,9 +13151,7 @@ pub(crate) mod tests {
             let permits = keys
                 .iter()
                 .map(|&key| {
-                    expect_expert_install(
-                        treatment.acquire_with_unpublish(key, |_, _| {}).unwrap(),
-                    )
+                    expect_expert_install(treatment.acquire_with_unpublish(key, |_, _| {}).unwrap())
                 })
                 .collect::<Vec<_>>();
             let mut prepared = permits

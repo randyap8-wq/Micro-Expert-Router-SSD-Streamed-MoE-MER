@@ -135,6 +135,7 @@ fn adjacent(source: RoutePoint, target: RoutePoint, model: ModelMetadata) -> boo
 pub(crate) enum PredictorSource {
     CpuFixture,
     CompletedPositionReplay,
+    Layer47Temporal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -273,6 +274,7 @@ pub(crate) enum PredictionStage {
 pub(crate) enum SourceKind {
     SyntheticRead,
     SyntheticAlreadyAvailable,
+    HostBackedLogical,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SourceState {
@@ -291,6 +293,58 @@ enum ReservationState {
 pub(crate) enum InstallOrigin {
     SpeculativeFixture,
     RestorationFixture,
+    PredictorV2Sidecar,
+}
+
+/// Exact scalar identity of the isolated writer, independent of ordinary slots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct P1jIdentity {
+    pub candidate: p1e::Candidate,
+    pub logical_generation: u64,
+    pub epoch: u32,
+    pub writer_sequence: u64,
+}
+
+impl P1jIdentity {
+    pub(crate) fn global_id(self) -> u32 {
+        (p1e::LAYER * p1e::EXPERTS) as u32 + self.candidate.expert
+    }
+    pub(crate) fn prediction(self) -> PredictionIdentity {
+        let c = self.candidate;
+        PredictionIdentity {
+            request: c.request,
+            source_position: c.source_position,
+            source_layer: c.source_layer,
+            target_position: c.target_position,
+            target_layer: c.target_layer,
+            expert_local_id: c.expert,
+            prediction_generation: c.generation,
+            candidate_sequence: c.sequence,
+            predictor_source: PredictorSource::Layer47Temporal,
+            predictor_revision: c.signal_revision,
+        }
+    }
+    pub(crate) fn location(self) -> InstallLocation {
+        InstallLocation {
+            executor_namespace: self.candidate.namespace.context,
+            model_namespace: self.candidate.namespace.arena as u64,
+            logical_generation: self.logical_generation,
+            bank: 1,
+            slot: 0,
+            slot_epoch: u64::from(self.epoch),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum P1jTerminal {
+    UsedMatching,
+    Unused,
+    StaleLogicalGeneration,
+    OrdinarySuperseded,
+    Cancelled,
+    RequestEnded,
+    WriteFailure,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InstallState {
@@ -803,7 +857,9 @@ impl LifecycleLedger {
                         && old.model_namespace == install.model_namespace
                         && old.layer == install.layer
                         && old.expert_local_id == install.expert_local_id
-                        && old.logical_generation >= install.logical_generation
+                        && (old.logical_generation > install.logical_generation
+                            || (old.logical_generation == install.logical_generation
+                                && origin != InstallOrigin::PredictorV2Sidecar))
                 }),
                 AccountingError::ReusedIdentity,
             )?;
@@ -954,7 +1010,10 @@ impl LifecycleLedger {
                 .ok_or(AccountingError::InvalidIdentity)?;
             require(
                 record.state == InstallState::Available
-                    && record.origin == InstallOrigin::SpeculativeFixture
+                    && matches!(
+                        record.origin,
+                        InstallOrigin::SpeculativeFixture | InstallOrigin::PredictorV2Sidecar
+                    )
                     && record.credited_demand.is_none()
                     && s.current.get(&install.slot_key()) == Some(&install)
                     && record
@@ -1450,6 +1509,153 @@ impl RequestObserver {
     pub fn temporal_mut(&mut self) -> Option<&mut p1e::Temporal> {
         self.temporal.as_deref_mut()
     }
+
+    pub(crate) fn p1j_ready(&self) -> bool {
+        self.ledger.incomplete.is_none()
+            && !self.ledger.closed
+            && self.temporal().is_some_and(|t| t.active())
+    }
+
+    /// Import the already-frozen P1E identity; this never scores or chooses a candidate.
+    pub(crate) fn p1j_acquired(
+        &mut self,
+        id: P1jIdentity,
+    ) -> AccountingResult<PhysicalInstallIdentity> {
+        let freeze = self.temporal().and_then(|t| {
+            t.pending_freeze(id.candidate.target_position.absolute_position as usize)
+        });
+        let valid = self.p1j_ready()
+            && freeze.is_some_and(|f| {
+                f.candidate == id.candidate
+                    && f.current == Some(false)
+                    && f.incomplete.is_none()
+                    && f.source.logical_materialized
+                    && f.source.logical_generation == Some(id.logical_generation)
+            });
+        let prediction = id.prediction();
+        self.ledger.account(|s| {
+            require(
+                valid && id.epoch != 0 && id.writer_sequence != 0,
+                AccountingError::InvalidIdentity,
+            )?;
+            require(
+                prediction.request == s.request
+                    && id.candidate.model == s.model
+                    && prediction.source_layer == p1e::LAYER
+                    && prediction.target_layer == p1e::LAYER
+                    && prediction
+                        .target_position
+                        .follows(prediction.source_position)
+                    && s.observations.contains_key(&RoutePoint {
+                        request: s.request,
+                        position: prediction.source_position,
+                        layer: p1e::LAYER,
+                    })
+                    && !s.observations.contains_key(&prediction.target())
+                    && !s.predictions.contains_key(&prediction),
+                AccountingError::InvalidIdentity,
+            )?;
+            s.room(s.predictions.len(), 1)?;
+            s.predictions.insert(
+                prediction,
+                PredictionRecord {
+                    stage: PredictionStage::Emitted,
+                    admission: None,
+                    acquisition: None,
+                    install: None,
+                    consumed_by: None,
+                    causal: true,
+                },
+            );
+            Ok(())
+        })?;
+        self.ledger
+            .admit(prediction, AdmissionDisposition::Accepted)?;
+        let source = self
+            .ledger
+            .request_source(prediction, SourceKind::HostBackedLogical)?;
+        self.ledger
+            .complete_source(source, SourceState::Completed)?;
+        self.ledger
+            .reserve(prediction, id.location(), InstallOrigin::PredictorV2Sidecar)
+    }
+
+    pub(crate) fn p1j_published(
+        &mut self,
+        install: PhysicalInstallIdentity,
+    ) -> AccountingResult<()> {
+        self.ledger.finish_reservation(install, None)?;
+        self.ledger.make_available(install)
+    }
+
+    pub(crate) fn p1j_finish(
+        &mut self,
+        id: P1jIdentity,
+        install: PhysicalInstallIdentity,
+        terminal: P1jTerminal,
+    ) -> AccountingResult<()> {
+        if terminal == P1jTerminal::UsedMatching {
+            let sequence = self
+                .ledger
+                .demand_sequence
+                .checked_add(1)
+                .ok_or(AccountingError::Overflow)?;
+            self.ledger.consume(
+                DemandIdentity {
+                    request: id.candidate.request,
+                    target_position: id.candidate.target_position,
+                    layer: p1e::LAYER,
+                    expert_local_id: id.candidate.expert,
+                    demand_sequence: sequence,
+                },
+                install,
+                DemandStatus::CleanCommitted,
+            )?;
+        }
+        self.ledger.account(|s| {
+            let reservation = s
+                .reservations
+                .get_mut(&install)
+                .ok_or(AccountingError::InvalidIdentity)?;
+            require(
+                reservation.origin == InstallOrigin::PredictorV2Sidecar,
+                AccountingError::InvalidIdentity,
+            )?;
+            if reservation.state == ReservationState::Live {
+                reservation.state = ReservationState::Aborted;
+            }
+            if let Some(record) = s.installs.get_mut(&install) {
+                record.state = InstallState::Evicted;
+                if s.current.get(&install.slot_key()) == Some(&install) {
+                    s.current.remove(&install.slot_key());
+                }
+            }
+            let p = s
+                .predictions
+                .get_mut(&id.prediction())
+                .ok_or(AccountingError::InvalidIdentity)?;
+            if !matches!(p.stage, PredictionStage::Terminal(_)) {
+                Self::p1j_terminate(p, terminal);
+            }
+            Ok(())
+        })
+    }
+
+    fn p1j_terminate(p: &mut PredictionRecord, terminal: P1jTerminal) {
+        LifecycleLedger::terminate_record(
+            p,
+            match terminal {
+                P1jTerminal::UsedMatching => TerminalReason::ConsumedByMatchingRoute,
+                P1jTerminal::Unused => TerminalReason::EvictedUnused,
+                P1jTerminal::OrdinarySuperseded | P1jTerminal::StaleLogicalGeneration => {
+                    TerminalReason::Superseded
+                }
+                P1jTerminal::Cancelled => TerminalReason::Cancelled,
+                P1jTerminal::RequestEnded => TerminalReason::RequestEnded,
+                P1jTerminal::WriteFailure => TerminalReason::InstallFailed,
+            },
+        );
+    }
     pub fn prepare_temporal(
         &mut self,
         position: PositionIdentity,
@@ -1788,8 +1994,25 @@ pub(crate) mod p1e {
         /// Actual demand order, not sorted route order. Probe-only lookups never
         /// call this. Full protection is computed before choosing any victim.
         pub fn demand(&mut self, ids: &[u32]) {
+            self.demand_with_sidecar(ids, None);
+        }
+        /// The shadow still describes only ordinary capacity. The exact
+        /// published sidecar satisfies one selected id without a shadow install.
+        pub fn demand_with_sidecar(&mut self, ids: &[u32], sidecar: Option<Resident>) {
             self.apply(|s| {
                 selected(ids)?;
+                if let Some(r) = sidecar {
+                    check(
+                        r.valid()
+                            && r.bank == 1
+                            && r.slot == 0
+                            && !s
+                                .residents
+                                .iter()
+                                .any(|ordinary| ordinary.expert == r.expert),
+                        Error::PhysicalEvidence,
+                    )?;
+                }
                 check(
                     s.victims.is_empty() && s.installs.is_empty(),
                     Error::ShadowDisagreement,
@@ -1798,6 +2021,9 @@ pub(crate) mod p1e {
                 let mut residents = s.residents.clone();
                 let mut installs = Vec::new();
                 for &id in ids {
+                    if sidecar.is_some_and(|r| r.expert == id) {
+                        continue;
+                    }
                     if let Some(index) = residents.iter().position(|r| r.expert == id) {
                         let r = residents.remove(index);
                         residents.push(r);
@@ -2397,6 +2623,28 @@ pub(crate) mod p1e {
                         && r.freeze.candidate.target_position.absolute_position == position as u64
                 })
                 .map(|r| r.freeze.candidate)
+        }
+        pub fn pending_freeze(&self, position: usize) -> Option<Freeze> {
+            self.records
+                .last()
+                .filter(|r| {
+                    r.outcome == Outcome::Pending
+                        && r.freeze.candidate.target_position.absolute_position == position as u64
+                })
+                .map(|r| r.freeze)
+        }
+        pub fn p1j_deadline_valid(&self, candidate: Candidate) -> bool {
+            self.active()
+                && self.records.last().is_some_and(|r| {
+                    r.freeze.candidate == candidate
+                        && r.incomplete.is_none()
+                        && r.deadline.is_some_and(|d| {
+                            d.incomplete.is_none()
+                                && d.current.is_some()
+                                && d.request == candidate.request
+                                && d.position == candidate.target_position
+                        })
+                })
         }
         pub fn deadline(
             &mut self,
@@ -3173,6 +3421,281 @@ pub(crate) mod p1e {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn p1j_observer_fixture() -> (RequestObserver, P1jIdentity) {
+        let r = request(1);
+        let model = ModelMetadata {
+            num_layers: 48,
+            num_experts: 128,
+            top_k: 8,
+        };
+        let namespace = p1e::Namespace {
+            runtime: 1,
+            context: 7,
+            arena: 3,
+            layer: 47,
+            capacity: 8,
+        };
+        let mut observer = RequestObserver::new(r, model, 100_000).unwrap();
+        observer.enable_temporal(namespace).unwrap();
+        for (n, first) in [0, 8, 0].into_iter().enumerate() {
+            let source = PositionIdentity::from_prompt_length(n, 10).unwrap();
+            let target = PositionIdentity::from_prompt_length(n + 1, 10).unwrap();
+            observer.observe_completed_position(
+                r,
+                source,
+                model,
+                &vec![(first..first + 8).collect(); 48],
+            );
+            if let Some(candidate) = observer.prepare_temporal(source, target) {
+                observer.temporal_mut().unwrap().freeze(
+                    candidate,
+                    100 + n as u64,
+                    Ok(p1e::PhysicalEvidence {
+                        snapshot: p1e::PhysicalSnapshot {
+                            namespace,
+                            residents: [None; 8],
+                        },
+                        event_cutoff: 0,
+                        committed_installs: 0,
+                        physical_victims: 0,
+                    }),
+                    p1e::HostSource {
+                        logical_generation: Some(11),
+                        logical_materialized: true,
+                        ram_resident: false,
+                        permanence: p1e::Permanence::Unknown,
+                    },
+                );
+            }
+        }
+        let candidate = observer.temporal().unwrap().pending_candidate(3).unwrap();
+        assert_eq!(candidate.expert, 8);
+        (
+            observer,
+            P1jIdentity {
+                candidate,
+                logical_generation: 11,
+                epoch: 1,
+                writer_sequence: 1,
+            },
+        )
+    }
+    #[test]
+    fn p1j_p0_host_source_and_sidecar_install_identity_reconcile_truthfully() {
+        let (mut observer, id) = p1j_observer_fixture();
+        let install = observer.p1j_acquired(id).unwrap();
+        assert_eq!(
+            (
+                install.bank,
+                install.slot,
+                install.slot_epoch,
+                install.logical_generation
+            ),
+            (1, 0, 1, 11)
+        );
+        assert_eq!(
+            (
+                install.runtime_namespace,
+                install.executor_namespace,
+                install.model_namespace
+            ),
+            (1, 7, 3)
+        );
+        assert_eq!(
+            observer.ledger.sources[&install.reservation.acquisition].kind,
+            SourceKind::HostBackedLogical
+        );
+        assert_eq!(
+            observer.ledger.reservations[&install].origin,
+            InstallOrigin::PredictorV2Sidecar
+        );
+        let s = observer.snapshot().unwrap();
+        assert_eq!(
+            (
+                s.emitted,
+                s.source_completed,
+                s.reservations_live,
+                s.direct_matching_demand_credits
+            ),
+            (1, 1, 1, 0)
+        );
+        observer.p1j_published(install).unwrap();
+        assert_eq!(observer.snapshot().unwrap().available_installs, 1);
+    }
+    #[test]
+    fn p1j_matching_clean_target_credit_is_once_and_survives_retirement() {
+        let (mut observer, id) = p1j_observer_fixture();
+        let install = observer.p1j_acquired(id).unwrap();
+        observer.p1j_published(install).unwrap();
+        observer.observe_completed_position(
+            id.candidate.request,
+            id.candidate.target_position,
+            id.candidate.model,
+            &vec![(8..16).collect(); 48],
+        );
+        observer
+            .p1j_finish(id, install, P1jTerminal::UsedMatching)
+            .unwrap();
+        let snapshot = observer.snapshot().unwrap();
+        assert_eq!(
+            (
+                snapshot.direct_matching_demand_credits,
+                snapshot.terminal_predictions,
+                snapshot.available_installs
+            ),
+            (1, 1, 0)
+        );
+        assert!(observer.ledger.current.is_empty());
+        assert!(observer
+            .p1j_finish(id, install, P1jTerminal::UsedMatching)
+            .is_err());
+        assert_eq!(
+            observer.snapshot().unwrap().direct_matching_demand_credits,
+            1
+        );
+    }
+    #[test]
+    fn p1j_wrong_target_retires_unused_without_credit() {
+        let (mut observer, id) = p1j_observer_fixture();
+        let install = observer.p1j_acquired(id).unwrap();
+        observer.p1j_published(install).unwrap();
+        observer.observe_completed_position(
+            id.candidate.request,
+            id.candidate.target_position,
+            id.candidate.model,
+            &vec![(0..8).collect(); 48],
+        );
+        observer
+            .p1j_finish(id, install, P1jTerminal::Unused)
+            .unwrap();
+        let s = observer.snapshot().unwrap();
+        assert_eq!(
+            (
+                s.terminal_predictions,
+                s.direct_matching_demand_credits,
+                s.available_installs
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            observer.ledger.predictions[&id.prediction()].stage,
+            PredictionStage::Terminal(TerminalReason::EvictedUnused)
+        );
+    }
+    #[test]
+    fn p1j_incomplete_accounting_stops_admission_and_keeps_reconciliation() {
+        let (mut observer, id) = p1j_observer_fixture();
+        observer.mark_incomplete(AccountingError::Capacity);
+        assert!(!observer.p1j_ready());
+        assert!(observer.p1j_acquired(id).is_err());
+        assert_eq!(observer.snapshot().unwrap().emitted, 0);
+    }
+    #[test]
+    fn p1j_cancelled_source_reservation_is_terminal_without_fabricated_install() {
+        let (mut observer, id) = p1j_observer_fixture();
+        let install = observer.p1j_acquired(id).unwrap();
+        observer
+            .p1j_finish(id, install, P1jTerminal::Cancelled)
+            .unwrap();
+        let s = observer.snapshot().unwrap();
+        assert_eq!(
+            (
+                s.source_completed,
+                s.reservations_aborted,
+                s.install_owners,
+                s.terminal_predictions
+            ),
+            (1, 1, 0, 1)
+        );
+    }
+    #[test]
+    fn p1j_same_generation_distinct_epoch_is_a_new_real_install() {
+        let (mut observer, id) = p1j_observer_fixture();
+        let install = observer.p1j_acquired(id).unwrap();
+        observer.p1j_published(install).unwrap();
+        observer
+            .p1j_finish(id, install, P1jTerminal::Unused)
+            .unwrap();
+        // Exercise the actual ledger's epoch rule independently of scoring.
+        let mut next = id.prediction();
+        next.candidate_sequence += 1;
+        observer.ledger.predictions.insert(
+            next,
+            PredictionRecord {
+                stage: PredictionStage::Emitted,
+                admission: None,
+                acquisition: None,
+                install: None,
+                consumed_by: None,
+                causal: true,
+            },
+        );
+        observer
+            .ledger
+            .admit(next, AdmissionDisposition::Accepted)
+            .unwrap();
+        let source = observer
+            .ledger
+            .request_source(next, SourceKind::HostBackedLogical)
+            .unwrap();
+        observer
+            .ledger
+            .complete_source(source, SourceState::Completed)
+            .unwrap();
+        let mut location = id.location();
+        location.slot_epoch += 1;
+        let next_install = observer
+            .ledger
+            .reserve(next, location, InstallOrigin::PredictorV2Sidecar)
+            .unwrap();
+        assert_ne!(next_install, install);
+        assert_eq!(next_install.logical_generation, install.logical_generation);
+        assert_eq!(observer.snapshot().unwrap().reservations, 2);
+    }
+    #[test]
+    fn p1j_recovery_shadow_excludes_sidecar_from_installs_victims_and_capacity() {
+        let (observer, id) = p1j_observer_fixture();
+        let namespace = observer.temporal().unwrap().namespace();
+        let initial = p1e::PhysicalSnapshot {
+            namespace,
+            residents: std::array::from_fn(|i| {
+                Some(p1e::Resident {
+                    expert: i as u32,
+                    generation: 1,
+                    bank: 0,
+                    slot: i as u32,
+                    epoch: 1,
+                })
+            }),
+        };
+        let mut shadow = p1e::Shadow::new(initial).unwrap();
+        let sidecar = p1e::Resident {
+            expert: 8,
+            generation: 11,
+            bank: 1,
+            slot: 0,
+            epoch: id.epoch,
+        };
+        // Seven ordinary hits + sidecar; no ordinary install or eviction.
+        shadow.demand_with_sidecar(&[0, 1, 2, 3, 4, 5, 6, 8], Some(sidecar));
+        let reordered = p1e::PhysicalSnapshot {
+            namespace,
+            residents: [7, 0, 1, 2, 3, 4, 5, 6].map(|e| Some(initial.residents[e].unwrap())),
+        };
+        let evidence = shadow.evidence(reordered).unwrap();
+        assert_eq!(
+            (evidence.committed_installs, evidence.physical_victims),
+            (0, 0)
+        );
+        assert_eq!(evidence.snapshot.residents.iter().flatten().count(), 8);
+        assert!(!evidence
+            .snapshot
+            .residents
+            .iter()
+            .flatten()
+            .any(|r| r.expert == 8));
+    }
 
     fn request(sequence: u64) -> RequestIdentity {
         RequestIdentity {

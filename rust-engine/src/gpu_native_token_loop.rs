@@ -28,11 +28,14 @@ use crate::backend::gpu_native::{
     GpuNativeRouterScratch, GpuNativeScratch, GpuNativeTokenState, GPU_NATIVE_STATUS_FATAL_MASK,
     GPU_NATIVE_STATUS_RETRYABLE_MASK, MAX_GPU_NATIVE_ROUTER_EXPERTS, MAX_GPU_NATIVE_ROUTER_TOP_K,
 };
+use crate::backend::gpu_native::{P1jPhase, P1jPublication};
 use crate::dense_tensor::DenseDType;
 use crate::engine::{Engine, GpuNativeDemandResidencyError};
 use crate::gating::ScoringFunc;
 use crate::gpu_native_residency::GpuNativeTieredResidencyManager;
+use crate::gpu_native_residency::P1jSidecarOwner;
 use crate::model::RealModel;
+use crate::predictor_v2::{P1jIdentity, P1jTerminal, PhysicalInstallIdentity};
 use crate::sampling::SamplingParams;
 
 use crate::predictor_v2::p1e;
@@ -93,6 +96,49 @@ struct PredictorV2RequestObservation {
     identity: Option<PredictorV2RequestIdentity>,
     enabled: Option<Box<(PredictorV2ObservationConfig, PredictorV2RequestObserver)>>,
     p1e_clock: Option<Instant>,
+}
+
+struct P1jCleanup {
+    owner: Arc<P1jSidecarOwner>,
+    id: P1jIdentity,
+    armed: bool,
+}
+impl Drop for P1jCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            self.owner.retire(self.id, P1jTerminal::Cancelled);
+        }
+    }
+}
+struct P1jPending {
+    cleanup: P1jCleanup,
+    install: PhysicalInstallIdentity,
+    published: bool,
+    terminal: Option<P1jTerminal>,
+}
+
+fn p1j_binding_eligible(
+    id: P1jIdentity,
+    published: bool,
+    cancelled: bool,
+    phase: Option<P1jPhase>,
+    request: Option<PredictorV2RequestIdentity>,
+    position: usize,
+    layer: usize,
+) -> bool {
+    published
+        && !cancelled
+        && layer == p1e::LAYER
+        && id.candidate.target_position.absolute_position == position as u64
+        && Some(id.candidate.request) == request
+        // D granted this exact target's binding view. A busy read cannot
+        // revoke it while the cancellation fence still protects its lifetime.
+        && matches!(phase, Some(P1jPhase::Published) | None)
+}
+
+struct P1jRequest {
+    owner: Arc<P1jSidecarOwner>,
+    pending: Option<P1jPending>,
 }
 
 // Lazy adapters keep disabled observation inert. Only copied scalar results
@@ -1269,6 +1315,137 @@ pub struct GpuNativeTokenLoop {
 }
 
 impl GpuNativeTokenLoop {
+    fn launch_p1j_at_freeze(
+        &self,
+        request: &mut GpuNativeRequestState,
+        position: usize,
+        clean_first_attempt: bool,
+    ) {
+        let Some(movement) = request.p1j.as_mut() else {
+            return;
+        };
+        if !clean_first_attempt || movement.pending.is_some() {
+            return;
+        }
+        let Some((_, observer)) = request.predictor_v2_observation.enabled.as_deref_mut() else {
+            return;
+        };
+        if !observer.p1j_ready() {
+            return;
+        }
+        let Some(target) = position.checked_add(1) else {
+            return;
+        };
+        let Some(freeze) = observer.temporal().and_then(|t| t.pending_freeze(target)) else {
+            return;
+        };
+        let Some(writer) = movement
+            .owner
+            .try_prepare(freeze, self.residency_manager.gpu_cache())
+        else {
+            return;
+        };
+        let id = writer.id;
+        let Ok(install) = observer.p1j_acquired(id) else {
+            movement.owner.retire(id, P1jTerminal::Cancelled);
+            return; // Writer guard structurally closes before the resource can recycle.
+        };
+        movement.pending = Some(P1jPending {
+            cleanup: P1jCleanup {
+                owner: movement.owner.clone(),
+                id,
+                armed: true,
+            },
+            install,
+            published: false,
+            terminal: None,
+        });
+        writer.spawn();
+    }
+
+    fn publish_p1j_at_deadline(&self, request: &mut GpuNativeRequestState, position: usize) {
+        let Some(pending) = request.p1j.as_mut().and_then(|s| s.pending.as_mut()) else {
+            return;
+        };
+        let id = pending.cleanup.id;
+        let observer = request
+            .predictor_v2_observation
+            .enabled
+            .as_deref_mut()
+            .map(|(_, o)| o);
+        let valid = id.candidate.target_position.absolute_position == position as u64
+            && request.predictor_v2_observation.identity == Some(id.candidate.request)
+            && observer.as_ref().is_some_and(|o| {
+                o.p1j_ready()
+                    && o.temporal()
+                        .is_some_and(|t| t.p1j_deadline_valid(id.candidate))
+            });
+        let outcome = if valid {
+            pending
+                .cleanup
+                .owner
+                .try_publish(id, self.residency_manager.gpu_cache())
+        } else {
+            P1jPublication::IdentityMismatch
+        };
+        if outcome == P1jPublication::Published {
+            if observer
+                .expect("validated observer")
+                .p1j_published(pending.install)
+                .is_ok()
+            {
+                pending.published = true;
+                return;
+            }
+        }
+        let reason = match outcome {
+            P1jPublication::OrdinaryWins => P1jTerminal::OrdinarySuperseded,
+            P1jPublication::Stale => P1jTerminal::StaleLogicalGeneration,
+            _ => P1jTerminal::Cancelled,
+        };
+        pending.terminal = Some(reason);
+        pending.cleanup.owner.retire(id, reason);
+    }
+
+    fn finish_p1j_target(
+        &self,
+        request: &mut GpuNativeRequestState,
+        position: usize,
+        selected: Option<&[u32]>,
+    ) {
+        let Some(movement) = request.p1j.as_mut() else {
+            return;
+        };
+        if !movement.pending.as_ref().is_some_and(|p| {
+            p.cleanup.id.candidate.target_position.absolute_position == position as u64
+        }) {
+            return;
+        }
+        let mut pending = movement.pending.take().unwrap();
+        let id = pending.cleanup.id;
+        let phase = pending.cleanup.owner.phase(id);
+        let reason = pending.terminal.unwrap_or_else(|| match phase {
+            Some(P1jPhase::Terminal(reason)) => reason,
+            Some(P1jPhase::Published)
+                if pending.published
+                    && selected.is_some_and(|ids| ids.contains(&id.candidate.expert)) =>
+            {
+                P1jTerminal::UsedMatching
+            }
+            Some(P1jPhase::Published) if selected.is_some() => P1jTerminal::Unused,
+            _ => P1jTerminal::Cancelled,
+        });
+        if let Some((_, observer)) = request.predictor_v2_observation.enabled.as_deref_mut() {
+            if phase.is_none() && pending.terminal.is_none() {
+                observer.mark_incomplete(PredictorV2AccountingError::Incomplete);
+            }
+            let _ = observer.p1j_finish(id, pending.install, reason);
+        }
+        // Safety cleanup is independent of every accounting result.
+        pending.cleanup.owner.retire(id, reason);
+        pending.cleanup.armed = false;
+    }
+
     fn observe_p1e_completed(
         &self,
         engine: &Engine,
@@ -1312,10 +1489,17 @@ impl GpuNativeTokenLoop {
 
     fn observe_p1e_deadline(&self, request: &mut GpuNativeRequestState, position: usize) {
         let origin = request.predictor_v2_observation.p1e_clock;
+        let p1j_enabled = request.p1j.is_some();
         observe_p1e_deadline_values(
             &mut request.predictor_v2_observation,
             position,
-            |namespace| self.residency_manager.observe_p1e_physical(namespace),
+            |namespace| {
+                if p1j_enabled {
+                    self.residency_manager.try_observe_p1j_physical(namespace)
+                } else {
+                    self.residency_manager.observe_p1e_physical(namespace)
+                }
+            },
             || origin.as_ref().and_then(p1e_host_timestamp),
         );
     }
@@ -1806,6 +1990,7 @@ impl GpuNativeTokenLoop {
             committed_position: 0,
             max_seq_len: self.model_geometry.max_seq_len,
             predictor_v2_observation: self.predictor_v2_requests.allocate(),
+            p1j: None,
         })
     }
 
@@ -2150,11 +2335,11 @@ impl GpuNativeTokenLoop {
                 detail: "semantic corpus trace was not collected".into(),
             }
         })?;
-        let sampled_token = out.sampled_token.ok_or_else(|| {
-            GpuNativeTokenLoopError::InvalidBoundaryReport {
-                detail: "semantic corpus diagnostic step produced no sampled token".into(),
-            }
-        })?;
+        let sampled_token =
+            out.sampled_token
+                .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                    detail: "semantic corpus diagnostic step produced no sampled token".into(),
+                })?;
         Ok((trace, sampled_token, out.attempts))
     }
 
@@ -2542,6 +2727,16 @@ impl GpuNativeTokenLoop {
         )>,
         oracle_hook: Option<&dyn GpuNativeOracleScheduleHook>,
     ) -> Result<GpuNativeStepOutput, GpuNativeTokenLoopError> {
+        let mut p1j_cancellation = request
+            .p1j
+            .as_ref()
+            .and_then(|s| s.pending.as_ref())
+            .filter(|p| p.cleanup.id.candidate.target_position.absolute_position == position as u64)
+            .map(|p| P1jCleanup {
+                owner: p.cleanup.owner.clone(),
+                id: p.cleanup.id,
+                armed: true,
+            });
         let result = self
             .step_token_p1e_observed_inner(
                 engine,
@@ -2556,6 +2751,7 @@ impl GpuNativeTokenLoop {
             )
             .await;
         if result.is_err() {
+            self.finish_p1j_target(request, position, None);
             if let Some(temporal) = request
                 .predictor_v2_observation
                 .enabled
@@ -2564,6 +2760,9 @@ impl GpuNativeTokenLoop {
             {
                 temporal.censor_target(position);
             }
+        }
+        if let Some(guard) = p1j_cancellation.as_mut() {
+            guard.armed = false;
         }
         result
     }
@@ -2868,7 +3067,13 @@ impl GpuNativeTokenLoop {
                 },
                 report,
             );
+            self.finish_p1j_target(
+                request,
+                position,
+                report.selected_ids.get(p1e::LAYER).map(Vec::as_slice),
+            );
             self.observe_p1e_completed(engine, request, position);
+            self.launch_p1j_at_freeze(request, position, attempts == 1 && recovery.is_none());
 
             return Ok(GpuNativeStepOutput {
                 sampled_token: if sample {
@@ -2994,15 +3199,44 @@ impl GpuNativeTokenLoop {
         } else {
             // Ordinary serving and treatment enter this same production call.
             let scratch = require_q4_route_parallel_scratch(request.q4_parallel_scratch.as_ref())?;
-            self.executor.encode_q4_expert_route_parallel(
-                encoder,
-                &layer_plan.router_plan,
-                &request.router_scratch,
-                arena,
-                &request.token_state,
-                &request.expert_scratch,
-                scratch,
-            )?
+            let sidecar = request
+                .p1j
+                .as_ref()
+                .and_then(|s| s.pending.as_ref())
+                .filter(|p| {
+                    p1j_binding_eligible(
+                        p.cleanup.id,
+                        p.published,
+                        p.cleanup.owner.cancelled(p.cleanup.id),
+                        p.cleanup.owner.phase(p.cleanup.id),
+                        request.predictor_v2_observation.identity,
+                        request.committed_position,
+                        layer_idx,
+                    )
+                });
+            if let Some(pending) = sidecar {
+                self.executor.encode_q4_expert_route_parallel_p1j(
+                    encoder,
+                    &layer_plan.router_plan,
+                    &request.router_scratch,
+                    arena,
+                    &request.token_state,
+                    &request.expert_scratch,
+                    scratch,
+                    pending.cleanup.owner.resource(),
+                    pending.cleanup.id,
+                )?
+            } else {
+                self.executor.encode_q4_expert_route_parallel(
+                    encoder,
+                    &layer_plan.router_plan,
+                    &request.router_scratch,
+                    arena,
+                    &request.token_state,
+                    &request.expert_scratch,
+                    scratch,
+                )?
+            }
         };
         if let Some(observation) = observation {
             observation.record(evidence);
@@ -3256,6 +3490,7 @@ impl GpuNativeTokenLoop {
         for layer_idx in segment.ordinary_layers.clone() {
             if p1e_deadline_eligible && layer_idx == p1e::LAYER {
                 self.observe_p1e_deadline(request, position);
+                self.publish_p1j_at_deadline(request, position);
             }
             let layer_plan = &self.layers[layer_idx];
             // 1. Attention Pre-Norm
@@ -3757,9 +3992,43 @@ pub struct GpuNativeRequestState {
     pub committed_position: usize,
     pub max_seq_len: usize,
     predictor_v2_observation: PredictorV2RequestObservation,
+    p1j: Option<Box<P1jRequest>>,
 }
 
 impl GpuNativeRequestState {
+    /// P1J foundation only. A future explicitly authorized internal qualifier
+    /// must call this separately; enabling the P1E observer never calls it.
+    pub(crate) fn enable_predictor_v2_p1j_sidecar(
+        &mut self,
+        token_loop: &GpuNativeTokenLoop,
+    ) -> Result<(), String> {
+        if self.committed_position != 0
+            || self.p1j.is_some()
+            || token_loop.q4_qualification.get().is_some()
+            || token_loop.snapshot().token_attempts != 0
+        {
+            return Err("P1J opt-in requires an unused route-parallel runtime".into());
+        }
+        let observer = self
+            .predictor_v2_observation
+            .enabled
+            .as_deref()
+            .map(|(_, o)| o)
+            .filter(|o| o.p1j_ready())
+            .ok_or("P1J requires an explicitly enabled P1E observer")?;
+        let namespace = observer
+            .temporal()
+            .ok_or("missing temporal authority")?
+            .namespace();
+        let owner = token_loop
+            .residency_manager
+            .enable_p1j_sidecar(namespace.runtime)?;
+        self.p1j = Some(Box::new(P1jRequest {
+            owner,
+            pending: None,
+        }));
+        Ok(())
+    }
     /// Internal typed opt-in for a later approved driver. Ordinary constructors,
     /// public API, configuration and CLI never activate P1E.
     #[allow(dead_code)]
@@ -3858,6 +4127,20 @@ impl GpuNativeRequestState {
 
     #[allow(dead_code)]
     pub(crate) fn finish_predictor_v2_observation(&mut self, cancelled: bool) {
+        if let Some(movement) = self.p1j.as_mut() {
+            if let Some(mut pending) = movement.pending.take() {
+                let reason = if cancelled {
+                    P1jTerminal::Cancelled
+                } else {
+                    P1jTerminal::RequestEnded
+                };
+                if let Some((_, observer)) = self.predictor_v2_observation.enabled.as_deref_mut() {
+                    let _ = observer.p1j_finish(pending.cleanup.id, pending.install, reason);
+                }
+                pending.cleanup.owner.retire(pending.cleanup.id, reason);
+                pending.cleanup.armed = false;
+            }
+        }
         if let Some((_, observer)) = self.predictor_v2_observation.enabled.as_deref_mut() {
             observer.finish(cancelled);
         }
@@ -5520,6 +5803,279 @@ pub(crate) mod tests {
         assert_eq!(boundary.authorize_layer_once(4), Ok(()));
         assert!(boundary.authorize_layer_once(4).is_err());
         assert_eq!(boundary.authorize_layer_once(5), Ok(()));
+    }
+
+    fn p1j_binding_fixture() -> P1jIdentity {
+        let mut observed = p1e_fixture_observation(true, 100_000);
+        let model = PredictorV2ModelMetadata {
+            num_layers: 48,
+            num_experts: 128,
+            top_k: 8,
+        };
+        for (position, first) in [0, 8, 0].into_iter().enumerate() {
+            let report = GpuNativeBoundaryReport {
+                layer_statuses: vec![0; 48],
+                selected_ids: vec![(first..first + 8).collect(); 48],
+                final_status: 0,
+                sampled_token: 1,
+            };
+            observe_predictor_v2_completed_position(&mut observed, position, model, &report);
+            observe_p1e_completed_values(
+                &mut observed,
+                position,
+                |ns| Ok(p1e_fixture_evidence(ns, 0)),
+                |_| Ok(p1e_fixture_source()),
+                || Some(100 + position as u64),
+            );
+        }
+        let candidate = observed
+            .enabled
+            .as_deref()
+            .unwrap()
+            .1
+            .temporal()
+            .unwrap()
+            .pending_candidate(3)
+            .unwrap();
+        assert_eq!(candidate.expert, 8);
+        P1jIdentity {
+            candidate,
+            logical_generation: 42,
+            epoch: 1,
+            writer_sequence: 1,
+        }
+    }
+
+    #[test]
+    fn p1j_binding_is_exact_request_target_and_survives_recovery_contention() {
+        let id = p1j_binding_fixture();
+        let request = Some(id.candidate.request);
+        for phase in [Some(P1jPhase::Published), None] {
+            // Repeated encodings of this target reuse the granted view; no
+            // second D check, payload write, or sidecar-specific retry occurs.
+            for _ in 0..3 {
+                assert!(p1j_binding_eligible(id, true, false, phase, request, 3, 47));
+            }
+            assert!(!p1j_binding_eligible(
+                id, false, false, phase, request, 3, 47
+            ));
+            assert!(!p1j_binding_eligible(
+                id, true, false, phase, request, 4, 47
+            ));
+            assert!(!p1j_binding_eligible(
+                id, true, false, phase, request, 3, 46
+            ));
+            let mut other = id.candidate.request;
+            other.request_sequence += 1;
+            assert!(!p1j_binding_eligible(
+                id,
+                true,
+                false,
+                phase,
+                Some(other),
+                3,
+                47
+            ));
+        }
+    }
+
+    #[test]
+    fn p1j_cancelled_request_cannot_reuse_cached_binding_even_if_phase_is_busy_or_recycled() {
+        let id = p1j_binding_fixture();
+        for phase in [
+            None,
+            Some(P1jPhase::Published),
+            Some(P1jPhase::Retiring),
+            Some(P1jPhase::Terminal(P1jTerminal::Cancelled)),
+        ] {
+            assert!(!p1j_binding_eligible(
+                id,
+                true,
+                true,
+                phase,
+                Some(id.candidate.request),
+                3,
+                47
+            ));
+        }
+        for phase in [
+            P1jPhase::Writing,
+            P1jPhase::EnqueuedClosed,
+            P1jPhase::Retiring,
+            P1jPhase::Terminal(P1jTerminal::OrdinarySuperseded),
+        ] {
+            assert!(!p1j_binding_eligible(
+                id,
+                true,
+                false,
+                Some(phase),
+                Some(id.candidate.request),
+                3,
+                47
+            ));
+        }
+    }
+
+    fn p1j_production_source() -> &'static str {
+        include_str!("gpu_native_token_loop.rs")
+            .split("#[cfg(test)]\npub(crate) mod tests")
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn p1j_f_and_d_reuse_frozen_top1_and_exact_first_fresh_hook_without_wait_or_io() {
+        let source = p1j_production_source();
+        let movement = source
+            .split("    fn launch_p1j_at_freeze(")
+            .nth(1)
+            .unwrap()
+            .split("    fn finish_p1j_target(")
+            .next()
+            .unwrap();
+        for forbidden in [
+            ".await",
+            ".join(",
+            ".lock(",
+            "queue.submit",
+            "device.poll",
+            "Condvar",
+            "Notify",
+            "loop {",
+            "while ",
+            "fetch_with_retry",
+            "read_expert",
+            "score >=",
+            "score >",
+            "sort",
+            "runner_up",
+            "ExpertResident",
+        ] {
+            assert!(!movement.contains(forbidden), "{forbidden}");
+        }
+        assert!(movement.contains("if !clean_first_attempt || movement.pending.is_some()"));
+        assert!(movement.contains("t.pending_freeze(target)"));
+        assert!(movement.contains("o.p1j_ready()"));
+        assert!(movement.find(".try_prepare(").unwrap() < movement.find("writer.spawn()").unwrap());
+        assert!(
+            movement.find("observer.p1j_acquired(id)").unwrap()
+                < movement.find("writer.spawn()").unwrap()
+        );
+        let hook = source
+            .find("self.publish_p1j_at_deadline(request, position)")
+            .unwrap();
+        assert_eq!(
+            source
+                .matches("self.publish_p1j_at_deadline(request, position)")
+                .count(),
+            1
+        );
+        assert!(source[..hook]
+            .ends_with("self.observe_p1e_deadline(request, position);\n                "));
+        assert!(source[hook..].find("// 1. Attention Pre-Norm").unwrap() < 1500);
+        assert!(source.contains("if p1e_deadline_eligible && layer_idx == p1e::LAYER"));
+        assert!(source.contains(
+            "!full_token_replay && segment.attempt_start == GpuNativeAttemptStart::Fresh"
+        ));
+        assert_eq!(source.matches("self.launch_p1j_at_freeze(").count(), 1);
+        assert!(source.contains(
+            "self.launch_p1j_at_freeze(request, position, attempts == 1 && recovery.is_none())"
+        ));
+    }
+
+    #[test]
+    fn p1j_dormant_constructor_and_p1e_driver_have_no_movement_activation() {
+        let source = p1j_production_source();
+        assert!(source.contains("p1j: None,"));
+        // Definition only: a later authorized qualifier must explicitly call it.
+        assert_eq!(
+            source.matches("enable_predictor_v2_p1j_sidecar(").count(),
+            1
+        );
+        let p1e_enable = source
+            .split("pub(crate) fn enable_predictor_v2_p1e_observation(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn predictor_v2_p1e_report(")
+            .next()
+            .unwrap();
+        assert!(!p1e_enable.contains("p1j"));
+        for code in [
+            include_str!("main.rs"),
+            include_str!("server.rs"),
+            include_str!("gpu_native_predictor_v2_observation.rs"),
+        ] {
+            assert!(!code.contains("enable_predictor_v2_p1j_sidecar"));
+            assert!(!code.contains("enable_p1j_sidecar"));
+        }
+    }
+
+    #[test]
+    fn p1j_cleanup_remains_independent_of_accounting_and_guards_cancelled_future() {
+        let source = p1j_production_source();
+        let cleanup = source
+            .split("    fn finish_p1j_target(")
+            .nth(1)
+            .unwrap()
+            .split("    fn observe_p1e_completed(")
+            .next()
+            .unwrap();
+        assert!(cleanup.contains("let _ = observer.p1j_finish("));
+        assert!(
+            cleanup.find("observer.p1j_finish(").unwrap()
+                < cleanup.find("pending.cleanup.owner.retire(").unwrap()
+        );
+        let worker = source
+            .split("    async fn step_token_unified_inner(")
+            .nth(1)
+            .unwrap()
+            .split("    async fn step_token_p1e_observed_inner(")
+            .next()
+            .unwrap();
+        assert!(worker.find("let mut p1j_cancellation").unwrap() < worker.find(".await").unwrap());
+        assert!(worker.find(".await").unwrap() < worker.find("guard.armed = false").unwrap());
+        let complete = source
+            .split("observe_predictor_v2_completed_position(\n                &mut request")
+            .nth(1)
+            .unwrap();
+        assert!(
+            complete.find("self.finish_p1j_target(").unwrap()
+                < complete.find("self.launch_p1j_at_freeze(").unwrap()
+        );
+        let residency = include_str!("gpu_native_residency.rs");
+        let close = residency
+            .split("    fn close(&mut self, success: bool)")
+            .nth(1)
+            .unwrap()
+            .split("impl Drop for P1jWriter")
+            .next()
+            .unwrap();
+        assert!(close.contains(".try_close_p1j_writer("));
+        assert!(!close.contains(".lock("));
+        let demand = residency
+            .split("pub(crate) fn has_current_for_demand(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn record_physical_source_acquisition(")
+            .next()
+            .unwrap();
+        assert!(demand.contains("self.p1j_current(global_id).is_some()"));
+        let recovery = residency
+            .split("// The token loop's execution guard spans this target recovery.")
+            .nth(1)
+            .unwrap()
+            .split("} else {")
+            .next()
+            .unwrap();
+        assert!(recovery.contains("resolved[index] = Some(residency)"));
+        for forbidden in [
+            "write_p1j_payload",
+            "install(",
+            "source_acquisition",
+            ".residents.",
+        ] {
+            assert!(!recovery.contains(forbidden), "{forbidden}");
+        }
     }
 
     fn p1e_fixture_observation(enabled: bool, capacity: usize) -> PredictorV2RequestObservation {

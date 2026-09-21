@@ -233,6 +233,59 @@ impl GpuNativeExecutorContext {
         expert_scratch: &GpuNativeQ4ExpertScratch,
         parallel: &GpuNativeQ4RouteParallelScratch,
     ) -> Result<DispatchEvidence, GpuNativeBootstrapError> {
+        self.encode_q4_expert_route_parallel_with_binding(
+            encoder,
+            router_plan,
+            router_scratch,
+            arena,
+            state,
+            expert_scratch,
+            parallel,
+            None,
+        )
+    }
+
+    pub(crate) fn encode_q4_expert_route_parallel_p1j(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        router_plan: &GpuNativeRouterPlan,
+        router_scratch: &GpuNativeRouterScratch,
+        arena: &GpuNativeQ4ExpertArena,
+        state: &GpuNativeTokenState,
+        expert_scratch: &GpuNativeQ4ExpertScratch,
+        parallel: &GpuNativeQ4RouteParallelScratch,
+        sidecar: &GpuNativeP1jSidecar,
+        id: crate::predictor_v2::P1jIdentity,
+    ) -> Result<DispatchEvidence, GpuNativeBootstrapError> {
+        if sidecar.context_id != self.context_id
+            || sidecar.arena_identity != arena as *const _ as usize
+            || id.candidate.namespace.arena != sidecar.arena_identity
+        {
+            return Err(GpuNativeBootstrapError::ForeignExpertArena);
+        }
+        self.encode_q4_expert_route_parallel_with_binding(
+            encoder,
+            router_plan,
+            router_scratch,
+            arena,
+            state,
+            expert_scratch,
+            parallel,
+            Some(sidecar),
+        )
+    }
+
+    fn encode_q4_expert_route_parallel_with_binding(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        router_plan: &GpuNativeRouterPlan,
+        router_scratch: &GpuNativeRouterScratch,
+        arena: &GpuNativeQ4ExpertArena,
+        state: &GpuNativeTokenState,
+        expert_scratch: &GpuNativeQ4ExpertScratch,
+        parallel: &GpuNativeQ4RouteParallelScratch,
+        sidecar: Option<&GpuNativeP1jSidecar>,
+    ) -> Result<DispatchEvidence, GpuNativeBootstrapError> {
         let before = Q4DispatchCounters::capture(self);
         let gpu = self.authoritative_gpu()?;
         let limits = gpu.device.limits();
@@ -269,14 +322,12 @@ impl GpuNativeExecutorContext {
         let down_workgroups = self.checked_workgroups(arena.geometry.d_model, &limits)?;
         let combine_workgroups = down_workgroups;
         let residual_workgroups = down_workgroups;
-        let bank_slots =
-            arena.plan.layout.banks.map(|bank| {
-                u32::try_from(bank.slot_capacity).expect("validated bank slot capacity")
-            });
+        let (active_banks, bank_slots) =
+            p1j_binding_layout(arena.plan, arena.layer_index, sidecar.is_some())?;
         let resolve_pc = GpuNativeExpertResolvePushConstants {
             num_experts: arena.geometry.num_experts as u32,
             top_k: arena.geometry.top_k as u32,
-            active_banks: arena.plan.layout.active_banks as u32,
+            active_banks,
             _reserved: 0,
             bank_slots,
         };
@@ -334,7 +385,9 @@ impl GpuNativeExecutorContext {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: arena.banks[1].as_entire_binding(),
+                            resource: sidecar
+                                .map_or(&arena.banks[1], |s| &s.buffer)
+                                .as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -726,7 +779,12 @@ mod tests {
         let source = include_str!("q4_route_parallel.rs");
         assert!(function(source, "encode_q4_expert_serial_qualification")
             .contains("self.encode_q4_expert_arena_combine("));
-        let treatment = function(source, "encode_q4_expert_route_parallel");
+        let treatment = function(source, "encode_q4_expert_route_parallel_with_binding");
+        let ordinary = function(source, "encode_q4_expert_route_parallel")
+            .split_whitespace()
+            .collect::<String>();
+        assert!(ordinary.contains("parallel,None,"));
+        assert!(function(source, "encode_q4_expert_route_parallel_p1j").contains("Some(sidecar)"));
         assert!(
             treatment
                 .find("validate_route_parallel_scratch_identity(")
