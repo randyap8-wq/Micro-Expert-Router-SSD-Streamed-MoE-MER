@@ -838,6 +838,13 @@ pub struct GpuAdmission {
     generation: u64,
 }
 
+/// Copied observation only; grants no payload ownership or lifetime guarantee.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LogicalHostObservation {
+    pub(crate) generation: u64,
+    pub(crate) host_payload_present: bool,
+}
+
 impl GpuAdmission {
     #[inline]
     pub fn resident(&self) -> &Arc<GpuResident> {
@@ -1243,6 +1250,21 @@ impl GpuExpertCache {
     pub fn current_admission(&self, id: u32) -> Option<GpuAdmission> {
         let g = self.inner.lock();
         g.anchor.get(&id).or_else(|| g.lru.peek(&id)).cloned()
+    }
+
+    /// P1E non-touching source classification. No admission/payload is cloned,
+    /// and logical-only data access, telemetry, promotion and LRU are untouched.
+    pub(crate) fn observe_logical_host(&self, id: u32) -> Option<LogicalHostObservation> {
+        let g = self.inner.lock();
+        let admission = g.anchor.get(&id).or_else(|| g.lru.peek(&id))?;
+        Some(LogicalHostObservation {
+            generation: admission.generation,
+            host_payload_present: matches!(
+                &admission.resident.payload,
+                GpuResidentHostPayload::Materialized(_)
+                    | GpuResidentHostPayload::QualificationShared(_)
+            ),
+        })
     }
 
     /// Check whether an expert is currently resident in either the
@@ -2251,6 +2273,118 @@ mod tests {
         // buffer that `make(2, ...)` consumed, the pool should have
         // strictly more free slots than it did at the rejection.
         assert!(pool.try_acquire().is_some());
+    }
+
+    #[test]
+    fn p1e_logical_host_observation_is_scalar_and_preserves_every_cache_state() {
+        use crate::inference::WeightDtype;
+        fn copy_only<T: Copy>() {}
+        copy_only::<LogicalHostObservation>();
+        assert!(!std::mem::needs_drop::<LogicalHostObservation>());
+        // Both anchor and LRU, with all three payload variants.
+        for anchor_ratio in [0.0, 1.0] {
+            let cache = Arc::new(GpuExpertCache::new(128, anchor_ratio, 3));
+            let audit = Arc::new(AtomicU64::new(0));
+            let payload: Arc<[u8]> = Arc::from(vec![7u8; 16]);
+            let residents = [
+                gpu_res(1, 16),
+                Arc::new(GpuResident::new_qualification_shared(
+                    2,
+                    payload.clone(),
+                    WeightDtype::F32,
+                )),
+                Arc::new(GpuResident::new_qualification_logical_only(
+                    3,
+                    16,
+                    WeightDtype::F32,
+                    audit.clone(),
+                )),
+            ];
+            for r in &residents {
+                assert!(cache.promote_sync(r.clone()));
+            }
+            assert!(cache.claim_promotion(99, 3));
+            let protection = cache.protect_demand_set(&[1, 2, 3]).unwrap();
+            let state = || {
+                let g = cache.inner.lock();
+                (
+                    g.anchor
+                        .iter()
+                        .map(|(&id, a)| (id, a.generation()))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    g.lru
+                        .iter()
+                        .map(|(&id, a)| (id, a.generation()))
+                        .collect::<Vec<_>>(),
+                    g.anchor_used_bytes,
+                    g.lru_used_bytes,
+                    g.next_generation,
+                    g.promotion_pending.clone(),
+                    g.promotion_rearm.clone(),
+                    g.demand_protections.clone(),
+                )
+            };
+            let before = state();
+            let counters = (
+                cache.hits(),
+                cache.misses(),
+                cache.promotions(),
+                cache.used_bytes(),
+            );
+            let owners = residents.each_ref().map(Arc::strong_count);
+            let payload_owners = Arc::strong_count(&payload);
+            let audit_owners = Arc::strong_count(&audit);
+            let mut copied = Vec::new();
+            for _ in 0..32 {
+                for (index, r) in residents.iter().enumerate() {
+                    let observation = cache.observe_logical_host(r.id).unwrap();
+                    assert_eq!(
+                        observation.generation,
+                        cache.current_generation(r.id).unwrap()
+                    );
+                    assert_eq!(observation.host_payload_present, index != 2);
+                    copied.push(observation);
+                }
+                assert_eq!(cache.observe_logical_host(99), None);
+            }
+            assert_eq!(state(), before);
+            assert_eq!(
+                (
+                    cache.hits(),
+                    cache.misses(),
+                    cache.promotions(),
+                    cache.used_bytes()
+                ),
+                counters
+            );
+            assert_eq!(residents.each_ref().map(Arc::strong_count), owners);
+            assert_eq!(Arc::strong_count(&payload), payload_owners);
+            assert_eq!(Arc::strong_count(&audit), audit_owners);
+            assert_eq!(audit.load(Ordering::Relaxed), 0);
+            drop(protection);
+            drop(cache);
+            assert_eq!(residents.each_ref().map(Arc::strong_count), [1; 3]);
+            // Copied observations outlive cache ownership without owning bytes.
+            assert_eq!(copied.len(), 96);
+        }
+    }
+
+    #[test]
+    fn p1e_repeated_cache_observation_does_not_change_next_victim() {
+        let cache = GpuExpertCache::new(32, 0.0, 3);
+        assert!(cache.promote_sync(gpu_res(1, 16)));
+        assert!(cache.promote_sync(gpu_res(2, 16)));
+        let generation = cache.observe_logical_host(1).unwrap().generation;
+        for _ in 0..64 {
+            assert_eq!(
+                cache.observe_logical_host(1).unwrap().generation,
+                generation
+            );
+        }
+        assert!(cache.promote_sync(gpu_res(3, 16)));
+        assert!(!cache.contains(1));
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
     }
 
     fn gpu_res(id: u32, bytes: usize) -> Arc<GpuResident> {

@@ -540,6 +540,7 @@ struct PhysicalRecord {
 }
 
 struct LayerResidencyState {
+    p1e_shadow: Option<Box<crate::predictor_v2::p1e::Shadow>>,
     residents: LruCache<u32, PhysicalRecord>,
     last_installed_generations: HashMap<u32, u64>,
     physical_evictions: u64,
@@ -549,9 +550,48 @@ impl Default for LayerResidencyState {
     fn default() -> Self {
         Self {
             residents: LruCache::unbounded(),
+            p1e_shadow: None,
             last_installed_generations: HashMap::new(),
             physical_evictions: 0,
         }
+    }
+}
+
+/// Copy LRU to MRU through an immutable reference. The verifier is used only
+/// inside this module to check an existing record, never to fetch or touch it.
+fn copy_p1e_snapshot<T>(
+    namespace: crate::predictor_v2::p1e::Namespace,
+    residents: &LruCache<u32, T>,
+    arena_resident_count: usize,
+    verify: impl Fn(u32, &T) -> Option<crate::predictor_v2::p1e::Resident>,
+) -> Result<crate::predictor_v2::p1e::PhysicalSnapshot, crate::predictor_v2::p1e::Error> {
+    use crate::predictor_v2::p1e::{Error, PhysicalSnapshot, CAPACITY, EXPERTS, LAYER};
+    if residents.len() > CAPACITY || arena_resident_count != residents.len() {
+        return Err(Error::PhysicalEvidence);
+    }
+    let mut copied = [None; CAPACITY];
+    for (dst, (&global_id, record)) in copied.iter_mut().zip(residents.iter().rev()) {
+        let resident = verify(global_id, record).ok_or(Error::PhysicalEvidence)?;
+        if global_id as usize != LAYER * EXPERTS + resident.expert as usize {
+            return Err(Error::PhysicalEvidence);
+        }
+        *dst = Some(resident);
+    }
+    let snapshot = PhysicalSnapshot {
+        namespace,
+        residents: copied,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn p1e_resident(record: PhysicalRecord) -> crate::predictor_v2::p1e::Resident {
+    crate::predictor_v2::p1e::Resident {
+        expert: record.key.expert_id(),
+        generation: record.key.logical_generation(),
+        bank: record.residency.location().bank(),
+        slot: record.residency.location().slot(),
+        epoch: record.residency.slot_epoch(),
     }
 }
 
@@ -714,6 +754,100 @@ impl GpuNativeTieredResidencyManager {
 
     pub(crate) fn arena(&self, layer_index: usize) -> Option<&Arc<GpuNativeQ4ExpertArena>> {
         self.layers.get(layer_index).map(|layer| &layer.arena)
+    }
+
+    fn p1e_namespace(
+        &self,
+        runtime: u64,
+    ) -> Result<crate::predictor_v2::p1e::Namespace, crate::predictor_v2::p1e::Error> {
+        use crate::predictor_v2::p1e::{Error, Namespace, CAPACITY, EXPERTS, LAYER};
+        let layer = self.layers.get(LAYER).ok_or(Error::PhysicalEvidence)?;
+        if self.layers.len() != LAYER + 1
+            || self.plan.geometry().num_experts() != EXPERTS
+            || self.plan.geometry().top_k() != CAPACITY
+            || layer.arena.slot_capacity() != CAPACITY
+            || layer.arena.layer_index() != LAYER
+            || runtime == 0
+        {
+            return Err(Error::PhysicalEvidence);
+        }
+        Ok(Namespace {
+            runtime,
+            context: self.executor.context_id(),
+            arena: Arc::as_ptr(&layer.arena) as usize,
+            layer: LAYER,
+            capacity: CAPACITY,
+        })
+    }
+
+    fn p1e_copy_locked(
+        &self,
+        namespace: crate::predictor_v2::p1e::Namespace,
+        state: &LayerResidencyState,
+    ) -> Result<crate::predictor_v2::p1e::PhysicalSnapshot, crate::predictor_v2::p1e::Error> {
+        use crate::predictor_v2::p1e::{Error, LAYER};
+        if self.p1e_namespace(namespace.runtime)? != namespace {
+            return Err(Error::PhysicalEvidence);
+        }
+        let layer = &self.layers[LAYER];
+        copy_p1e_snapshot(
+            namespace,
+            &state.residents,
+            layer.arena.resident_experts(),
+            |global, record| {
+                let identity = self.identity(global).ok()?;
+                (identity.layer_index == LAYER
+                    && record.key.layer_index() == LAYER
+                    && record.key.expert_id() == identity.local_expert_id
+                    && record.residency.key() == record.key
+                    && layer
+                        .arena
+                        .contains_exact_residency(self.executor.context_id(), record.residency))
+                .then(|| p1e_resident(*record))
+            },
+        )
+    }
+
+    /// Internal observation opt-in only. Seeds once from verified copied state;
+    /// subsequent requests inherit the physical shadow, never temporal history.
+    pub(crate) fn enable_p1e_shadow(
+        &self,
+        runtime: u64,
+    ) -> Result<crate::predictor_v2::p1e::Namespace, crate::predictor_v2::p1e::Error> {
+        use crate::predictor_v2::p1e::{Error, Shadow, LAYER};
+        let namespace = self.p1e_namespace(runtime)?;
+        let mut state = self.layers[LAYER].state.lock();
+        let actual = self.p1e_copy_locked(namespace, &state)?;
+        if let Some(shadow) = state.p1e_shadow.as_deref_mut() {
+            if shadow.namespace() != namespace {
+                return Err(Error::PhysicalEvidence);
+            }
+            shadow.evidence(actual)?;
+        } else {
+            state.p1e_shadow = Some(Box::new(Shadow::new(actual)?));
+        }
+        Ok(namespace)
+    }
+
+    /// Bounded non-touching evidence at F/D (and clean completion). The only
+    /// mutable object is CPU observation accounting; physical/cache state and
+    /// counters are never mutated. No source access or GPU synchronization.
+    pub(crate) fn observe_p1e_physical(
+        &self,
+        namespace: crate::predictor_v2::p1e::Namespace,
+    ) -> Result<crate::predictor_v2::p1e::PhysicalEvidence, crate::predictor_v2::p1e::Error> {
+        use crate::predictor_v2::p1e::{Error, LAYER};
+        let layer = self.layers.get(LAYER).ok_or(Error::PhysicalEvidence)?;
+        let mut state = layer.state.lock();
+        let actual = self.p1e_copy_locked(namespace, &state);
+        let shadow = state.p1e_shadow.as_deref_mut().ok_or(Error::Incomplete)?;
+        match actual {
+            Ok(actual) => shadow.evidence(actual),
+            Err(e) => {
+                shadow.mark_incomplete(e);
+                Err(e)
+            }
+        }
     }
 
     fn identity(
@@ -1034,6 +1168,13 @@ impl GpuNativeTieredResidencyManager {
                 .fetch_add(demands.len() as u64, Ordering::Relaxed);
         }
         let mut state = layer.state.lock();
+        if let Some(shadow) = state.p1e_shadow.as_deref_mut() {
+            let local_ids = demands
+                .iter()
+                .map(|d| d.global_id() % self.plan.geometry().num_experts() as u32)
+                .collect::<Vec<_>>();
+            shadow.demand(&local_ids);
+        }
         let mut resolved = vec![None; demands.len()];
         let mut misses = Vec::new();
         for (index, demand) in demands.iter().enumerate() {
@@ -1568,6 +1709,12 @@ impl GpuNativeTieredResidencyManager {
                     residency,
                 },
             );
+            if let Some(shadow) = state.p1e_shadow.as_deref_mut() {
+                shadow.committed_install(p1e_resident(PhysicalRecord {
+                    key: staged.key,
+                    residency,
+                }));
+            }
             self.counters
                 .ram_to_vram_installs
                 .fetch_add(1, Ordering::Relaxed);
@@ -1794,6 +1941,9 @@ impl GpuNativeTieredResidencyManager {
             | GpuNativeQ4ExpertRetire::StaleRequester => {}
         }
         state.residents.pop(&global_id);
+        if let Some(shadow) = state.p1e_shadow.as_deref_mut() {
+            shadow.victim(record.key.expert_id());
+        }
         if capacity_eviction {
             state.physical_evictions = state.physical_evictions.saturating_add(1);
             self.counters
@@ -1941,6 +2091,9 @@ impl GpuNativeTieredResidencyManager {
         state
             .residents
             .put(global_id, PhysicalRecord { key, residency });
+        if let Some(shadow) = state.p1e_shadow.as_deref_mut() {
+            shadow.committed_install(p1e_resident(PhysicalRecord { key, residency }));
+        }
         if installed {
             self.counters
                 .ram_to_vram_installs
@@ -1986,6 +2139,164 @@ pub(crate) fn validate_qualification_physical_source_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn p1e_frozen_plan_has_exactly_eight_layer47_slots_without_device_construction() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        let limits = limits();
+        let plan = GpuNativeModelExpertVramPlan::try_new(48, geometry, 2048 * 1024 * 1024, &limits)
+            .unwrap();
+        assert_eq!(plan.layer_plans()[47].slot_capacity(), 8);
+    }
+
+    #[test]
+    fn p1e_read_only_snapshot_and_shadow_match_real_lru_victim_helpers() {
+        use crate::predictor_v2::p1e::{Namespace, Resident, Shadow};
+        let namespace = Namespace {
+            runtime: 1,
+            context: 2,
+            arena: 3,
+            layer: 47,
+            capacity: 8,
+        };
+        let mut residents = LruCache::unbounded();
+        for expert in 0..8 {
+            residents.put(
+                47 * 128 + expert,
+                Resident {
+                    expert,
+                    generation: 10,
+                    bank: 0,
+                    slot: expert,
+                    epoch: 1,
+                },
+            );
+        }
+        let copy = |cache: &LruCache<u32, Resident>| {
+            copy_p1e_snapshot(namespace, cache, cache.len(), |_, r| Some(*r)).unwrap()
+        };
+        let initial = copy(&residents);
+        let mut shadow = Shadow::new(initial).unwrap();
+        for _ in 0..20 {
+            assert_eq!(copy(&residents), initial);
+            assert!(!shadow
+                .evidence(copy(&residents))
+                .unwrap()
+                .snapshot
+                .current(namespace, 8)
+                .unwrap());
+        }
+        let ids = [8, 0, 1, 2, 3, 4, 5, 9];
+        shadow.demand(&ids);
+        let protected = ids.iter().map(|&id| 47 * 128 + id).collect::<HashSet<_>>();
+        let mut missing = Vec::new();
+        for &id in &ids {
+            if touch_physical_record(&mut residents, 47 * 128 + id).is_none() {
+                missing.push(id);
+            }
+        }
+        let mut free = Vec::new();
+        while residents.len() + missing.len() > 8 {
+            let victim = oldest_unprotected(&residents, &protected).unwrap();
+            let old = residents.pop(&victim).unwrap();
+            shadow.victim(old.expert);
+            free.push(old.slot);
+        }
+        for (id, slot) in missing.into_iter().zip(free) {
+            let record = Resident {
+                expert: id,
+                generation: 11,
+                bank: 0,
+                slot,
+                epoch: 2,
+            };
+            residents.put(47 * 128 + id, record);
+            shadow.committed_install(record);
+        }
+        let after = copy(&residents);
+        assert_eq!(shadow.evidence(after).unwrap().snapshot, after);
+        assert_eq!(
+            after.residents.map(|r| r.unwrap().expert),
+            [0, 1, 2, 3, 4, 5, 8, 9]
+        );
+        // Real host logical eviction has no physical event or shadow mutation.
+        let logical = GpuExpertCache::new(16, 0.0, 0);
+        assert!(
+            logical.promote_sync(Arc::new(crate::expert_cache::GpuResident::new(
+                47 * 128 + 8,
+                vec![0; 16]
+            )))
+        );
+        assert!(
+            logical.promote_sync(Arc::new(crate::expert_cache::GpuResident::new(
+                999,
+                vec![0; 16]
+            )))
+        );
+        assert!(!logical.contains(47 * 128 + 8));
+        assert_eq!(copy(&residents), after);
+        assert!(shadow
+            .evidence(after)
+            .unwrap()
+            .snapshot
+            .current(namespace, 8)
+            .unwrap());
+        assert!(copy_p1e_snapshot(namespace, &residents, 7, |_, r| Some(*r)).is_err());
+        assert!(copy_p1e_snapshot(namespace, &residents, 8, |_, _| None).is_err());
+        let mut wrong = LruCache::unbounded();
+        wrong.put(
+            8,
+            Resident {
+                expert: 8,
+                generation: 1,
+                bank: 0,
+                slot: 0,
+                epoch: 1,
+            },
+        );
+        assert!(copy_p1e_snapshot(namespace, &wrong, 1, |_, r| Some(*r)).is_err());
+    }
+
+    #[test]
+    fn p1e_physical_seam_uses_exact_non_touching_arena_validation() {
+        let source = include_str!("gpu_native_residency.rs");
+        let seam = source
+            .split("    fn p1e_copy_locked(")
+            .nth(1)
+            .unwrap()
+            .split("    /// Internal observation opt-in")
+            .next()
+            .unwrap();
+        for required in [
+            "record.key.layer_index()",
+            "record.key.expert_id()",
+            "record.residency.key() == record.key",
+            "contains_exact_residency(self.executor.context_id(), record.residency)",
+            "&state.residents",
+        ] {
+            assert!(seam.contains(required), "{required}");
+        }
+        for forbidden in [
+            ".get(&",
+            "touch_physical_record",
+            "acquire_q4",
+            "retire_q4",
+            ".fetch_add",
+            "device.poll",
+            "queue.submit",
+        ] {
+            assert!(!seam.contains(forbidden), "{forbidden}");
+        }
+        let copy = source
+            .split("fn copy_p1e_snapshot<T>(")
+            .nth(1)
+            .unwrap()
+            .split("fn p1e_resident")
+            .next()
+            .unwrap();
+        assert!(copy.contains("residents: &LruCache"));
+        assert!(!copy.contains("&mut"));
+    }
+
     use crate::buffer_pool::BufferPool;
     use crate::expert_cache::GpuResident;
 

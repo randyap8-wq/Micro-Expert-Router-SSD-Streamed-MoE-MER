@@ -1126,7 +1126,7 @@ mod tests {
             ),
             (
                 include_str!("gpu_native_residency.rs"),
-                "662feee8293175a06a26ee3a400fdff23ce245513d1ebaa44a51b3cc9f601cbe",
+                "e42719f1682323dce28132a632f5b8585197e57fcbc2d6bc200c14da1e4cb91a",
             ),
             (
                 include_str!("config.rs"),

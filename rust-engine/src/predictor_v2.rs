@@ -1,4 +1,4 @@
-//! Predictor-v2 P0: bounded, request-owned CPU attribution, never scheduling.
+//! Predictor-v2 P0/P1E: bounded, request-owned CPU observation, never scheduling.
 //!
 //! Inputs are copied local route IDs and value metadata. There are deliberately
 //! no crate imports, callbacks, execution handles, I/O, or asynchronous methods.
@@ -92,7 +92,7 @@ impl PositionIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ModelMetadata {
     pub num_layers: usize,
     pub num_experts: usize,
@@ -1383,13 +1383,15 @@ struct TransitionKey {
 
 /// No Clone implementation: history is owned by one native request. There is no
 /// shared predecessor ring or shared learned table. Completed-position replay
-/// trains descriptive transitions only; it emits no predictions or utility.
+/// trains descriptive transitions only. P1E has a separate explicit opt-in for
+/// temporal opportunity records; neither observer schedules work.
 #[derive(Debug)]
 pub(crate) struct RequestObserver {
     ledger: LifecycleLedger,
     predecessor: Option<Predecessor>,
     transition_counts: BTreeMap<TransitionKey, u64>,
     completed_positions: u64,
+    temporal: Option<Box<p1e::Temporal>>,
 }
 
 impl RequestObserver {
@@ -1403,6 +1405,7 @@ impl RequestObserver {
             predecessor: None,
             transition_counts: BTreeMap::new(),
             completed_positions: 0,
+            temporal: None,
         })
     }
     pub fn request_identity(&self) -> RequestIdentity {
@@ -1415,12 +1418,60 @@ impl RequestObserver {
         self.completed_positions
     }
     pub fn mark_incomplete(&mut self, error: AccountingError) {
+        if let Some(temporal) = self.temporal.as_deref_mut() {
+            temporal.mark_incomplete(p1e::Error::Incomplete);
+        }
         self.ledger.mark_incomplete(error);
         self.predecessor = None;
     }
     pub fn finish(&mut self, cancelled: bool) {
+        if let Some(temporal) = self.temporal.as_deref_mut() {
+            temporal.finish();
+        }
         let _ = self.ledger.end_request(cancelled);
         self.predecessor = None;
+    }
+
+    pub fn enable_temporal(&mut self, namespace: p1e::Namespace) -> Result<(), p1e::Error> {
+        if self.completed_positions != 0 || self.temporal.is_some() || self.ledger.closed {
+            return Err(p1e::Error::Identity);
+        }
+        self.temporal = Some(Box::new(p1e::Temporal::new(
+            self.ledger.request,
+            self.ledger.model,
+            namespace,
+            self.ledger.capacity,
+        )?));
+        Ok(())
+    }
+    pub fn temporal(&self) -> Option<&p1e::Temporal> {
+        self.temporal.as_deref()
+    }
+    pub fn temporal_mut(&mut self) -> Option<&mut p1e::Temporal> {
+        self.temporal.as_deref_mut()
+    }
+    pub fn prepare_temporal(
+        &mut self,
+        position: PositionIdentity,
+        target: PositionIdentity,
+    ) -> Option<p1e::Candidate> {
+        let temporal = self.temporal.as_deref_mut()?;
+        if self.ledger.incomplete.is_some()
+            || self.ledger.closed
+            || position.absolute_position.checked_add(1) != Some(self.completed_positions)
+        {
+            temporal.mark_incomplete(p1e::Error::Incomplete);
+            return None;
+        }
+        let Some(previous) = self.predecessor.as_ref().filter(|p| {
+            p.point.layer == p1e::LAYER
+                && p.point.position == position
+                && p.point.request == self.ledger.request
+        }) else {
+            temporal.mark_incomplete(p1e::Error::Identity);
+            return None;
+        };
+        temporal.committed(position, target, &previous.ids)
     }
 
     fn observe_layer(&mut self, point: RoutePoint, ids: &[u32]) -> AccountingResult<()> {
@@ -1484,6 +1535,9 @@ impl RequestObserver {
         model: ModelMetadata,
         routes: &[Vec<u32>],
     ) {
+        if let Some(temporal) = self.temporal.as_deref_mut() {
+            temporal.note_p0_truth(position);
+        }
         let result = (|| {
             require(
                 self.ledger.incomplete.is_none(),
@@ -1527,6 +1581,1591 @@ impl RequestObserver {
         })();
         if let Err(error) = result {
             self.mark_incomplete(error);
+        }
+    }
+}
+
+/// Frozen P1E geometry and signal. This module accepts values only, never an
+/// executor, source, cache, callback or task. Its shadow describes ordinary work.
+pub(crate) mod p1e {
+    use super::{ModelMetadata, PositionIdentity, PositionKind, RequestIdentity};
+    use serde::{Deserialize, Serialize};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    pub const LAYER: usize = 47;
+    pub const CAPACITY: usize = 8;
+    pub const EXPERTS: usize = 128;
+    pub const REVISION: u64 = 1;
+    const MAX_REPORT_RECORDS: usize = 4096;
+    const MAX_RECOVERY_EVENTS: usize = 512;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub enum Error {
+        Identity,
+        Capacity,
+        Overflow,
+        PhysicalEvidence,
+        ShadowDisagreement,
+        Chronology,
+        MissingDeadline,
+        Incomplete,
+        Closed,
+    }
+    type Result<T> = std::result::Result<T, Error>;
+    fn check(ok: bool, error: Error) -> Result<()> {
+        if ok {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+    fn increment(n: u64) -> Result<u64> {
+        n.checked_add(1).ok_or(Error::Overflow)
+    }
+    fn selected(ids: &[u32]) -> Result<[u32; CAPACITY]> {
+        check(
+            ids.len() == CAPACITY
+                && ids.iter().all(|&e| (e as usize) < EXPERTS)
+                && ids.iter().copied().collect::<BTreeSet<_>>().len() == CAPACITY,
+            Error::Identity,
+        )?;
+        let mut out = [0; CAPACITY];
+        out.copy_from_slice(ids);
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Namespace {
+        pub runtime: u64,
+        pub context: u64,
+        /// Process-local scalar address of the manager-owned arena. The manager
+        /// retains that arena for this namespace's lifetime; this is not a handle.
+        pub arena: usize,
+        pub layer: usize,
+        pub capacity: usize,
+    }
+    impl Namespace {
+        fn valid(self) -> bool {
+            self.runtime != 0
+                && self.context != 0
+                && self.arena != 0
+                && self.layer == LAYER
+                && self.capacity == CAPACITY
+        }
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Resident {
+        pub expert: u32,
+        pub generation: u64,
+        pub bank: u32,
+        pub slot: u32,
+        pub epoch: u32,
+    }
+    impl Resident {
+        fn valid(self) -> bool {
+            (self.expert as usize) < EXPERTS
+                && self.generation != 0
+                && self.bank < 4
+                && (self.slot as usize) < CAPACITY
+                && self.epoch != 0
+        }
+    }
+    /// LRU to MRU. Every entry was checked against the authoritative arena
+    /// owner before being copied. There is no reservation or payload here.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct PhysicalSnapshot {
+        pub namespace: Namespace,
+        pub residents: [Option<Resident>; CAPACITY],
+    }
+    impl PhysicalSnapshot {
+        pub fn validate(&self) -> Result<()> {
+            check(self.namespace.valid(), Error::PhysicalEvidence)?;
+            let mut ids = BTreeSet::new();
+            let mut slots = BTreeSet::new();
+            let mut gap = false;
+            for entry in self.residents {
+                match entry {
+                    Some(r) => check(
+                        !gap && r.valid() && ids.insert(r.expert) && slots.insert((r.bank, r.slot)),
+                        Error::PhysicalEvidence,
+                    )?,
+                    None => gap = true,
+                }
+            }
+            Ok(())
+        }
+        pub fn current(&self, namespace: Namespace, expert: u32) -> Result<bool> {
+            self.validate()?;
+            check(
+                self.namespace == namespace && (expert as usize) < EXPERTS,
+                Error::PhysicalEvidence,
+            )?;
+            Ok(self.residents.iter().flatten().any(|r| r.expert == expert))
+        }
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct PhysicalEvidence {
+        pub snapshot: PhysicalSnapshot,
+        pub event_cutoff: u64,
+        pub committed_installs: u64,
+        pub physical_victims: u64,
+    }
+
+    /// Persistent runtime-owned CPU description, independently replaying the
+    /// capacity-8 policy. Request history resets must not reset this object.
+    #[derive(Debug)]
+    pub struct Shadow {
+        namespace: Namespace,
+        residents: Vec<Resident>,
+        victims: Vec<u32>,
+        installs: Vec<u32>,
+        event: u64,
+        committed_installs: u64,
+        physical_victims: u64,
+        incomplete: Option<Error>,
+    }
+    impl Shadow {
+        pub fn new(initial: PhysicalSnapshot) -> Result<Self> {
+            initial.validate()?;
+            Ok(Self {
+                namespace: initial.namespace,
+                residents: initial.residents.into_iter().flatten().collect(),
+                victims: Vec::new(),
+                installs: Vec::new(),
+                event: 0,
+                committed_installs: 0,
+                physical_victims: 0,
+                incomplete: None,
+            })
+        }
+        pub fn namespace(&self) -> Namespace {
+            self.namespace
+        }
+        pub fn mark_incomplete(&mut self, e: Error) {
+            self.incomplete.get_or_insert(e);
+        }
+        fn apply(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) {
+            if self.incomplete.is_none() {
+                if let Err(e) = f(self) {
+                    self.mark_incomplete(e);
+                }
+            }
+        }
+        fn ready(&self) -> Result<()> {
+            self.incomplete.map_or(Ok(()), Err)
+        }
+        fn values(&self) -> PhysicalSnapshot {
+            let mut residents = [None; CAPACITY];
+            for (dst, src) in residents.iter_mut().zip(&self.residents) {
+                *dst = Some(*src);
+            }
+            PhysicalSnapshot {
+                namespace: self.namespace,
+                residents,
+            }
+        }
+        pub fn evidence(&mut self, actual: PhysicalSnapshot) -> Result<PhysicalEvidence> {
+            let result = (|| {
+                self.ready()?;
+                actual.validate()?;
+                check(
+                    self.victims.is_empty() && self.installs.is_empty() && self.values() == actual,
+                    Error::ShadowDisagreement,
+                )?;
+                Ok(PhysicalEvidence {
+                    snapshot: actual,
+                    event_cutoff: self.event,
+                    committed_installs: self.committed_installs,
+                    physical_victims: self.physical_victims,
+                })
+            })();
+            if let Err(e) = result {
+                self.mark_incomplete(e);
+            }
+            result
+        }
+        /// Actual demand order, not sorted route order. Probe-only lookups never
+        /// call this. Full protection is computed before choosing any victim.
+        pub fn demand(&mut self, ids: &[u32]) {
+            self.apply(|s| {
+                selected(ids)?;
+                check(
+                    s.victims.is_empty() && s.installs.is_empty(),
+                    Error::ShadowDisagreement,
+                )?;
+                let event = increment(s.event)?;
+                let mut residents = s.residents.clone();
+                let mut installs = Vec::new();
+                for &id in ids {
+                    if let Some(index) = residents.iter().position(|r| r.expert == id) {
+                        let r = residents.remove(index);
+                        residents.push(r);
+                    } else {
+                        installs.push(id);
+                    }
+                }
+                let mut preview = residents.clone();
+                let mut victims = Vec::new();
+                while preview
+                    .len()
+                    .checked_add(installs.len())
+                    .ok_or(Error::Overflow)?
+                    > CAPACITY
+                {
+                    let index = preview
+                        .iter()
+                        .position(|r| !ids.contains(&r.expert))
+                        .ok_or(Error::ShadowDisagreement)?;
+                    victims.push(preview.remove(index).expert);
+                }
+                s.residents = residents;
+                s.victims = victims;
+                s.installs = installs;
+                s.event = event;
+                Ok(())
+            });
+        }
+        pub fn victim(&mut self, expert: u32) {
+            self.apply(|s| {
+                check(
+                    s.victims.first() == Some(&expert),
+                    Error::ShadowDisagreement,
+                )?;
+                let index = s
+                    .residents
+                    .iter()
+                    .position(|r| r.expert == expert)
+                    .ok_or(Error::ShadowDisagreement)?;
+                let event = increment(s.event)?;
+                let count = increment(s.physical_victims)?;
+                s.residents.remove(index);
+                s.victims.remove(0);
+                s.event = event;
+                s.physical_victims = count;
+                Ok(())
+            });
+        }
+        /// Called only after successful committed installation and current
+        /// generation validation. Reserved, failed and stale work emits nothing.
+        pub fn committed_install(&mut self, resident: Resident) {
+            self.apply(|s| {
+                check(
+                    resident.valid()
+                        && s.victims.is_empty()
+                        && s.installs.first() == Some(&resident.expert)
+                        && s.residents.len() < CAPACITY
+                        && !s.residents.iter().any(|r| {
+                            r.expert == resident.expert
+                                || (r.bank, r.slot) == (resident.bank, resident.slot)
+                        }),
+                    Error::ShadowDisagreement,
+                )?;
+                let event = increment(s.event)?;
+                let count = increment(s.committed_installs)?;
+                s.residents.push(resident);
+                s.installs.remove(0);
+                s.event = event;
+                s.committed_installs = count;
+                Ok(())
+            });
+        }
+        // Logical eviction has deliberately no physical event or mutation.
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    struct Key {
+        revision: u64,
+        source_layer: usize,
+        target_layer: usize,
+        position_delta: u64,
+        source_kind: PositionKind,
+        target_kind: PositionKind,
+        source_expert: u32,
+        target_expert: u32,
+    }
+    impl Key {
+        fn new(source: PositionKind, target: PositionKind, s: u32, e: u32) -> Self {
+            Self {
+                revision: REVISION,
+                source_layer: LAYER,
+                target_layer: LAYER,
+                position_delta: 1,
+                source_kind: source,
+                target_kind: target,
+                source_expert: s,
+                target_expert: e,
+            }
+        }
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub enum Permanence {
+        Unknown,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct HostSource {
+        pub logical_generation: Option<u64>,
+        pub logical_materialized: bool,
+        pub ram_resident: bool,
+        pub permanence: Permanence,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Candidate {
+        pub request: RequestIdentity,
+        pub model: ModelMetadata,
+        pub namespace: Namespace,
+        pub source_position: PositionIdentity,
+        pub target_position: PositionIdentity,
+        pub source_layer: usize,
+        pub target_layer: usize,
+        pub position_distance: u64,
+        pub nominal_layer_lead: usize,
+        pub source_set: [u32; CAPACITY],
+        pub expert: u32,
+        pub score: u64,
+        pub signal_revision: u64,
+        pub generation: u64,
+        pub sequence: u64,
+        /// Completed clean positions and 64-cell updates included in scoring.
+        pub committed_position_cutoff: u64,
+        pub table_update_cutoff: u64,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Freeze {
+        pub candidate: Candidate,
+        pub timestamp_ns: u64,
+        pub physical: Option<PhysicalEvidence>,
+        pub current: Option<bool>,
+        pub source: HostSource,
+        pub incomplete: Option<Error>,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Deadline {
+        pub request: RequestIdentity,
+        pub position: PositionIdentity,
+        pub timestamp_ns: u64,
+        pub physical: Option<PhysicalEvidence>,
+        pub current: Option<bool>,
+        pub host_lead_ns: Option<u64>,
+        pub incomplete: Option<Error>,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub enum Outcome {
+        Pending,
+        Resolved { prediction_hit: bool },
+        Censored,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct RecoveryEvent {
+        pub attempt: usize,
+        pub attempted_start: usize,
+        pub attempted_end: usize,
+        pub first_failure_layer: Option<usize>,
+        pub final_status: u32,
+        pub layer47_demand_service_completed: bool,
+    }
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Observation {
+        pub freeze: Freeze,
+        pub deadline: Option<Deadline>,
+        pub outcome: Outcome,
+        pub recovery: Vec<RecoveryEvent>,
+        pub completion_physical: Option<PhysicalEvidence>,
+        pub incomplete: Option<Error>,
+        initial_attempt_seen: bool,
+        deadline_eligible: bool,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Opportunities {
+        pub prediction_hit: Option<bool>,
+        pub physical_miss_at_f: Option<bool>,
+        pub physical_miss_at_d: Option<bool>,
+        pub useful: Option<bool>,
+        pub target_confirmed_useful: Option<bool>,
+        pub already_resident: Option<bool>,
+        pub redundant_route_hit: Option<bool>,
+    }
+    impl Observation {
+        pub fn opportunities(&self) -> Opportunities {
+            let hit = match self.outcome {
+                Outcome::Resolved { prediction_hit } => Some(prediction_hit),
+                _ => None,
+            };
+            let f = self.freeze.current.map(|v| !v);
+            let d = self.deadline.and_then(|d| d.current).map(|v| !v);
+            // Unknown inputs stay outside boolean partitions, even when another
+            // operand is false. No target failure is converted into a route miss.
+            let useful = hit.zip(f).map(|(h, f)| h && f);
+            Opportunities {
+                prediction_hit: hit,
+                physical_miss_at_f: f,
+                physical_miss_at_d: d,
+                useful,
+                target_confirmed_useful: useful.zip(d).map(|(u, d)| u && d),
+                already_resident: self.freeze.current,
+                redundant_route_hit: hit.zip(self.freeze.current).map(|(h, f)| h && f),
+            }
+        }
+        /// Hypothetical host preparation budget only. This is neither GPU
+        /// execution lead nor measured quarantine readiness.
+        pub fn timely(&self, budget_ns: u64) -> Option<bool> {
+            self.opportunities()
+                .target_confirmed_useful
+                .zip(self.deadline?.host_lead_ns)
+                .map(|(useful, lead)| useful && lead > budget_ns)
+        }
+        pub fn late(&self, budget_ns: u64) -> Option<bool> {
+            self.opportunities()
+                .target_confirmed_useful
+                .zip(self.deadline?.host_lead_ns)
+                .map(|(useful, lead)| useful && lead <= budget_ns)
+        }
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub enum NoEmissionReason {
+        NoPositiveHistory,
+        Incomplete,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct NoEmission {
+        pub source: PositionIdentity,
+        pub target: PositionIdentity,
+        pub reason: NoEmissionReason,
+    }
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Partitions {
+        pub emitted: usize,
+        pub resolved: usize,
+        pub pending: usize,
+        pub censored: usize,
+        pub prediction_hits: usize,
+        pub route_misses: usize,
+        pub valid_f: usize,
+        pub current_at_f: usize,
+        pub absent_at_f: usize,
+        pub useful: usize,
+        pub target_confirmed_useful: usize,
+    }
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct Report {
+        pub request: RequestIdentity,
+        pub observations: Vec<Observation>,
+        /// Per-candidate derived fields, joined by the immutable sequence.
+        pub opportunities: Vec<(u64, Opportunities)>,
+        pub no_emissions: Vec<NoEmission>,
+        pub incomplete: Option<Error>,
+        pub partitions: Partitions,
+        pub readiness_measured: bool,
+    }
+    /// No Clone/shared state. Only this request's already committed truth trains
+    /// this table; it is independent from P0 adjacent transitions and lifecycle.
+    #[derive(Debug)]
+    pub struct Temporal {
+        request: RequestIdentity,
+        model: ModelMetadata,
+        namespace: Namespace,
+        capacity: usize,
+        table: BTreeMap<Key, u64>,
+        previous: Option<(PositionIdentity, [u32; CAPACITY])>,
+        committed: u64,
+        updates: u64,
+        generation: u64,
+        sequence: u64,
+        prepared: Option<Candidate>,
+        records: Vec<Observation>,
+        no_emissions: Vec<NoEmission>,
+        incomplete: Option<Error>,
+        closed: bool,
+    }
+    impl Temporal {
+        pub fn new(
+            request: RequestIdentity,
+            model: ModelMetadata,
+            namespace: Namespace,
+            capacity: usize,
+        ) -> Result<Self> {
+            check(
+                namespace.valid()
+                    && namespace.runtime == request.runtime_namespace
+                    && model.num_layers == LAYER + 1
+                    && model.num_experts == EXPERTS
+                    && model.top_k == CAPACITY
+                    && capacity > 0,
+                Error::Identity,
+            )?;
+            Ok(Self {
+                request,
+                model,
+                namespace,
+                capacity,
+                table: BTreeMap::new(),
+                previous: None,
+                committed: 0,
+                updates: 0,
+                generation: 0,
+                sequence: 0,
+                prepared: None,
+                records: Vec::new(),
+                no_emissions: Vec::new(),
+                incomplete: None,
+                closed: false,
+            })
+        }
+        pub fn mark_incomplete(&mut self, e: Error) {
+            self.incomplete.get_or_insert(e);
+        }
+        pub fn namespace(&self) -> Namespace {
+            self.namespace
+        }
+        pub(super) fn note_p0_truth(&mut self, position: PositionIdentity) {
+            if self
+                .prepared
+                .is_some_and(|c| position.absolute_position >= c.target_position.absolute_position)
+            {
+                self.abandon_prepared(Error::Identity);
+            }
+        }
+        pub fn abandon_prepared(&mut self, e: Error) {
+            if let Some(c) = self.prepared.take() {
+                self.note_no_emission(
+                    c.source_position,
+                    c.target_position,
+                    NoEmissionReason::Incomplete,
+                );
+            }
+            self.mark_incomplete(e);
+        }
+        pub fn censor_target(&mut self, position: usize) {
+            if let Some(r) = self.pending_mut(position) {
+                r.outcome = Outcome::Censored;
+            }
+            self.mark_incomplete(Error::Closed);
+        }
+        pub fn service_completed(&mut self, position: usize, attempt: usize) {
+            if let Some(r) = self.pending_mut(position) {
+                if let Some(e) = r
+                    .recovery
+                    .last_mut()
+                    .filter(|e| e.attempt == attempt && e.first_failure_layer == Some(LAYER))
+                {
+                    e.layer47_demand_service_completed = true;
+                }
+            }
+        }
+        pub fn active(&self) -> bool {
+            !self.closed && self.incomplete.is_none()
+        }
+        fn record_capacity(&self) -> Result<()> {
+            check(
+                self.records
+                    .len()
+                    .checked_add(self.no_emissions.len())
+                    .ok_or(Error::Overflow)?
+                    < self.capacity.min(MAX_REPORT_RECORDS),
+                Error::Capacity,
+            )
+        }
+        fn note_no_emission(
+            &mut self,
+            source: PositionIdentity,
+            target: PositionIdentity,
+            reason: NoEmissionReason,
+        ) {
+            if self.record_capacity().is_ok() {
+                self.no_emissions.push(NoEmission {
+                    source,
+                    target,
+                    reason,
+                });
+            }
+        }
+        /// Only called through RequestObserver after P0 has accepted an entire
+        /// clean committed position. Target truth resolves the old immutable
+        /// record first, then trains historical pairs, then scores the NEXT target.
+        pub(super) fn committed(
+            &mut self,
+            position: PositionIdentity,
+            target: PositionIdentity,
+            ids: &[u32],
+        ) -> Option<Candidate> {
+            let result = (|| {
+                check(!self.closed, Error::Closed)?;
+                let set = selected(ids)?;
+                check(
+                    position.valid()
+                        && position.absolute_position == self.committed
+                        && target.follows(position)
+                        && self.prepared.is_none(),
+                    Error::Identity,
+                )?;
+                if let Some(last) = self
+                    .records
+                    .last_mut()
+                    .filter(|r| r.freeze.candidate.target_position == position)
+                {
+                    check(last.outcome == Outcome::Pending, Error::Identity)?;
+                    last.outcome = Outcome::Resolved {
+                        prediction_hit: set.contains(&last.freeze.candidate.expert),
+                    };
+                    if last.deadline.is_none() {
+                        last.incomplete.get_or_insert(Error::MissingDeadline);
+                        return Err(Error::MissingDeadline);
+                    }
+                }
+                check(self.incomplete.is_none(), Error::Incomplete)?;
+                self.record_capacity()?;
+                let committed = increment(self.committed)?;
+                let generation = increment(self.generation)?;
+                let mut changes = Vec::new();
+                let mut updates = self.updates;
+                if let Some((previous_position, previous_set)) = self.previous {
+                    check(position.follows(previous_position), Error::Identity)?;
+                    updates = increment(updates)?;
+                    for s in previous_set {
+                        for e in set {
+                            let key = Key::new(
+                                previous_position.position_kind,
+                                position.position_kind,
+                                s,
+                                e,
+                            );
+                            let count = increment(self.table.get(&key).copied().unwrap_or(0))?;
+                            changes.push((key, count));
+                        }
+                    }
+                    let extra = changes
+                        .iter()
+                        .filter(|(k, _)| !self.table.contains_key(k))
+                        .count();
+                    check(
+                        self.table.len().checked_add(extra).ok_or(Error::Overflow)?
+                            <= self.capacity,
+                        Error::Capacity,
+                    )?;
+                } else {
+                    check(
+                        position.absolute_position == 0
+                            && position.position_kind == PositionKind::Prompt,
+                        Error::Identity,
+                    )?;
+                }
+                // Every one of the 64 increments, update cutoff and capacity
+                // checks succeeded before the first table cell is changed.
+                for (key, count) in changes {
+                    self.table.insert(key, count);
+                }
+                self.previous = Some((position, set));
+                self.committed = committed;
+                self.updates = updates;
+                self.generation = generation;
+                let mut best = None;
+                for expert in 0..EXPERTS as u32 {
+                    let mut score = 0u64;
+                    for s in set {
+                        score = score
+                            .checked_add(
+                                self.table
+                                    .get(&Key::new(
+                                        position.position_kind,
+                                        target.position_kind,
+                                        s,
+                                        expert,
+                                    ))
+                                    .copied()
+                                    .unwrap_or(0),
+                            )
+                            .ok_or(Error::Overflow)?;
+                    }
+                    // Ascending iteration retains the smallest ID on ties.
+                    if score > best.map_or(0, |(_, score)| score) {
+                        best = Some((expert, score));
+                    }
+                }
+                let Some((expert, score)) = best else {
+                    return Ok(None);
+                };
+                let sequence = increment(self.sequence)?;
+                let candidate = Candidate {
+                    request: self.request,
+                    model: self.model,
+                    namespace: self.namespace,
+                    source_position: position,
+                    target_position: target,
+                    source_layer: LAYER,
+                    target_layer: LAYER,
+                    position_distance: 1,
+                    nominal_layer_lead: LAYER,
+                    source_set: set,
+                    expert,
+                    score,
+                    signal_revision: REVISION,
+                    generation,
+                    sequence,
+                    committed_position_cutoff: committed,
+                    table_update_cutoff: updates,
+                };
+                self.prepared = Some(candidate);
+                Ok(Some(candidate))
+            })();
+            match result {
+                Ok(Some(candidate)) => Some(candidate),
+                Ok(None) => {
+                    self.note_no_emission(position, target, NoEmissionReason::NoPositiveHistory);
+                    None
+                }
+                Err(e) => {
+                    self.mark_incomplete(e);
+                    self.note_no_emission(position, target, NoEmissionReason::Incomplete);
+                    None
+                }
+            }
+        }
+        pub fn freeze(
+            &mut self,
+            candidate: Candidate,
+            timestamp_ns: u64,
+            physical: Result<PhysicalEvidence>,
+            source: HostSource,
+        ) {
+            let result = (|| {
+                check(
+                    self.active() && self.prepared == Some(candidate),
+                    Error::Identity,
+                )?;
+                self.record_capacity()?;
+                let current =
+                    physical.and_then(|p| p.snapshot.current(self.namespace, candidate.expert));
+                let error = current.err();
+                self.records.push(Observation {
+                    freeze: Freeze {
+                        candidate,
+                        timestamp_ns,
+                        physical: physical.ok(),
+                        current: current.ok(),
+                        source,
+                        incomplete: error,
+                    },
+                    deadline: None,
+                    outcome: Outcome::Pending,
+                    recovery: Vec::new(),
+                    completion_physical: None,
+                    incomplete: error,
+                    initial_attempt_seen: false,
+                    deadline_eligible: false,
+                });
+                self.sequence = candidate.sequence;
+                self.prepared = None;
+                if let Some(e) = error {
+                    self.mark_incomplete(e);
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                self.mark_incomplete(e);
+            }
+        }
+        fn pending_mut(&mut self, position: usize) -> Option<&mut Observation> {
+            let request = self.request;
+            self.records.last_mut().filter(|r| {
+                r.outcome == Outcome::Pending
+                    && r.freeze.candidate.request == request
+                    && r.freeze.candidate.target_position.absolute_position == position as u64
+            })
+        }
+        /// Close eligibility at the first attempt, even if encoding fails before
+        /// reaching layer 47. Recovery/full-token replay can never reopen it.
+        pub fn begin_attempt(&mut self, position: usize, initial_fresh: bool) -> bool {
+            if self
+                .prepared
+                .is_some_and(|c| position as u64 >= c.target_position.absolute_position)
+            {
+                self.abandon_prepared(Error::Identity);
+            }
+            let Some(record) = self.pending_mut(position) else {
+                return false;
+            };
+            let first = !record.initial_attempt_seen;
+            record.initial_attempt_seen = true;
+            record.deadline_eligible = first && initial_fresh;
+            record.deadline_eligible
+        }
+        pub fn pending_candidate(&self, position: usize) -> Option<Candidate> {
+            self.records
+                .last()
+                .filter(|r| {
+                    r.outcome == Outcome::Pending
+                        && r.freeze.candidate.target_position.absolute_position == position as u64
+                })
+                .map(|r| r.freeze.candidate)
+        }
+        pub fn deadline(
+            &mut self,
+            request: RequestIdentity,
+            position: usize,
+            timestamp_ns: u64,
+            physical: Result<PhysicalEvidence>,
+        ) {
+            let Some(record) = self.pending_mut(position) else {
+                self.mark_incomplete(Error::Identity);
+                return;
+            };
+            if record.deadline.is_some() {
+                return;
+            }
+            let c = record.freeze.candidate;
+            let lead = timestamp_ns
+                .checked_sub(record.freeze.timestamp_ns)
+                .filter(|&v| v > 0);
+            let current = (|| {
+                check(
+                    record.deadline_eligible && request == c.request,
+                    Error::Identity,
+                )?;
+                check(lead.is_some(), Error::Chronology)?;
+                physical?.snapshot.current(c.namespace, c.expert)
+            })();
+            let error = current.err();
+            record.deadline = Some(Deadline {
+                request,
+                position: c.target_position,
+                timestamp_ns,
+                physical: physical.ok(),
+                current: current.ok(),
+                host_lead_ns: lead,
+                incomplete: error,
+            });
+            if let Some(e) = error {
+                record.incomplete.get_or_insert(e);
+                self.mark_incomplete(e);
+            }
+        }
+        pub fn recovery_event(&mut self, position: usize, event: RecoveryEvent) {
+            if let Some(record) = self.pending_mut(position) {
+                if record.recovery.len() >= MAX_RECOVERY_EVENTS {
+                    record.incomplete.get_or_insert(Error::Capacity);
+                    self.mark_incomplete(Error::Capacity);
+                } else {
+                    record.recovery.push(event);
+                }
+            }
+        }
+        pub fn completion_evidence(&mut self, position: usize, physical: Result<PhysicalEvidence>) {
+            if let Some(record) = self
+                .records
+                .last_mut()
+                .filter(|r| r.freeze.candidate.target_position.absolute_position == position as u64)
+            {
+                record.completion_physical = physical.ok();
+                if let Err(e) = physical {
+                    record.incomplete.get_or_insert(e);
+                    self.mark_incomplete(e);
+                }
+            }
+        }
+        pub fn finish(&mut self) {
+            self.closed = true;
+            self.previous = None;
+            self.prepared = None;
+            for r in &mut self.records {
+                if r.outcome == Outcome::Pending {
+                    r.outcome = Outcome::Censored;
+                }
+            }
+        }
+        pub fn report(&self) -> Report {
+            let mut p = Partitions {
+                emitted: self.records.len(),
+                ..Partitions::default()
+            };
+            for r in &self.records {
+                match r.outcome {
+                    Outcome::Pending => p.pending += 1,
+                    Outcome::Censored => p.censored += 1,
+                    Outcome::Resolved { prediction_hit } => {
+                        p.resolved += 1;
+                        if prediction_hit {
+                            p.prediction_hits += 1;
+                        } else {
+                            p.route_misses += 1;
+                        }
+                    }
+                }
+                if let Some(current) = r.freeze.current {
+                    p.valid_f += 1;
+                    if current {
+                        p.current_at_f += 1;
+                    } else {
+                        p.absent_at_f += 1;
+                    }
+                }
+                let o = r.opportunities();
+                p.useful += usize::from(o.useful == Some(true));
+                p.target_confirmed_useful += usize::from(o.target_confirmed_useful == Some(true));
+            }
+            let reconciled = p.emitted == p.resolved + p.pending + p.censored
+                && p.resolved == p.prediction_hits + p.route_misses
+                && p.valid_f == p.current_at_f + p.absent_at_f
+                && p.useful <= p.prediction_hits
+                && p.useful <= p.absent_at_f
+                && p.target_confirmed_useful <= p.useful;
+            Report {
+                request: self.request,
+                observations: self.records.clone(),
+                opportunities: self
+                    .records
+                    .iter()
+                    .map(|r| (r.freeze.candidate.sequence, r.opportunities()))
+                    .collect(),
+                no_emissions: self.no_emissions.clone(),
+                incomplete: self.incomplete.or(if reconciled {
+                    None
+                } else {
+                    Some(Error::Identity)
+                }),
+                partitions: p,
+                readiness_measured: false,
+            }
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::super::{RequestObserver, RequestPhase};
+        use super::*;
+
+        fn request(n: u64, phase: RequestPhase) -> RequestIdentity {
+            RequestIdentity {
+                runtime_namespace: 1,
+                request_sequence: n,
+                phase,
+                phase_run_index: n,
+            }
+        }
+        fn namespace() -> Namespace {
+            Namespace {
+                runtime: 1,
+                context: 2,
+                arena: 3,
+                layer: LAYER,
+                capacity: CAPACITY,
+            }
+        }
+        fn model() -> ModelMetadata {
+            ModelMetadata {
+                num_layers: 48,
+                num_experts: EXPERTS,
+                top_k: CAPACITY,
+            }
+        }
+        fn observer(n: u64, phase: RequestPhase) -> RequestObserver {
+            let mut observer = RequestObserver::new(request(n, phase), model(), 100_000).unwrap();
+            observer.enable_temporal(namespace()).unwrap();
+            observer
+        }
+        fn set(start: u32) -> [u32; 8] {
+            std::array::from_fn(|i| start + i as u32)
+        }
+        fn position(p: usize, prompt: usize) -> PositionIdentity {
+            PositionIdentity::from_prompt_length(p, prompt).unwrap()
+        }
+        fn resident(expert: u32, slot: u32, epoch: u32) -> Resident {
+            Resident {
+                expert,
+                generation: 1,
+                bank: 0,
+                slot,
+                epoch,
+            }
+        }
+        fn snapshot(ids: &[u32]) -> PhysicalSnapshot {
+            let mut residents = [None; 8];
+            for (slot, &id) in ids.iter().enumerate() {
+                residents[slot] = Some(resident(id, slot as u32, 1));
+            }
+            PhysicalSnapshot {
+                namespace: namespace(),
+                residents,
+            }
+        }
+        fn evidence(ids: &[u32]) -> PhysicalEvidence {
+            PhysicalEvidence {
+                snapshot: snapshot(ids),
+                event_cutoff: 0,
+                committed_installs: 0,
+                physical_victims: 0,
+            }
+        }
+        fn source() -> HostSource {
+            HostSource {
+                logical_generation: None,
+                logical_materialized: false,
+                ram_resident: false,
+                permanence: Permanence::Unknown,
+            }
+        }
+        fn commit(
+            o: &mut RequestObserver,
+            p: usize,
+            prompt: usize,
+            ids: &[u32],
+        ) -> Option<Candidate> {
+            let pos = position(p, prompt);
+            o.observe_completed_position(
+                o.request_identity(),
+                pos,
+                model(),
+                &vec![ids.to_vec(); 48],
+            );
+            o.prepare_temporal(pos, position(p + 1, prompt))
+        }
+        fn step(
+            o: &mut RequestObserver,
+            p: usize,
+            prompt: usize,
+            ids: &[u32],
+        ) -> Option<Candidate> {
+            // Model the initial-attempt deadline before delivering any target truth.
+            let t = o.temporal_mut().unwrap();
+            if let Some(candidate) = t.pending_candidate(p) {
+                assert!(t.begin_attempt(p, true));
+                t.deadline(
+                    candidate.request,
+                    p,
+                    p as u64 * 100,
+                    Ok(evidence(&candidate.source_set)),
+                );
+            }
+            let candidate = commit(o, p, prompt, ids);
+            if let Some(c) = candidate {
+                o.temporal_mut().unwrap().freeze(
+                    c,
+                    p as u64 * 100 + 1,
+                    Ok(evidence(ids)),
+                    source(),
+                );
+            }
+            candidate
+        }
+        fn alternating() -> RequestObserver {
+            let mut o = observer(1, RequestPhase::Fixture);
+            assert_eq!(step(&mut o, 0, 10, &set(0)), None);
+            assert_eq!(step(&mut o, 1, 10, &set(8)), None);
+            let c = step(&mut o, 2, 10, &set(0)).unwrap();
+            assert_eq!((c.expert, c.score), (8, 8));
+            o
+        }
+
+        #[test]
+        fn p1e_a_b_a_freezes_expert8_absent_before_truth_and_reconciles_usefulness() {
+            let mut o = alternating();
+            let before = o.temporal().unwrap().report().observations[0].freeze;
+            assert_eq!(before.current, Some(false));
+            assert_eq!(before.candidate.source_set, set(0));
+            assert_eq!(before.candidate.table_update_cutoff, 2);
+            assert_eq!(before.candidate.committed_position_cutoff, 3);
+            assert_eq!(before.candidate.target_position, position(3, 10));
+            assert_eq!(o.temporal().unwrap().report().partitions.resolved, 0);
+            step(&mut o, 3, 10, &set(8));
+            let report = o.temporal().unwrap().report();
+            let r = &report.observations[0];
+            assert_eq!(r.freeze, before);
+            assert_eq!(
+                r.opportunities(),
+                Opportunities {
+                    prediction_hit: Some(true),
+                    physical_miss_at_f: Some(true),
+                    physical_miss_at_d: Some(true),
+                    useful: Some(true),
+                    target_confirmed_useful: Some(true),
+                    already_resident: Some(false),
+                    redundant_route_hit: Some(false)
+                }
+            );
+            assert_eq!(r.deadline.unwrap().host_lead_ns, Some(99));
+            assert_eq!(r.timely(98), Some(true));
+            assert_eq!(r.late(99), Some(true));
+            assert_eq!(
+                (
+                    report.partitions.emitted,
+                    report.partitions.resolved,
+                    report.partitions.pending
+                ),
+                (2, 1, 1)
+            );
+            assert_eq!(
+                (
+                    report.partitions.prediction_hits,
+                    report.partitions.useful,
+                    report.partitions.target_confirmed_useful
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(report.incomplete, None);
+            assert!(!report.readiness_measured);
+        }
+
+        #[test]
+        fn p1e_redundant_top1_is_retained_with_no_runner_up() {
+            let mut o = observer(1, RequestPhase::Fixture);
+            step(&mut o, 0, 10, &set(0));
+            let c = step(&mut o, 1, 10, &set(0)).unwrap();
+            assert_eq!(c.expert, 0);
+            // A lower scoring absent expert must not replace the resident winner.
+            o.temporal_mut().unwrap().table.insert(
+                Key::new(PositionKind::Prompt, PositionKind::Prompt, 0, 8),
+                1,
+            );
+            let next = step(&mut o, 2, 10, &set(0)).unwrap();
+            assert_eq!(next.expert, 0);
+            let r = &o.temporal().unwrap().report().observations[0];
+            assert_eq!(r.opportunities().redundant_route_hit, Some(true));
+            assert_eq!(r.opportunities().useful, Some(false));
+            assert_eq!(r.freeze.current, Some(true));
+        }
+
+        #[test]
+        fn p1e_unfrozen_draft_cannot_be_frozen_after_target_truth_or_attempt() {
+            for truth in [false, true] {
+                let mut o = observer(1, RequestPhase::Fixture);
+                step(&mut o, 0, 10, &set(0));
+                let draft = commit(&mut o, 1, 10, &set(0)).unwrap();
+                if truth {
+                    o.observe_completed_position(
+                        o.request_identity(),
+                        position(2, 10),
+                        model(),
+                        &vec![set(8).to_vec(); 48],
+                    );
+                } else {
+                    assert!(!o.temporal_mut().unwrap().begin_attempt(2, true));
+                }
+                o.temporal_mut()
+                    .unwrap()
+                    .freeze(draft, 201, Ok(evidence(&set(8))), source());
+                let report = o.temporal().unwrap().report();
+                assert!(report.observations.is_empty());
+                assert!(report.incomplete.is_some());
+                assert_eq!(
+                    report.no_emissions.last().unwrap().reason,
+                    NoEmissionReason::Incomplete
+                );
+            }
+        }
+
+        #[test]
+        fn p1e_request_phase_and_run_reset_isolation() {
+            let old = alternating();
+            let frozen = old.temporal().unwrap().report();
+            for (n, phase) in [
+                (2, RequestPhase::Warmup),
+                (3, RequestPhase::Measured),
+                (4, RequestPhase::Serving),
+                (5, RequestPhase::Measured),
+            ] {
+                let mut fresh = observer(n, phase);
+                assert!(fresh.temporal().unwrap().table.is_empty());
+                assert_eq!(step(&mut fresh, 0, 10, &set(0)), None);
+                assert_eq!(
+                    fresh.temporal().unwrap().report().request,
+                    request(n, phase)
+                );
+                fresh.finish(false);
+                assert!(!fresh.temporal().unwrap().active());
+            }
+            assert_eq!(old.temporal().unwrap().report(), frozen);
+        }
+
+        #[test]
+        fn p1e_kind_pairs_start_cold_and_never_borrow() {
+            let mut o = observer(1, RequestPhase::Fixture);
+            assert_eq!(step(&mut o, 0, 3, &set(0)), None);
+            assert!(step(&mut o, 1, 3, &set(0)).is_some()); // prompt->prompt
+            assert_eq!(step(&mut o, 2, 3, &set(0)), None); // prompt->decode cold
+            assert_eq!(step(&mut o, 3, 3, &set(0)), None); // decode->decode cold
+            assert!(step(&mut o, 4, 3, &set(0)).is_some());
+            let t = o.temporal().unwrap();
+            let count = |a, b| {
+                t.table
+                    .iter()
+                    .filter(|(k, _)| k.source_kind == a && k.target_kind == b)
+                    .map(|(_, &v)| v)
+                    .sum::<u64>()
+            };
+            assert_eq!(count(PositionKind::Prompt, PositionKind::Prompt), 128);
+            assert_eq!(count(PositionKind::Prompt, PositionKind::Decode), 64);
+            assert_eq!(count(PositionKind::Decode, PositionKind::Decode), 64);
+        }
+
+        #[test]
+        fn p1e_zero_history_ties_order_invariance_and_exact_64_cells() {
+            let mut forward = observer(1, RequestPhase::Fixture);
+            let mut reverse = observer(1, RequestPhase::Fixture);
+            for (p, ids) in [set(0), set(8), set(0)].iter().enumerate() {
+                let mut reversed = *ids;
+                reversed.reverse();
+                assert_eq!(
+                    step(&mut forward, p, 10, ids),
+                    step(&mut reverse, p, 10, &reversed)
+                );
+                assert_eq!(
+                    forward.temporal().unwrap().table,
+                    reverse.temporal().unwrap().table
+                );
+                assert_eq!(forward.temporal().unwrap().table.len(), p * 64);
+                assert!(forward.temporal().unwrap().table.values().all(|&v| v == 1));
+            }
+            assert_eq!(forward.temporal().unwrap().report().no_emissions.len(), 2);
+            assert_eq!(
+                forward.temporal().unwrap().report().observations[0]
+                    .freeze
+                    .candidate
+                    .expert,
+                8
+            );
+        }
+
+        #[test]
+        fn p1e_checked_update_overflow_and_capacity_are_atomic() {
+            for capacity_failure in [false, true] {
+                let mut o = observer(1, RequestPhase::Fixture);
+                step(&mut o, 0, 10, &set(0));
+                let t = o.temporal_mut().unwrap();
+                // Last Cartesian cell would overflow: none of the first 63 may change.
+                if capacity_failure {
+                    t.capacity = 63;
+                } else {
+                    t.table.insert(
+                        Key::new(PositionKind::Prompt, PositionKind::Prompt, 7, 15),
+                        u64::MAX,
+                    );
+                }
+                let before = (t.table.clone(), t.updates, t.committed, t.previous);
+                assert!(commit(&mut o, 1, 10, &set(8)).is_none());
+                let t = o.temporal().unwrap();
+                assert_eq!(
+                    (t.table.clone(), t.updates, t.committed, t.previous),
+                    before
+                );
+                assert_eq!(
+                    t.incomplete,
+                    Some(if capacity_failure {
+                        Error::Capacity
+                    } else {
+                        Error::Overflow
+                    })
+                );
+                assert_eq!(
+                    o.completed_positions(),
+                    2,
+                    "observation failure cannot reject P0 completion"
+                );
+                assert_eq!(commit(&mut o, 2, 10, &set(0)), None);
+                assert_eq!(o.completed_positions(), 3);
+            }
+        }
+
+        #[test]
+        fn p1e_checked_score_and_identity_counter_overflows_stop_emission() {
+            for mode in 0..4 {
+                let mut o = observer(1, RequestPhase::Fixture);
+                step(&mut o, 0, 10, &set(0));
+                let t = o.temporal_mut().unwrap();
+                match mode {
+                    0 => {
+                        for s in 0..8 {
+                            t.table.insert(
+                                Key::new(PositionKind::Prompt, PositionKind::Prompt, s, 99),
+                                u64::MAX,
+                            );
+                        }
+                    }
+                    1 => t.generation = u64::MAX,
+                    2 => t.sequence = u64::MAX,
+                    _ => t.updates = u64::MAX,
+                }
+                assert_eq!(commit(&mut o, 1, 10, &set(0)), None);
+                assert_eq!(o.temporal().unwrap().incomplete, Some(Error::Overflow));
+                assert_eq!(o.completed_positions(), 2);
+            }
+        }
+
+        #[test]
+        fn p1e_duplicate_out_of_order_and_malformed_positions_rejected() {
+            for mode in 0..4 {
+                let mut o = observer(1, RequestPhase::Fixture);
+                step(&mut o, 0, 10, &set(0));
+                let before = o.temporal().unwrap().table.clone();
+                let p = if mode == 0 {
+                    0
+                } else if mode == 1 {
+                    2
+                } else {
+                    1
+                };
+                let mut ids = set(0).to_vec();
+                if mode == 2 {
+                    ids[7] = ids[0];
+                }
+                if mode == 3 {
+                    ids.pop();
+                }
+                assert!(commit(&mut o, p, 10, &ids).is_none());
+                assert_eq!(o.temporal().unwrap().table, before);
+                assert!(o.temporal().unwrap().incomplete.is_some());
+            }
+            let mut o = observer(1, RequestPhase::Fixture);
+            assert!(o
+                .prepare_temporal(position(0, 10), position(1, 10))
+                .is_none());
+            assert_eq!(o.temporal().unwrap().incomplete, Some(Error::Incomplete));
+        }
+
+        #[test]
+        fn p1e_recovery_deadline_closes_once_and_final_clean_truth_trains_once() {
+            let mut o = alternating();
+            let t = o.temporal_mut().unwrap();
+            let frozen = t.records[0].freeze;
+            assert!(t.begin_attempt(3, true));
+            t.deadline(
+                request(1, RequestPhase::Fixture),
+                3,
+                250,
+                Ok(evidence(&set(0))),
+            );
+            let deadline = t.records[0].deadline;
+            let table = t.table.clone();
+            for attempt in 1..=3 {
+                t.recovery_event(
+                    3,
+                    RecoveryEvent {
+                        attempt,
+                        attempted_start: 0,
+                        attempted_end: 48,
+                        first_failure_layer: Some(LAYER),
+                        final_status: 0,
+                        layer47_demand_service_completed: false,
+                    },
+                );
+                t.service_completed(3, attempt);
+                assert!(!t.begin_attempt(3, true));
+                t.deadline(
+                    request(1, RequestPhase::Fixture),
+                    3,
+                    999,
+                    Ok(evidence(&set(8))),
+                );
+                assert_eq!(t.table, table);
+                assert_eq!(t.records[0].freeze, frozen);
+                assert_eq!(t.records[0].deadline, deadline);
+            }
+            let c = commit(&mut o, 3, 10, &set(8)).unwrap();
+            let t = o.temporal().unwrap();
+            assert_eq!(t.updates, 3);
+            assert_eq!(
+                t.records[0].outcome,
+                Outcome::Resolved {
+                    prediction_hit: true
+                }
+            );
+            assert!(t.records[0]
+                .recovery
+                .iter()
+                .all(|e| e.layer47_demand_service_completed));
+            assert_eq!(c.source_position, position(3, 10));
+            assert!(commit(&mut o, 3, 10, &set(8)).is_none());
+            assert_eq!(o.temporal().unwrap().updates, 3);
+        }
+
+        #[test]
+        fn p1e_initial_attempt_failure_before_layer47_cannot_reopen_deadline() {
+            let mut o = alternating();
+            let t = o.temporal_mut().unwrap();
+            assert!(t.begin_attempt(3, true));
+            // No layer 47 hook was reached before initial encoding failure.
+            assert!(!t.begin_attempt(3, true));
+            t.deadline(
+                request(1, RequestPhase::Fixture),
+                3,
+                250,
+                Ok(evidence(&set(0))),
+            );
+            assert_eq!(t.records[0].deadline.unwrap().current, None);
+            assert_eq!(t.incomplete, Some(Error::Identity));
+        }
+
+        #[test]
+        fn p1e_equal_negative_and_wrong_identity_deadlines_are_incomplete() {
+            for (time, wrong_request) in [(201, false), (200, false), (250, true)] {
+                let mut o = alternating();
+                let t = o.temporal_mut().unwrap();
+                t.begin_attempt(3, true);
+                t.deadline(
+                    request(if wrong_request { 2 } else { 1 }, RequestPhase::Fixture),
+                    3,
+                    time,
+                    Ok(evidence(&set(0))),
+                );
+                assert!(t.incomplete.is_some());
+                assert_eq!(t.records[0].deadline.unwrap().current, None);
+                assert_eq!(t.records[0].opportunities().target_confirmed_useful, None);
+                // Clean target truth remains usable independently of bad timing.
+                assert!(commit(&mut o, 3, 10, &set(8)).is_none());
+                assert_eq!(
+                    o.temporal().unwrap().records[0]
+                        .opportunities()
+                        .prediction_hit,
+                    Some(true)
+                );
+            }
+        }
+
+        #[test]
+        fn p1e_route_miss_redundancy_and_unknown_partitions_reconcile() {
+            for target in [set(8), set(16)] {
+                for d_current in [false, true] {
+                    let mut o = alternating();
+                    let t = o.temporal_mut().unwrap();
+                    t.begin_attempt(3, true);
+                    t.deadline(
+                        request(1, RequestPhase::Fixture),
+                        3,
+                        250,
+                        Ok(evidence(&if d_current { set(8) } else { set(0) })),
+                    );
+                    commit(&mut o, 3, 10, &target);
+                    let r = o.temporal().unwrap().report();
+                    let expected_hit = target == set(8);
+                    assert_eq!(r.partitions.prediction_hits, usize::from(expected_hit));
+                    assert_eq!(r.partitions.route_misses, usize::from(!expected_hit));
+                    assert_eq!(
+                        r.partitions.target_confirmed_useful,
+                        usize::from(expected_hit && !d_current)
+                    );
+                    assert_eq!(r.incomplete, None);
+                }
+            }
+            let mut o = alternating();
+            o.temporal_mut().unwrap().censor_target(3);
+            let r = o.temporal().unwrap().report();
+            assert_eq!(
+                (
+                    r.partitions.emitted,
+                    r.partitions.censored,
+                    r.partitions.resolved
+                ),
+                (1, 1, 0)
+            );
+            assert_eq!(r.observations[0].opportunities().prediction_hit, None);
+            assert_eq!(r.observations[0].opportunities().useful, None);
+            let mut cancelled = alternating();
+            cancelled.finish(true);
+            assert_eq!(
+                cancelled.temporal().unwrap().report().partitions.censored,
+                1
+            );
+        }
+
+        #[test]
+        fn p1e_bad_f_evidence_does_not_become_absence_or_hide_clean_route_truth() {
+            let mut o = observer(1, RequestPhase::Fixture);
+            step(&mut o, 0, 10, &set(0));
+            let c = commit(&mut o, 1, 10, &set(0)).unwrap();
+            o.temporal_mut()
+                .unwrap()
+                .freeze(c, 101, Err(Error::ShadowDisagreement), source());
+            let t = o.temporal_mut().unwrap();
+            t.begin_attempt(2, true);
+            t.deadline(c.request, 2, 200, Err(Error::ShadowDisagreement));
+            assert!(commit(&mut o, 2, 10, &set(0)).is_none());
+            let r = o.temporal().unwrap().report();
+            assert_eq!(r.partitions.prediction_hits, 1);
+            assert_eq!(r.partitions.valid_f, 0);
+            assert_eq!(r.observations[0].opportunities().useful, None);
+        }
+
+        #[test]
+        fn p1e_shadow_protects_full_set_evicts_oldest_and_waits_for_commits() {
+            let initial = snapshot(&set(0));
+            let mut shadow = Shadow::new(initial).unwrap();
+            assert_eq!(shadow.evidence(initial).unwrap().snapshot, initial);
+            // Hit 0 is oldest but protected, while 6,7 are evictable. Demand
+            // ordering controls recency; planned installs do not become current.
+            let ids = [8, 0, 1, 2, 3, 4, 5, 9];
+            shadow.demand(&ids);
+            assert_eq!(shadow.victims, [6, 7]);
+            assert!(!shadow.values().current(namespace(), 8).unwrap());
+            shadow.victim(6);
+            shadow.victim(7);
+            assert_eq!(shadow.residents.len(), 6);
+            shadow.committed_install(resident(8, 6, 2));
+            shadow.committed_install(resident(9, 7, 2));
+            let actual = shadow.values();
+            assert_eq!(
+                actual.residents.map(|r| r.unwrap().expert),
+                [0, 1, 2, 3, 4, 5, 8, 9]
+            );
+            let evidence = shadow.evidence(actual).unwrap();
+            assert_eq!(
+                (evidence.physical_victims, evidence.committed_installs),
+                (2, 2)
+            );
+            // Starting another request and dropping host logical admission has
+            // no shadow reset/event: the same runtime's physical bytes persist.
+            drop(observer(2, RequestPhase::Measured));
+            assert_eq!(shadow.evidence(actual).unwrap(), evidence);
+            let mut bad = Shadow::new(initial).unwrap();
+            bad.demand(&ids);
+            bad.victim(0);
+            assert_eq!(bad.incomplete, Some(Error::ShadowDisagreement));
+        }
+
+        #[test]
+        fn p1e_shadow_disagreement_and_invalid_namespace_records_fail_closed() {
+            let initial = snapshot(&set(0));
+            for mode in 0..9 {
+                let mut corrupted = initial;
+                match mode {
+                    0 => corrupted.namespace.context += 1,
+                    1 => corrupted.namespace.arena += 1,
+                    2 => corrupted.namespace.layer = 0,
+                    3 => corrupted.namespace.capacity = 9,
+                    4 => corrupted.residents[0].as_mut().unwrap().generation += 1,
+                    5 => corrupted.residents[0].as_mut().unwrap().epoch += 1,
+                    6 => corrupted.residents[0].as_mut().unwrap().expert = 128,
+                    7 => corrupted.residents.swap(0, 1),
+                    _ => corrupted.residents[0].as_mut().unwrap().slot = 1,
+                }
+                let mut shadow = Shadow::new(initial).unwrap();
+                assert!(shadow.evidence(corrupted).is_err());
+                assert!(
+                    shadow.evidence(initial).is_err(),
+                    "never guess or repair after disagreement"
+                );
+            }
+            let mut reserved = Shadow::new(snapshot(&[])).unwrap();
+            reserved.demand(&set(8));
+            assert!(reserved.values().residents.iter().all(Option::is_none));
+            assert!(
+                reserved.evidence(snapshot(&[])).is_err(),
+                "failed/uncommitted work cannot reconcile as installed"
+            );
+        }
+
+        #[test]
+        fn p1e_default_observer_has_no_temporal_state_and_report_is_bounded() {
+            let o =
+                RequestObserver::new(request(1, RequestPhase::Fixture), model(), 100_000).unwrap();
+            assert!(o.temporal().is_none());
+            let mut t =
+                Temporal::new(request(1, RequestPhase::Fixture), model(), namespace(), 1).unwrap();
+            assert!(t
+                .committed(position(0, 10), position(1, 10), &set(0))
+                .is_none());
+            assert!(t
+                .committed(position(1, 10), position(2, 10), &set(8))
+                .is_none());
+            assert_eq!(t.no_emissions.len(), 1);
+            assert_eq!(t.incomplete, Some(Error::Capacity));
+            assert!(t.records.is_empty());
         }
     }
 }
