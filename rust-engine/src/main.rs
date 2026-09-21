@@ -152,6 +152,7 @@ pub(crate) mod gpu_native_demand_source_concurrency;
 pub(crate) mod gpu_native_oracle_routes;
 pub(crate) mod gpu_native_oracle_scheduled_residency;
 pub(crate) mod gpu_native_real_benchmark;
+mod gpu_native_predictor_v2_observation;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
@@ -914,6 +915,10 @@ enum Cmd {
         #[arg(long)]
         report_out: Option<PathBuf>,
     },
+
+    /// Observe frozen request-local P1E accounting on one qualification request.
+    #[command(name = "observe-gpu-native-predictor-v2-p1e")]
+    ObserveGpuNativePredictorV2P1e(crate::gpu_native_predictor_v2_observation::CommandArgs),
 
     /// Capture authoritative ordered route truth from the ordinary production
     /// GPU-native token loop and run offline capacity/replacement analysis.
@@ -2031,6 +2036,7 @@ fn parse_autotune_probe_output(
 
 fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
     match cmd {
+        Cmd::ObserveGpuNativePredictorV2P1e(args) => Some(args.config.as_path()),
         Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
             config,
             standalone_only: false,
@@ -2474,6 +2480,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     progress_watchdog,
                 },
             ))
+        }
+        Cmd::ObserveGpuNativePredictorV2P1e(args) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_predictor_v2_observation::run_command(args))
         }
         Cmd::TraceGpuNativeOracleRoutes {
             config,
