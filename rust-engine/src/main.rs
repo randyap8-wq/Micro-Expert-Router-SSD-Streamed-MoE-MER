@@ -147,6 +147,7 @@ pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_out_of_core;
 pub(crate) mod gpu_native_physical_install_staging;
+mod gpu_native_predictor_v2_sidecar_qualifier;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_demand_source_concurrency;
 pub(crate) mod gpu_native_oracle_routes;
@@ -919,6 +920,12 @@ enum Cmd {
     /// Observe frozen request-local P1E accounting on one qualification request.
     #[command(name = "observe-gpu-native-predictor-v2-p1e")]
     ObserveGpuNativePredictorV2P1e(crate::gpu_native_predictor_v2_observation::CommandArgs),
+
+    /// Qualify isolated P1J sidecar mechanism and exact semantic parity.
+    #[command(name = "qualify-gpu-native-predictor-v2-p1j-sidecar")]
+    QualifyGpuNativePredictorV2P1jSidecar(
+        crate::gpu_native_predictor_v2_sidecar_qualifier::CommandArgs,
+    ),
 
     /// Capture authoritative ordered route truth from the ordinary production
     /// GPU-native token loop and run offline capacity/replacement analysis.
@@ -2037,6 +2044,7 @@ fn parse_autotune_probe_output(
 fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
     match cmd {
         Cmd::ObserveGpuNativePredictorV2P1e(args) => Some(args.config.as_path()),
+        Cmd::QualifyGpuNativePredictorV2P1jSidecar(args) => Some(args.config.as_path()),
         Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
             config,
             standalone_only: false,
@@ -2486,6 +2494,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             rt.block_on(crate::gpu_native_predictor_v2_observation::run_command(args))
+        }
+        Cmd::QualifyGpuNativePredictorV2P1jSidecar(args) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_predictor_v2_sidecar_qualifier::run_command(args))
         }
         Cmd::TraceGpuNativeOracleRoutes {
             config,
