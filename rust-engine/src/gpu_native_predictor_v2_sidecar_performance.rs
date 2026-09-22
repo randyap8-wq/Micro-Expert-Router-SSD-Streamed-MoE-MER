@@ -1238,6 +1238,17 @@ fn structural_initial(initial: &P1qInitialSnapshot) -> Result<Value> {
     }
     Ok(value)
 }
+
+// Fresh runtimes have distinct legacy context incarnations. Normalize only
+// that ID for resource/calibration equality; retain the raw ArmReport evidence.
+fn structural_runtime_contract(raw: &evidence::RuntimeContractEvidence) -> Result<Value> {
+    let mut value = serde_json::to_value(raw)?;
+    *value
+        .pointer_mut("/legacy_execution_plan/context_id")
+        .ok_or("missing legacy execution context ID")? = json!("runtime-local");
+    Ok(value)
+}
+
 fn initial_state_valid(
     before: &crate::gpu_native_residency::P1qResourceSnapshot,
     s: &P1qInitialSnapshot,
@@ -1329,7 +1340,7 @@ async fn execute_arm(
             "production_configuration": report.provenance.as_ref().ok_or("missing provenance")?.production_configuration,
             "adapter": report.adapter,
             "model_load": report.model_load,
-            "runtime_contract": report.runtime_contract,
+            "runtime_contract": structural_runtime_contract(report.runtime_contract.as_ref().ok_or("missing runtime contract")?)?,
             "prompt_token_count": prompt.len(),
             "prompt_token_ids_sha256": crate::greedy_parity::token_ids_sha256(prompt),
             "output_token_count": OUTPUT_TOKENS,
@@ -2307,6 +2318,370 @@ mod p1q_tests {
             noise_calibration_report: None,
         }
     }
+
+    mod p1q1 {
+        use super::*;
+
+        fn runtime_contract(context_id: &str) -> evidence::RuntimeContractEvidence {
+            evidence::RuntimeContractEvidence {
+                real_transformer_enabled: true,
+                real_transformer_gpu_native: true,
+                compute_offload: "gpu".into(),
+                ordinary_step_token_only: true,
+                legacy_execution_plan: crate::qualification::ExecutionPlanEvidence {
+                    context_id: context_id.into(),
+                    requested: "gpu".into(),
+                    resolved: "gpu".into(),
+                    embeddings: "cpu".into(),
+                    lm_head: "cpu".into(),
+                    dense_projections: "cpu".into(),
+                    attention: "gpu".into(),
+                    kv: "gpu".into(),
+                    router: "cpu".into(),
+                    routed_experts: "cpu".into(),
+                    routed_expert_dtype: "q4_0".into(),
+                    fallback_occurred: false,
+                    reason: None,
+                },
+                token_loop_geometry: crate::gpu_native_token_loop::GpuNativeModelGeometry {
+                    num_layers: 48,
+                    d_model: 2048,
+                    d_ff: 768,
+                    num_experts: 128,
+                    top_k: 8,
+                    num_heads: 64,
+                    num_kv_heads: 8,
+                    head_dim: 128,
+                    rope_dim: 128,
+                    vocab_size: 151936,
+                    max_seq_len: 4096,
+                    rms_eps: 1e-6,
+                    rope_base: 10000.0,
+                },
+                strict_fail_closed_routed_experts: true,
+            }
+        }
+
+        type ContractDrift = (&'static str, fn(&mut evidence::RuntimeContractEvidence));
+        fn contract_drifts() -> Vec<ContractDrift> {
+            vec![
+                ("real_transformer_enabled", |r| {
+                    r.real_transformer_enabled = false
+                }),
+                ("real_transformer_gpu_native", |r| {
+                    r.real_transformer_gpu_native = false
+                }),
+                ("compute_offload", |r| r.compute_offload = "cpu".into()),
+                ("ordinary_step_token_only", |r| {
+                    r.ordinary_step_token_only = false
+                }),
+                ("strict_fail_closed_routed_experts", |r| {
+                    r.strict_fail_closed_routed_experts = false
+                }),
+                ("requested", |r| {
+                    r.legacy_execution_plan.requested = "auto".into()
+                }),
+                ("resolved", |r| {
+                    r.legacy_execution_plan.resolved = "cpu".into()
+                }),
+                ("embeddings", |r| {
+                    r.legacy_execution_plan.embeddings = "gpu".into()
+                }),
+                ("lm_head", |r| {
+                    r.legacy_execution_plan.lm_head = "gpu".into()
+                }),
+                ("dense_projections", |r| {
+                    r.legacy_execution_plan.dense_projections = "gpu".into()
+                }),
+                ("attention", |r| {
+                    r.legacy_execution_plan.attention = "cpu".into()
+                }),
+                ("kv", |r| r.legacy_execution_plan.kv = "cpu".into()),
+                ("router", |r| r.legacy_execution_plan.router = "gpu".into()),
+                ("routed_experts", |r| {
+                    r.legacy_execution_plan.routed_experts = "gpu".into()
+                }),
+                ("routed_expert_dtype", |r| {
+                    r.legacy_execution_plan.routed_expert_dtype = "f32".into()
+                }),
+                ("fallback_occurred", |r| {
+                    r.legacy_execution_plan.fallback_occurred = true
+                }),
+                ("reason", |r| {
+                    r.legacy_execution_plan.reason = Some("fallback".into())
+                }),
+                ("num_layers", |r| r.token_loop_geometry.num_layers += 1),
+                ("d_model", |r| r.token_loop_geometry.d_model += 1),
+                ("d_ff", |r| r.token_loop_geometry.d_ff += 1),
+                ("num_experts", |r| r.token_loop_geometry.num_experts += 1),
+                ("top_k", |r| r.token_loop_geometry.top_k += 1),
+                ("num_heads", |r| r.token_loop_geometry.num_heads += 1),
+                ("num_kv_heads", |r| r.token_loop_geometry.num_kv_heads += 1),
+                ("head_dim", |r| r.token_loop_geometry.head_dim += 1),
+                ("rope_dim", |r| r.token_loop_geometry.rope_dim += 1),
+                ("vocab_size", |r| r.token_loop_geometry.vocab_size += 1),
+                ("max_seq_len", |r| r.token_loop_geometry.max_seq_len += 1),
+                ("rms_eps", |r| r.token_loop_geometry.rms_eps *= 2.0),
+                ("rope_base", |r| r.token_loop_geometry.rope_base += 1.0),
+            ]
+        }
+
+        // Report-only fixtures: no runtime, model, device, or request execution.
+        fn fresh_arm(mode: ExperimentMode, which: Arm, context_id: &str) -> ArmReport {
+            let mut r = arm(mode, which);
+            r.runtime_contract = Some(runtime_contract(context_id));
+            r.resource_identity = Some(json!({
+                "initial": structural_initial(r.initial.as_ref().unwrap()).unwrap(),
+                "runtime_config_identity": "config",
+                "model_identity": {"sha256": "model"},
+                "production_configuration": {"strict_weights": true},
+                "adapter": {
+                    "name": "NVIDIA L4", "vendor_id": 0x10de, "device_id": 0x27b8,
+                    "device_type": "DiscreteGpu", "wgpu_backend": "vulkan",
+                    "driver": "fixture", "driver_info": "fixture",
+                    "compute_plane": "wgpu-vulkan", "software_adapter": false
+                },
+                "model_load": {"strict": true, "loaded_tensors": 10},
+                "runtime_contract": structural_runtime_contract(r.runtime_contract.as_ref().unwrap()).unwrap(),
+                "prompt_token_count": 16,
+                "prompt_token_ids_sha256": "prompt",
+                "output_token_count": OUTPUT_TOKENS,
+                "planned_positions": PLANNED_POSITIONS,
+                "max_seq_len": 4096,
+            }));
+            r
+        }
+
+        fn fresh_experiment() -> Report {
+            let mode = ExperimentMode::AaNoiseCalibration;
+            let mut r = experiment(mode);
+            r.pairs = (0..PAIRS)
+                .map(|i| {
+                    finish_pair(
+                        i,
+                        mode,
+                        fresh_arm(mode, Arm::Control, &(2 + i * 2).to_string()),
+                        fresh_arm(mode, Arm::Treatment, &(3 + i * 2).to_string()),
+                    )
+                })
+                .collect();
+            r.resource_identity = r.pairs[0].control.resource_identity.clone();
+            finish_experiment(&mut r).unwrap();
+            r
+        }
+
+        fn fresh_calibration_value() -> Value {
+            let mut v = serde_json::to_value(fresh_experiment()).unwrap();
+            let provenance = v["input_provenance"].clone();
+            for pair in v["pairs"].as_array_mut().unwrap() {
+                for name in ["control", "treatment"] {
+                    pair[name]["provenance"] = provenance.clone();
+                }
+            }
+            v
+        }
+
+        #[test]
+        fn context_ids_normalize_equal_and_raw_arm_evidence_is_lossless() {
+            let a = runtime_contract("2");
+            let b = runtime_contract("3");
+            let before_a = serde_json::to_value(&a).unwrap();
+            let before_b = serde_json::to_value(&b).unwrap();
+            assert_ne!(before_a, before_b);
+            assert_eq!(
+                structural_runtime_contract(&a).unwrap(),
+                structural_runtime_contract(&b).unwrap()
+            );
+            let mut expected = before_a.clone();
+            expected["legacy_execution_plan"]["context_id"] = json!("runtime-local");
+            assert_eq!(structural_runtime_contract(&a).unwrap(), expected);
+            assert_eq!(serde_json::to_value(&a).unwrap(), before_a);
+            assert_eq!(serde_json::to_value(&b).unwrap(), before_b);
+            for (id, raw) in [("2", &a), ("3", &b)] {
+                let report = fresh_arm(ExperimentMode::AaNoiseCalibration, Arm::Control, id);
+                let serialized = transport_value(&report).unwrap();
+                assert_eq!(
+                    serialized["runtime_contract"],
+                    transport_value(&raw).unwrap()
+                );
+                assert_eq!(
+                    serialized["runtime_contract"]["legacy_execution_plan"]["context_id"],
+                    id
+                );
+            }
+        }
+
+        #[test]
+        fn every_substantive_runtime_contract_field_remains_exact() {
+            let expected = structural_runtime_contract(&runtime_contract("2")).unwrap();
+            for (field, drift) in contract_drifts() {
+                let mut current = runtime_contract("3");
+                drift(&mut current);
+                assert_ne!(
+                    expected,
+                    structural_runtime_contract(&current).unwrap(),
+                    "{field}"
+                );
+            }
+        }
+
+        #[test]
+        fn namespace_normalization_is_only_three_ids_and_declared_mode() {
+            let a = initial();
+            let mut expected = serde_json::to_value(&a).unwrap();
+            expected.as_object_mut().unwrap().remove("mode");
+            for key in ["runtime", "context", "arena"] {
+                expected["resources"]["namespace"][key] = json!(0);
+            }
+            assert_eq!(structural_initial(&a).unwrap(), expected);
+            let mut b = a.clone();
+            b.mode = P1jRequestMode::Active;
+            let ns = b.resources.namespace.as_mut().unwrap();
+            ns.runtime += 11;
+            ns.context += 13;
+            ns.arena += 17;
+            assert_eq!(structural_initial(&b).unwrap(), expected);
+            for drift in [
+                (|s: &mut P1qInitialSnapshot| s.resources.namespace.as_mut().unwrap().layer += 1)
+                    as fn(&mut P1qInitialSnapshot),
+                |s| s.resources.namespace.as_mut().unwrap().capacity += 1,
+            ] {
+                let mut changed = b.clone();
+                drift(&mut changed);
+                assert_ne!(structural_initial(&changed).unwrap(), expected);
+            }
+            b.resources.namespace = None;
+            assert!(structural_initial(&b).is_err());
+        }
+
+        #[test]
+        fn namespace_layer_and_capacity_remain_exact() {
+            let expected = structural_initial(&initial()).unwrap();
+            let changes: &[fn(&mut p1e::Namespace)] = &[
+                |namespace| namespace.layer += 1,
+                |namespace| namespace.capacity += 1,
+            ];
+            for change in changes {
+                let mut current = initial();
+                change(current.resources.namespace.as_mut().unwrap());
+                assert_ne!(structural_initial(&current).unwrap(), expected);
+            }
+        }
+
+        #[test]
+        fn fresh_context_aa_fixture_satisfies_resource_equality() {
+            let r = fresh_experiment();
+            assert!(r.qualification_pass);
+            assert!(r.resource_footprint_matched);
+            assert!(r.performance_comparison_authorized);
+            assert_eq!(r.performance_verdict, "NOISE_STABLE");
+            for pair in &r.pairs {
+                assert!(pair.pair_valid);
+                assert_eq!(
+                    pair.control.resource_identity,
+                    pair.treatment.resource_identity
+                );
+                assert_ne!(
+                    pair.control
+                        .runtime_contract
+                        .as_ref()
+                        .unwrap()
+                        .legacy_execution_plan
+                        .context_id,
+                    pair.treatment
+                        .runtime_contract
+                        .as_ref()
+                        .unwrap()
+                        .legacy_execution_plan
+                        .context_id,
+                );
+            }
+        }
+
+        #[test]
+        fn fresh_context_ab_calibration_binding_accepts_only_incarnation_drift() {
+            let v = fresh_calibration_value();
+            let calibrated = calibration(&v).unwrap();
+            for which in [Arm::Control, Arm::Treatment] {
+                let current = fresh_arm(ExperimentMode::AbMovement, which, "99");
+                assert!(serialized_identity_matches(
+                    &calibrated.resource_identity,
+                    current.resource_identity.as_ref().unwrap()
+                )
+                .unwrap());
+            }
+            for (field, drift) in contract_drifts() {
+                let mut current = fresh_arm(ExperimentMode::AbMovement, Arm::Treatment, "99");
+                let raw = current.runtime_contract.as_mut().unwrap();
+                drift(raw);
+                current.resource_identity.as_mut().unwrap()["runtime_contract"] =
+                    structural_runtime_contract(raw).unwrap();
+                let identity = current.resource_identity.as_ref().unwrap();
+                assert!(
+                    !serialized_identity_matches(&calibrated.resource_identity, identity).unwrap(),
+                    "{field}"
+                );
+                let mut changed = v.clone();
+                changed["pairs"][0]["treatment"]["resource_identity"] =
+                    transport_value(identity).unwrap();
+                assert!(calibration(&changed).is_err(), "{field}");
+            }
+        }
+
+        // Mutate each leaf independently so newly added identity fields also
+        // remain covered by the exact pair and calibration equality gates.
+        fn leaf_drifts(value: &Value, path: &str, out: &mut Vec<(String, Value)>) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, value) in fields {
+                        let key = key.replace('~', "~0").replace('/', "~1");
+                        leaf_drifts(value, &format!("{path}/{key}"), out);
+                    }
+                }
+                Value::Array(values) => {
+                    for (i, value) in values.iter().enumerate() {
+                        leaf_drifts(value, &format!("{path}/{i}"), out);
+                    }
+                }
+                Value::Bool(value) => out.push((path.into(), json!(!value))),
+                Value::Number(value) => {
+                    out.push((path.into(), json!(value.as_f64().unwrap() + 1.0)))
+                }
+                Value::String(value) => out.push((path.into(), json!(format!("{value}-drift")))),
+                Value::Null => out.push((path.into(), json!("drift"))),
+            }
+        }
+
+        #[test]
+        fn adapter_config_model_geometry_and_state_drift_blocks_all_verdicts() {
+            let v = fresh_calibration_value();
+            let calibrated = calibration(&v).unwrap();
+            let mut changes = Vec::new();
+            leaf_drifts(&calibrated.resource_identity, "", &mut changes);
+            for (path, value) in changes {
+                let mut r = fresh_experiment();
+                let c = fresh_arm(r.experiment_mode, Arm::Control, "2");
+                let mut t = fresh_arm(r.experiment_mode, Arm::Treatment, "3");
+                let identity = t.resource_identity.as_mut().unwrap();
+                *identity.pointer_mut(&path).unwrap() = value;
+                assert!(
+                    !serialized_identity_matches(&calibrated.resource_identity, identity).unwrap(),
+                    "{path}"
+                );
+                let mut changed = v.clone();
+                changed["pairs"][0]["treatment"]["resource_identity"] =
+                    transport_value(identity).unwrap();
+                assert!(calibration(&changed).is_err(), "{path}");
+                r.pairs[0] = finish_pair(0, r.experiment_mode, c, t);
+                assert!(!r.pairs[0].pair_valid, "{path}");
+                finish_experiment(&mut r).unwrap();
+                assert!(!r.resource_footprint_matched, "{path}");
+                assert!(!r.performance_comparison_authorized, "{path}");
+                assert_eq!(r.performance_verdict, "NOT_AUTHORIZED", "{path}");
+            }
+        }
+    }
+
     #[test]
     fn p1q_mode_classification() {
         assert_eq!(
