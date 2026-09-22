@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-const SCHEMA: &str = "mer.predictor-v2-p1k-sidecar-runtime-qualifier.v2";
+const SCHEMA: &str = "mer.predictor-v2-p1k-sidecar-runtime-qualifier.v3";
 const MAX_POSITIONS: usize = 4096;
 
 #[derive(Clone, Debug, clap::Args, Serialize)]
@@ -188,39 +188,41 @@ fn write_report(path: &Path, report: &impl Serialize) -> Result<()> {
     result
 }
 
-// The normalized causal trace is separate from raw mechanical evidence:
-// recovery events, physical LRU/install snapshots and runtime counters remain
-// lossless in raw_p1e_report/runtime_counters. P1J may change those mechanics.
-// Within predictor/route truth only arm-local identities and time are removed.
+// The normalized semantic trace retains the entire candidate except for the
+// five runtime-local identity fields. Mechanical evidence is compared separately;
+// timestamps, recovery events and physical snapshots remain lossless in raw P1E.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct NormalizedObservation {
+struct SemanticObservation {
     candidate: p1e::Candidate,
-    current_at_f: Option<bool>,
-    source_at_f: p1e::HostSource,
-    freeze_evidence_present: bool,
     freeze_incomplete: Option<p1e::Error>,
-    deadline: Option<NormalizedDeadline>,
+    deadline: Option<SemanticDeadline>,
     outcome: p1e::Outcome,
-    opportunities: p1e::Opportunities,
     incomplete: Option<p1e::Error>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct NormalizedDeadline {
+struct SemanticDeadline {
     request: crate::predictor_v2::RequestIdentity,
     position: crate::predictor_v2::PositionIdentity,
-    current: Option<bool>,
-    evidence_present: bool,
     incomplete: Option<p1e::Error>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct NormalizedP1e {
+struct SemanticRoute {
     request: crate::predictor_v2::RequestIdentity,
-    observations: Vec<NormalizedObservation>,
-    opportunities: Vec<(u64, p1e::Opportunities)>,
+    observations: Vec<SemanticObservation>,
+    prediction_hits_by_sequence: Vec<(u64, Option<bool>)>,
     no_emissions: Vec<p1e::NoEmission>,
     incomplete: Option<p1e::Error>,
-    partitions: p1e::Partitions,
+    partitions: RoutePartitions,
     readiness_measured: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RoutePartitions {
+    emitted: usize,
+    resolved: usize,
+    pending: usize,
+    censored: usize,
+    prediction_hits: usize,
+    route_misses: usize,
 }
 fn normalize_request(
     mut id: crate::predictor_v2::RequestIdentity,
@@ -229,8 +231,8 @@ fn normalize_request(
     id.request_sequence = 0;
     id
 }
-fn normalize(raw: &p1e::Report) -> NormalizedP1e {
-    NormalizedP1e {
+fn semantic_route(raw: &p1e::Report) -> SemanticRoute {
+    SemanticRoute {
         request: normalize_request(raw.request),
         observations: raw
             .observations
@@ -243,33 +245,256 @@ fn normalize(raw: &p1e::Report) -> NormalizedP1e {
                 candidate.namespace.arena = 0;
                 // Candidate generation is a deterministic request-local signal
                 // counter, not a runtime incarnation: retain it and both cutoffs.
-                let mut source = r.freeze.source;
-                // Logical cache generations are runtime-local. Preserve existence.
-                source.logical_generation = source.logical_generation.map(|_| 0);
-                NormalizedObservation {
+                SemanticObservation {
                     candidate,
-                    current_at_f: r.freeze.current,
-                    source_at_f: source,
-                    freeze_evidence_present: r.freeze.physical.is_some(),
                     freeze_incomplete: r.freeze.incomplete,
-                    deadline: r.deadline.map(|d| NormalizedDeadline {
+                    deadline: r.deadline.map(|d| SemanticDeadline {
                         request: normalize_request(d.request),
                         position: d.position,
-                        current: d.current,
-                        evidence_present: d.physical.is_some(),
                         incomplete: d.incomplete,
                     }),
                     outcome: r.outcome,
-                    opportunities: r.opportunities(),
                     incomplete: r.incomplete,
                 }
             })
             .collect(),
-        opportunities: raw.opportunities.clone(),
+        prediction_hits_by_sequence: raw
+            .opportunities
+            .iter()
+            .map(|(sequence, o)| (*sequence, o.prediction_hit))
+            .collect(),
         no_emissions: raw.no_emissions.clone(),
         incomplete: raw.incomplete,
-        partitions: raw.partitions,
+        partitions: RoutePartitions {
+            emitted: raw.partitions.emitted,
+            resolved: raw.partitions.resolved,
+            pending: raw.partitions.pending,
+            censored: raw.partitions.censored,
+            prediction_hits: raw.partitions.prediction_hits,
+            route_misses: raw.partitions.route_misses,
+        },
         readiness_measured: raw.readiness_measured,
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct EvidenceStructure {
+    sequence: u64,
+    f_physical_evidence_present: bool,
+    deadline_present: bool,
+    // None distinguishes no deadline from a deadline with no physical evidence.
+    d_physical_evidence_present: Option<bool>,
+}
+fn evidence_structure(raw: &p1e::Report) -> Vec<EvidenceStructure> {
+    raw.observations
+        .iter()
+        .map(|r| EvidenceStructure {
+            sequence: r.freeze.candidate.sequence,
+            f_physical_evidence_present: r.freeze.physical.is_some(),
+            deadline_present: r.deadline.is_some(),
+            d_physical_evidence_present: r.deadline.map(|d| d.physical.is_some()),
+        })
+        .collect()
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct PhysicalOpportunities {
+    physical_miss_at_f: Option<bool>,
+    physical_miss_at_d: Option<bool>,
+    useful: Option<bool>,
+    target_confirmed_useful: Option<bool>,
+    already_resident: Option<bool>,
+    redundant_route_hit: Option<bool>,
+}
+impl From<p1e::Opportunities> for PhysicalOpportunities {
+    fn from(o: p1e::Opportunities) -> Self {
+        Self {
+            physical_miss_at_f: o.physical_miss_at_f,
+            physical_miss_at_d: o.physical_miss_at_d,
+            useful: o.useful,
+            target_confirmed_useful: o.target_confirmed_useful,
+            already_resident: o.already_resident,
+            redundant_route_hit: o.redundant_route_hit,
+        }
+    }
+}
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct MechanicalObservation {
+    sequence: u64,
+    f_current: Option<bool>,
+    f_source_logical_generation_present: bool,
+    f_source_logical_materialized: bool,
+    f_source_ram_resident: bool,
+    f_source_permanence: p1e::Permanence,
+    d_current: Option<bool>,
+    #[serde(flatten)]
+    opportunities: PhysicalOpportunities,
+}
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct PhysicalPartitions {
+    valid_f: usize,
+    current_at_f: usize,
+    absent_at_f: usize,
+    useful: usize,
+    target_confirmed_useful: usize,
+}
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct MechanicalState {
+    observations: Vec<MechanicalObservation>,
+    // Keep the reported rows independently, including order and duplicate or
+    // missing sequences. Do not replace reported evidence with recomputed rows.
+    reported_opportunities: Vec<(u64, PhysicalOpportunities)>,
+    physical_partitions: PhysicalPartitions,
+}
+fn mechanical_state(raw: &p1e::Report) -> MechanicalState {
+    MechanicalState {
+        observations: raw
+            .observations
+            .iter()
+            .map(|r| MechanicalObservation {
+                sequence: r.freeze.candidate.sequence,
+                f_current: r.freeze.current,
+                f_source_logical_generation_present: r.freeze.source.logical_generation.is_some(),
+                f_source_logical_materialized: r.freeze.source.logical_materialized,
+                f_source_ram_resident: r.freeze.source.ram_resident,
+                f_source_permanence: r.freeze.source.permanence,
+                d_current: r.deadline.and_then(|d| d.current),
+                opportunities: r.opportunities().into(),
+            })
+            .collect(),
+        reported_opportunities: raw
+            .opportunities
+            .iter()
+            .map(|(s, o)| (*s, (*o).into()))
+            .collect(),
+        physical_partitions: PhysicalPartitions {
+            valid_f: raw.partitions.valid_f,
+            current_at_f: raw.partitions.current_at_f,
+            absent_at_f: raw.partitions.absent_at_f,
+            useful: raw.partitions.useful,
+            target_confirmed_useful: raw.partitions.target_confirmed_useful,
+        },
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExactParity<T> {
+    exact_match: bool,
+    control: Option<T>,
+    treatment: Option<T>,
+}
+impl<T> Default for ExactParity<T> {
+    fn default() -> Self {
+        Self {
+            exact_match: false,
+            control: None,
+            treatment: None,
+        }
+    }
+}
+fn exact_parity<T: Eq>(control: Option<T>, treatment: Option<T>) -> ExactParity<T> {
+    // Even two missing reports cannot certify parity.
+    let exact_match = matches!((&control, &treatment), (Some(c), Some(t)) if c == t);
+    ExactParity {
+        exact_match,
+        control,
+        treatment,
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct MechanicalDiff {
+    divergent_observation_count: usize,
+    divergent_sequences: Vec<u64>,
+    field_divergence_counts: std::collections::BTreeMap<&'static str, usize>,
+    divergent_reported_opportunity_count: usize,
+    divergent_reported_opportunity_sequences: Vec<u64>,
+    reported_opportunity_field_divergence_counts: std::collections::BTreeMap<&'static str, usize>,
+}
+#[derive(Debug, Default, Serialize)]
+struct MechanicalStateComparison {
+    control: Option<MechanicalState>,
+    treatment: Option<MechanicalState>,
+    // Unavailable evidence is not reported as zero divergence.
+    diff: Option<MechanicalDiff>,
+}
+
+fn compare_mechanical(control: &ArmReport, treatment: &ArmReport) -> MechanicalStateComparison {
+    let control = control.raw_p1e_report.as_ref().map(mechanical_state);
+    let treatment = treatment.raw_p1e_report.as_ref().map(mechanical_state);
+    let diff = match (&control, &treatment) {
+        (Some(c), Some(t)) => {
+            let mut diff = MechanicalDiff::default();
+            // Pair ordered observations, without a lossy map keyed by sequence.
+            // Sequence/length disagreement independently fails semantic parity.
+            macro_rules! fields {
+                ($counts:expr, $c:ident, $t:ident, $($name:literal => $($field:ident).+),+ $(,)?) => {{
+                    let mut divergent = false;
+                    $(let unequal = $c.map(|r| &r.$($field).+) != $t.map(|r| &r.$($field).+);
+                    *$counts.entry($name).or_default() += usize::from(unequal);
+                    divergent |= unequal;)+
+                    divergent
+                }};
+            }
+            for i in 0..c.observations.len().max(t.observations.len()) {
+                let c = c.observations.get(i);
+                let t = t.observations.get(i);
+                if fields!(diff.field_divergence_counts, c, t,
+                    "sequence" => sequence,
+                    "f_current" => f_current,
+                    "f_source_logical_generation_present" => f_source_logical_generation_present,
+                    "f_source_logical_materialized" => f_source_logical_materialized,
+                    "f_source_ram_resident" => f_source_ram_resident,
+                    "f_source_permanence" => f_source_permanence,
+                    "d_current" => d_current,
+                    "physical_miss_at_f" => opportunities.physical_miss_at_f,
+                    "physical_miss_at_d" => opportunities.physical_miss_at_d,
+                    "useful" => opportunities.useful,
+                    "target_confirmed_useful" => opportunities.target_confirmed_useful,
+                    "already_resident" => opportunities.already_resident,
+                    "redundant_route_hit" => opportunities.redundant_route_hit,
+                ) {
+                    diff.divergent_observation_count += 1;
+                    diff.divergent_sequences
+                        .extend(c.into_iter().chain(t).map(|r| r.sequence));
+                }
+            }
+            for i in 0..c
+                .reported_opportunities
+                .len()
+                .max(t.reported_opportunities.len())
+            {
+                let cr = c.reported_opportunities.get(i);
+                let tr = t.reported_opportunities.get(i);
+                let c = cr.map(|r| &r.1);
+                let t = tr.map(|r| &r.1);
+                let fields_differ = fields!(diff.reported_opportunity_field_divergence_counts, c, t,
+                    "physical_miss_at_f" => physical_miss_at_f,
+                    "physical_miss_at_d" => physical_miss_at_d,
+                    "useful" => useful,
+                    "target_confirmed_useful" => target_confirmed_useful,
+                    "already_resident" => already_resident,
+                    "redundant_route_hit" => redundant_route_hit,
+                );
+                if fields_differ || cr.map(|r| r.0) != tr.map(|r| r.0) {
+                    diff.divergent_reported_opportunity_count += 1;
+                    diff.divergent_reported_opportunity_sequences
+                        .extend(cr.into_iter().chain(tr).map(|r| r.0));
+                }
+            }
+            diff.divergent_sequences.sort_unstable();
+            diff.divergent_sequences.dedup();
+            diff.divergent_reported_opportunity_sequences
+                .sort_unstable();
+            diff.divergent_reported_opportunity_sequences.dedup();
+            Some(diff)
+        }
+        _ => None,
+    };
+    MechanicalStateComparison {
+        control,
+        treatment,
+        diff,
     }
 }
 
@@ -364,7 +589,6 @@ struct ArmReport {
     completed_positions: usize,
     observation_capacity_per_collection: usize,
     raw_p1e_report: Option<p1e::Report>,
-    normalized_p1e: Option<NormalizedP1e>,
     predictor_v2_snapshot: Option<ReconciliationSnapshot>,
     p1j_launch_before: Option<P1jLaunchSnapshot>,
     p1j_launch_after: Option<P1jLaunchSnapshot>,
@@ -390,7 +614,6 @@ impl ArmReport {
             completed_positions: 0,
             observation_capacity_per_collection: 0,
             raw_p1e_report: None,
-            normalized_p1e: None,
             predictor_v2_snapshot: None,
             p1j_launch_before: None,
             p1j_launch_after: None,
@@ -402,10 +625,11 @@ impl ArmReport {
         }
     }
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct Parity {
     output_exact_match: bool,
-    normalized_p1e_exact_match: bool,
+    semantic_route_parity: ExactParity<SemanticRoute>,
+    evidence_structure_parity: ExactParity<Vec<EvidenceStructure>>,
     mismatch_details: Vec<String>,
 }
 #[derive(Debug, Serialize)]
@@ -426,6 +650,7 @@ struct Report {
     control: ArmReport,
     treatment: ArmReport,
     parity: Parity,
+    mechanical_state_comparison: MechanicalStateComparison,
     mechanism: Mechanism,
     #[serde(flatten)]
     performance: PerformanceBoundary,
@@ -515,42 +740,27 @@ fn compare(control: &ArmReport, treatment: &ArmReport) -> Parity {
             );
         mismatch_details.push(format!("generated output IDs/hash mismatch; first unequal/missing index={first}, lengths={}/{}", control.generated_token_ids.len(), treatment.generated_token_ids.len()));
     }
-    let normalized_p1e_exact_match = match (&control.normalized_p1e, &treatment.normalized_p1e) {
-        (Some(c), Some(t)) => {
-            if c != t {
-                if c.observations != t.observations {
-                    let first = c
-                        .observations
-                        .iter()
-                        .zip(&t.observations)
-                        .position(|(a, b)| a != b)
-                        .unwrap_or(c.observations.len().min(t.observations.len()));
-                    mismatch_details.push(format!("normalized prediction mismatch at index {first}: control={:?}; treatment={:?}", c.observations.get(first), t.observations.get(first)));
-                }
-                if c.no_emissions != t.no_emissions {
-                    mismatch_details.push("normalized no-emission sequence/reason mismatch".into());
-                }
-                if c.request != t.request
-                    || c.partitions != t.partitions
-                    || c.incomplete != t.incomplete
-                    || c.readiness_measured != t.readiness_measured
-                    || c.opportunities != t.opportunities
-                {
-                    mismatch_details.push(
-                        "normalized request/partition/opportunity/completeness mismatch".into(),
-                    );
-                }
-            }
-            c == t
-        }
-        _ => {
-            mismatch_details.push("normalized P1E evidence unavailable".into());
-            false
-        }
-    };
+    let semantic_route_parity = exact_parity(
+        control.raw_p1e_report.as_ref().map(semantic_route),
+        treatment.raw_p1e_report.as_ref().map(semantic_route),
+    );
+    if !semantic_route_parity.exact_match {
+        mismatch_details.push(
+            "semantic route evidence unequal or unavailable; see both semantic_route_parity arms"
+                .into(),
+        );
+    }
+    let evidence_structure_parity = exact_parity(
+        control.raw_p1e_report.as_ref().map(evidence_structure),
+        treatment.raw_p1e_report.as_ref().map(evidence_structure),
+    );
+    if !evidence_structure_parity.exact_match {
+        mismatch_details.push("F/deadline/D evidence structure unequal or unavailable; see both evidence_structure_parity arms".into());
+    }
     Parity {
         output_exact_match,
-        normalized_p1e_exact_match,
+        semantic_route_parity,
+        evidence_structure_parity,
         mismatch_details,
     }
 }
@@ -599,6 +809,7 @@ fn finish_launch_diagnostics(report: &mut ArmReport, after: P1jLaunchSnapshot) {
 
 fn finish_report(report: &mut Report) {
     report.parity = compare(&report.control, &report.treatment);
+    report.mechanical_state_comparison = compare_mechanical(&report.control, &report.treatment);
     let control_errors = report
         .control
         .predictor_v2_snapshot
@@ -616,6 +827,12 @@ fn finish_report(report: &mut Report) {
     errors.extend(report.parity.mismatch_details.iter().cloned());
     for arm in [&report.control, &report.treatment] {
         errors.extend(launch_diagnostics_gate(arm));
+        if !shutdown_complete(arm) {
+            errors.push(format!(
+                "{:?} clean shutdown missing or incomplete",
+                arm.arm
+            ));
+        }
         if !arm.ordinary_invariants_pass {
             errors.push(format!("{:?} ordinary invariants failed", arm.arm));
         }
@@ -633,7 +850,10 @@ fn finish_report(report: &mut Report) {
     };
     report.qualification_pass = report.mechanism.qualification_failure_reasons.is_empty()
         && report.parity.output_exact_match
-        && report.parity.normalized_p1e_exact_match;
+        && report.parity.semantic_route_parity.exact_match
+        && report.parity.evidence_structure_parity.exact_match
+        && shutdown_complete(&report.control)
+        && shutdown_complete(&report.treatment);
 }
 
 // Both arms must exclude every optional legacy predictive mode. Accept the
@@ -879,7 +1099,6 @@ fn finish_request(
 ) {
     request.finish_predictor_v2_observation(cancelled);
     report.raw_p1e_report = request.predictor_v2_p1e_report();
-    report.normalized_p1e = report.raw_p1e_report.as_ref().map(normalize);
     report.generated_token_ids_sha256 =
         crate::greedy_parity::token_ids_sha256(&report.generated_token_ids);
     match request.predictor_v2_snapshot() {
@@ -1082,11 +1301,8 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<()> {
         frozen_p1j_contract: FrozenContract::default(),
         control: ArmReport::new(Arm::Control),
         treatment: ArmReport::new(Arm::Treatment),
-        parity: Parity {
-            output_exact_match: false,
-            normalized_p1e_exact_match: false,
-            mismatch_details: Vec::new(),
-        },
+        parity: Parity::default(),
+        mechanical_state_comparison: MechanicalStateComparison::default(),
         mechanism: Mechanism {
             control_movement_zero: false,
             treatment_movement_accounting_pass: false,
@@ -1341,7 +1557,6 @@ mod p1k_tests {
     fn arm(arm: Arm) -> ArmReport {
         let mut r = ArmReport::new(arm);
         let raw = raw(vec![record(0, true, Some(false), Some(false))]);
-        r.normalized_p1e = Some(normalize(&raw));
         r.raw_p1e_report = Some(raw);
         r.generated_token_ids = vec![11, 22, 33];
         r.generated_token_ids_sha256 =
@@ -1364,6 +1579,11 @@ mod p1k_tests {
             }
         };
         finish_launch_diagnostics(&mut r, after);
+        r.runtime_shutdown = Some(crate::greedy_parity::BackgroundShutdownEvidence {
+            controlled_shutdown_requested: true,
+            all_runtime_resources_released: true,
+            poll_iterations: 1,
+        });
         r.ordinary_invariants_pass = true;
         r
     }
@@ -1383,11 +1603,8 @@ mod p1k_tests {
             frozen_p1j_contract: Default::default(),
             control: arm(Arm::Control),
             treatment: arm(Arm::Treatment),
-            parity: Parity {
-                output_exact_match: false,
-                normalized_p1e_exact_match: false,
-                mismatch_details: Vec::new(),
-            },
+            parity: Parity::default(),
+            mechanical_state_comparison: MechanicalStateComparison::default(),
             mechanism: Mechanism {
                 control_movement_zero: false,
                 treatment_movement_accounting_pass: false,
@@ -1502,7 +1719,7 @@ mod p1k_tests {
         assert!(mul(usize::MAX, 2).is_err());
     }
     #[test]
-    fn normalized_namespaces_times_and_logical_generations_compare_equal() {
+    fn p1o_normalized_namespaces_times_and_logical_generations_compare_equal() {
         let a = raw(vec![record(0, true, Some(false), Some(false))]);
         let mut b = a.clone();
         b.request.runtime_namespace = 100;
@@ -1518,66 +1735,87 @@ mod p1k_tests {
         d.request = b.request;
         d.timestamp_ns = 9000;
         d.host_lead_ns = Some(4000);
-        assert_eq!(normalize(&a), normalize(&b));
+        assert_eq!(semantic_route(&a), semantic_route(&b));
         assert_ne!(a, b);
-        assert_eq!(normalize(&a).observations[0].candidate.generation, 3);
+        assert_eq!(semantic_route(&a).observations[0].candidate.generation, 3);
         assert_eq!(
-            normalize(&a).observations[0].candidate.table_update_cutoff,
+            semantic_route(&a).observations[0]
+                .candidate
+                .table_update_cutoff,
             2
         );
     }
     fn mismatch(change: impl FnOnce(&mut p1e::Observation)) {
         let mut r = report();
         change(&mut r.treatment.raw_p1e_report.as_mut().unwrap().observations[0]);
-        r.treatment.normalized_p1e = r.treatment.raw_p1e_report.as_ref().map(normalize);
         finish_report(&mut r);
-        assert!(!r.parity.normalized_p1e_exact_match);
+        assert!(!r.parity.semantic_route_parity.exact_match);
         assert!(!r.qualification_pass);
         assert!(!r.parity.mismatch_details.is_empty());
     }
     #[test]
-    fn expert_mismatch_fails() {
+    fn p1o_expert_mismatch_fails() {
         mismatch(|r| r.freeze.candidate.expert += 1);
     }
     #[test]
-    fn score_mismatch_fails() {
+    fn p1o_score_mismatch_fails() {
         mismatch(|r| r.freeze.candidate.score += 1);
     }
     #[test]
-    fn source_set_mismatch_fails() {
+    fn p1o_source_set_mismatch_fails() {
         mismatch(|r| r.freeze.candidate.source_set[0] = 100);
     }
     #[test]
-    fn outcome_mismatch_fails() {
+    fn p1o_outcome_mismatch_fails() {
         mismatch(|r| r.outcome = p1e::Outcome::Censored);
     }
     #[test]
-    fn prediction_hit_mismatch_fails() {
+    fn p1o_prediction_hit_mismatch_fails() {
         mismatch(|r| {
             r.outcome = p1e::Outcome::Resolved {
                 prediction_hit: false,
             }
         });
     }
-    #[test]
-    fn freeze_currentness_mismatch_fails() {
-        mismatch(|r| r.freeze.current = Some(true));
-        mismatch(|r| r.freeze.current = None);
+    fn mechanical_change(change: impl FnOnce(&mut p1e::Report)) -> Report {
+        let mut r = report();
+        change(r.treatment.raw_p1e_report.as_mut().unwrap());
+        finish_report(&mut r);
+        assert!(r.parity.semantic_route_parity.exact_match);
+        assert!(r.parity.evidence_structure_parity.exact_match);
+        assert!(
+            r.qualification_pass,
+            "{:?}",
+            r.mechanism.qualification_failure_reasons
+        );
+        r
     }
     #[test]
-    fn deadline_currentness_mismatch_fails() {
-        mismatch(|r| r.deadline.as_mut().unwrap().current = Some(true));
-        mismatch(|r| r.deadline.as_mut().unwrap().current = None);
-        mismatch(|r| r.deadline = None);
+    fn p1o_f_currentness_only_divergence_is_descriptive() {
+        for current in [Some(true), None] {
+            mechanical_change(|r| r.observations[0].freeze.current = current);
+        }
     }
     #[test]
-    fn host_source_mismatch_fails() {
-        mismatch(|r| r.freeze.source.logical_materialized = true);
-        mismatch(|r| r.freeze.source.ram_resident = true);
-        mismatch(|r| r.freeze.source.logical_generation = None);
+    fn p1o_d_currentness_only_divergence_is_descriptive() {
+        for current in [Some(true), None] {
+            mechanical_change(|r| r.observations[0].deadline.as_mut().unwrap().current = current);
+        }
     }
     #[test]
-    fn all_candidate_causal_fields_survive_normalization() {
+    fn p1o_host_materialization_divergence_is_descriptive() {
+        mechanical_change(|r| r.observations[0].freeze.source.logical_materialized = true);
+    }
+    #[test]
+    fn p1o_ram_residency_divergence_is_descriptive() {
+        mechanical_change(|r| r.observations[0].freeze.source.ram_resident = true);
+    }
+    #[test]
+    fn p1o_logical_generation_existence_divergence_is_descriptive() {
+        mechanical_change(|r| r.observations[0].freeze.source.logical_generation = None);
+    }
+    #[test]
+    fn p1o_all_candidate_causal_fields_survive_normalization() {
         mismatch(|r| r.freeze.candidate.sequence += 1);
         mismatch(|r| r.freeze.candidate.source_position.absolute_position += 1);
         mismatch(|r| {
@@ -1594,10 +1832,9 @@ mod p1k_tests {
         mismatch(|r| r.freeze.candidate.namespace.capacity += 1);
         mismatch(|r| r.incomplete = Some(p1e::Error::Chronology));
         mismatch(|r| r.freeze.incomplete = Some(p1e::Error::PhysicalEvidence));
-        mismatch(|r| r.freeze.physical = None);
     }
     #[test]
-    fn no_emission_sequence_reason_and_position_mismatch_fails() {
+    fn p1o_no_emission_sequence_reason_and_position_mismatch_fails() {
         let mut r = report();
         let n = p1e::NoEmission {
             source: PositionIdentity::from_prompt_length(0, 3).unwrap(),
@@ -1605,30 +1842,38 @@ mod p1k_tests {
             reason: p1e::NoEmissionReason::NoPositiveHistory,
         };
         r.control
-            .normalized_p1e
+            .raw_p1e_report
             .as_mut()
             .unwrap()
             .no_emissions
             .push(n);
         r.treatment
-            .normalized_p1e
+            .raw_p1e_report
             .as_mut()
             .unwrap()
             .no_emissions
             .push(n);
-        assert!(compare(&r.control, &r.treatment).normalized_p1e_exact_match);
-        r.treatment.normalized_p1e.as_mut().unwrap().no_emissions[0].reason =
+        assert!(
+            compare(&r.control, &r.treatment)
+                .semantic_route_parity
+                .exact_match
+        );
+        r.treatment.raw_p1e_report.as_mut().unwrap().no_emissions[0].reason =
             p1e::NoEmissionReason::Incomplete;
         finish_report(&mut r);
         assert!(!r.qualification_pass);
-        r.treatment.normalized_p1e.as_mut().unwrap().no_emissions[0] = n;
-        r.treatment.normalized_p1e.as_mut().unwrap().no_emissions[0]
+        r.treatment.raw_p1e_report.as_mut().unwrap().no_emissions[0] = n;
+        r.treatment.raw_p1e_report.as_mut().unwrap().no_emissions[0]
             .source
             .absolute_position = 2;
-        assert!(!compare(&r.control, &r.treatment).normalized_p1e_exact_match);
+        assert!(
+            !compare(&r.control, &r.treatment)
+                .semantic_route_parity
+                .exact_match
+        );
     }
     #[test]
-    fn recovery_mechanics_remain_raw_without_becoming_causal_truth() {
+    fn p1o_recovery_mechanics_remain_raw_without_becoming_causal_truth() {
         let a = raw(vec![record(0, true, Some(false), Some(false))]);
         let mut b = a.clone();
         b.observations[0].recovery.clear();
@@ -1637,7 +1882,7 @@ mod p1k_tests {
             .as_mut()
             .unwrap()
             .committed_installs += 1;
-        assert_eq!(normalize(&a), normalize(&b));
+        assert_eq!(semantic_route(&a), semantic_route(&b));
         assert_ne!(
             serde_json::to_value(a).unwrap(),
             serde_json::to_value(b).unwrap()
@@ -1745,14 +1990,14 @@ mod p1k_tests {
         assert!(treatment_gate(&p).is_empty());
     }
     #[test]
-    fn p1m_v2_serializes_complete_diagnostics_and_checked_deltas_for_both_arms() {
+    fn p1m_diagnostics_v3_serializes_complete_diagnostics_and_checked_deltas_for_both_arms() {
         let mut r = report();
         finish_report(&mut r);
         assert!(r.qualification_pass);
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
             v["schema"],
-            "mer.predictor-v2-p1k-sidecar-runtime-qualifier.v2"
+            "mer.predictor-v2-p1k-sidecar-runtime-qualifier.v3"
         );
         for point in ["p1j_launch_before", "p1j_launch_after", "p1j_launch_delta"] {
             assert_eq!(
@@ -1897,6 +2142,7 @@ mod p1k_tests {
     #[test]
     fn ordinary_incomplete_pending_and_coverage_fail_closed() {
         let mut a = arm(Arm::Control);
+        a.runtime_shutdown = None;
         a.completed_positions = 1;
         a.raw_p1e_report.as_mut().unwrap().observations[0].outcome = p1e::Outcome::Pending;
         a.raw_p1e_report.as_mut().unwrap().observations[0]
@@ -1924,6 +2170,7 @@ mod p1k_tests {
     #[test]
     fn shutdown_gate_requires_both_controlled_and_released() {
         let mut a = arm(Arm::Control);
+        a.runtime_shutdown = None;
         assert!(!shutdown_complete(&a));
         for controlled in [false, true] {
             for released in [false, true] {
@@ -2150,6 +2397,474 @@ mod p1k_tests {
             ),
         ] {
             assert!(write.find(a).unwrap() < write.find(b).unwrap());
+        }
+    }
+
+    mod p1o_tests {
+        use super::*;
+
+        fn semantic_report_mismatch(change: impl FnOnce(&mut p1e::Report)) {
+            let mut r = report();
+            finish_report(&mut r);
+            assert!(r.qualification_pass);
+            change(r.treatment.raw_p1e_report.as_mut().unwrap());
+            finish_report(&mut r);
+            assert!(!r.parity.semantic_route_parity.exact_match);
+            assert!(!r.qualification_pass);
+            assert!(!r.mechanism.qualification_failure_reasons.is_empty());
+        }
+
+        #[test]
+        fn schema_v3_and_semantic_exact_equality_pass() {
+            let mut r = report();
+            finish_report(&mut r);
+            let v = serde_json::to_value(&r).unwrap();
+            assert_eq!(
+                v["schema"],
+                "mer.predictor-v2-p1k-sidecar-runtime-qualifier.v3"
+            );
+            assert!(r.qualification_pass);
+            assert!(r.parity.output_exact_match);
+            assert!(r.parity.semantic_route_parity.exact_match);
+            assert!(r.parity.evidence_structure_parity.exact_match);
+            assert_eq!(
+                v["parity"]["semantic_route_parity"]["control"],
+                v["parity"]["semantic_route_parity"]["treatment"]
+            );
+            assert!(v["parity"].get("normalized_p1e_exact_match").is_none());
+            assert_eq!(
+                v["mechanical_state_comparison"]["diff"]["divergent_observation_count"],
+                0
+            );
+            assert!(r
+                .mechanical_state_comparison
+                .diff
+                .as_ref()
+                .unwrap()
+                .field_divergence_counts
+                .values()
+                .all(|&n| n == 0));
+        }
+
+        macro_rules! candidate_mismatch {
+            ($name:ident, $($field:ident).+) => {
+                #[test]
+                fn $name() {
+                    mismatch(|r| r.freeze.candidate.$($field).+ += 1);
+                }
+            };
+        }
+        candidate_mismatch!(sequence_mismatch_fails, sequence);
+        candidate_mismatch!(candidate_generation_mismatch_fails, generation);
+        candidate_mismatch!(committed_cutoff_mismatch_fails, committed_position_cutoff);
+        candidate_mismatch!(table_cutoff_mismatch_fails, table_update_cutoff);
+        candidate_mismatch!(
+            source_position_mismatch_fails,
+            source_position.absolute_position
+        );
+        candidate_mismatch!(
+            target_position_mismatch_fails,
+            target_position.absolute_position
+        );
+        candidate_mismatch!(position_distance_mismatch_fails, position_distance);
+        candidate_mismatch!(nominal_layer_lead_mismatch_fails, nominal_layer_lead);
+        candidate_mismatch!(namespace_layer_mismatch_fails, namespace.layer);
+        candidate_mismatch!(model_layers_mismatch_fails, model.num_layers);
+        candidate_mismatch!(model_experts_mismatch_fails, model.num_experts);
+        candidate_mismatch!(model_top_k_mismatch_fails, model.top_k);
+        candidate_mismatch!(
+            request_phase_run_index_mismatch_fails,
+            request.phase_run_index
+        );
+
+        #[test]
+        fn position_kinds_and_kind_indices_must_match() {
+            mismatch(|r| {
+                r.freeze.candidate.source_position.position_kind =
+                    crate::predictor_v2::PositionKind::Decode
+            });
+            mismatch(|r| r.freeze.candidate.source_position.decode_index = Some(99));
+            mismatch(|r| r.freeze.candidate.target_position.decode_index = Some(99));
+        }
+
+        #[test]
+        fn report_and_deadline_request_semantics_must_match() {
+            semantic_report_mismatch(|r| r.request.phase = RequestPhase::Warmup);
+            semantic_report_mismatch(|r| r.request.phase_run_index += 1);
+            mismatch(|r| r.deadline.as_mut().unwrap().request.phase = RequestPhase::Warmup);
+            mismatch(|r| r.deadline.as_mut().unwrap().request.phase_run_index += 1);
+            mismatch(|r| r.deadline.as_mut().unwrap().position.absolute_position += 1);
+            mismatch(|r| r.deadline.as_mut().unwrap().position.decode_index = Some(99));
+            mismatch(|r| {
+                r.deadline.as_mut().unwrap().position.position_kind =
+                    crate::predictor_v2::PositionKind::Decode
+            });
+            mismatch(|r| {
+                r.deadline.as_mut().unwrap().incomplete = Some(p1e::Error::MissingDeadline)
+            });
+        }
+
+        #[test]
+        fn route_partitions_must_each_match() {
+            let mutations: &[fn(&mut p1e::Report)] = &[
+                |r| r.partitions.emitted += 1,
+                |r| r.partitions.resolved += 1,
+                |r| r.partitions.pending += 1,
+                |r| r.partitions.censored += 1,
+                |r| r.partitions.prediction_hits += 1,
+                |r| r.partitions.route_misses += 1,
+            ];
+            for change in mutations {
+                semantic_report_mismatch(change);
+            }
+        }
+
+        #[test]
+        fn readiness_and_report_incomplete_mismatch_fail() {
+            semantic_report_mismatch(|r| r.readiness_measured = true);
+            semantic_report_mismatch(|r| r.incomplete = Some(p1e::Error::Incomplete));
+        }
+
+        #[test]
+        fn reported_prediction_hit_sequence_and_presence_are_semantic() {
+            semantic_report_mismatch(|r| r.opportunities[0].1.prediction_hit = Some(false));
+            semantic_report_mismatch(|r| r.opportunities[0].1.prediction_hit = None);
+            semantic_report_mismatch(|r| r.opportunities[0].0 += 1);
+            semantic_report_mismatch(|r| r.opportunities.clear());
+            semantic_report_mismatch(|r| r.opportunities.push(r.opportunities[0]));
+            semantic_report_mismatch(|r| r.observations.clear());
+            semantic_report_mismatch(|r| r.observations.push(r.observations[0].clone()));
+        }
+
+        fn evidence_mismatch(change: impl FnOnce(&mut p1e::Observation), semantic_equal: bool) {
+            let mut r = report();
+            change(&mut r.treatment.raw_p1e_report.as_mut().unwrap().observations[0]);
+            finish_report(&mut r);
+            assert_eq!(r.parity.semantic_route_parity.exact_match, semantic_equal);
+            assert!(!r.parity.evidence_structure_parity.exact_match);
+            assert!(!r.qualification_pass);
+        }
+        #[test]
+        fn f_evidence_presence_mismatch_fails() {
+            evidence_mismatch(|r| r.freeze.physical = None, true);
+        }
+        #[test]
+        fn deadline_presence_mismatch_fails() {
+            evidence_mismatch(|r| r.deadline = None, false);
+        }
+        #[test]
+        fn d_evidence_presence_mismatch_fails() {
+            evidence_mismatch(|r| r.deadline.as_mut().unwrap().physical = None, true);
+        }
+
+        #[test]
+        fn missing_reports_fail_closed_and_do_not_claim_zero_mechanical_divergence() {
+            for missing in 0..3 {
+                let mut r = report();
+                if missing != 0 {
+                    r.control.raw_p1e_report = None;
+                }
+                if missing != 1 {
+                    r.treatment.raw_p1e_report = None;
+                }
+                finish_report(&mut r);
+                assert!(!r.parity.semantic_route_parity.exact_match);
+                assert!(!r.parity.evidence_structure_parity.exact_match);
+                assert!(!r.qualification_pass);
+                assert!(r.mechanical_state_comparison.diff.is_none());
+            }
+        }
+
+        #[test]
+        fn physical_opportunity_fields_are_descriptive_and_counted_independently() {
+            let mutations: &[(&str, fn(&mut p1e::Opportunities))] = &[
+                ("physical_miss_at_f", |o| o.physical_miss_at_f = Some(false)),
+                ("physical_miss_at_d", |o| o.physical_miss_at_d = Some(false)),
+                ("useful", |o| o.useful = Some(false)),
+                ("target_confirmed_useful", |o| {
+                    o.target_confirmed_useful = Some(false)
+                }),
+                ("already_resident", |o| o.already_resident = Some(true)),
+                ("redundant_route_hit", |o| {
+                    o.redundant_route_hit = Some(true)
+                }),
+            ];
+            for &(field, change) in mutations {
+                let r = mechanical_change(|r| change(&mut r.opportunities[0].1));
+                let diff = r.mechanical_state_comparison.diff.unwrap();
+                assert_eq!(diff.divergent_observation_count, 0);
+                assert_eq!(diff.divergent_reported_opportunity_count, 1);
+                assert_eq!(diff.divergent_reported_opportunity_sequences, vec![0]);
+                assert_eq!(diff.reported_opportunity_field_divergence_counts[field], 1);
+                assert_eq!(
+                    diff.reported_opportunity_field_divergence_counts
+                        .values()
+                        .sum::<usize>(),
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn physical_partition_divergence_does_not_fail_qualification() {
+            let mutations: &[(&str, fn(&mut p1e::Partitions))] = &[
+                ("valid_f", |p| p.valid_f += 1),
+                ("current_at_f", |p| p.current_at_f += 1),
+                ("absent_at_f", |p| p.absent_at_f += 1),
+                ("useful", |p| p.useful += 1),
+                ("target_confirmed_useful", |p| {
+                    p.target_confirmed_useful += 1
+                }),
+            ];
+            for &(field, change) in mutations {
+                let r = mechanical_change(|r| change(&mut r.partitions));
+                let v = serde_json::to_value(&r.mechanical_state_comparison).unwrap();
+                assert_eq!(
+                    v["treatment"]["physical_partitions"][field]
+                        .as_u64()
+                        .unwrap(),
+                    v["control"]["physical_partitions"][field].as_u64().unwrap() + 1
+                );
+            }
+        }
+
+        #[test]
+        fn p1n_shape_same_semantics_with_ten_mechanical_divergences_passes() {
+            let mut r = report();
+            let control = raw((0..13)
+                .map(|s| record(s, s < 9, Some(false), Some(false)))
+                .collect());
+            let mut observations = control.observations.clone();
+            for o in &mut observations[..10] {
+                o.freeze.current = Some(true);
+                o.deadline.as_mut().unwrap().current = Some(true);
+                o.freeze.source.logical_generation = None;
+                o.freeze.source.logical_materialized = true;
+                o.freeze.source.ram_resident = true;
+            }
+            let treatment = raw(observations);
+            r.control.raw_p1e_report = Some(control);
+            r.treatment.raw_p1e_report = Some(treatment);
+            r.treatment.predictor_v2_snapshot = Some(ReconciliationSnapshot {
+                emitted: 13,
+                terminal_predictions: 13,
+                accepted: 13,
+                source_leaders: 13,
+                source_completed: 13,
+                reservations: 13,
+                reservations_committed: 13,
+                install_owners: 13,
+                direct_matching_demand_credits: 9,
+                terminal_categories: vec![
+                    (TerminalReason::ConsumedByMatchingRoute, 9),
+                    (TerminalReason::EvictedUnused, 4),
+                ],
+                ..Default::default()
+            });
+            finish_launch_diagnostics(
+                &mut r.treatment,
+                P1jLaunchSnapshot {
+                    launch_considered: 13,
+                    source_checkpoint_recovered_clean: 13,
+                    writer_spawned: 13,
+                    ..Default::default()
+                },
+            );
+            finish_report(&mut r);
+            assert!(r.qualification_pass);
+            let v = serde_json::to_value(&r.mechanical_state_comparison).unwrap();
+            assert_eq!(v["diff"]["divergent_observation_count"], 10);
+            assert_eq!(
+                v["diff"]["divergent_sequences"],
+                json!((0..10).collect::<Vec<_>>())
+            );
+            assert_eq!(v["diff"]["divergent_reported_opportunity_count"], 10);
+            let counts = &v["diff"]["field_divergence_counts"];
+            for field in [
+                "f_current",
+                "d_current",
+                "f_source_logical_generation_present",
+                "f_source_logical_materialized",
+                "f_source_ram_resident",
+                "physical_miss_at_f",
+                "physical_miss_at_d",
+                "already_resident",
+            ] {
+                assert_eq!(counts[field], 10, "{field}");
+            }
+            for field in ["useful", "target_confirmed_useful", "redundant_route_hit"] {
+                assert_eq!(counts[field], 9, "{field}");
+            }
+            assert_eq!(counts["f_source_permanence"], 0);
+            assert_eq!(counts["sequence"], 0);
+            assert_eq!(
+                v["control"]["physical_partitions"],
+                json!({"valid_f":13,"current_at_f":0,"absent_at_f":13,"useful":9,"target_confirmed_useful":9})
+            );
+            assert_eq!(
+                v["treatment"]["physical_partitions"],
+                json!({"valid_f":13,"current_at_f":10,"absent_at_f":3,"useful":0,"target_confirmed_useful":0})
+            );
+            assert_eq!(
+                v["control"]["observations"][0]["f_source_permanence"],
+                "Unknown"
+            );
+        }
+
+        #[test]
+        fn mechanical_rows_preserve_order_duplicates_missing_rows_and_unknown_values() {
+            let mut r = report();
+            r.treatment
+                .raw_p1e_report
+                .as_mut()
+                .unwrap()
+                .observations
+                .push(record(0, true, None, None));
+            finish_report(&mut r);
+            assert!(!r.qualification_pass);
+            let m = &r.mechanical_state_comparison;
+            assert_eq!(m.treatment.as_ref().unwrap().observations.len(), 2);
+            assert_eq!(m.diff.as_ref().unwrap().divergent_observation_count, 1);
+            assert_eq!(m.diff.as_ref().unwrap().divergent_sequences, vec![0]);
+            let v = serde_json::to_value(m).unwrap();
+            assert!(v["treatment"]["observations"][1]["f_current"].is_null());
+            assert!(v["treatment"]["observations"][1]["useful"].is_null());
+            assert_eq!(
+                v["diff"]["field_divergence_counts"]["f_source_permanence"],
+                1
+            );
+        }
+
+        #[test]
+        fn raw_p1e_reports_remain_lossless_through_finish_and_serialization() {
+            let mut r = report();
+            let raw = r.treatment.raw_p1e_report.as_mut().unwrap();
+            raw.request.runtime_namespace = 919;
+            raw.observations[0].freeze.timestamp_ns = 123456;
+            raw.observations[0].freeze.source.logical_generation = Some(5678);
+            let recovery = raw.observations[0].recovery[0];
+            raw.observations[0].recovery.push(recovery);
+            raw.observations[0]
+                .completion_physical
+                .as_mut()
+                .unwrap()
+                .committed_installs = 99;
+            let before_c = serde_json::to_value(&r.control.raw_p1e_report).unwrap();
+            let before_t = serde_json::to_value(&r.treatment.raw_p1e_report).unwrap();
+            finish_report(&mut r);
+            let v = serde_json::to_value(&r).unwrap();
+            assert_eq!(v["control"]["raw_p1e_report"], before_c);
+            assert_eq!(v["treatment"]["raw_p1e_report"], before_t);
+            let restored: p1e::Report =
+                serde_json::from_value(v["treatment"]["raw_p1e_report"].clone()).unwrap();
+            assert_eq!(&restored, r.treatment.raw_p1e_report.as_ref().unwrap());
+        }
+
+        #[test]
+        fn output_movement_diagnostics_errors_invariants_and_shutdown_stay_hard() {
+            let changes: &[fn(&mut Report)] = &[
+                |r| r.treatment.generated_token_ids[0] += 1,
+                |r| r.treatment.generated_token_ids_sha256 = "wrong".into(),
+                |r| r.treatment.predictor_v2_snapshot.as_mut().unwrap().emitted = 0,
+                |r| {
+                    r.treatment
+                        .predictor_v2_snapshot
+                        .as_mut()
+                        .unwrap()
+                        .direct_matching_demand_credits = 0
+                },
+                |r| r.control.predictor_v2_snapshot.as_mut().unwrap().emitted = 1,
+                |r| r.control.p1j_launch_delta.as_mut().unwrap().writer_spawned = 1,
+                |r| {
+                    r.treatment
+                        .p1j_launch_delta
+                        .as_mut()
+                        .unwrap()
+                        .writer_spawned = 0
+                },
+                |r| r.control.p1j_launch_before = None,
+                |r| r.treatment.p1j_launch_after = None,
+                |r| r.control.ordinary_invariants_pass = false,
+                |r| r.treatment.ordinary_invariants_pass = false,
+                |r| r.control.errors.push("control failure".into()),
+                |r| r.treatment.errors.push("treatment failure".into()),
+                |r| r.control.runtime_shutdown = None,
+                |r| r.treatment.runtime_shutdown = None,
+                |r| {
+                    r.control
+                        .runtime_shutdown
+                        .as_mut()
+                        .unwrap()
+                        .controlled_shutdown_requested = false
+                },
+                |r| {
+                    r.treatment
+                        .runtime_shutdown
+                        .as_mut()
+                        .unwrap()
+                        .all_runtime_resources_released = false
+                },
+            ];
+            for (i, change) in changes.iter().enumerate() {
+                let mut r = mechanical_change(|r| r.observations[0].freeze.current = Some(true));
+                change(&mut r);
+                finish_report(&mut r);
+                assert!(!r.qualification_pass, "mutation {i}");
+                assert!(!r.mechanism.qualification_failure_reasons.is_empty());
+                let v = serde_json::to_value(&r).unwrap();
+                assert_eq!(v["performance_verdict"], "NOT_AUTHORIZED");
+                assert_eq!(v["performance_comparison_authorized"], false);
+                assert_eq!(v["resource_footprint_matched"], false);
+            }
+        }
+
+        #[test]
+        fn one_file_source_contract_against_exact_p1m_and_no_activation() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .current_dir(root)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap()
+            };
+            assert_eq!(
+                git(&[
+                    "show",
+                    "-s",
+                    "--format=%T",
+                    "02530dd3b0cc7bd4771d99f23a3640db67aba29d"
+                ])
+                .trim(),
+                "bd1959f2b9398a7356ad0bcadb6ba38e4810746b"
+            );
+            assert_eq!(
+                git(&[
+                    "diff",
+                    "--name-only",
+                    "02530dd3b0cc7bd4771d99f23a3640db67aba29d",
+                    "--"
+                ])
+                .trim(),
+                "rust-engine/src/gpu_native_predictor_v2_sidecar_qualifier.rs"
+            );
+            assert!(git(&["ls-files", "--others", "--exclude-standard"])
+                .trim()
+                .is_empty());
+            no_serving_config_environment_or_direct_main_activation();
+            only_ordinary_step_token_and_no_runtime_in_tests();
+            let frozen = FrozenContract::default();
+            assert!(!frozen.serving_activation);
+            assert_eq!(
+                serde_json::to_value(PerformanceBoundary).unwrap()["performance_verdict"],
+                "NOT_AUTHORIZED"
+            );
         }
     }
 }
