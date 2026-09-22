@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 64" width="320" height="64" role="img" aria-label="Amalgafy">
+  <title>Amalgafy</title>
+  <style>
+    .wordmark, .dot { fill: #0F1115; }
+    .accent { fill: #1FB68A; }
+    @media (prefers-color-scheme: dark) {
+      .wordmark, .dot { fill: #F0F6FC; }
+    }
+  </style>
+  <g>
+    <circle class="accent" cx="16" cy="24" r="5"/>
+    <circle class="dot" cx="34" cy="24" r="5"/>
+    <circle class="dot" cx="16" cy="42" r="5"/>
+    <circle class="dot" cx="34" cy="42" r="5"/>
+  </g>
+  <text class="wordmark"
+        x="58" y="44"
+        font-family="Inter, 'Helvetica Neue', Arial, sans-serif"
+        font-weight="800"
+        font-size="32"
+        letter-spacing="1">AMALGAFY</text>
+</svg>
