@@ -285,7 +285,7 @@ Ordinary demand remains authoritative. The sidecar cannot substitute a different
 
 ---
 
-## Model support
+## Supported model architectures
 
 MER has architecture-aware loading and execution code for multiple model families, but **implemented parsing is not the same thing as hardware qualification**.
 
