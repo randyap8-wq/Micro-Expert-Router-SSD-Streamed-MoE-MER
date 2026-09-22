@@ -4,7 +4,7 @@
 
 MER is an experimental inference runtime for sparse Mixture-of-Experts (MoE) models that treats **NVMe/SSD, system RAM, and GPU VRAM as one managed expert-residency hierarchy**.
 
-Instead of requiring every routed expert to remain permanently in VRAM, MER keeps expert weights in lower-cost storage tiers and materializes the experts needed by the active route onto the execution tier. The current GPU path uses **WGPU/Vulkan** for routed-expert execution while dense transformer work, attention, KV state, routing, and orchestration can remain on the host.
+Instead of requiring every routed expert to remain permanently in VRAM, MER keeps expert weights in lower-cost storage tiers and materializes the experts needed by the active route into bounded GPU residency. The current primary path is a **GPU-owned full transformer token loop over WGPU/Vulkan**: embedding, attention/KV, routing, routed-expert execution, final normalization, LM head, and greedy token selection execute on the GPU while the host manages storage, residency, recovery, and orchestration.
 
 The project started as a CPU/SSD-streaming engine. That work is still part of MER, but it is now the storage and fallback foundation for a broader constrained-memory inference architecture.
 
@@ -20,29 +20,51 @@ The project started as a CPU/SSD-streaming engine. That work is still part of ME
 
 ## Why MER exists
 
-Large sparse MoE models have a useful property: only a small subset of experts is active for each token.
+Sparse MoE models reduce **compute per token**, but they do not automatically reduce the **memory footprint of the expert set**. A model may activate only a handful of experts at each layer while still containing far more expert weights than a practical accelerator can keep resident at once.
 
-The conventional deployment answer is still often to provision enough accelerator memory for the whole expert set—or to accept expensive transfers and framework-level offload when it does not fit.
+That creates a different systems problem from ordinary dense-model inference: the GPU can have enough compute for the active route while still lacking enough VRAM for the model's complete expert population.
 
-MER explores a different execution model:
+MER is built around that mismatch.
 
-\`\`\`text
-                    ┌───────────────────────────┐
-                    │  Dense / attention plane  │
-                    │ CPU today; GPU work may   │
-                    │ expand independently      │
-                    └─────────────┬─────────────┘
-                                  │
-                           router selects
-                                  │
-                                  ▼
-NVMe / SSD  ──▶  Host expert cache  ──▶  Physical GPU residency  ──▶  Q4 routed experts
- backing          RAM / generations       bounded VRAM                WGPU / Vulkan
- store                  │                        │
-                        └──── recovery / install ┴──── constrained-memory execution
-\`\`\`
+```text
+                         committed token
+                               │
+                               ▼
+              ┌────────────────────────────────┐
+              │   GPU-owned transformer loop   │
+              │                                │
+              │ embedding → attention / KV     │
+              │          → router / top-k      │
+              │          → routed experts      │
+              │          → final norm / head   │
+              │          → greedy token        │
+              └────────────────┬───────────────┘
+                               │ selected experts
+                               ▼
+              ┌────────────────────────────────┐
+              │   MER expert residency layer   │
+              │                                │
+              │ exact physical hit in VRAM?    │
+              │       │ yes          │ no      │
+              │       ▼              ▼         │
+              │   execute       resolve source │
+              └──────────────────────┬─────────┘
+                                     │
+                           ┌─────────┴─────────┐
+                           ▼                   ▼
+                    host payload / RAM     NVMe / SSD
+                           │                   │
+                           └─────────┬─────────┘
+                                     ▼
+                           bounded VRAM install
+                                     │
+                                     ▼
+                           continue GPU execution
+```
 
-The goal is not “CPU inference instead of GPU inference.” The goal is to make **expert residency itself virtualized and explicit**, so useful GPU execution remains possible when the routed-expert working set is larger than the VRAM budget.
+The key idea is that **GPU execution and expert residency are separate concerns**. MER keeps the token path GPU-native while treating routed-expert weights as a virtualized memory population that can move through NVMe/SSD, RAM, and constrained VRAM as demand changes.
+
+That is the core product thesis: a sparse model should not require its entire expert set to be permanently resident on the accelerator simply because the active token path executes there.
 
 ---
 
@@ -53,18 +75,20 @@ MER is a Rust runtime with separate storage, routing, residency, execution, and 
 ### Expert storage and host residency
 
 - Expert weights can live outside accelerator memory and be brought in on demand.
-- Linux storage paths support page-aligned direct I/O and optional \`io_uring\`.
+- Linux storage paths support page-aligned direct I/O and optional `io_uring`.
 - A host expert cache tracks payloads, generations, residency, and eviction independently from physical GPU state.
 - Packed expert storage, cache policies, predictive prefetching, and historical CPU streaming paths remain available for storage-oriented experiments.
 
-### GPU-native routed experts
+### GPU-native token execution
 
 - WGPU is compiled into the standard runtime and can use Vulkan-backed hardware adapters.
-- Routed experts can execute on the GPU while attention, router, dense projections, KV, embeddings, and LM head remain on the CPU.
-- MER tracks **logical admission** separately from **physical device residency**.
-- Generation checks prevent stale logical admissions from being treated as valid GPU-resident weights.
-- The GPU expert registry is bounded by a configured expert-weight budget; workspaces are tracked separately.
+- The primary GPU-native path owns the full autoregressive transformer token loop: embedding, attention/KV, router/top-k, Q4 routed-expert compute/combine, final RMSNorm, LM head, and greedy argmax.
+- Host code remains responsible for runtime orchestration, storage access, expert-source resolution, residency service, recovery control, and telemetry.
+- MER tracks **logical host admission** separately from **physical device residency**.
+- Generation checks prevent stale host admissions from being treated as valid GPU-resident weights.
+- The physical GPU expert registry is bounded by a configured expert-weight budget; non-expert GPU workspaces are accounted separately.
 - Explicit GPU modes fail closed when the required device or execution contract cannot be satisfied.
+- CPU and Hybrid paths remain useful as references, fallbacks, and historical qualification surfaces; they are not the primary architecture described here.
 
 ### Quantized expert execution
 
@@ -91,7 +115,7 @@ The primary current qualification target is:
 | Field | Current target |
 |---|---|
 | Model | Qwen3-Coder-30B-A3B-Instruct |
-| Architecture | \`qwen3_moe\` |
+| Architecture | `qwen3_moe` |
 | Routed expert dtype | Q4_0 |
 | Transformer layers | 48 |
 | Experts per layer | 128 |
@@ -124,7 +148,7 @@ This is different from the older generic SSD prefetch logic:
 
 ### Latest certified Predictor-v2 result
 
-Predictor-v2 is currently a **validated development branch**, not yet part of frozen \`main\`.
+Predictor-v2 is currently a **validated development branch**, not yet part of frozen `main`.
 
 The P1O certification on an NVIDIA L4 completed successfully with:
 
@@ -162,23 +186,24 @@ Until that work closes, Predictor-v2 should be described as **correctness/mechan
 
 ---
 
-## What is on \`main\` vs. current development work?
+## What is on `main` vs. current development work?
 
 MER is developed with strict qualification branches, so the newest validated research can be ahead of the frozen production branch.
 
-### Frozen \`main\`
+### Frozen `main`
 
 The mainline runtime contains the core MER execution architecture, including:
 
 - Rust orchestration and full-transformer paths;
 - SSD/RAM expert streaming and cache management;
 - WGPU/Vulkan GPU backend;
+- GPU-owned full transformer token loop;
 - bounded physical GPU expert residency;
-- GPU-native Q4_0 routed-expert execution;
+- GPU-native Q4_0 routed-expert execution/combine;
 - strict hardware qualification seams;
 - checkpointed physical-residency recovery;
 - OpenAI-style serving infrastructure and telemetry;
-- optional \`io_uring\`, distributed expert sharding, and historical CPU execution paths.
+- optional `io_uring`, distributed expert sharding, and historical CPU execution paths.
 
 ### Qualified development work
 
@@ -188,51 +213,75 @@ This distinction is intentional: MER does not merge a mechanism merely because i
 
 ---
 
-## Execution hierarchy
+## Execution and residency flow
 
-At a high level, MER treats expert execution as a hierarchy rather than a single cache:
+MER does not route the entire model through a storage hierarchy. The **transformer token loop stays on the GPU**; the hierarchy is specifically for the routed-expert weights that may not fit in the configured VRAM budget.
 
-\`\`\`text
-                   route demand
-                       │
-                       ▼
-              ┌──────────────────┐
-              │ ordinary GPU     │
-              │ physical expert  │
-              │ residency        │
-              └────────┬─────────┘
-                       │ miss
-                       ▼
-              ┌──────────────────┐
-              │ host expert      │
-              │ payload / cache  │
-              └────────┬─────────┘
-                       │ miss
-                       ▼
-              ┌──────────────────┐
-              │ NVMe / SSD       │
-              │ backing store    │
-              └──────────────────┘
+```text
+GPU token state
+     │
+     ▼
+embedding → attention / KV → router / top-k
+                              │
+                              │ selected expert IDs + generations
+                              ▼
+                    ┌─────────────────────┐
+                    │ physical GPU expert │
+                    │ residency lookup    │
+                    └─────────┬───────────┘
+                              │
+                 ┌────────────┴────────────┐
+                 │ hit                     │ miss
+                 ▼                         ▼
+        Q4 expert compute          exact host source?
+        + weighted combine          │
+                 │             ┌────┴────┐
+                 │             │ yes     │ no
+                 │             ▼         ▼
+                 │          RAM / host   NVMe / SSD
+                 │             │         backing store
+                 │             └────┬────┘
+                 │                  ▼
+                 │          physical VRAM install
+                 │                  │
+                 └──────────────────┴──────────────▶ continue token loop
+                                                    │
+                                                    ▼
+                                          final norm → LM head
+                                                    │
+                                                    ▼
+                                             greedy token
+```
 
-Predictor-v2 development path:
+A physical miss therefore does not turn the whole request into CPU inference. MER services the missing expert through the tiered residency path and then continues the GPU-native token execution path under the qualified recovery contract.
 
-committed route p
-      │
-      ▼
-future expert prediction
-      │
-      ├── already current ──▶ no movement
-      │
-      └── host-backed + absent
-                 │
-                 ▼
-        isolated GPU sidecar
-                 │
-                 ▼
-       matching future demand
-\`\`\`
+**Logical host admission is not physical GPU residency.** Host cache/admission state says that MER has a valid source payload and generation available; the physical residency registry says whether the exact expert generation is currently installed on the GPU.
 
-Logical host admission and physical GPU residency are intentionally separate concepts. Metrics that report logical GPU admission should not be interpreted as proof that an expert is physically resident on the device.
+### Predictor-v2 development path
+
+Predictor-v2 is orthogonal to ordinary demand residency. It uses committed routing evidence to try to move a future expert **before** demand reaches it:
+
+```text
+committed route evidence
+          │
+          ▼
+predict one future expert
+          │
+          ├── already physically current ──▶ no movement
+          │
+          └── exact host-backed source + absent
+                         │
+                         ▼
+                isolated sidecar residency
+                         │
+                         ▼
+               matching future route
+                         │
+                         ▼
+                 direct demand credit
+```
+
+Ordinary demand remains authoritative. The sidecar cannot substitute a different expert, weaken generation checks, or turn a prediction into credit unless matching real demand consumes the moved residency.
 
 ---
 
@@ -242,7 +291,7 @@ MER has architecture-aware loading and execution code for multiple model familie
 
 | Status | Model families / scope |
 |---|---|
-| Current primary qualification target | Qwen3-Coder-30B-A3B / \`qwen3_moe\` |
+| Current primary qualification target | Qwen3-Coder-30B-A3B / `qwen3_moe` |
 | Implemented MoE architecture paths | Mixtral/Llama-style MoE, Qwen3-MoE, DeepSeek-V3/V3.1, MiMo-V2-Flash, GPT-OSS paths |
 | Dense paths | Qwen3 dense, Mistral Small 3, Phi-family dense loading/execution paths |
 | Historical benchmark target | Mixtral 8x7B |
@@ -254,45 +303,55 @@ Use model-specific qualification evidence before treating a checkpoint as suppor
 
 ## Build
 
-The engine lives in [\`rust-engine/\`](rust-engine/).
+The engine lives in [`rust-engine/`](rust-engine/).
 
 A current portable release build is:
 
-\`\`\`bash
+```bash
 cd rust-engine
 cargo build --release --features tokenizer
-\`\`\`
+```
 
 Run the software test suite with:
 
-\`\`\`bash
+```bash
 cargo test --locked --features tokenizer
-\`\`\`
+```
 
-Linux deployments that intentionally use the direct-I/O reactor can add the optional \`io_uring\` feature. CPU kernel features such as \`avx512\` are opt-in and runtime-gated.
+### Quick start
 
-WGPU support is part of the normal runtime; the legacy \`gpu\` Cargo feature is retained only for backward compatibility and is a no-op.
+For a local smoke test without a real model checkpoint, the repository includes a synthetic-data quick start:
 
-The separate \`cuda\` feature enables the Candle CUDA path and is distinct from the WGPU/Vulkan routed-expert path.
+```bash
+./scripts/quickstart.sh
+```
+
+It generates a small synthetic expert set and starts `micro-expert-router serve` with the root configuration. This is a **bring-up path**, not the Qwen3-Coder GPU-native qualification workload or a performance benchmark. For real-model deployment and API operation, see [`docs/production.md`](docs/production.md).
+
+Linux deployments that intentionally use the direct-I/O reactor can add the optional `io_uring` feature. CPU kernel features such as `avx512` are opt-in and runtime-gated.
+
+WGPU support is part of the normal runtime; the legacy `gpu` Cargo feature is retained only for backward compatibility and is a no-op.
+
+The separate `cuda` feature enables the Candle CUDA path and is distinct from the WGPU/Vulkan routed-expert path.
 
 ---
 
 ## Configuration
 
-The annotated root [\`config.toml\`](config.toml) documents the runtime configuration.
+The annotated root [`config.toml`](config.toml) documents the runtime configuration.
 
 Important concepts:
 
-- \`[real_transformer]\` enables real decoder execution instead of the legacy benchmark generator.
-- \`[gpu_cache]\` controls logical GPU admission and the bounded physical routed-expert budget.
-- \`[storage]\` controls the host expert cache and backing-store behavior.
-- \`[sampling]\` controls deterministic or stochastic token sampling.
-- \`[performance]\` contains host-side placement and worker controls.
-- \`[distributed]\` configures optional expert partitioning across nodes.
+- `[real_transformer]` enables real decoder execution instead of the legacy benchmark generator.
+- `[gpu_cache]` controls logical GPU admission and the bounded physical routed-expert budget.
+- `[storage]` controls the host expert cache and backing-store behavior.
+- `[sampling]` controls deterministic or stochastic token sampling.
+- `[performance]` contains host-side placement and worker controls.
+- `[distributed]` configures optional expert partitioning across nodes.
 
 For deterministic qualification, MER generally uses greedy sampling and explicit fail-closed hardware contracts.
 
-For deployment and API details, see [\`docs/production.md\`](docs/production.md).
+For deployment and API details, see [`docs/production.md`](docs/production.md).
 
 ---
 
@@ -300,21 +359,21 @@ For deployment and API details, see [\`docs/production.md\`](docs/production.md)
 
 MER includes an OpenAI-style HTTP serving path and native telemetry.
 
-The runtime exposes observability for:
+The normal operational endpoints expose:
 
 - host expert-cache activity;
-- logical GPU admission;
-- physical GPU expert residency;
+- logical GPU-admission activity;
 - promotions and evictions;
-- source and install activity;
-- routed-expert execution;
+- source/install and routed-expert activity;
 - request/runtime health.
 
-The native terminal monitor can consume the health and metrics endpoints for a live view of storage and residency activity.
+The compatibility `vram_*` Prometheus gauges and the terminal monitor describe **logical admission / host-side cache state**, not an authoritative count of live WGPU expert allocations. Exact physical GPU expert residency and byte accounting are maintained by MER's internal physical-residency snapshot interfaces and are used by qualification paths.
+
+That distinction matters operationally: a logically admitted expert may be a valid source for GPU installation without already being physically present on the device.
 
 Production deployment guidance, authentication, rate limiting, health endpoints, and operational caveats live in:
 
-- [\`docs/production.md\`](docs/production.md)
+- [`docs/production.md`](docs/production.md)
 
 ---
 
@@ -338,7 +397,7 @@ What changed is the role of that work.
 
 CPU-only execution is now **one execution/fallback mode and an important historical baseline**, not the project's primary identity.
 
-Historical CPU benchmark reports remain available under [\`docs/benchmarks/\`](docs/benchmarks/), including:
+Historical CPU benchmark reports remain available under [`docs/benchmarks/`](docs/benchmarks/), including:
 
 - [Qwen3-Coder 30B-A3B Q8 CPU full-transformer validation](docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md)
 - [Mixtral 8x7B CPU cache-scaling study](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md)
@@ -364,14 +423,14 @@ That distinction is intentional and is reflected throughout the qualification is
 
 | Path | Purpose |
 |---|---|
-| [\`rust-engine/\`](rust-engine/) | Core Rust inference runtime |
-| [\`rust-engine/src/backend/\`](rust-engine/src/backend/) | CPU/GPU execution backends |
-| [\`config.toml\`](config.toml) | Annotated runtime configuration |
-| [\`docs/production.md\`](docs/production.md) | Serving and deployment guidance |
-| [\`docs/audit-findings.md\`](docs/audit-findings.md) | Runtime/model-loading audit notes |
-| [\`docs/distributed.md\`](docs/distributed.md) | Distributed expert-sharding design and transport |
-| [\`docs/benchmarks/\`](docs/benchmarks/) | Current and historical qualification/benchmark evidence |
-| [\`scripts/\`](scripts/) | Model conversion, extraction, and support tooling |
+| [`rust-engine/`](rust-engine/) | Core Rust inference runtime |
+| [`rust-engine/src/backend/`](rust-engine/src/backend/) | CPU/GPU execution backends |
+| [`config.toml`](config.toml) | Annotated runtime configuration |
+| [`docs/production.md`](docs/production.md) | Serving and deployment guidance |
+| [`docs/audit-findings.md`](docs/audit-findings.md) | Runtime/model-loading audit notes |
+| [`docs/distributed.md`](docs/distributed.md) | Distributed expert-sharding design and transport |
+| [`docs/benchmarks/`](docs/benchmarks/) | Current and historical qualification/benchmark evidence |
+| [`scripts/`](scripts/) | Model conversion, extraction, and support tooling |
 
 ---
 
@@ -400,13 +459,13 @@ Useful starting points:
 - [Mixtral CPU cache-scaling study](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md)
 - [All benchmark and qualification notes](docs/benchmarks/)
 
-For the newest Predictor-v2 development evidence, use the linked GitHub qualification issues above; those results are intentionally not rewritten as \`main\` benchmark documents until that development lane is merged.
+For the newest Predictor-v2 development evidence, use the linked GitHub qualification issues above; those results are intentionally not rewritten as `main` benchmark documents until that development lane is merged.
 
 ---
 
 ## License
 
-MER is distributed under the **Business Source License 1.1** with the additional-use terms and Change Date defined in [\`LICENSE\`](LICENSE).
+MER is distributed under the **Business Source License 1.1** with the additional-use terms and Change Date defined in [`LICENSE`](LICENSE).
 
 Non-commercial research, evaluation, and other uses are governed by the license text. Commercial use requires a separate commercial license.
 
