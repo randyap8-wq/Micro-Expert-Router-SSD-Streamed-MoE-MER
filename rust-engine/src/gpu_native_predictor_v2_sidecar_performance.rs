@@ -1115,6 +1115,7 @@ async fn shutdown(runtime: crate::BenchRealRuntime, report: &mut ArmReport) {
 enum ExperimentMode {
     AaNoiseCalibration,
     AbMovement,
+    FdLifetimeDiagnostic,
 }
 impl ExperimentMode {
     fn request_mode(self, arm: Arm) -> P1jRequestMode {
@@ -1128,6 +1129,7 @@ impl ExperimentMode {
         match self {
             Self::AaNoiseCalibration => ["A", "B"],
             Self::AbMovement => ["C", "T"],
+            Self::FdLifetimeDiagnostic => unreachable!("FD diagnostic has no performance arms"),
         }
     }
 }
@@ -1626,6 +1628,9 @@ fn finish_experiment(report: &mut Report) -> Result<()> {
                 }
             }
         }
+        ExperimentMode::FdLifetimeDiagnostic => {
+            return Err("FD diagnostic cannot produce a performance report".into());
+        }
     }
     report.statistics = Some(stats);
     Ok(())
@@ -1890,13 +1895,7 @@ async fn run_arm(
         Err(e) => report.errors.push(e.to_string()),
         Ok((spec, tokenizer, prompt)) => {
             report.runtime_build_attempted = true;
-            match crate::build_isolated_greedy_runtime(
-                &spec,
-                crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
-                tokenizer.clone(),
-            )
-            .await
-            {
+            match build_p1q_isolated_runtime(&spec, tokenizer.clone()).await {
                 Err(e) => report.errors.push(e.to_string()),
                 Ok(runtime) => {
                     report.runtime_constructed = true;
@@ -1940,8 +1939,24 @@ async fn run_arm(
     report
 }
 
+// One exact factory bridge for both lanes; no request preparation or execution.
+async fn build_p1q_isolated_runtime(
+    spec: &crate::ResolvedRealCliSpec,
+    tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+) -> Result<crate::BenchRealRuntime> {
+    crate::build_isolated_greedy_runtime(
+        spec,
+        crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
+        tokenizer,
+    )
+    .await
+}
+
 pub(crate) async fn run_command(args: CommandArgs) -> Result<()> {
     validate_args(&args)?;
+    if args.experiment_mode == ExperimentMode::FdLifetimeDiagnostic {
+        return run_fd_diagnostic(&args).await;
+    }
     ensure_output_absent(&args.report_out)?;
     let request_bytes = std::fs::read(&args.request_json)?;
     parse_request(&request_bytes)?;
@@ -2025,6 +2040,492 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<()> {
     write_report(&args.report_out, &report)?;
     if !report.qualification_pass {
         return Err("P1Q certification failed; complete evidence retained".into());
+    }
+    Ok(())
+}
+
+// P1Q2 is a separate, construction/shutdown-only lane (issue #203). No delay:
+// immediate post-shutdown retention remains visible even if later released.
+const FD_SCHEMA: &str = "mer.predictor-v2-p1q2-fd-lifetime.v1";
+const FD_MAX_ITERATIONS: usize = 12;
+const FD_TARGET_SUMMARY_LIMIT: usize = 16;
+const FD_SELF_OBSERVATION_RULE: &str = "exclude exactly dirfd of this census's /proc/self/fd DIR; retain all other descriptors, including other proc directory handles";
+const FD_RESERVED: usize = 128;
+const FD_CACHE_MIN: usize = 64;
+const FD_CACHE_MAX: usize = 65_536;
+
+#[derive(Debug, Serialize)]
+struct FdLimits {
+    soft: u64,
+    hard: u64,
+    reserved_fd_assumption: usize,
+    default_cache_min: usize,
+    default_cache_max: usize,
+    expected_default_expert_fd_cache_cap: usize,
+}
+impl FdLimits {
+    fn new(soft: u64, hard: u64) -> Self {
+        // Mirror io_provider::default_fd_cache_cap, including the usize fallback.
+        // This is a reported assumption, never a storage or rlimit modification.
+        Self {
+            soft,
+            hard,
+            reserved_fd_assumption: FD_RESERVED,
+            default_cache_min: FD_CACHE_MIN,
+            default_cache_max: FD_CACHE_MAX,
+            expected_default_expert_fd_cache_cap: usize::try_from(soft)
+                .unwrap_or(1024)
+                .saturating_sub(FD_RESERVED)
+                .clamp(FD_CACHE_MIN, FD_CACHE_MAX),
+        }
+    }
+}
+fn fd_require_linux() -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Err("fd-lifetime-diagnostic requires Linux; runtime construction forbidden".into());
+    }
+    Ok(())
+}
+#[cfg(target_os = "linux")]
+fn fd_limits() -> Result<FdLimits> {
+    let mut raw: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut raw) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(FdLimits::new(raw.rlim_cur, raw.rlim_max))
+}
+#[cfg(not(target_os = "linux"))]
+fn fd_limits() -> Result<FdLimits> {
+    Err("RLIMIT census requires Linux".into())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FdCategory {
+    ExpertFile,
+    NvidiaDevice,
+    DriDrmDevice,
+    AnonInode,
+    Socket,
+    Pipe,
+    Other,
+    Unresolved,
+}
+const FD_CATEGORIES: [FdCategory; 8] = [
+    FdCategory::ExpertFile,
+    FdCategory::NvidiaDevice,
+    FdCategory::DriDrmDevice,
+    FdCategory::AnonInode,
+    FdCategory::Socket,
+    FdCategory::Pipe,
+    FdCategory::Other,
+    FdCategory::Unresolved,
+];
+
+// Resolve the actual model's filenames once, before any iteration. This set is
+// bounded by the validated model geometry (48*128), not by process FD growth.
+// It is classifier state only and is never serialized. Canonical paths also
+// recognize symlinked expert files; arbitrary regular files are not experts.
+struct FdExpertFiles {
+    paths: std::collections::BTreeSet<PathBuf>,
+    data_dir: PathBuf,
+    packed_blob: Option<PathBuf>,
+}
+impl FdExpertFiles {
+    fn from_config(cfg: &crate::config::Config) -> Result<Self> {
+        let data_dir = std::fs::canonicalize(&cfg.model.data_dir)?;
+        let packed_blob = cfg
+            .storage
+            .packed_blob
+            .as_ref()
+            .map(std::fs::canonicalize)
+            .transpose()?;
+        let mut paths = std::collections::BTreeSet::new();
+        if let Some(path) = &packed_blob {
+            paths.insert(path.clone());
+        } else {
+            if cfg.model.num_layers != 48 || cfg.model.num_experts != 128 {
+                return Err("FD classifier requires frozen 48*128 expert geometry".into());
+            }
+            for id in 0..48 * 128 {
+                // Same primary/fallback naming as NvmeStorage::expert_path in
+                // the isolated factory (which does not configure striped paths).
+                let primary = data_dir.join(format!("expert_{id}.bin"));
+                let path = if std::fs::metadata(&primary).is_ok() {
+                    primary
+                } else {
+                    data_dir.join(format!("expert_{}_{}.bin", id / 128, id % 128))
+                };
+                // Missing files must remain available to the actual factory's
+                // failure path, rather than being hidden by classifier preflight.
+                paths.insert(std::fs::canonicalize(&path).unwrap_or(path));
+            }
+        }
+        Ok(Self {
+            paths,
+            data_dir,
+            packed_blob,
+        })
+    }
+}
+fn fd_category(target: Option<&Path>, experts: &FdExpertFiles) -> FdCategory {
+    let Some(target) = target else {
+        return FdCategory::Unresolved;
+    };
+    // Linux appends this suffix to unlinked file targets. Preserve the original
+    // target in non-expert summaries, but match expert identity before the suffix.
+    let bytes = target.as_os_str().as_encoded_bytes();
+    let stripped = bytes.strip_suffix(b" (deleted)").unwrap_or(bytes);
+    if experts.paths.contains(target)
+        || (stripped.len() != bytes.len()
+            && experts
+                .paths
+                .iter()
+                .any(|p| p.as_os_str().as_encoded_bytes() == stripped))
+    {
+        return FdCategory::ExpertFile;
+    }
+    if stripped.starts_with(b"/dev/nvidia") {
+        return FdCategory::NvidiaDevice;
+    }
+    if stripped.starts_with(b"/dev/dri/") {
+        return FdCategory::DriDrmDevice;
+    }
+    if bytes.starts_with(b"anon_inode:") {
+        return FdCategory::AnonInode;
+    }
+    if bytes.starts_with(b"socket:[") && bytes.ends_with(b"]") {
+        return FdCategory::Socket;
+    }
+    if bytes.starts_with(b"pipe:[") && bytes.ends_with(b"]") {
+        return FdCategory::Pipe;
+    }
+    FdCategory::Other
+}
+
+#[derive(Debug, Serialize)]
+struct FdCensus {
+    total: usize,
+    categories: std::collections::BTreeMap<FdCategory, usize>,
+    excluded_census_directory_fds: usize,
+    // Lexicographically smallest N distinct non-expert targets, with exact
+    // descriptor multiplicities. Streaming insertion keeps memory bounded;
+    // selection is independent of readdir order. Debug path escaping is lossless
+    // for non-UTF8 Unix filenames, unlike to_string_lossy(). No expert path list.
+    non_expert_targets: std::collections::BTreeMap<String, usize>,
+    non_expert_descriptors_not_summarized: usize,
+}
+impl FdCensus {
+    fn new() -> Self {
+        Self {
+            total: 0,
+            categories: FD_CATEGORIES.into_iter().map(|c| (c, 0)).collect(),
+            excluded_census_directory_fds: 0,
+            non_expert_targets: Default::default(),
+            non_expert_descriptors_not_summarized: 0,
+        }
+    }
+    fn observe(&mut self, fd: i32, census_fd: i32, target: Option<&Path>, experts: &FdExpertFiles) {
+        // Identify our own handle numerically, never by path: another open
+        // /proc/<pid>/fd directory is a real process descriptor and must count.
+        if fd == census_fd {
+            self.excluded_census_directory_fds += 1;
+            return;
+        }
+        self.total += 1;
+        let category = fd_category(target, experts);
+        *self
+            .categories
+            .get_mut(&category)
+            .expect("all categories initialized") += 1;
+        if category != FdCategory::ExpertFile {
+            if let Some(target) = target {
+                *self
+                    .non_expert_targets
+                    .entry(format!("{:?}", target.as_os_str()))
+                    .or_default() += 1;
+                if self.non_expert_targets.len() > FD_TARGET_SUMMARY_LIMIT {
+                    self.non_expert_targets.pop_last();
+                }
+            }
+        }
+        self.non_expert_descriptors_not_summarized = self.total
+            - self.categories[&FdCategory::ExpertFile]
+            - self.non_expert_targets.values().sum::<usize>();
+    }
+}
+#[derive(Debug, Serialize)]
+struct FdCensusCapture {
+    census: Option<FdCensus>,
+    error: Option<String>,
+}
+fn fd_capture(experts: &FdExpertFiles) -> FdCensusCapture {
+    match fd_census(experts) {
+        Ok(census) => FdCensusCapture {
+            census: Some(census),
+            error: None,
+        },
+        Err(e) => FdCensusCapture {
+            census: None,
+            error: Some(e.to_string()),
+        },
+    }
+}
+#[cfg(target_os = "linux")]
+fn fd_census(experts: &FdExpertFiles) -> Result<FdCensus> {
+    // DIR owns exactly one descriptor. RAII closes it on every return, including
+    // readlink/readdir failures; it never survives into build or shutdown.
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let raw = unsafe { libc::opendir(b"/proc/self/fd\0".as_ptr().cast()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let dir = Directory(raw);
+    let own_fd = unsafe { libc::dirfd(dir.0) };
+    if own_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut census = FdCensus::new();
+    loop {
+        // POSIX distinguishes end-of-directory from error through errno.
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(dir.0) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) {
+                return Err(error.into());
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_str()?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        let fd: i32 = name.parse()?;
+        let target = if fd == own_fd {
+            None
+        } else {
+            std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+        };
+        census.observe(fd, own_fd, target.as_deref(), experts);
+    }
+    if census.excluded_census_directory_fds != 1 {
+        return Err("census did not observe exactly its own enumeration descriptor".into());
+    }
+    Ok(census)
+}
+#[cfg(not(target_os = "linux"))]
+fn fd_census(_: &FdExpertFiles) -> Result<FdCensus> {
+    Err("/proc/self/fd census requires Linux".into())
+}
+
+#[derive(Default, Serialize)]
+struct FdIteration {
+    iteration: usize,
+    input_provenance: Option<ArmProvenance>,
+    preparation_error: Option<String>,
+    build_attempted: bool,
+    build_succeeded: bool,
+    build_error: Option<String>,
+    adapter: Option<crate::backend::GpuDeviceIdentity>,
+    runtime_validation_error: Option<String>,
+    before_build: Option<FdCensusCapture>,
+    after_build: Option<FdCensusCapture>,
+    after_failed_build: Option<FdCensusCapture>,
+    shutdown_evidence: Option<crate::greedy_parity::BackgroundShutdownEvidence>,
+    shutdown_error: Option<String>,
+    after_shutdown: Option<FdCensusCapture>,
+}
+impl FdIteration {
+    fn stop_reason(&self) -> Option<&'static str> {
+        if self.preparation_error.is_some() {
+            return Some("preparation_failed");
+        }
+        if self.build_error.is_some() {
+            return Some("build_failed");
+        }
+        if self.shutdown_error.is_some() {
+            return Some("shutdown_failed");
+        }
+        if self.runtime_validation_error.is_some() {
+            return Some("runtime_validation_failed");
+        }
+        if [
+            &self.before_build,
+            &self.after_build,
+            &self.after_failed_build,
+            &self.after_shutdown,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|c| c.error.is_some() || c.census.is_none())
+        {
+            return Some("census_failed");
+        }
+        if !self.build_attempted
+            || !self.build_succeeded
+            || self.before_build.is_none()
+            || self.after_build.is_none()
+            || self.after_shutdown.is_none()
+        {
+            return Some("incomplete_iteration");
+        }
+        if !self
+            .shutdown_evidence
+            .is_some_and(|s| s.controlled_shutdown_requested && s.all_runtime_resources_released)
+        {
+            return Some("shutdown_failed");
+        }
+        None
+    }
+}
+#[derive(Serialize)]
+struct FdReport {
+    schema: &'static str,
+    source_identity: Value,
+    input_provenance: Value,
+    request_json_sha256: String,
+    expected_adapter: String,
+    rlimit_nofile: FdLimits,
+    maximum_iterations: usize,
+    census_self_observation_rule: &'static str,
+    target_summary_limit: usize,
+    expert_data_directory: PathBuf,
+    expert_packed_blob: Option<PathBuf>,
+    expert_target_identity_count: usize,
+    iterations: Vec<FdIteration>,
+    final_stop_reason: &'static str,
+    completed_iterations: usize,
+}
+// Shared by the real driver and CPU doubles. Push the failed record before
+// testing its outcome. No retry, filtering, reordering or survivor selection.
+async fn fd_collect_iterations<F, Fut>(mut iteration: F) -> (Vec<FdIteration>, &'static str, usize)
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = FdIteration>,
+{
+    let mut records = Vec::with_capacity(FD_MAX_ITERATIONS);
+    let mut completed = 0;
+    for index in 1..=FD_MAX_ITERATIONS {
+        let record = iteration(index).await;
+        let stop = record.stop_reason();
+        records.push(record);
+        if let Some(reason) = stop {
+            return (records, reason, completed);
+        }
+        completed += 1;
+    }
+    (records, "completed_all_iterations", completed)
+}
+
+async fn fd_run_iteration(
+    args: &CommandArgs,
+    expected: &Value,
+    experts: &FdExpertFiles,
+    index: usize,
+) -> FdIteration {
+    let mut record = FdIteration {
+        iteration: index,
+        ..Default::default()
+    };
+    let preparation: Result<_> = (|| {
+        let prepared = prepare_arm(args)?;
+        let identity_matches = *expected == serde_json::to_value(&prepared.provenance)?;
+        record.input_provenance = Some(prepared.provenance);
+        if !identity_matches {
+            return Err("input/config/model/executable provenance drift".into());
+        }
+        let tokenizer = crate::load_real_cli_tokenizer(
+            &prepared.spec.cfg,
+            crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
+        )?;
+        Ok((prepared.spec, tokenizer))
+    })();
+    let (spec, tokenizer) = match preparation {
+        Ok(p) => p,
+        Err(e) => {
+            record.preparation_error = Some(e.to_string());
+            return record;
+        }
+    };
+    record.before_build = Some(fd_capture(experts));
+    if record.before_build.as_ref().unwrap().error.is_some() {
+        return record;
+    }
+    record.build_attempted = true;
+    match build_p1q_isolated_runtime(&spec, tokenizer).await {
+        Err(e) => {
+            record.build_error = Some(e.to_string());
+            record.after_failed_build = Some(fd_capture(experts));
+        }
+        Ok(runtime) => {
+            record.build_succeeded = true;
+            // Existing read-only P1Q runtime validation checks the exact adapter,
+            // config, strict model load, GPU plane and zero initial counters.
+            // This scratch evidence object creates no P1E/P1J request state.
+            let mut validation = ArmReport::new(Arm::Control);
+            validation.provenance = record.input_provenance.take();
+            if let Err(e) = validate_runtime(&runtime, &args.expected_adapter_name, &mut validation)
+            {
+                record.runtime_validation_error = Some(e.to_string());
+            }
+            record.input_provenance = validation.provenance.take();
+            record.adapter = runtime.engine.gpu_device_identity();
+            record.after_build = Some(fd_capture(experts));
+            // Always shut down, even on adapter/config/census rejection. The
+            // existing factory's teardown consumes runtime; no retained clones.
+            let shutdown = runtime.shutdown_isolated().await;
+            record.after_shutdown = Some(fd_capture(experts));
+            match shutdown {
+                Ok(evidence) => record.shutdown_evidence = Some(evidence),
+                Err(e) => record.shutdown_error = Some(e.to_string()),
+            }
+        }
+    }
+    record
+}
+
+async fn run_fd_diagnostic(args: &CommandArgs) -> Result<()> {
+    fd_require_linux()?;
+    ensure_output_absent(&args.report_out)?;
+    // CLI compatibility only: read/hash once; neither parse nor tokenize.
+    let request_bytes = std::fs::read(&args.request_json)?;
+    let prepared = prepare_arm(args)?;
+    let experts = FdExpertFiles::from_config(&prepared.spec.cfg)?;
+    let provenance = serde_json::to_value(&prepared.provenance)?;
+    let limits = fd_limits()?;
+    drop(prepared);
+    let (iterations, stop, completed) =
+        fd_collect_iterations(|index| fd_run_iteration(args, &provenance, &experts, index)).await;
+    let report = FdReport {
+        schema: FD_SCHEMA,
+        source_identity: source_identity(),
+        input_provenance: provenance,
+        request_json_sha256: crate::greedy_parity::sha256_hex(&request_bytes),
+        expected_adapter: args.expected_adapter_name.clone(),
+        rlimit_nofile: limits,
+        maximum_iterations: FD_MAX_ITERATIONS,
+        census_self_observation_rule: FD_SELF_OBSERVATION_RULE,
+        target_summary_limit: FD_TARGET_SUMMARY_LIMIT,
+        expert_data_directory: experts.data_dir,
+        expert_packed_blob: experts.packed_blob,
+        expert_target_identity_count: experts.paths.len(),
+        iterations,
+        final_stop_reason: stop,
+        completed_iterations: completed,
+    };
+    write_report(&args.report_out, &report)?;
+    if stop != "completed_all_iterations" {
+        return Err(format!("P1Q2 {stop}; diagnostic evidence retained").into());
     }
     Ok(())
 }
@@ -3553,6 +4054,504 @@ mod p1q_tests {
                 }
             }
             assert!(new.contains(&old[start..end]), "{name}");
+        }
+    }
+    #[test]
+    fn p1q2_mode_and_arguments_preserve_aa_ab() {
+        use clap::ValueEnum;
+        assert_eq!(
+            ExperimentMode::from_str("fd-lifetime-diagnostic", false).unwrap(),
+            ExperimentMode::FdLifetimeDiagnostic
+        );
+        for arm in [Arm::Control, Arm::Treatment] {
+            assert_eq!(
+                ExperimentMode::FdLifetimeDiagnostic.request_mode(arm),
+                P1jRequestMode::InertResourceOnly
+            );
+        }
+        p1q_mode_classification();
+        let mut a = args(ExperimentMode::FdLifetimeDiagnostic);
+        assert!(validate_args(&a).is_ok());
+        a.noise_calibration_report = Some("noise.json".into());
+        assert!(validate_args(&a).is_err());
+        a.noise_calibration_report = None;
+        for name in ["nvidia l4", "NVIDIA L4 ", "CPU", "NVIDIA A100"] {
+            a.expected_adapter_name = name.into();
+            assert!(validate_args(&a).is_err());
+        }
+    }
+    #[test]
+    fn p1q2_frozen_predecessor_source_functions_exact() {
+        // Exact P1Q1 function bytes, including normalization, timers, comparison,
+        // thresholds, request lifecycle, argument and calibration/source binding.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["show", "d858dc338dcf7a90acd7cedc2cb41235721bb67a:rust-engine/src/gpu_native_predictor_v2_sidecar_performance.rs"])
+            .current_dir(root).output().unwrap();
+        assert!(output.status.success());
+        let base = String::from_utf8(output.stdout).unwrap();
+        let current = production();
+        for name in [
+            "execution_order",
+            "validate_args",
+            "paired_delta",
+            "median_six",
+            "noise_statistics",
+            "noise_stable",
+            "noise_floor",
+            "ab_verdict",
+            "source_identity",
+            "structural_initial",
+            "structural_runtime_contract",
+            "validate_calibration",
+            "calibration_floor_from_bytes",
+            "serialized_identity_matches",
+            "initial_state_valid",
+            "finish_pair",
+            "execute_arm",
+            "step_request",
+            "validate_runtime",
+            "prepare_arm",
+        ] {
+            let start = base.find(&format!("fn {name}(")).unwrap();
+            let open = start + base[start..].find('{').unwrap();
+            let mut depth = 1;
+            let mut end = open + 1;
+            for (i, ch) in base[open + 1..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                }
+                if ch == '}' {
+                    depth -= 1;
+                }
+                if depth == 0 {
+                    end = open + 2 + i;
+                    break;
+                }
+            }
+            assert!(current.contains(&base[start..end]), "{name} changed");
+        }
+        assert_eq!((PAIRS, OUTPUT_TOKENS, PLANNED_POSITIONS), (6, 128, 143));
+        assert_eq!(
+            source_identity()["performance"],
+            crate::greedy_parity::sha256_hex(include_bytes!(
+                "gpu_native_predictor_v2_sidecar_performance.rs"
+            ))
+        );
+    }
+    #[test]
+    fn p1q2_diagnostic_call_path_has_no_request_lifecycle() {
+        let s = production();
+        let run = part(s, "pub(crate) async fn run_command(", "// P1Q2");
+        assert!(
+            run.find("return run_fd_diagnostic(&args).await;").unwrap()
+                < run.find("parse_request(").unwrap()
+        );
+        let diagnostic = part(s, "// P1Q2", "\0");
+        for forbidden in [
+            "step_request(",
+            ".step_token(",
+            "execute_arm(",
+            "run_arm(",
+            "parse_request(",
+            "tokenizer.encode(",
+            "enable_predictor",
+            "enable_p1j",
+            "P1jRequestMode::Active",
+            "GpuNativeRequestState",
+            "observation_config(",
+            "finish_request(",
+            "RequestSnapshotStart",
+            "Instant::now(",
+            "sleep(",
+        ] {
+            assert!(!diagnostic.contains(forbidden), "{forbidden}");
+        }
+        let driver = part(s, "async fn run_fd_diagnostic(", "\0");
+        assert!(driver.find("fd_require_linux()?").unwrap() < driver.find("prepare_arm(").unwrap());
+        assert!(
+            driver.find("fd_require_linux()?").unwrap()
+                < driver.find("fd_collect_iterations(").unwrap()
+        );
+        let iteration = part(
+            s,
+            "async fn fd_run_iteration(",
+            "async fn run_fd_diagnostic(",
+        );
+        assert_eq!(iteration.matches("build_p1q_isolated_runtime(").count(), 1);
+        assert_eq!(iteration.matches("shutdown_isolated().await").count(), 1);
+        assert!(
+            iteration.find("record.before_build =").unwrap()
+                < iteration.find("build_p1q_isolated_runtime(").unwrap()
+        );
+        assert!(
+            iteration.find("validate_runtime(").unwrap()
+                < iteration.find("record.after_build =").unwrap()
+        );
+        assert!(
+            iteration.find("record.after_build =").unwrap()
+                < iteration.find("shutdown_isolated().await").unwrap()
+        );
+        assert!(iteration.contains("let shutdown = runtime.shutdown_isolated().await;\n            record.after_shutdown = Some(fd_capture(experts));"));
+        assert!(iteration.contains("record.build_error = Some(e.to_string());\n            record.after_failed_build = Some(fd_capture(experts));"));
+        let bridge = part(
+            s,
+            "async fn build_p1q_isolated_runtime(",
+            "pub(crate) async fn run_command(",
+        );
+        assert!(bridge.contains("crate::build_isolated_greedy_runtime("));
+        assert!(bridge.contains("crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark"));
+        for helper in [
+            bridge,
+            part(s, "fn validate_runtime(", "fn finish_snapshots("),
+            part(s, "fn prepare_arm(", "fn validate_runtime("),
+        ] {
+            for forbidden in [
+                "step_request(",
+                ".step_token(",
+                "enable_predictor",
+                "enable_p1j",
+                "tokenizer.encode(",
+            ] {
+                assert!(!helper.contains(forbidden), "{forbidden}");
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn p1q2_non_linux_fails_before_any_io_or_runtime() {
+        // No config, request or model exists. The first actual diagnostic gate
+        // must reject Linux-only authority before even trying to read them.
+        let e = run_command(args(ExperimentMode::FdLifetimeDiagnostic))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "fd-lifetime-diagnostic requires Linux; runtime construction forbidden"
+        );
+    }
+    fn fd_experts_fixture() -> FdExpertFiles {
+        FdExpertFiles {
+            paths: [
+                "/model/expert_1.bin",
+                "/model/expert_2_3.bin",
+                "/elsewhere/resolved-expert.bin",
+                "/model/packed.bin",
+            ]
+            .map(PathBuf::from)
+            .into_iter()
+            .collect(),
+            data_dir: "/model".into(),
+            packed_blob: None,
+        }
+    }
+    #[test]
+    fn p1q2_classifier_exact_families_and_actual_expert_identities() {
+        let experts = fd_experts_fixture();
+        for (target, category) in [
+            ("/model/expert_1.bin", FdCategory::ExpertFile),
+            ("/model/expert_2_3.bin (deleted)", FdCategory::ExpertFile),
+            ("/elsewhere/resolved-expert.bin", FdCategory::ExpertFile),
+            ("/model/packed.bin", FdCategory::ExpertFile),
+            ("/other/expert_1.bin", FdCategory::Other),
+            ("/model/expert_999999.bin", FdCategory::Other),
+            ("/dev/nvidia0", FdCategory::NvidiaDevice),
+            ("/dev/nvidiactl", FdCategory::NvidiaDevice),
+            ("/dev/nvidia-uvm", FdCategory::NvidiaDevice),
+            ("/dev/dri/renderD128", FdCategory::DriDrmDevice),
+            ("/dev/dri/card0", FdCategory::DriDrmDevice),
+            ("anon_inode:[eventfd]", FdCategory::AnonInode),
+            ("anon_inode:dmabuf", FdCategory::AnonInode),
+            ("socket:[123]", FdCategory::Socket),
+            ("pipe:[456]", FdCategory::Pipe),
+            ("/model/metadata.json", FdCategory::Other),
+            ("/model/dense.bin", FdCategory::Other),
+        ] {
+            assert_eq!(
+                fd_category(Some(Path::new(target)), &experts),
+                category,
+                "{target}"
+            );
+        }
+        assert_eq!(fd_category(None, &experts), FdCategory::Unresolved);
+    }
+    #[test]
+    fn p1q2_census_self_observation_excludes_only_owned_fd() {
+        let experts = fd_experts_fixture();
+        for own_fd in [3, 88, 999] {
+            let mut c = FdCensus::new();
+            c.observe(own_fd, own_fd, None, &experts);
+            c.observe(
+                own_fd + 1,
+                own_fd,
+                Some(Path::new("/proc/123/fd")),
+                &experts,
+            );
+            c.observe(own_fd + 2, own_fd, None, &experts);
+            assert_eq!(c.total, 2);
+            assert_eq!(c.excluded_census_directory_fds, 1);
+            assert_eq!(c.categories[&FdCategory::Other], 1);
+            assert_eq!(c.categories[&FdCategory::Unresolved], 1);
+            assert_eq!(c.categories.values().sum::<usize>(), c.total);
+        }
+        assert!(FD_SELF_OBSERVATION_RULE.contains("exactly dirfd"));
+        let linux = part(production(), "fn fd_census(experts:", "#[cfg(not(target_os");
+        assert!(linux.contains("libc::dirfd(dir.0)"));
+        assert!(linux.contains("libc::closedir(self.0)"));
+        assert!(linux.contains("census.excluded_census_directory_fds != 1"));
+    }
+    #[test]
+    fn p1q2_summary_bounded_order_independent_and_reconciled() {
+        assert_eq!(FD_TARGET_SUMMARY_LIMIT, 16);
+        let experts = fd_experts_fixture();
+        let targets: Vec<_> = (0..200)
+            .map(|i| PathBuf::from(format!("/other/{i:04}")))
+            .collect();
+        let census = |reverse: bool| {
+            let mut c = FdCensus::new();
+            for i in 0..targets.len() {
+                let target = &targets[if reverse { targets.len() - 1 - i } else { i }];
+                for _ in 0..2 {
+                    c.observe(10, 99, Some(target), &experts);
+                }
+                c.observe(11, 99, Some(Path::new("/model/expert_1.bin")), &experts);
+                assert!(c.non_expert_targets.len() <= FD_TARGET_SUMMARY_LIMIT);
+            }
+            c
+        };
+        let a = census(false);
+        let b = census(true);
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap()
+        );
+        assert_eq!(a.total, 600);
+        assert_eq!(a.categories[&FdCategory::ExpertFile], 200);
+        assert_eq!(a.non_expert_descriptors_not_summarized, 368);
+        assert_eq!(a.non_expert_targets.len(), 16);
+        assert_eq!(a.non_expert_targets.values().sum::<usize>(), 32);
+        assert!(!serde_json::to_string(&a).unwrap().contains("expert_1.bin"));
+        assert_eq!(
+            a.non_expert_targets.keys().next().unwrap(),
+            "\"/other/0000\""
+        );
+        assert_eq!(
+            a.non_expert_targets.keys().last().unwrap(),
+            "\"/other/0015\""
+        );
+    }
+    #[test]
+    fn p1q2_rlimit_arithmetic_matches_storage_and_rejects_old_hypothesis() {
+        let l = FdLimits::new(1024, 1048576);
+        assert_eq!(
+            (
+                l.soft,
+                l.hard,
+                l.reserved_fd_assumption,
+                l.expected_default_expert_fd_cache_cap
+            ),
+            (1024, 1048576, 128, 896)
+        );
+        assert_eq!(
+            FdLimits::new(1, 1024).expected_default_expert_fd_cache_cap,
+            64
+        );
+        assert_eq!(
+            FdLimits::new(1000000, 1000000).expected_default_expert_fd_cache_cap,
+            65536
+        );
+        let source = include_str!("io_provider.rs");
+        let cap = part(source, "fn default_fd_cache_cap()", "/// Classify");
+        for frozen in [
+            "const RESERVED_FDS: usize = 128;",
+            "const MIN_CAP: usize = 64;",
+            "const MAX_CAP: usize = 65_536;",
+            "soft.saturating_sub(RESERVED_FDS).clamp(MIN_CAP, MAX_CAP)",
+        ] {
+            assert!(cap.contains(frozen));
+        }
+    }
+    fn fd_capture_fixture() -> FdCensusCapture {
+        FdCensusCapture {
+            census: Some(FdCensus::new()),
+            error: None,
+        }
+    }
+    fn fd_iteration_fixture(iteration: usize) -> FdIteration {
+        FdIteration {
+            iteration,
+            build_attempted: true,
+            build_succeeded: true,
+            before_build: Some(fd_capture_fixture()),
+            after_build: Some(fd_capture_fixture()),
+            after_shutdown: Some(fd_capture_fixture()),
+            shutdown_evidence: Some(crate::greedy_parity::BackgroundShutdownEvidence {
+                controlled_shutdown_requested: true,
+                all_runtime_resources_released: true,
+                poll_iterations: 1,
+            }),
+            ..Default::default()
+        }
+    }
+    #[tokio::test]
+    async fn p1q2_loop_stops_at_every_first_build_failure_retains_exact_error() {
+        for fail in 1..=12 {
+            let mut calls = Vec::new();
+            let (records, stop, completed) = fd_collect_iterations(|index| {
+                calls.push(index);
+                let mut r = fd_iteration_fixture(index);
+                if index == fail {
+                    r.build_succeeded = false;
+                    r.build_error = Some("Too many open files (os error 24)".into());
+                    r.after_build = None;
+                    r.after_shutdown = None;
+                    r.shutdown_evidence = None;
+                    r.after_failed_build = Some(fd_capture_fixture());
+                }
+                std::future::ready(r)
+            })
+            .await;
+            assert_eq!(calls, (1..=fail).collect::<Vec<_>>());
+            assert_eq!(
+                (records.len(), completed, stop),
+                (fail, fail - 1, "build_failed")
+            );
+            let last = records.last().unwrap();
+            assert_eq!(
+                last.build_error.as_deref(),
+                Some("Too many open files (os error 24)")
+            );
+            assert!(last.after_failed_build.is_some());
+        }
+    }
+    #[tokio::test]
+    async fn p1q2_loop_stops_at_every_shutdown_failure_no_survivors() {
+        for fail in 1..=12 {
+            for incomplete_evidence in [false, true] {
+                let mut calls = Vec::new();
+                let (records, stop, completed) = fd_collect_iterations(|index| {
+                    calls.push(index);
+                    let mut r = fd_iteration_fixture(index);
+                    if index == fail {
+                        if incomplete_evidence {
+                            r.shutdown_evidence
+                                .as_mut()
+                                .unwrap()
+                                .all_runtime_resources_released = false;
+                        } else {
+                            r.shutdown_evidence = None;
+                            r.shutdown_error = Some("exact shutdown failure".into());
+                        }
+                    }
+                    std::future::ready(r)
+                })
+                .await;
+                assert_eq!(calls, (1..=fail).collect::<Vec<_>>());
+                assert_eq!(
+                    (records.len(), completed, stop),
+                    (fail, fail - 1, "shutdown_failed")
+                );
+                assert!(records.last().unwrap().after_shutdown.is_some());
+                if !incomplete_evidence {
+                    assert_eq!(
+                        records.last().unwrap().shutdown_error.as_deref(),
+                        Some("exact shutdown failure")
+                    );
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn p1q2_loop_census_adapter_and_preparation_fail_closed() {
+        for kind in [
+            "preparation_failed",
+            "runtime_validation_failed",
+            "census_failed",
+        ] {
+            let (records, stop, completed) = fd_collect_iterations(|index| {
+                assert_eq!(index, 1);
+                let mut r = fd_iteration_fixture(index);
+                match kind {
+                    "preparation_failed" => r.preparation_error = Some("config drift".into()),
+                    "runtime_validation_failed" => {
+                        r.runtime_validation_error = Some("wrong adapter".into())
+                    }
+                    _ => {
+                        r.after_shutdown = Some(FdCensusCapture {
+                            census: None,
+                            error: Some("EMFILE".into()),
+                        })
+                    }
+                }
+                std::future::ready(r)
+            })
+            .await;
+            assert_eq!((records.len(), stop, completed), (1, kind, 0));
+        }
+    }
+    #[tokio::test]
+    async fn p1q2_report_exact_schema_ordered_censuses_no_performance() {
+        assert_eq!(FD_MAX_ITERATIONS, 12);
+        assert_eq!(FD_SCHEMA, "mer.predictor-v2-p1q2-fd-lifetime.v1");
+        let (records, stop, completed) =
+            fd_collect_iterations(|index| std::future::ready(fd_iteration_fixture(index))).await;
+        assert_eq!(
+            (records.len(), stop, completed),
+            (12, "completed_all_iterations", 12)
+        );
+        let report = FdReport {
+            schema: FD_SCHEMA,
+            source_identity: source_identity(),
+            input_provenance: json!({"fixture": true}),
+            request_json_sha256: "request".into(),
+            expected_adapter: "NVIDIA L4".into(),
+            rlimit_nofile: FdLimits::new(1024, 1048576),
+            maximum_iterations: FD_MAX_ITERATIONS,
+            census_self_observation_rule: FD_SELF_OBSERVATION_RULE,
+            target_summary_limit: FD_TARGET_SUMMARY_LIMIT,
+            expert_data_directory: "/model".into(),
+            expert_packed_blob: None,
+            expert_target_identity_count: 6144,
+            iterations: records,
+            final_stop_reason: stop,
+            completed_iterations: completed,
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["rlimit_nofile"]["soft"], 1024);
+        assert_eq!(v["rlimit_nofile"]["hard"], 1048576);
+        assert_eq!(v["final_stop_reason"], "completed_all_iterations");
+        for (i, r) in v["iterations"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(r["iteration"], i + 1);
+            for key in [
+                "build_attempted",
+                "build_succeeded",
+                "build_error",
+                "adapter",
+                "before_build",
+                "after_build",
+                "after_failed_build",
+                "shutdown_evidence",
+                "shutdown_error",
+                "after_shutdown",
+            ] {
+                assert!(r.get(key).is_some(), "{key}");
+            }
+        }
+        let serialized = serde_json::to_string(&v).unwrap();
+        for forbidden in [
+            "WIN",
+            "LOSS",
+            "INCONCLUSIVE",
+            "NOISE_STABLE",
+            "NOISE_UNSTABLE",
+            "frozen_noise_floor_pct",
+            "statistics",
+            "paired_generated_tps_delta_pct",
+            "performance_comparison_authorized",
+            "performance_verdict",
+            "delayed_after_shutdown",
+        ] {
+            assert!(!serialized.contains(forbidden), "{forbidden}");
         }
     }
 }
