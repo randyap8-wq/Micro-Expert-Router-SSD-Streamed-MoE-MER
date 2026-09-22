@@ -673,6 +673,24 @@ pub(crate) struct GpuNativeTieredResidencySnapshot {
     pub(crate) layers: Vec<GpuNativeTieredLayerSnapshot>,
 }
 
+/// Read-only setup evidence; local namespace IDs are retained for audit and
+/// normalized only by the performance driver's structural comparison.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct P1qResourceSnapshot {
+    pub(crate) sidecar_initialized: bool,
+    pub(crate) sidecar_allocated: bool,
+    pub(crate) sidecar_stride_bytes: u64,
+    pub(crate) sidecar_bank: u32,
+    pub(crate) sidecar_slot: u32,
+    pub(crate) namespace: Option<p1e::Namespace>,
+    pub(crate) ordinary_total_expert_budget_bytes: u64,
+    pub(crate) ordinary_arena_allocation_bytes: u64,
+    pub(crate) ordinary_layer_capacities: Vec<usize>,
+    pub(crate) ordinary_layer_resident_counts: Vec<usize>,
+    pub(crate) p1e_shadow_present: bool,
+    pub(crate) activity_counters: [u64; 14],
+}
+
 /// Model-scoped owner of the preallocated per-layer Q4 expert arenas.
 pub(crate) struct GpuNativeTieredResidencyManager {
     executor: Arc<GpuNativeExecutorContext>,
@@ -1079,6 +1097,73 @@ impl GpuNativeTieredResidencyManager {
             return Err("P1J model/runtime namespace mismatch".into());
         }
         Ok(owner.clone())
+    }
+
+    /// Bounded CPU-only setup snapshot. Contention fails closed; this never
+    /// touches an LRU, waits for a writer, allocates a GPU resource or submits.
+    pub(crate) fn p1q_resource_snapshot(&self) -> Result<P1qResourceSnapshot, String> {
+        let mut resident_counts = Vec::with_capacity(self.layers.len());
+        let mut p1e_shadow_present = false;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let state = layer
+                .state
+                .try_lock()
+                .ok_or("P1Q residency snapshot busy")?;
+            resident_counts.push(state.residents.len());
+            if index == p1e::LAYER {
+                p1e_shadow_present = state.p1e_shadow.is_some();
+            }
+        }
+        let owner = self
+            .p1j
+            .get()
+            .map(|v| v.as_ref().map_err(Clone::clone))
+            .transpose()?;
+        Ok(P1qResourceSnapshot {
+            sidecar_initialized: self.p1j.get().is_some(),
+            sidecar_allocated: owner.is_some(),
+            // Successful allocation validates precisely this frozen backend layout.
+            sidecar_stride_bytes: crate::backend::gpu_native::P1J_STRIDE_BYTES as u64,
+            sidecar_bank: 1,
+            sidecar_slot: 0,
+            namespace: owner.map(|o| o.namespace),
+            ordinary_total_expert_budget_bytes: self.plan.total_expert_budget_bytes(),
+            ordinary_arena_allocation_bytes: self.plan.total_arena_allocation_bytes(),
+            ordinary_layer_capacities: self
+                .plan
+                .layer_plans()
+                .iter()
+                .map(|p| p.slot_capacity())
+                .collect(),
+            ordinary_layer_resident_counts: resident_counts,
+            p1e_shadow_present,
+            activity_counters: [
+                self.counters.vram_hits.load(Ordering::Relaxed),
+                self.counters.vram_misses.load(Ordering::Relaxed),
+                self.counters.physical_current_hits.load(Ordering::Relaxed),
+                self.counters
+                    .physical_source_acquisitions
+                    .load(Ordering::Relaxed),
+                self.counters
+                    .logical_admissions_for_physical_misses
+                    .load(Ordering::Relaxed),
+                self.counters.ram_to_vram_installs.load(Ordering::Relaxed),
+                self.counters.physical_evictions.load(Ordering::Relaxed),
+                self.counters.physical_reinstalls.load(Ordering::Relaxed),
+                self.counters
+                    .stale_generation_rejections
+                    .load(Ordering::Relaxed),
+                self.counters.demand_requests.load(Ordering::Relaxed),
+                self.counters.speculative_requests.load(Ordering::Relaxed),
+                self.counters.speculative_vram_hits.load(Ordering::Relaxed),
+                self.counters
+                    .speculative_ram_to_vram_installs
+                    .load(Ordering::Relaxed),
+                self.counters
+                    .speculative_dropped_capacity_or_pressure
+                    .load(Ordering::Relaxed),
+            ],
+        })
     }
 
     fn p1j_current(&self, global: u32) -> Option<(P1jIdentity, GpuNativeQ4ExpertResidency)> {

@@ -403,7 +403,29 @@ fn p1j_binding_eligible(
         && matches!(phase, Some(P1jPhase::Published) | None)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) enum P1jRequestMode {
+    InertResourceOnly,
+    Active,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct P1qInitialSnapshot {
+    pub(crate) mode: P1jRequestMode,
+    pub(crate) resources: crate::gpu_native_residency::P1qResourceSnapshot,
+    pub(crate) token_loop: GpuNativeTokenLoopSnapshot,
+    pub(crate) recovery: GpuNativeRecoverySnapshot,
+    pub(crate) production_install:
+        crate::backend::gpu_native::GpuNativeProductionPhysicalInstallSnapshot,
+    pub(crate) launch: P1jLaunchSnapshot,
+    pub(crate) p0: PredictorV2Snapshot,
+    pub(crate) committed_position: usize,
+    pub(crate) pending_sidecar: bool,
+    pub(crate) observation_capacity: usize,
+}
+
 struct P1jRequest {
+    mode: P1jRequestMode,
     owner: Arc<P1jSidecarOwner>,
     pending: Option<P1jPending>,
 }
@@ -1583,6 +1605,19 @@ pub struct GpuNativeTokenLoop {
 }
 
 impl GpuNativeTokenLoop {
+    pub(crate) fn p1q_resource_snapshot(
+        &self,
+    ) -> Result<crate::gpu_native_residency::P1qResourceSnapshot, String> {
+        self.residency_manager.p1q_resource_snapshot()
+    }
+
+    pub(crate) fn p1q_install_snapshot(
+        &self,
+    ) -> crate::backend::gpu_native::GpuNativeProductionPhysicalInstallSnapshot {
+        self.residency_manager
+            .production_physical_install_snapshot()
+    }
+
     pub(crate) fn p1j_launch_snapshot(&self) -> P1jLaunchSnapshot {
         self.p1j_launch.snapshot()
     }
@@ -1595,6 +1630,9 @@ impl GpuNativeTokenLoop {
         let Some(movement) = request.p1j.as_mut() else {
             return;
         };
+        if movement.mode == P1jRequestMode::InertResourceOnly {
+            return;
+        }
         let owner = &movement.owner;
         let pending = &mut movement.pending;
         p1m_launch(
@@ -4279,6 +4317,22 @@ impl GpuNativeRequestState {
         &mut self,
         token_loop: &GpuNativeTokenLoop,
     ) -> Result<(), String> {
+        self.enable_p1j_mode(token_loop, P1jRequestMode::Active)
+    }
+
+    /// Performance-only matched allocation; movement is disabled at launch.
+    pub(crate) fn enable_predictor_v2_p1j_sidecar_inert(
+        &mut self,
+        token_loop: &GpuNativeTokenLoop,
+    ) -> Result<(), String> {
+        self.enable_p1j_mode(token_loop, P1jRequestMode::InertResourceOnly)
+    }
+
+    fn enable_p1j_mode(
+        &mut self,
+        token_loop: &GpuNativeTokenLoop,
+        mode: P1jRequestMode,
+    ) -> Result<(), String> {
         if self.committed_position != 0
             || self.p1j.is_some()
             || token_loop.q4_qualification.get().is_some()
@@ -4301,11 +4355,42 @@ impl GpuNativeRequestState {
             .residency_manager
             .enable_p1j_sidecar(namespace.runtime)?;
         self.p1j = Some(Box::new(P1jRequest {
+            mode,
             owner,
             pending: None,
         }));
         Ok(())
     }
+    /// Pre-request evidence only; ordinary execution never calls this accessor.
+    pub(crate) fn p1q_initial_snapshot(
+        &self,
+        token_loop: &GpuNativeTokenLoop,
+    ) -> Result<P1qInitialSnapshot, String> {
+        let movement = self.p1j.as_ref().ok_or("P1Q requires sidecar opt-in")?;
+        let (config, _) = self
+            .predictor_v2_observation
+            .enabled
+            .as_deref()
+            .ok_or("P1Q requires observation")?;
+        Ok(P1qInitialSnapshot {
+            mode: movement.mode,
+            resources: token_loop.residency_manager.p1q_resource_snapshot()?,
+            token_loop: token_loop.snapshot(),
+            recovery: token_loop.recovery_snapshot(),
+            production_install: token_loop
+                .residency_manager
+                .production_physical_install_snapshot(),
+            launch: token_loop.p1j_launch_snapshot(),
+            p0: self
+                .predictor_v2_snapshot()
+                .ok_or("P1Q P0 unavailable")?
+                .map_err(|e| format!("{e:?}"))?,
+            committed_position: self.committed_position,
+            pending_sidecar: movement.pending.is_some(),
+            observation_capacity: config.capacity_per_collection,
+        })
+    }
+
     /// Internal typed opt-in for a later approved driver. Ordinary constructors,
     /// public API, configuration and CLI never activate P1E.
     #[allow(dead_code)]

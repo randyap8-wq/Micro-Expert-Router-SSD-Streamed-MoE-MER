@@ -148,6 +148,7 @@ pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_out_of_core;
 pub(crate) mod gpu_native_physical_install_staging;
 mod gpu_native_predictor_v2_sidecar_qualifier;
+mod gpu_native_predictor_v2_sidecar_performance;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_demand_source_concurrency;
 pub(crate) mod gpu_native_oracle_routes;
@@ -925,6 +926,12 @@ enum Cmd {
     #[command(name = "qualify-gpu-native-predictor-v2-p1j-sidecar")]
     QualifyGpuNativePredictorV2P1jSidecar(
         crate::gpu_native_predictor_v2_sidecar_qualifier::CommandArgs,
+    ),
+
+    /// Qualify matched-resource P1Q noise or movement performance.
+    #[command(name = "qualify-gpu-native-predictor-v2-sidecar-performance")]
+    QualifyGpuNativePredictorV2SidecarPerformance(
+        crate::gpu_native_predictor_v2_sidecar_performance::CommandArgs,
     ),
 
     /// Capture authoritative ordered route truth from the ordinary production
@@ -2045,6 +2052,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
     match cmd {
         Cmd::ObserveGpuNativePredictorV2P1e(args) => Some(args.config.as_path()),
         Cmd::QualifyGpuNativePredictorV2P1jSidecar(args) => Some(args.config.as_path()),
+        Cmd::QualifyGpuNativePredictorV2SidecarPerformance(args) => Some(args.config.as_path()),
         Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
             config,
             standalone_only: false,
@@ -2494,6 +2502,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             rt.block_on(crate::gpu_native_predictor_v2_observation::run_command(args))
+        }
+        Cmd::QualifyGpuNativePredictorV2SidecarPerformance(args) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_predictor_v2_sidecar_performance::run_command(args))
         }
         Cmd::QualifyGpuNativePredictorV2P1jSidecar(args) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
