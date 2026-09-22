@@ -2820,8 +2820,12 @@ mod p1k_tests {
 
         #[test]
         fn one_file_source_contract_against_exact_p1m_and_no_activation() {
+            const P1M: &str = "02530dd3b0cc7bd4771d99f23a3640db67aba29d";
+            const P1O: &str = "7d48639434a5097de23c9f7232cf3a5237dbf332";
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-            let git = |args: &[&str]| {
+            let mut commands = Vec::new();
+            let mut git = |args: &[&str]| {
+                commands.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
                 let output = std::process::Command::new("git")
                     .current_dir(root)
                     .args(args)
@@ -2835,28 +2839,28 @@ mod p1k_tests {
                 String::from_utf8(output.stdout).unwrap()
             };
             assert_eq!(
-                git(&[
-                    "show",
-                    "-s",
-                    "--format=%T",
-                    "02530dd3b0cc7bd4771d99f23a3640db67aba29d"
-                ])
-                .trim(),
+                git(&["show", "-s", "--format=%T", P1M]).trim(),
                 "bd1959f2b9398a7356ad0bcadb6ba38e4810746b"
             );
             assert_eq!(
-                git(&[
-                    "diff",
-                    "--name-only",
-                    "02530dd3b0cc7bd4771d99f23a3640db67aba29d",
-                    "--"
-                ])
-                .trim(),
+                git(&["show", "-s", "--format=%T", P1O]).trim(),
+                "3045932e4582627bb7f2bf47e6160dab2fcbc1c3"
+            );
+            assert_eq!(
+                git(&["diff", "--name-only", P1M, P1O, "--"]).trim(),
                 "rust-engine/src/gpu_native_predictor_v2_sidecar_qualifier.rs"
             );
-            assert!(git(&["ls-files", "--others", "--exclude-standard"])
-                .trim()
-                .is_empty());
+            // The complete executed command list is a deterministic descendant-safety
+            // witness: only pinned committed objects are queried, never HEAD, the
+            // tracked working-tree diff, or untracked files. No git state is mutated.
+            assert_eq!(
+                commands,
+                vec![
+                    vec!["show", "-s", "--format=%T", P1M],
+                    vec!["show", "-s", "--format=%T", P1O],
+                    vec!["diff", "--name-only", P1M, P1O, "--"],
+                ]
+            );
             no_serving_config_environment_or_direct_main_activation();
             only_ordinary_step_token_and_no_runtime_in_tests();
             let frozen = FrozenContract::default();
