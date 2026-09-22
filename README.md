@@ -12,7 +12,7 @@ The project started as a CPU/SSD-streaming engine. That work is still part of ME
 
 <p align="center">
   <a href="https://amalgafy.com">
-    <img src="https://raw.githubusercontent.com/randyap8-wq/Clean-Shot/main/public/amalgafy-icon.svg" alt="Amalgafy" width="160" />
+    <img src="docs/assets/amalgafy-logo.svg" alt="Amalgafy" width="160" />
   </a>
 </p>
 
