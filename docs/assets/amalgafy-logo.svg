@@ -1,23 +1,30 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 64" width="320" height="64" role="img" aria-label="Amalgafy">
-  <title>Amalgafy</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 230 40" role="img" aria-labelledby="title desc">
+  <title id="title">Amalgafy</title>
+  <desc id="desc">Amalgafy five-dot mark and wordmark</desc>
   <style>
-    .wordmark, .dot { fill: #0F1115; }
-    .accent { fill: #1FB68A; }
+    .amg-ink { fill: #0f0f12; }
+    .amg-green { fill: #0e9f6e; }
     @media (prefers-color-scheme: dark) {
-      .wordmark, .dot { fill: #F0F6FC; }
+      .amg-ink { fill: #f7f6f1; }
     }
   </style>
-  <g>
-    <circle class="accent" cx="16" cy="24" r="5"/>
-    <circle class="dot" cx="34" cy="24" r="5"/>
-    <circle class="dot" cx="16" cy="42" r="5"/>
-    <circle class="dot" cx="34" cy="42" r="5"/>
+
+  <!-- Exact site BrandMark geometry: four outer dots plus green center dot. -->
+  <g transform="translate(4 8)">
+    <circle class="amg-ink" cx="6.5" cy="6.5" r="2.5"/>
+    <circle class="amg-ink" cx="16.5" cy="6.5" r="2.5"/>
+    <circle class="amg-ink" cx="6.5" cy="16.5" r="2.5"/>
+    <circle class="amg-ink" cx="16.5" cy="16.5" r="2.5"/>
+    <circle class="amg-green" cx="11.5" cy="11.5" r="2.5"/>
   </g>
-  <text class="wordmark"
-        x="58" y="44"
-        font-family="Inter, 'Helvetica Neue', Arial, sans-serif"
-        font-weight="800"
-        font-size="32"
-        letter-spacing="1">AMALGAFY</text>
+
+  <!-- Site wordmark: Inter Tight / Inter, heavy weight, tight tracking. -->
+  <text
+    class="amg-ink"
+    x="39"
+    y="27"
+    font-family="'Inter Tight', Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+    font-size="22"
+    font-weight="820"
+    letter-spacing="-0.77">AMALGAFY</text>
 </svg>
