@@ -14,6 +14,7 @@ use std::time::Instant;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const SCHEMA: &str = "mer.predictor-v2-p1q-matched-resource-performance.v1";
+const CHILD_PROTOCOL: &str = "mer.predictor-v2-p1q3-arm.v1";
 const MAX_POSITIONS: usize = 4096;
 const PAIRS: usize = 6;
 const OUTPUT_TOKENS: usize = 128;
@@ -33,6 +34,12 @@ pub(crate) struct CommandArgs {
     experiment_mode: ExperimentMode,
     #[arg(long)]
     noise_calibration_report: Option<PathBuf>,
+    #[arg(long, hide = true, requires_all = ["p1q3_child_pair_index", "p1q3_child_arm"])]
+    p1q3_child_protocol: Option<String>,
+    #[arg(long, hide = true, requires_all = ["p1q3_child_protocol", "p1q3_child_arm"], value_parser = clap::value_parser!(u8).range(1..=6))]
+    p1q3_child_pair_index: Option<u8>,
+    #[arg(long, hide = true, value_enum, requires_all = ["p1q3_child_protocol", "p1q3_child_pair_index"])]
+    p1q3_child_arm: Option<Arm>,
 }
 
 // Reject unsupported request semantics instead of silently discarding them.
@@ -548,57 +555,394 @@ impl Default for FrozenContract {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 enum Arm {
     Control,
     Treatment,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArmProvenance {
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     provenance: evidence::BenchmarkProvenance,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     config_path: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     config_sha256: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     model_identity: crate::greedy_parity::ModelIdentityEvidence,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     production_configuration: evidence::ProductionConfiguration,
 }
+
+// Typed transport implementations live only in this qualification module.
+// The constructor lists EVERY original field (no defaults or struct update),
+// so additions to the original structs must also be handled here to compile.
+// Require even nullable fields to be present; null is distinct from omission.
+macro_rules! arm_transport_struct {
+    ($ty:path { $($field:ident: $field_ty:ty,)+ }) => {
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Fields {
+                    $(#[serde(deserialize_with = "Deserialize::deserialize")]
+                    $field: $field_ty,)+
+                }
+                let v = Fields::deserialize(d)?;
+                Ok(Self { $($field: v.$field,)+ })
+            }
+        }
+    };
+}
+macro_rules! arm_transport_enum {
+    ($ty:path { $($variant:ident,)+ }) => {
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                #[derive(Deserialize)]
+                enum Variant { $($variant,)+ }
+                Ok(match Variant::deserialize(d)? { $(Variant::$variant => Self::$variant,)+ })
+            }
+        }
+    };
+}
+arm_transport_struct!(crate::qualification::BuildProvenance {
+    git_sha: Option<String>,
+    dirty: Option<bool>,
+    package_version: String,
+});
+arm_transport_struct!(crate::qualification::ArtifactDigest {
+    configured_path: String,
+    canonical_path: String,
+    byte_length: u64,
+    sha256: String,
+});
+arm_transport_struct!(crate::qualification::QualificationArtifacts {
+    config: Option<crate::qualification::ArtifactDigest>,
+    tokenizer: Option<crate::qualification::ArtifactDigest>,
+    expert_metadata: Option<crate::qualification::ArtifactDigest>,
+    packed_manifest: Option<crate::qualification::ArtifactDigest>,
+    weights_config: Option<crate::qualification::ArtifactDigest>,
+    dense_weights_directory: Option<String>,
+    expert_data_directory: String,
+    packed_expert_blob: Option<String>,
+    large_artifacts_recursively_hashed: bool,
+});
+arm_transport_struct!(crate::qualification::ExpertMetadataEvidence {
+    dtype: Option<String>,
+    q4_0_layout: Option<String>,
+    conversion_mode: Option<String>,
+    source: Option<String>,
+    explicitly_synthetic: bool,
+});
+arm_transport_struct!(crate::greedy_parity::ModelIdentityEvidence {
+    architecture: String,
+    num_layers: usize,
+    num_experts_per_layer: u32,
+    total_experts: u64,
+    top_k: usize,
+    d_model: usize,
+    d_ff: usize,
+    routed_expert_dtype: String,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::BenchmarkProvenance {
+    build: crate::qualification::BuildProvenance,
+    executable_canonical_path: String,
+    executable_sha256: String,
+    resolved_config_sha256: String,
+    artifacts: crate::qualification::QualificationArtifacts,
+    expert_metadata: crate::qualification::ExpertMetadataEvidence,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::CacheResidencyConfiguration {
+    ram_cache_slots: usize,
+    block_align: usize,
+    direct_io: bool,
+    pipeline_depth: u32,
+    partial_load_fraction: f64,
+    pin_after_observations: u64,
+    packed_blob: Option<String>,
+    packed_manifest: Option<String>,
+    gpu_cache_enabled: bool,
+    gpu_vram_capacity_mb: usize,
+    gpu_vram_anchor_ratio: f32,
+    gpu_promote_after_hits: u64,
+    gpu_cache_dtype: String,
+    gpu_native_max_seq_len: usize,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::PredictorPrefetchConfiguration {
+    predict_fanout: usize,
+    predict_min_prob: f64,
+    max_concurrent_prefetches: usize,
+    max_fetch_yields: usize,
+    locality_enabled: bool,
+    locality_window: usize,
+    locality_threshold_pct: f32,
+    speculator_enabled: bool,
+    speculator_hidden_dim: usize,
+    speculator_top_k: usize,
+    affinity_enabled: bool,
+    affinity_neighbors_k: usize,
+    affinity_decay_epoch: u64,
+    prefetch_governor: bool,
+    prefetch_precision_floor: f64,
+    prefetch_contention_weight: f64,
+    cost_aware_eviction: bool,
+    pregate_enabled: bool,
+    static_residency_fraction: f64,
+    static_residency_warmup_tokens: u64,
+    static_residency_profile: Option<String>,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::ProductionConfiguration {
+    q4_dtype: String,
+    q4_layout: Option<String>,
+    cache_residency: crate::gpu_native_real_benchmark::CacheResidencyConfiguration,
+    predictor_prefetch: crate::gpu_native_real_benchmark::PredictorPrefetchConfiguration,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::RuntimeContractEvidence {
+    real_transformer_enabled: bool,
+    real_transformer_gpu_native: bool,
+    compute_offload: String,
+    ordinary_step_token_only: bool,
+    legacy_execution_plan: crate::qualification::ExecutionPlanEvidence,
+    token_loop_geometry: crate::gpu_native_token_loop::GpuNativeModelGeometry,
+    strict_fail_closed_routed_experts: bool,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::CounterRatios {
+    attempts_per_completed_position: f64,
+    misses_per_completed_position: f64,
+    replays_per_completed_position: f64,
+    submissions_per_completed_position: f64,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::RecoveryRatios {
+    resume_attempts_per_completed_position: f64,
+    recovery_segments_per_completed_position: f64,
+    checkpoint_captures_per_completed_position: f64,
+    checkpoint_restores_per_completed_position: f64,
+    full_token_replays_per_completed_position: f64,
+    layers_encoded_per_completed_position: f64,
+    attention_layers_reexecuted_per_completed_position: f64,
+    expert_layers_reexecuted_per_completed_position: f64,
+    invalid_tail_layers_encoded_per_completed_position: f64,
+    residency_service_us_per_completed_position: f64,
+    boundary_wait_us_per_completed_position: f64,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::EngineStorageSnapshot {
+    ram_hits: u64,
+    ram_misses: u64,
+    nvme_read_operations: u64,
+    nvme_bytes_read: u64,
+    prefetch_completed: u64,
+    predictor_observations: u64,
+    ssd_stall_us: u64,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::GpuNativeResidencyDelta {
+    vram_hits: u64,
+    vram_misses: u64,
+    physical_current_hits: u64,
+    physical_source_acquisitions: u64,
+    logical_admissions_for_physical_misses: u64,
+    ram_to_vram_installs: u64,
+    physical_evictions: u64,
+    physical_reinstalls: u64,
+    stale_generation_rejections: u64,
+    demand_requests: u64,
+    speculative_requests: u64,
+    speculative_vram_hits: u64,
+    speculative_ram_to_vram_installs: u64,
+    speculative_dropped_capacity_or_pressure: u64,
+});
+arm_transport_struct!(crate::gpu_native_real_benchmark::RequestSnapshots {
+    token_loop_before: crate::gpu_native_token_loop::GpuNativeTokenLoopSnapshot,
+    token_loop_after: crate::gpu_native_token_loop::GpuNativeTokenLoopSnapshot,
+    token_loop_delta: crate::gpu_native_token_loop::GpuNativeTokenLoopSnapshot,
+    token_loop_ratios: crate::gpu_native_real_benchmark::CounterRatios,
+    recovery_before: crate::gpu_native_token_loop::GpuNativeRecoverySnapshot,
+    recovery_after: crate::gpu_native_token_loop::GpuNativeRecoverySnapshot,
+    recovery_delta: crate::gpu_native_token_loop::GpuNativeRecoverySnapshot,
+    recovery_ratios: crate::gpu_native_real_benchmark::RecoveryRatios,
+    routed_execution_before: crate::engine::RoutedExpertExecutionSnapshot,
+    routed_execution_after: crate::engine::RoutedExpertExecutionSnapshot,
+    routed_execution_delta: crate::engine::RoutedExpertExecutionSnapshot,
+    runtime_cache_before: crate::greedy_parity::RuntimeCacheSnapshot,
+    runtime_cache_after: crate::greedy_parity::RuntimeCacheSnapshot,
+    engine_storage_before: crate::gpu_native_real_benchmark::EngineStorageSnapshot,
+    engine_storage_after: crate::gpu_native_real_benchmark::EngineStorageSnapshot,
+    engine_storage_delta: crate::gpu_native_real_benchmark::EngineStorageSnapshot,
+    gpu_expert_io_before: crate::backend::GpuExpertIoSnapshot,
+    gpu_expert_io_after: crate::backend::GpuExpertIoSnapshot,
+    gpu_expert_io_delta: crate::backend::GpuExpertIoSnapshot,
+    gpu_expert_memory_before: crate::backend::GpuExpertMemorySnapshot,
+    gpu_expert_memory_after: crate::backend::GpuExpertMemorySnapshot,
+    gpu_native_residency_before: crate::gpu_native_residency::GpuNativeTieredResidencySnapshot,
+    gpu_native_residency_after: crate::gpu_native_residency::GpuNativeTieredResidencySnapshot,
+    gpu_native_residency_delta: crate::gpu_native_real_benchmark::GpuNativeResidencyDelta,
+});
+arm_transport_struct!(crate::gpu_native_residency::P1qResourceSnapshot {
+    sidecar_initialized: bool,
+    sidecar_allocated: bool,
+    sidecar_stride_bytes: u64,
+    sidecar_bank: u32,
+    sidecar_slot: u32,
+    namespace: Option<p1e::Namespace>,
+    ordinary_total_expert_budget_bytes: u64,
+    ordinary_arena_allocation_bytes: u64,
+    ordinary_layer_capacities: Vec<usize>,
+    ordinary_layer_resident_counts: Vec<usize>,
+    p1e_shadow_present: bool,
+    activity_counters: [u64; 14],
+});
+arm_transport_struct!(crate::gpu_native_token_loop::P1qInitialSnapshot {
+    mode: crate::gpu_native_token_loop::P1jRequestMode,
+    resources: crate::gpu_native_residency::P1qResourceSnapshot,
+    token_loop: crate::gpu_native_token_loop::GpuNativeTokenLoopSnapshot,
+    recovery: crate::gpu_native_token_loop::GpuNativeRecoverySnapshot,
+    production_install: crate::backend::gpu_native::GpuNativeProductionPhysicalInstallSnapshot,
+    launch: crate::gpu_native_token_loop::P1jLaunchSnapshot,
+    p0: crate::predictor_v2::ReconciliationSnapshot,
+    committed_position: usize,
+    pending_sidecar: bool,
+    observation_capacity: usize,
+});
+arm_transport_struct!(crate::predictor_v2::ReconciliationSnapshot {
+    incomplete: Option<crate::predictor_v2::AccountingError>,
+    emitted: u64,
+    terminal_predictions: u64,
+    live_predictions: u64,
+    admission_pending: u64,
+    accepted: u64,
+    rejected: u64,
+    skipped: u64,
+    terminal_categories: Vec<(TerminalReason, u64)>,
+    source_leaders: u64,
+    source_followers: u64,
+    source_completed: u64,
+    source_failed: u64,
+    source_cancelled: u64,
+    source_live: u64,
+    reservations: u64,
+    reservations_committed: u64,
+    reservations_aborted: u64,
+    reservations_live: u64,
+    install_owners: u64,
+    install_followers: u64,
+    available_installs: u64,
+    direct_matching_demand_credits: u64,
+});
+arm_transport_struct!(P1jLaunchSnapshot {
+    launch_considered: u64,
+    source_first_attempt_clean: u64,
+    source_checkpoint_recovered_clean: u64,
+    source_not_eligible: u64,
+    p1j_not_ready: u64,
+    no_pending_freeze: u64,
+    pending_sidecar_existing: u64,
+    retirement_busy: u64,
+    candidate_identity_invalid: u64,
+    freeze_incomplete: u64,
+    candidate_already_current_at_f: u64,
+    physical_evidence_missing_or_invalid: u64,
+    not_logical_materialized: u64,
+    missing_logical_generation: u64,
+    host_lease_busy: u64,
+    host_lease_missing: u64,
+    host_lease_stale: u64,
+    host_lease_wrong_payload_kind: u64,
+    host_lease_wrong_dtype: u64,
+    host_lease_wrong_length: u64,
+    sidecar_lock_busy: u64,
+    sidecar_occupied: u64,
+    sidecar_identity_rejected: u64,
+    sidecar_epoch_exhausted: u64,
+    sidecar_writer_sequence_exhausted: u64,
+    p0_acquire_failed: u64,
+    writer_spawned: u64,
+    incomplete: bool,
+});
+arm_transport_enum!(crate::gpu_native_token_loop::P1jRequestMode {
+    InertResourceOnly,
+    Active,
+});
+arm_transport_enum!(crate::predictor_v2::AccountingError {
+    InvalidIdentity,
+    InvalidTransition,
+    ReusedIdentity,
+    Overflow,
+    Capacity,
+    Incomplete,
+    Closed,
+});
+
 struct PreparedArm {
     spec: crate::ResolvedRealCliSpec,
     provenance: ArmProvenance,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArmReport {
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     arm: Arm,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     provenance: Option<ArmProvenance>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     runtime_build_attempted: bool,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     runtime_constructed: bool,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     runtime_resolved_config_sha256: Option<String>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     model_load: Option<crate::greedy_parity::ModelLoadEvidence>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     adapter: Option<crate::backend::GpuDeviceIdentity>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     runtime_contract: Option<evidence::RuntimeContractEvidence>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     generated_token_ids: Vec<u32>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     generated_token_ids_sha256: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     completed_positions: usize,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     observation_capacity_per_collection: usize,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     raw_p1e_report: Option<p1e::Report>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     predictor_v2_snapshot: Option<ReconciliationSnapshot>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     p1j_launch_before: Option<P1jLaunchSnapshot>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     p1j_launch_after: Option<P1jLaunchSnapshot>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     p1j_launch_delta: Option<P1jLaunchSnapshot>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     runtime_counters: Option<evidence::RequestSnapshots>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     runtime_shutdown: Option<crate::greedy_parity::BackgroundShutdownEvidence>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     errors: Vec<String>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     ordinary_invariants_pass: bool,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     mode: P1jRequestMode,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     resources_before_opt_in: Option<crate::gpu_native_residency::P1qResourceSnapshot>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     initial: Option<P1qInitialSnapshot>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     resource_identity: Option<Value>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     sidecar_freshly_initialized: bool,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     initial_state_pass: bool,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     request_wall_ns: Option<u64>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     generated_tps: Option<f64>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     planned_position_tps: Option<f64>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     production_install_after: Option<Value>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     production_install_delta: Option<Value>,
 }
 impl ArmReport {
@@ -1139,6 +1483,7 @@ fn execution_order(pair: usize) -> [Arm; 2] {
     }
 }
 fn validate_args(args: &CommandArgs) -> Result<()> {
+    child_request(args)?;
     if args.expected_adapter_name != "NVIDIA L4" {
         return Err("P1Q requires expected-adapter-name NVIDIA L4".into());
     }
@@ -1544,6 +1889,7 @@ struct Report {
     frozen_p1j_contract: FrozenContract,
     planned_positions: usize,
     pairs: Vec<PairReport>,
+    child_processes: Vec<ChildProcessEvidence>,
     noise_calibration_report_sha256: Option<String>,
     frozen_noise_floor_pct: Option<f64>,
     statistics: Option<NoiseStatistics>,
@@ -1940,6 +2286,629 @@ async fn run_arm(
     report
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChildRequest {
+    pair_index: usize,
+    arm: Arm,
+}
+
+fn child_request(args: &CommandArgs) -> Result<Option<ChildRequest>> {
+    match (
+        args.p1q3_child_protocol.as_deref(),
+        args.p1q3_child_pair_index,
+        args.p1q3_child_arm,
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(CHILD_PROTOCOL), Some(pair), Some(arm)) if (1..=PAIRS).contains(&(pair as usize)) => {
+            Ok(Some(ChildRequest { pair_index: pair as usize, arm }))
+        }
+        _ => Err("invalid or incomplete P1Q3 child protocol; requires exact protocol, pair 1..=6 and control/treatment".into()),
+    }
+}
+
+impl Arm {
+    fn child_arg(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Treatment => "treatment",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildArmArtifact {
+    schema: String,
+    protocol: String,
+    pair_index: usize,
+    requested_arm: Arm,
+    child_pid: u32,
+    executable_sha256: String,
+    source_identity: Value,
+    request_sha256: String,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    noise_calibration_report_sha256: Option<String>,
+    arm_report: ArmReport,
+}
+
+// Transport evidence is descriptive only. Artifacts, including malformed or
+// failed ones, are deterministically preserved alongside the parent report.
+#[derive(Serialize)]
+struct ChildProcessEvidence {
+    protocol: &'static str,
+    pair_index: usize,
+    requested_arm: Arm,
+    report_path: PathBuf,
+    child_pid: Option<u32>,
+    exit_code: Option<i32>,
+    normal_exit: bool,
+    report_sha256: Option<String>,
+    transport_error: Option<String>,
+}
+
+struct ChildOutcome {
+    report: Result<ArmReport>,
+    evidence: ChildProcessEvidence,
+}
+
+// This synchronous boundary cannot return a successful arm before its child
+// has exited. CPU doubles implement the same boundary without spawning MER.
+trait ArmProcess {
+    fn launch_and_wait(&mut self, request: ChildRequest) -> ChildOutcome;
+}
+
+struct ProcessLauncher<'a> {
+    args: &'a CommandArgs,
+    executable: PathBuf,
+    executable_sha256: String,
+    sources: Value,
+    request_sha256: String,
+    calibration_sha256: Option<String>,
+}
+
+fn child_report_path(parent: &Path, request: ChildRequest) -> PathBuf {
+    let mut path = parent.as_os_str().to_os_string();
+    path.push(format!(
+        ".p1q3-pair-{}-{}.json",
+        request.pair_index,
+        request.arm.child_arg()
+    ));
+    PathBuf::from(path)
+}
+
+fn child_command(
+    executable: &Path,
+    args: &CommandArgs,
+    request: ChildRequest,
+    report_path: &Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("qualify-gpu-native-predictor-v2-sidecar-performance")
+        .arg("--config")
+        .arg(&args.config)
+        .arg("--request-json")
+        .arg(&args.request_json)
+        .arg("--expected-adapter-name")
+        .arg(&args.expected_adapter_name)
+        .arg("--experiment-mode")
+        .arg(match args.experiment_mode {
+            ExperimentMode::AaNoiseCalibration => "aa-noise-calibration",
+            ExperimentMode::AbMovement => "ab-movement",
+        });
+    if let Some(path) = &args.noise_calibration_report {
+        command.arg("--noise-calibration-report").arg(path);
+    }
+    command
+        .arg("--p1q3-child-protocol")
+        .arg(CHILD_PROTOCOL)
+        .arg("--p1q3-child-pair-index")
+        .arg(request.pair_index.to_string())
+        .arg("--p1q3-child-arm")
+        .arg(request.arm.child_arg())
+        .arg("--report-out")
+        .arg(report_path);
+    // No environment, affinity, thread-count, backend or resource-limit edits.
+    command
+}
+
+// The pinned serde_json reader does not enable float_roundtrip. A second JSON
+// boundary must not change TPS or identity bits before the frozen calibration
+// reader sees them. Validate the entire JSON grammar with serde_json, then feed
+// the SAME bytes to the typed Deserialize visitor, parsing numeric lexemes with
+// Rust's correctly rounded FromStr. This is syntax-only transport: no ArmReport
+// fields, identities, counters or statistical semantics are interpreted here.
+fn read_child_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    serde_json::from_slice::<serde::de::IgnoredAny>(bytes)?;
+    let mut json = ChildJson {
+        remaining: std::str::from_utf8(bytes)?,
+    };
+    let result = T::deserialize(&mut json)?;
+    if !json.remaining.trim().is_empty() {
+        return Err("trailing child JSON".into());
+    }
+    Ok(result)
+}
+
+struct ChildJson<'de> {
+    remaining: &'de str,
+}
+type JsonError = serde::de::value::Error;
+impl ChildJson<'_> {
+    fn error(message: impl std::fmt::Display) -> JsonError {
+        serde::de::Error::custom(message)
+    }
+    fn peek(&mut self) -> Option<u8> {
+        self.remaining = self.remaining.trim_start();
+        self.remaining.as_bytes().first().copied()
+    }
+    fn take(&mut self, byte: u8) -> std::result::Result<(), JsonError> {
+        if self.peek() != Some(byte) {
+            return Err(Self::error("unexpected child JSON token"));
+        }
+        self.remaining = &self.remaining[1..];
+        Ok(())
+    }
+    fn string(&mut self) -> std::result::Result<String, JsonError> {
+        if self.peek() != Some(b'"') {
+            return Err(Self::error("expected child JSON string"));
+        }
+        let bytes = self.remaining.as_bytes();
+        let mut end = 1;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'\\' => end += 2,
+                b'"' => {
+                    let value =
+                        serde_json::from_str(&self.remaining[..=end]).map_err(Self::error)?;
+                    self.remaining = &self.remaining[end + 1..];
+                    return Ok(value);
+                }
+                _ => end += 1,
+            }
+        }
+        Err(Self::error("unterminated child JSON string"))
+    }
+    fn number(&mut self) -> std::result::Result<&str, JsonError> {
+        self.peek();
+        let end = self
+            .remaining
+            .bytes()
+            .take_while(|b| matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'))
+            .count();
+        if end == 0 {
+            return Err(Self::error("expected child JSON number"));
+        }
+        let (number, rest) = self.remaining.split_at(end);
+        self.remaining = rest;
+        Ok(number)
+    }
+}
+
+struct ChildJsonAccess<'a, 'de> {
+    json: &'a mut ChildJson<'de>,
+    first: bool,
+}
+impl ChildJsonAccess<'_, '_> {
+    fn next(&mut self, end: u8) -> std::result::Result<bool, JsonError> {
+        if self.json.peek() == Some(end) {
+            return Ok(false);
+        }
+        if !self.first {
+            self.json.take(b',')?;
+        }
+        self.first = false;
+        Ok(true)
+    }
+}
+impl<'de> serde::de::MapAccess<'de> for ChildJsonAccess<'_, 'de> {
+    type Error = JsonError;
+    fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> std::result::Result<Option<K::Value>, JsonError> {
+        if !self.next(b'}')? {
+            return Ok(None);
+        }
+        let key = seed.deserialize(serde::de::value::StringDeserializer::<JsonError>::new(
+            self.json.string()?,
+        ))?;
+        self.json.take(b':')?;
+        Ok(Some(key))
+    }
+    fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        seed.deserialize(&mut *self.json)
+    }
+}
+impl<'de> serde::de::SeqAccess<'de> for ChildJsonAccess<'_, 'de> {
+    type Error = JsonError;
+    fn next_element_seed<T: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> std::result::Result<Option<T::Value>, JsonError> {
+        if !self.next(b']')? {
+            return Ok(None);
+        }
+        seed.deserialize(&mut *self.json).map(Some)
+    }
+}
+impl<'de, 'a> serde::de::EnumAccess<'de> for &'a mut ChildJson<'de> {
+    type Error = JsonError;
+    type Variant = Self;
+    fn variant_seed<V: serde::de::DeserializeSeed<'de>>(
+        self,
+        seed: V,
+    ) -> std::result::Result<(V::Value, Self), JsonError> {
+        let variant = seed.deserialize(serde::de::value::StringDeserializer::<JsonError>::new(
+            self.string()?,
+        ))?;
+        self.take(b':')?;
+        Ok((variant, self))
+    }
+}
+impl<'de> serde::de::VariantAccess<'de> for &mut ChildJson<'de> {
+    type Error = JsonError;
+    fn unit_variant(self) -> std::result::Result<(), JsonError> {
+        Deserialize::deserialize(self)
+    }
+    fn newtype_variant_seed<T: serde::de::DeserializeSeed<'de>>(
+        self,
+        seed: T,
+    ) -> std::result::Result<T::Value, JsonError> {
+        seed.deserialize(self)
+    }
+    fn tuple_variant<V: serde::de::Visitor<'de>>(
+        self,
+        _: usize,
+        visitor: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        serde::Deserializer::deserialize_seq(self, visitor)
+    }
+    fn struct_variant<V: serde::de::Visitor<'de>>(
+        self,
+        _: &'static [&'static str],
+        visitor: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        serde::Deserializer::deserialize_map(self, visitor)
+    }
+}
+impl<'de> serde::Deserializer<'de> for &mut ChildJson<'de> {
+    type Error = JsonError;
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        match self.peek() {
+            Some(b'{') => {
+                self.take(b'{')?;
+                let value = visitor.visit_map(ChildJsonAccess {
+                    json: &mut *self,
+                    first: true,
+                })?;
+                self.take(b'}')?;
+                Ok(value)
+            }
+            Some(b'[') => {
+                self.take(b'[')?;
+                let value = visitor.visit_seq(ChildJsonAccess {
+                    json: &mut *self,
+                    first: true,
+                })?;
+                self.take(b']')?;
+                Ok(value)
+            }
+            Some(b'"') => visitor.visit_string(self.string()?),
+            Some(b'n') => {
+                self.remaining = &self.remaining[4..];
+                visitor.visit_unit()
+            }
+            Some(b't') => {
+                self.remaining = &self.remaining[4..];
+                visitor.visit_bool(true)
+            }
+            Some(b'f') => {
+                self.remaining = &self.remaining[5..];
+                visitor.visit_bool(false)
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                let number = self.number()?;
+                if number.contains(['.', 'e', 'E']) || number == "-0" {
+                    let value: f64 = number.parse().map_err(ChildJson::error)?;
+                    if !value.is_finite() {
+                        return Err(ChildJson::error("non-finite child JSON number"));
+                    }
+                    visitor.visit_f64(value)
+                } else if number.starts_with('-') {
+                    visitor.visit_i64(number.parse().map_err(ChildJson::error)?)
+                } else {
+                    visitor.visit_u64(number.parse().map_err(ChildJson::error)?)
+                }
+            }
+            _ => Err(ChildJson::error("invalid child JSON token")),
+        }
+    }
+    fn deserialize_f32<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        let value: f32 = self.number()?.parse().map_err(ChildJson::error)?;
+        if !value.is_finite() {
+            return Err(ChildJson::error("non-finite child f32"));
+        }
+        visitor.visit_f32(value)
+    }
+    fn deserialize_f64<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        let value: f64 = self.number()?.parse().map_err(ChildJson::error)?;
+        if !value.is_finite() {
+            return Err(ChildJson::error("non-finite child f64"));
+        }
+        visitor.visit_f64(value)
+    }
+    fn deserialize_option<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        if self.peek() == Some(b'n') {
+            self.remaining = &self.remaining[4..];
+            visitor.visit_none()
+        } else {
+            visitor.visit_some(self)
+        }
+    }
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _: &'static str,
+        visitor: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        visitor.visit_newtype_struct(self)
+    }
+    fn deserialize_enum<V: serde::de::Visitor<'de>>(
+        self,
+        _: &'static str,
+        _: &'static [&'static str],
+        visitor: V,
+    ) -> std::result::Result<V::Value, JsonError> {
+        if self.peek() == Some(b'"') {
+            visitor.visit_enum(serde::de::value::StringDeserializer::<JsonError>::new(
+                self.string()?,
+            ))
+        } else {
+            self.take(b'{')?;
+            let value = visitor.visit_enum(&mut *self)?;
+            self.take(b'}')?;
+            Ok(value)
+        }
+    }
+    serde::forward_to_deserialize_any! { bool i8 i16 i32 i64 u8 u16 u32 u64 char str string bytes byte_buf unit unit_struct seq tuple tuple_struct map struct identifier ignored_any }
+}
+
+fn validate_child_artifact(
+    bytes: &[u8],
+    request: ChildRequest,
+    process: &ChildProcessEvidence,
+    launcher: &ProcessLauncher<'_>,
+) -> Result<ArmReport> {
+    if !process.normal_exit || process.exit_code != Some(0) {
+        return Err(format!(
+            "child did not exit normally and successfully: exit_code={:?}",
+            process.exit_code
+        )
+        .into());
+    }
+    // Validate and decode the complete typed document without numeric drift.
+    let artifact: ChildArmArtifact = read_child_json(bytes)?;
+    if artifact.schema != CHILD_PROTOCOL
+        || artifact.protocol != CHILD_PROTOCOL
+        || artifact.pair_index != request.pair_index
+        || artifact.requested_arm != request.arm
+        || Some(artifact.child_pid) != process.child_pid
+        || artifact.child_pid == 0
+        || artifact.executable_sha256 != launcher.executable_sha256
+        || artifact.source_identity != launcher.sources
+        || artifact.request_sha256 != launcher.request_sha256
+        || artifact.noise_calibration_report_sha256 != launcher.calibration_sha256
+        || artifact.arm_report.arm != request.arm
+        || artifact.arm_report.mode != launcher.args.experiment_mode.request_mode(request.arm)
+    {
+        return Err("P1Q3 child schema/protocol/pair/arm/PID/executable/source/request/calibration/mode identity mismatch".into());
+    }
+    Ok(artifact.arm_report)
+}
+
+impl ArmProcess for ProcessLauncher<'_> {
+    fn launch_and_wait(&mut self, request: ChildRequest) -> ChildOutcome {
+        let report_path = child_report_path(&self.args.report_out, request);
+        let mut evidence = ChildProcessEvidence {
+            protocol: CHILD_PROTOCOL,
+            pair_index: request.pair_index,
+            requested_arm: request.arm,
+            report_path,
+            child_pid: None,
+            exit_code: None,
+            normal_exit: false,
+            report_sha256: None,
+            transport_error: None,
+        };
+        let report = (|| -> Result<ArmReport> {
+            ensure_output_absent(&evidence.report_path)?;
+            let mut child =
+                child_command(&self.executable, self.args, request, &evidence.report_path)
+                    .spawn()?;
+            evidence.child_pid = Some(child.id());
+            let status = child.wait()?;
+            evidence.exit_code = status.code();
+            evidence.normal_exit = status.success();
+            // One immutable snapshot supplies both the retained hash and parser.
+            let bytes = std::fs::read(&evidence.report_path)?;
+            evidence.report_sha256 = Some(crate::greedy_parity::sha256_hex(&bytes));
+            validate_child_artifact(&bytes, request, &evidence, self)
+        })();
+        evidence.transport_error = report.as_ref().err().map(ToString::to_string);
+        ChildOutcome { report, evidence }
+    }
+}
+
+fn reconcile_child_identity(
+    arm: &mut ArmReport,
+    provenance: &mut Option<Value>,
+    resources: &mut Option<Value>,
+    calibration: Option<&Calibration>,
+) {
+    let result = (|| -> Result<()> {
+        let input = arm
+            .provenance
+            .as_ref()
+            .ok_or("child input provenance unavailable")?;
+        let current = serde_json::to_value(input)?;
+        let identity = arm
+            .resource_identity
+            .as_ref()
+            .ok_or("child resource identity unavailable")?;
+        if provenance.as_ref().is_some_and(|first| first != &current)
+            || resources.as_ref().is_some_and(|first| first != identity)
+        {
+            return Err(
+                "cross-process input provenance or structural resource identity drift".into(),
+            );
+        }
+        if let Some(c) = calibration {
+            if !serialized_identity_matches(&c.input_provenance, input)?
+                || !serialized_identity_matches(&c.resource_identity, identity)?
+            {
+                return Err("cross-process calibration provenance/resource identity drift".into());
+            }
+        }
+        if provenance.is_none() {
+            *provenance = Some(current);
+        }
+        if resources.is_none() {
+            *resources = Some(identity.clone());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        arm.errors.push(error.to_string());
+        arm.ordinary_invariants_pass = false;
+    }
+}
+
+fn accept_child(
+    report: &mut Report,
+    calibration: Option<&Calibration>,
+    process: &mut impl ArmProcess,
+    request: ChildRequest,
+) -> ArmReport {
+    let outcome = process.launch_and_wait(request);
+    report.child_processes.push(outcome.evidence);
+    match outcome.report {
+        Ok(mut arm) => {
+            reconcile_child_identity(
+                &mut arm,
+                &mut report.input_provenance,
+                &mut report.resource_identity,
+                calibration,
+            );
+            arm
+        }
+        Err(error) => {
+            // No reconstruction of missing/invalid child evidence or retry.
+            let mut arm = ArmReport::new(request.arm);
+            arm.mode = report.experiment_mode.request_mode(request.arm);
+            arm.errors
+                .push(format!("P1Q3 child transport failed: {error}"));
+            arm
+        }
+    }
+}
+
+fn run_pairs(
+    report: &mut Report,
+    calibration: Option<&Calibration>,
+    process: &mut impl ArmProcess,
+) {
+    for index in 0..PAIRS {
+        let order = execution_order(index);
+        let first = accept_child(
+            report,
+            calibration,
+            process,
+            ChildRequest {
+                pair_index: index + 1,
+                arm: order[0],
+            },
+        );
+        let second = if shutdown_complete(&first) {
+            accept_child(
+                report,
+                calibration,
+                process,
+                ChildRequest {
+                    pair_index: index + 1,
+                    arm: order[1],
+                },
+            )
+        } else {
+            let mut skipped = ArmReport::new(order[1]);
+            skipped.mode = report.experiment_mode.request_mode(order[1]);
+            skipped
+                .errors
+                .push("not constructed: previous arm shutdown unproven".into());
+            skipped
+        };
+        let (control, treatment) = if order[0] == Arm::Control {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let pair = finish_pair(index, report.experiment_mode, control, treatment);
+        let valid = pair.pair_valid;
+        report.pairs.push(pair);
+        // Retain the failed pair, then stop. Never continue and select survivors.
+        if !valid {
+            break;
+        }
+    }
+}
+
+async fn run_child(
+    args: &CommandArgs,
+    request: ChildRequest,
+    request_bytes: &[u8],
+    launcher: &ProcessLauncher<'_>,
+    calibration: Option<&Calibration>,
+) -> Result<()> {
+    let arm_report = run_arm(
+        args,
+        request_bytes,
+        request.arm,
+        &mut None,
+        &mut None,
+        calibration,
+    )
+    .await;
+    let artifact = ChildArmArtifact {
+        schema: CHILD_PROTOCOL.into(),
+        protocol: CHILD_PROTOCOL.into(),
+        pair_index: request.pair_index,
+        requested_arm: request.arm,
+        child_pid: std::process::id(),
+        executable_sha256: launcher.executable_sha256.clone(),
+        source_identity: launcher.sources.clone(),
+        request_sha256: launcher.request_sha256.clone(),
+        noise_calibration_report_sha256: launcher.calibration_sha256.clone(),
+        arm_report,
+    };
+    // Qualification errors belong to the complete arm. A successful exit means
+    // only that its transport artifact was published after isolated shutdown.
+    write_report(&args.report_out, &artifact)
+}
+
 pub(crate) async fn run_command(args: CommandArgs) -> Result<()> {
     validate_args(&args)?;
     ensure_output_absent(&args.report_out)?;
@@ -1956,6 +2925,25 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<()> {
             validate_calibration(&bytes, &request_sha, &sources)
         })
         .transpose()?;
+    let (executable, executable_sha256) = crate::current_executable_identity()?;
+    let mut launcher = ProcessLauncher {
+        args: &args,
+        executable,
+        executable_sha256,
+        sources: sources.clone(),
+        request_sha256: request_sha.clone(),
+        calibration_sha256: calibration.as_ref().map(|c| c.bytes_sha256.clone()),
+    };
+    if let Some(request) = child_request(&args)? {
+        return run_child(
+            &args,
+            request,
+            &request_bytes,
+            &launcher,
+            calibration.as_ref(),
+        )
+        .await;
+    }
     let mut report = Report {
         schema: SCHEMA,
         experiment_mode: args.experiment_mode,
@@ -1967,6 +2955,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<()> {
         frozen_p1j_contract: FrozenContract::default(),
         planned_positions: PLANNED_POSITIONS,
         pairs: Vec::with_capacity(PAIRS),
+        child_processes: Vec::with_capacity(PAIRS * 2),
         noise_calibration_report_sha256: calibration.as_ref().map(|c| c.bytes_sha256.clone()),
         frozen_noise_floor_pct: calibration.as_ref().map(|c| c.floor),
         statistics: None,
@@ -1979,48 +2968,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<()> {
         performance_verdict: "NOT_AUTHORIZED",
         errors: Vec::new(),
     };
-    for index in 0..PAIRS {
-        let order = execution_order(index);
-        let first = run_arm(
-            &args,
-            &request_bytes,
-            order[0],
-            &mut report.input_provenance,
-            &mut report.resource_identity,
-            calibration.as_ref(),
-        )
-        .await;
-        let second = if shutdown_complete(&first) {
-            run_arm(
-                &args,
-                &request_bytes,
-                order[1],
-                &mut report.input_provenance,
-                &mut report.resource_identity,
-                calibration.as_ref(),
-            )
-            .await
-        } else {
-            let mut skipped = ArmReport::new(order[1]);
-            skipped.mode = args.experiment_mode.request_mode(order[1]);
-            skipped
-                .errors
-                .push("not constructed: previous arm shutdown unproven".into());
-            skipped
-        };
-        let (control, treatment) = if order[0] == Arm::Control {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        let pair = finish_pair(index, args.experiment_mode, control, treatment);
-        let valid = pair.pair_valid;
-        report.pairs.push(pair);
-        // Retain the failed pair, then stop. Never continue and select survivors.
-        if !valid {
-            break;
-        }
-    }
+    run_pairs(&mut report, calibration.as_ref(), &mut launcher);
     finish_experiment(&mut report)?;
     write_report(&args.report_out, &report)?;
     if !report.qualification_pass {
@@ -2276,6 +3224,7 @@ mod p1q_tests {
             frozen_p1j_contract: Default::default(),
             planned_positions: PLANNED_POSITIONS,
             pairs: (0..PAIRS).map(|i| pair(mode, i)).collect(),
+            child_processes: vec![],
             noise_calibration_report_sha256: None,
             frozen_noise_floor_pct: None,
             statistics: None,
@@ -2316,13 +3265,917 @@ mod p1q_tests {
             report_out: "report".into(),
             experiment_mode: mode,
             noise_calibration_report: None,
+            p1q3_child_protocol: None,
+            p1q3_child_pair_index: None,
+            p1q3_child_arm: None,
+        }
+    }
+
+    mod p1q3 {
+        use super::*;
+        use clap::{CommandFactory, Parser};
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: CommandArgs,
+        }
+
+        fn argv() -> Vec<&'static str> {
+            vec![
+                "p1q",
+                "--config",
+                "c",
+                "--request-json",
+                "r",
+                "--expected-adapter-name",
+                "NVIDIA L4",
+                "--experiment-mode",
+                "aa-noise-calibration",
+                "--report-out",
+                "o",
+            ]
+        }
+
+        fn provenance() -> ArmProvenance {
+            ArmProvenance {
+                provenance: evidence::BenchmarkProvenance {
+                    build: crate::qualification::BuildProvenance {
+                        git_sha: Some("frozen-source".into()),
+                        dirty: Some(false),
+                        package_version: "test".into(),
+                    },
+                    executable_canonical_path: "/fixture/mer".into(),
+                    executable_sha256: "executable".into(),
+                    resolved_config_sha256: "resolved".into(),
+                    artifacts: crate::qualification::QualificationArtifacts {
+                        config: Some(crate::qualification::ArtifactDigest {
+                            configured_path: "config".into(),
+                            canonical_path: "/fixture/config".into(),
+                            byte_length: 123,
+                            sha256: "config-hash".into(),
+                        }),
+                        ..Default::default()
+                    },
+                    expert_metadata: crate::qualification::ExpertMetadataEvidence {
+                        dtype: Some("q4_0".into()),
+                        q4_0_layout: Some("ggml".into()),
+                        conversion_mode: None,
+                        source: Some("fixture".into()),
+                        explicitly_synthetic: false,
+                    },
+                },
+                config_path: "/fixture/config".into(),
+                config_sha256: "config-hash".into(),
+                model_identity: crate::greedy_parity::ModelIdentityEvidence {
+                    architecture: "qwen3_moe".into(),
+                    num_layers: 48,
+                    num_experts_per_layer: 128,
+                    total_experts: 6144,
+                    top_k: 8,
+                    d_model: 2048,
+                    d_ff: 768,
+                    routed_expert_dtype: "q4_0".into(),
+                },
+                production_configuration: evidence::ProductionConfiguration {
+                    cache_residency: evidence::CacheResidencyConfiguration {
+                        gpu_vram_anchor_ratio: 0.6,
+                        partial_load_fraction: 0.75,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn transported_arm(mode: ExperimentMode, which: Arm) -> ArmReport {
+            let mut r = arm(mode, which);
+            r.provenance = Some(provenance());
+            r.runtime_build_attempted = true;
+            r.runtime_constructed = true;
+            r.runtime_resolved_config_sha256 = Some("resolved".into());
+            r.model_load = Some(crate::greedy_parity::ModelLoadEvidence {
+                strict: true,
+                loader: "fixture".into(),
+                loaded_tensors: 1,
+                required_tensors: 1,
+                optional_probed: 0,
+                optional_loaded: 0,
+                seeded_fallback_remained: false,
+            });
+            r.adapter = Some(crate::backend::GpuDeviceIdentity {
+                name: "NVIDIA L4".into(),
+                wgpu_backend: "vulkan".into(),
+                device_type: "DiscreteGpu".into(),
+                vendor_id: 4318,
+                device_id: 10168,
+                driver: "driver".into(),
+                driver_info: "fixture".into(),
+                compute_plane: "gpu".into(),
+                software_adapter: false,
+            });
+            r.runtime_contract = Some(super::p1q1::runtime_contract("raw-context"));
+            r.runtime_counters = Some(evidence::RequestSnapshots {
+                token_loop_before: Default::default(),
+                token_loop_after: Default::default(),
+                token_loop_delta: Default::default(),
+                token_loop_ratios: Default::default(),
+                recovery_before: Default::default(),
+                recovery_after: Default::default(),
+                recovery_delta: Default::default(),
+                recovery_ratios: Default::default(),
+                routed_execution_before: Default::default(),
+                routed_execution_after: Default::default(),
+                routed_execution_delta: Default::default(),
+                runtime_cache_before: Default::default(),
+                runtime_cache_after: Default::default(),
+                engine_storage_before: Default::default(),
+                engine_storage_after: Default::default(),
+                engine_storage_delta: Default::default(),
+                gpu_expert_io_before: Default::default(),
+                gpu_expert_io_after: Default::default(),
+                gpu_expert_io_delta: Default::default(),
+                gpu_expert_memory_before: Default::default(),
+                gpu_expert_memory_after: Default::default(),
+                gpu_native_residency_before: Default::default(),
+                gpu_native_residency_after: Default::default(),
+                gpu_native_residency_delta: Default::default(),
+            });
+            r.production_install_after = Some(json!({"sentinel":17}));
+            r.production_install_delta = Some(json!({"sentinel":13}));
+            r
+        }
+
+        fn launcher(args: &CommandArgs) -> ProcessLauncher<'_> {
+            ProcessLauncher {
+                args,
+                executable: "/fixture/mer".into(),
+                executable_sha256: "executable".into(),
+                sources: json!({"fixture":"source"}),
+                request_sha256: "request".into(),
+                calibration_sha256: None,
+            }
+        }
+
+        fn envelope(request: ChildRequest, mode: ExperimentMode) -> ChildArmArtifact {
+            ChildArmArtifact {
+                schema: CHILD_PROTOCOL.into(),
+                protocol: CHILD_PROTOCOL.into(),
+                pair_index: request.pair_index,
+                requested_arm: request.arm,
+                child_pid: 101,
+                executable_sha256: "executable".into(),
+                source_identity: json!({"fixture":"source"}),
+                request_sha256: "request".into(),
+                noise_calibration_report_sha256: None,
+                arm_report: transported_arm(mode, request.arm),
+            }
+        }
+
+        fn process_evidence(request: ChildRequest) -> ChildProcessEvidence {
+            ChildProcessEvidence {
+                protocol: CHILD_PROTOCOL,
+                pair_index: request.pair_index,
+                requested_arm: request.arm,
+                report_path: child_report_path(Path::new("report"), request),
+                child_pid: Some(101),
+                exit_code: Some(0),
+                normal_exit: true,
+                report_sha256: None,
+                transport_error: None,
+            }
+        }
+
+        #[test]
+        fn public_cli_and_hidden_protocol_fail_closed() {
+            let normal = Cli::try_parse_from(argv()).unwrap();
+            assert!(validate_args(&normal.args).is_ok());
+            assert_eq!(child_request(&normal.args).unwrap(), None);
+            let help = Cli::command().render_long_help().to_string();
+            assert!(!help.contains("p1q3-child"));
+            let mut ab = argv();
+            ab[8] = "ab-movement";
+            ab.extend(["--noise-calibration-report", "aa.json"]);
+            assert!(validate_args(&Cli::try_parse_from(ab).unwrap().args).is_ok());
+            let fields = [
+                ["--p1q3-child-protocol", CHILD_PROTOCOL],
+                ["--p1q3-child-pair-index", "1"],
+                ["--p1q3-child-arm", "control"],
+            ];
+            for mask in 1..7 {
+                let mut values = argv();
+                for (i, pair) in fields.iter().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        values.extend(pair);
+                    }
+                }
+                assert!(Cli::try_parse_from(values).is_err(), "mask {mask}");
+                let mut raw = args(ExperimentMode::AaNoiseCalibration);
+                if mask & 1 != 0 {
+                    raw.p1q3_child_protocol = Some(CHILD_PROTOCOL.into());
+                }
+                if mask & 2 != 0 {
+                    raw.p1q3_child_pair_index = Some(1);
+                }
+                if mask & 4 != 0 {
+                    raw.p1q3_child_arm = Some(Arm::Control);
+                }
+                assert!(validate_args(&raw).is_err());
+            }
+            for pair in 1..=6 {
+                for arm in ["control", "treatment"] {
+                    let index = pair.to_string();
+                    let mut values = argv();
+                    values.extend([
+                        "--p1q3-child-protocol",
+                        CHILD_PROTOCOL,
+                        "--p1q3-child-pair-index",
+                        &index,
+                        "--p1q3-child-arm",
+                        arm,
+                    ]);
+                    let parsed = Cli::try_parse_from(values).unwrap().args;
+                    assert_eq!(child_request(&parsed).unwrap().unwrap().pair_index, pair);
+                    assert!(validate_args(&parsed).is_ok());
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_pair_arm_protocol_rejected() {
+            for (pair, arm, protocol) in [
+                ("0", "control", CHILD_PROTOCOL),
+                ("7", "control", CHILD_PROTOCOL),
+                ("-1", "control", CHILD_PROTOCOL),
+                ("256", "control", CHILD_PROTOCOL),
+                ("1", "A", CHILD_PROTOCOL),
+                ("1", "Control", CHILD_PROTOCOL),
+                ("1", "other", CHILD_PROTOCOL),
+                ("1", "control", "other"),
+            ] {
+                let mut values = argv();
+                values.extend([
+                    "--p1q3-child-protocol",
+                    protocol,
+                    "--p1q3-child-pair-index",
+                    pair,
+                    "--p1q3-child-arm",
+                    arm,
+                ]);
+                assert!(Cli::try_parse_from(values)
+                    .map(|c| validate_args(&c.args).is_err())
+                    .unwrap_or(true));
+            }
+        }
+
+        #[test]
+        fn complete_typed_arm_roundtrip_including_failure_and_nullable_fields() {
+            for mode in [
+                ExperimentMode::AaNoiseCalibration,
+                ExperimentMode::AbMovement,
+            ] {
+                let mut original = transported_arm(mode, Arm::Treatment);
+                original.errors.push("retained failure".into());
+                original.predictor_v2_snapshot.as_mut().unwrap().incomplete =
+                    Some(crate::predictor_v2::AccountingError::Overflow);
+                let bytes = serde_json::to_vec(&original).unwrap();
+                let parsed: ArmReport = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(serde_json::to_vec(&parsed).unwrap(), bytes);
+                assert_eq!(parsed.request_wall_ns, original.request_wall_ns);
+                let value = serde_json::to_value(&original).unwrap();
+                for key in value.as_object().unwrap().keys() {
+                    let mut incomplete = value.clone();
+                    incomplete.as_object_mut().unwrap().remove(key);
+                    assert!(
+                        serde_json::from_value::<ArmReport>(incomplete).is_err(),
+                        "missing {key}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn typed_transport_preserves_nontrivial_tps_and_calibration_identity() {
+            let mut original = transported_arm(ExperimentMode::AaNoiseCalibration, Arm::Control);
+            original.request_wall_ns = Some(1_000_007_321);
+            let (g, p) = throughput(original.request_wall_ns.unwrap()).unwrap();
+            original.generated_tps = Some(g);
+            original.planned_position_tps = Some(p);
+            original
+                .provenance
+                .as_mut()
+                .unwrap()
+                .production_configuration
+                .cache_residency
+                .partial_load_fraction = 0.12799906291886037;
+            original.resource_identity.as_mut().unwrap()["nontrivial_float"] =
+                json!(0.12799906291886037);
+            let bytes = serde_json::to_vec(&original).unwrap();
+            let parsed: ArmReport = read_child_json(&bytes).unwrap();
+            assert_eq!(parsed.generated_tps, original.generated_tps);
+            assert_eq!(parsed.planned_position_tps, original.planned_position_tps);
+            assert_eq!(serde_json::to_vec(&parsed).unwrap(), bytes);
+        }
+
+        #[test]
+        fn lossless_json_numbers_containers_enums_and_invalid_documents() {
+            #[derive(Debug, PartialEq, Serialize, Deserialize)]
+            enum Shape {
+                Unit,
+                Newtype(u64),
+                Tuple(f64, String),
+                Struct { fixed: [u32; 2] },
+            }
+            for value in [
+                Shape::Unit,
+                Shape::Newtype(u64::MAX),
+                Shape::Tuple(127.99906291886037, "escaped \" \\ 日本語".into()),
+                Shape::Struct { fixed: [7, 9] },
+            ] {
+                let bytes = serde_json::to_vec(&value).unwrap();
+                assert_eq!(read_child_json::<Shape>(&bytes).unwrap(), value);
+            }
+            for value in [
+                f64::MIN_POSITIVE,
+                f64::MAX,
+                0.0,
+                -0.0,
+                0.12799906291886037,
+                1e-300,
+                2.718281828459045,
+            ] {
+                let bytes = serde_json::to_vec(&value).unwrap();
+                assert_eq!(
+                    read_child_json::<f64>(&bytes).unwrap().to_bits(),
+                    value.to_bits()
+                );
+            }
+            for value in [f32::MIN_POSITIVE, f32::MAX, 0.0, -0.0, 0.6] {
+                let bytes = serde_json::to_vec(&value).unwrap();
+                assert_eq!(
+                    read_child_json::<f32>(&bytes).unwrap().to_bits(),
+                    value.to_bits()
+                );
+            }
+            assert_eq!(read_child_json::<[u8; 2]>(b"[1,2]").unwrap(), [1, 2]);
+            assert!(read_child_json::<[u8; 2]>(b"[1,2,3]").is_err());
+            for bad in [
+                b"[1,]".as_slice(),
+                b"{\"x\":1,}".as_slice(),
+                b"NaN".as_slice(),
+                b"01".as_slice(),
+                b"1 2".as_slice(),
+                b"[".as_slice(),
+            ] {
+                assert!(read_child_json::<Value>(bad).is_err());
+            }
+            assert!(read_child_json::<f64>(b"1e400").is_err());
+            assert!(read_child_json::<f32>(b"1e100").is_err());
+            assert!(read_child_json::<Shape>(br#"{"Newtype":1,"Newtype":2}"#).is_err());
+        }
+
+        #[test]
+        fn transported_aa_calibration_keeps_original_integer_ns_rules() {
+            let (mut report, _) = schedule(ExperimentMode::AaNoiseCalibration, None);
+            for (index, pair) in report.pairs.iter_mut().enumerate() {
+                for (arm, multiplier) in [(&mut pair.control, 7321), (&mut pair.treatment, 4123)] {
+                    let ns = 1_000_000_000 + (index as u64 + 1) * multiplier;
+                    arm.request_wall_ns = Some(ns);
+                    let (g, p) = throughput(ns).unwrap();
+                    arm.generated_tps = Some(g);
+                    arm.planned_position_tps = Some(p);
+                    *arm = read_child_json(&serde_json::to_vec(&arm).unwrap()).unwrap();
+                }
+                pair.paired_generated_tps_delta_pct = Some(
+                    paired_delta(
+                        pair.control.request_wall_ns.unwrap(),
+                        pair.treatment.request_wall_ns.unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
+            finish_experiment(&mut report).unwrap();
+            let bytes = serde_json::to_vec(&report).unwrap();
+            let calibration =
+                validate_calibration(&bytes, "request", &json!({"fixture":"source"})).unwrap();
+            let mut arm = transported_arm(ExperimentMode::AbMovement, Arm::Treatment);
+            reconcile_child_identity(&mut arm, &mut None, &mut None, Some(&calibration));
+            assert!(arm.errors.is_empty(), "{:?}", arm.errors);
+            assert_eq!(calibration.floor, 2.0);
+        }
+
+        #[test]
+        fn exact_artifact_identity_complete_parse_and_normal_exit() {
+            let args = args(ExperimentMode::AaNoiseCalibration);
+            let launcher = launcher(&args);
+            let request = ChildRequest {
+                pair_index: 1,
+                arm: Arm::Control,
+            };
+            let artifact = envelope(request, args.experiment_mode);
+            let bytes = serde_json::to_vec(&artifact).unwrap();
+            let process = process_evidence(request);
+            assert!(validate_child_artifact(&bytes, request, &process, &launcher).is_ok());
+            for (path, value) in [
+                ("/schema", json!("wrong")),
+                ("/protocol", json!("wrong")),
+                ("/pair_index", json!(2)),
+                ("/requested_arm", json!("Treatment")),
+                ("/child_pid", json!(102)),
+                ("/executable_sha256", json!("wrong")),
+                ("/source_identity/fixture", json!("wrong")),
+                ("/request_sha256", json!("wrong")),
+                ("/noise_calibration_report_sha256", json!("wrong")),
+                ("/arm_report/arm", json!("Treatment")),
+                ("/arm_report/mode", json!("Active")),
+            ] {
+                let mut v = serde_json::to_value(&artifact).unwrap();
+                *v.pointer_mut(path).unwrap() = value;
+                assert!(
+                    validate_child_artifact(
+                        &serde_json::to_vec(&v).unwrap(),
+                        request,
+                        &process,
+                        &launcher
+                    )
+                    .is_err(),
+                    "{path}"
+                );
+            }
+            for extra in [b"{}".as_slice(), b"garbage".as_slice()] {
+                let mut trailing = bytes.clone();
+                trailing.extend(extra);
+                assert!(validate_child_artifact(&trailing, request, &process, &launcher).is_err());
+            }
+            assert!(validate_child_artifact(
+                &bytes[..bytes.len() - 1],
+                request,
+                &process,
+                &launcher
+            )
+            .is_err());
+            for (normal, code, pid) in [
+                (false, None, Some(101)),
+                (false, Some(1), Some(101)),
+                (true, Some(1), Some(101)),
+                (true, Some(0), None),
+            ] {
+                let mut p = process_evidence(request);
+                p.normal_exit = normal;
+                p.exit_code = code;
+                p.child_pid = pid;
+                assert!(validate_child_artifact(&bytes, request, &p, &launcher).is_err());
+            }
+        }
+
+        #[test]
+        fn exact_command_paths_calibration_and_unchanged_environment() {
+            for mode in [
+                ExperimentMode::AaNoiseCalibration,
+                ExperimentMode::AbMovement,
+            ] {
+                let mut args = args(mode);
+                args.config = "some config.toml".into();
+                args.request_json = "request with spaces.json".into();
+                if mode == ExperimentMode::AbMovement {
+                    args.noise_calibration_report = Some("frozen aa.json".into());
+                }
+                let request = ChildRequest {
+                    pair_index: 6,
+                    arm: Arm::Treatment,
+                };
+                let output = child_report_path(&args.report_out, request);
+                let command =
+                    child_command(Path::new("/exact/executable"), &args, request, &output);
+                assert_eq!(command.get_program(), "/exact/executable");
+                assert_eq!(command.get_envs().count(), 0);
+                assert!(command.get_current_dir().is_none());
+                let mut argv = vec![std::ffi::OsString::from("p1q")];
+                let full: Vec<_> = command.get_args().collect();
+                assert_eq!(
+                    full[0],
+                    "qualify-gpu-native-predictor-v2-sidecar-performance"
+                );
+                argv.extend(full[1..].iter().map(|s| s.to_os_string()));
+                let child = Cli::try_parse_from(argv).unwrap().args;
+                assert_eq!(child.config, args.config);
+                assert_eq!(child.request_json, args.request_json);
+                assert_eq!(
+                    child.noise_calibration_report,
+                    args.noise_calibration_report
+                );
+                assert_eq!(child.experiment_mode, mode);
+                assert_eq!(child.expected_adapter_name, "NVIDIA L4");
+                assert_eq!(child.report_out, output);
+                assert_eq!(child_request(&child).unwrap(), Some(request));
+            }
+            let paths: std::collections::BTreeSet<_> = (1..=PAIRS)
+                .flat_map(|pair_index| {
+                    [Arm::Control, Arm::Treatment].map(move |arm| {
+                        child_report_path(Path::new("report"), ChildRequest { pair_index, arm })
+                    })
+                })
+                .collect();
+            assert_eq!(paths.len(), 12);
+        }
+
+        struct Double {
+            mode: ExperimentMode,
+            events: Vec<(&'static str, ChildRequest)>,
+            fault: Option<(usize, &'static str)>,
+        }
+        impl ArmProcess for Double {
+            fn launch_and_wait(&mut self, request: ChildRequest) -> ChildOutcome {
+                assert!(self.events.last().is_none_or(|(e, _)| *e == "exit"));
+                let n = self.events.len() / 2 + 1;
+                self.events.push(("spawn", request));
+                let mut envelope = envelope(request, self.mode);
+                let fault = self.fault.filter(|(index, _)| *index == n).map(|(_, s)| s);
+                match fault {
+                    Some("shutdown") => {
+                        envelope
+                            .arm_report
+                            .runtime_shutdown
+                            .as_mut()
+                            .unwrap()
+                            .all_runtime_resources_released = false
+                    }
+                    Some("invalid") => envelope
+                        .arm_report
+                        .generated_token_ids
+                        .pop()
+                        .map(|_| ())
+                        .unwrap(),
+                    Some("provenance") => {
+                        envelope
+                            .arm_report
+                            .provenance
+                            .as_mut()
+                            .unwrap()
+                            .config_sha256 = "drift".into()
+                    }
+                    Some("resources") => {
+                        envelope.arm_report.resource_identity.as_mut().unwrap()["config"] =
+                            json!("drift")
+                    }
+                    Some("adapter") => {
+                        let arm = &mut envelope.arm_report;
+                        let raw = arm.runtime_contract.as_ref().unwrap();
+                        arm.adapter.as_mut().unwrap().name = "NVIDIA L4/PCIe/SSE2".into();
+                        arm.adapter.as_mut().unwrap().wgpu_backend = "gl".into();
+                        let input = evidence::RuntimeContractInput {
+                            real_transformer_enabled: true,
+                            real_transformer_gpu_native: true,
+                            compute_offload: crate::backend::ComputeOffload::Gpu,
+                            legacy_execution_plan: raw.legacy_execution_plan.clone(),
+                            token_loop_geometry: Some(raw.token_loop_geometry),
+                            authoritative_device: arm.adapter.clone(),
+                            model_load: arm.model_load.clone().unwrap(),
+                            routed_failure_policy:
+                                crate::engine::RoutedExpertGpuFailurePolicy::StrictFailClosed,
+                        };
+                        let error =
+                            evidence::validate_runtime_contract(&input, "NVIDIA L4").unwrap_err();
+                        arm.errors.push(error.to_string());
+                        arm.ordinary_invariants_pass = false;
+                    }
+                    _ => {}
+                }
+                self.events.push(("exit", request));
+                let args = args(self.mode);
+                let launcher = launcher(&args);
+                let mut evidence = process_evidence(request);
+                let bytes = serde_json::to_vec(&envelope).unwrap();
+                evidence.report_sha256 = Some(crate::greedy_parity::sha256_hex(&bytes));
+                let report = if fault == Some("transport") {
+                    Err("exact simulated transport failure".into())
+                } else {
+                    validate_child_artifact(&bytes, request, &evidence, &launcher)
+                };
+                evidence.transport_error = report.as_ref().err().map(ToString::to_string);
+                ChildOutcome { report, evidence }
+            }
+        }
+        fn schedule(
+            mode: ExperimentMode,
+            fault: Option<(usize, &'static str)>,
+        ) -> (Report, Double) {
+            let mut report = experiment(mode);
+            report.pairs.clear();
+            report.input_provenance = None;
+            report.resource_identity = None;
+            let mut process = Double {
+                mode,
+                events: vec![],
+                fault,
+            };
+            run_pairs(&mut report, None, &mut process);
+            finish_experiment(&mut report).unwrap();
+            (report, process)
+        }
+
+        #[test]
+        fn twelve_children_alternate_and_exit_before_next_launch() {
+            for mode in [
+                ExperimentMode::AaNoiseCalibration,
+                ExperimentMode::AbMovement,
+            ] {
+                let (report, double) = schedule(mode, None);
+                assert_eq!(report.pairs.len(), 6);
+                assert_eq!(report.child_processes.len(), 12);
+                assert!(report.qualification_pass);
+                assert_eq!(double.events.len(), 24);
+                let expected = [
+                    Arm::Control,
+                    Arm::Treatment,
+                    Arm::Treatment,
+                    Arm::Control,
+                    Arm::Control,
+                    Arm::Treatment,
+                    Arm::Treatment,
+                    Arm::Control,
+                    Arm::Control,
+                    Arm::Treatment,
+                    Arm::Treatment,
+                    Arm::Control,
+                ];
+                for (index, events) in double.events.chunks_exact(2).enumerate() {
+                    let request = ChildRequest {
+                        pair_index: index / 2 + 1,
+                        arm: expected[index],
+                    };
+                    assert_eq!(events, [("spawn", request), ("exit", request)]);
+                }
+                for pair in &report.pairs {
+                    assert_eq!(pair.control.request_wall_ns, Some(1_000_000_000));
+                    assert_eq!(pair.treatment.request_wall_ns, Some(1_000_000_000));
+                }
+            }
+        }
+
+        #[test]
+        fn transport_failure_retained_and_no_future_children() {
+            for failure in [1, 2, 3, 12] {
+                let (report, double) = schedule(
+                    ExperimentMode::AaNoiseCalibration,
+                    Some((failure, "transport")),
+                );
+                assert_eq!(report.child_processes.len(), failure);
+                assert_eq!(double.events.len(), failure * 2);
+                assert_eq!(report.pairs.len(), (failure + 1) / 2);
+                assert!(!report.qualification_pass);
+                assert_eq!(
+                    report
+                        .child_processes
+                        .last()
+                        .unwrap()
+                        .transport_error
+                        .as_deref(),
+                    Some("exact simulated transport failure")
+                );
+                assert_eq!(report.performance_verdict, "NOT_AUTHORIZED");
+            }
+        }
+
+        #[test]
+        fn invalid_pair_retained_without_later_pairs() {
+            let (report, process) =
+                schedule(ExperimentMode::AaNoiseCalibration, Some((2, "invalid")));
+            assert_eq!(report.pairs.len(), 1);
+            assert_eq!(process.events.len(), 4);
+            assert!(!report.pairs[0].pair_valid);
+        }
+
+        #[test]
+        fn unproven_first_shutdown_skips_second_even_after_normal_process_exit() {
+            let (report, process) =
+                schedule(ExperimentMode::AaNoiseCalibration, Some((1, "shutdown")));
+            assert_eq!(process.events.len(), 2);
+            assert!(report.child_processes[0].normal_exit);
+            assert!(!report.qualification_pass);
+            assert_eq!(report.pairs.len(), 1);
+            assert_eq!(
+                report.pairs[0].treatment.errors,
+                vec!["not constructed: previous arm shutdown unproven"]
+            );
+        }
+
+        #[test]
+        fn cross_pair_provenance_and_resources_fail() {
+            for fault in ["provenance", "resources"] {
+                let (report, process) =
+                    schedule(ExperimentMode::AaNoiseCalibration, Some((3, fault)));
+                assert_eq!(report.pairs.len(), 2);
+                assert_eq!(process.events.len(), 8);
+                assert!(report.pairs[0].pair_valid);
+                assert!(!report.pairs[1].pair_valid);
+                assert!(report.pairs[1]
+                    .treatment
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("cross-process")));
+                assert!(!report.performance_comparison_authorized);
+            }
+        }
+
+        #[test]
+        fn wrong_adapter_is_retained_without_retry() {
+            let (report, process) =
+                schedule(ExperimentMode::AaNoiseCalibration, Some((1, "adapter")));
+            assert_eq!(report.pairs.len(), 1);
+            assert_eq!(process.events.len(), 4);
+            let failed = &report.pairs[0].control;
+            assert_eq!(failed.adapter.as_ref().unwrap().name, "NVIDIA L4/PCIe/SSE2");
+            assert!(!failed.errors.is_empty());
+            assert!(!report.qualification_pass);
+        }
+
+        #[test]
+        fn calibration_identity_matches_and_rejects_each_drift() {
+            let original = transported_arm(ExperimentMode::AbMovement, Arm::Treatment);
+            let calibration = Calibration {
+                bytes_sha256: "calibration".into(),
+                floor: 2.0,
+                input_provenance: transport_value(original.provenance.as_ref().unwrap()).unwrap(),
+                resource_identity: transport_value(original.resource_identity.as_ref().unwrap())
+                    .unwrap(),
+            };
+            for fault in [None, Some("provenance"), Some("resources")] {
+                let mut arm: ArmReport =
+                    serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+                match fault {
+                    Some("provenance") => {
+                        arm.provenance.as_mut().unwrap().config_sha256 = "drift".into()
+                    }
+                    Some("resources") => {
+                        arm.resource_identity.as_mut().unwrap()["config"] = json!("drift")
+                    }
+                    _ => {}
+                }
+                reconcile_child_identity(&mut arm, &mut None, &mut None, Some(&calibration));
+                assert_eq!(arm.errors.is_empty(), fault.is_none());
+            }
+        }
+
+        fn base_function(name: &str) -> String {
+            let output=std::process::Command::new("git").args(["show","d858dc338dcf7a90acd7cedc2cb41235721bb67a:rust-engine/src/gpu_native_predictor_v2_sidecar_performance.rs"]).current_dir(env!("CARGO_MANIFEST_DIR")).output().unwrap();
+            assert!(output.status.success());
+            let source = String::from_utf8(output.stdout).unwrap();
+            let start = source.find(&format!("fn {name}(")).unwrap();
+            let open = start + source[start..].find('{').unwrap();
+            let mut depth = 1;
+            for (i, c) in source[open + 1..].char_indices() {
+                if c == '{' {
+                    depth += 1;
+                }
+                if c == '}' {
+                    depth -= 1;
+                }
+                if depth == 0 {
+                    return source[start..open + i + 2].into();
+                }
+            }
+            panic!("unclosed {name}")
+        }
+
+        #[test]
+        fn frozen_timing_runtime_normalization_and_statistics_bytes() {
+            let source = production();
+            for name in [
+                "run_arm",
+                "execute_arm",
+                "step_request",
+                "shutdown",
+                "shutdown_complete",
+                "structural_initial",
+                "structural_runtime_contract",
+                "noise_statistics",
+                "noise_stable",
+                "noise_floor",
+                "ab_verdict",
+                "throughput",
+                "paired_delta",
+                "finish_pair",
+                "finish_experiment",
+                "validate_calibration",
+                "calibration_floor_from_bytes",
+                "serialized_identity_matches",
+            ] {
+                assert!(source.contains(&base_function(name)), "{name} changed");
+            }
+            assert_eq!((PAIRS, OUTPUT_TOKENS, PLANNED_POSITIONS), (6, 128, 143));
+        }
+
+        #[test]
+        fn parent_call_graph_contains_no_runtime_and_child_has_one_arm() {
+            let source = production();
+            let parent = part(source, "pub(crate) async fn run_command(", "\0");
+            assert!(parent.find("return run_child(").unwrap() < parent.find("run_pairs(").unwrap());
+            let schedule = part(source, "fn run_pairs(", "async fn run_child(");
+            let acceptance = part(source, "fn accept_child(", "fn run_pairs(");
+            let launch = part(
+                source,
+                "impl ArmProcess for ProcessLauncher",
+                "fn reconcile_child_identity(",
+            );
+            for block in [parent, schedule, acceptance, launch] {
+                for forbidden in [
+                    "run_arm(",
+                    "prepare_arm(",
+                    "build_isolated_greedy_runtime(",
+                    "build_p1q_isolated_runtime(",
+                    "load_real_cli_tokenizer(",
+                    "execute_arm(",
+                    "step_request(",
+                    "step_token(",
+                    "GpuBackend",
+                    "wgpu::",
+                    "Instant::now()",
+                ] {
+                    assert!(!block.contains(forbidden), "{forbidden}");
+                }
+                assert!(!block.contains("request_wall_ns ="));
+            }
+            let child = part(
+                source,
+                "async fn run_child(",
+                "pub(crate) async fn run_command(",
+            );
+            assert_eq!(child.matches("run_arm(").count(), 1);
+            assert!(child.find("run_arm(").unwrap() < child.find("write_report(").unwrap());
+            assert!(!child.contains("for "));
+            assert!(!child.contains("loop {"));
+            assert_eq!(launch.matches(".spawn()?").count(), 1);
+            assert_eq!(launch.matches(".wait()?").count(), 1);
+            assert!(launch.find(".spawn()?").unwrap() < launch.find(".wait()?").unwrap());
+            assert!(launch.find(".wait()?").unwrap() < launch.find("std::fs::read(").unwrap());
+            assert!(
+                launch.find("sha256_hex(&bytes)").unwrap()
+                    < launch.find("validate_child_artifact(&bytes").unwrap()
+            );
+            assert!(!launch.contains("remove_file"));
+            for bad in [
+                "/proc/self/fd",
+                "RLIMIT_NOFILE",
+                "fd-lifetime-diagnostic",
+                "WGPU_BACKEND",
+                "setrlimit",
+                "set_var(",
+            ] {
+                assert!(!source.contains(bad));
+            }
+        }
+
+        #[test]
+        fn child_artifact_no_clobber_and_preserved() {
+            let dir =
+                std::env::temp_dir().join(format!("mer-p1q3-transport-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let request = ChildRequest {
+                pair_index: 1,
+                arm: Arm::Control,
+            };
+            let output = child_report_path(&dir.join("report.json"), request);
+            let artifact = envelope(request, ExperimentMode::AaNoiseCalibration);
+            write_report(&output, &artifact).unwrap();
+            let first = std::fs::read(&output).unwrap();
+            assert!(write_report(&output, &artifact).is_err());
+            let args = args(ExperimentMode::AaNoiseCalibration);
+            assert!(validate_child_artifact(
+                &first,
+                request,
+                &process_evidence(request),
+                &launcher(&args)
+            )
+            .is_ok());
+            assert_eq!(std::fs::read(&output).unwrap(), first);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn exact_one_file_scope_against_p1q1() {
+            let output = std::process::Command::new("git")
+                .args([
+                    "diff",
+                    "--name-only",
+                    "d858dc338dcf7a90acd7cedc2cb41235721bb67a",
+                    "--",
+                ])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                "rust-engine/src/gpu_native_predictor_v2_sidecar_performance.rs\n"
+            );
         }
     }
 
     mod p1q1 {
         use super::*;
 
-        fn runtime_contract(context_id: &str) -> evidence::RuntimeContractEvidence {
+        pub(super) fn runtime_contract(context_id: &str) -> evidence::RuntimeContractEvidence {
             evidence::RuntimeContractEvidence {
                 real_transformer_enabled: true,
                 real_transformer_gpu_native: true,
@@ -3347,7 +5200,7 @@ mod p1q_tests {
         let arm = part(s, "async fn run_arm(", "pub(crate) async fn run_command(");
         assert!(arm.contains("prepare_arm(args)?"));
         assert_eq!(arm.matches("tokenizer.encode(").count(), 1);
-        let run = part(s, "pub(crate) async fn run_command(", "\0");
+        let run = part(s, "fn run_pairs(", "async fn run_child(");
         assert!(run.contains("for index in 0..PAIRS"));
         assert!(run.contains("if shutdown_complete(&first)"));
         assert!(run.find("report.pairs.push(pair)").unwrap() < run.find("if !valid").unwrap());
