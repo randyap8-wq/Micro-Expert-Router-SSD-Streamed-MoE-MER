@@ -36,6 +36,8 @@ impl CpuAutotuneKey {
 pub struct CpuAutotuneMachine {
     pub os: String,
     pub arch: String,
+    pub cpu_vendor: String,
+    pub cpu_model: String,
     pub cpu_features: Vec<&'static str>,
     pub available_logical_cores: usize,
     pub effective_cpu_mask: Option<Vec<usize>>,
@@ -46,6 +48,8 @@ impl CpuAutotuneMachine {
         Self {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            cpu_vendor: crate::kernels::cpu_features().vendor.clone(),
+            cpu_model: crate::kernels::cpu_features().model.clone(),
             cpu_features: detected_cpu_features(),
             available_logical_cores: affinity.logical_cores,
             effective_cpu_mask: affinity.cpus.clone(),
@@ -65,8 +69,14 @@ impl CpuAutotuneMachine {
             self.cpu_features.join("+")
         };
         format!(
-            "os={};arch={};features={};logical={};affinity={}",
-            self.os, self.arch, features, self.available_logical_cores, mask
+            "version=2;os={};arch={};cpu_vendor={};cpu_model={};features={};logical={};affinity={}",
+            self.os,
+            self.arch,
+            self.cpu_vendor,
+            self.cpu_model,
+            features,
+            self.available_logical_cores,
+            mask
         )
     }
 }
@@ -798,6 +808,159 @@ pub fn percentile_ms(sorted_us: &[u64], q: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::numa::EffectiveCpuAffinity;
+
+    fn test_machine() -> CpuAutotuneMachine {
+        CpuAutotuneMachine {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            cpu_vendor: "Vendor A".to_string(),
+            cpu_model: "Example CPU  1 @ 2.90GHz".to_string(),
+            cpu_features: vec!["avx2", "fma"],
+            available_logical_cores: 32,
+            effective_cpu_mask: Some((0..32).collect()),
+        }
+    }
+
+    #[test]
+    fn identical_machine_data_has_identical_fingerprint() {
+        assert_eq!(test_machine().fingerprint(), test_machine().fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_differs_when_only_cpu_vendor_changes() {
+        let a = test_machine();
+        let mut b = a.clone();
+        b.cpu_vendor = "Vendor B".to_string();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_differs_when_only_cpu_model_changes() {
+        let a = test_machine();
+        let mut b = a.clone();
+        b.cpu_model = "Example CPU  2 @ 2.90GHz".to_string();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+
+        b.cpu_model = "Example CPU 1 @ 2.90GHz".to_string();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_is_version_2_with_exact_cpu_identity() {
+        assert_eq!(
+            test_machine().fingerprint(),
+            "version=2;os=linux;arch=x86_64;cpu_vendor=Vendor A;cpu_model=Example CPU  1 @ 2.90GHz;features=avx2+fma;logical=32;affinity=0-31"
+        );
+    }
+
+    #[test]
+    fn fingerprint_preserves_literal_unknown_cpu_identity() {
+        let mut machine = test_machine();
+        machine.cpu_vendor = "unknown".to_string();
+        machine.cpu_model = "unknown".to_string();
+        assert!(machine
+            .fingerprint()
+            .contains(";cpu_vendor=unknown;cpu_model=unknown;"));
+    }
+
+    #[test]
+    fn machine_uses_cached_cpu_identity() {
+        let affinity = EffectiveCpuAffinity {
+            cpus: Some((0..32).collect()),
+            logical_cores: 32,
+            display: "0-31".to_string(),
+        };
+        let machine = CpuAutotuneMachine::from_effective_affinity(&affinity);
+        let cached = crate::kernels::cpu_features();
+        assert_eq!(machine.cpu_vendor, cached.vendor);
+        assert_eq!(machine.cpu_model, cached.model);
+    }
+
+    #[test]
+    fn fingerprint_separates_masks_with_identical_logical_core_counts() {
+        let a = test_machine();
+        let mut b = a.clone();
+        b.effective_cpu_mask = Some((32..64).collect());
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    const LEGACY_PROFILE_STORE_JSON: &str = r#"{
+        "profiles": {
+            "os=linux;arch=x86_64;features=avx2+fma;logical=32;affinity=0-31|model|backend": {
+                "threads": 30,
+                "p50_ms": 58.0,
+                "p95_ms": 61.0,
+                "sustained_tps": 17.0,
+                "confidence": "high"
+            }
+        }
+    }"#;
+
+    fn legacy_profile_key() -> CpuAutotuneKey {
+        CpuAutotuneKey {
+            machine_fingerprint: "os=linux;arch=x86_64;features=avx2+fma;logical=32;affinity=0-31"
+                .to_string(),
+            model_fingerprint: "model".to_string(),
+            backend_fingerprint: "backend".to_string(),
+        }
+    }
+
+    #[test]
+    fn legacy_profile_store_json_remains_readable() {
+        let store: RayonAutotuneProfileStore =
+            serde_json::from_str(LEGACY_PROFILE_STORE_JSON).unwrap();
+        assert_eq!(store.profiles.len(), 1);
+        let profile = store
+            .profiles
+            .get(&legacy_profile_key().cache_key())
+            .unwrap();
+        assert_eq!(profile.threads, 30);
+        assert_eq!(profile.confidence, RayonAutotuneConfidence::High);
+        assert!(profile.reusable_by_default());
+    }
+
+    #[test]
+    fn legacy_profile_misses_v2_key_and_can_coexist_with_v2_profile() {
+        let dir = std::env::temp_dir().join(format!(
+            "mer-rayon-autotune-v2-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = default_profile_path(&dir);
+        std::fs::write(&path, LEGACY_PROFILE_STORE_JSON).unwrap();
+        let legacy_key = legacy_profile_key();
+        let v2_key = CpuAutotuneKey {
+            machine_fingerprint: test_machine().fingerprint(),
+            ..legacy_key.clone()
+        };
+
+        let legacy_profile = load_profile(&path, &legacy_key).unwrap();
+        assert!(legacy_profile.reusable_by_default());
+        assert_ne!(legacy_key.cache_key(), v2_key.cache_key());
+        assert!(load_profile(&path, &v2_key).is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            LEGACY_PROFILE_STORE_JSON
+        );
+
+        let mut v2_profile = legacy_profile.clone();
+        v2_profile.threads = 28;
+        save_profile(&path, &v2_key, v2_profile).unwrap();
+        assert_eq!(load_profile(&path, &v2_key).unwrap().threads, 28);
+        let saved_legacy = load_profile(&path, &legacy_key).unwrap();
+        assert_eq!(
+            serde_json::to_value(saved_legacy).unwrap(),
+            serde_json::to_value(legacy_profile).unwrap()
+        );
+        let store: RayonAutotuneProfileStore =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(store.profiles.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn fingerprint_differs_for_different_effective_masks() {
