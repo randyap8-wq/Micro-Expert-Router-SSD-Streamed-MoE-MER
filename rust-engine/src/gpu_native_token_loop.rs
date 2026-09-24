@@ -38,6 +38,7 @@ use crate::model::RealModel;
 use crate::predictor_v2::{P1jIdentity, P1jTerminal, PhysicalInstallIdentity};
 use crate::sampling::SamplingParams;
 
+use crate::gpu_native_predictor_v2_critical_path_attribution::{self as p1r, Event as P1rEvent};
 use crate::predictor_v2::p1e;
 use crate::predictor_v2::{
     AccountingError as PredictorV2AccountingError, ModelMetadata as PredictorV2ModelMetadata,
@@ -86,6 +87,7 @@ impl PredictorV2RequestAllocator {
             identity,
             enabled: None,
             p1e_clock: None,
+            p1r: None,
         }
     }
 }
@@ -96,6 +98,7 @@ struct PredictorV2RequestObservation {
     identity: Option<PredictorV2RequestIdentity>,
     enabled: Option<Box<(PredictorV2ObservationConfig, PredictorV2RequestObserver)>>,
     p1e_clock: Option<Instant>,
+    p1r: Option<Arc<p1r::Recorder>>,
 }
 
 // Fixed scalar diagnostics, dormant unless the request explicitly enables P1J.
@@ -320,7 +323,7 @@ fn p1m_launch<W>(
     prepare: impl FnOnce(p1e::Freeze) -> Result<(P1jIdentity, W), P1jPrepareRefusal>,
     retire: impl FnOnce(P1jIdentity),
     spawn: impl FnOnce(W, P1jIdentity, PhysicalInstallIdentity),
-) {
+) -> P1mLaunchTerminal {
     diagnostics.count(&diagnostics.launch_considered);
     match source.class {
         P1mSourceClass::FirstAttemptCleanCommitted => {
@@ -331,7 +334,7 @@ fn p1m_launch<W>(
         }
         P1mSourceClass::NotEligible => {
             diagnostics.terminal(P1mLaunchTerminal::SourceNotEligible);
-            return;
+            return P1mLaunchTerminal::SourceNotEligible;
         }
     }
     let terminal = (|| {
@@ -363,17 +366,20 @@ fn p1m_launch<W>(
         P1mLaunchTerminal::WriterSpawned
     })();
     diagnostics.terminal(terminal);
+    terminal
 }
 
 struct P1jCleanup {
     owner: Arc<P1jSidecarOwner>,
     id: P1jIdentity,
     armed: bool,
+    p1r: Option<p1r::Context>,
 }
 impl Drop for P1jCleanup {
     fn drop(&mut self) {
         if self.armed {
-            self.owner.retire(self.id, P1jTerminal::Cancelled);
+            self.owner
+                .retire_p1r(self.id, P1jTerminal::Cancelled, self.p1r.as_ref());
         }
     }
 }
@@ -458,7 +464,18 @@ fn observe_p1e_completed_values(
         temporal.mark_incomplete(p1e::Error::Overflow);
         return;
     };
-    let Some(candidate) = observer.prepare_temporal(previous, target) else {
+    let diag = observation.p1r.as_ref().map(|r| r.context(position + 1, 0));
+    let started = diag.as_ref().and_then(p1r::Context::now);
+    let candidate = observer.prepare_temporal(previous, target);
+    if let Some(d) = &diag {
+        d.record(
+            P1rEvent::Observation,
+            started,
+            d.now(),
+            &[u64::from(candidate.is_some())],
+        );
+    }
+    let Some(candidate) = candidate else {
         return;
     };
     let Some(temporal) = observer.temporal_mut() else {
@@ -470,7 +487,22 @@ fn observe_p1e_completed_values(
     };
     let physical = physical(candidate.namespace);
     match source(candidate.expert) {
-        Ok(source) => temporal.freeze(candidate, timestamp, physical, source),
+        Ok(source) => {
+            temporal.freeze(candidate, timestamp, physical, source);
+            if let Some(d) = &diag {
+                d.record(
+                    P1rEvent::Freeze,
+                    Some(timestamp),
+                    Some(timestamp),
+                    &[
+                        candidate.sequence,
+                        candidate.expert as u64,
+                        source.logical_generation.unwrap_or(0),
+                        candidate.generation,
+                    ],
+                );
+            }
+        }
         Err(e) => temporal.abandon_prepared(e),
     }
 }
@@ -496,6 +528,14 @@ fn observe_p1e_deadline_values(
         return;
     };
     temporal.deadline(candidate.request, position, timestamp, physical);
+    if let Some(r) = &observation.p1r {
+        r.context(position, 0).record(
+            P1rEvent::DP1e,
+            Some(timestamp),
+            Some(timestamp),
+            &[candidate.sequence],
+        );
+    }
 }
 
 fn p1e_host_timestamp(origin: &Instant) -> Option<u64> {
@@ -1627,15 +1667,24 @@ impl GpuNativeTokenLoop {
         request: &mut GpuNativeRequestState,
         source: P1mSourceCompletion,
     ) {
+        let diag = request
+            .predictor_v2_observation
+            .p1r
+            .as_ref()
+            .map(|r| r.context(source.position.saturating_add(1), 0));
+        let started = diag.as_ref().and_then(p1r::Context::now);
         let Some(movement) = request.p1j.as_mut() else {
             return;
         };
         if movement.mode == P1jRequestMode::InertResourceOnly {
+            if let Some(d) = &diag {
+                d.record(P1rEvent::Launch, started, d.now(), &[0]);
+            }
             return;
         }
         let owner = &movement.owner;
         let pending = &mut movement.pending;
-        p1m_launch(
+        let terminal = p1m_launch(
             &self.p1j_launch,
             source,
             pending.is_some(),
@@ -1646,16 +1695,45 @@ impl GpuNativeTokenLoop {
                 .map(|(_, o)| o),
             |freeze| {
                 owner
-                    .try_prepare(freeze, self.residency_manager.gpu_cache())
+                    .try_prepare_p1r(freeze, self.residency_manager.gpu_cache(), diag.as_ref())
                     .map(|writer| (writer.id, writer))
             },
-            |id| owner.retire(id, P1jTerminal::Cancelled),
+            |id| owner.retire_p1r(id, P1jTerminal::Cancelled, diag.as_ref()),
             |writer, id, install| {
+                if let Some(d) = &diag {
+                    d.stamp(
+                        P1rEvent::P0Install,
+                        &[
+                            install.runtime_namespace,
+                            install.executor_namespace,
+                            install.model_namespace,
+                            install.layer as u64,
+                            install.expert_local_id as u64,
+                            install.logical_generation,
+                            install.bank as u64,
+                            install.slot as u64,
+                            install.slot_epoch,
+                        ],
+                    );
+                    let a = install.reservation.acquisition;
+                    d.stamp(
+                        P1rEvent::P0Reservation,
+                        &[
+                            a.owner_request.runtime_namespace,
+                            a.owner_request.request_sequence,
+                            a.layer as u64,
+                            a.expert_local_id as u64,
+                            a.acquisition_sequence,
+                            install.reservation.ticket_sequence,
+                        ],
+                    );
+                }
                 *pending = Some(P1jPending {
                     cleanup: P1jCleanup {
                         owner: owner.clone(),
                         id,
                         armed: true,
+                        p1r: diag.clone(),
                     },
                     install,
                     published: false,
@@ -1664,6 +1742,18 @@ impl GpuNativeTokenLoop {
                 writer.spawn();
             },
         );
+        if let Some(d) = &diag {
+            let code = match terminal {
+                P1mLaunchTerminal::SourceNotEligible => 1,
+                P1mLaunchTerminal::P1jNotReady => 2,
+                P1mLaunchTerminal::NoPendingFreeze => 3,
+                P1mLaunchTerminal::PendingSidecarExisting => 4,
+                P1mLaunchTerminal::Prepare(reason) => 100 + reason as u64,
+                P1mLaunchTerminal::P0AcquireFailed => 5,
+                P1mLaunchTerminal::WriterSpawned => 6,
+            };
+            d.record(P1rEvent::Launch, started, d.now(), &[code]);
+        }
     }
 
     fn publish_p1j_at_deadline(&self, request: &mut GpuNativeRequestState, position: usize) {
@@ -1683,6 +1773,8 @@ impl GpuNativeTokenLoop {
                     && o.temporal()
                         .is_some_and(|t| t.p1j_deadline_valid(id.candidate))
             });
+        let diag = pending.cleanup.p1r.as_ref();
+        let started = diag.and_then(p1r::Context::now);
         let outcome = if valid {
             pending
                 .cleanup
@@ -1691,6 +1783,9 @@ impl GpuNativeTokenLoop {
         } else {
             P1jPublication::IdentityMismatch
         };
+        if let Some(d) = diag {
+            d.identity(P1rEvent::Publication, started, id, outcome as u64);
+        }
         if outcome == P1jPublication::Published {
             if observer
                 .expect("validated observer")
@@ -1707,7 +1802,10 @@ impl GpuNativeTokenLoop {
             _ => P1jTerminal::Cancelled,
         };
         pending.terminal = Some(reason);
-        pending.cleanup.owner.retire(id, reason);
+        pending
+            .cleanup
+            .owner
+            .retire_p1r(id, reason, pending.cleanup.p1r.as_ref());
     }
 
     fn finish_p1j_target(
@@ -1742,10 +1840,21 @@ impl GpuNativeTokenLoop {
             if phase.is_none() && pending.terminal.is_none() {
                 observer.mark_incomplete(PredictorV2AccountingError::Incomplete);
             }
-            let _ = observer.p1j_finish(id, pending.install, reason);
+            let result = observer.p1j_finish(id, pending.install, reason);
+            if let Some(d) = &pending.cleanup.p1r {
+                d.identity(
+                    P1rEvent::Credit,
+                    d.now(),
+                    id,
+                    if result.is_ok() { 1 + reason as u64 } else { 0 },
+                );
+            }
         }
         // Safety cleanup is independent of every accounting result.
-        pending.cleanup.owner.retire(id, reason);
+        pending
+            .cleanup
+            .owner
+            .retire_p1r(id, reason, pending.cleanup.p1r.as_ref());
         pending.cleanup.armed = false;
     }
 
@@ -2295,6 +2404,8 @@ impl GpuNativeTokenLoop {
             max_seq_len: self.model_geometry.max_seq_len,
             predictor_v2_observation: self.predictor_v2_requests.allocate(),
             p1j: None,
+            p1r_attempt: 0,
+            p1r_position: 0,
         })
     }
 
@@ -3040,6 +3151,7 @@ impl GpuNativeTokenLoop {
                 owner: p.cleanup.owner.clone(),
                 id: p.cleanup.id,
                 armed: true,
+                p1r: p.cleanup.p1r.clone(),
             });
         let result = self
             .step_token_p1e_observed_inner(
@@ -3156,6 +3268,18 @@ impl GpuNativeTokenLoop {
             };
             attempts += 1;
             let report = &output.boundary_report;
+            if let Some(r) = &request.predictor_v2_observation.p1r {
+                let d = r.context(position, attempts - 1);
+                let ids = report
+                    .selected_ids
+                    .get(p1e::LAYER)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let clean = report.final_status == 0
+                    && report.layer_statuses.iter().all(|s| *s == 0)
+                    && segment.completes_token;
+                d.set(P1rEvent::Boundary, d.now(), ids, u64::from(clean));
+            }
             if let Some(temporal) = request
                 .predictor_v2_observation
                 .enabled
@@ -3277,10 +3401,25 @@ impl GpuNativeTokenLoop {
                     .collect::<Result<Vec<_>, _>>()?;
 
                 let residency_started = Instant::now();
-                engine
-                    .ensure_gpu_native_demand_residency(fail_layer, &global_ids)
-                    .await
-                    .map_err(GpuNativeTokenLoopError::ResidencyServiceFailed)?;
+                let diag = request
+                    .predictor_v2_observation
+                    .p1r
+                    .as_ref()
+                    .filter(|_| fail_layer == p1e::LAYER)
+                    .map(|r| r.context(position, attempts - 1));
+                let started = diag.as_ref().and_then(p1r::Context::now);
+                let result = engine
+                    .ensure_gpu_native_demand_residency_p1r(fail_layer, &global_ids, diag.as_ref())
+                    .await;
+                if let Some(d) = &diag {
+                    d.set(
+                        P1rEvent::Service,
+                        started,
+                        &global_ids,
+                        u64::from(result.is_ok()),
+                    );
+                }
+                result.map_err(GpuNativeTokenLoopError::ResidencyServiceFailed)?;
                 self.recovery_counters
                     .residency_service_us
                     .fetch_add(saturating_micros(residency_started), Ordering::Relaxed);
@@ -3382,6 +3521,19 @@ impl GpuNativeTokenLoop {
                 },
                 report,
             );
+            if let Some(r) = &request.predictor_v2_observation.p1r {
+                let d = r.context(position, 0);
+                d.set(
+                    P1rEvent::CleanRoute,
+                    d.now(),
+                    report
+                        .selected_ids
+                        .get(p1e::LAYER)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    attempts as u64,
+                );
+            }
             self.finish_p1j_target(
                 request,
                 position,
@@ -3530,6 +3682,9 @@ impl GpuNativeTokenLoop {
                     )
                 });
             if let Some(pending) = sidecar {
+                if let Some(d) = request.p1r_context() {
+                    d.identity(P1rEvent::Binding, d.now(), pending.cleanup.id, 1);
+                }
                 self.executor.encode_q4_expert_route_parallel_p1j(
                     encoder,
                     &layer_plan.router_plan,
@@ -3695,6 +3850,13 @@ impl GpuNativeTokenLoop {
             });
         }
 
+        if request.predictor_v2_observation.p1r.is_some() {
+            if request.p1r_position != position {
+                request.p1r_position = position;
+                request.p1r_attempt = 0;
+            }
+            request.p1r_attempt = request.p1r_attempt.saturating_add(1);
+        }
         let p1e_deadline_eligible = request
             .predictor_v2_observation
             .enabled
@@ -3804,6 +3966,9 @@ impl GpuNativeTokenLoop {
 
         for layer_idx in segment.ordinary_layers.clone() {
             if p1e_deadline_eligible && layer_idx == p1e::LAYER {
+                if let Some(r) = &request.predictor_v2_observation.p1r {
+                    r.context(position, 0).stamp(P1rEvent::DEntry, &[]);
+                }
                 self.observe_p1e_deadline(request, position);
                 self.publish_p1j_at_deadline(request, position);
             }
@@ -4158,6 +4323,17 @@ impl GpuNativeTokenLoop {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
+        if let Some(d) = request.p1r_context() {
+            d.stamp(
+                P1rEvent::Segment,
+                &[
+                    segment.attempted_layers.start as u64,
+                    segment.attempted_layers.end as u64,
+                    u64::from(full_token_replay),
+                    u64::from(segment.completes_token),
+                ],
+            );
+        }
         // ONE submission
         gpu.queue.submit(Some(encoder.finish()));
         self.counters
@@ -4308,9 +4484,33 @@ pub struct GpuNativeRequestState {
     pub max_seq_len: usize,
     predictor_v2_observation: PredictorV2RequestObservation,
     p1j: Option<Box<P1jRequest>>,
+    p1r_attempt: usize,
+    p1r_position: usize,
 }
 
 impl GpuNativeRequestState {
+    pub(crate) fn enable_p1r(&mut self) -> Result<Arc<p1r::Recorder>, String> {
+        if self.committed_position != 0
+            || self.p1j.is_none()
+            || self.predictor_v2_observation.p1r.is_some()
+        {
+            return Err("P1R requires fresh P1E/P1J opt-in".into());
+        }
+        let origin = self
+            .predictor_v2_observation
+            .p1e_clock
+            .ok_or("P1R requires P1E clock")?;
+        let recorder = p1r::Recorder::new(origin);
+        self.predictor_v2_observation.p1r = Some(recorder.clone());
+        Ok(recorder)
+    }
+    fn p1r_context(&self) -> Option<p1r::Context> {
+        self.predictor_v2_observation
+            .p1r
+            .as_ref()
+            .map(|r| r.context(self.p1r_position, self.p1r_attempt.saturating_sub(1)))
+    }
+
     /// P1J foundation only. A future explicitly authorized internal qualifier
     /// must call this separately; enabling the P1E observer never calls it.
     pub(crate) fn enable_predictor_v2_p1j_sidecar(
@@ -4413,6 +4613,7 @@ impl GpuNativeRequestState {
             identity: self.predictor_v2_observation.identity,
             enabled: None,
             p1e_clock: None,
+            p1r: None,
         };
         observation
             .enable(
@@ -4497,9 +4698,21 @@ impl GpuNativeRequestState {
                     P1jTerminal::RequestEnded
                 };
                 if let Some((_, observer)) = self.predictor_v2_observation.enabled.as_deref_mut() {
-                    let _ = observer.p1j_finish(pending.cleanup.id, pending.install, reason);
+                    let result = observer.p1j_finish(pending.cleanup.id, pending.install, reason);
+                    if let Some(d) = &pending.cleanup.p1r {
+                        d.identity(
+                            P1rEvent::Credit,
+                            d.now(),
+                            pending.cleanup.id,
+                            if result.is_ok() { 1 + reason as u64 } else { 0 },
+                        );
+                    }
                 }
-                pending.cleanup.owner.retire(pending.cleanup.id, reason);
+                pending.cleanup.owner.retire_p1r(
+                    pending.cleanup.id,
+                    reason,
+                    pending.cleanup.p1r.as_ref(),
+                );
                 pending.cleanup.armed = false;
             }
         }
@@ -6325,7 +6538,9 @@ pub(crate) mod tests {
         assert!(decision.contains("if pending"));
         assert!(decision.contains("t.pending_freeze(target)"));
         assert!(movement.contains("o.p1j_ready()"));
-        assert!(movement.find(".try_prepare(").unwrap() < movement.find("writer.spawn()").unwrap());
+        assert!(
+            movement.find(".try_prepare_p1r(").unwrap() < movement.find("writer.spawn()").unwrap()
+        );
         assert!(
             decision.find("observer.p1j_acquired(id)").unwrap()
                 < decision.find("spawn(writer, id, install)").unwrap()
@@ -6387,10 +6602,9 @@ pub(crate) mod tests {
             .split("    fn observe_p1e_completed(")
             .next()
             .unwrap();
-        assert!(cleanup.contains("let _ = observer.p1j_finish("));
+        assert!(cleanup.contains("let result = observer.p1j_finish("));
         assert!(
-            cleanup.find("observer.p1j_finish(").unwrap()
-                < cleanup.find("pending.cleanup.owner.retire(").unwrap()
+            cleanup.find("observer.p1j_finish(").unwrap() < cleanup.find("retire_p1r(").unwrap()
         );
         let worker = source
             .split("    async fn step_token_unified_inner(")
@@ -6417,7 +6631,7 @@ pub(crate) mod tests {
             .split("impl Drop for P1jWriter")
             .next()
             .unwrap();
-        assert!(close.contains(".try_close_p1j_writer("));
+        assert!(close.contains(".try_close_p1j_writer_p1r("));
         assert!(!close.contains(".lock("));
         let demand = residency
             .split("pub(crate) fn has_current_for_demand(")
@@ -7093,13 +7307,15 @@ pub(crate) mod tests {
     #[test]
     fn p1m_frozen_publish_p1j_at_deadline_bytes() {
         use sha2::{Digest, Sha256};
-        let body = p1j_production_source()
-            .split("    fn publish_p1j_at_deadline(")
-            .nth(1)
-            .unwrap()
-            .split("    fn finish_p1j_target(")
-            .next()
-            .unwrap();
+        let body = crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+            "gpu_native_token_loop.rs",
+        )
+        .split("    fn publish_p1j_at_deadline(")
+        .nth(1)
+        .unwrap()
+        .split("    fn finish_p1j_target(")
+        .next()
+        .unwrap();
         assert_eq!(
             format!("{:x}", Sha256::digest(body.as_bytes())),
             "615db1099bd0b6eecd10054b769b0b331b7703370af9b65ac178d47c43976edd"
@@ -7109,13 +7325,15 @@ pub(crate) mod tests {
     #[test]
     fn p1m_frozen_execute_token_segment_unified_bytes() {
         use sha2::{Digest, Sha256};
-        let body = p1j_production_source()
-            .split("    fn execute_token_segment_unified(")
-            .nth(1)
-            .unwrap()
-            .split("\n    }")
-            .next()
-            .unwrap();
+        let body = crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+            "gpu_native_token_loop.rs",
+        )
+        .split("    fn execute_token_segment_unified(")
+        .nth(1)
+        .unwrap()
+        .split("\n    }")
+        .next()
+        .unwrap();
         assert_eq!(
             format!("{:x}", Sha256::digest(body.as_bytes())),
             "e20501fe8ba70cf63d8138e310dda98573579fcd931b1f22d621757592e750c2"

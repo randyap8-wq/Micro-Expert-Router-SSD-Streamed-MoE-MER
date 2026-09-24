@@ -4159,6 +4159,7 @@ mod p1q_tests {
                     "diff",
                     "--name-only",
                     "d858dc338dcf7a90acd7cedc2cb41235721bb67a",
+                    "a6b9cbcd6e6b576f90a1d875c9351c7276c950e2",
                     "--",
                 ])
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -5062,7 +5063,9 @@ mod p1q_tests {
     }
     #[test]
     fn p1q_inert_returns_before_launch_prepare_spawn_or_pending() {
-        let s = include_str!("gpu_native_token_loop.rs");
+        let s = crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+            "gpu_native_token_loop.rs",
+        );
         let launch = part(
             s,
             "    fn launch_p1j_at_freeze(",
@@ -5119,7 +5122,9 @@ mod p1q_tests {
     #[test]
     fn p1q_frozen_active_publish_finish_deadline_and_execution_bytes() {
         let old = base("gpu_native_token_loop.rs");
-        let new = include_str!("gpu_native_token_loop.rs");
+        let new = crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+            "gpu_native_token_loop.rs",
+        );
         for (a, b) in [
             (
                 "    fn publish_p1j_at_deadline(",
@@ -5264,15 +5269,25 @@ mod p1q_tests {
         for (file, source, oldhash, new) in [
             (
                 "gpu_native_predictor_v2_observation.rs",
-                include_bytes!("gpu_native_token_loop.rs").as_slice(),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "gpu_native_token_loop.rs",
+                )
+                .as_bytes(),
                 "b6e1769508d8ed219d411c77318d28fa08752895ca03f947c55b7422106a8a0e",
-                include_str!("gpu_native_predictor_v2_observation.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "gpu_native_predictor_v2_observation.rs",
+                ),
             ),
             (
                 "gpu_native_q4_route_parallel.rs",
-                include_bytes!("gpu_native_residency.rs").as_slice(),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "gpu_native_residency.rs",
+                )
+                .as_bytes(),
                 "4d1554bad7a97e72c2df423e2696d5b76fe8ace8280e3d5642c8213962faa50e",
-                include_str!("gpu_native_q4_route_parallel.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "gpu_native_q4_route_parallel.rs",
+                ),
             ),
         ] {
             let original = base(file);
@@ -5289,6 +5304,7 @@ mod p1q_tests {
                 "diff",
                 "--name-only",
                 "1849d8ff0d2114100bd89d1d682d4e902ec6825e",
+                "a6b9cbcd6e6b576f90a1d875c9351c7276c950e2",
                 "--",
             ])
             .current_dir(root)

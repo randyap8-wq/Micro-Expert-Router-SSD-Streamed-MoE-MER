@@ -15,6 +15,9 @@ pub(crate) mod q4_route_parallel;
 
 use super::{create_startup_buffer, BackendBox, GpuDeviceIdentity, GpuStartupAllocationError};
 use crate::dense_tensor::{DenseDType, DenseWeight};
+use crate::gpu_native_predictor_v2_critical_path_attribution::{
+    Context as P1rContext, Event as P1rEvent,
+};
 use crate::inference::{Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
@@ -3643,8 +3646,42 @@ impl<B> GpuNativeQ4ExpertArena<B> {
     }
 
     pub(crate) fn close_p1j_writer(&self, id: crate::predictor_v2::P1jIdentity, success: bool) {
+        self.close_p1j_writer_p1r(id, success, None);
+    }
+    pub(crate) fn close_p1j_writer_p1r(
+        &self,
+        id: crate::predictor_v2::P1jIdentity,
+        success: bool,
+        diag: Option<&P1rContext>,
+    ) {
         let mut state = self.state.lock();
+        let was_writing = state.p1j.occupant == Some((id, P1jPhase::Writing));
+        let lower = diag.and_then(P1rContext::now);
         Self::close_p1j_writer_locked(&mut state, id, success);
+        let ready = state.p1j.occupant == Some((id, P1jPhase::EnqueuedClosed));
+        let freed = state.p1j.occupant.is_none()
+            && state
+                .p1j
+                .last_terminal
+                .is_some_and(|(owner, _)| owner == id);
+        drop(state);
+        if let Some(d) = diag {
+            d.identity(
+                P1rEvent::Close,
+                lower,
+                id,
+                if ready {
+                    1
+                } else if was_writing {
+                    2
+                } else {
+                    0
+                },
+            );
+            if freed {
+                d.identity(P1rEvent::DeferredRetire, d.now(), id, 1);
+            }
+        }
     }
 
     pub(crate) fn try_close_p1j_writer(
@@ -3652,10 +3689,44 @@ impl<B> GpuNativeQ4ExpertArena<B> {
         id: crate::predictor_v2::P1jIdentity,
         success: bool,
     ) -> bool {
+        self.try_close_p1j_writer_p1r(id, success, None)
+    }
+    pub(crate) fn try_close_p1j_writer_p1r(
+        &self,
+        id: crate::predictor_v2::P1jIdentity,
+        success: bool,
+        diag: Option<&P1rContext>,
+    ) -> bool {
         let Some(mut state) = self.state.try_lock() else {
             return false;
         };
+        let was_writing = state.p1j.occupant == Some((id, P1jPhase::Writing));
+        let lower = diag.and_then(P1rContext::now);
         Self::close_p1j_writer_locked(&mut state, id, success);
+        let ready = state.p1j.occupant == Some((id, P1jPhase::EnqueuedClosed));
+        let freed = state.p1j.occupant.is_none()
+            && state
+                .p1j
+                .last_terminal
+                .is_some_and(|(owner, _)| owner == id);
+        drop(state);
+        if let Some(d) = diag {
+            d.identity(
+                P1rEvent::Close,
+                lower,
+                id,
+                if ready {
+                    1
+                } else if was_writing {
+                    2
+                } else {
+                    0
+                },
+            );
+            if freed {
+                d.identity(P1rEvent::DeferredRetire, d.now(), id, 1);
+            }
+        }
         true
     }
 
@@ -3772,6 +3843,16 @@ impl<B> GpuNativeQ4ExpertArena<B> {
         reason: crate::predictor_v2::P1jTerminal,
         unpublish: impl FnOnce(u64, GpuNativeQ4ExpertMappingEntry),
     ) {
+        self.retire_p1j_epoch_with_p1r(namespace, epoch, reason, unpublish, None)
+    }
+    fn retire_p1j_epoch_with_p1r(
+        &self,
+        namespace: crate::predictor_v2::p1e::Namespace,
+        epoch: u32,
+        reason: crate::predictor_v2::P1jTerminal,
+        unpublish: impl FnOnce(u64, GpuNativeQ4ExpertMappingEntry),
+        diag: Option<&P1rContext>,
+    ) {
         let mut state = self.state.lock();
         let Some((id, _)) = state.p1j.occupant else {
             return;
@@ -3781,12 +3862,19 @@ impl<B> GpuNativeQ4ExpertArena<B> {
         if id.epoch != epoch || id.candidate.namespace != namespace {
             return;
         }
-        state.p1j.retire(id, reason, || {
+        let freed = state.p1j.retire(id, reason, || {
             unpublish(
                 u64::from(id.candidate.expert) * GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64,
                 GpuNativeQ4ExpertMappingEntry::UNMAPPED,
             );
         });
+        drop(state);
+        if freed {
+            if let Some(d) = diag {
+                d.target(id.candidate.target_position.absolute_position as usize)
+                    .identity(P1rEvent::DeferredRetire, d.now(), id, 2);
+            }
+        }
     }
     fn from_buffers(
         context_id: u64,
@@ -7305,16 +7393,32 @@ impl GpuNativeExecutorContext {
         reason: crate::predictor_v2::P1jTerminal,
         nonblocking: bool,
     ) -> Option<bool> {
+        self.retire_p1j_p1r(arena, id, reason, nonblocking, None)
+    }
+    pub(crate) fn retire_p1j_p1r(
+        &self,
+        arena: &GpuNativeQ4ExpertArena,
+        id: crate::predictor_v2::P1jIdentity,
+        reason: crate::predictor_v2::P1jTerminal,
+        nonblocking: bool,
+        diag: Option<&P1rContext>,
+    ) -> Option<bool> {
         if arena.context_id != self.context_id {
             return Some(false);
         }
         let BackendBox::Gpu(gpu) = self.authoritative_backend.as_ref() else {
             return Some(false);
         };
-        arena.retire_p1j_with(id, reason, nonblocking, |offset, entry| {
+        let result = arena.retire_p1j_with(id, reason, nonblocking, |offset, entry| {
             gpu.queue
                 .write_buffer(&arena.mapping, offset, bytemuck::bytes_of(&entry));
-        })
+        });
+        if result == Some(true) {
+            if let Some(d) = diag {
+                d.identity(P1rEvent::DeferredRetire, d.now(), id, 1);
+            }
+        }
+        result
     }
 
     pub(crate) fn retire_p1j_epoch(
@@ -7324,16 +7428,32 @@ impl GpuNativeExecutorContext {
         epoch: u32,
         reason: crate::predictor_v2::P1jTerminal,
     ) {
+        self.retire_p1j_epoch_p1r(arena, namespace, epoch, reason, None)
+    }
+    pub(crate) fn retire_p1j_epoch_p1r(
+        &self,
+        arena: &GpuNativeQ4ExpertArena,
+        namespace: crate::predictor_v2::p1e::Namespace,
+        epoch: u32,
+        reason: crate::predictor_v2::P1jTerminal,
+        diag: Option<&P1rContext>,
+    ) {
         if arena.context_id != self.context_id {
             return;
         }
         let BackendBox::Gpu(gpu) = self.authoritative_backend.as_ref() else {
             return;
         };
-        arena.retire_p1j_epoch_with(namespace, epoch, reason, |offset, entry| {
-            gpu.queue
-                .write_buffer(&arena.mapping, offset, bytemuck::bytes_of(&entry));
-        });
+        arena.retire_p1j_epoch_with_p1r(
+            namespace,
+            epoch,
+            reason,
+            |offset, entry| {
+                gpu.queue
+                    .write_buffer(&arena.mapping, offset, bytemuck::bytes_of(&entry));
+            },
+            diag,
+        );
     }
 
     pub(super) fn try_new(
@@ -12114,6 +12234,123 @@ pub(crate) mod tests {
         assert!(arena.state.lock().p1j.occupant.is_none());
     }
 
+    #[test]
+    fn p1r_delayed_writer_across_d_records_close_without_waiting_at_d() {
+        use crate::gpu_native_predictor_v2_critical_path_attribution::{Event, Recorder};
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        let recorder = Recorder::fixture(std::time::Instant::now(), 4);
+        let d = recorder.context(3, 0);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let a = &arena;
+            let context = d.clone();
+            let b = &barrier;
+            let worker = scope.spawn(move || {
+                b.wait();
+                a.close_p1j_writer_p1r(id, true, Some(&context));
+            });
+            d.stamp(Event::DEntry, &[]);
+            assert_eq!(
+                arena.try_publish_p1j_with(id, true, |_, _| panic!("Writing cannot publish")),
+                P1jPublication::NotReady
+            );
+            assert!(recorder.snapshot().event(3, Event::Close).is_none());
+            barrier.wait();
+            worker.join().unwrap();
+        });
+        let snap = recorder.snapshot();
+        let close = snap.event(3, Event::Close).unwrap();
+        let entry = snap.event(3, Event::DEntry).unwrap();
+        assert_eq!(close[2], 1);
+        assert!(close[0] >= entry[0]);
+        assert!(close[1] >= close[0]);
+        assert!(!snap.invalid);
+    }
+    #[test]
+    fn p1r_close_before_d_and_publication_busy_vs_not_ready() {
+        use crate::gpu_native_predictor_v2_critical_path_attribution::{Event, Recorder};
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        let r = Recorder::fixture(std::time::Instant::now(), 4);
+        let d = r.context(3, 0);
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |_, _| panic!()),
+            P1jPublication::NotReady
+        );
+        let held = arena.state.lock();
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |_, _| panic!()),
+            P1jPublication::Busy
+        );
+        drop(held);
+        arena.close_p1j_writer_p1r(id, true, Some(&d));
+        d.stamp(Event::DEntry, &[]);
+        let snap = r.snapshot();
+        assert!(
+            snap.event(3, Event::Close).unwrap()[1] <= snap.event(3, Event::DEntry).unwrap()[0]
+        );
+        assert_eq!(
+            arena.try_publish_p1j_with(id, true, |_, _| {}),
+            P1jPublication::Published
+        );
+    }
+    #[test]
+    fn p1r_cancellation_during_writing_cannot_manufacture_readiness() {
+        use crate::gpu_native_predictor_v2_critical_path_attribution::{Event, Recorder};
+        let arena = p1j_arena();
+        let id = p1j_claim(&arena);
+        let r = Recorder::fixture(std::time::Instant::now(), 4);
+        let d = r.context(3, 0);
+        assert_eq!(
+            arena.retire_p1j_with(
+                id,
+                crate::predictor_v2::P1jTerminal::Cancelled,
+                true,
+                |_, _| panic!()
+            ),
+            Some(false)
+        );
+        assert_eq!(arena.try_p1j_phase(id), Some(P1jPhase::Writing));
+        arena.close_p1j_writer_p1r(id, true, Some(&d));
+        let snap = r.snapshot();
+        assert_eq!(snap.event(3, Event::Close).unwrap()[2], 2);
+        assert_eq!(snap.event(3, Event::DeferredRetire).unwrap()[2], 1);
+        assert!(arena.state.lock().p1j.occupant.is_none());
+        assert!(!snap.invalid);
+    }
+    #[test]
+    fn p1r_failed_writer_deferred_retirement_and_stale_identity() {
+        use crate::gpu_native_predictor_v2_critical_path_attribution::{Event, Recorder};
+        let arena = p1j_arena();
+        let old = p1j_claim(&arena);
+        let r = Recorder::fixture(std::time::Instant::now(), 4);
+        let d = r.context(3, 0);
+        arena.close_p1j_writer_p1r(old, false, Some(&d));
+        assert_eq!(r.snapshot().event(3, Event::Close).unwrap()[2], 2);
+        let id = p1j_claim(&arena);
+        arena.close_p1j_writer(id, true);
+        assert_eq!(
+            arena.try_publish_p1j_with(id, false, |_, _| panic!()),
+            P1jPublication::Stale
+        );
+        arena.retire_p1j_epoch_with_p1r(
+            id.candidate.namespace,
+            old.epoch,
+            crate::predictor_v2::P1jTerminal::Cancelled,
+            |_, _| panic!(),
+            None,
+        );
+        assert!(arena.state.lock().p1j.occupant.is_some());
+        arena.retire_p1j_epoch_with_p1r(
+            id.candidate.namespace,
+            id.epoch,
+            crate::predictor_v2::P1jTerminal::Cancelled,
+            |_, _| {},
+            None,
+        );
+        assert!(arena.state.lock().p1j.occupant.is_none());
+    }
     fn test_mutable_expert_arena(slot_capacity: usize) -> GpuNativeQ4ExpertArena<()> {
         let geometry = GpuNativeQ4ExpertGeometry::try_new(32, 32, 128, 1).unwrap();
         let limits = supported_expert_limits();

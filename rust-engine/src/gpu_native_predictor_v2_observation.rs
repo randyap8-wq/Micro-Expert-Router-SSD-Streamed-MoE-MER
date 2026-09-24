@@ -1583,22 +1583,34 @@ mod tests {
     fn frozen_signal_token_loop_and_config_bytes_unchanged() {
         for (source, digest) in [
             (
-                include_str!("predictor_v2.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "predictor_v2.rs",
+                ),
                 "bd534f6252b6a059a8b773e88151c35b2e8f2a35734a2bec4584b1b59c3a236e",
             ),
             (
-                include_str!("gpu_native_token_loop.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "gpu_native_token_loop.rs",
+                ),
                 "e2e16fed24e15fc91154035e86b2e6d70de9b6ac34e98c11a495c86369738f8a",
             ),
             (
-                include_str!("config.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "config.rs",
+                ),
                 "f57f8131c2f37976a5019cd16d9e8fdac83f75379bab324235e27f4a27395428",
             ),
         ] {
             assert_eq!(crate::greedy_parity::sha256_hex(source.as_bytes()), digest);
         }
-        assert!(!include_str!("server.rs").contains("enable_predictor_v2_p1e_observation"));
-        let main = include_str!("main.rs");
+        assert!(
+            !crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                "server.rs"
+            )
+            .contains("enable_predictor_v2_p1e_observation")
+        );
+        let main =
+            crate::gpu_native_predictor_v2_critical_path_attribution::historical_source("main.rs");
         assert!(!main.contains("enable_predictor_v2_p1e_observation"));
         assert_eq!(
             main.matches("gpu_native_predictor_v2_observation::run_command")

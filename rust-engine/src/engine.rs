@@ -25,6 +25,9 @@ use crate::expert_cache::{
     GpuHotPromotionOutcome, GpuResident,
 };
 use crate::gating::Router;
+use crate::gpu_native_predictor_v2_critical_path_attribution::{
+    Context as P1rContext, Event as P1rEvent,
+};
 use crate::gpu_native_residency::{
     global_to_layer_local as gpu_native_global_to_layer_local, GpuNativeDemandExpert,
     GpuNativeModelExpertVramPlan, GpuNativePhysicalInstallObserver, GpuNativeResidencyPriority,
@@ -6225,29 +6228,55 @@ impl Engine {
         global_id: u32,
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
         source_upload: Option<Arc<SourceUploadState>>,
+        diag: Option<&P1rContext>,
     ) -> Result<Arc<ExpertResident>, GpuNativeDemandResidencyError> {
+        let context = diag.and_then(|d| d.for_id(global_id));
+        let mut span = context.as_ref().map(|d| {
+            d.span(
+                if d.logical {
+                    P1rEvent::LogicalSource
+                } else {
+                    P1rEvent::SourceExpert
+                },
+                &[0, global_id as u64],
+            )
+        });
         let qualification = self.gpu_native_demand_source_qualification();
         if let Some(state) = qualification.as_ref() {
             state.record_source_request(global_id);
         }
         if let Some(resident) = residents.get(&global_id) {
+            if let Some(s) = &mut span {
+                s.value(0, 1);
+                s.value(2, 1);
+            }
             return Ok(resident.clone());
         }
         let resident = match self.core.cache.get(global_id) {
             Some(resident) => {
+                if let Some(s) = &mut span {
+                    s.value(2, 2);
+                }
                 if let Some(state) = qualification.as_ref() {
                     state.source_ram_hits.fetch_add(1, Ordering::Relaxed);
                 }
                 resident
             }
             None => {
+                if let Some(s) = &mut span {
+                    s.value(2, 3);
+                }
                 if let Some(state) = qualification.as_ref() {
                     state.source_ram_misses.fetch_add(1, Ordering::Relaxed);
                 }
-                self.fetch_with_retry_inner(global_id, source_upload.clone()).await?
+                self.fetch_with_retry_inner(global_id, source_upload.clone())
+                    .await?
             }
         };
         residents.insert(global_id, resident.clone());
+        if let Some(s) = &mut span {
+            s.value(0, 1);
+        }
         Ok(resident)
     }
 
@@ -6256,7 +6285,9 @@ impl Engine {
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
         source_upload: Option<Arc<SourceUploadState>>,
+        diag: Option<&P1rContext>,
     ) -> Result<(), GpuNativeDemandResidencyError> {
+        let started_p1r = diag.and_then(P1rContext::now);
         let qualification = self.gpu_native_demand_source_qualification();
         if let Some(state) = qualification.as_ref() {
             state.record_source_set(global_ids);
@@ -6270,8 +6301,9 @@ impl Engine {
                     global_ids,
                     residents,
                     source_upload.clone(),
+                    diag,
                 )
-                    .await
+                .await
             }
             Some(GpuNativeQualificationPurpose::DemandSource(
                 GpuNativeDemandSourceQualificationArm::Treatment,
@@ -6286,14 +6318,23 @@ impl Engine {
                     global_ids,
                     residents,
                     source_upload.clone(),
+                    diag,
                 )
-                    .await
+                .await
             }
         };
         if let Some(state) = qualification.as_ref() {
             state
                 .source_acquisition_wall_us
                 .fetch_add(qualification_elapsed_us(started), Ordering::Relaxed);
+        }
+        if let Some(d) = diag {
+            d.set(
+                P1rEvent::SourceSet,
+                started_p1r,
+                global_ids,
+                u64::from(result.is_ok()),
+            );
         }
         result
     }
@@ -6307,6 +6348,7 @@ impl Engine {
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
         source_upload: Option<Arc<SourceUploadState>>,
+        diag: Option<&P1rContext>,
     ) -> Result<(), GpuNativeDemandResidencyError> {
         for &global_id in global_ids {
             if residents.contains_key(&global_id) {
@@ -6314,7 +6356,7 @@ impl Engine {
             }
             let individual_started = Instant::now();
             let source_result = self
-                .gpu_native_demand_source(global_id, residents, source_upload.clone())
+                .gpu_native_demand_source(global_id, residents, source_upload.clone(), diag)
                 .await
                 .map(|_| ());
             if let Some(state) = self.gpu_native_demand_source_qualification() {
@@ -6340,7 +6382,9 @@ impl Engine {
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
         source_upload: Option<Arc<SourceUploadState>>,
+        diag: Option<&P1rContext>,
     ) -> Result<(), GpuNativeDemandResidencyError> {
+        let mut branch = diag.map(|d| d.span(P1rEvent::SourceBranch, &[]));
         let telemetry = self.production_demand_source.clone();
         telemetry.source_sets.fetch_add(1, Ordering::Relaxed);
         let unresolved = global_ids
@@ -6350,6 +6394,9 @@ impl Engine {
             .collect::<Vec<_>>();
 
         if unresolved.len() <= 1 {
+            if let Some(s) = &mut branch {
+                s.value(0, 1);
+            }
             telemetry
                 .fallback_single_item
                 .fetch_add(1, Ordering::Relaxed);
@@ -6358,6 +6405,7 @@ impl Engine {
                     global_ids,
                     residents,
                     source_upload.clone(),
+                    diag,
                 )
                 .await;
         }
@@ -6369,12 +6417,16 @@ impl Engine {
             .iter()
             .any(|global_id| self.core.cache.contains(*global_id))
         {
+            if let Some(s) = &mut branch {
+                s.value(0, 2);
+            }
             telemetry.fallback_mixed_ram.fetch_add(1, Ordering::Relaxed);
             return self
                 .gpu_native_sequential_source_physical_missing_set(
                     global_ids,
                     residents,
                     source_upload.clone(),
+                    diag,
                 )
                 .await;
         }
@@ -6399,6 +6451,9 @@ impl Engine {
                     leadership.guards.push(guard);
                 }
                 Err(_leader_notify) => {
+                    if let Some(s) = &mut branch {
+                        s.value(0, 3);
+                    }
                     telemetry
                         .singleflight_followers_observed
                         .fetch_add(1, Ordering::Relaxed);
@@ -6424,6 +6479,7 @@ impl Engine {
                             global_ids,
                             residents,
                             source_upload.clone(),
+                            diag,
                         )
                         .await;
                 }
@@ -6446,6 +6502,9 @@ impl Engine {
             .iter()
             .any(|global_id| self.core.cache.contains(*global_id))
         {
+            if let Some(s) = &mut branch {
+                s.value(0, 2);
+            }
             telemetry.fallback_mixed_ram.fetch_add(1, Ordering::Relaxed);
             drop(leadership);
             return self
@@ -6453,27 +6512,31 @@ impl Engine {
                     global_ids,
                     residents,
                     source_upload.clone(),
+                    diag,
                 )
                 .await;
         }
 
-        let reservation_outcome =
-            match self.core.cache.try_reserve_exact_demand(&unresolved) {
-                Ok(reservation) => reservation,
-                Err(_) => {
-                    telemetry
-                        .fallback_reservation
-                        .fetch_add(1, Ordering::Relaxed);
-                    drop(leadership);
-                    return self
-                        .gpu_native_sequential_source_physical_missing_set(
-                            global_ids,
-                            residents,
-                            source_upload.clone(),
-                        )
-                        .await;
+        let reservation_outcome = match self.core.cache.try_reserve_exact_demand(&unresolved) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                if let Some(s) = &mut branch {
+                    s.value(0, 4);
                 }
-            };
+                telemetry
+                    .fallback_reservation
+                    .fetch_add(1, Ordering::Relaxed);
+                drop(leadership);
+                return self
+                    .gpu_native_sequential_source_physical_missing_set(
+                        global_ids,
+                        residents,
+                        source_upload.clone(),
+                        diag,
+                    )
+                    .await;
+            }
+        };
         let reserved_slots = reservation_outcome.reservation.remaining();
         telemetry
             .cache_slots_reserved
@@ -6545,6 +6608,10 @@ impl Engine {
         let mut fused_residents = None;
         let expected_bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
         let _foreground = self.core.governor.foreground_guard();
+        if let Some(s) = &mut branch {
+            s.value(0, if production_fusion_eligible { 6 } else { 5 });
+            s.value(1, unresolved.len() as u64);
+        }
         let read_result = if production_fusion_eligible {
             let upload = upload.as_ref().expect("eligible upload state");
             match upload
@@ -6570,6 +6637,10 @@ impl Engine {
                 .await
         };
         drop(_foreground);
+        if let Some(s) = &mut branch {
+            s.value(2, u64::from(read_result.is_ok()));
+            s.value(3, expected_bytes as u64);
+        }
         let batch_wall_us = qualification_elapsed_us(batch_started);
         if read_result.is_err() {
             if let Some(upload) = upload
@@ -6672,7 +6743,11 @@ impl Engine {
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
         source_upload: Option<Arc<SourceUploadState>>,
+        diag: Option<&P1rContext>,
     ) -> Result<(Vec<GpuAdmission>, usize), GpuNativeDemandResidencyError> {
+        let context = diag.map(P1rContext::logical);
+        let diag = context.as_ref();
+        let mut span = diag.map(|d| d.span(P1rEvent::LogicalSet, &[]));
         let gpu = self.execution_context().gpu_expert_cache();
         let mut payloads = HashMap::with_capacity(global_ids.len());
         let upload = source_upload.clone();
@@ -6710,6 +6785,10 @@ impl Engine {
                             &new_ids,
                         );
                     }
+                    if let Some(s) = &mut span {
+                        s.value(0, 1);
+                        s.value(1, attempt as u64);
+                    }
                     return Ok((admissions, newly_admitted));
                 }
                 GpuDemandSetAdmission::PayloadRequired(missing)
@@ -6729,6 +6808,7 @@ impl Engine {
                                 global_id,
                                 residents,
                                 source_upload.clone(),
+                                diag,
                             )
                             .await?;
                         let payload = if let Some(upload) = upload
@@ -6800,6 +6880,20 @@ impl Engine {
         Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>,
         GpuNativeDemandResidencyError,
     > {
+        self.ensure_gpu_native_demand_residency_p1r(layer_index, global_ids, None)
+            .await
+    }
+    pub(crate) async fn ensure_gpu_native_demand_residency_p1r(
+        self: &Arc<Self>,
+        layer_index: usize,
+        global_ids: &[u32],
+        diag: Option<&P1rContext>,
+    ) -> Result<
+        Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>,
+        GpuNativeDemandResidencyError,
+    > {
+        let context = diag.map(|d| d.selected(global_ids));
+        let diag = context.as_ref();
         let manager = self
             .core
             .gpu_native_residency
@@ -6851,6 +6945,11 @@ impl Engine {
         let mut residents = HashMap::with_capacity(global_ids.len());
         let mut recovery_attempts = 0usize;
         loop {
+            let context = diag.map(|d| d.pass(recovery_attempts));
+            let diag = context.as_ref();
+            if let Some(d) = diag {
+                d.set(P1rEvent::Selected, d.now(), global_ids, 1);
+            }
             // No logical-cache lock is held while probing the physical layer.
             // A probe result may race with a later physical eviction; the
             // fixed one-retry recovery below re-probes the complete set.
@@ -6861,11 +6960,15 @@ impl Engine {
                 physical_current.push(current);
             }
             if let Some(state) = qualification.as_ref() {
-                state
-                    .physical_probe_us
-                    .fetch_add(qualification_elapsed_us(physical_probe_started), Ordering::Relaxed);
+                state.physical_probe_us.fetch_add(
+                    qualification_elapsed_us(physical_probe_started),
+                    Ordering::Relaxed,
+                );
             }
             let physical_missing = gpu_native_physical_missing_ids(global_ids, &physical_current);
+            if let Some(d) = diag {
+                d.set(P1rEvent::Probe, d.now(), &physical_missing, 1);
+            }
             if let Some(state) = qualification.as_ref() {
                 state
                     .physical_missing_experts
@@ -6894,6 +6997,7 @@ impl Engine {
                     &physical_missing,
                     &mut residents,
                     source_upload.clone(),
+                    diag,
                 )
                 .await?;
                 let logical_admission_started = Instant::now();
@@ -6902,6 +7006,7 @@ impl Engine {
                         &physical_missing,
                         &mut residents,
                         source_upload.clone(),
+                        diag,
                     )
                     .await?;
                 if let Some(state) = qualification.as_ref() {
@@ -6939,6 +7044,7 @@ impl Engine {
                 })
                 .collect::<Vec<_>>();
 
+            let p1r_install_started = diag.and_then(P1rContext::now);
             let physical_install_started = Instant::now();
             let physical_install_result = match qualification.as_ref().map(|state| state.purpose) {
                 Some(GpuNativeQualificationPurpose::PhysicalInstallStaging(arm)) => {
@@ -7021,29 +7127,31 @@ impl Engine {
                         }
                     }
                 }
-                Some(GpuNativeQualificationPurpose::DemandSource(_)) => manager
-                    .ensure_demand_set(GpuNativeResidencyPriority::Demand, layer_index, &demands),
-                None => {
-                    if let Some(upload) = source_upload.as_ref() {
-                        manager.ensure_demand_set_source_upload(
-                            GpuNativeResidencyPriority::Demand,
-                            layer_index,
-                            &demands,
-                            upload.as_ref(),
-                        )
-                    } else {
-                        manager.ensure_demand_set(
-                            GpuNativeResidencyPriority::Demand,
-                            layer_index,
-                            &demands,
-                        )
-                    }
-                }
+                Some(GpuNativeQualificationPurpose::DemandSource(_)) => manager.ensure_demand_set(
+                    GpuNativeResidencyPriority::Demand,
+                    layer_index,
+                    &demands,
+                ),
+                None => manager.ensure_demand_set_p1r(
+                    GpuNativeResidencyPriority::Demand,
+                    layer_index,
+                    &demands,
+                    source_upload.as_deref(),
+                    diag,
+                ),
             };
             if let Some(state) = qualification.as_ref() {
                 state.physical_demand_install_us.fetch_add(
                     qualification_elapsed_us(physical_install_started),
                     Ordering::Relaxed,
+                );
+            }
+            if let Some(d) = diag {
+                d.set(
+                    P1rEvent::InstallSet,
+                    p1r_install_started,
+                    global_ids,
+                    u64::from(physical_install_result.is_ok()),
                 );
             }
             match physical_install_result {
@@ -10142,7 +10250,7 @@ mod tests {
 
         let mut first_request = HashMap::new();
         let first = engine
-            .gpu_native_demand_source(0, &mut first_request, None)
+            .gpu_native_demand_source(0, &mut first_request, None, None)
             .await
             .unwrap();
         let after_nvme = engine.report().bytes_read;
@@ -10150,14 +10258,14 @@ mod tests {
 
         let mut second_request = HashMap::new();
         let ram_hit = engine
-            .gpu_native_demand_source(0, &mut second_request, None)
+            .gpu_native_demand_source(0, &mut second_request, None, None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&first, &ram_hit));
         assert_eq!(engine.report().bytes_read, after_nvme);
 
         let same_request = engine
-            .gpu_native_demand_source(0, &mut second_request, None)
+            .gpu_native_demand_source(0, &mut second_request, None, None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&ram_hit, &same_request));
@@ -10292,7 +10400,7 @@ mod tests {
     ) -> Result<HashMap<u32, Arc<ExpertResident>>, GpuNativeDemandResidencyError> {
         let mut residents = HashMap::new();
         engine
-            .gpu_native_source_physical_missing_set(&ids, &mut residents, None)
+            .gpu_native_source_physical_missing_set(&ids, &mut residents, None, None)
             .await?;
         Ok(residents)
     }
@@ -10370,7 +10478,7 @@ mod tests {
         let mut priming = HashMap::new();
         for id in 0..6 {
             engine
-                .gpu_native_demand_source(id, &mut priming, None)
+                .gpu_native_demand_source(id, &mut priming, None, None)
                 .await
                 .unwrap();
         }
@@ -10454,7 +10562,7 @@ mod tests {
         let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 21);
         let mut priming = HashMap::new();
         let retained = engine
-            .gpu_native_demand_source(0, &mut priming, None)
+            .gpu_native_demand_source(0, &mut priming, None, None)
             .await
             .unwrap();
         drop(priming);
@@ -10489,7 +10597,7 @@ mod tests {
         let mut priming = HashMap::new();
         for id in 0..4 {
             engine
-                .gpu_native_demand_source(id, &mut priming, None)
+                .gpu_native_demand_source(id, &mut priming, None, None)
                 .await
                 .unwrap();
         }
@@ -10502,7 +10610,7 @@ mod tests {
             .unwrap();
         let mut residents = HashMap::new();
         let error = engine
-            .gpu_native_source_physical_missing_set(&[4, 5], &mut residents, None)
+            .gpu_native_source_physical_missing_set(&[4, 5], &mut residents, None, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -10536,7 +10644,7 @@ mod tests {
         let mut retained = HashMap::new();
         for id in [0, 1] {
             engine
-                .gpu_native_demand_source(id, &mut retained, None)
+                .gpu_native_demand_source(id, &mut retained, None, None)
                 .await
                 .unwrap();
         }
@@ -10546,7 +10654,7 @@ mod tests {
         // can be acquired, forcing the post-reservation fail-closed path.
         let mut residents = HashMap::new();
         let error = engine
-            .gpu_native_source_physical_missing_set(&[2, 3], &mut residents, None)
+            .gpu_native_source_physical_missing_set(&[2, 3], &mut residents, None, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -10682,7 +10790,7 @@ mod tests {
         let mut priming = HashMap::new();
         for id in [0, 1] {
             engine
-                .gpu_native_demand_source(id, &mut priming, None)
+                .gpu_native_demand_source(id, &mut priming, None, None)
                 .await
                 .unwrap();
         }
@@ -13588,7 +13696,19 @@ mod tests {
             .next()
             .unwrap();
         assert!(demand.contains("try_begin_production_demand()"));
-        assert!(demand.contains("ensure_demand_set_source_upload("));
+        assert!(demand.contains("ensure_demand_set_p1r("));
+        let residency = include_str!("gpu_native_residency.rs");
+        let diagnostic_wrapper = residency
+            .split("pub(crate) fn ensure_demand_set_p1r(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn ensure_demand_set(")
+            .next()
+            .unwrap();
+        assert!(diagnostic_wrapper.contains("if diag.is_none()"));
+        assert!(diagnostic_wrapper.contains("ensure_demand_set_source_upload("));
+        assert!(diagnostic_wrapper.contains("ensure_demand_set_inner_with_source_upload::<false>("));
+        assert!(diagnostic_wrapper.contains("ordinary_demand_install_path()"));
         assert!(demand.contains("ensure_demand_set_source_upload_observed("));
         let ordinary_fetch = source
             .split("pub async fn fetch_with_retry(")
@@ -13617,7 +13737,12 @@ mod tests {
         ));
         let mut residents = HashMap::new();
         engine
-            .gpu_native_source_physical_missing_set(&[0], &mut residents, Some(upload.clone()))
+            .gpu_native_source_physical_missing_set(
+                &[0],
+                &mut residents,
+                Some(upload.clone()),
+                None,
+            )
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&resident, &residents[&0]));
@@ -13642,7 +13767,12 @@ mod tests {
         ));
         let mut residents = HashMap::new();
         engine
-            .gpu_native_source_physical_missing_set(&[2, 0], &mut residents, Some(upload.clone()))
+            .gpu_native_source_physical_missing_set(
+                &[2, 0],
+                &mut residents,
+                Some(upload.clone()),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(

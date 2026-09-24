@@ -1121,19 +1121,27 @@ mod tests {
         use sha2::Digest;
         for (source, expected) in [
             (
-                include_str!("engine.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "engine.rs",
+                ),
                 "dd51bbad5d85a06950a1d8c82d7e43aff3d0231c128dcd7e09e0addff8134d8c",
             ),
             (
-                include_str!("gpu_native_residency.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "gpu_native_residency.rs",
+                ),
                 "ddd73fb0d80c736512802eb57d4f2b8b24bc764ad2abe8d1197c3be393f95367",
             ),
             (
-                include_str!("config.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "config.rs",
+                ),
                 "f57f8131c2f37976a5019cd16d9e8fdac83f75379bab324235e27f4a27395428",
             ),
             (
-                include_str!("gpu_native_physical_install_staging.rs"),
+                crate::gpu_native_predictor_v2_critical_path_attribution::historical_source(
+                    "gpu_native_physical_install_staging.rs",
+                ),
                 "6f65b3704f5e64a8dc22a696251b9a0d284a7780fd57c42996e807998249cc52",
             ),
         ] {

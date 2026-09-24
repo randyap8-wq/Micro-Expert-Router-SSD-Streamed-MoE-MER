@@ -18,6 +18,9 @@ use crate::backend::gpu_native::{GpuNativeP1jSidecar, P1jClaimRefusal, P1jPhase,
 use crate::expert_cache::{
     ExpertResident, GpuAdmission, GpuExpertCache, HostBackedLease, HostBackedLeaseResult,
 };
+use crate::gpu_native_predictor_v2_critical_path_attribution::{
+    Context as P1rContext, Event as P1rEvent,
+};
 use crate::predictor_v2::{p1e, P1jIdentity, P1jTerminal};
 use lru::LruCache;
 use parking_lot::{Mutex, MutexGuard};
@@ -870,13 +873,63 @@ pub(crate) fn p1j_prepare_source(
     cache: &GpuExpertCache,
     claim: impl FnOnce(p1e::Candidate, u64) -> Result<P1jIdentity, P1jClaimRefusal>,
 ) -> Result<(P1jIdentity, HostBackedLease), P1jPrepareRefusal> {
+    p1j_prepare_source_p1r(retirement_busy, namespace, freeze, cache, claim, None)
+}
+fn p1j_prepare_source_p1r(
+    retirement_busy: bool,
+    namespace: p1e::Namespace,
+    freeze: p1e::Freeze,
+    cache: &GpuExpertCache,
+    claim: impl FnOnce(p1e::Candidate, u64) -> Result<P1jIdentity, P1jClaimRefusal>,
+    diag: Option<&P1rContext>,
+) -> Result<(P1jIdentity, HostBackedLease), P1jPrepareRefusal> {
     if retirement_busy {
         return Err(P1jPrepareRefusal::RetirementBusy);
     }
     let c = freeze.candidate;
     let generation = p1j_prepare_generation(namespace, freeze)?;
-    let lease = p1j_host_lease(cache.try_lease_host_backed((47 * 128) + c.expert, generation))?;
-    let id = claim(c, generation)?;
+    let started = diag.and_then(P1rContext::now);
+    let result = p1j_host_lease(cache.try_lease_host_backed((47 * 128) + c.expert, generation));
+    if let Some(d) = diag {
+        d.record(
+            P1rEvent::Lease,
+            started,
+            d.now(),
+            &[
+                if result.is_ok() { 1 } else { 0 },
+                c.sequence,
+                c.expert as u64,
+                generation,
+            ],
+        );
+    }
+    let lease = result?;
+    let started = diag.and_then(P1rContext::now);
+    let result = claim(c, generation);
+    if let Some(d) = diag {
+        match result {
+            Ok(id) => d.identity(P1rEvent::Claim, started, id, 1),
+            Err(reason) => d.record(
+                P1rEvent::Claim,
+                started,
+                d.now(),
+                &[0, c.sequence, c.expert as u64, generation, reason as u64],
+            ),
+        }
+    }
+    let id = match result {
+        Ok(id) => id,
+        Err(error) => {
+            drop(lease);
+            if let Some(d) = diag {
+                d.stamp(
+                    P1rEvent::LeaseRelease,
+                    &[1, c.sequence, c.expert as u64, generation],
+                );
+            }
+            return Err(error.into());
+        }
+    };
     debug_assert_eq!(lease.global_id(), id.global_id());
     debug_assert_eq!(lease.generation(), id.logical_generation);
     Ok((id, lease))
@@ -887,6 +940,7 @@ pub(crate) struct P1jWriter {
     pub(crate) id: P1jIdentity,
     lease: Option<HostBackedLease>,
     closed: bool,
+    p1r: Option<P1rContext>,
 }
 
 /// Shared by the real worker and CPU queue doubles. Even an unwinding write
@@ -904,17 +958,31 @@ fn p1j_stage_lease(
 impl P1jWriter {
     pub(crate) fn spawn(self) {
         let runtime = self.owner.runtime.clone();
+        let diag = self.p1r.clone();
+        let started = diag.as_ref().and_then(P1rContext::now);
         // Claim and lease already exist before dispatch. There is no prediction queue.
         runtime.spawn_blocking(move || {
             let mut writer = self;
+            if let Some(d) = &writer.p1r {
+                d.identity(P1rEvent::WriterStart, d.now(), writer.id, 1);
+            }
             let lease = writer.lease.take().expect("writer owns source");
             let owner = &writer.owner;
             p1j_stage_lease(
                 lease,
                 |payload| {
-                    owner
-                        .executor
-                        .write_p1j_payload(&owner.resource, writer.id, payload)
+                    let mut span = writer
+                        .p1r
+                        .as_ref()
+                        .map(|d| d.span_identity(P1rEvent::Payload, writer.id, 0));
+                    let result =
+                        owner
+                            .executor
+                            .write_p1j_payload(&owner.resource, writer.id, payload);
+                    if let Some(s) = &mut span {
+                        s.value(0, u64::from(result.is_ok()));
+                    }
+                    result
                 },
                 |success| {
                     if !success {
@@ -922,11 +990,19 @@ impl P1jWriter {
                             .retirement
                             .request(writer.id.epoch, P1jTerminal::WriteFailure);
                     }
-                    owner.arena.close_p1j_writer(writer.id, success);
+                    owner
+                        .arena
+                        .close_p1j_writer_p1r(writer.id, success, writer.p1r.as_ref());
                 },
             );
+            if let Some(d) = &writer.p1r {
+                d.identity(P1rEvent::LeaseRelease, d.now(), writer.id, 1);
+            }
             writer.closed = true;
         });
+        if let Some(d) = &diag {
+            d.record(P1rEvent::Spawn, started, d.now(), &[]);
+        }
     }
     fn close(&mut self, success: bool) {
         if self.closed {
@@ -937,18 +1013,30 @@ impl P1jWriter {
                 .retirement
                 .request(self.id.epoch, P1jTerminal::WriteFailure);
         }
-        if !self.owner.arena.try_close_p1j_writer(self.id, success) {
+        if !self
+            .owner
+            .arena
+            .try_close_p1j_writer_p1r(self.id, success, self.p1r.as_ref())
+        {
             // A never-dispatched writer can be dropped on the foreground path.
             // Its enqueue capability is gone; keep WRITING claimed until this
             // scalar-only closer runs. There can be only one such closer.
             let owner = self.owner.clone();
             let id = self.id;
+            let diag = self.p1r.clone();
             self.owner.runtime.spawn_blocking(move || {
-                owner.arena.close_p1j_writer(id, success);
+                owner.arena.close_p1j_writer_p1r(id, success, diag.as_ref());
             });
         }
         // No code may access source bytes after ENQUEUED_CLOSED. Drop immediately.
-        drop(self.lease.take());
+        let released = self.lease.take();
+        let had_lease = released.is_some();
+        drop(released);
+        if had_lease {
+            if let Some(d) = &self.p1r {
+                d.identity(P1rEvent::LeaseRelease, d.now(), self.id, 1);
+            }
+        }
         self.closed = true;
     }
 }
@@ -965,18 +1053,28 @@ impl P1jSidecarOwner {
         freeze: p1e::Freeze,
         cache: &GpuExpertCache,
     ) -> Result<P1jWriter, P1jPrepareRefusal> {
-        let (id, lease) = p1j_prepare_source(
+        self.try_prepare_p1r(freeze, cache, None)
+    }
+    pub(crate) fn try_prepare_p1r(
+        self: &Arc<Self>,
+        freeze: p1e::Freeze,
+        cache: &GpuExpertCache,
+        diag: Option<&P1rContext>,
+    ) -> Result<P1jWriter, P1jPrepareRefusal> {
+        let (id, lease) = p1j_prepare_source_p1r(
             self.retirement.running.load(Ordering::Acquire),
             self.namespace,
             freeze,
             cache,
             |c, generation| self.arena.try_claim_p1j(c, generation),
+            diag,
         )?;
         Ok(P1jWriter {
             owner: self.clone(),
             id,
             lease: Some(lease),
             closed: false,
+            p1r: diag.cloned(),
         })
     }
 
@@ -1006,13 +1104,24 @@ impl P1jSidecarOwner {
     /// while this exact occupant prevents destination reuse; it performs only
     /// conditional unpublication, never payload writes or mapping publication.
     pub(crate) fn retire(self: &Arc<Self>, id: P1jIdentity, reason: P1jTerminal) {
+        self.retire_p1r(id, reason, None)
+    }
+    pub(crate) fn retire_p1r(
+        self: &Arc<Self>,
+        id: P1jIdentity,
+        reason: P1jTerminal,
+        diag: Option<&P1rContext>,
+    ) {
+        if let Some(d) = diag {
+            d.identity(P1rEvent::Retire, d.now(), id, reason as u64);
+        }
         if id.candidate.namespace != self.namespace {
             return;
         }
         self.retirement.request(id.epoch, reason);
         if self
             .executor
-            .retire_p1j(&self.arena, id, reason, true)
+            .retire_p1j_p1r(&self.arena, id, reason, true, diag)
             .is_some()
         {
             return;
@@ -1021,11 +1130,16 @@ impl P1jSidecarOwner {
             return;
         }
         let owner = self.clone();
+        let diag = diag.cloned();
         self.runtime.spawn_blocking(move || {
             owner.retirement.drain(|epoch, reason| {
-                owner
-                    .executor
-                    .retire_p1j_epoch(&owner.arena, owner.namespace, epoch, reason);
+                owner.executor.retire_p1j_epoch_p1r(
+                    &owner.arena,
+                    owner.namespace,
+                    epoch,
+                    reason,
+                    diag.as_ref(),
+                );
             });
         });
     }
@@ -1408,6 +1522,40 @@ impl GpuNativeTieredResidencyManager {
         }
     }
 
+    pub(crate) fn ensure_demand_set_p1r(
+        &self,
+        priority: GpuNativeResidencyPriority,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        source_upload: Option<&crate::gpu_native_source_upload::State>,
+        diag: Option<&P1rContext>,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        if diag.is_none() {
+            return match source_upload {
+                Some(upload) => {
+                    self.ensure_demand_set_source_upload(priority, layer_index, demands, upload)
+                }
+                None => self.ensure_demand_set(priority, layer_index, demands),
+            };
+        }
+        if source_upload.is_some_and(|u| u.arm != crate::gpu_native_source_upload::Arm::Treatment) {
+            return Err(GpuNativeTieredResidencyError::Backend(
+                GpuNativeBootstrapError::QualificationSourceUpload {
+                    detail: "ordinary production source/upload state must use treatment".into(),
+                },
+            ));
+        }
+        self.ensure_demand_set_inner_with_source_upload::<false>(
+            priority,
+            layer_index,
+            demands,
+            ordinary_demand_install_path(),
+            None,
+            source_upload,
+            diag,
+        )
+    }
+
     pub(crate) fn ensure_demand_set(
         &self,
         priority: GpuNativeResidencyPriority,
@@ -1444,6 +1592,7 @@ impl GpuNativeTieredResidencyManager {
             ordinary_demand_install_path(),
             None,
             Some(source_upload),
+            None,
         )
     }
 
@@ -1475,6 +1624,7 @@ impl GpuNativeTieredResidencyManager {
             ordinary_demand_install_path(),
             Some(observer),
             Some(source_upload),
+            None,
         )
     }
 
@@ -1595,6 +1745,7 @@ impl GpuNativeTieredResidencyManager {
             install_path,
             observer,
             None,
+            None,
         )
     }
 
@@ -1606,6 +1757,7 @@ impl GpuNativeTieredResidencyManager {
         install_path: DemandPhysicalInstallPath,
         observer: Option<&dyn GpuNativePhysicalInstallObserver>,
         production_source_upload: Option<&crate::gpu_native_source_upload::State>,
+        diag: Option<&P1rContext>,
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
         if !matches!(
             priority,
@@ -1678,6 +1830,7 @@ impl GpuNativeTieredResidencyManager {
                 shadow.demand(&local_ids);
             }
         }
+        let mut p1r_locked = 0u64;
         let mut resolved = vec![None; demands.len()];
         let mut misses = Vec::new();
         for (index, demand) in demands.iter().enumerate() {
@@ -1687,6 +1840,9 @@ impl GpuNativeTieredResidencyManager {
                 self.counters
                     .physical_current_hits
                     .fetch_add(1, Ordering::Relaxed);
+                if diag.is_some() && index < 8 {
+                    p1r_locked |= 1 << (index * 2);
+                }
                 resolved[index] = Some(record.residency);
             } else if let Some((_, residency)) = self.p1j_current(global_id) {
                 // The token loop's execution guard spans this target recovery.
@@ -1695,8 +1851,14 @@ impl GpuNativeTieredResidencyManager {
                 self.counters
                     .physical_current_hits
                     .fetch_add(1, Ordering::Relaxed);
+                if diag.is_some() && index < 8 {
+                    p1r_locked |= 2 << (index * 2);
+                }
                 resolved[index] = Some(residency);
             } else {
+                if diag.is_some() && index < 8 {
+                    p1r_locked |= 3 << (index * 2);
+                }
                 self.counters.vram_misses.fetch_add(1, Ordering::Relaxed);
                 match demand {
                     GpuNativeDemandExpert::Install { .. } => misses.push(index),
@@ -1709,6 +1871,22 @@ impl GpuNativeTieredResidencyManager {
             }
         }
 
+        if let Some(d) = diag {
+            let mut ids = [0; 8];
+            if demands.len() <= 8 {
+                for (i, v) in demands.iter().enumerate() {
+                    ids[i] = v.global_id();
+                }
+                d.set(
+                    P1rEvent::LockedSet,
+                    d.now(),
+                    &ids[..demands.len()],
+                    p1r_locked,
+                );
+            } else {
+                d.invalidate();
+            }
+        }
         while state.residents.len().saturating_add(misses.len()) > layer.arena.slot_capacity() {
             let victim = oldest_unprotected(&state.residents, &protected)
                 .ok_or(GpuNativeTieredResidencyError::NoEvictablePhysicalSlot { layer_index })?;
@@ -1735,6 +1913,7 @@ impl GpuNativeTieredResidencyManager {
                     &mut resolved,
                     observer,
                     production_source_upload,
+                    diag,
                 )?;
             } else {
                 self.install_parallel_physical_misses_locked::<OBSERVE, false>(
@@ -1745,6 +1924,7 @@ impl GpuNativeTieredResidencyManager {
                     &mut resolved,
                     observer,
                     production_source_upload,
+                    diag,
                 )?;
             }
         } else {
@@ -1809,6 +1989,7 @@ impl GpuNativeTieredResidencyManager {
         resolved: &mut [Option<GpuNativeQ4ExpertResidency>],
         observer: Option<&dyn GpuNativePhysicalInstallObserver>,
         production_source_upload: Option<&crate::gpu_native_source_upload::State>,
+        diag: Option<&P1rContext>,
     ) -> Result<(), GpuNativeTieredResidencyError> {
         if misses.is_empty() {
             return Ok(());
@@ -1839,6 +2020,13 @@ impl GpuNativeTieredResidencyManager {
             else {
                 unreachable!("miss list contains only install sources")
             };
+            let context = diag.and_then(|d| d.for_id(*global_id));
+            let mut span = context.as_ref().map(|d| {
+                d.span(
+                    P1rEvent::Reservation,
+                    &[0, *global_id as u64, admission.generation()],
+                )
+            });
             let identity = self.identity(*global_id)?;
             let key = global_to_q4_expert_key(
                 *global_id,
@@ -1958,6 +2146,14 @@ impl GpuNativeTieredResidencyManager {
                         permit.install_ticket(),
                     );
             }
+            if let Some(s) = &mut span {
+                let r = permit.reserved_residency();
+                s.value(0, 1);
+                s.value(3, r.location().bank() as u64);
+                s.value(4, r.location().slot() as u64);
+                s.value(5, r.slot_epoch() as u64);
+                s.value(6, permit.install_ticket());
+            }
             reserved.push(ReservedPhysicalInstall {
                 demand_index,
                 global_id: *global_id,
@@ -2005,6 +2201,17 @@ impl GpuNativeTieredResidencyManager {
             .filter(|u| u.arm == crate::gpu_native_source_upload::Arm::Treatment)
             .map(crate::gpu_native_source_upload::CopySet::new);
         let stage_one = |reserved: ReservedPhysicalInstall<'a>| {
+            let context = diag.and_then(|d| d.for_id(reserved.global_id));
+            let mut p1r_stage = context.as_ref().map(|d| {
+                d.span(
+                    P1rEvent::Stage,
+                    &[
+                        0,
+                        reserved.global_id as u64,
+                        reserved.admission.generation(),
+                    ],
+                )
+            });
             if OBSERVE {
                 observer
                     .expect("observed production install has an observer")
@@ -2035,6 +2242,10 @@ impl GpuNativeTieredResidencyManager {
                     .stage_q4_expert_residency_production(reserved.permit, reserved.resident.data())
                     .map(|prepared| (prepared, GpuNativePhysicalInstallEvidence::default()))
             }};
+            if let Some(s) = &mut p1r_stage {
+                s.value(0, u64::from(result.is_ok()));
+                s.value(3, u64::from(fused_source_upload));
+            }
             match result {
                 Ok((prepared, mut evidence)) => {
                     let individual_stage_us = stage_started.map_or(0, qualification_elapsed_us);
@@ -2103,10 +2314,14 @@ impl GpuNativeTieredResidencyManager {
         // precedes every executable mapping publication, including a prefix
         // retained by the existing ordered failure semantics.
         if let Some(copies) = &copies {
+            let mut span = diag.map(|d| d.span(P1rEvent::CopySet, &[]));
             copies.submit(&self.executor).map_err(|detail| {
                 upload.expect("copy audit").add(|m| &mut m.copy_failures, 1);
                 GpuNativeTieredResidencyError::from(crate::backend::gpu_native::GpuNativeBootstrapError::QualificationSourceUpload { detail })
             })?;
+            if let Some(s) = &mut span {
+                s.value(0, 1);
+            }
         }
         let first_stage_failure = staged.iter().position(Result::is_err);
         let mut remaining_successful = staged.iter().filter(|result| result.is_ok()).count() as u64;
@@ -2142,6 +2357,13 @@ impl GpuNativeTieredResidencyManager {
                     .expect("observed production install has an observer")
                     .record_ordered_commit_attempt();
             }
+            let context = diag.and_then(|d| d.for_id(staged.global_id));
+            let mut p1r_commit = context.as_ref().map(|d| {
+                d.span(
+                    P1rEvent::Commit,
+                    &[0, staged.global_id as u64, staged.admission.generation()],
+                )
+            });
             let commit_started = OBSERVE.then(Instant::now);
             let commit_result = if OBSERVE {
                 self.executor
@@ -2179,6 +2401,9 @@ impl GpuNativeTieredResidencyManager {
                     return Err(error.into());
                 }
             };
+            if let Some(s) = &mut p1r_commit {
+                s.value(0, 1);
+            }
             remaining_successful = remaining_successful.saturating_sub(1);
             if !self
                 .gpu_cache
@@ -2247,6 +2472,19 @@ impl GpuNativeTieredResidencyManager {
                         staged.individual_stage_us,
                         commit_us,
                     ),
+                );
+            }
+            if let Some(d) = &context {
+                d.stamp(
+                    P1rEvent::Installed,
+                    &[
+                        1,
+                        staged.global_id as u64,
+                        residency.key().logical_generation(),
+                        residency.location().bank() as u64,
+                        residency.location().slot() as u64,
+                        residency.slot_epoch() as u64,
+                    ],
                 );
             }
             resolved[staged.demand_index] = Some(residency);
@@ -2848,6 +3086,51 @@ mod tests {
             ),
             (0, 1)
         );
+    }
+
+    #[test]
+    fn p1r_unwinding_and_failed_writer_record_failure_and_release_lease_once() {
+        use crate::expert_cache::{GpuResident, HOST_BACKED_Q4_BYTES};
+        use crate::gpu_native_predictor_v2_critical_path_attribution::Recorder;
+        for unwind in [false, true] {
+            let cache = GpuExpertCache::new(HOST_BACKED_Q4_BYTES, 0.0, 0);
+            assert!(cache.promote_sync(Arc::new(GpuResident::new_with_dtype(
+                1,
+                vec![0; HOST_BACKED_Q4_BYTES],
+                crate::inference::WeightDtype::Q4_0
+            ))));
+            let HostBackedLeaseResult::Acquired(lease) =
+                cache.try_lease_host_backed(1, cache.current_generation(1).unwrap())
+            else {
+                panic!("lease")
+            };
+            let r = Recorder::fixture(Instant::now(), 1);
+            let d = r.context(0, 0);
+            let closed = std::cell::Cell::new(false);
+            p1j_stage_lease(
+                lease,
+                |_| {
+                    let _span = d.span(P1rEvent::Payload, &[0]);
+                    if unwind {
+                        panic!("injected writer unwind");
+                    }
+                    Err(GpuNativeBootstrapError::GpuBackendUnavailable)
+                },
+                |success| {
+                    assert!(!success);
+                    closed.set(true);
+                },
+            );
+            assert!(closed.get());
+            assert_eq!(r.snapshot().event(0, P1rEvent::Payload).unwrap()[2], 0);
+            assert_eq!(
+                (
+                    cache.host_backed_lease_snapshot().active,
+                    cache.host_backed_lease_snapshot().releases
+                ),
+                (0, 1)
+            );
+        }
     }
     #[test]
     fn p1j_launch_and_writer_have_no_source_io_or_demand_buffer_capability() {

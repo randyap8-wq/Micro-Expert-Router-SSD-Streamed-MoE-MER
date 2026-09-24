@@ -155,6 +155,7 @@ pub(crate) mod gpu_native_oracle_routes;
 pub(crate) mod gpu_native_oracle_scheduled_residency;
 pub(crate) mod gpu_native_real_benchmark;
 mod gpu_native_predictor_v2_observation;
+mod gpu_native_predictor_v2_critical_path_attribution;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
@@ -932,6 +933,12 @@ enum Cmd {
     #[command(name = "qualify-gpu-native-predictor-v2-sidecar-performance")]
     QualifyGpuNativePredictorV2SidecarPerformance(
         crate::gpu_native_predictor_v2_sidecar_performance::CommandArgs,
+    ),
+
+    /// One process-isolated P1R attribution pair; runtime requires separate authority.
+    #[command(name = "diagnose-gpu-native-predictor-v2-critical-path-attribution")]
+    DiagnoseGpuNativePredictorV2CriticalPathAttribution(
+        crate::gpu_native_predictor_v2_critical_path_attribution::CommandArgs,
     ),
 
     /// Capture authoritative ordered route truth from the ordinary production
@@ -2051,6 +2058,9 @@ fn parse_autotune_probe_output(
 fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
     match cmd {
         Cmd::ObserveGpuNativePredictorV2P1e(args) => Some(args.config.as_path()),
+        Cmd::DiagnoseGpuNativePredictorV2CriticalPathAttribution(args) => {
+            Some(args.config.as_path())
+        }
         Cmd::QualifyGpuNativePredictorV2P1jSidecar(args) => Some(args.config.as_path()),
         Cmd::QualifyGpuNativePredictorV2SidecarPerformance(args) => Some(args.config.as_path()),
         Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
@@ -2502,6 +2512,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             rt.block_on(crate::gpu_native_predictor_v2_observation::run_command(args))
+        }
+        Cmd::DiagnoseGpuNativePredictorV2CriticalPathAttribution(args) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_predictor_v2_critical_path_attribution::run_command(args))
         }
         Cmd::QualifyGpuNativePredictorV2SidecarPerformance(args) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
