@@ -129,6 +129,14 @@ The primary current qualification target is:
 
 A release-grade model-quality claim is separate from runtime qualification. Some historical Q4 artifacts were requantized for systems validation; the README does not treat those artifacts as a model-quality benchmark.
 
+### AWS portability target
+
+MER is also establishing its first AWS hardware/software profile under [AWS-1](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/207).
+
+The frozen first target is one **`g6.8xlarge`** in **`us-east-1`**: 32 vCPUs, 128 GiB RAM, one NVIDIA L4 with 22 GiB VRAM, and two 450 GB local NVMe instance-store volumes. AWS-1 is a portability/preflight gate, not a performance benchmark.
+
+The first launch was blocked before instance creation by the account's regional **Running On-Demand G and VT instances** quota. The requested minimum is 32 vCPUs. No AWS model load, inference, or performance claim has been made from that blocked attempt.
+
 ---
 
 ## Predictor-v2: predictive physical expert movement
@@ -148,41 +156,40 @@ This is different from the older generic SSD prefetch logic:
 
 ### Latest certified Predictor-v2 result
 
-Predictor-v2 is currently a **validated development branch**, not yet part of frozen `main`.
+Predictor-v2 is still development work outside frozen `main`, but the qualification chain has advanced beyond the earlier P1O mechanism-only result.
 
-The P1O certification on an NVIDIA L4 completed successfully with:
+P1O established semantic-route/output parity and clean movement accounting. The later process-isolated matched-resource P1Q3 qualification on **NVIDIA L4 / Vulkan / driver 580.178.04** completed all six control/treatment pairs successfully and produced a valid **INCONCLUSIVE** performance result:
 
-| Certification field | Result |
+| P1Q3 field | Result |
 |---|---:|
-| Planned positions | 143 |
-| Generated tokens | 128 |
-| Generated-output exact parity | PASS |
-| Semantic route parity | PASS |
-| Evidence-structure parity | PASS |
-| Predictor-v2 movement lifecycles emitted | 13 |
+| Valid matched-resource pairs | 6 / 6 |
+| Frozen noise floor | 2.0% |
+| Median request-time delta | -0.0146% |
+| MAD | 0.0571% |
+| Maximum absolute pair delta | 0.2298% |
+| Pair signs | 3 positive / 3 negative |
+| Treatment predictions emitted / accepted | 13 / 13 |
 | Consumed by matching future route | 9 |
 | Evicted unused | 4 |
 | Direct matching demand credits | 9 |
-| Source / install / accounting failures | 0 |
-| Ordinary runtime invariants | PASS |
-| Controlled shutdown | PASS |
+| Movement failures / live residuals | 0 / 0 |
 
-The control and treatment generated the same token sequence and preserved the same predictor/route semantics. Mechanical cache state was allowed to diverge because successful movement can legitimately change later ordinary residency behavior.
+The important result is mechanical rather than promotional: Predictor-v2 **does move exact expert residency ahead of matching demand and is consumed correctly**, but this frozen workload did not show a request-time improvement or regression above the certified 2.0% detection floor. P1Q3 is therefore neither a WIN nor a LOSS and is not being repeated.
 
-Authoritative development record:
+Authoritative records:
 
-- [Issue #197 — Predictor-v2 P1O semantic-route parity qualifier](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/197)
+- [Issue #197 — P1O semantic-route parity qualifier](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/197)
+- [Issue #204 — P1Q3 process-isolated matched-resource performance qualification](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/204)
 
-### What is *not* claimed yet
+### Current P1R attribution lane
 
-The P1O certification deliberately did **not** authorize a performance verdict because its control and treatment did not have identical GPU resource footprints.
+The active follow-up is [Issue #208 — Predictor-v2 P1R critical-path payoff attribution](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/208).
 
-The next performance lane is building a matched-resource control and calibrating runtime noise before an A/B throughput claim is allowed.
+P1R asks why 9 of the 13 treatment predictions were consumed by exact matching demand while end-to-end request timing stayed centered near zero. Its diagnostic implementation is published on a dedicated development branch and is being validated before the one-shot control → treatment attribution run.
 
-- [Issue #198 — matched-resource performance experiment design](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/198)
-- [Issue #199 — matched-resource performance harness](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/199)
+P1R is designed to measure host-side readiness relative to demand and the equivalent control's foreground miss-service exposure. It deliberately does **not** claim GPU completion timing or exact per-expert marginal savings where demand work is shared/concurrent.
 
-Until that work closes, Predictor-v2 should be described as **correctness/mechanism certified**, not “faster.”
+Until that attribution closes, Predictor-v2 should be described as **mechanically validated with an inconclusive request-time performance result**, not “faster.”
 
 ---
 
@@ -207,7 +214,9 @@ The mainline runtime contains the core MER execution architecture, including:
 
 ### Qualified development work
 
-Predictor-v2 sidecar movement and its current certification/performance harness live on dedicated development branches until the associated gates are complete.
+Predictor-v2 sidecar movement, the completed P1Q3 matched-resource qualifier, and the current P1R critical-path attribution diagnostics live on dedicated development branches until their gates are complete.
+
+Separately, AWS portability work is tracked under AWS-1 before any AWS model or performance qualification is allowed.
 
 This distinction is intentional: MER does not merge a mechanism merely because it compiles or produces a promising benchmark.
 
@@ -438,13 +447,13 @@ That distinction is intentional and is reflected throughout the qualification is
 
 Near-term work is deliberately narrow:
 
-1. complete the matched-resource Predictor-v2 performance harness;
-2. calibrate A/A runtime noise with fresh isolated runtimes;
-3. run Predictor-v2 A/B only after the noise threshold is frozen;
-4. continue hardware/model qualification without weakening exact parity and accounting gates;
-5. only then consider broader activation in serving paths.
+1. finish P1R critical-path attribution to determine whether successful Predictor-v2 credits are early enough and actually remove foreground miss-service work;
+2. choose the next Predictor-v2 optimization class from that evidence rather than guessing at signal, fanout, or writer changes;
+3. complete AWS-1 on the frozen `g6.8xlarge` / NVIDIA L4 profile once the regional G/VT On-Demand quota is approved;
+4. continue hardware/model qualification without weakening exact parity, resource-accounting, or fail-closed gates;
+5. only consider broader serving activation after those qualification gates close.
 
-Longer-term work includes broader constrained-VRAM qualification, additional model families, expanded execution offload, and edge/hardware-specific deployment profiles.
+Longer-term work includes broader constrained-VRAM qualification, additional model families, edge/hardware-specific deployment profiles, and further optimization of expert movement and residency.
 
 ---
 
