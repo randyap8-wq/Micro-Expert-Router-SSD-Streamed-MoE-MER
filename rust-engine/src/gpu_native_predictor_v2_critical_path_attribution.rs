@@ -679,6 +679,20 @@ mod driver {
         production_configuration: evidence::ProductionConfiguration,
     }
 
+    fn provenance_identity(provenance: &ArmProvenance) -> Result<Value> {
+        // Compare typed provenance directly in every process. A JSON-text
+        // roundtrip can reparse a shortest f32 decimal as a different f64 Value.
+        Ok(serde_json::to_value(provenance)?)
+    }
+
+    fn bind_provenance_identity(expected: &mut Option<Value>, identity: Value) -> Result<()> {
+        if expected.as_ref().is_some_and(|p| p != &identity) {
+            return Err("input/config/model/executable provenance drift".into());
+        }
+        *expected = Some(identity);
+        Ok(())
+    }
+
     struct PreparedArm {
         spec: crate::ResolvedRealCliSpec,
         provenance: ArmProvenance,
@@ -1403,12 +1417,9 @@ mod driver {
         let preparation: Result<_> = (|| {
             let (prompt, _) = parse_request(bytes)?;
             let prepared = prepare_arm(args)?;
-            let identity = serde_json::to_value(&prepared.provenance)?;
+            let identity = provenance_identity(&prepared.provenance)?;
             report.provenance = Some(prepared.provenance);
-            if expected_provenance.as_ref().is_some_and(|p| p != &identity) {
-                return Err("input/config/model/executable provenance drift".into());
-            }
-            *expected_provenance = Some(identity);
+            bind_provenance_identity(expected_provenance, identity)?;
             let mode = crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark;
             let tokenizer = crate::load_real_cli_tokenizer(&prepared.spec.cfg, mode)?;
             Ok((prepared.spec, tokenizer, prompt))
@@ -1821,9 +1832,6 @@ mod driver {
             }}),
         )
     }
-    fn transport(value: &impl Serialize) -> Result<Value> {
-        read_child_json(&serde_json::to_vec(value)?)
-    }
     fn valid_arm(report: &ArmReport) -> bool {
         report.errors.is_empty()
             && arm_invariant_errors(report, 16, OUTPUT_TOKENS, PLANNED_POSITIONS).is_empty()
@@ -2094,7 +2102,7 @@ mod driver {
                 if control.pid == std::process::id() {
                     return Err("P1R requires distinct isolated processes".into());
                 }
-                expected_provenance = Some(transport(
+                expected_provenance = Some(provenance_identity(
                     control
                         .report
                         .provenance
@@ -2166,7 +2174,16 @@ mod driver {
         if let (Some(c), Some(t)) = (&control, &treatment) {
             if c.pid == t.pid
                 || c.report.resource_identity != t.report.resource_identity
-                || transport(&c.report.provenance)? != transport(&t.report.provenance)?
+                || c.report
+                    .provenance
+                    .as_ref()
+                    .map(provenance_identity)
+                    .transpose()?
+                    != t.report
+                        .provenance
+                        .as_ref()
+                        .map(provenance_identity)
+                        .transpose()?
                 || c.report.generated_token_ids != t.report.generated_token_ids
             {
                 report
@@ -3629,6 +3646,115 @@ mod driver {
             });
             assert!(attribute(&c, &t).is_err());
         }
+        fn provenance_fixture() -> ArmProvenance {
+            let mut production_configuration = evidence::ProductionConfiguration::default();
+            production_configuration
+                .cache_residency
+                .gpu_vram_anchor_ratio = 0.1_f32;
+            ArmProvenance {
+                provenance: evidence::BenchmarkProvenance {
+                    build: crate::qualification::BuildProvenance {
+                        git_sha: Some("c390bd4607e9108d8c63dc2e96f0aca9061741fc".into()),
+                        dirty: Some(false),
+                        package_version: "0.1.0".into(),
+                    },
+                    executable_canonical_path: "/fixture/mer".into(),
+                    executable_sha256: "binary-sha256".into(),
+                    resolved_config_sha256: "resolved-config-sha256".into(),
+                    artifacts: crate::qualification::QualificationArtifacts::default(),
+                    expert_metadata: crate::qualification::ExpertMetadataEvidence {
+                        dtype: Some("q4_0".into()),
+                        q4_0_layout: Some("standard_v1".into()),
+                        conversion_mode: None,
+                        source: None,
+                        explicitly_synthetic: false,
+                    },
+                },
+                config_path: "/fixture/config.toml".into(),
+                config_sha256: "config-sha256".into(),
+                model_identity: crate::greedy_parity::ModelIdentityEvidence {
+                    architecture: "qwen3_moe".into(),
+                    num_layers: 48,
+                    num_experts_per_layer: 128,
+                    total_experts: 6_144,
+                    top_k: 8,
+                    d_model: 2_048,
+                    d_ff: 768,
+                    routed_expert_dtype: "q4_0".into(),
+                },
+                production_configuration,
+            }
+        }
+
+        #[test]
+        fn p1r_provenance_old_text_transport_changes_f32_identity() {
+            let provenance = provenance_fixture();
+            let direct = serde_json::to_value(&provenance).unwrap();
+            let old: Value = read_child_json(&serde_json::to_vec(&provenance).unwrap()).unwrap();
+            let leaf = "/production_configuration/cache_residency/gpu_vram_anchor_ratio";
+            assert_eq!(direct.pointer(leaf).unwrap().as_f64(), Some(0.1_f32 as f64));
+            assert_eq!(old.pointer(leaf).unwrap().as_f64(), Some(0.1_f64));
+            assert_ne!(direct, old);
+        }
+
+        #[test]
+        fn p1r_provenance_typed_identity_matches_independent_child_reconstruction() {
+            let control = provenance_fixture();
+            let imported: ArmProvenance =
+                read_child_json(&serde_json::to_vec(&control).unwrap()).unwrap();
+            let treatment = provenance_fixture();
+            let expected = provenance_identity(&imported).unwrap();
+            assert_eq!(expected, provenance_identity(&control).unwrap());
+            assert_eq!(expected, provenance_identity(&treatment).unwrap());
+            let mut bound = Some(expected.clone());
+            bind_provenance_identity(&mut bound, provenance_identity(&treatment).unwrap()).unwrap();
+            assert_eq!(bound, Some(expected));
+        }
+
+        #[test]
+        fn p1r_provenance_true_drift_is_rejected_without_rebinding() {
+            let mut expected = None;
+            bind_provenance_identity(
+                &mut expected,
+                provenance_identity(&provenance_fixture()).unwrap(),
+            )
+            .unwrap();
+            let original = expected.clone();
+            for field in [
+                "f32",
+                "config",
+                "resolved_config",
+                "model",
+                "executable",
+                "source",
+            ] {
+                let mut changed = provenance_fixture();
+                match field {
+                    "f32" => {
+                        changed
+                            .production_configuration
+                            .cache_residency
+                            .gpu_vram_anchor_ratio = f32::from_bits(0.1_f32.to_bits() + 1);
+                    }
+                    "config" => changed.config_sha256.push('x'),
+                    "resolved_config" => changed.provenance.resolved_config_sha256.push('x'),
+                    "model" => changed.model_identity.d_model += 1,
+                    "executable" => changed.provenance.executable_sha256.push('x'),
+                    "source" => changed.provenance.build.git_sha = Some("different-commit".into()),
+                    _ => unreachable!(),
+                }
+                let error =
+                    bind_provenance_identity(&mut expected, provenance_identity(&changed).unwrap())
+                        .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "input/config/model/executable provenance drift",
+                    "{field}"
+                );
+                assert_eq!(expected, original, "{field}");
+            }
+        }
+
         #[test]
         fn p1r_u64_transport_and_duplicate_field_rejection() {
             let r = Record {
