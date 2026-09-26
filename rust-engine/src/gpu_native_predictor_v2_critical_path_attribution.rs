@@ -1799,10 +1799,12 @@ mod driver {
         errors: Vec<String>,
         diagnostic_evidence_valid: bool,
     }
-    fn source_identity() -> Result<Value> {
-        let build = crate::qualification::BuildProvenance::embedded();
-        evidence::validate_preflight_provenance(&build)?;
-        let commit = build.git_sha.as_deref().ok_or("missing source commit")?;
+    const TYPED_PROVENANCE_COMMIT: &str = "142436798cecc22e5a6ea7dce46c3aa59c5d20e1";
+    const TYPED_PROVENANCE_TREE: &str = "36f0b7d2d495dfb9bb3fb65ddb5b747526b3945b";
+    const ORIGINAL_P1R_COMMIT: &str = "c390bd4607e9108d8c63dc2e96f0aca9061741fc";
+    const FROZEN_P1Q3_COMMIT: &str = "a6b9cbcd6e6b576f90a1d875c9351c7276c950e2";
+
+    fn source_commit_metadata(commit: &str) -> Result<String> {
         let output = std::process::Command::new("git")
             .args(["show", "-s", "--format=%H%n%T%n%P", commit])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -1810,14 +1812,51 @@ mod driver {
         if !output.status.success() {
             return Err("source lineage unavailable".into());
         }
-        let line = String::from_utf8(output.stdout)?;
-        let fields: Vec<_> = line.lines().collect();
-        if fields.len() != 3
-            || fields[0] != commit
-            || fields[2] != "a6b9cbcd6e6b576f90a1d875c9351c7276c950e2"
-        {
-            return Err("P1R must be exactly one child of the frozen P1Q3 base".into());
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn validate_corrected_source_lineage(
+        commit: &str,
+        fields: &[&str],
+        typed_provenance: &[&str],
+        original_p1r: &[&str],
+    ) -> Result<()> {
+        if fields.len() != 3 || fields[0] != commit || fields[2] != TYPED_PROVENANCE_COMMIT {
+            return Err("P1R must be exactly one child of the typed-provenance fix".into());
         }
+        // Compare the complete %P field: an additional merge parent must fail.
+        if typed_provenance
+            != [
+                TYPED_PROVENANCE_COMMIT,
+                TYPED_PROVENANCE_TREE,
+                ORIGINAL_P1R_COMMIT,
+            ]
+        {
+            return Err("P1R typed-provenance fix lineage mismatch".into());
+        }
+        if original_p1r.len() != 3
+            || original_p1r[0] != ORIGINAL_P1R_COMMIT
+            || original_p1r[2] != FROZEN_P1Q3_COMMIT
+        {
+            return Err("original P1R must be exactly one child of the frozen P1Q3 base".into());
+        }
+        Ok(())
+    }
+
+    fn source_identity() -> Result<Value> {
+        let build = crate::qualification::BuildProvenance::embedded();
+        evidence::validate_preflight_provenance(&build)?;
+        let commit = build.git_sha.as_deref().ok_or("missing source commit")?;
+        let line = source_commit_metadata(commit)?;
+        let fields: Vec<_> = line.lines().collect();
+        let typed_provenance = source_commit_metadata(TYPED_PROVENANCE_COMMIT)?;
+        let original_p1r = source_commit_metadata(ORIGINAL_P1R_COMMIT)?;
+        validate_corrected_source_lineage(
+            commit,
+            &fields,
+            &typed_provenance.lines().collect::<Vec<_>>(),
+            &original_p1r.lines().collect::<Vec<_>>(),
+        )?;
         Ok(
             json!({"commit":fields[0],"tree":fields[1],"parent":fields[2],"files":{
                 "gpu_native_predictor_v2_critical_path_attribution.rs":crate::greedy_parity::sha256_hex(include_bytes!("gpu_native_predictor_v2_critical_path_attribution.rs")),
@@ -3646,6 +3685,146 @@ mod driver {
             });
             assert!(attribute(&c, &t).is_err());
         }
+        fn corrected_lineage_fixture() -> [[&'static str; 3]; 3] {
+            [
+                [
+                    "0123456789abcdef0123456789abcdef01234567",
+                    "89abcdef0123456789abcdef0123456789abcdef",
+                    "142436798cecc22e5a6ea7dce46c3aa59c5d20e1",
+                ],
+                [
+                    "142436798cecc22e5a6ea7dce46c3aa59c5d20e1",
+                    "36f0b7d2d495dfb9bb3fb65ddb5b747526b3945b",
+                    "c390bd4607e9108d8c63dc2e96f0aca9061741fc",
+                ],
+                [
+                    "c390bd4607e9108d8c63dc2e96f0aca9061741fc",
+                    "5543475e0f256680277de353bd37fb32c4535817",
+                    "a6b9cbcd6e6b576f90a1d875c9351c7276c950e2",
+                ],
+            ]
+        }
+
+        #[test]
+        fn p1r_corrected_lineage_exact_chain_passes() {
+            let [candidate, typed, original] = corrected_lineage_fixture();
+            // Read the same pinned Git objects as production, without building
+            // a runtime or mutating Git state to manufacture a candidate.
+            let typed_metadata = source_commit_metadata(TYPED_PROVENANCE_COMMIT).unwrap();
+            let original_metadata = source_commit_metadata(ORIGINAL_P1R_COMMIT).unwrap();
+            let typed_fields = typed_metadata.lines().collect::<Vec<_>>();
+            let original_fields = original_metadata.lines().collect::<Vec<_>>();
+            assert_eq!(typed_fields, typed);
+            assert_eq!(original_fields, original);
+            validate_corrected_source_lineage(
+                candidate[0],
+                &candidate,
+                &typed_fields,
+                &original_fields,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn p1r_corrected_lineage_wrong_immediate_parent_fails() {
+            let [mut candidate, typed, original] = corrected_lineage_fixture();
+            for parent in [
+                ORIGINAL_P1R_COMMIT,
+                FROZEN_P1Q3_COMMIT,
+                "",
+                "142436798cecc22e5a6ea7dce46c3aa59c5d20e1 c390bd4607e9108d8c63dc2e96f0aca9061741fc",
+            ] {
+                candidate[2] = parent;
+                assert!(
+                    validate_corrected_source_lineage(candidate[0], &candidate, &typed, &original)
+                        .is_err(),
+                    "{parent}"
+                );
+            }
+        }
+
+        #[test]
+        fn p1r_corrected_lineage_wrong_typed_parent_tree_fails() {
+            let [candidate, mut typed, original] = corrected_lineage_fixture();
+            typed[1] = original[1];
+            assert!(
+                validate_corrected_source_lineage(candidate[0], &candidate, &typed, &original)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn p1r_corrected_lineage_wrong_typed_parent_ancestry_fails() {
+            let [candidate, mut typed, original] = corrected_lineage_fixture();
+            for parent in [
+                FROZEN_P1Q3_COMMIT,
+                "",
+                "c390bd4607e9108d8c63dc2e96f0aca9061741fc a6b9cbcd6e6b576f90a1d875c9351c7276c950e2",
+            ] {
+                typed[2] = parent;
+                assert!(
+                    validate_corrected_source_lineage(candidate[0], &candidate, &typed, &original)
+                        .is_err(),
+                    "{parent}"
+                );
+            }
+        }
+
+        #[test]
+        fn p1r_corrected_lineage_wrong_original_p1r_ancestry_fails() {
+            let [candidate, typed, mut original] = corrected_lineage_fixture();
+            for parent in [
+                TYPED_PROVENANCE_COMMIT,
+                "",
+                "a6b9cbcd6e6b576f90a1d875c9351c7276c950e2 d858dc338dcf7a90acd7cedc2cb41235721bb67a",
+            ] {
+                original[2] = parent;
+                assert!(
+                    validate_corrected_source_lineage(candidate[0], &candidate, &typed, &original)
+                        .is_err(),
+                    "{parent}"
+                );
+            }
+        }
+
+        #[test]
+        fn p1r_corrected_lineage_wrong_commit_or_malformed_metadata_fails() {
+            let chain = corrected_lineage_fixture();
+            for index in 0..chain.len() {
+                let mut changed = chain;
+                changed[index][0] = "wrong-commit";
+                assert!(validate_corrected_source_lineage(
+                    chain[0][0],
+                    &changed[0],
+                    &changed[1],
+                    &changed[2]
+                )
+                .is_err());
+                for len in 0..3 {
+                    let mut fields = chain.iter().map(|f| f.as_slice()).collect::<Vec<_>>();
+                    fields[index] = &chain[index][..len];
+                    assert!(validate_corrected_source_lineage(
+                        chain[0][0],
+                        fields[0],
+                        fields[1],
+                        fields[2]
+                    )
+                    .is_err());
+                }
+                let mut extra = chain[index].to_vec();
+                extra.push("unexpected-field");
+                let mut fields = chain.iter().map(|f| f.as_slice()).collect::<Vec<_>>();
+                fields[index] = &extra;
+                assert!(validate_corrected_source_lineage(
+                    chain[0][0],
+                    fields[0],
+                    fields[1],
+                    fields[2]
+                )
+                .is_err());
+            }
+        }
+
         fn provenance_fixture() -> ArmProvenance {
             let mut production_configuration = evidence::ProductionConfiguration::default();
             production_configuration
