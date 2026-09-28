@@ -14,6 +14,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import ExitStack
+from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -26,6 +27,30 @@ from .supervisor import (FutureBackend, Supervisor, parent_argv, plan,
 from .test_p1v import (FakeReader, PipelineFake, adapter_fixture, closure_fixture,
                       confinement_fixture, encode_raw, fake_content,
                       launch_fixture, raw_fixture, receipts)
+
+
+PROTECTED_P1V_FILES = {
+    "__init__.py": "6d7e816042d9bce309517688772e2c3f9bbe32d376781ad3af81da065553e1cf",
+    "content_hasher.py": "4dae50fa88fa151e03626be8b4cb552fae4c268d523d7110c64070eb194e5ca7",
+    "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
+    "supervisor.py": "e33a9acd5f643df96420e82a31fea81368f6067ed26ed822e76f1b665ad3dce3",
+    "test_p1v.py": "946241bdafff633c1c48c54832105cea2d5305fce330d0ca16570fbf46b28bbd",
+    "linux_backend.py": "de0af25c587007aba5db58f27a811a3f193d54735560e743d202f74a4bb1bf45",
+}
+REQUIRED_P1V_FILES = frozenset(PROTECTED_P1V_FILES) | {"test_linux_backend.py"}
+OPTIONAL_P1V5_FILES = frozenset({"live_system.py", "test_live_system.py",
+                                 "linux_gate.py", "test_linux_gate.py"})
+
+
+def assert_package_scope(test, root):
+    """Shared real/fixture witness: #221 permits only frozen #217 successors."""
+    actual = {p.name for p in root.iterdir() if p.is_file()}
+    test.assertLessEqual(REQUIRED_P1V_FILES, actual, "missing required regular files")
+    test.assertLessEqual(actual, REQUIRED_P1V_FILES | OPTIONAL_P1V5_FILES,
+                         "unauthorized regular files")
+    for name, expected in PROTECTED_P1V_FILES.items():
+        test.assertEqual(digest((root / name).read_bytes()), expected,
+                         "protected SHA256: " + name)
 
 
 class FixtureSystem:
@@ -1070,19 +1095,7 @@ class RlimitCompatibilityTests(unittest.TestCase):
                 self.assertNotIn(ast.unparse(node.args[0]), ("resource", "resource_module"))
 
     def test_two_path_p1v_scope_preserves_all_other_files(self):
-        protected = {
-            "__init__.py": "6d7e816042d9bce309517688772e2c3f9bbe32d376781ad3af81da065553e1cf",
-            "content_hasher.py": "4dae50fa88fa151e03626be8b4cb552fae4c268d523d7110c64070eb194e5ca7",
-            "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
-            "supervisor.py": "e33a9acd5f643df96420e82a31fea81368f6067ed26ed822e76f1b665ad3dce3",
-            "test_p1v.py": "946241bdafff633c1c48c54832105cea2d5305fce330d0ca16570fbf46b28bbd",
-        }
-        root = Path(lb.__file__).parent
-        self.assertEqual({p.name for p in root.iterdir() if p.is_file()},
-                         set(protected) | {"linux_backend.py", "test_linux_backend.py"})
-        for name, expected in protected.items():
-            with self.subTest(path=name):
-                self.assertEqual(digest((root / name).read_bytes()), expected)
+        assert_package_scope(self, Path(lb.__file__).parent)
 
     def test_220_rejected_on_grant_recheck_and_live_receipt(self):
         token = b"synthetic legacy seam only" * 2
@@ -1117,6 +1130,95 @@ class RlimitCompatibilityTests(unittest.TestCase):
         lb.ExecutionGrant.check(stored, authorization, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             lb.require_adapter_grant(authorization, stored, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
+
+
+class PackageScopeWitnessTests(unittest.TestCase):
+    """Package expansion is synthetic; no successor is created in the checkout."""
+
+    def package_fixture(self, successors=()):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        source = Path(lb.__file__).parent
+        for name in REQUIRED_P1V_FILES:
+            (root / name).write_bytes((source / name).read_bytes())
+        for name in successors:
+            (root / name).write_bytes(b"# Synthetic package-scope fixture only.\n")
+        return root
+
+    def test_baseline_seven_files_pass_without_optional_successors(self):
+        root = self.package_fixture()
+        self.assertEqual({p.name for p in root.iterdir()}, REQUIRED_P1V_FILES)
+        self.assertEqual(len(REQUIRED_P1V_FILES), 7)
+        self.assertFalse(any((root / name).exists() for name in OPTIONAL_P1V5_FILES))
+        assert_package_scope(self, root)
+
+    def test_each_authorized_successor_individually_passes(self):
+        for name in sorted(OPTIONAL_P1V5_FILES):
+            with self.subTest(successor=name):
+                assert_package_scope(self, self.package_fixture((name,)))
+
+    def test_all_four_authorized_successors_together_pass(self):
+        root = self.package_fixture(OPTIONAL_P1V5_FILES)
+        self.assertEqual(len(list(root.iterdir())), 11)
+        assert_package_scope(self, root)
+
+    def test_all_sixteen_optional_successor_subsets_pass(self):
+        successors = sorted(OPTIONAL_P1V5_FILES)
+        checked = 0
+        for count in range(len(successors) + 1):
+            for subset in combinations(successors, count):
+                with self.subTest(successors=subset):
+                    assert_package_scope(self, self.package_fixture(subset))
+                checked += 1
+        self.assertEqual(checked, 16)
+
+    def test_unknown_hidden_backup_and_generated_regular_files_rejected(self):
+        for name in ("unrelated.py", "README.txt", ".hidden", ".hidden.py",
+                     "linux_backend.py.bak", "test_linux_backend.py~", "generated.pyc"):
+            with self.subTest(filename=name):
+                root = self.package_fixture(OPTIONAL_P1V5_FILES)
+                (root / name).write_bytes(b"unauthorized")
+                with self.assertRaisesRegex(AssertionError, "unauthorized regular files"):
+                    assert_package_scope(self, root)
+
+    def test_typo_and_alternate_successor_names_rejected(self):
+        for name in ("live_systen.py", "test_live_systen.py", "linux_gates.py",
+                     "test_linux_gates.py", "Live_system.py", "linux_gate.py.bak"):
+            with self.subTest(filename=name):
+                root = self.package_fixture((name,))
+                with self.assertRaisesRegex(AssertionError, "unauthorized regular files"):
+                    assert_package_scope(self, root)
+
+    def test_deleting_each_required_file_rejected_even_with_all_successors(self):
+        for name in sorted(REQUIRED_P1V_FILES):
+            with self.subTest(filename=name):
+                root = self.package_fixture(OPTIONAL_P1V5_FILES)
+                (root / name).unlink()
+                with self.assertRaisesRegex(AssertionError, "missing required regular files"):
+                    assert_package_scope(self, root)
+
+    def test_required_filename_as_directory_does_not_satisfy_witness(self):
+        root = self.package_fixture()
+        (root / "test_linux_backend.py").unlink()
+        (root / "test_linux_backend.py").mkdir()
+        with self.assertRaisesRegex(AssertionError, "missing required regular files"):
+            assert_package_scope(self, root)
+
+    def test_each_protected_file_mutation_fails_its_hash_check(self):
+        self.assertEqual(len(PROTECTED_P1V_FILES), 6)
+        for name in sorted(PROTECTED_P1V_FILES):
+            with self.subTest(filename=name):
+                root = self.package_fixture(OPTIONAL_P1V5_FILES)
+                path = root / name
+                path.write_bytes(path.read_bytes() + b"\n# synthetic mutation\n")
+                with self.assertRaisesRegex(AssertionError, "protected SHA256: " + name):
+                    assert_package_scope(self, root)
+
+    def test_authorized_witness_does_not_pin_its_own_bytes(self):
+        root = self.package_fixture()
+        (root / "test_linux_backend.py").write_bytes(b"# Authorized witness change.\n")
+        assert_package_scope(self, root)
 
 
 if __name__ == "__main__":
