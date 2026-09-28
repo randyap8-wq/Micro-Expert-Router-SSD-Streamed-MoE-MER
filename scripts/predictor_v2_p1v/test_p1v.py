@@ -27,7 +27,7 @@ from .offline_verify import (ATTEMPT_STRIDE, CAPACITY, EVENTS, LAUNCH_FIELDS,
                              Trace, classify, opportunities, readiness,
                              semantic, slot, verify_reports, verify_sealed)
 from .supervisor import (ALIAS_PARENT, HASH_WINDOW, FakeBackend, FutureBackend,
-                         Supervisor, main, parent_argv, plan, validate_enforcement)
+                         Supervisor, main, parent_argv, plan, receipt_gate, validate_enforcement)
 
 
 class FakeReader:
@@ -399,9 +399,11 @@ def receipts(raw, content):
     result["SHUTDOWN"].update(recursive_populated=0, unexpected_child_groups=[])
     result["FILESYSTEM_RO"].update(syncfs_checked=True, mount_ro=True)
     for name in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW", "FILESYSTEM_RW"):
-        result[name].update(device_identity=copy.deepcopy(device_identity), private_mount_id=200, healthy=True, journal_clean=True)
-    for name in ("PROTECTED", "REVALIDATE"):
-        result[name].update(mount_ro=True, superblock_ro=True)
+        result[name].update(device_identity=copy.deepcopy(device_identity), private_mount_id=200,
+                            healthy=True, external_journal=False)
+    for name in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW"):
+        result[name].update(mount_ro=True, superblock_ro=True, recovery_required=False, journal_clean=True)
+    result["FILESYSTEM_RW"].update(recovery_required=True)
     return result
 
 
@@ -441,6 +443,60 @@ class FixtureTests(unittest.TestCase):
 
 
 class SupervisorTests(FixtureTests):
+    def test_phase_receipts_accept_quiesced_ro_and_active_rw(self):
+        fixture = receipts(self.raw, self.content)
+        for action in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW", "FILESYSTEM_RW"):
+            with self.subTest(action=action):
+                receipt_gate(action, fixture[action], {"receipts": fixture})
+        self.assertNotIn("journal_clean", fixture["FILESYSTEM_RW"])
+        self.assertIs(fixture["FILESYSTEM_RW"]["recovery_required"], True)
+
+    def test_each_quiesced_receipt_rejects_missing_wrong_or_nonboolean_phase_fields(self):
+        fixture = receipts(self.raw, self.content)
+        for action in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW"):
+            for key, good in (("healthy", True), ("external_journal", False),
+                              ("recovery_required", False), ("journal_clean", True),
+                              ("mount_ro", True), ("superblock_ro", True)):
+                for value in (not good, int(good), None, str(good)):
+                    bad = copy.deepcopy(fixture[action])
+                    bad[key] = value
+                    with self.subTest(action=action, key=key, value=value), self.assertRaises(InvalidEvidence):
+                        receipt_gate(action, bad, {"receipts": fixture})
+                bad = copy.deepcopy(fixture[action])
+                del bad[key]
+                with self.subTest(action=action, missing=key), self.assertRaises((InvalidEvidence, KeyError)):
+                    receipt_gate(action, bad, {"receipts": fixture})
+
+    def test_restored_rw_receipt_requires_active_journal_and_rejects_clean_field(self):
+        fixture = receipts(self.raw, self.content)
+        for key, good in (("healthy", True), ("external_journal", False), ("recovery_required", True),
+                          ("filesystem_rw", True), ("device_rw", True)):
+            for value in (not good, int(good), None, str(good)):
+                bad = copy.deepcopy(fixture["FILESYSTEM_RW"])
+                bad[key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(InvalidEvidence):
+                    receipt_gate("FILESYSTEM_RW", bad, {"receipts": fixture})
+            bad = copy.deepcopy(fixture["FILESYSTEM_RW"])
+            del bad[key]
+            with self.subTest(missing=key), self.assertRaises((InvalidEvidence, KeyError)):
+                receipt_gate("FILESYSTEM_RW", bad, {"receipts": fixture})
+        for value in (True, False, None, 0, "true"):
+            bad = dict(fixture["FILESYSTEM_RW"], journal_clean=value)
+            with self.subTest(journal_clean=value), self.assertRaises(InvalidEvidence):
+                receipt_gate("FILESYSTEM_RW", bad, {"receipts": fixture})
+
+    def test_all_phase_receipts_reject_device_uuid_and_private_mount_drift(self):
+        fixture = receipts(self.raw, self.content)
+        for action in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW", "FILESYSTEM_RW"):
+            for key in fixture[action]["device_identity"]:
+                bad = copy.deepcopy(fixture[action])
+                bad["device_identity"][key] = "drift"
+                with self.subTest(action=action, identity=key), self.assertRaises(InvalidEvidence):
+                    receipt_gate(action, bad, {"receipts": fixture})
+            bad = dict(fixture[action], private_mount_id=999)
+            with self.subTest(action=action, identity="private_mount_id"), self.assertRaises(InvalidEvidence):
+                receipt_gate(action, bad, {"receipts": fixture})
+
     def test_exact_happy_order_and_seal(self):
         backend = self.backend()
         result = self.run_backend(backend)

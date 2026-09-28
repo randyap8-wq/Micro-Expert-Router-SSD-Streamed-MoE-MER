@@ -1,7 +1,7 @@
 """P1V4 Linux adapter, with injected host observations and syscall interfaces.
 
-#216/#218/#220 authorize implementation, never execution. Nothing happens on import.
-Live integration needs an externally reviewed >220 grant, a complete baseline,
+#216/#218/#220/#222 authorize implementation, never execution. Nothing happens on import.
+Live integration needs an externally reviewed >222 grant, a complete baseline,
 root-controlled evidence backing and pinned inspection/process dependencies.
 The trusted runtime premise excludes hostile namespace substitution; it does
 not assert that unprivileged namespace syscalls are universally denied.
@@ -205,7 +205,7 @@ class ExecutionGrant:
     """
     def __init__(self, scope, expected_scope_sha256, token, expected_token_sha256):
         exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256"), "grant scope")
-        require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 220, "execution authority must follow #220")
+        require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 222, "execution authority must follow #222")
         require(type(scope["host_id"]) is str and scope["host_id"], "grant host")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "explicit full operation scope")
@@ -223,7 +223,7 @@ class ExecutionGrant:
         from . import strict_json
         require_future(authorization)
         scope = strict_json(self._scope)
-        require(authorization.issue == scope["authority_issue"] and authorization.issue > 220,
+        require(authorization.issue == scope["authority_issue"] and authorization.issue > 222,
                 "both authorities must identify the same future issue")
         require(scope["host_id"] == host_id and scope["attempt"] == attempt
                 and scope["adapter_manifest_sha256"] == digest(canonical_json(manifest))
@@ -389,15 +389,30 @@ class LinuxBackend(FutureBackend):
         require(not self.running, "adapter observation forbidden while P1R parent runs")
         return copy.deepcopy(self.system.observe(topic))
 
-    def _backing_check(self, snapshot):
+    def _identity_health_check(self, snapshot):
         require(snapshot["device_identity"] == self.backing["identity"], "retained device identity drift")
         require(snapshot["private_mount_id"] == self.backing["private_mount_id"], "private mount identity drift")
-        require(snapshot["healthy"] is True and snapshot["journal_clean"] is True, "filesystem health/journal uncertain")
+        require(snapshot["healthy"] is True and snapshot["external_journal"] is False,
+                "filesystem health/internal journal uncertain")
+
+    def _quiesced_ro_check(self, snapshot):
+        """RO_QUIESCED_CLEAN exists only after the normal ext4 RO remount."""
+        self._identity_health_check(snapshot)
+        require(snapshot["recovery_required"] is False and snapshot["journal_clean"] is True,
+                "RO quiesced journal uncertain")
+        require(snapshot["mount_ro"] is True and snapshot["superblock_ro"] is True,
+                "mount and superblock RO required")
+
+    def _restored_rw_check(self, snapshot):
+        """RW_RESTORED_ACTIVE has an active internal journal, not an RO certificate."""
+        self._identity_health_check(snapshot)
+        require(snapshot["recovery_required"] is True and "journal_clean" not in snapshot,
+                "restored active RW journal uncertain")
 
     def _protected(self):
         r = self._observe("protected")
         protection(r)
-        self._backing_check(r)
+        self._quiesced_ro_check(r)
         require(r["mount_ro"] is True and r["superblock_ro"] is True, "mount and superblock RO required")
         require(self.system.block_get(self.backing["device_fd"]) == 1, "protected device readback")
         return r
@@ -482,20 +497,25 @@ class LinuxBackend(FutureBackend):
         if name == "FILESYSTEM_RO":
             s.syncfs(self.backing["filesystem_fd"])
             health = self._observe("sync_health")
-            require(health == {"syncfs_ok": True, "journal_clean": True, "healthy": True}, "sync/journal uncertainty")
+            # PRE_RO_SYNCED_ACTIVE: syncfs is synchronization, not journal-empty proof.
+            exact_keys(health, ("syncfs_ok", "healthy", "external_journal", "recovery_required"),
+                       "pre-RO sync receipt must not assert journal_clean")
+            require(health["syncfs_ok"] is True and health["healthy"] is True
+                    and health["external_journal"] is False and health["recovery_required"] is True,
+                    "pre-RO synced active journal uncertain")
             s.mount(None, MOUNT, "ext4", self.backing["mount_flags"] | MS_REMOUNT | MS_RDONLY, self.backing["mount_data"])
             r = self._observe("filesystem_ro")
-            self._backing_check(r)
+            self._quiesced_ro_check(r)
             require(r["mount_ro"] is True and s.block_get(self.backing["device_fd"]) == 0, "FS/device transition order")
             return r
         if name == "DEVICE_RO":
             r = self._observe("filesystem_ro")
-            self._backing_check(r)
+            self._quiesced_ro_check(r)
             require(r["superblock_ro"] is True and r["mount_ro"] is True, "superblock RO prerequisite")
             s.block_ro(self.backing["device_fd"], True)
             require(s.block_get(self.backing["device_fd"]) == 1, "BLKROSET RO readback failed")
             r = self._observe("device_ro")
-            self._backing_check(r)
+            self._quiesced_ro_check(r)
             return r
         if name in ("PROTECTED", "REVALIDATE"):
             return self._protected()
@@ -572,16 +592,16 @@ class LinuxBackend(FutureBackend):
             s.block_ro(self.backing["device_fd"], False)
             require(s.block_get(self.backing["device_fd"]) == 0, "BLKROSET RW readback failed")
             r = self._observe("device_rw")
-            self._backing_check(r)
+            self._quiesced_ro_check(r)
             return r
         if name == "FILESYSTEM_RW":
             r = self._observe("device_rw")
-            self._backing_check(r)
+            self._quiesced_ro_check(r)
             require(r["filesystem_still_ro"] is True and s.block_get(self.backing["device_fd"]) == 0,
                     "device-rw/FS-ro prerequisite")
             s.mount(None, MOUNT, "ext4", self.backing["mount_flags"] | MS_REMOUNT, self.backing["mount_data"])
             r = self._observe("filesystem_rw")
-            self._backing_check(r)
+            self._restored_rw_check(r)
             return r
         if name == "RESTORATION_SEAL":
             data = {"evidence_seal_sha256": before["SEAL"]["sha256"],
@@ -1023,7 +1043,7 @@ def validate_execution_scope(receipt, evidence):
         require(scope == {"status": "NOT_GRANTED"}, "portable evidence must not possess live grant")
         return
     exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256"), "live scope coverage")
-    require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 220, "live grant must postdate implementation")
+    require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 222, "live grant must postdate implementation")
     require(scope["host_id"] == receipt["host_id"] and scope["attempt"] == evidence["attempt"]
             and scope["operations"] == [a.name for a in plan(evidence["attempt"])]
             and scope["adapter_manifest_sha256"] == digest(canonical_json(receipt["adapter_manifest"])), "live grant evidence binding")

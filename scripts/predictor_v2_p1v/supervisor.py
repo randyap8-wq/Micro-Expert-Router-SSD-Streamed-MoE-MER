@@ -296,7 +296,14 @@ def receipt_gate(name, r, evidence):
     if name in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW", "FILESYSTEM_RW"):
         require(r["device_identity"] == previous["TOPOLOGY"]["device_identity"]
                 and r["private_mount_id"] == previous["NAMESPACE"]["private_mount_id"]
-                and r["healthy"] is True and r["journal_clean"] is True, "backing identity/health/readback drift")
+                and r["healthy"] is True and r["external_journal"] is False, "backing identity/health/readback drift")
+        if name == "FILESYSTEM_RW":
+            require(r["recovery_required"] is True and "journal_clean" not in r,
+                    "restored active RW journal uncertain")
+        else:
+            require(r["recovery_required"] is False and r["journal_clean"] is True
+                    and r["mount_ro"] is True and r["superblock_ro"] is True,
+                    "RO quiesced journal uncertain")
 
 
 class Supervisor:

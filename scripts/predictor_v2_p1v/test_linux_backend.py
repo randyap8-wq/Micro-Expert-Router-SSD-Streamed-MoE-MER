@@ -33,9 +33,9 @@ PROTECTED_P1V_FILES = {
     "__init__.py": "6d7e816042d9bce309517688772e2c3f9bbe32d376781ad3af81da065553e1cf",
     "content_hasher.py": "4dae50fa88fa151e03626be8b4cb552fae4c268d523d7110c64070eb194e5ca7",
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
-    "supervisor.py": "e33a9acd5f643df96420e82a31fea81368f6067ed26ed822e76f1b665ad3dce3",
-    "test_p1v.py": "946241bdafff633c1c48c54832105cea2d5305fce330d0ca16570fbf46b28bbd",
-    "linux_backend.py": "de0af25c587007aba5db58f27a811a3f193d54735560e743d202f74a4bb1bf45",
+    "supervisor.py": "e9127e5295d331daaf7cca062bc21b0fd4e2b9a628bc9368b305c0baf01ca344",
+    "test_p1v.py": "5eb76dc68c62919e2246ab5a55ada47bec73268e0965906a9a191bda626c31b6",
+    "linux_backend.py": "c2ed3699ec399fd6847ffcc1c2d8a44bd9a961a70799ef77b24a0c89fd2ee5a5",
 }
 REQUIRED_P1V_FILES = frozenset(PROTECTED_P1V_FILES) | {"test_linux_backend.py"}
 OPTIONAL_P1V5_FILES = frozenset({"live_system.py", "test_live_system.py",
@@ -82,7 +82,7 @@ class FixtureSystem:
             "alias_ro": {**self.receipts["ALIAS_RO"], "preserved_flags": 1024,
                          "canonical_target": lb.CANONICAL, "output_still_rw": True},
             "metadata": self.receipts["METADATA"],
-            "sync_health": {"syncfs_ok": True, "journal_clean": True, "healthy": True},
+            "sync_health": {"syncfs_ok": True, "healthy": True, "external_journal": False, "recovery_required": True},
             "filesystem_ro": {**self.receipts["FILESYSTEM_RO"], "mount_ro": True},
             "device_ro": self.receipts["DEVICE_RO"], "protected": self.receipts["PROTECTED"],
             "cgroup_preflight": {"baseline": launch_fixture()["resource_domain"],
@@ -95,7 +95,7 @@ class FixtureSystem:
         }
         for key in ("filesystem_ro", "device_ro", "protected", "device_rw", "filesystem_rw"):
             self.observations[key].update(device_identity=self.backing["identity"].copy(), private_mount_id=200,
-                                          healthy=True, journal_clean=True)
+                                          healthy=True, external_journal=False)
 
     def call(self, name, *args):
         if self.running:
@@ -184,6 +184,163 @@ class AdapterTests(unittest.TestCase):
 
     def run_backend(self, backend):
         return Supervisor(backend, "p1v-fixture").run()
+
+    def phase_failure(self, action, topic, changes, absent=()):
+        """Inject one observation at the named phase, after earlier gates passed."""
+        backend = self.make()
+        original = backend.system.observe
+
+        def observe(name):
+            snapshot = original(name)
+            if name == topic and plan()[len(backend.done)].name == action:
+                snapshot.update(changes)
+                for key in absent:
+                    del snapshot[key]
+            return snapshot
+
+        backend.system.observe = observe
+        result = self.run_backend(backend)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["failure"]["action"], action)
+        self.assertTrue(backend.failed)
+        self.assertNotIn(action, backend.done)
+        self.assertNotIn("RELEASE", backend.done)
+        return backend
+
+    def pre_ro_failure(self, changes, absent=()):
+        backend = self.phase_failure("FILESYSTEM_RO", "sync_health", changes, absent)
+        self.assertEqual(backend.system.calls[-1], ("observe:sync_health",))
+        self.assertFalse(any(c[0] == "mount" and c[2] == lb.MOUNT for c in backend.system.calls))
+        self.assertFalse(any(c[0] == "block_ro" for c in backend.system.calls))
+        self.assertEqual(backend.created_readers, [])
+
+    def test_pre_ro_synced_active_without_journal_clean_passes_in_order(self):
+        backend = self.make()
+        self.assertEqual(backend.system.observations["sync_health"], {
+            "syncfs_ok": True, "healthy": True, "external_journal": False, "recovery_required": True})
+        result = self.run_backend(backend)
+        self.assertEqual(result["status"], "PASS_SIMULATION", result.get("failure"))
+        calls = backend.system.calls
+        start = calls.index(("syncfs", 41))
+        self.assertEqual(calls[start:start + 4], [
+            ("syncfs", 41), ("observe:sync_health",),
+            ("mount", None, lb.MOUNT, "ext4", 1024 | lb.MS_REMOUNT | lb.MS_RDONLY,
+             "synthetic-original-ext4-options"), ("observe:filesystem_ro",)])
+
+    def test_pre_ro_sync_failure_rejects_before_remount(self):
+        self.pre_ro_failure({"syncfs_ok": False})
+        backend = self.make()
+        backend.system.fail = "syncfs"
+        result = self.run_backend(backend)
+        self.assertEqual(result["failure"]["action"], "FILESYSTEM_RO")
+        self.assertEqual(backend.system.calls[-1], ("syncfs", 41))
+        self.assertNotIn(("observe:sync_health",), backend.system.calls)
+
+    def test_pre_ro_health_failure_rejects_before_remount(self):
+        self.pre_ro_failure({"healthy": False})
+
+    def test_pre_ro_external_journal_rejects_before_remount(self):
+        self.pre_ro_failure({"external_journal": True})
+
+    def test_pre_ro_recovery_clear_rejects_before_remount(self):
+        self.pre_ro_failure({"recovery_required": False})
+
+    def test_pre_ro_fabricated_journal_clean_field_rejects(self):
+        for value in (True, False, None, 1, "true"):
+            with self.subTest(value=value):
+                self.pre_ro_failure({"journal_clean": value})
+
+    def test_pre_ro_fields_are_required_strict_booleans(self):
+        for key in ("syncfs_ok", "healthy", "external_journal", "recovery_required"):
+            with self.subTest(missing=key):
+                self.pre_ro_failure({}, (key,))
+            for value in (0, 1, None, "true"):
+                with self.subTest(key=key, value=value):
+                    self.pre_ro_failure({key: value})
+
+    def test_ro_remount_success_with_recovery_still_set_rejects(self):
+        # Model ext4 reconfigure returning successfully despite a failed recovery
+        # completion. RO flags and syncfs success cannot replace the clear bit.
+        backend = self.phase_failure("FILESYSTEM_RO", "filesystem_ro", {"recovery_required": True})
+        self.assertEqual(backend.system.calls[-1], ("observe:filesystem_ro",))
+        self.assertFalse(any(c[0] == "block_ro" for c in backend.system.calls))
+
+    def test_ro_remount_unclean_journal_rejects(self):
+        backend = self.phase_failure("FILESYSTEM_RO", "filesystem_ro", {"journal_clean": False})
+        self.assertFalse(any(c[0] == "block_ro" for c in backend.system.calls))
+
+    def test_quiesced_phases_and_restored_active_rw_pass(self):
+        backend = self.make()
+        result = self.run_backend(backend)
+        self.assertEqual(result["status"], "PASS_SIMULATION", result.get("failure"))
+        for action in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW"):
+            r = result["receipts"][action]
+            self.assertIs(r["recovery_required"], False)
+            self.assertIs(r["journal_clean"], True)
+            self.assertIs(r["external_journal"], False)
+            self.assertIs(r["healthy"], True)
+            self.assertIs(r["mount_ro"], True)
+            self.assertIs(r["superblock_ro"], True)
+        rw = result["receipts"]["FILESYSTEM_RW"]
+        self.assertIs(rw["filesystem_rw"], True)
+        self.assertIs(rw["device_rw"], True)
+        self.assertIs(rw["healthy"], True)
+        self.assertIs(rw["external_journal"], False)
+        self.assertIs(rw["recovery_required"], True)
+        self.assertNotIn("journal_clean", rw)
+        self.assertEqual(backend.done[-5:], ["SEAL", "DEVICE_RW", "FILESYSTEM_RW", "RESTORATION_SEAL", "RELEASE"])
+        restoration = strict_json((backend.journal.root / "restoration.json").read_bytes())
+        self.assertIs(restoration["device"]["journal_clean"], True)
+        self.assertNotIn("journal_clean", restoration["filesystem"])
+
+    def test_device_ro_requires_quiescence_before_block_ro(self):
+        for key, value in (("recovery_required", True), ("journal_clean", False),
+                           ("mount_ro", False), ("superblock_ro", False)):
+            with self.subTest(key=key):
+                backend = self.phase_failure("DEVICE_RO", "filesystem_ro", {key: value})
+                self.assertFalse(any(c[0] == "block_ro" for c in backend.system.calls))
+
+    def test_every_quiesced_readback_requires_all_phase_fields(self):
+        for action, topic in (("FILESYSTEM_RO", "filesystem_ro"), ("DEVICE_RO", "device_ro"),
+                              ("PROTECTED", "protected"), ("REVALIDATE", "protected"),
+                              ("DEVICE_RW", "device_rw")):
+            for key, value in (("healthy", False), ("external_journal", True),
+                               ("recovery_required", True), ("journal_clean", False),
+                               ("mount_ro", False), ("superblock_ro", False),
+                               ("device_identity", {}), ("private_mount_id", 999)):
+                with self.subTest(action=action, key=key):
+                    self.phase_failure(action, topic, {key: value})
+                    self.phase_failure(action, topic, {}, (key,))
+
+    def test_device_rw_requires_quiescence_before_device_write_enable(self):
+        for key, value in (("recovery_required", True), ("journal_clean", False)):
+            with self.subTest(key=key):
+                backend = self.phase_failure("DEVICE_RW", "protected", {key: value})
+                self.assertNotIn(("block_ro", 40, False), backend.system.calls)
+
+    def test_filesystem_rw_requires_quiescence_before_rw_remount(self):
+        for key, value in (("recovery_required", True), ("journal_clean", False),
+                           ("mount_ro", False), ("superblock_ro", False)):
+            with self.subTest(key=key):
+                backend = self.phase_failure("FILESYSTEM_RW", "device_rw", {key: value})
+                self.assertFalse(any(c[0] == "mount" and c[2] == lb.MOUNT
+                                     and not c[4] & lb.MS_RDONLY for c in backend.system.calls))
+
+    def test_restored_rw_recovery_clear_rejects(self):
+        self.phase_failure("FILESYSTEM_RW", "filesystem_rw", {"recovery_required": False})
+
+    def test_restored_rw_any_journal_clean_field_rejects(self):
+        for value in (True, False, None, 1, "true"):
+            with self.subTest(value=value):
+                self.phase_failure("FILESYSTEM_RW", "filesystem_rw", {"journal_clean": value})
+
+    def test_restored_rw_requires_identity_health_and_internal_journal(self):
+        for key, value in (("healthy", False), ("external_journal", True),
+                           ("device_identity", {}), ("private_mount_id", 999),
+                           ("filesystem_rw", False), ("device_rw", False)):
+            with self.subTest(key=key):
+                self.phase_failure("FILESYSTEM_RW", "filesystem_rw", {key: value})
+                self.phase_failure("FILESYSTEM_RW", "filesystem_rw", {}, (key,))
 
     def test_full_adapter_seal_and_unchanged_classifier(self):
         backend = self.make()
@@ -450,7 +607,7 @@ class EnforcementTests(unittest.TestCase):
     def test_legacy_future_authority_never_enables_adapter(self):
         # Fake old-seam tokens do not constitute an adapter-specific live grant.
         token = b"synthetic legacy authorization only" * 2
-        for issue in (215, 216, 217, 218, 219, 220):
+        for issue in (215, 216, 217, 218, 219, 220, 221, 222):
             authorization = FutureAuthorization(token, digest(token), issue)
             with self.subTest(issue=issue), patch("os.open", side_effect=AssertionError("unauthorized open")):
                 with self.assertRaises(InvalidEvidence):
@@ -464,11 +621,11 @@ class EnforcementTests(unittest.TestCase):
 
     def test_implementation_grant_cannot_be_issued(self):
         token = b"synthetic implementation authority only" * 2
-        for issue in (215, 216, 217, 218, 219, 220):
+        for issue in (215, 216, 217, 218, 219, 220, 221, 222):
             scope = {"authority_issue": issue, "host_id": "synthetic", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64}
             # All supplied pins match: the issue boundary itself must reject.
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #220"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #222"):
                 lb.ExecutionGrant(scope, digest(canonical_json(scope)), token, digest(token))
 
     def test_import_no_effect_and_no_shell_or_native_invocation(self):
@@ -743,7 +900,7 @@ class MountAndScopeTests(unittest.TestCase):
 
     def test_later_grant_requires_scope_and_matching_external_token(self):
         # Deliberately invalid: this suite never creates a valid live grant.
-        scope = {"authority_issue": 221, "host_id": "synthetic", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 223, "host_id": "synthetic", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64}
         with self.assertRaisesRegex(InvalidEvidence, "external adapter grant required"):
             lb.ExecutionGrant(scope, digest(canonical_json(scope)), b"invalid" * 10, "0" * 64)
@@ -1100,7 +1257,7 @@ class RlimitCompatibilityTests(unittest.TestCase):
     def test_220_rejected_on_grant_recheck_and_live_receipt(self):
         token = b"synthetic legacy seam only" * 2
         manifest = adapter_fixture()
-        for issue in (219, 220):
+        for issue in (219, 220, 221, 222):
             authorization = FutureAuthorization(token, digest(token), issue)
             scope = {"authority_issue": issue, "host_id": "synthetic", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan()],
@@ -1116,17 +1273,17 @@ class RlimitCompatibilityTests(unittest.TestCase):
     def test_later_authorities_must_match_without_issuing_live_grant(self):
         token = b"synthetic legacy seam only" * 2
         manifest = adapter_fixture()
-        scope = {"authority_issue": 221, "host_id": "synthetic", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 223, "host_id": "synthetic", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan()],
                  "adapter_manifest_sha256": digest(canonical_json(manifest))}
         stored = SimpleNamespace(_scope=canonical_json(scope))
-        for issue in (220, 222):
+        for issue in (220, 221, 222, 224):
             with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "same future issue"):
                 lb.ExecutionGrant.check(stored, FutureAuthorization(token, digest(token), issue),
                                         "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
         # The pure unbound check accepts matching later scope; this fake receiver
         # still cannot pass require_adapter_grant's exact ExecutionGrant type gate.
-        authorization = FutureAuthorization(token, digest(token), 221)
+        authorization = FutureAuthorization(token, digest(token), 223)
         lb.ExecutionGrant.check(stored, authorization, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             lb.require_adapter_grant(authorization, stored, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
