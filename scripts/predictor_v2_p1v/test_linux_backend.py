@@ -1,7 +1,7 @@
 """Portable P1V4 validation: synthetic interfaces and temporary evidence only.
 
 No valid adapter execution grant is created anywhere in this suite. Native
-privileged entry points are tested only for rejection before any syscall.
+entry points use rejection tests or fake receivers with fully mocked syscalls.
 """
 
 import ast
@@ -422,7 +422,7 @@ class EnforcementTests(unittest.TestCase):
     def test_legacy_future_authority_never_enables_adapter(self):
         # Fake old-seam tokens do not constitute an adapter-specific live grant.
         token = b"synthetic legacy authorization only" * 2
-        for issue in (215, 216, 217):
+        for issue in (215, 216, 217, 218):
             authorization = FutureAuthorization(token, digest(token), issue)
             with self.subTest(issue=issue), patch("os.open", side_effect=AssertionError("unauthorized open")):
                 with self.assertRaises(InvalidEvidence):
@@ -430,14 +430,18 @@ class EnforcementTests(unittest.TestCase):
                 with self.assertRaises(InvalidEvidence):
                     lb.NativePrimitives(authorization, None, "host", "p1v-fixture", adapter_fixture(), lambda: "AUTHORITY")
                 with self.assertRaises(InvalidEvidence):
+                    lb.NativeProcesses(authorization, None, "host", "p1v-fixture", adapter_fixture())
+                with self.assertRaises(InvalidEvidence):
                     lb.DurableJournal("/not-used", "p1v-fixture", authorization=authorization)
 
     def test_implementation_grant_cannot_be_issued(self):
-        for issue in (215, 216):
+        token = b"synthetic implementation authority only" * 2
+        for issue in (215, 216, 217, 218):
             scope = {"authority_issue": issue, "host_id": "synthetic", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64}
-            with self.assertRaises(InvalidEvidence):
-                lb.ExecutionGrant(scope, digest(canonical_json(scope)), b"invalid" * 10, "0" * 64)
+            # All supplied pins match: the issue boundary itself must reject.
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #218"):
+                lb.ExecutionGrant(scope, digest(canonical_json(scope)), token, digest(token))
 
     def test_import_no_effect_and_no_shell_or_native_invocation(self):
         import ctypes
@@ -661,11 +665,8 @@ class AdditionalGateTests(unittest.TestCase):
             def apply_launch_credentials_and_close_fds(self, manifest):
                 self.calls.append(("credentials_fds", manifest))
 
-            def stop_self(self):
-                self.calls.append("stop")
-
-            def exec_parent(self, argv, environment):
-                self.calls.append(("exec_parent", argv, environment))
+            def stop_then_exec_parent(self, argv, manifest):
+                self.calls.append(("stop_then_exec_parent", argv, manifest))
                 raise Executed()
 
         processes = Processes()
@@ -674,8 +675,8 @@ class AdditionalGateTests(unittest.TestCase):
         with self.assertRaises(Executed):
             roles.prepare_stopped_child(parent_argv("p1v-fixture"), baseline.encoded, "synthetic")
         self.assertEqual(processes.calls, ["fork", ("membership", "synthetic"),
-                                          ("credentials_fds", baseline.encoded), "stop",
-                                          ("exec_parent", parent_argv("p1v-fixture"), launch_fixture()["environment"]["values"])])
+                                          ("credentials_fds", baseline.encoded),
+                                          ("stop_then_exec_parent", parent_argv("p1v-fixture"), baseline.encoded)])
 
 
 class MountAndScopeTests(unittest.TestCase):
@@ -714,7 +715,7 @@ class MountAndScopeTests(unittest.TestCase):
 
     def test_later_grant_requires_scope_and_matching_external_token(self):
         # Deliberately invalid: this suite never creates a valid live grant.
-        scope = {"authority_issue": 217, "host_id": "synthetic", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 219, "host_id": "synthetic", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64}
         with self.assertRaises(InvalidEvidence):
             lb.ExecutionGrant(scope, digest(canonical_json(scope)), b"invalid" * 10, "0" * 64)
@@ -723,6 +724,183 @@ class MountAndScopeTests(unittest.TestCase):
             del bad[key]
             with self.assertRaises(InvalidEvidence):
                 lb.ExecutionGrant(bad, "0" * 64, b"invalid" * 10, "0" * 64)
+
+
+class ReleaseExecBoundaryTests(unittest.TestCase):
+    """Exercise the resumed-child defect with syntax and synthetic call traces.
+
+    No NativeProcesses instance or live grant is constructed. The unbound
+    primitive receives a fake authorization interface; every OS call is mocked.
+    """
+    class Executed(BaseException):
+        pass
+
+    class PreparedChild:
+        def __init__(self, calls, deny=False):
+            self.attempt = "p1v-fixture"
+            self.context = (None, None, "synthetic", self.attempt, adapter_fixture())
+            self.calls, self.deny = calls, deny
+
+        def _check(self, action):
+            self.calls.append(("authorize", action))
+            if self.deny:
+                raise InvalidEvidence("synthetic denied authority")
+
+    @staticmethod
+    def method(owner, name):
+        tree = ast.parse(Path(lb.__file__).read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner)
+        return next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def test_native_stop_is_immediately_followed_by_only_direct_execve(self):
+        method = self.method("NativeProcesses", "stop_then_exec_parent")
+        stops = [i for i, n in enumerate(method.body)
+                 if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                 and ast.unparse(n.value.func) == "os.kill"]
+        self.assertEqual(len(stops), 1)
+        stop = stops[0]
+        self.assertEqual(ast.unparse(method.body[stop]), "os.kill(pid, signal.SIGSTOP)")
+        self.assertEqual(len(method.body[stop + 1:]), 1)
+        following = method.body[stop + 1]
+        self.assertEqual(ast.unparse(following), "os.execve(executable, argv, environment)")
+        self.assertEqual([ast.unparse(n.func) for n in ast.walk(following) if isinstance(n, ast.Call)],
+                         ["os.execve"])
+        self.assertTrue(all(isinstance(arg, ast.Name) for arg in following.value.args))
+        before = ast.unparse(ast.Module(body=method.body[:stop], type_ignores=[]))
+        for required in ('self._check(\'P1R_PARENT\')', 'import signal', 'parent_argv(self.attempt)',
+                         'LaunchManifest.parse', 'launch.sha256', "['launch_manifest_sha256']",
+                         "['environment']['values']", 'executable = argv[0]', 'pid = os.getpid()'):
+            self.assertIn(required, before)
+
+    def test_runtime_role_has_one_atomic_stop_exec_and_no_old_sequence(self):
+        method = self.method("ProcessRoles", "prepare_stopped_child")
+        child = next(n for n in method.body if isinstance(n, ast.If) and ast.unparse(n.test) == "pid == 0")
+        calls = [ast.unparse(n.value.func) for n in child.body if isinstance(n, ast.Expr)]
+        self.assertEqual(calls, ['self.processes.enter_cgroup',
+                                 'self.processes.apply_launch_credentials_and_close_fds',
+                                 'self.processes.stop_then_exec_parent'])
+        self.assertNotIn('stop_self', ast.unparse(child))
+        tree = ast.parse(Path(lb.__file__).read_text())
+        self.assertFalse(any(isinstance(n, ast.FunctionDef) and n.name == 'exec_parent' for n in ast.walk(tree)))
+        self.assertFalse(any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                             and n.func.attr == 'exec_parent' for n in ast.walk(tree)))
+        self.assertEqual(sum(isinstance(n, ast.Call) and ast.unparse(n.func) == 'os.execve'
+                             for n in ast.walk(tree)), 1)
+
+    def test_guardian_authorization_precedes_sigcont_then_single_waitpid(self):
+        method = self.method("NativeProcesses", "resume_wait_once")
+        release = next(i for i, n in enumerate(method.body)
+                       if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                       and ast.unparse(n.value.func) == 'os.kill')
+        self.assertEqual(ast.unparse(method.body[release]), 'os.kill(pid, signal.SIGCONT)')
+        wait = method.body[release + 1]
+        self.assertEqual(ast.unparse(wait.value), 'os.waitpid(pid, 0)')
+        self.assertEqual([ast.unparse(n.func) for n in ast.walk(wait) if isinstance(n, ast.Call)], ['os.waitpid'])
+        self.assertEqual(sum(isinstance(n, ast.Call) and ast.unparse(n.func) == 'os.waitpid'
+                             for n in ast.walk(method)), 1)
+        self.assertIn("self._check('P1R_PARENT')", ast.unparse(ast.Module(body=method.body[:release], type_ignores=[])))
+
+    def test_preparation_calls_all_precede_fake_stop_and_exec_is_exact(self):
+        import signal
+        from contextlib import ExitStack
+        calls = []
+        child = self.PreparedChild(calls)
+        baseline = lb.LaunchManifest.parse(launch_fixture()).encoded
+        argv = parent_argv(child.attempt)
+        released = False
+
+        def traced(name, function):
+            def invoke(*args, **kwargs):
+                self.assertFalse(released, 'helper call after SIGCONT: ' + name)
+                calls.append(name)
+                return function(*args, **kwargs)
+            return invoke
+
+        def stop(pid, sig):
+            nonlocal released
+            self.assertEqual((pid, sig), (1234, signal.SIGSTOP))
+            calls.append('SIGSTOP/SIGCONT')
+            released = True
+
+        def execute(executable, actual_argv, environment):
+            self.assertTrue(released)
+            self.assertEqual(calls[-1], 'SIGSTOP/SIGCONT')
+            self.assertEqual((executable, actual_argv, environment),
+                             (argv[0], argv, launch_fixture()['environment']['values']))
+            calls.append('execve')
+            raise self.Executed()
+
+        with ExitStack() as stack:
+            for name in ('require', 'parent_argv', 'canonical_json', 'digest'):
+                stack.enter_context(patch.object(lb, name, traced(name, getattr(lb, name))))
+            stack.enter_context(patch.object(lb.os, 'getpid', side_effect=traced('getpid', lambda: 1234)))
+            stack.enter_context(patch.object(lb.os, 'kill', side_effect=stop))
+            exec_call = stack.enter_context(patch.object(lb.os, 'execve', side_effect=execute))
+            with self.assertRaises(self.Executed):
+                lb.NativeProcesses.stop_then_exec_parent(child, argv, baseline)
+        self.assertEqual(calls[0], ('authorize', 'P1R_PARENT'))
+        self.assertEqual(calls[-2:], ['SIGSTOP/SIGCONT', 'execve'])
+        exec_call.assert_called_once()
+
+    def test_denied_authority_argv_environment_and_manifest_never_stop(self):
+        baseline = lb.LaunchManifest.parse(launch_fixture()).encoded
+        changed = launch_fixture()
+        changed['environment']['values']['UNREVIEWED'] = 'injection'
+        invalid = launch_fixture()
+        invalid['environment']['values']['BAD=NAME'] = 'x'
+        cases = [('authority', baseline, parent_argv('p1v-fixture'), True),
+                 ('argv', baseline, ('/wrong',), False),
+                 ('environment', lb.LaunchManifest.parse(changed).encoded, parent_argv('p1v-fixture'), False),
+                 ('invalid_environment', canonical_json(invalid), parent_argv('p1v-fixture'), False),
+                 ('noncanonical', baseline + b' ', parent_argv('p1v-fixture'), False),
+                 ('manifest_type', baseline.decode(), parent_argv('p1v-fixture'), False)]
+        for name, manifest, argv, deny in cases:
+            child = self.PreparedChild([], deny=deny)
+            with self.subTest(case=name), patch.object(lb.os, 'getpid') as getpid, \
+                    patch.object(lb.os, 'kill') as kill, patch.object(lb.os, 'execve') as execute:
+                with self.assertRaises(InvalidEvidence):
+                    lb.NativeProcesses.stop_then_exec_parent(child, argv, manifest)
+                getpid.assert_not_called()
+                kill.assert_not_called()
+                execute.assert_not_called()
+
+    def test_stop_failure_never_execs_or_retries(self):
+        child = self.PreparedChild([])
+        with patch.object(lb.os, 'getpid', return_value=1234), \
+                patch.object(lb.os, 'kill', side_effect=OSError('synthetic stop failure')) as kill, \
+                patch.object(lb.os, 'execve') as execute:
+            with self.assertRaises(OSError):
+                lb.NativeProcesses.stop_then_exec_parent(child, parent_argv(child.attempt),
+                                                        lb.LaunchManifest.parse(launch_fixture()).encoded)
+        kill.assert_called_once()
+        execute.assert_not_called()
+
+    def test_exec_failure_propagates_without_retry_or_recovery(self):
+        child = self.PreparedChild([])
+        with patch.object(lb.os, 'getpid', return_value=1234), patch.object(lb.os, 'kill') as kill, \
+                patch.object(lb.os, 'execve', side_effect=OSError('synthetic exec failure')) as execute:
+            with self.assertRaises(OSError):
+                lb.NativeProcesses.stop_then_exec_parent(child, parent_argv(child.attempt),
+                                                        lb.LaunchManifest.parse(launch_fixture()).encoded)
+        kill.assert_called_once()
+        execute.assert_called_once()
+
+    def test_implementation_issue_rejected_on_scope_readback_and_recheck(self):
+        token = b'synthetic legacy seam only' * 2
+        authorization = FutureAuthorization(token, digest(token), 218)
+        scope = {'authority_issue': 218, 'host_id': 'synthetic', 'attempt': 'p1v-fixture',
+                 'operations': [a.name for a in plan()],
+                 'adapter_manifest_sha256': digest(canonical_json(adapter_fixture()))}
+        # Fake serialized input only; never an ExecutionGrant instance.
+        class StoredScope:
+            _scope = canonical_json(scope)
+
+        with self.assertRaisesRegex(InvalidEvidence, 'same future issue'):
+            lb.ExecutionGrant.check(StoredScope(), authorization, 'synthetic', 'p1v-fixture',
+                                    adapter_fixture(), 'P1R_PARENT')
+        receipt = {'host_id': 'synthetic', 'execution_grant': scope, 'adapter_manifest': adapter_fixture()}
+        with self.assertRaisesRegex(InvalidEvidence, 'postdate implementation'):
+            lb.validate_execution_scope(receipt, {'mode': 'LIVE', 'attempt': 'p1v-fixture'})
 
 
 if __name__ == "__main__":

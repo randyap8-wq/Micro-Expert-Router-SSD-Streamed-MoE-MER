@@ -1,7 +1,7 @@
 """P1V4 Linux adapter, with injected host observations and syscall interfaces.
 
-#216 authorizes implementation, never execution. Nothing happens on import.
-Live integration needs an externally reviewed >216 grant, a complete baseline,
+#216/#218 authorize implementation, never execution. Nothing happens on import.
+Live integration needs an externally reviewed >218 grant, a complete baseline,
 root-controlled evidence backing and pinned inspection/process dependencies.
 The trusted runtime premise excludes hostile namespace substitution; it does
 not assert that unprivileged namespace syscalls are universally denied.
@@ -189,7 +189,7 @@ class ExecutionGrant:
     """
     def __init__(self, scope, expected_scope_sha256, token, expected_token_sha256):
         exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256"), "grant scope")
-        require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 216, "execution authority must follow #216")
+        require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 218, "execution authority must follow #218")
         require(type(scope["host_id"]) is str and scope["host_id"], "grant host")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "explicit full operation scope")
@@ -207,7 +207,7 @@ class ExecutionGrant:
         from . import strict_json
         require_future(authorization)
         scope = strict_json(self._scope)
-        require(authorization.issue == scope["authority_issue"] and authorization.issue > 216,
+        require(authorization.issue == scope["authority_issue"] and authorization.issue > 218,
                 "both authorities must identify the same future issue")
         require(scope["host_id"] == host_id and scope["attempt"] == attempt
                 and scope["adapter_manifest_sha256"] == digest(canonical_json(manifest))
@@ -754,7 +754,7 @@ class ProcessInterfaces(Protocol):
     def enter_cgroup(self, cgroup: str) -> None: ...
     def apply_launch_credentials_and_close_fds(self, manifest: bytes) -> None: ...
     def stop_self(self) -> None: ...
-    def exec_parent(self, argv: tuple, environment: dict) -> None: ...
+    def stop_then_exec_parent(self, argv: tuple, manifest: bytes) -> None: ...
     def exit_worker(self, code: int) -> None: ...
 
 
@@ -804,15 +804,14 @@ class ProcessRoles:
         self._authorize("CONFINEMENT")
         require(not self.child_used and argv == parent_argv(self.attempt), "one unchanged parent only")
         self.child_used = True
-        baseline = LaunchManifest(manifest).values()
-        LaunchManifest.parse(baseline)
+        LaunchManifest.parse(LaunchManifest(manifest).values())
         pid = self.processes.fork()
         if pid == 0:
             self.processes.enter_cgroup(cgroup)
             self.processes.apply_launch_credentials_and_close_fds(manifest)
-            self.processes.stop_self()
+            # One primitive owns the stop/exec boundary; no resumed helper call.
             # Only the unchanged parent is exec'd. It owns CONTROL -> TREATMENT.
-            self.processes.exec_parent(argv, baseline["environment"]["values"])
+            self.processes.stop_then_exec_parent(argv, manifest)
             raise InvalidEvidence("parent exec unexpectedly returned")
         require(uint(pid, 32) > 0, "handoff fork failure")
         require(self.processes.wait_once(pid, True) == {"pid": pid, "stopped": True}, "handoff child did not stop")
@@ -967,10 +966,25 @@ class NativeProcesses:
         import signal
         os.kill(os.getpid(), signal.SIGSTOP)
 
-    def exec_parent(self, argv, environment):
+    def stop_then_exec_parent(self, argv, manifest):
+        """Prepare everything before SIGSTOP; SIGCONT returns directly to exec.
+
+        The canonical launch manifest supplies a private environment dictionary
+        and must match the externally granted adapter manifest. The guardian
+        independently rechecks P1R_PARENT authority before releasing this child.
+        """
         self._check("P1R_PARENT")
-        require(argv == parent_argv(self.attempt), "only unchanged P1R parent may execute")
-        os.execve(argv[0], argv, environment)
+        import signal
+        require(type(argv) is tuple and argv == parent_argv(self.attempt), "only unchanged P1R parent may execute")
+        require(type(manifest) is bytes, "canonical launch manifest bytes required")
+        launch = LaunchManifest.parse(LaunchManifest(manifest).values())
+        require(launch.encoded == manifest and launch.sha256 == self.context[4]["launch_manifest_sha256"],
+                "exec launch manifest differs from grant")
+        environment = launch.values()["environment"]["values"]
+        executable = argv[0]
+        pid = os.getpid()
+        os.kill(pid, signal.SIGSTOP)
+        os.execve(executable, argv, environment)
 
     def exit_worker(self, code):
         self._check("AUTHORITY")
@@ -992,7 +1006,7 @@ def validate_execution_scope(receipt, evidence):
         require(scope == {"status": "NOT_GRANTED"}, "portable evidence must not possess live grant")
         return
     exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256"), "live scope coverage")
-    require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 216, "live grant must postdate implementation")
+    require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 218, "live grant must postdate implementation")
     require(scope["host_id"] == receipt["host_id"] and scope["attempt"] == evidence["attempt"]
             and scope["operations"] == [a.name for a in plan(evidence["attempt"])]
             and scope["adapter_manifest_sha256"] == digest(canonical_json(receipt["adapter_manifest"])), "live grant evidence binding")
