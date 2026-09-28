@@ -1,9 +1,9 @@
 """Fail-closed P1V control machine and side-effect-free --plan.
 
-Host operations are an explicit adapter boundary: #214 implements and tests
-their ordered contract, not a deployable privileged launcher. FutureBackend
-requires separate authorization and a reviewed executor; no shell executor,
-sudo, automatic recovery, or live backend is installed by this package.
+Host operations are an explicit adapter boundary. #216 adds a minimal Linux
+adapter contract and enforcement v2, not execution authority. FutureBackend
+requires both future authorization and an adapter-specific external grant.
+The CLI remains plan-only; no automatic recovery is permitted.
 
 An executor must durably append each intent/result under supervisor ownership,
 implement kernel transitions and inspect their results (not echo expectations),
@@ -72,7 +72,7 @@ def plan(attempt="p1v-plan"):
         Action("DEVICE_RO", "PRE", "only after verified successful filesystem-ro transition",
                ("blockdev", "--setro", DEVICE)),
         Action("PROTECTED", "PRE", "verify superblock/device ro, alias lock, pinned namespace and continuous exclusion"),
-        Action("CONFINEMENT", "PRE", "prepare unprivileged child handoff: all UID/GID slots, groups, zero capabilities, no_new_privs, seccomp, closed setup FDs, nondelegated cgroup"),
+        Action("CONFINEMENT", "PRE", "prepare unprivileged child handoff: all UID/GID slots, groups, zero capabilities, no_new_privs, closed setup FDs, trusted execution closure, passive resource-neutral descendant cgroup; NO seccomp; NO added device BPF"),
         Action("MARKER", "PRE", "consume new exclusive one-shot marker; fsync file and parent directory"),
         Action("P1R_PARENT", "PAIR", "one unchanged parent, serial CONTROL then TREATMENT; no external helper between arms", parent_argv(attempt)),
         Action("SHUTDOWN", "POST", "wait for parent exit and empty nondelegated runtime cgroup; reject any uncertain descendant"),
@@ -102,22 +102,31 @@ class Backend(Protocol):
 class FutureBackend:
     """Gated integration seam for a separately reviewed, privileged host adapter.
 
-    The adapter receives argv arrays, never shell text. No real executor ships
-    under P1V2; --execute therefore refuses before any host or payload access.
-    Authorization must be external, cannot be inferred from a plan or VM facts.
+    The adapter receives typed actions, never shell text. --execute refuses
+    before any host or payload access. Both grants must be external; neither
+    implementation authority, a plan, nor historical VM facts enable execution.
     """
     simulated = False
 
-    def __init__(self, authorization, executor, journal):
-        require_future(authorization)
+    def __init__(self, authorization, executor, journal, *, grant=None, host_id=None,
+                 attempt=None, adapter_manifest=None):
+        from .linux_backend import require_adapter_grant
+        require_adapter_grant(authorization, grant, host_id, attempt, adapter_manifest, "AUTHORITY")
         require(callable(executor) and callable(journal), "reviewed host adapter required")
         self.authorization = authorization
+        self.grant_context = (authorization, grant, host_id, attempt, adapter_manifest)
         self.executor, self.journal = executor, journal
 
+    def authorize(self, operation):
+        from .linux_backend import require_adapter_grant
+        require_adapter_grant(*self.grant_context, operation)
+
     def perform(self, action, evidence):
+        self.authorize(action.name)
         return self.executor(action, copy.deepcopy(evidence))
 
     def retain(self, record):
+        self.authorize(record["action"])
         self.journal(copy.deepcopy(record))
 
 
@@ -182,6 +191,9 @@ def receipt_gate(name, r, evidence):
         for field in ("inputs_verified", "outputs_absent", "marker_absent", "frozen_environment", "frozen_limits"):
             require(r[field] is True, "preflight gate: " + field)
         require(r["argv"] == list(parent_argv(evidence["attempt"])), "parent invocation mismatch")
+        from .linux_backend import validate_adapter_manifest, validate_execution_scope
+        validate_execution_scope(r, evidence)
+        validate_adapter_manifest(r["adapter_manifest"], r["launch_manifest"], r["execution_closure"])
     elif name == "EXCLUSION":
         require(r["held"] is True and r["trusted_host"] is True
                 and r["uncontrolled_writers"] == [] and r["raw_holders"] == []
@@ -194,18 +206,29 @@ def receipt_gate(name, r, evidence):
                 and r["uncontrolled_aliases"] == [] and r["writes_on_data_backing"] == [], "unsupported topology")
         require(r["boot_id"] and r["disk_sequence"] and r["mount_id"] and r["original_mount_options"], "host identity missing")
         require(r["output_major_minor"] == "259:1", "evidence/cache backing mismatch")
+        from .linux_backend import backing_identity
+        backing_identity(r["device_identity"], r)
+        require(type(r["original_mount_flags"]) is int and type(r["original_alias_flags"]) is int
+                and type(r["original_mount_data"]) is str, "original mount recipe required")
     elif name == "NAMESPACE":
+        require(r["original_namespace_id"] != r["namespace_id"]
+                and r["original_mount_id"] == previous["TOPOLOGY"]["mount_id"]
+                and type(r["private_mount_id"]) is int and r["private_mount_id"] > 0
+                and r["private_mount_id"] != r["original_mount_id"], "distinct namespace/mount identities required")
         require(r["private_recursive"] is True and r["initial_user_namespace"] is True
                 and r["references_pinned"] is True and r["namespace_id"], "namespace preparation failed")
     elif name == "ALIAS_BIND":
         require(r["path"] == ALIAS_PARENT and r["private_bind"] is True, "alias bind failed")
     elif name == "ALIAS_RO":
+        require(r["canonical_target"] == CANONICAL and r["output_still_rw"] is True
+                and r["preserved_flags"] == previous["TOPOLOGY"]["original_alias_flags"], "alias readback/flags/output")
         require(r["alias_parent_ro"] is True and r["configured"] == CONFIGURED
                 and r["symlink_target"] == CANONICAL and r["runtime_cannot_replace"] is True,
                 "configured alias lockdown failed")
     elif name == "METADATA":
         metadata_gate(r["records"])
     elif name == "FILESYSTEM_RO":
+        require(r["syncfs_checked"] is True and r["mount_ro"] is True, "syncfs and mount-level readback required")
         require(r["superblock_ro"] is True and r["normal_unforced_transition"] is True
                 and r["journal_writeback_complete"] is True and r["device_still_rw"] is True
                 and r["healthy"] is True, "filesystem-ro transition uncertain")
@@ -213,20 +236,13 @@ def receipt_gate(name, r, evidence):
         require(r["device_ro"] is True and r["filesystem_still_ro"] is True, "device-ro transition uncertain")
     elif name in ("PROTECTED", "REVALIDATE"):
         protection(r)
-        require(r["namespace_id"] == previous["NAMESPACE"]["namespace_id"], "namespace drift")
+        require(r["namespace_id"] == previous["NAMESPACE"]["namespace_id"]
+                and r["mount_ro"] is True and r["superblock_ro"] is True, "namespace/superblock drift")
         for key in ("boot_id", "disk_sequence", "mount_id"):
             require(r[key] == previous["TOPOLOGY"][key], "host identity drift: " + key)
     elif name == "CONFINEMENT":
-        require(len(r["uids"]) == 3 and len(set(r["uids"])) == 1 and uint(r["uids"][0]) > 0,
-                "runtime privileged UID")
-        require(len(r["gids"]) == 3 and len(set(r["gids"])) == 1 and uint(r["gids"][0]) > 0,
-                "runtime privileged GID")
-        require(r["capabilities"] == {k: 0 for k in ("effective", "permitted", "inheritable", "ambient", "bounding")}, "runtime capabilities")
-        for key in ("no_new_privs", "groups_reviewed", "brokers_excluded", "setup_fds_closed",
-                    "seccomp_enforced", "cgroup_nondelegated", "namespace_apis_denied", "raw_device_access_denied"):
-            require(r[key] is True, "runtime confinement: " + key)
-        sha256(r["policy_sha256"])
-        require(r["inherited_fds"] == [0, 1, 2] and r["cgroup_id"], "runtime FD/cgroup boundary")
+        from .linux_backend import validate_confinement
+        validate_confinement(r, previous["AUTHORITY"]["launch_manifest"], previous["NAMESPACE"])
     elif name == "MARKER":
         require(r["created_exclusive"] is True and r["durable"] is True
                 and r["attempt"] == evidence["attempt"], "one-shot marker failed")
@@ -239,10 +255,15 @@ def receipt_gate(name, r, evidence):
         for h in r["raw_report_hashes"].values():
             sha256(h)
     elif name == "SHUTDOWN":
+        require(type(r["recursive_populated"]) is int and r["recursive_populated"] == 0
+                and r["unexpected_child_groups"] == [], "recursive empty cgroup required")
         require(r["parent_reaped"] is True and r["runtime_tree_empty"] is True
                 and r["uncertain_descendants"] == [] and r["cgroup_id"] == previous["CONFINEMENT"]["cgroup_id"],
                 "whole runtime tree shutdown uncertain")
     elif name == "HASH":
+        require(previous["P1R_PARENT"]["exit_code"] == 0
+                and previous["SHUTDOWN"]["runtime_tree_empty"] is True, "hash shutdown prerequisites")
+        protection(previous["REVALIDATE"])
         require(r["window"] == HASH_WINDOW and r["hasher_stopped"] is True, "hasher lifecycle uncertain")
         verify_content(r["content"])
         selected = previous["METADATA"]["records"][-6:]
@@ -272,6 +293,10 @@ def receipt_gate(name, r, evidence):
         require(r["released"] is True, "exclusion release uncertain")
     else:
         raise InvalidEvidence("unknown action")
+    if name in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW", "FILESYSTEM_RW"):
+        require(r["device_identity"] == previous["TOPOLOGY"]["device_identity"]
+                and r["private_mount_id"] == previous["NAMESPACE"]["private_mount_id"]
+                and r["healthy"] is True and r["journal_clean"] is True, "backing identity/health/readback drift")
 
 
 class Supervisor:
@@ -279,13 +304,15 @@ class Supervisor:
         if not backend.simulated:
             require(isinstance(backend, FutureBackend), "live backend must pass future authorization interlock")
             require_future(backend.authorization)
+            backend.authorize("AUTHORITY")
         self.backend, self.attempt, self.clock = backend, validate_attempt(attempt), clock
         self.used = False
 
     def run(self):
         require(not self.used, "one-shot supervisor cannot be retried")
         self.used = True
-        evidence = {"schema": "mer.p1v.enforcement.v1", "attempt": self.attempt,
+        evidence = {"schema": "mer.p1v.enforcement.v2",
+                    "profile": "trusted-runtime-minimal-hot-path", "attempt": self.attempt,
                     "mode": "SIMULATED" if self.backend.simulated else "LIVE",
                     "authority": copy.deepcopy(AUTHORITY), "tools": tool_hashes(),
                     "events": [], "receipts": {}}
@@ -320,7 +347,8 @@ class Supervisor:
 
 def validate_enforcement(envelope, allow_simulated=False, through_hash=False):
     """Validate the pre-restoration sealed prefix, not just endpoint ro booleans."""
-    require(envelope["schema"] == "mer.p1v.enforcement.v1", "enforcement schema")
+    require(envelope["schema"] == "mer.p1v.enforcement.v2"
+            and envelope["profile"] == "trusted-runtime-minimal-hot-path", "enforcement v2 schema/profile required")
     require(envelope["mode"] == "LIVE" or (allow_simulated and envelope["mode"] == "SIMULATED"),
             "synthetic evidence cannot qualify a live run")
     require(envelope["authority"] == AUTHORITY, "enforcement authority mismatch")
@@ -331,7 +359,7 @@ def validate_enforcement(envelope, allow_simulated=False, through_hash=False):
     prefix = actions[:16 if through_hash else 17]  # strictly before seal/restoration
     require([e["action"] for e in envelope["events"]] == [a.name for a in prefix], "continuity event order/coverage")
     require(set(envelope["receipts"]) == {a.name for a in prefix}, "continuity receipt coverage")
-    replay = {k: copy.deepcopy(envelope[k]) for k in ("schema", "attempt", "mode", "authority", "tools")}
+    replay = {k: copy.deepcopy(envelope[k]) for k in ("schema", "profile", "attempt", "mode", "authority", "tools")}
     replay.update(events=[], receipts={})
     last = -1
     for step, (action, event) in enumerate(zip(prefix, envelope["events"])):
@@ -353,9 +381,17 @@ def main(argv=None):
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     if args.execute or not args.plan:
-        parser.error("NOT_AUTHORIZED: #214 supplies no live host adapter or future authorization token")
+        parser.error("NOT_AUTHORIZED: #216 is implementation only; later external adapter grant and complete baseline required")
     output = {"mode": "PLAN_ONLY", "expectations_not_observations": EXPECTATIONS,
               "authority": AUTHORITY, "future_authorization_required": True,
+              "enforcement_schema": "mer.p1v.enforcement.v2",
+              "enforcement_profile": "trusted-runtime-minimal-hot-path",
+              "adapter_execution_authority_after_issue": 216,
+              "complete_external_launch_manifest_required": True,
+              "seccomp": "NOT_REQUIRED", "cgroup": "PASSIVE_TREE_ONLY",
+              "cgroup_device_bpf": "NOT_REQUIRED", "external_hot_path_interposition": "NONE",
+              "P1V_REQUEST_THROUGHPUT_VERDICT": "NOT_AUTHORIZED",
+              "P1V_SPEEDUP_VERDICT": "NOT_AUTHORIZED",
               "startup_metadata_ids": STARTUP_IDS, "post_shutdown_hash_ids": IDS,
               "actions": [asdict(a) for a in plan(args.attempt)]}
     print(canonical_json(output).decode("ascii"), end="")

@@ -282,6 +282,65 @@ def encode_raw(fixture):
     return {k: canonical_json(v) for k, v in zip(("parent", "control", "treatment"), (parent, control, treatment))}
 
 
+def launch_fixture():
+    """Synthetic complete values only; none are a VM baseline or live grant."""
+    from .linux_backend import CONTROLLERS, DEPENDENCIES, RLIMITS
+    domain = {k: {"domain": "synthetic-domain", "constraints": {"fixture": True}} for k in CONTROLLERS}
+    domain.update(effective_cpus=[0, 1], effective_mems=[0], ancestor_constraints=[], bpf_ancestry=[])
+    return {
+        "environment": {"complete": True, "values": {"PATH": "/synthetic/bin"}, "absent": ["LD_PRELOAD"]},
+        "rlimits": {k: [1024, 2048] for k in RLIMITS}, "umask": 0o022,
+        "stdio": [{"fd": fd, "type": "regular", "backing": "synthetic-259:1", "flags": fd != 0 and 1 or 0}
+                  for fd in range(3)],
+        "scheduler": {"class": "OTHER", "attributes": {"priority": 0}}, "nice": 0,
+        "cpu_affinity": [0, 1], "io_priority": {"class": 0, "priority": 0},
+        "cpu_policy": {"governors": ["synthetic"], "frequency_limits": [100, 200], "boost": False, "power": "synthetic"},
+        "numa": {"allowed_nodes": [0], "memory_policy": "synthetic-default"},
+        "thp": {"policy": "synthetic", "evidence_sha256": "1" * 64},
+        "numa_balancing": {"policy": "synthetic", "evidence_sha256": "2" * 64},
+        "resource_domain": domain,
+        "gpu": {k: "synthetic" for k in ("device", "driver", "nodes", "libraries", "icds", "layers", "cache",
+                                          "persistence", "compute", "power", "clocks", "mps", "mig")},
+        "cwd": "/synthetic", "signals": {"mask": [], "dispositions": {"all": "synthetic-default"}},
+        "credentials": {"uid": 1000, "gid": 1000, "groups": [1000]},
+        "adapter_pins": {k: "a" * 64 for k in DEPENDENCIES},
+        "session": {"session_id": 100, "process_group": 100, "autogroup": "synthetic"},
+        "security_context": {"lsm": "synthetic", "labels": [], "inherited_policy_sha256": "b" * 64},
+    }
+
+
+def closure_fixture():
+    from .linux_backend import TRUST_PREMISE
+    return {"premise": copy.deepcopy(TRUST_PREMISE), "source_commit": AUTHORITY["commit"],
+            **{k: AUTHORITY[k] for k in ("binary_sha256", "config_sha256", "request_sha256")},
+            **{k: {"/synthetic/" + k: "c" * 64} for k in ("loader", "libraries", "git", "driver_modules")},
+            "environment_sha256": digest(canonical_json(launch_fixture()["environment"]))}
+
+
+def adapter_fixture():
+    from .linux_backend import LaunchManifest
+    return {"schema": "mer.p1v.adapter.v1", "implementation_issue": 216,
+            "module_sha256": digest(Path(__file__).with_name("linux_backend.py").read_bytes()),
+            "dependencies": launch_fixture()["adapter_pins"],
+            "launch_manifest_sha256": LaunchManifest.parse(launch_fixture()).sha256,
+            "execution_closure_sha256": digest(canonical_json(closure_fixture()))}
+
+
+def confinement_fixture():
+    return {"ok": True, "uids": [1000] * 3, "gids": [1000] * 3, "groups": [1000],
+            "capabilities": dict.fromkeys(("effective", "permitted", "inheritable", "ambient", "bounding"), 0),
+            **dict.fromkeys(("no_new_privs", "groups_exact", "brokers_excluded", "setup_fds_closed",
+                            "initial_user_namespace", "private_mount_namespace", "trusted_execution_closure_verified",
+                            "cgroup_nondelegated", "resource_domain_equal", "launch_profile_equal", "raw_device_access_denied",
+                            "handoff_stopped"), True),
+            **{k: [] for k in ("raw_or_privileged_fds", "writable_alias_routes", "cgroup_controllers_changed",
+                              "cgroup_limits_changed", "cgroup_bpf_added")},
+            "seccomp_mode": 0, "p1v_device_bpf_attached": False, "inherited_fds": [0, 1, 2],
+            "cgroup_mode": "PASSIVE_TREE_ONLY", "cgroup_active_monitoring_during_pair": False,
+            "cgroup_id": "synthetic-runtime", "namespace_id": "synthetic-ns", "handoff_pid": 1234,
+            "launch_observed": launch_fixture(), "resource_domain_observed": launch_fixture()["resource_domain"]}
+
+
 def receipts(raw, content):
     protection = {"ok": True, "expectations": EXPECTATIONS, "filesystem_ro": True, "device_ro": True,
                   "alias_locked": True, "exclusion_held": True, "namespace_pinned": True,
@@ -292,10 +351,13 @@ def receipts(raw, content):
                  "canonical": reader.canonical(alternatives(g)[0]), "identity": asdict(reader.identities[alternatives(g)[0]]),
                  "dio_eligible": True, "o_direct_retained": True, "payload_bytes_read": 0,
                  "redirects": [], "disallowed_features": []} for g in STARTUP_IDS + IDS]
-    return {
+    result = {
         "AUTHORITY": {"ok": True, "authority": AUTHORITY, "tools": tool_hashes(), "inputs_verified": True,
                       "outputs_absent": True, "marker_absent": True, "frozen_environment": True, "frozen_limits": True,
-                      "argv": list(parent_argv("p1v-fixture"))},
+                      "argv": list(parent_argv("p1v-fixture")),
+                      "adapter_manifest": adapter_fixture(), "launch_manifest": launch_fixture(),
+                      "execution_closure": closure_fixture(), "host_id": "synthetic-host",
+                      "execution_grant": {"status": "NOT_GRANTED"}},
         "EXCLUSION": {"ok": True, "held": True, "trusted_host": True, "uncontrolled_writers": [], "raw_holders": [], "uncontrolled_mount_namespaces": []},
         "TOPOLOGY": {"ok": True, "expectations": EXPECTATIONS, "filesystem_rw": True, "device_rw": True,
                      "healthy": True, "external_journal": False, "stacked_or_overlapping_devices": [],
@@ -311,11 +373,7 @@ def receipts(raw, content):
                           "journal_writeback_complete": True, "device_still_rw": True, "healthy": True},
         "DEVICE_RO": {"ok": True, "device_ro": True, "filesystem_still_ro": True},
         "PROTECTED": protection.copy(),
-        "CONFINEMENT": {"ok": True, "uids": [1000] * 3, "gids": [1000] * 3,
-                        "capabilities": dict.fromkeys(("effective", "permitted", "inheritable", "ambient", "bounding"), 0),
-                        **dict.fromkeys(("no_new_privs", "groups_reviewed", "brokers_excluded", "setup_fds_closed",
-                                         "seccomp_enforced", "cgroup_nondelegated", "namespace_apis_denied", "raw_device_access_denied"), True),
-                        "policy_sha256": "b" * 64, "inherited_fds": [0, 1, 2], "cgroup_id": "synthetic-runtime"},
+        "CONFINEMENT": confinement_fixture(),
         "MARKER": {"ok": True, "created_exclusive": True, "durable": True, "attempt": "p1v-fixture"},
         "P1R_PARENT": {"ok": True, "invocations": 1, "argv": list(parent_argv("p1v-fixture")),
                        "external_actions_between_arms": [], "exit_code": 0, "report_origin": "created_by_this_invocation",
@@ -332,6 +390,20 @@ def receipts(raw, content):
         "RESTORATION_SEAL": {"ok": True, "durable": True, "exclusive": True},
         "RELEASE": {"ok": True, "released": True},
     }
+    device_identity = {"path": "/dev/nvme0n1", "major_minor": "259:4", "uuid": EXPECTATIONS["data_uuid"],
+                       "disk_sequence": 1, "sysfs_identity": "synthetic-nvme"}
+    result["TOPOLOGY"].update(device_identity=device_identity, original_mount_flags=1024,
+                              original_mount_data="synthetic-original-ext4-options", original_alias_flags=1024)
+    result["NAMESPACE"].update(original_namespace_id="synthetic-original-ns", original_mount_id=100, private_mount_id=200)
+    result["ALIAS_RO"].update(canonical_target=CANONICAL, output_still_rw=True, preserved_flags=1024)
+    result["SHUTDOWN"].update(recursive_populated=0, unexpected_child_groups=[])
+    result["FILESYSTEM_RO"].update(syncfs_checked=True, mount_ro=True)
+    for name in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW", "FILESYSTEM_RW"):
+        result[name].update(device_identity=copy.deepcopy(device_identity), private_mount_id=200, healthy=True, journal_clean=True)
+    for name in ("PROTECTED", "REVALIDATE"):
+        result[name].update(mount_ro=True, superblock_ro=True)
+    return result
+
 
 
 class PipelineFake(FakeBackend):
@@ -770,7 +842,7 @@ class PublicationTests(unittest.TestCase):
 
     def test_no_shell_or_subprocess_execution_in_package(self):
         # Static safety assertion: the software-only package has no hidden
-        # executor bypass. ctypes is limited to the future-gated direct reader.
+        # executor bypass in the original tools; the new adapter is checked separately.
         root = Path(__file__).parent
         for name in TOOLS:
             tree = ast.parse((root / name).read_text())
