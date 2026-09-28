@@ -9,11 +9,14 @@ import copy
 import importlib
 import io
 import os
+import sys
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 from . import (AUTHORITY, EXPECTATIONS, FutureAuthorization, InvalidEvidence,
                canonical_json, digest, strict_json)
@@ -422,7 +425,7 @@ class EnforcementTests(unittest.TestCase):
     def test_legacy_future_authority_never_enables_adapter(self):
         # Fake old-seam tokens do not constitute an adapter-specific live grant.
         token = b"synthetic legacy authorization only" * 2
-        for issue in (215, 216, 217, 218):
+        for issue in (215, 216, 217, 218, 219, 220):
             authorization = FutureAuthorization(token, digest(token), issue)
             with self.subTest(issue=issue), patch("os.open", side_effect=AssertionError("unauthorized open")):
                 with self.assertRaises(InvalidEvidence):
@@ -436,11 +439,11 @@ class EnforcementTests(unittest.TestCase):
 
     def test_implementation_grant_cannot_be_issued(self):
         token = b"synthetic implementation authority only" * 2
-        for issue in (215, 216, 217, 218):
+        for issue in (215, 216, 217, 218, 219, 220):
             scope = {"authority_issue": issue, "host_id": "synthetic", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64}
             # All supplied pins match: the issue boundary itself must reject.
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #218"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #220"):
                 lb.ExecutionGrant(scope, digest(canonical_json(scope)), token, digest(token))
 
     def test_import_no_effect_and_no_shell_or_native_invocation(self):
@@ -715,9 +718,9 @@ class MountAndScopeTests(unittest.TestCase):
 
     def test_later_grant_requires_scope_and_matching_external_token(self):
         # Deliberately invalid: this suite never creates a valid live grant.
-        scope = {"authority_issue": 219, "host_id": "synthetic", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 221, "host_id": "synthetic", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64}
-        with self.assertRaises(InvalidEvidence):
+        with self.assertRaisesRegex(InvalidEvidence, "external adapter grant required"):
             lb.ExecutionGrant(scope, digest(canonical_json(scope)), b"invalid" * 10, "0" * 64)
         for key in scope:
             bad = copy.deepcopy(scope)
@@ -901,6 +904,219 @@ class ReleaseExecBoundaryTests(unittest.TestCase):
         receipt = {'host_id': 'synthetic', 'execution_grant': scope, 'adapter_manifest': adapter_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, 'postdate implementation'):
             lb.validate_execution_scope(receipt, {'mode': 'LIVE', 'attempt': 'p1v-fixture'})
+
+
+class RlimitCompatibilityTests(unittest.TestCase):
+    FROZEN_LIMITS = ("CPU", "FSIZE", "DATA", "STACK", "CORE", "RSS", "NPROC", "NOFILE",
+                     "MEMLOCK", "AS", "LOCKS", "SIGPENDING", "MSGQUEUE", "NICE", "RTPRIO", "RTTIME")
+
+    def test_frozen_manifest_still_requires_locks_in_exact_position(self):
+        self.assertEqual(lb.RLIMITS, self.FROZEN_LIMITS)
+        baseline = launch_fixture()
+        self.assertEqual(set(lb.LaunchManifest.parse(baseline).values()["rlimits"]), set(self.FROZEN_LIMITS))
+        del baseline["rlimits"]["LOCKS"]
+        with self.assertRaisesRegex(InvalidEvidence, "all Linux RLIMITs required"):
+            lb.LaunchManifest.parse(baseline)
+
+    def test_ordinary_limits_use_exported_integers_without_numbering_guesses(self):
+        for index, name in enumerate(self.FROZEN_LIMITS):
+            if name == "LOCKS":
+                continue
+            # Deliberately unlike Linux numbering, including the historic 5-9 range.
+            exported = 100 + index
+            resource = SimpleNamespace(**{"RLIMIT_" + name: exported})
+            for platform in ("linux", "darwin"):
+                with self.subTest(name=name, platform=platform):
+                    self.assertIs(lb.linux_rlimit_id(resource, name, platform), exported)
+
+    def test_missing_locks_on_linux_resolves_to_integer_ten_without_mutation(self):
+        resource = SimpleNamespace()
+        result = lb.linux_rlimit_id(resource, "LOCKS", "linux")
+        self.assertIs(type(result), int)
+        self.assertEqual(result, 10)
+        self.assertEqual(vars(resource), {})
+
+    def test_exported_locks_integer_ten_is_accepted_without_mutation(self):
+        resource = SimpleNamespace(RLIMIT_LOCKS=10)
+        for platform in ("linux", "darwin"):
+            self.assertEqual(lb.linux_rlimit_id(resource, "LOCKS", platform), 10)
+        self.assertEqual(vars(resource), {"RLIMIT_LOCKS": 10})
+
+    def test_wrong_or_noninteger_exported_locks_rejects(self):
+        for value in (-1, 0, 9, 11, 10.0, "10", None, True, False):
+            resource = SimpleNamespace(RLIMIT_LOCKS=value)
+            for platform in ("linux", "darwin"):
+                with self.subTest(value=value, platform=platform), self.assertRaises(InvalidEvidence):
+                    lb.linux_rlimit_id(resource, "LOCKS", platform)
+            self.assertEqual(vars(resource), {"RLIMIT_LOCKS": value})
+
+    def test_missing_locks_on_nonlinux_fails_closed(self):
+        for platform in ("darwin", "win32", "freebsd14", "linux2", ""):
+            with self.subTest(platform=platform), self.assertRaisesRegex(InvalidEvidence, "missing RLIMIT symbol"):
+                lb.linux_rlimit_id(SimpleNamespace(), "LOCKS", platform)
+
+    def test_every_other_missing_symbol_fails_closed(self):
+        for name in self.FROZEN_LIMITS:
+            if name != "LOCKS":
+                with self.subTest(name=name), self.assertRaisesRegex(InvalidEvidence, "missing RLIMIT symbol"):
+                    lb.linux_rlimit_id(SimpleNamespace(), name, "linux")
+
+    def test_noninteger_ordinary_export_and_unknown_name_reject(self):
+        for value in (True, 5.0, "5", None):
+            with self.subTest(value=value), self.assertRaisesRegex(InvalidEvidence, "must be integer"):
+                lb.linux_rlimit_id(SimpleNamespace(RLIMIT_CPU=value), "CPU", "linux")
+        with self.assertRaisesRegex(InvalidEvidence, "unknown frozen RLIMIT name"):
+            lb.linux_rlimit_id(SimpleNamespace(RLIMIT_UNKNOWN=10), "UNKNOWN", "linux")
+
+    def handoff_fixture(self, mismatch=None):
+        """Run the real unbound method with no native receiver or host interfaces."""
+        baseline = launch_fixture()
+        baseline["rlimits"] = {name: [800 + i, 900 + i] for i, name in enumerate(self.FROZEN_LIMITS)}
+        baseline["rlimits"]["CPU"] = ["INFINITY", "INFINITY"]
+        baseline["rlimits"]["FSIZE"][1] = "INFINITY"
+        baseline["signals"] = {"mask": [], "dispositions": {"1": "DEFAULT", "2": "IGNORE"}}
+        identifiers = {name: 10 if name == "LOCKS" else 100 + i for i, name in enumerate(self.FROZEN_LIMITS)}
+        pairs = {identifiers[name]: tuple(-1 if v == "INFINITY" else v for v in pair)
+                 for name, pair in baseline["rlimits"].items()}
+        if mismatch is not None:
+            pairs[identifiers[mismatch]] = (0, 0)
+        resource = SimpleNamespace(RLIM_INFINITY=-1, getrlimit=Mock(side_effect=pairs.__getitem__),
+                                   **{"RLIMIT_" + name: identifier for name, identifier in identifiers.items()
+                                      if name != "LOCKS"})
+        original_resource = vars(resource).copy()
+        fake_os = SimpleNamespace(
+            geteuid=Mock(return_value=0), sched_getaffinity=Mock(return_value={0, 1}),
+            getpriority=Mock(return_value=0), PRIO_PROCESS=0,
+            setgroups=Mock(), setresgid=Mock(), setresuid=Mock(), umask=Mock(), chdir=Mock(),
+            listdir=Mock(return_value=["0", "1", "2", "40", "41"]), closerange=Mock(),
+            kill=Mock(), execve=Mock())
+        signals = SimpleNamespace(valid_signals=Mock(return_value={1, 2, 9, 19}), SIGKILL=9, SIGSTOP=19,
+                                  SIG_DFL=0, SIG_IGN=1, SIG_SETMASK=2, signal=Mock(), pthread_sigmask=Mock())
+        libc = SimpleNamespace(prctl=Mock(return_value=0), capset=Mock(return_value=0))
+        child = SimpleNamespace(_check=Mock(), _prctl=Mock())
+        path = Mock()
+        path.return_value.read_text.return_value = "2\n"
+        encoded = lb.LaunchManifest.parse(baseline).encoded
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {"resource": resource, "signal": signals}))
+            stack.enter_context(patch.object(sys, "platform", "linux"))
+            stack.enter_context(patch.object(lb, "os", fake_os))
+            stack.enter_context(patch.object(lb, "Path", path))
+            loader = stack.enter_context(patch("ctypes.CDLL", return_value=libc))
+            if mismatch is None:
+                lb.NativeProcesses.apply_launch_credentials_and_close_fds(child, encoded)
+            else:
+                with self.assertRaisesRegex(InvalidEvidence, "inherited RLIMIT drift"):
+                    lb.NativeProcesses.apply_launch_credentials_and_close_fds(child, encoded)
+        self.assertEqual(vars(resource), original_resource)
+        self.assertFalse(hasattr(resource, "RLIMIT_LOCKS"))
+        child._check.assert_called_once_with("CONFINEMENT")
+        fake_os.kill.assert_not_called()
+        fake_os.execve.assert_not_called()
+        return SimpleNamespace(resource=resource, os=fake_os, signals=signals, libc=libc, child=child,
+                               loader=loader, path=path, identifiers=identifiers)
+
+    def test_stock_cpython_unbound_handoff_checks_all_sixteen_in_frozen_order(self):
+        fixture = self.handoff_fixture()
+        self.assertEqual(fixture.resource.getrlimit.call_args_list,
+                         [call(fixture.identifiers[name]) for name in self.FROZEN_LIMITS])
+        locks_argument = fixture.resource.getrlimit.call_args_list[10].args[0]
+        self.assertIs(type(locks_argument), int)
+        self.assertEqual(locks_argument, 10)
+        fixture.os.sched_getaffinity.assert_called_once_with(0)
+        fixture.os.getpriority.assert_called_once_with(0, 0)
+        fixture.loader.assert_called_once_with(None, use_errno=True)
+        fixture.libc.prctl.assert_called_once_with(21, 0, 0, 0, 0)
+        self.assertEqual(fixture.child._prctl.call_args_list,
+                         [call(fixture.libc, 38, 1), call(fixture.libc, 47, 4),
+                          *[call(fixture.libc, 24, cap) for cap in range(3)], call(fixture.libc, 8, 0)])
+        fixture.os.setgroups.assert_called_once_with([1000])
+        fixture.os.setresgid.assert_called_once_with(1000, 1000, 1000)
+        fixture.os.setresuid.assert_called_once_with(1000, 1000, 1000)
+        fixture.libc.capset.assert_called_once()
+        self.assertEqual(fixture.signals.signal.call_args_list, [call(1, 0), call(2, 1)])
+        fixture.signals.pthread_sigmask.assert_called_once_with(2, [])
+        fixture.os.closerange.assert_called_once_with(3, 42)
+
+    def assert_rejected_before_mutation(self, name):
+        fixture = self.handoff_fixture(mismatch=name)
+        index = self.FROZEN_LIMITS.index(name)
+        self.assertEqual(fixture.resource.getrlimit.call_args_list,
+                         [call(fixture.identifiers[n]) for n in self.FROZEN_LIMITS[:index + 1]])
+        for interface in (fixture.os, fixture.signals, fixture.libc):
+            for field, mock in vars(interface).items():
+                if isinstance(mock, Mock) and field != "geteuid":
+                    mock.assert_not_called()
+        fixture.loader.assert_not_called()
+        fixture.child._prctl.assert_not_called()
+        fixture.path.assert_not_called()
+
+    def test_locks_value_mismatch_rejects_before_credentials_fds_or_stop(self):
+        self.assert_rejected_before_mutation("LOCKS")
+
+    def test_each_other_inherited_pair_mismatch_still_rejects_before_mutation(self):
+        for name in self.FROZEN_LIMITS:
+            if name != "LOCKS":
+                with self.subTest(name=name):
+                    self.assert_rejected_before_mutation(name)
+
+    def test_no_setrlimit_or_resource_monkeypatch_in_adapter(self):
+        source = Path(lb.__file__).read_text()
+        self.assertNotIn("setrlimit", source)
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.assertNotIn(ast.unparse(node.value), ("resource", "resource_module"))
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in ("setattr", "delattr"):
+                self.assertNotIn(ast.unparse(node.args[0]), ("resource", "resource_module"))
+
+    def test_two_path_p1v_scope_preserves_all_other_files(self):
+        protected = {
+            "__init__.py": "6d7e816042d9bce309517688772e2c3f9bbe32d376781ad3af81da065553e1cf",
+            "content_hasher.py": "4dae50fa88fa151e03626be8b4cb552fae4c268d523d7110c64070eb194e5ca7",
+            "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
+            "supervisor.py": "e33a9acd5f643df96420e82a31fea81368f6067ed26ed822e76f1b665ad3dce3",
+            "test_p1v.py": "946241bdafff633c1c48c54832105cea2d5305fce330d0ca16570fbf46b28bbd",
+        }
+        root = Path(lb.__file__).parent
+        self.assertEqual({p.name for p in root.iterdir() if p.is_file()},
+                         set(protected) | {"linux_backend.py", "test_linux_backend.py"})
+        for name, expected in protected.items():
+            with self.subTest(path=name):
+                self.assertEqual(digest((root / name).read_bytes()), expected)
+
+    def test_220_rejected_on_grant_recheck_and_live_receipt(self):
+        token = b"synthetic legacy seam only" * 2
+        manifest = adapter_fixture()
+        for issue in (219, 220):
+            authorization = FutureAuthorization(token, digest(token), issue)
+            scope = {"authority_issue": issue, "host_id": "synthetic", "attempt": "p1v-fixture",
+                     "operations": [a.name for a in plan()],
+                     "adapter_manifest_sha256": digest(canonical_json(manifest))}
+            stored = SimpleNamespace(_scope=canonical_json(scope))  # Never a live ExecutionGrant.
+            with self.subTest(issue=issue):
+                with self.assertRaisesRegex(InvalidEvidence, "same future issue"):
+                    lb.ExecutionGrant.check(stored, authorization, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
+                receipt = {"host_id": "synthetic", "execution_grant": scope, "adapter_manifest": manifest}
+                with self.assertRaisesRegex(InvalidEvidence, "postdate implementation"):
+                    lb.validate_execution_scope(receipt, {"mode": "LIVE", "attempt": "p1v-fixture"})
+
+    def test_later_authorities_must_match_without_issuing_live_grant(self):
+        token = b"synthetic legacy seam only" * 2
+        manifest = adapter_fixture()
+        scope = {"authority_issue": 221, "host_id": "synthetic", "attempt": "p1v-fixture",
+                 "operations": [a.name for a in plan()],
+                 "adapter_manifest_sha256": digest(canonical_json(manifest))}
+        stored = SimpleNamespace(_scope=canonical_json(scope))
+        for issue in (220, 222):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "same future issue"):
+                lb.ExecutionGrant.check(stored, FutureAuthorization(token, digest(token), issue),
+                                        "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
+        # The pure unbound check accepts matching later scope; this fake receiver
+        # still cannot pass require_adapter_grant's exact ExecutionGrant type gate.
+        authorization = FutureAuthorization(token, digest(token), 221)
+        lb.ExecutionGrant.check(stored, authorization, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
+        with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
+            lb.require_adapter_grant(authorization, stored, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
 
 
 if __name__ == "__main__":

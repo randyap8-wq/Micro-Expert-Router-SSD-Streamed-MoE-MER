@@ -1,7 +1,7 @@
 """P1V4 Linux adapter, with injected host observations and syscall interfaces.
 
-#216/#218 authorize implementation, never execution. Nothing happens on import.
-Live integration needs an externally reviewed >218 grant, a complete baseline,
+#216/#218/#220 authorize implementation, never execution. Nothing happens on import.
+Live integration needs an externally reviewed >220 grant, a complete baseline,
 root-controlled evidence backing and pinned inspection/process dependencies.
 The trusted runtime premise excludes hostile namespace substitution; it does
 not assert that unprivileged namespace syscalls are universally denied.
@@ -54,6 +54,22 @@ POLICY_FIELDS = {
     "session": ("session_id", "process_group", "autogroup"),
     "security_context": ("lsm", "labels", "inherited_policy_sha256"),
 }
+
+
+def linux_rlimit_id(resource_module, name, platform_name):
+    """Resolve exported limits, with only the reviewed Linux LOCKS ABI fallback."""
+    require(name in RLIMITS, "unknown frozen RLIMIT name")
+    try:
+        identifier = getattr(resource_module, "RLIMIT_" + name)
+    except AttributeError:
+        require(name == "LOCKS" and platform_name == "linux", "missing RLIMIT symbol: " + name)
+        # Linux v6.8 include/uapi/asm-generic/resource.h: RLIMIT_LOCKS = 10.
+        # Historical architecture differences in IDs 5-9 use exports above.
+        identifier = 10
+    require(type(identifier) is int, "RLIMIT identifier must be integer: " + name)
+    if name == "LOCKS":
+        require(identifier == 10, "RLIMIT_LOCKS must match Linux ABI id 10")
+    return identifier
 
 
 def exact_keys(value, keys, message):
@@ -189,7 +205,7 @@ class ExecutionGrant:
     """
     def __init__(self, scope, expected_scope_sha256, token, expected_token_sha256):
         exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256"), "grant scope")
-        require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 218, "execution authority must follow #218")
+        require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 220, "execution authority must follow #220")
         require(type(scope["host_id"]) is str and scope["host_id"], "grant host")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "explicit full operation scope")
@@ -207,7 +223,7 @@ class ExecutionGrant:
         from . import strict_json
         require_future(authorization)
         scope = strict_json(self._scope)
-        require(authorization.issue == scope["authority_issue"] and authorization.issue > 218,
+        require(authorization.issue == scope["authority_issue"] and authorization.issue > 220,
                 "both authorities must identify the same future issue")
         require(scope["host_id"] == host_id and scope["attempt"] == attempt
                 and scope["adapter_manifest_sha256"] == digest(canonical_json(manifest))
@@ -914,12 +930,13 @@ class NativeProcesses:
         import ctypes
         import resource
         import signal
+        import sys
         value = LaunchManifest(manifest).values()
         LaunchManifest.parse(value)
         require(os.geteuid() == 0, "privileged handoff setup required")
         for name in RLIMITS:
             expected = tuple(resource.RLIM_INFINITY if v == "INFINITY" else v for v in value["rlimits"][name])
-            require(resource.getrlimit(getattr(resource, "RLIMIT_" + name)) == expected, "inherited RLIMIT drift")
+            require(resource.getrlimit(linux_rlimit_id(resource, name, sys.platform)) == expected, "inherited RLIMIT drift")
         require(sorted(os.sched_getaffinity(0)) == value["cpu_affinity"]
                 and os.getpriority(os.PRIO_PROCESS, 0) == value["nice"], "inherited scheduling drift")
         libc = ctypes.CDLL(None, use_errno=True)
@@ -1006,7 +1023,7 @@ def validate_execution_scope(receipt, evidence):
         require(scope == {"status": "NOT_GRANTED"}, "portable evidence must not possess live grant")
         return
     exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256"), "live scope coverage")
-    require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 218, "live grant must postdate implementation")
+    require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 220, "live grant must postdate implementation")
     require(scope["host_id"] == receipt["host_id"] and scope["attempt"] == evidence["attempt"]
             and scope["operations"] == [a.name for a in plan(evidence["attempt"])]
             and scope["adapter_manifest_sha256"] == digest(canonical_json(receipt["adapter_manifest"])), "live grant evidence binding")
