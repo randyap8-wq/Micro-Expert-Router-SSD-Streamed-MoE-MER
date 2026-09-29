@@ -586,12 +586,13 @@ class PinnedNvml:
 
 def observe_host_identity(io, host_id):
     io.check()
-    import uuid
     uname = os.uname()
     require(uname.sysname == "Linux" and uname.release == NUMA_ABI["kernel"]
             and uname.machine == "x86_64", "target kernel/architecture mismatch")
     boot = io.text("/proc/sys/kernel/random/boot_id").strip()
-    require(str(uuid.UUID(boot)) == boot, "boot ID format")
+    require(len(boot) == 36 and all(c == "-" if i in (8, 13, 18, 23)
+                                  else c in "0123456789abcdef" for i, c in enumerate(boot)),
+            "boot ID format")
     machine_id = io.text("/etc/machine-id").strip()
     require(len(machine_id) == 32 and all(c in "0123456789abcdef" for c in machine_id), "machine ID format")
     observed = digest(canonical_json({"machine_id": machine_id, "boot_id": boot,

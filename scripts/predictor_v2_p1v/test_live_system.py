@@ -1,6 +1,7 @@
 """Software-only P1V5 tests. No valid external live grant is created."""
 
 import ast
+import builtins
 import copy
 import ctypes
 import importlib
@@ -1055,6 +1056,135 @@ class IntegrationAdmissionTests(unittest.TestCase):
              patch("os.open", return_value=100), patch("os.fstat", return_value=info), patch("os.close"), \
              patch("os.read", side_effect=AssertionError("unadmitted report read")), self.assertRaises(InvalidEvidence):
             obj.raw_reports(obj.attempt)
+
+
+class HostIdentityHermeticityTests(unittest.TestCase):
+    boot = "11111111-2222-3333-4444-555555555555"
+    fixture_host_id = "f85e708067ebddffffef7de70b872fceb3f2d0c86d7e386a2c50f666204bb884"
+
+    def observe(self, boot, machine_id="a" * 32, host_id=None):
+        host = Mock()
+        host.text.side_effect = [boot + "\n", machine_id + "\n"]
+        uname = SimpleNamespace(sysname="Linux", release="6.8.0-1069-gcp", machine="x86_64")
+        if host_id is None:
+            host_id = digest(canonical_json({"machine_id": machine_id, "boot_id": boot,
+                                            "kernel": uname.release, "machine": uname.machine}))
+        with patch("os.uname", return_value=uname):
+            return ls.observe_host_identity(host, host_id)
+
+    def test_canonical_lowercase_without_version_or_variant_restrictions(self):
+        for boot in (self.boot, "abcdef01-2345-6789-abcd-ef0123456789",
+                     "00000000-0000-0000-0000-000000000000",
+                     "ffffffff-ffff-ffff-ffff-ffffffffffff"):
+            with self.subTest(boot=boot):
+                self.assertEqual(self.observe(boot), boot)
+
+    def test_malformed_boot_ids_reject_before_machine_read(self):
+        boot = "abcdef01-2345-6789-abcd-ef0123456789"
+        cases = {"uppercase": boot.upper(), "missing_hyphen": boot.replace("-", "", 1),
+                 "misplaced_hyphen": boot[:7] + "-" + boot[7] + boot[9:],
+                 "extra_hyphen": boot[:8] + "-" + boot[8:],
+                 "nonhex": "g" + boot[1:], "truncated": boot[:-1], "extended": boot + "0",
+                 "braced": "{" + boot + "}", "internal_space": boot[:20] + " " + boot[21:],
+                 "internal_tab": boot[:20] + "\t" + boot[21:],
+                 "internal_newline": boot[:20] + "\n" + boot[21:], "empty": ""}
+        for name, value in cases.items():
+            host = Mock()
+            host.text.return_value = value + "\n"
+            with self.subTest(case=name), patch("os.uname", return_value=SimpleNamespace(
+                    sysname="Linux", release="6.8.0-1069-gcp", machine="x86_64")), \
+                    self.assertRaisesRegex(InvalidEvidence, "boot ID format"):
+                ls.observe_host_identity(host, "fixture")
+            host.text.assert_called_once_with("/proc/sys/kernel/random/boot_id")
+
+    def test_every_position_requires_exact_hyphen_or_lowercase_hex(self):
+        for index in range(36):
+            replacements = ("0", "a", " ") if index in (8, 13, 18, 23) else ("-", "A", "G", "g", " ", "\u0661")
+            for char in replacements:
+                boot = self.boot[:index] + char + self.boot[index + 1:]
+                with self.subTest(index=index, char=char), self.assertRaisesRegex(InvalidEvidence, "boot ID format"):
+                    self.observe(boot)
+
+    def test_machine_id_remains_exact_lowercase_hex(self):
+        for machine_id in ("a" * 32, "0123456789abcdef" * 2):
+            with self.subTest(machine_id=machine_id):
+                self.assertEqual(self.observe(self.boot, machine_id), self.boot)
+        for machine_id in ("", "a" * 31, "a" * 33, "A" * 32, "g" + "a" * 31,
+                           "a" * 15 + "-" + "a" * 16, "a" * 15 + " " + "a" * 16,
+                           "{" + "a" * 30 + "}", self.boot):
+            with self.subTest(machine_id=machine_id), self.assertRaisesRegex(InvalidEvidence, "machine ID format"):
+                self.observe(self.boot, machine_id)
+
+    def test_existing_fixture_digest_is_unchanged(self):
+        self.assertEqual(self.observe(self.boot, host_id=self.fixture_host_id), self.boot)
+        self.assertEqual(self.observe(" \t" + self.boot + "\n", "\t" + "a" * 32 + " ",
+                                      self.fixture_host_id), self.boot)
+
+    def test_changed_identity_still_rejects_original_digest(self):
+        for boot, machine_id in (("0" + self.boot[1:], "a" * 32), (self.boot, "b" * 32)):
+            with self.subTest(boot=boot, machine_id=machine_id), \
+                    self.assertRaisesRegex(InvalidEvidence, "host ID/grant mismatch"):
+                self.observe(boot, machine_id, self.fixture_host_id)
+
+    def test_denied_check_precedes_uname_and_text(self):
+        host = Mock()
+        host.check.side_effect = InvalidEvidence("denied")
+        with patch("os.uname", side_effect=AssertionError("host observation before check")) as uname, \
+                self.assertRaisesRegex(InvalidEvidence, "denied"):
+            ls.observe_host_identity(host, self.fixture_host_id)
+        uname.assert_not_called()
+        host.text.assert_not_called()
+
+    def test_check_uname_boot_machine_order(self):
+        events = []
+        host = Mock()
+        host.check.side_effect = lambda: events.append("check")
+        values = {"/proc/sys/kernel/random/boot_id": self.boot + "\n", "/etc/machine-id": "a" * 32 + "\n"}
+        def text(path):
+            events.append(path)
+            return values[path]
+        def uname():
+            events.append("uname")
+            return SimpleNamespace(sysname="Linux", release="6.8.0-1069-gcp", machine="x86_64")
+        host.text.side_effect = text
+        with patch("os.uname", side_effect=uname):
+            self.assertEqual(ls.observe_host_identity(host, self.fixture_host_id), self.boot)
+        self.assertEqual(events, ["check", "uname", "/proc/sys/kernel/random/boot_id", "/etc/machine-id"])
+
+    def test_kernel_or_architecture_mismatch_precedes_text(self):
+        for field, value in (("sysname", "Darwin"), ("release", "other"), ("machine", "aarch64")):
+            host = Mock()
+            uname = SimpleNamespace(sysname="Linux", release="6.8.0-1069-gcp", machine="x86_64")
+            setattr(uname, field, value)
+            with self.subTest(field=field), patch("os.uname", return_value=uname), \
+                    self.assertRaisesRegex(InvalidEvidence, "target kernel/architecture mismatch"):
+                ls.observe_host_identity(host, self.fixture_host_id)
+            host.text.assert_not_called()
+
+    def test_observation_needs_no_runtime_imports(self):
+        for release in ("6.8.0-1069-gcp", "other"):
+            host = Mock()
+            host.text.side_effect = [self.boot + "\n", "a" * 32 + "\n"]
+            uname = SimpleNamespace(sysname="Linux", release=release, machine="x86_64")
+            with self.subTest(release=release), patch("os.uname", return_value=uname):
+                if release == "other":
+                    with self.assertRaisesRegex(InvalidEvidence, "target kernel/architecture mismatch"):
+                        with patch("builtins.__import__", side_effect=AssertionError("incidental runtime import")):
+                            ls.observe_host_identity(host, self.fixture_host_id)
+                    host.text.assert_not_called()
+                else:
+                    with patch("builtins.__import__", side_effect=AssertionError("incidental runtime import")):
+                        observed = ls.observe_host_identity(host, self.fixture_host_id)
+                    self.assertEqual(observed, self.boot)
+
+    def test_import_does_not_discover_host_or_import_uuid(self):
+        original_import = builtins.__import__
+        def guarded_import(name, *args, **kwargs):
+            self.assertNotIn(name.split(".")[0], ("uuid", "platform"))
+            return original_import(name, *args, **kwargs)
+        with patch("os.uname", side_effect=AssertionError("import-time host discovery")), \
+                patch("builtins.__import__", side_effect=guarded_import):
+            importlib.reload(ls)
 
 
 class HostIdentityTests(unittest.TestCase):
