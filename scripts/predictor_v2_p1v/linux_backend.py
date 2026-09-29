@@ -437,7 +437,9 @@ class LinuxBackend(FutureBackend):
         s, before = self.system, evidence["receipts"]
         if name == "AUTHORITY":
             r = self._observe("authority")
-            self.baseline.compare(r.pop("launch_observed"))
+            require("launch_observed" not in r, "AUTHORITY forbids child launch observation")
+            # The approved manifest is prospective; only CONFINEMENT observes
+            # the exact stopped handoff child and compares its full launch state.
             require(r.pop("execution_closure") == self.closure, "observed trusted execution closure drift")
             require(r.pop("adapter_manifest") == self.manifest, "observed adapter/dependency pins drift")
             require(r["host_id"] == self.host_id, "grant/observed host mismatch")

@@ -35,7 +35,7 @@ PROTECTED_P1V_FILES = {
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "e9127e5295d331daaf7cca062bc21b0fd4e2b9a628bc9368b305c0baf01ca344",
     "test_p1v.py": "5eb76dc68c62919e2246ab5a55ada47bec73268e0965906a9a191bda626c31b6",
-    "linux_backend.py": "c2ed3699ec399fd6847ffcc1c2d8a44bd9a961a70799ef77b24a0c89fd2ee5a5",
+    "linux_backend.py": "6d248e09e07a8fb9e87b768ab287acb21ddf7ba9f84fd649decf896efe4e6a69",
 }
 REQUIRED_P1V_FILES = frozenset(PROTECTED_P1V_FILES) | {"test_linux_backend.py"}
 OPTIONAL_P1V5_FILES = frozenset({"live_system.py", "test_live_system.py",
@@ -72,7 +72,7 @@ class FixtureSystem:
                         "host_mount_id": 100, "private_mount_id": 200,
                         "mount_flags": 1024, "mount_data": "synthetic-original-ext4-options", "alias_flags": 1024}
         self.observations = {
-            "authority": {**self.receipts["AUTHORITY"], "launch_observed": launch_fixture()},
+            "authority": self.receipts["AUTHORITY"],
             "exclusion": self.receipts["EXCLUSION"], "topology": self.receipts["TOPOLOGY"],
             "roles": {"guardian_original_namespace": True, "worker_single_threaded": True,
                       "initial_user_namespace": True, "worker_privileged": True},
@@ -184,6 +184,208 @@ class AdapterTests(unittest.TestCase):
 
     def run_backend(self, backend):
         return Supervisor(backend, "p1v-fixture").run()
+
+    def test_authority_returns_prospective_manifest_without_child_observation(self):
+        backend = self.make()
+        self.assertNotIn("launch_observed", backend.system.observations["authority"])
+        with patch.object(lb.LaunchManifest, "compare", side_effect=AssertionError("premature child observation")):
+            receipt = backend._perform("AUTHORITY", {"receipts": {}})
+        self.assertEqual(receipt["launch_manifest"], launch_fixture())
+        self.assertEqual(receipt["adapter_manifest"], adapter_fixture())
+        self.assertEqual(receipt["execution_closure"], closure_fixture())
+        self.assertEqual(receipt["execution_grant"], {"status": "NOT_GRANTED"})
+        self.assertNotIn("launch_observed", receipt)
+        self.assertIsNone(backend.child)
+        self.assertEqual(backend.system.calls, [("observe:authority",)])
+
+    def test_authority_rejects_even_exact_or_empty_launch_observed(self):
+        for observed in (launch_fixture(), {}, None, False):
+            with self.subTest(observed=observed):
+                backend = self.make()
+                backend.system.observations["authority"]["launch_observed"] = observed
+                with patch.object(lb.LaunchManifest, "compare", side_effect=AssertionError("must reject presence")):
+                    with self.assertRaisesRegex(InvalidEvidence, "AUTHORITY forbids child launch observation"):
+                        backend.perform(plan("p1v-fixture")[0], {"attempt": "p1v-fixture", "receipts": {}})
+                self.assertTrue(backend.failed)
+                self.assertEqual(backend.done, [])
+                self.assertIsNone(backend.child)
+                self.assertEqual(backend.system.calls, [("observe:authority",)])
+
+    def test_authority_rejects_privileged_setup_credentials_as_launch_receipt(self):
+        observed = launch_fixture()
+        observed["credentials"] = {"uid": 0, "gid": 0, "groups": [0]}
+        backend = self.phase_failure("AUTHORITY", "authority", {"launch_observed": observed})
+        self.assertEqual(backend.system.calls, [("observe:authority",)])
+        self.assertIsNone(backend.child)
+
+    def test_authority_still_rejects_closure_dependency_and_host_drift(self):
+        closure = closure_fixture()
+        closure["source_commit"] = "0" * 40
+        manifest = adapter_fixture()
+        manifest["dependencies"]["python"] = "0" * 64
+        for field, value in (("execution_closure", closure), ("adapter_manifest", manifest),
+                             ("host_id", "other-host")):
+            with self.subTest(field=field):
+                backend = self.phase_failure("AUTHORITY", "authority", {field: value})
+                self.assertEqual(backend.system.calls, [("observe:authority",)])
+        for field in ("inputs_verified", "outputs_absent", "marker_absent", "frozen_environment", "frozen_limits"):
+            with self.subTest(field=field):
+                self.phase_failure("AUTHORITY", "authority", {field: False})
+
+    def test_invalid_prospective_manifest_rejected_before_any_observation(self):
+        variants = []
+        for field in ("uid", "gid"):
+            bad = launch_fixture()
+            bad["credentials"][field] = 0
+            variants.append(bad)
+        bad = launch_fixture()
+        del bad["rlimits"]["LOCKS"]
+        variants.append(bad)
+        bad = launch_fixture()
+        bad["environment"]["complete"] = False
+        variants.append(bad)
+        bad = launch_fixture()
+        bad["adapter_pins"]["python"] = "invalid"
+        variants.append(bad)
+        for baseline in variants:
+            with self.subTest(baseline=baseline):
+                backend = self.make()
+                with self.assertRaises(InvalidEvidence):
+                    lb.LaunchManifest.parse(baseline)
+                with self.assertRaises(InvalidEvidence):
+                    lb.validate_adapter_manifest(adapter_fixture(), baseline, closure_fixture())
+                with self.assertRaises(InvalidEvidence):
+                    lb.LinuxBackend(backend.system, backend.journal, baseline, adapter_fixture(), closure_fixture(),
+                                    host_id="synthetic-host", attempt="p1v-fixture",
+                                    fixture_reader_factory=backend.reader_factory)
+                self.assertEqual(backend.system.calls, [])
+
+    def confinement_failure(self, changes, absent=()):
+        backend = self.phase_failure("CONFINEMENT", "confinement", changes, absent)
+        self.assertEqual(backend.child, 1234)
+        self.assertEqual(backend.system.calls[-1], ("observe:confinement",))
+        self.assertNotIn("MARKER", backend.done)
+        self.assertNotIn("parent_once", [c[0] for c in backend.system.calls])
+        self.assertEqual(backend.created_readers, [])
+        return backend
+
+    def test_confinement_rejects_other_or_probe_pid_even_with_exact_manifest(self):
+        for pid in (1235, 9999):
+            with self.subTest(pid=pid):
+                self.confinement_failure({"handoff_pid": pid, "launch_observed": launch_fixture()})
+
+    def test_confinement_requires_strict_stopped_true(self):
+        for stopped in (False, 1, None, "true"):
+            with self.subTest(stopped=stopped):
+                self.confinement_failure({"handoff_stopped": stopped})
+
+    def test_confinement_requires_actual_launch_observed(self):
+        self.confinement_failure({}, ("launch_observed",))
+
+    def test_confinement_preserves_namespace_and_cgroup_binding(self):
+        for field in ("namespace_id", "cgroup_id"):
+            with self.subTest(field=field):
+                self.confinement_failure({field: "other"})
+
+    def test_confinement_rejects_each_wrong_actual_uid_gid_and_groups(self):
+        for field in ("uids", "gids"):
+            for index in range(3):
+                for value in (0, 1001):
+                    actual = [1000] * 3
+                    actual[index] = value
+                    with self.subTest(field=field, index=index, value=value):
+                        self.confinement_failure({field: actual})
+        for groups in ([], [0], [1001], [1000, 1001]):
+            with self.subTest(groups=groups):
+                self.confinement_failure({"groups": groups})
+        for field, value in (("uid", 1001), ("gid", 1001), ("groups", [1001])):
+            observed = launch_fixture()
+            observed["credentials"][field] = value
+            with self.subTest(launch_credential=field):
+                self.confinement_failure({"launch_observed": observed})
+
+    def test_confinement_rejects_valid_drift_in_every_full_launch_field(self):
+        changed = launch_fixture()
+        changed["environment"]["values"]["PATH"] = "/other/bin"
+        changed["rlimits"]["LOCKS"] = [1023, 2048]
+        changed["umask"] = 0o077
+        changed["stdio"][0]["backing"] = "other"
+        changed["scheduler"]["attributes"]["priority"] = 1
+        changed["nice"] = 1
+        changed["cpu_affinity"] = [0]
+        changed["io_priority"]["priority"] = 1
+        changed["cpu_policy"]["boost"] = True
+        changed["numa"]["memory_policy"] = "other"
+        changed["thp"]["policy"] = "other"
+        changed["numa_balancing"]["policy"] = "other"
+        changed["resource_domain"]["cpu"]["domain"] = "other"
+        changed["gpu"]["clocks"] = "other-normalization-certificate"
+        changed["cwd"] = "/other"
+        changed["signals"]["mask"] = [1]
+        changed["credentials"]["uid"] = 1001
+        changed["adapter_pins"]["python"] = "0" * 64
+        changed["session"]["session_id"] = 101
+        changed["security_context"]["labels"] = ["other"]
+        self.assertEqual(set(changed), set(lb.LAUNCH_FIELDS))
+        for field in lb.LAUNCH_FIELDS:
+            observed = launch_fixture()
+            observed[field] = changed[field]
+            with self.subTest(field=field):
+                lb.LaunchManifest.parse(observed)
+                self.assertNotEqual(observed[field], launch_fixture()[field])
+                self.confinement_failure({"launch_observed": observed})
+
+    def test_confinement_rejects_drift_in_all_sixteen_rlimits(self):
+        self.assertEqual(len(lb.RLIMITS), 16)
+        self.assertIn("LOCKS", lb.RLIMITS)
+        for limit in lb.RLIMITS:
+            observed = launch_fixture()
+            observed["rlimits"][limit] = [1023, 2048]
+            with self.subTest(limit=limit):
+                self.confinement_failure({"launch_observed": observed})
+
+    def test_prospective_gpu_clock_certificate_requires_exact_confinement_receipt(self):
+        backend = self.make()
+        observed = launch_fixture()
+        observed["gpu"]["clocks"] = "different-actual-normalization-certificate"
+        backend.system.observations["confinement"]["launch_observed"] = observed
+        result = self.run_backend(backend)
+        self.assertEqual(result["failure"]["action"], "CONFINEMENT")
+        self.assertEqual(result["receipts"]["AUTHORITY"]["launch_manifest"]["gpu"]["clocks"],
+                         launch_fixture()["gpu"]["clocks"])
+        self.assertNotIn("MARKER", backend.done)
+        self.assertNotIn("parent_once", [c[0] for c in backend.system.calls])
+
+    def test_full_observation_follows_exact_child_preparation_in_unchanged_action_order(self):
+        backend = self.make()
+        original = backend.system.observe
+
+        def observe(topic):
+            if topic == "authority":
+                self.assertIsNone(backend.child)
+                self.assertNotIn("prepare_child", [c[0] for c in backend.system.calls])
+            if topic == "confinement":
+                self.assertEqual(backend.child, 1234)
+                self.assertEqual(backend.system.calls[-1],
+                                 ("prepare_child", parent_argv("p1v-fixture"), backend.baseline.encoded,
+                                  "synthetic-runtime"))
+            return original(topic)
+
+        backend.system.observe = observe
+        result = self.run_backend(backend)
+        self.assertEqual(result["status"], "PASS_SIMULATION", result.get("failure"))
+        self.assertEqual(backend.done, [
+            "AUTHORITY", "EXCLUSION", "TOPOLOGY", "NAMESPACE", "ALIAS_BIND", "ALIAS_RO", "METADATA",
+            "FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "CONFINEMENT", "MARKER", "P1R_PARENT", "SHUTDOWN",
+            "REVALIDATE", "HASH", "VERIFY", "SEAL", "DEVICE_RW", "FILESYSTEM_RW", "RESTORATION_SEAL", "RELEASE"])
+        calls = backend.system.calls
+        start = calls.index(("observe:cgroup_preflight",))
+        self.assertEqual([c[0] for c in calls[start:start + 4]],
+                         ["observe:cgroup_preflight", "cgroup_create", "prepare_child", "observe:confinement"])
+        self.assertEqual(calls.count(("observe:confinement",)), 1)
+        self.assertEqual(calls.count(("parent_once", 1234)), 1)
+        self.assertEqual(result["receipts"]["CONFINEMENT"]["launch_observed"],
+                         result["receipts"]["AUTHORITY"]["launch_manifest"])
 
     def phase_failure(self, action, topic, changes, absent=()):
         """Inject one observation at the named phase, after earlier gates passed."""
