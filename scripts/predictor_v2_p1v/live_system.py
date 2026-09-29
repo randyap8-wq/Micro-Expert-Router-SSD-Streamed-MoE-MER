@@ -1,4 +1,4 @@
-"""P1V5 direct observations. #217/#223/#224/#225 never authorize execution.
+"""P1V5 direct observations. Live execution requires a future issue >228.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -21,19 +21,19 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 225
+FLOOR = 228
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
           "filesystem_rw", "release")
 PROTECTED = {
-    "__init__.py": "6d7e816042d9bce309517688772e2c3f9bbe32d376781ad3af81da065553e1cf",
+    "__init__.py": "62b51e97eb4ade156236da5fa8f1c4b531203a918f618399fca1c18222a3a1e3",
     "content_hasher.py": "4dae50fa88fa151e03626be8b4cb552fae4c268d523d7110c64070eb194e5ca7",
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "e9127e5295d331daaf7cca062bc21b0fd4e2b9a628bc9368b305c0baf01ca344",
     "test_p1v.py": "5eb76dc68c62919e2246ab5a55ada47bec73268e0965906a9a191bda626c31b6",
     "linux_backend.py": "6d248e09e07a8fb9e87b768ab287acb21ddf7ba9f84fd649decf896efe4e6a69",
-    "test_linux_backend.py": "5f4e78f54535f7d320d9b786fdb5f838e65e886ee86f8796e95a8312de0b7d22",
+    "test_linux_backend.py": "5ad1ba7f901a76fca23fe663ec783e18d584309cb49475828a770f9ffc60a4d7",
 }
 NUMA_ABI = {"schema": "mer.p1v.numa-abi.v1", "architecture": "x86_64",
             "kernel": "6.8.0-1069-gcp", "source_profile": "Linux-v6.8",
@@ -214,7 +214,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #225")
+                "execution authority must follow #228")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -230,7 +230,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #225")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #228")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id

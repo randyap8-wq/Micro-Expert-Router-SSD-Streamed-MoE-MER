@@ -46,7 +46,7 @@ LAUNCHES = (
 EXPECTATIONS = {
     "kernel": "6.8.0-1069-gcp", "data_device": DEVICE,
     "data_major_minor": "259:4", "data_mount": MOUNT, "data_fstype": "ext4",
-    "data_uuid": "5bd529dc-bb64-47f2-9d27-82c3defb0d39",
+    "data_uuid": "b362df64-42eb-4603-a685-c8e5595038ee",
     "configured_data_path": CONFIGURED, "canonical_data_path": CANONICAL,
     "configured_path_alias": "symlink_to_canonical_data_path",
     "root_output_major_minor": "259:1", "expert_size": EXPERT_SIZE,

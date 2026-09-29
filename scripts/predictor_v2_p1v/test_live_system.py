@@ -408,10 +408,10 @@ class BoundaryTests(unittest.TestCase):
             importlib.reload(ls)
 
     def test_current_authorities_cannot_grant(self):
-        for issue in (217, 218, 220, 221, 222, 223, 224, 225):
+        for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #225"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #228"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -994,13 +994,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 226, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 229, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 226, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 229, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -1247,6 +1247,240 @@ class HostIdentityTests(unittest.TestCase):
         with patch.object(obj, "libc", side_effect=AssertionError("task syscall during parent")), \
              self.assertRaisesRegex(InvalidEvidence, "parent"):
             obj.task_policy()
+
+
+class DataFilesystemProfileTests(unittest.TestCase):
+    """Prospective identity only; historical P1V1 payload continuity is unproven.
+
+    Future continuity begins at the newly qualified current filesystem baseline.
+    The historical UUID below is used only as an explicitly rejected fixture.
+    """
+
+    CURRENT = "b362df64-42eb-4603-a685-c8e5595038ee"
+    HISTORICAL_REJECTED = "5bd529dc-bb64-47f2-9d27-82c3defb0d39"
+    WRONG = "11111111-2222-3333-4444-555555555555"
+
+    def test_exact_single_current_uuid_expectation(self):
+        self.assertIs(type(ls.EXPECTATIONS["data_uuid"]), str)
+        self.assertEqual(ls.EXPECTATIONS["data_uuid"], self.CURRENT)
+        self.assertNotEqual(ls.EXPECTATIONS["data_uuid"], self.HISTORICAL_REJECTED)
+        self.assertEqual([k for k in ls.EXPECTATIONS if "uuid" in k], ["data_uuid"])
+
+    def test_ext4_fixture_contains_current_uuid_in_each_phase(self):
+        for recovery in (True, False):
+            with self.subTest(recovery=recovery):
+                value = ls.ext4_superblock(superblock(recovery))
+                self.assertEqual(value["uuid"], self.CURRENT)
+                self.assertIs(value["recovery_required"], recovery)
+
+    def device(self, obj):
+        with patch.object(ls, "major_minor", return_value="259:4"), \
+                patch("os.path.realpath", return_value="/sys/devices/pci/nvme/nvme0/nvme0n1"):
+            return obj._device()
+
+    def test_device_queries_only_exact_current_uuid_alias(self):
+        obj = HostIdentityTests.device_fixture(self)
+        self.assertEqual(self.device(obj)["uuid"], self.CURRENT)
+        self.assertEqual([c.args for c in obj.io.stat.call_args_list],
+                         [("/dev/nvme0n1",), ("/dev/disk/by-uuid/" + self.CURRENT, True)])
+
+    def test_uuid_alias_must_be_block_device(self):
+        for mode in (stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK):
+            obj = HostIdentityTests.device_fixture(self)
+            obj.io.stat.side_effect = [SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=999),
+                                      SimpleNamespace(st_mode=mode, st_rdev=999)]
+            with self.subTest(mode=mode), self.assertRaisesRegex(InvalidEvidence, "UUID device link"):
+                self.device(obj)
+
+    def test_current_alias_must_resolve_to_exact_retained_device(self):
+        obj = HostIdentityTests.device_fixture(self)
+        obj.io.stat.side_effect = [SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=os.makedev(259, 4)),
+                                  SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=os.makedev(259, 1))]
+        with self.assertRaisesRegex(InvalidEvidence, "UUID device link"):
+            self.device(obj)
+
+    def test_historical_alias_cannot_substitute_for_missing_current_alias(self):
+        obj = HostIdentityTests.device_fixture(self)
+        def observed(path, follow=False):
+            if path in ("/dev/nvme0n1", "/dev/disk/by-uuid/" + self.HISTORICAL_REJECTED):
+                return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=999)
+            raise FileNotFoundError(path)
+        obj.io.stat.side_effect = observed
+        with self.assertRaises(FileNotFoundError):
+            self.device(obj)
+        self.assertEqual([c.args for c in obj.io.stat.call_args_list],
+                         [("/dev/nvme0n1",), ("/dev/disk/by-uuid/" + self.CURRENT, True)])
+
+    def health_fixture(self):
+        obj = HostIdentityTests.device_fixture(self)
+        identity = self.device(obj)
+        obj._device = Mock(return_value=identity)
+        obj.backing = {"device_fd": 40, "identity": copy.deepcopy(identity), "private_mount_id": 20}
+        data = bytearray(superblock())
+        obj.io.superblock.side_effect = lambda fd: ls.ext4_superblock(bytes(data))
+        record = {"mount_id": 20, "target": ls.MOUNT, "fstype": "ext4", "major_minor": "259:4",
+                  "mount_ro": False, "superblock_ro": False, "mount_options": ["rw"]}
+        obj._mounts = Mock(return_value=[record])
+        obj.sync_done, obj.ro_transition, obj.rw_transition = True, False, False
+        obj.block_get = Mock(return_value=0)
+        return obj, data, record
+
+    def transition_ro(self, obj, data, record):
+        obj._observe_sync_health()
+        obj.ro_transition = True
+        struct.pack_into("<I", data, 0x60, 0)
+        record.update(mount_ro=True, superblock_ro=True, mount_options=["ro"])
+
+    def test_historical_and_wrong_superblock_uuid_reject(self):
+        for rejected in (self.HISTORICAL_REJECTED, self.WRONG):
+            obj, data, _ = self.health_fixture()
+            data[0x68:0x78] = bytes.fromhex(rejected.replace("-", ""))
+            with self.subTest(uuid=rejected), self.assertRaisesRegex(InvalidEvidence, "same retained ext4 device/UUID"):
+                obj._observe_sync_health()
+
+    def test_current_uuid_passes_all_three_phase_identities(self):
+        obj, data, record = self.health_fixture()
+        self.transition_ro(obj, data, record)
+        self.assertEqual(strict_json(obj.pre_superblock)["uuid"], self.CURRENT)
+        ro = obj._observe_filesystem_ro()
+        self.assertTrue(ro["journal_clean"])
+        self.assertEqual(ro["device_identity"]["uuid"], self.CURRENT)
+        obj.rw_transition = True
+        struct.pack_into("<I", data, 0x60, 4)
+        record.update(mount_ro=False, superblock_ro=False, mount_options=["rw"])
+        rw = obj._observe_filesystem_rw()
+        self.assertEqual(rw["device_identity"], ro["device_identity"])
+        self.assertTrue(rw["recovery_required"])
+        self.assertNotIn("journal_clean", rw)
+
+    def test_pre_ro_to_ro_uuid_drift_rejects(self):
+        for rejected in (self.HISTORICAL_REJECTED, self.WRONG):
+            obj, data, record = self.health_fixture()
+            self.transition_ro(obj, data, record)
+            data[0x68:0x78] = bytes.fromhex(rejected.replace("-", ""))
+            with self.subTest(uuid=rejected), self.assertRaisesRegex(InvalidEvidence, "same retained ext4 device/UUID"):
+                obj._observe_filesystem_ro()
+
+    def test_ro_to_restored_rw_uuid_drift_rejects(self):
+        for rejected in (self.HISTORICAL_REJECTED, self.WRONG):
+            obj, data, record = self.health_fixture()
+            self.transition_ro(obj, data, record)
+            obj._observe_filesystem_ro()
+            obj.rw_transition = True
+            struct.pack_into("<I", data, 0x60, 4)
+            record.update(mount_ro=False, superblock_ro=False)
+            data[0x68:0x78] = bytes.fromhex(rejected.replace("-", ""))
+            with self.subTest(uuid=rejected), self.assertRaisesRegex(InvalidEvidence, "same retained ext4 device/UUID"):
+                obj._observe_filesystem_rw()
+
+    def test_same_device_and_private_mount_equality_still_exact(self):
+        for field in ("path", "major_minor", "disk_sequence", "sysfs_identity"):
+            obj, _, _ = self.health_fixture()
+            obj._device.return_value[field] = "changed"
+            with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "same retained ext4 device/UUID"):
+                obj._health()
+        obj, _, record = self.health_fixture()
+        record["mount_id"] += 1
+        with self.assertRaisesRegex(InvalidEvidence, "private ext4 mount identity"):
+            obj._health()
+
+    def test_all_phase_receipts_require_current_uuid(self):
+        from .supervisor import receipt_gate
+        from .test_p1v import encode_raw, fake_content, raw_fixture, receipts
+        fixture = receipts(encode_raw(raw_fixture()), fake_content())
+        for action in ("FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW", "FILESYSTEM_RW"):
+            self.assertEqual(fixture[action]["device_identity"]["uuid"], self.CURRENT)
+            receipt_gate(action, fixture[action], {"receipts": fixture})
+            for rejected in (self.HISTORICAL_REJECTED, self.WRONG):
+                bad = copy.deepcopy(fixture[action])
+                bad["device_identity"]["uuid"] = rejected
+                with self.subTest(action=action, uuid=rejected), self.assertRaises(InvalidEvidence):
+                    receipt_gate(action, bad, {"receipts": fixture})
+
+    def test_refreshed_hash_propagation_and_other_protected_pins(self):
+        from .test_linux_backend import PROTECTED_P1V_FILES
+        root = Path(ls.__file__).parent
+        expected_init = "62b51e97eb4ade156236da5fa8f1c4b531203a918f618399fca1c18222a3a1e3"
+        self.assertEqual(digest((root / "__init__.py").read_bytes()), expected_init)
+        self.assertEqual(PROTECTED_P1V_FILES["__init__.py"], expected_init)
+        self.assertEqual(ls.PROTECTED, {**PROTECTED_P1V_FILES,
+            "test_linux_backend.py": digest((root / "test_linux_backend.py").read_bytes())})
+
+    def test_package_witness_rejects_restoring_historical_uuid(self):
+        from .test_linux_backend import PackageScopeWitnessTests, assert_package_scope
+        root = PackageScopeWitnessTests.package_fixture(self)
+        path = root / "__init__.py"
+        self.assertIn(self.CURRENT, path.read_text())
+        path.write_text(path.read_text().replace(self.CURRENT, self.HISTORICAL_REJECTED))
+        with self.assertRaisesRegex(AssertionError, "protected SHA256: __init__.py"):
+            assert_package_scope(self, root)
+
+    def test_no_historical_uuid_fallback_or_uuid_repair_in_production(self):
+        root = Path(ls.__file__).parent
+        for name in ("__init__.py", "live_system.py", "linux_gate.py", "linux_backend.py",
+                     "content_hasher.py", "offline_verify.py", "supervisor.py"):
+            source = (root / name).read_text()
+            with self.subTest(module=name):
+                for forbidden in (self.HISTORICAL_REJECTED, "tune2fs", "e2fsck", "udevadm"):
+                    self.assertNotIn(forbidden, source)
+
+
+class RefreshedAuthorityTests(unittest.TestCase):
+    """Pure synthetic grant checks; no complete external live grant is issued."""
+
+    def scope(self):
+        return {"authority_issue": 229, "host_id": "fixture", "attempt": "p1v-fixture",
+                "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64}
+
+    def test_exact_floor(self):
+        self.assertEqual(ls.FLOOR, 228)
+
+    def test_every_nonnegative_authority_through_228_rejects_before_host_access(self):
+        for issue in range(229):
+            scope = dict(self.scope(), authority_issue=issue)
+            authorization = object.__new__(ls.FutureAuthorization)
+            authorization.issue = issue
+            with self.subTest(issue=issue), patch.object(lb, "require_adapter_grant", side_effect=AssertionError("adapter")):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #228"):
+                    ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
+                with self.assertRaisesRegex(InvalidEvidence, "follow #228"):
+                    ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
+
+    def test_synthetic_229_complete_scope_passes_only_pure_constructor_check(self):
+        receiver, scope = SimpleNamespace(), self.scope()
+        ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
+        self.assertEqual(strict_json(receiver.encoded), scope)
+        # This fake receiver cannot satisfy the exact ProviderGrant type gate.
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 229)
+        with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
+            ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
+
+    def test_synthetic_229_requires_complete_valid_scope(self):
+        for field in self.scope():
+            scope = self.scope()
+            del scope[field]
+            with self.subTest(missing=field), self.assertRaises(InvalidEvidence):
+                ls.ProviderGrant.__init__(SimpleNamespace(), scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
+        for field, invalid in (("authority_issue", True), ("host_id", ""), ("attempt", "../escape"),
+                               ("operations", ["AUTHORITY"]), ("provider_manifest_sha256", "bad")):
+            scope = dict(self.scope(), **{field: invalid})
+            with self.subTest(field=field), self.assertRaises(InvalidEvidence):
+                ls.ProviderGrant.__init__(SimpleNamespace(), scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
+
+    def test_synthetic_229_provider_bindings_and_adapter_grant_still_required(self):
+        provider = bundle_fixture()["provider"]
+        scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 229)
+        # Uninitialized provider receiver only: no adapter grant or live System.
+        receiver = object.__new__(ls.ProviderGrant)
+        receiver.encoded = canonical_json(scope)
+        with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
+            ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
+        for field, mismatch in (("authority_issue", 230), ("host_id", "other"), ("attempt", "p1v-other"),
+                                ("operations", []), ("provider_manifest_sha256", "0" * 64)):
+            receiver.encoded = canonical_json(dict(scope, **{field: mismatch}))
+            with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
+                ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
 
 
 if __name__ == "__main__":

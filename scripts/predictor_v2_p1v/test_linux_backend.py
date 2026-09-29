@@ -30,7 +30,7 @@ from .test_p1v import (FakeReader, PipelineFake, adapter_fixture, closure_fixtur
 
 
 PROTECTED_P1V_FILES = {
-    "__init__.py": "6d7e816042d9bce309517688772e2c3f9bbe32d376781ad3af81da065553e1cf",
+    "__init__.py": "62b51e97eb4ade156236da5fa8f1c4b531203a918f618399fca1c18222a3a1e3",
     "content_hasher.py": "4dae50fa88fa151e03626be8b4cb552fae4c268d523d7110c64070eb194e5ca7",
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "e9127e5295d331daaf7cca062bc21b0fd4e2b9a628bc9368b305c0baf01ca344",
