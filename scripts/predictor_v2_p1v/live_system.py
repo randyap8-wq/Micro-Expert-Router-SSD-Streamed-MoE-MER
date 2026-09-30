@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >228.
+"""P1V5 direct observations. Live execution requires a future issue >230.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -14,26 +14,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import (AUTHORITY, EXPECTATIONS, ALIAS_PARENT, CANONICAL, CONFIGURED,
-               DEVICE, MOUNT, IDS, STARTUP_IDS, SOURCE_FILES, TOOLS,
+               MOUNT, IDS, STARTUP_IDS, SOURCE_FILES, TOOLS,
                FutureAuthorization, InvalidEvidence, canonical_json, digest,
-               path_bytes, require, sha256, strict_json, uint)
+               path_bytes, require, sha256, strict_json, uint, validate_storage_identity,
+               observed_local_ssd_aliases)
 from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 228
+FLOOR = 230
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
           "filesystem_rw", "release")
 PROTECTED = {
-    "__init__.py": "62b51e97eb4ade156236da5fa8f1c4b531203a918f618399fca1c18222a3a1e3",
-    "content_hasher.py": "4dae50fa88fa151e03626be8b4cb552fae4c268d523d7110c64070eb194e5ca7",
+    "__init__.py": "a936eec1bd452981180dd06ad236caf84040ba3d3275a5ad56de5a570228b1be",
+    "content_hasher.py": "dec979b29cb55f0e61afd08173267d338bafe120ebffa98b4305cbaca42f3085",
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
-    "supervisor.py": "e9127e5295d331daaf7cca062bc21b0fd4e2b9a628bc9368b305c0baf01ca344",
-    "test_p1v.py": "5eb76dc68c62919e2246ab5a55ada47bec73268e0965906a9a191bda626c31b6",
-    "linux_backend.py": "6d248e09e07a8fb9e87b768ab287acb21ddf7ba9f84fd649decf896efe4e6a69",
-    "test_linux_backend.py": "5ad1ba7f901a76fca23fe663ec783e18d584309cb49475828a770f9ffc60a4d7",
+    "supervisor.py": "c0f57a524814ae12677af8d42a65fa08b900a10ba183093d6006bdbf5df354f8",
+    "test_p1v.py": "0035021c0532c56d2934ede1e5db976876fd07024d60744039ef6555005752e5",
+    "linux_backend.py": "b67cd701c721157e96c56ffad25ac1abde40dd5508138f0408811531b5c1b484",
+    "test_linux_backend.py": "542dd08c07525070e579f57971d8fe4ce3f669c1abec96aaec53429588cbc535",
 }
 NUMA_ABI = {"schema": "mer.p1v.numa-abi.v1", "architecture": "x86_64",
             "kernel": "6.8.0-1069-gcp", "source_profile": "Linux-v6.8",
@@ -208,21 +209,29 @@ def validate_host_profile(value):
             path_bytes(path)
 
 
+@dataclass(frozen=True, init=False)
 class ProviderGrant:
     """External scope interlock; this implementation issues no grants."""
+    encoded: bytes
+
     def __init__(self, scope, expected_scope_sha256, token, expected_token_sha256):
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
-                             "provider_manifest_sha256"), "provider grant scope")
+                             "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #228")
+                "execution authority must follow #230")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
         sha256(scope["provider_manifest_sha256"])
+        validate_storage_identity(scope["storage_identity"])
         require(digest(canonical_json(scope)) == sha256(expected_scope_sha256), "external provider scope pin")
         require(type(token) is bytes and len(token) >= 32
                 and digest(token) == sha256(expected_token_sha256), "external provider token")
-        self.encoded = canonical_json(scope)
+        object.__setattr__(self, "encoded", canonical_json(scope))
+
+    @property
+    def storage_identity(self):
+        return self.public_scope()["storage_identity"]
 
     def public_scope(self):
         return strict_json(self.encoded)
@@ -230,13 +239,14 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #228")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #230")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
             and scope["attempt"] == attempt and operation in scope["operations"]
             and scope["provider_manifest_sha256"] == digest(canonical_json(provider)), "provider grant mismatch")
     lb.require_adapter_grant(authorization, adapter_grant, host_id, attempt, adapter, operation)
+    require(adapter_grant.storage_identity == provider_grant.storage_identity, "independent storage grants mismatch")
 
 
 @dataclass(frozen=True)
@@ -281,6 +291,11 @@ class DirectLinux:
         require_live(*context, "AUTHORITY")
         require(callable(guard), "provider phase guard required")
         self.context, self.guard = context, guard
+        self._storage_identity = canonical_json(context[2].storage_identity)
+
+    @property
+    def storage_identity(self):
+        return strict_json(self._storage_identity)
 
     def authorize(self):
         require_live(*self.context, "AUTHORITY")
@@ -294,7 +309,7 @@ class DirectLinux:
         require(not str(path).startswith((CANONICAL + "/", CONFIGURED + "/")), "expert payload read forbidden")
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
-            require(major_minor(os.fstat(fd)) != "259:4", "expert backing read forbidden")
+            require(major_minor(os.fstat(fd)) != self.storage_identity["major_minor"], "expert backing read forbidden")
             chunks, size = [], 0
             while True:
                 part = os.read(fd, min(65536, limit + 1 - size))
@@ -389,7 +404,7 @@ class DirectLinux:
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
             before = os.fstat(fd)
-            require(stat.S_ISREG(before.st_mode) and major_minor(before) != "259:4", "dependency must be regular and off expert backing")
+            require(stat.S_ISREG(before.st_mode) and major_minor(before) != self.storage_identity["major_minor"], "dependency must be regular and off expert backing")
             result = hashlib.sha256()
             while True:
                 data = os.read(fd, 1048576)
@@ -658,6 +673,7 @@ class LiveSystem:
                 and type(roles) is lb.ProcessRoles, "reviewed direct process/native implementations required")
         self.context = (authorization, grant, provider_grant, host_id, attempt,
                         copy.deepcopy(manifest), copy.deepcopy(provider_manifest))
+        self._storage_identity = canonical_json(provider_grant.storage_identity)
         self.host_id, self.attempt = host_id, validate_attempt(attempt)
         self.manifest, self.provider, self.closure = map(copy.deepcopy, (manifest, provider_manifest, closure))
         self.baseline = lb.LaunchManifest.parse(baseline)
@@ -682,6 +698,10 @@ class LiveSystem:
         self.original_ns = self.io.namespace(self.worker_pid, "mnt")
         self.initial_user_ns = self.io.namespace(1, "user")
         require(self.io.namespace(self.worker_pid, "user") == self.initial_user_ns, "initial user namespace required")
+    @property
+    def storage_identity(self):
+        return strict_json(self._storage_identity)
+
     def _action(self):
         return self.journal.pending[1] if self.journal.pending else "AUTHORITY"
 
@@ -706,26 +726,43 @@ class LiveSystem:
         return observe_host_identity(self.io, self.host_id)
 
     def _device(self):
-        info = self.io.stat(DEVICE)
-        require(stat.S_ISBLK(info.st_mode) and major_minor(info, True) == "259:4", "exact NVMe block device")
-        sysfs = os.path.realpath("/sys/dev/block/259:4", strict=True)
-        require(sysfs.startswith("/sys/devices/") and Path(sysfs).name == "nvme0n1", "stable NVMe sysfs identity")
-        require(self.io.text(sysfs + "/dev").strip() == "259:4", "sysfs major/minor mismatch")
+        identity = self.storage_identity
+        info = self.io.stat(identity["device_path"])
+        require(stat.S_ISBLK(info.st_mode) and major_minor(info, True) == identity["major_minor"],
+                "exact granted block device")
+        sysfs = os.path.realpath("/sys/dev/block/" + identity["major_minor"], strict=True)
+        require(sysfs == identity["sysfs_identity"], "exact granted sysfs identity")
+        mm = self.io.text(sysfs + "/dev").strip()
+        require(mm == identity["major_minor"], "sysfs major/minor mismatch")
         require(self.io.listdir(sysfs + "/holders") == [] and self.io.listdir(sysfs + "/slaves") == [],
                 "stacked block-device holders/slaves")
-        require(not any(n.startswith("nvme0n1p") for n in self.io.listdir(sysfs)), "overlapping partitions")
+        entries = self.io.listdir(sysfs)
+        require("partition" not in entries, "granted device is a partition")
+        for name in entries:
+            try:
+                self.io.stat(sysfs + "/" + name + "/partition")
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            raise InvalidEvidence("overlapping partitions")
         sequence = int(self.io.text(sysfs + "/diskseq").strip())
-        require(sequence > 0, "disk sequence missing")
-        link = self.io.stat("/dev/disk/by-uuid/" + EXPECTATIONS["data_uuid"], True)
+        require(sequence == identity["disk_sequence"], "exact granted disk sequence")
+        link = self.io.stat("/dev/disk/by-uuid/" + identity["uuid"], True)
         require(stat.S_ISBLK(link.st_mode) and link.st_rdev == info.st_rdev, "ext4 UUID device link")
-        return {"path": DEVICE, "major_minor": major_minor(info, True), "uuid": EXPECTATIONS["data_uuid"],
-                "disk_sequence": sequence, "sysfs_identity": sysfs}
+        aliases = observed_local_ssd_aliases(info.st_rdev, self.io.listdir, lambda p: self.io.stat(p, True))
+        observed = {"device_path": identity["device_path"], "major_minor": major_minor(info, True),
+                    "uuid": identity["uuid"], "disk_sequence": sequence,
+                    "sysfs_identity": sysfs, "by_id_aliases": aliases}
+        require(observed == identity, "observed storage differs from external grant")
+        return observed
 
     def _health(self):
         require(self.backing is not None, "retained backing absent")
         device = self._device()
+        require(self.backing["device_fd"] == self.native.retained_fds["device"]
+                and self.backing["filesystem_fd"] == self.native.retained_fds["filesystem"], "retained descriptor drift")
+        self.native._device(self.backing["device_fd"])
         value = self.io.superblock(self.backing["device_fd"])
-        require(value["uuid"] == device["uuid"] and device == self.backing["identity"], "same retained ext4 device/UUID")
+        require(value["uuid"] == device["uuid"] and device == self.backing["identity"] == self.storage_identity, "same retained ext4 device/UUID")
         record = mount_at(self._mounts(), MOUNT)
         require(record["target"] == MOUNT and record["fstype"] == "ext4"
                 and record["major_minor"] == device["major_minor"]
@@ -831,7 +868,7 @@ class LiveSystem:
             ns = self.io.namespace(pid, "mnt")
             userns = self.io.namespace(pid, "user")
             records = self._mounts(pid)
-            exposing = [r for r in records if r["major_minor"] == "259:4"]
+            exposing = [r for r in records if r["major_minor"] == self.storage_identity["major_minor"]]
             if exposing:
                 require(userns == self.initial_user_ns, "unexpected user namespace exposing protected data")
                 if ns not in (self.original_ns, self.io.namespace(self.worker_pid, "mnt")):
@@ -854,7 +891,7 @@ class LiveSystem:
                 if (stat.S_ISBLK(info.st_mode) or stat.S_ISCHR(info.st_mode)) and (stat.S_IFMT(info.st_mode), info.st_rdev) in raw_nodes:
                     require(own and self.backing is not None and int(fdname) == self.backing["device_fd"],
                             "unexpected raw-device holder")
-                if major_minor(info) == "259:4":
+                if major_minor(info) == self.storage_identity["major_minor"]:
                     fields = dict(line.split(":", 1) for line in self.io.text(f"/proc/{pid}/fdinfo/{fdname}").splitlines()
                                   if ":" in line)
                     flags = int(fields["flags"].strip(), 8)
@@ -863,7 +900,7 @@ class LiveSystem:
             for line in maps.splitlines():
                 parts = line.split(None, 5)
                 require(len(parts) >= 5, "malformed process maps")
-                require(not (parts[3].lower() == "103:04" and "w" in parts[1] and parts[1].endswith("s")),
+                require(not (tuple(int(n, 16) for n in parts[3].split(":")) == tuple(int(n) for n in self.storage_identity["major_minor"].split(":")) and "w" in parts[1] and parts[1].endswith("s")),
                         "shared writable protected-data mapping")
             require(identity == self.io.identity(pid), "process churn during exclusion inventory")
             namespaces[ns] = userns
@@ -938,7 +975,7 @@ class LiveSystem:
         mounts = self._mounts()
         data = mount_at(mounts, MOUNT)
         output = mount_at(mounts, OUTPUT_ROOT)
-        require(data["target"] == MOUNT and data["major_minor"] == "259:4" and data["fstype"] == "ext4"
+        require(data["root"] == "/" and data["target"] == MOUNT and data["major_minor"] == self.storage_identity["major_minor"] and data["fstype"] == "ext4"
                 and not data["mount_ro"] and not data["superblock_ro"], "original ext4 RW mount")
         require(output["major_minor"] == "259:1" and not output["mount_ro"] and not output["superblock_ro"], "output backing")
         require(self.io.link(CONFIGURED) == CANONICAL, "configured alias target")
@@ -960,9 +997,8 @@ class LiveSystem:
         # Every expected constant below is checked against a direct observation.
         require(self.nvml.certificate is not None, "GPU identity transition required")
         gpu = strict_json(self.nvml.certificate)
-        observed = {"kernel": os.uname().release, "data_device": record["source"],
-                    "data_major_minor": record["major_minor"], "data_mount": record["target"],
-                    "data_fstype": record["fstype"], "data_uuid": device["uuid"],
+        observed = {"kernel": os.uname().release, "data_mount": record["target"],
+                    "data_fstype": record["fstype"],
                     "configured_data_path": CONFIGURED, "canonical_data_path": self.io.link(CONFIGURED),
                     "configured_path_alias": "symlink_to_canonical_data_path",
                     "root_output_major_minor": major_minor(self.io.stat(OUTPUT_ROOT)),
@@ -985,7 +1021,7 @@ class LiveSystem:
 
     def _preliminary_health(self, device):
         value = self.io.superblock(self.backing["device_fd"])
-        require(value["uuid"] == device["uuid"] and value["recovery_required"], "original ext4 active journal")
+        require(device == self.storage_identity and value["uuid"] == device["uuid"] and value["recovery_required"], "original ext4 active journal")
         return value["healthy"]
 
     def retain_backing(self):
@@ -1069,7 +1105,7 @@ class LiveSystem:
                     selected = fallback
                     info = os.lstat(selected)
                 identity = Identity.from_stat(info)
-                identity.check()
+                identity.check(self.storage_identity)
                 canonical = os.path.realpath(selected, strict=True)
                 require(canonical == CANONICAL + "/" + selected.rsplit("/", 1)[1], "metadata path escape")
                 for root in (str(Path(CONFIGURED).parent), CANONICAL):
@@ -1287,7 +1323,7 @@ class LiveSystem:
                 if stat.S_ISREG(info.st_mode):
                     entries[path] = {"sha256": self.io.file_hash(path)}
                 elif stat.S_ISDIR(info.st_mode):
-                    require(major_minor(info) != "259:4", "GPU inventory cannot read expert backing")
+                    require(major_minor(info) != self.storage_identity["major_minor"], "GPU inventory cannot read expert backing")
                     contents = {}
                     pending = [path]
                     while pending:

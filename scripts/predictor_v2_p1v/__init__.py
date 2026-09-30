@@ -30,7 +30,6 @@ AUTHORITY = {
 CANONICAL = "/mnt/localssd/data/qwen3-coder-q4"
 CONFIGURED = "/mnt/mer-local-ssd/mer/qwen3-coder-q4"
 ALIAS_PARENT = "/mnt/mer-local-ssd/mer"
-DEVICE = "/dev/nvme0n1"
 MOUNT = "/mnt/localssd"
 EXPERT_SIZE = 2658304
 ALIGN = 4096
@@ -44,9 +43,7 @@ LAUNCHES = (
     (111, 116, 22, 6038),
 )
 EXPECTATIONS = {
-    "kernel": "6.8.0-1069-gcp", "data_device": DEVICE,
-    "data_major_minor": "259:4", "data_mount": MOUNT, "data_fstype": "ext4",
-    "data_uuid": "b362df64-42eb-4603-a685-c8e5595038ee",
+    "kernel": "6.8.0-1069-gcp", "data_mount": MOUNT, "data_fstype": "ext4",
     "configured_data_path": CONFIGURED, "canonical_data_path": CANONICAL,
     "configured_path_alias": "symlink_to_canonical_data_path",
     "root_output_major_minor": "259:1", "expert_size": EXPERT_SIZE,
@@ -122,6 +119,47 @@ def path_bytes(value):
     require(b"\0" not in raw and os.path.normpath(value) == value
             and not value.startswith("//"), "noncanonical path")
     return raw
+
+
+def local_ssd_alias(path):
+    """GCP's whole-device Local SSD aliases; never a wildcard grant."""
+    return type(path) is str and re.fullmatch(
+        r"/dev/disk/by-id/google-local-(?:nvme-)?ssd-(?:0|[1-9][0-9]*)", path) is not None
+
+
+def validate_storage_identity(value):
+    """Pure external-scope validation. No discovery or default identity exists."""
+    require(type(value) is dict and set(value) == {
+        "device_path", "major_minor", "uuid", "disk_sequence", "sysfs_identity", "by_id_aliases"
+    }, "exact storage identity keys required")
+    for field, prefix in (("device_path", "/dev/"), ("sysfs_identity", "/sys/devices/")):
+        path_bytes(value[field])
+        require(value[field].startswith(prefix) and not any(c in value[field] for c in "*?[]"),
+                "storage identity path: " + field)
+    require(type(value["major_minor"]) is str and re.fullmatch(
+        r"(?:0|[1-9][0-9]*):(?:0|[1-9][0-9]*)", value["major_minor"]), "canonical storage major:minor")
+    require(type(value["uuid"]) is str and re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value["uuid"]),
+        "canonical storage UUID")
+    require(type(value["disk_sequence"]) is int and value["disk_sequence"] > 0, "positive storage disk sequence")
+    aliases = value["by_id_aliases"]
+    require(type(aliases) is list and aliases and all(local_ssd_alias(p) for p in aliases),
+            "exact GCP Local SSD by-id aliases required")
+    require(aliases == sorted(set(aliases)), "sorted unique storage by-id aliases required")
+    return value
+
+
+def observed_local_ssd_aliases(rdev, listdir, follow_stat):
+    """Complete matching GCP alias set, observed without opening device data."""
+    aliases = []
+    for name in listdir("/dev/disk/by-id"):
+        path = "/dev/disk/by-id/" + name
+        if local_ssd_alias(path):
+            info = follow_stat(path)
+            require(stat.S_ISBLK(info.st_mode), "Local SSD alias must resolve to block device")
+            if info.st_rdev == rdev:
+                aliases.append(path)
+    return sorted(aliases)
 
 
 def publish_new(path, data, forbidden=()):

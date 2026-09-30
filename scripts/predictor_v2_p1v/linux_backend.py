@@ -1,7 +1,7 @@
 """P1V4 Linux adapter, with injected host observations and syscall interfaces.
 
 #216/#218/#220/#222 authorize implementation, never execution. Nothing happens on import.
-Live integration needs an externally reviewed >222 grant, a complete baseline,
+Live integration needs an externally reviewed >230 grant, a complete baseline,
 root-controlled evidence backing and pinned inspection/process dependencies.
 The trusted runtime premise excludes hostile namespace substitution; it does
 not assert that unprivileged namespace syscalls are universally denied.
@@ -14,9 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from . import (ALIAS_PARENT, AUTHORITY, CANONICAL, CONFIGURED, DEVICE,
+from . import (ALIAS_PARENT, AUTHORITY, CANONICAL, CONFIGURED,
                EXPECTATIONS, MOUNT, InvalidEvidence, canonical_json, digest,
-               path_bytes, require, require_future, sha256, uint)
+               path_bytes, require, require_future, sha256, uint, strict_json,
+               validate_storage_identity, observed_local_ssd_aliases)
 from .content_hasher import Identity, hash_content
 from .supervisor import (HASH_WINDOW, FutureBackend, parent_argv, plan,
                          protection, receipt_gate, validate_attempt)
@@ -196,6 +197,7 @@ def validate_adapter_manifest(manifest, baseline, closure):
     return launch
 
 
+@dataclass(frozen=True, init=False)
 class ExecutionGrant:
     """External interlock, not a signature service. Never issued by this module.
 
@@ -203,17 +205,24 @@ class ExecutionGrant:
     token digest. Secrets are checked then discarded, never serialized. Scope
     pins the adapter/closure/baseline transitively via adapter_manifest_sha256.
     """
+    _scope: bytes
+
     def __init__(self, scope, expected_scope_sha256, token, expected_token_sha256):
-        exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256"), "grant scope")
-        require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 222, "execution authority must follow #222")
+        exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256", "storage_identity"), "grant scope")
+        require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 230, "execution authority must follow #230")
         require(type(scope["host_id"]) is str and scope["host_id"], "grant host")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "explicit full operation scope")
         sha256(scope["adapter_manifest_sha256"])
+        validate_storage_identity(scope["storage_identity"])
         require(digest(canonical_json(scope)) == sha256(expected_scope_sha256), "external scope pin mismatch")
         require(type(token) is bytes and len(token) >= 32
                 and digest(token) == sha256(expected_token_sha256), "external adapter grant required")
-        self._scope = canonical_json(scope)
+        object.__setattr__(self, "_scope", canonical_json(scope))
+
+    @property
+    def storage_identity(self):
+        return self.public_scope()["storage_identity"]
 
     def public_scope(self):
         from . import strict_json
@@ -223,7 +232,7 @@ class ExecutionGrant:
         from . import strict_json
         require_future(authorization)
         scope = strict_json(self._scope)
-        require(authorization.issue == scope["authority_issue"] and authorization.issue > 222,
+        require(authorization.issue == scope["authority_issue"] and authorization.issue > 230,
                 "both authorities must identify the same future issue")
         require(scope["host_id"] == host_id and scope["attempt"] == attempt
                 and scope["adapter_manifest_sha256"] == digest(canonical_json(manifest))
@@ -362,6 +371,8 @@ class LinuxBackend(FutureBackend):
         self.manifest, self.closure = copy.deepcopy(manifest), copy.deepcopy(closure)
         self.host_id, self.attempt = host_id, validate_attempt(attempt)
         self.authorization, self.grant = authorization, grant
+        self.authorize("AUTHORITY")
+        self._storage_identity = canonical_json(grant.storage_identity)
         self.simulated = system.simulated is True
         require(journal.attempt == attempt and journal.fixture == self.simulated, "journal attempt/mode mismatch")
         if not self.simulated:
@@ -375,6 +386,10 @@ class LinuxBackend(FutureBackend):
         self.parent_calls = 0
         self.backing = self.child = self.cgroup = None
         self.raw = None
+
+    @property
+    def storage_identity(self):
+        return strict_json(self._storage_identity)
 
     def authorize(self, operation):
         require_adapter_grant(self.authorization, self.grant, self.host_id, self.attempt, self.manifest, operation)
@@ -390,7 +405,7 @@ class LinuxBackend(FutureBackend):
         return copy.deepcopy(self.system.observe(topic))
 
     def _identity_health_check(self, snapshot):
-        require(snapshot["device_identity"] == self.backing["identity"], "retained device identity drift")
+        require(snapshot["device_identity"] == self.backing["identity"] == self.storage_identity, "retained device identity drift")
         require(snapshot["private_mount_id"] == self.backing["private_mount_id"], "private mount identity drift")
         require(snapshot["healthy"] is True and snapshot["external_journal"] is False,
                 "filesystem health/internal journal uncertain")
@@ -444,7 +459,8 @@ class LinuxBackend(FutureBackend):
             require(r.pop("adapter_manifest") == self.manifest, "observed adapter/dependency pins drift")
             require(r["host_id"] == self.host_id, "grant/observed host mismatch")
             r.update(adapter_manifest=self.manifest, launch_manifest=self.baseline.values(), execution_closure=self.closure,
-                     execution_grant={"status": "NOT_GRANTED"} if self.simulated else self.grant.public_scope())
+                     execution_grant={"status": "NOT_GRANTED", "storage_identity": self.storage_identity}
+                     if self.simulated else self.grant.public_scope())
             return r
         if name == "EXCLUSION":
             s.acquire_exclusion()
@@ -456,11 +472,10 @@ class LinuxBackend(FutureBackend):
             b = self.backing
             exact_keys(b, ("device_fd", "filesystem_fd", "identity", "host_mount_id", "private_mount_id",
                            "mount_flags", "mount_data", "alias_flags"), "retained backing coverage")
-            exact_keys(b["identity"], ("path", "major_minor", "uuid", "disk_sequence", "sysfs_identity"), "device identity")
-            require(b["identity"]["path"] == DEVICE and b["identity"]["major_minor"] == "259:4"
-                    and b["identity"]["uuid"] == EXPECTATIONS["data_uuid"]
-                    and b["identity"]["disk_sequence"] == r["disk_sequence"]
-                    and b["identity"]["sysfs_identity"], "retained exact nvme identity")
+            validate_storage_identity(b["identity"])
+            require(b["identity"] == self.storage_identity
+                    and b["identity"]["disk_sequence"] == r["disk_sequence"], "retained exact grant storage identity")
+            require(r["device_identity"] == self.storage_identity, "observed topology storage grant mismatch")
             require(b["host_mount_id"] == r["mount_id"], "original mount identity")
             for key in ("device_fd", "filesystem_fd", "mount_flags", "alias_flags"):
                 uint(b[key])
@@ -566,15 +581,16 @@ class LinuxBackend(FutureBackend):
         if name == "HASH":
             require(self.done[-3:] == ["P1R_PARENT", "SHUTDOWN", "REVALIDATE"], "hash lifecycle prerequisite")
             self._protected()
+            storage_identity = self.storage_identity
             if self.simulated:
                 reader = self.reader_factory()
             else:
                 self.authorize(name)
                 from .content_hasher import LinuxDirectReader
-                reader = LinuxDirectReader(self.authorization, HASH_WINDOW)
+                reader = LinuxDirectReader(self.authorization, HASH_WINDOW, storage_identity)
             pre = {r["global_expert_id"]: (r["selected"], r["canonical"], Identity(**r["identity"]))
                    for r in before["METADATA"]["records"][-6:]}
-            content = hash_content(reader, pre, HASH_WINDOW)
+            content = hash_content(reader, pre, HASH_WINDOW, storage_identity)
             return {"ok": True, "window": copy.deepcopy(HASH_WINDOW), "hasher_stopped": True, "content": content}
         if name == "VERIFY":
             from .offline_verify import verify_reports
@@ -627,8 +643,13 @@ class NativePrimitives:
     def __init__(self, authorization, grant, host_id, attempt, manifest, current_action):
         require_adapter_grant(authorization, grant, host_id, attempt, manifest, "AUTHORITY")
         self.context = (authorization, grant, host_id, attempt, copy.deepcopy(manifest))
+        self._storage_identity = canonical_json(grant.storage_identity)
         self.current_action = current_action
         self.retained_fds = {}
+
+    @property
+    def storage_identity(self):
+        return strict_json(self._storage_identity)
 
     def _check(self, permitted):
         action = self.current_action()
@@ -663,7 +684,8 @@ class NativePrimitives:
         """
         self._check(("TOPOLOGY",))
         require(not self.retained_fds, "retained object reuse")
-        for name, path, directory in (("device", DEVICE, False), ("filesystem", MOUNT, True),
+        identity = self.storage_identity
+        for name, path, directory in (("device", identity["device_path"], False), ("filesystem", MOUNT, True),
                                       ("host_mount_ns", "/proc/self/ns/mnt", False)):
             flags = os.O_RDONLY | os.O_CLOEXEC
             if name != "host_mount_ns":
@@ -671,11 +693,22 @@ class NativePrimitives:
             if directory:
                 flags |= os.O_DIRECTORY
             self.retained_fds[name] = os.open(path, flags)
-        self._device(self.retained_fds["device"])
+        device = self._device(self.retained_fds["device"])
+        path_info = os.lstat(identity["device_path"])
+        require(stat.S_ISBLK(path_info.st_mode) and path_info.st_rdev == device.st_rdev,
+                "retained non-symlink device path binding")
         info = os.fstat(self.retained_fds["filesystem"])
-        require((os.major(info.st_dev), os.minor(info.st_dev)) == (259, 4), "retained filesystem device")
-        expected = os.stat("/dev/disk/by-uuid/" + EXPECTATIONS["data_uuid"])
-        require(stat.S_ISBLK(expected.st_mode) and (os.major(expected.st_rdev), os.minor(expected.st_rdev)) == (259, 4), "UUID device binding")
+        require(stat.S_ISDIR(info.st_mode) and f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}" == identity["major_minor"],
+                "retained filesystem device")
+        for alias in ["/dev/disk/by-uuid/" + identity["uuid"], *identity["by_id_aliases"]]:
+            expected = os.stat(alias)
+            require(stat.S_ISBLK(expected.st_mode) and expected.st_rdev == device.st_rdev, "granted alias device binding")
+        require(observed_local_ssd_aliases(device.st_rdev, os.listdir, os.stat) == identity["by_id_aliases"],
+                "complete retained Local SSD alias set")
+        records = self.mount_snapshot()
+        matches = [r for r in records if r["target"] == MOUNT]
+        require(len(matches) == 1 and matches[0]["major_minor"] == identity["major_minor"]
+                and matches[0]["fstype"] == "ext4" and matches[0]["root"] == "/", "retained exact mount backing")
         return dict(self.retained_fds)
 
     def mount_snapshot(self):
@@ -718,8 +751,12 @@ class NativePrimitives:
         self._result(self._libc().syncfs(fd))
 
     def _device(self, fd):
+        require(fd == self.retained_fds.get("device"), "retained block descriptor only")
         value = os.fstat(fd)
-        require(stat.S_ISBLK(value.st_mode) and (os.major(value.st_rdev), os.minor(value.st_rdev)) == (259, 4), "exact block descriptor")
+        require(stat.S_ISBLK(value.st_mode)
+                and f"{os.major(value.st_rdev)}:{os.minor(value.st_rdev)}" == self.storage_identity["major_minor"],
+                "exact block descriptor")
+        return value
 
     def block_ro(self, fd, read_only):
         action = self._check(("DEVICE_RO", "DEVICE_RW"))
@@ -1031,21 +1068,24 @@ class NativeProcesses:
         os._exit(code)
 
 
-def backing_identity(value, topology):
-    exact_keys(value, ("path", "major_minor", "uuid", "disk_sequence", "sysfs_identity"), "exact retained device identity required")
-    require(value["path"] == DEVICE and value["major_minor"] == EXPECTATIONS["data_major_minor"]
-            and value["uuid"] == EXPECTATIONS["data_uuid"] and value["disk_sequence"] == topology["disk_sequence"]
-            and type(value["sysfs_identity"]) is str and value["sysfs_identity"], "retained nvme topology drift")
+def backing_identity(value, topology, storage_identity):
+    validate_storage_identity(storage_identity)
+    validate_storage_identity(value)
+    require(value == storage_identity, "topology differs from external storage grant")
+    require(value["disk_sequence"] == topology["disk_sequence"], "retained storage topology drift")
 
 
 def validate_execution_scope(receipt, evidence):
     require(type(receipt["host_id"]) is str and receipt["host_id"], "observed host identity required")
     scope = receipt["execution_grant"]
     if evidence["mode"] == "SIMULATED":
-        require(scope == {"status": "NOT_GRANTED"}, "portable evidence must not possess live grant")
+        exact_keys(scope, ("status", "storage_identity"), "synthetic scope coverage")
+        require(scope["status"] == "NOT_GRANTED", "portable evidence must not possess live grant")
+        validate_storage_identity(scope["storage_identity"])
         return
-    exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256"), "live scope coverage")
-    require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 222, "live grant must postdate implementation")
+    exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256", "storage_identity"), "live scope coverage")
+    require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 230, "live grant must postdate implementation")
+    validate_storage_identity(scope["storage_identity"])
     require(scope["host_id"] == receipt["host_id"] and scope["attempt"] == evidence["attempt"]
             and scope["operations"] == [a.name for a in plan(evidence["attempt"])]
             and scope["adapter_manifest_sha256"] == digest(canonical_json(receipt["adapter_manifest"])), "live grant evidence binding")

@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 from . import InvalidEvidence, canonical_json, digest, strict_json
 from . import live_system as ls
 from . import linux_backend as lb
-from .test_p1v import launch_fixture, adapter_fixture, closure_fixture
+from .test_p1v import launch_fixture, adapter_fixture, closure_fixture, storage_fixture, execution_fixture
 
 
 def mask(*nodes):
@@ -58,7 +58,7 @@ def superblock(recovery=True):
     struct.pack_into("<I", data, 0x5C, 4)
     struct.pack_into("<I", data, 0x60, 4 if recovery else 0)
     struct.pack_into("<I", data, 0xE0, 8)
-    data[0x68:0x78] = uuid.UUID(ls.EXPECTATIONS["data_uuid"]).bytes
+    data[0x68:0x78] = uuid.UUID(storage_fixture()["uuid"]).bytes
     return bytes(data)
 
 
@@ -139,6 +139,7 @@ class PolicyTests(unittest.TestCase):
             return 0
         libc.syscall.side_effect = query
         io = object.__new__(ls.DirectLinux)
+        io._storage_identity = canonical_json(storage_fixture())
         io.check = lambda: None
         with patch.object(io, "libc", return_value=libc):
             value = strict_json(io.task_policy())
@@ -148,6 +149,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_direct_query_failure_rejects(self):
         io = object.__new__(ls.DirectLinux)
+        io._storage_identity = canonical_json(storage_fixture())
         io.check = lambda: None
         with patch.object(io, "libc", return_value=SimpleNamespace(syscall=Mock(return_value=-1))):
             with self.assertRaisesRegex(InvalidEvidence, "syscall failure"):
@@ -155,6 +157,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_denied_query_before_library_load(self):
         io = object.__new__(ls.DirectLinux)
+        io._storage_identity = canonical_json(storage_fixture())
         io.check = Mock(side_effect=InvalidEvidence("denied"))
         with patch("ctypes.CDLL", side_effect=AssertionError("live library load")):
             with self.assertRaisesRegex(InvalidEvidence, "denied"):
@@ -173,6 +176,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_snapshot_not_reused_by_provider(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj.child, obj.snapshot, obj.snapshot_consumed = 41, Mock(), True
         with self.assertRaisesRegex(InvalidEvidence, "one exact child"):
             obj._observe_confinement()
@@ -410,8 +414,8 @@ class BoundaryTests(unittest.TestCase):
     def test_current_authorities_cannot_grant(self):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
-                     "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #228"):
+                     "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #230"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -425,12 +429,14 @@ class BoundaryTests(unittest.TestCase):
         for topic in ls.TOPICS:
             self.assertTrue(callable(getattr(ls.LiveSystem, "_observe_" + topic)))
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj._check = lambda: None
         with self.assertRaises(InvalidEvidence):
             obj.observe("unknown")
 
     def test_every_provider_operation_refuses_during_parent(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj.running, obj.failed = True, False
         for topic in ls.TOPICS:
             with self.subTest(topic=topic), self.assertRaisesRegex(InvalidEvidence, "parent"):
@@ -442,6 +448,7 @@ class BoundaryTests(unittest.TestCase):
 
     def test_reports_impossible_before_parent_return(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj._check, obj.returned = lambda: None, False
         with patch("os.open", side_effect=AssertionError("report opened")), self.assertRaises(InvalidEvidence):
             obj.raw_reports("p1v-fixture")
@@ -503,6 +510,7 @@ def plan_fixture():
 class ProviderReceiptTests(unittest.TestCase):
     def base(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj._check = lambda: None
         obj._host = lambda: "fixture-boot"
         obj.attempt, obj.host_id = "p1v-fixture", "fixture-host"
@@ -632,7 +640,8 @@ class ProviderReceiptTests(unittest.TestCase):
     def phase_object(self):
         obj = self.base()
         obj.sync_done, obj.ro_transition, obj.rw_transition = True, False, False
-        obj.backing = {"device_fd": 40, "identity": {"fixture": True}}
+        obj.native = Mock(retained_fds={"device": 40, "filesystem": 41})
+        obj.backing = {"filesystem_fd": 41, "device_fd": 40, "identity": {"fixture": True}}
         obj.block_get = Mock(return_value=0)
         value = {"uuid": "fixture-uuid", "healthy": True, "external_journal": False, "recovery_required": True}
         record = {"mount_id": 20, "mount_ro": False, "superblock_ro": False, "mount_options": ["rw"]}
@@ -709,6 +718,7 @@ class ProviderReceiptTests(unittest.TestCase):
 class ExclusionTests(unittest.TestCase):
     def fixture(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj._check = lambda: None
         obj.exclusion, obj.lock_fd, obj.worker_pid = True, 10, 40
         obj.original_ns, obj.initial_user_ns = "mnt:original", "user:initial"
@@ -791,9 +801,13 @@ class ExclusionTests(unittest.TestCase):
 
 
 class MetadataTests(unittest.TestCase):
-    def metadata(self, variant=None):
+    def metadata(self, variant=None, storage=None, file_storage=None):
+        storage = storage_fixture() if storage is None else storage
+        file_storage = storage if file_storage is None else file_storage
+        major, minor = map(int, file_storage["major_minor"].split(":"))
         from contextlib import ExitStack
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage)
         obj._check = lambda: None
         obj.baseline = lb.LaunchManifest.parse(numa_baseline())
         obj.io = Mock()
@@ -817,7 +831,7 @@ class MetadataTests(unittest.TestCase):
         with ExitStack() as stack:
             for name, result in (("geteuid", 0), ("getegid", 0), ("getgroups", [0]),
                                   ("setgroups", None), ("setegid", None), ("seteuid", None),
-                                  ("open", 100), ("close", None), ("major", 259), ("minor", 4)):
+                                  ("open", 100), ("close", None), ("major", major), ("minor", minor)):
                 stack.enter_context(patch.object(os, name, return_value=result))
             stack.enter_context(patch.object(os, "O_DIRECT", 0x4000, create=True))
             stack.enter_context(patch.object(os, "lstat", side_effect=lstat))
@@ -834,7 +848,7 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual([r["global_expert_id"] for r in records], list(ls.STARTUP_IDS + ls.IDS))
         self.assertTrue(all(r["payload_bytes_read"] == 0 and r["o_direct_retained"] for r in records))
         from .supervisor import metadata_gate
-        metadata_gate(records)
+        metadata_gate(records, storage_fixture())
 
     def test_primary_enoent_permits_exact_fallback(self):
         records = self.metadata("fallback")["records"]
@@ -851,6 +865,7 @@ class MetadataTests(unittest.TestCase):
 
     def test_statx_dioalign_mock_abi(self):
         obj = object.__new__(ls.DirectLinux)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj.check = lambda: None
         def statx(fd, path, flags, requested, out):
             self.assertEqual((fd, path, flags, requested), (100, b"", 0x1000, 0x2000))
@@ -865,6 +880,7 @@ class MetadataTests(unittest.TestCase):
 
     def test_statx_missing_alignment_rejects(self):
         obj = object.__new__(ls.DirectLinux)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj.check = lambda: None
         with patch.object(obj, "libc", return_value=SimpleNamespace(statx=Mock(return_value=0))), self.assertRaises(InvalidEvidence):
             obj.dio_alignment(100)
@@ -873,6 +889,7 @@ class MetadataTests(unittest.TestCase):
 class CgroupTests(unittest.TestCase):
     def fixture(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj._check, obj._host = lambda: None, lambda: "fixture-boot"
         obj.attempt, obj.host_id, obj.worker_pid = "p1v-fixture", "fixture-host", 40
         obj.exclusion, obj.snapshot_consumed = True, False
@@ -966,7 +983,7 @@ class IntegrationAdmissionTests(unittest.TestCase):
              patch.object(ls.DirectLinux, "task_policy", side_effect=AssertionError("early task policy query")), \
              patch("os.getpid", return_value=40), patch("os.getppid", return_value=39), \
              patch("ctypes.CDLL", side_effect=AssertionError("NVML library initialized early")):
-            obj = ls.LiveSystem(authorization=None, grant=None, provider_grant=None, host_id="fixture-host",
+            obj = ls.LiveSystem(authorization=None, grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()), host_id="fixture-host",
                 attempt="p1v-fixture", manifest=bundle["adapter"], provider_manifest=bundle["provider"],
                 baseline=bundle["launch"], closure=bundle["closure"], journal=journal,
                 native=object.__new__(lb.NativePrimitives), processes=object.__new__(lb.NativeProcesses),
@@ -987,32 +1004,34 @@ class IntegrationAdmissionTests(unittest.TestCase):
              patch.object(ls.DirectLinux, "namespace", side_effect=AssertionError("proc observation before code admission")), \
              patch("os.getpid", side_effect=AssertionError("host identity before code admission")), \
              self.assertRaisesRegex(InvalidEvidence, "module hash mismatch"):
-            ls.LiveSystem(authorization=None, grant=None, provider_grant=None, host_id="fixture-host",
+            ls.LiveSystem(authorization=None, grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()), host_id="fixture-host",
                 attempt="p1v-fixture", manifest=bundle["adapter"], provider_manifest=bundle["provider"],
                 baseline=bundle["launch"], closure=bundle["closure"], journal=SimpleNamespace(pending=None),
                 native=object.__new__(lb.NativePrimitives), processes=object.__new__(lb.NativeProcesses),
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 229, "host_id": "fixture", "attempt": "p1v-fixture",
-                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64}
+        scope = {"authority_issue": 231, "host_id": "fixture", "attempt": "p1v-fixture",
+                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 229, "host_id": "fixture", "attempt": "p1v-fixture",
-                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64}
+        scope = {"authority_issue": 231, "host_id": "fixture", "attempt": "p1v-fixture",
+                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
 
     def test_nvml_guard_rejects_parent_before_library_calls(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj.running, obj.failed = True, False
         with self.assertRaisesRegex(InvalidEvidence, "parent"):
             obj._gpu_check()
 
     def report_object(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj._check = lambda: None
         obj.returned, obj.attempt = True, "p1v-fixture"
         obj.baseline = lb.LaunchManifest.parse(numa_baseline())
@@ -1207,10 +1226,11 @@ class HostIdentityTests(unittest.TestCase):
 
     def device_fixture(self):
         obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj.io = Mock()
         obj.io.stat.return_value = SimpleNamespace(st_mode=stat.S_IFBLK | 0o600, st_rdev=999)
-        obj.io.listdir.return_value = []
-        obj.io.text.side_effect = lambda path: "259:4\n" if path.endswith("/dev") else "42\n"
+        obj.io.listdir.side_effect = lambda path: ["google-local-nvme-ssd-0"] if path == "/dev/disk/by-id" else []
+        obj.io.text.side_effect = lambda path: "259:4\n" if path.endswith("/dev") else "1\n"
         return obj
 
     def test_exact_sysfs_device_uuid_link_sequence(self):
@@ -1218,12 +1238,13 @@ class HostIdentityTests(unittest.TestCase):
         with patch.object(ls, "major_minor", return_value="259:4"), \
              patch("os.path.realpath", return_value="/sys/devices/pci/nvme/nvme0/nvme0n1"):
             value = obj._device()
-        self.assertEqual(value["disk_sequence"], 42)
-        self.assertEqual(value["uuid"], ls.EXPECTATIONS["data_uuid"])
-        self.assertEqual(value["path"], "/dev/nvme0n1")
+        self.assertEqual(value["disk_sequence"], 1)
+        self.assertEqual(value["uuid"], storage_fixture()["uuid"])
+        self.assertEqual(value["device_path"], "/dev/nvme0n1")
 
     def test_stacked_device_rejected(self):
         obj = self.device_fixture()
+        obj.io.listdir.side_effect = None
         obj.io.listdir.return_value = ["dm-0"]
         with patch.object(ls, "major_minor", return_value="259:4"), \
              patch("os.path.realpath", return_value="/sys/devices/pci/nvme/nvme0/nvme0n1"), \
@@ -1243,6 +1264,7 @@ class HostIdentityTests(unittest.TestCase):
         provider = object.__new__(ls.LiveSystem)
         provider.running, provider.failed = True, False
         obj = object.__new__(ls.DirectLinux)
+        obj._storage_identity = canonical_json(storage_fixture())
         obj.check = provider._check
         with patch.object(obj, "libc", side_effect=AssertionError("task syscall during parent")), \
              self.assertRaisesRegex(InvalidEvidence, "parent"):
@@ -1261,10 +1283,10 @@ class DataFilesystemProfileTests(unittest.TestCase):
     WRONG = "11111111-2222-3333-4444-555555555555"
 
     def test_exact_single_current_uuid_expectation(self):
-        self.assertIs(type(ls.EXPECTATIONS["data_uuid"]), str)
-        self.assertEqual(ls.EXPECTATIONS["data_uuid"], self.CURRENT)
-        self.assertNotEqual(ls.EXPECTATIONS["data_uuid"], self.HISTORICAL_REJECTED)
-        self.assertEqual([k for k in ls.EXPECTATIONS if "uuid" in k], ["data_uuid"])
+        self.assertIs(type(storage_fixture()["uuid"]), str)
+        self.assertEqual(storage_fixture()["uuid"], self.CURRENT)
+        self.assertNotEqual(storage_fixture()["uuid"], self.HISTORICAL_REJECTED)
+        self.assertFalse({"data_uuid", "data_device", "data_major_minor"} & set(ls.EXPECTATIONS))
 
     def test_ext4_fixture_contains_current_uuid_in_each_phase(self):
         for recovery in (True, False):
@@ -1282,7 +1304,8 @@ class DataFilesystemProfileTests(unittest.TestCase):
         obj = HostIdentityTests.device_fixture(self)
         self.assertEqual(self.device(obj)["uuid"], self.CURRENT)
         self.assertEqual([c.args for c in obj.io.stat.call_args_list],
-                         [("/dev/nvme0n1",), ("/dev/disk/by-uuid/" + self.CURRENT, True)])
+                         [("/dev/nvme0n1",), ("/dev/disk/by-uuid/" + self.CURRENT, True),
+                          (storage_fixture()["by_id_aliases"][0], True)])
 
     def test_uuid_alias_must_be_block_device(self):
         for mode in (stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK):
@@ -1315,7 +1338,8 @@ class DataFilesystemProfileTests(unittest.TestCase):
         obj = HostIdentityTests.device_fixture(self)
         identity = self.device(obj)
         obj._device = Mock(return_value=identity)
-        obj.backing = {"device_fd": 40, "identity": copy.deepcopy(identity), "private_mount_id": 20}
+        obj.native = Mock(retained_fds={"device": 40, "filesystem": 41})
+        obj.backing = {"filesystem_fd": 41, "device_fd": 40, "identity": copy.deepcopy(identity), "private_mount_id": 20}
         data = bytearray(superblock())
         obj.io.superblock.side_effect = lambda fd: ls.ext4_superblock(bytes(data))
         record = {"mount_id": 20, "target": ls.MOUNT, "fstype": "ext4", "major_minor": "259:4",
@@ -1374,7 +1398,7 @@ class DataFilesystemProfileTests(unittest.TestCase):
                 obj._observe_filesystem_rw()
 
     def test_same_device_and_private_mount_equality_still_exact(self):
-        for field in ("path", "major_minor", "disk_sequence", "sysfs_identity"):
+        for field in ("device_path", "major_minor", "disk_sequence", "sysfs_identity", "by_id_aliases"):
             obj, _, _ = self.health_fixture()
             obj._device.return_value[field] = "changed"
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "same retained ext4 device/UUID"):
@@ -1400,7 +1424,7 @@ class DataFilesystemProfileTests(unittest.TestCase):
     def test_refreshed_hash_propagation_and_other_protected_pins(self):
         from .test_linux_backend import PROTECTED_P1V_FILES
         root = Path(ls.__file__).parent
-        expected_init = "62b51e97eb4ade156236da5fa8f1c4b531203a918f618399fca1c18222a3a1e3"
+        expected_init = "a936eec1bd452981180dd06ad236caf84040ba3d3275a5ad56de5a570228b1be"
         self.assertEqual(digest((root / "__init__.py").read_bytes()), expected_init)
         self.assertEqual(PROTECTED_P1V_FILES["__init__.py"], expected_init)
         self.assertEqual(ls.PROTECTED, {**PROTECTED_P1V_FILES,
@@ -1410,8 +1434,8 @@ class DataFilesystemProfileTests(unittest.TestCase):
         from .test_linux_backend import PackageScopeWitnessTests, assert_package_scope
         root = PackageScopeWitnessTests.package_fixture(self)
         path = root / "__init__.py"
-        self.assertIn(self.CURRENT, path.read_text())
-        path.write_text(path.read_text().replace(self.CURRENT, self.HISTORICAL_REJECTED))
+        self.assertNotIn(self.CURRENT, path.read_text())
+        path.write_text(path.read_text() + "\n# forbidden fallback " + self.HISTORICAL_REJECTED)
         with self.assertRaisesRegex(AssertionError, "protected SHA256: __init__.py"):
             assert_package_scope(self, root)
 
@@ -1429,33 +1453,33 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 229, "host_id": "fixture", "attempt": "p1v-fixture",
-                "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64}
+        return {"authority_issue": 231, "host_id": "fixture", "attempt": "p1v-fixture",
+                "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 228)
+        self.assertEqual(ls.FLOOR, 230)
 
-    def test_every_nonnegative_authority_through_228_rejects_before_host_access(self):
-        for issue in range(229):
+    def test_every_nonnegative_authority_through_230_rejects_before_host_access(self):
+        for issue in range(231):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
             with self.subTest(issue=issue), patch.object(lb, "require_adapter_grant", side_effect=AssertionError("adapter")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #228"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #230"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #228"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #230"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_229_complete_scope_passes_only_pure_constructor_check(self):
+    def test_synthetic_231_complete_scope_passes_only_pure_constructor_check(self):
         receiver, scope = SimpleNamespace(), self.scope()
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 229)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 231)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_229_requires_complete_valid_scope(self):
+    def test_synthetic_231_requires_complete_valid_scope(self):
         for field in self.scope():
             scope = self.scope()
             del scope[field]
@@ -1467,20 +1491,177 @@ class RefreshedAuthorityTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(InvalidEvidence):
                 ls.ProviderGrant.__init__(SimpleNamespace(), scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
-    def test_synthetic_229_provider_bindings_and_adapter_grant_still_required(self):
+    def test_synthetic_231_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 229)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 231)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
-        receiver.encoded = canonical_json(scope)
+        object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
         for field, mismatch in (("authority_issue", 230), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
-            receiver.encoded = canonical_json(dict(scope, **{field: mismatch}))
+            object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
                 ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
+
+
+
+class ExternalStorageProviderTests(unittest.TestCase):
+    def grants(self, storage, provider_storage=None):
+        adapter = adapter_fixture()
+        provider = {"synthetic": True}
+        authorization, execution = execution_fixture(storage, adapter)
+        scope = {"authority_issue": 231, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
+                 "storage_identity": storage if provider_storage is None else provider_storage}
+        token = b"synthetic provider storage proof!!" * 2
+        grant = ls.ProviderGrant(scope, digest(canonical_json(scope)), token, digest(token))
+        return authorization, execution, grant, adapter, provider, scope
+
+    def test_cross_grants_equal_before_any_host_access_and_freeze_scope(self):
+        from dataclasses import FrozenInstanceError
+        for second in (False, True):
+            storage = storage_fixture(second)
+            authorization, execution, grant, adapter, provider, scope = self.grants(storage)
+            with patch("os.open", side_effect=AssertionError("host access")), patch("ctypes.CDLL", side_effect=AssertionError("library")):
+                ls.require_live(authorization, execution, grant, "synthetic-host", "p1v-fixture", adapter, provider, "AUTHORITY")
+                context = (authorization, execution, grant, "synthetic-host", "p1v-fixture", adapter, provider)
+                io = ls.DirectLinux(context, lambda: None)
+            scope["storage_identity"]["by_id_aliases"].append("changed")
+            grant.storage_identity["major_minor"] = "1:2"
+            self.assertEqual(execution.storage_identity, grant.storage_identity)
+            self.assertEqual(io.storage_identity, storage_fixture(second))
+            with self.assertRaises(FrozenInstanceError): grant.encoded = b"{}"
+            authorization, execution, grant, adapter, provider, _ = self.grants(storage_fixture(second), storage_fixture(not second))
+            with patch("os.open", side_effect=AssertionError("host access")), patch("ctypes.CDLL", side_effect=AssertionError("library")):
+                with self.assertRaisesRegex(InvalidEvidence, "independent storage grants"):
+                    ls.require_live(authorization, execution, grant, "synthetic-host", "p1v-fixture", adapter, provider, "AUTHORITY")
+                with self.assertRaisesRegex(InvalidEvidence, "independent storage grants"):
+                    ls.LiveSystem(authorization=authorization, grant=execution, provider_grant=grant,
+                                  host_id="synthetic-host", attempt="p1v-fixture", manifest=adapter,
+                                  provider_manifest=provider, baseline={}, closure={}, journal=None,
+                                  native=None, processes=None, roles=None, bootstrap=None)
+
+    def test_provider_constructor_rejects_noncanonical_storage(self):
+        for field in storage_fixture():
+            storage = storage_fixture(); del storage[field]
+            with self.subTest(field=field), self.assertRaises(InvalidEvidence):
+                self.grants(storage_fixture(), storage)
+
+    def device(self, second, variant=None):
+        storage = storage_fixture(second)
+        obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(storage)
+        block = SimpleNamespace(st_mode=stat.S_IFBLK | 0o600, st_rdev=999, mm=storage["major_minor"])
+        obj.io = Mock()
+        def observed(path, follow=False):
+            if path.endswith("/partition"):
+                if variant == "partition": return SimpleNamespace(st_mode=stat.S_IFREG)
+                raise FileNotFoundError(path)
+            info = copy.copy(block)
+            if path == storage["device_path"]:
+                if variant == "rdev": info.mm = "1:2"
+                if variant == "symlink": info.st_mode = stat.S_IFLNK
+            elif "/by-uuid/" in path and variant == "uuid_alias": info.st_rdev += 1
+            elif "/by-id/" in path and variant == "by_id_rdev": info.st_rdev += 1
+            return info
+        def listing(path):
+            if path == "/dev/disk/by-id":
+                return [storage["by_id_aliases"][0].rsplit("/", 1)[1]] + (["google-local-ssd-1"] if variant == "extra_alias" else [])
+            if path.endswith("/holders"): return ["holder"] if variant == "holders" else []
+            if path.endswith("/slaves"): return ["slave"] if variant == "slaves" else []
+            return ["arbitrary-device-child"] if variant == "partition" else (["partition"] if variant == "is_partition" else [])
+        obj.io.stat.side_effect = observed
+        obj.io.listdir.side_effect = listing
+        obj.io.text.side_effect = lambda path: ("1:2" if variant == "sysfs_dev" else storage["major_minor"]) if path.endswith("/dev") else str(storage["disk_sequence"] + int(variant == "diskseq"))
+        with patch.object(ls, "major_minor", side_effect=lambda info, device=False: info.mm), \
+             patch("os.path.realpath", return_value=storage["sysfs_identity"] + ("-changed" if variant == "sysfs" else "")):
+            return obj._device()
+
+    def test_device_checks_every_granted_coordinate_for_both_storage(self):
+        for second in (False, True):
+            self.assertEqual(self.device(second), storage_fixture(second))
+            for variant in ("rdev", "symlink", "sysfs", "sysfs_dev", "diskseq", "uuid_alias", "by_id_rdev", "extra_alias", "holders", "slaves", "partition", "is_partition"):
+                with self.subTest(second=second, variant=variant), self.assertRaises(InvalidEvidence):
+                    self.device(second, variant)
+
+    def test_metadata_checks_provider_storage_for_both_storage_and_cross_rejects(self):
+        from .supervisor import metadata_gate
+        for second in (False, True):
+            storage = storage_fixture(second)
+            records = MetadataTests.metadata(self, storage=storage)["records"]
+            metadata_gate(records, storage)
+            with self.assertRaisesRegex(InvalidEvidence, "wrong expert device"):
+                MetadataTests.metadata(self, storage=storage, file_storage=storage_fixture(not second))
+
+    def test_dynamic_read_dependency_and_gpu_backing_exclusions(self):
+        for second in (False, True):
+            storage = storage_fixture(second)
+            io = object.__new__(ls.DirectLinux)
+            io._storage_identity = canonical_json(storage)
+            io.check = lambda: None
+            with patch("os.open", return_value=40), patch("os.close"), \
+                 patch("os.fstat", return_value=SimpleNamespace(st_mode=stat.S_IFREG)), \
+                 patch.object(ls, "major_minor", return_value=storage["major_minor"]), \
+                 patch("os.read", side_effect=AssertionError("protected payload read")):
+                for method in (io.read, io.file_hash):
+                    with self.subTest(method=method.__name__), self.assertRaisesRegex(InvalidEvidence, "expert backing"):
+                        method("/synthetic/dependency")
+            obj = object.__new__(ls.LiveSystem)
+            obj._storage_identity = canonical_json(storage)
+            obj.io = Mock()
+            obj.io.stat.return_value = SimpleNamespace(st_mode=stat.S_IFDIR)
+            obj.profile = {"gpu_inventory_roots": {g: ["/synthetic/" + g] for g in ("nodes", "libraries", "icds", "layers", "cache")}}
+            with patch.object(ls, "major_minor", return_value=storage["major_minor"]), self.assertRaisesRegex(InvalidEvidence, "expert backing"):
+                obj._gpu_inventory()
+            obj.io.listdir.assert_not_called()
+            obj.io.file_hash.assert_not_called()
+
+    def test_mount_source_spelling_cannot_replace_granted_major_minor(self):
+        for second in (False, True):
+            storage = storage_fixture(second)
+            for source in (storage["device_path"], storage["by_id_aliases"][0], "UUID=" + storage["uuid"]):
+                obj = object.__new__(ls.LiveSystem)
+                obj._storage_identity = canonical_json(storage)
+                obj._host = Mock(return_value="synthetic-boot")
+                obj._device = Mock(return_value=storage)
+                base = {"root": "/", "mount_ro": False, "superblock_ro": False, "mount_options": ["rw", "relatime"], "super_options": ["rw"]}
+                data = dict(base, target=ls.MOUNT, major_minor=storage["major_minor"], fstype="ext4", source=source, mount_id=10)
+                output = dict(base, target="/", major_minor="259:1", fstype="ext4", source="synthetic-root", mount_id=1)
+                obj._mounts = Mock(return_value=[data, output])
+                obj.io = Mock(); obj.io.link.return_value = ls.CANONICAL
+                obj.native = Mock(); obj.native.retain_objects.return_value = {"device": 40, "filesystem": 41}
+                obj._topology_expectations = Mock(return_value={})
+                obj.backing = None
+                self.assertEqual(obj._observe_topology()["device_identity"], storage)
+                obj.backing = None
+                data["major_minor"] = storage_fixture(not second)["major_minor"]
+                with self.assertRaisesRegex(InvalidEvidence, "original ext4 RW mount"):
+                    obj._observe_topology()
+
+    def test_both_storage_ext4_uuid_continuity_pre_ro_through_restored_rw(self):
+        for second in (False, True):
+            storage = storage_fixture(second)
+            obj, data, record = DataFilesystemProfileTests.health_fixture(DataFilesystemProfileTests())
+            obj._storage_identity = canonical_json(storage)
+            obj.backing["identity"] = copy.deepcopy(storage)
+            obj._device.return_value = copy.deepcopy(storage)
+            record["major_minor"] = storage["major_minor"]
+            data[0x68:0x78] = bytes.fromhex(storage["uuid"].replace("-", ""))
+            self.assertTrue(obj._observe_sync_health()["syncfs_ok"])
+            obj.ro_transition = True
+            struct.pack_into("<I", data, 0x60, 0)
+            record.update(mount_ro=True, superblock_ro=True, mount_options=["ro"])
+            self.assertTrue(obj._observe_filesystem_ro()["journal_clean"])
+            obj.rw_transition = True
+            struct.pack_into("<I", data, 0x60, 4)
+            record.update(mount_ro=False, superblock_ro=False, mount_options=["rw"])
+            self.assertTrue(obj._observe_filesystem_rw()["recovery_required"])
+            data[0x68:0x78] = bytes.fromhex(storage_fixture(not second)["uuid"].replace("-", ""))
+            with self.assertRaisesRegex(InvalidEvidence, "same retained ext4 device/UUID"):
+                obj._observe_filesystem_rw()
 
 
 if __name__ == "__main__":

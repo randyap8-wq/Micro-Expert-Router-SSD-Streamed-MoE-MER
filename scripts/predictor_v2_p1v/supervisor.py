@@ -18,9 +18,9 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
-from . import (ALIAS_PARENT, AUTHORITY, CANONICAL, CONFIGURED, DEVICE, EXPECTATIONS,
+from . import (ALIAS_PARENT, AUTHORITY, CANONICAL, CONFIGURED, EXPECTATIONS,
                IDS, MOUNT, STARTUP_IDS, TOOLS, InvalidEvidence, canonical_json,
-               digest, require, require_future, sha256, tool_hashes, uint)
+               digest, require, require_future, sha256, tool_hashes, uint, validate_storage_identity)
 from .content_hasher import Identity, alternatives, verify_content
 
 BIN = "/home/randyap8/predictor-v2-p1r-lineage-fix-linux-gate-20260926T184626Z/cargo-target/release/micro-expert-router"
@@ -70,7 +70,7 @@ def plan(attempt="p1v-plan"):
         Action("FILESYSTEM_RO", "PRE", "normal filesystem-wide ext4 remount; finish journal/writeback while device is writable",
                ("mount", "-o", "remount,ro", MOUNT)),
         Action("DEVICE_RO", "PRE", "only after verified successful filesystem-ro transition",
-               ("blockdev", "--setro", DEVICE)),
+               ("BLKROSET", "retained-externally-granted-device-fd", "ro")),
         Action("PROTECTED", "PRE", "verify superblock/device ro, alias lock, pinned namespace and continuous exclusion"),
         Action("CONFINEMENT", "PRE", "prepare unprivileged child handoff: all UID/GID slots, groups, zero capabilities, no_new_privs, closed setup FDs, trusted execution closure, passive resource-neutral descendant cgroup; NO seccomp; NO added device BPF"),
         Action("MARKER", "PRE", "consume new exclusive one-shot marker; fsync file and parent directory"),
@@ -81,7 +81,7 @@ def plan(attempt="p1v-plan"):
         Action("VERIFY", "POST_SHUTDOWN", "verify immutable report hashes, raw evidence and exact 13 launches; offline derive"),
         Action("SEAL", "POST_SHUTDOWN", "exclusive durable content/derived/enforcement envelope; retain trusted root before restoration"),
         Action("DEVICE_RW", "RESTORE", "only after durable seal; leave filesystem ro",
-               ("blockdev", "--setrw", DEVICE)),
+               ("BLKROSET", "retained-externally-granted-device-fd", "rw")),
         Action("FILESYSTEM_RW", "RESTORE", "only after verified device-rw and filesystem still healthy/ro; restore exact original options",
                ("mount", "-o", "remount,rw", MOUNT)),
         Action("RESTORATION_SEAL", "RESTORE", "append durable restoration record referencing original seal; never rewrite the seal"),
@@ -168,13 +168,14 @@ def protection(receipt):
     require(receipt["expectations"] == EXPECTATIONS, "backing/path drift")
 
 
-def metadata_gate(records):
+def metadata_gate(records, storage_identity):
+    validate_storage_identity(storage_identity)
     require([r["global_expert_id"] for r in records] == list(STARTUP_IDS + IDS), "bounded metadata coverage")
     for record in records:
         g = record["global_expert_id"]
         require(record["selected"] in alternatives(g), "metadata selected path")
         require(record["canonical"] == CANONICAL + "/" + record["selected"].rsplit("/", 1)[1], "metadata escape")
-        Identity(**record["identity"]).check()
+        Identity(**record["identity"]).check(storage_identity)
         require(record["dio_eligible"] is True and record["o_direct_retained"] is True
                 and record["payload_bytes_read"] == 0 and record["redirects"] == []
                 and record["disallowed_features"] == [], "DIO/namespace metadata gate")
@@ -207,7 +208,8 @@ def receipt_gate(name, r, evidence):
         require(r["boot_id"] and r["disk_sequence"] and r["mount_id"] and r["original_mount_options"], "host identity missing")
         require(r["output_major_minor"] == "259:1", "evidence/cache backing mismatch")
         from .linux_backend import backing_identity
-        backing_identity(r["device_identity"], r)
+        backing_identity(r["device_identity"], r,
+                         previous["AUTHORITY"]["execution_grant"]["storage_identity"])
         require(type(r["original_mount_flags"]) is int and type(r["original_alias_flags"]) is int
                 and type(r["original_mount_data"]) is str, "original mount recipe required")
     elif name == "NAMESPACE":
@@ -226,7 +228,7 @@ def receipt_gate(name, r, evidence):
                 and r["symlink_target"] == CANONICAL and r["runtime_cannot_replace"] is True,
                 "configured alias lockdown failed")
     elif name == "METADATA":
-        metadata_gate(r["records"])
+        metadata_gate(r["records"], previous["AUTHORITY"]["execution_grant"]["storage_identity"])
     elif name == "FILESYSTEM_RO":
         require(r["syncfs_checked"] is True and r["mount_ro"] is True, "syncfs and mount-level readback required")
         require(r["superblock_ro"] is True and r["normal_unforced_transition"] is True
@@ -265,7 +267,7 @@ def receipt_gate(name, r, evidence):
                 and previous["SHUTDOWN"]["runtime_tree_empty"] is True, "hash shutdown prerequisites")
         protection(previous["REVALIDATE"])
         require(r["window"] == HASH_WINDOW and r["hasher_stopped"] is True, "hasher lifecycle uncertain")
-        verify_content(r["content"])
+        verify_content(r["content"], previous["AUTHORITY"]["execution_grant"]["storage_identity"])
         selected = previous["METADATA"]["records"][-6:]
         for pre, post in zip(selected, r["content"]["records"]):
             require(pre["selected"] == post["authoritative_selected_path"]

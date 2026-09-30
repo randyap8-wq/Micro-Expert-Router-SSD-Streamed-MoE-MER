@@ -1,6 +1,6 @@
 """Portable P1V4 validation: synthetic interfaces and temporary evidence only.
 
-No valid adapter execution grant is created anywhere in this suite. Native
+Only synthetic adapter scopes are constructed for pure simulated tests. Native
 entry points use rejection tests or fake receivers with fully mocked syscalls.
 """
 
@@ -26,16 +26,16 @@ from .supervisor import (FutureBackend, Supervisor, parent_argv, plan,
                          validate_enforcement)
 from .test_p1v import (FakeReader, PipelineFake, adapter_fixture, closure_fixture,
                       confinement_fixture, encode_raw, fake_content,
-                      launch_fixture, raw_fixture, receipts)
+                      launch_fixture, raw_fixture, receipts, storage_fixture, execution_fixture)
 
 
 PROTECTED_P1V_FILES = {
-    "__init__.py": "62b51e97eb4ade156236da5fa8f1c4b531203a918f618399fca1c18222a3a1e3",
-    "content_hasher.py": "4dae50fa88fa151e03626be8b4cb552fae4c268d523d7110c64070eb194e5ca7",
+    "__init__.py": "a936eec1bd452981180dd06ad236caf84040ba3d3275a5ad56de5a570228b1be",
+    "content_hasher.py": "dec979b29cb55f0e61afd08173267d338bafe120ebffa98b4305cbaca42f3085",
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
-    "supervisor.py": "e9127e5295d331daaf7cca062bc21b0fd4e2b9a628bc9368b305c0baf01ca344",
-    "test_p1v.py": "5eb76dc68c62919e2246ab5a55ada47bec73268e0965906a9a191bda626c31b6",
-    "linux_backend.py": "6d248e09e07a8fb9e87b768ab287acb21ddf7ba9f84fd649decf896efe4e6a69",
+    "supervisor.py": "c0f57a524814ae12677af8d42a65fa08b900a10ba183093d6006bdbf5df354f8",
+    "test_p1v.py": "0035021c0532c56d2934ede1e5db976876fd07024d60744039ef6555005752e5",
+    "linux_backend.py": "b67cd701c721157e96c56ffad25ac1abde40dd5508138f0408811531b5c1b484",
 }
 REQUIRED_P1V_FILES = frozenset(PROTECTED_P1V_FILES) | {"test_linux_backend.py"}
 OPTIONAL_P1V5_FILES = frozenset({"live_system.py", "test_live_system.py",
@@ -56,9 +56,10 @@ def assert_package_scope(test, root):
 class FixtureSystem:
     simulated = True
 
-    def __init__(self, raw, content):
+    def __init__(self, raw, content, storage_identity=None):
+        storage_identity = storage_fixture() if storage_identity is None else storage_identity
         self.raw = copy.deepcopy(raw)
-        self.receipts = receipts(raw, content)
+        self.receipts = receipts(raw, content, storage_identity)
         self.calls = []
         self.ro = 0
         self.fail = None
@@ -67,8 +68,7 @@ class FixtureSystem:
         self.started, self.finish = threading.Event(), threading.Event()
         self.finish.set()
         self.backing = {"device_fd": 40, "filesystem_fd": 41,
-                        "identity": {"path": lb.DEVICE, "major_minor": "259:4", "uuid": EXPECTATIONS["data_uuid"],
-                                     "disk_sequence": 1, "sysfs_identity": "synthetic-nvme"},
+                        "identity": copy.deepcopy(storage_identity),
                         "host_mount_id": 100, "private_mount_id": 200,
                         "mount_flags": 1024, "mount_data": "synthetic-original-ext4-options", "alias_flags": 1024}
         self.observations = {
@@ -177,8 +177,10 @@ class AdapterTests(unittest.TestCase):
             self.assertFalse(system.running)
             return FakeReader()
 
+        authorization, grant = execution_fixture()
         backend = lb.LinuxBackend(system, journal, launch_fixture(), adapter_fixture(), closure_fixture(),
-                                  host_id="synthetic-host", attempt="p1v-fixture", fixture_reader_factory=reader)
+                                  host_id="synthetic-host", attempt="p1v-fixture", authorization=authorization,
+                                  grant=grant, fixture_reader_factory=reader)
         backend.created_readers = created
         return backend
 
@@ -193,7 +195,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(receipt["launch_manifest"], launch_fixture())
         self.assertEqual(receipt["adapter_manifest"], adapter_fixture())
         self.assertEqual(receipt["execution_closure"], closure_fixture())
-        self.assertEqual(receipt["execution_grant"], {"status": "NOT_GRANTED"})
+        self.assertEqual(receipt["execution_grant"], {"status": "NOT_GRANTED", "storage_identity": storage_fixture()})
         self.assertNotIn("launch_observed", receipt)
         self.assertIsNone(backend.child)
         self.assertEqual(backend.system.calls, [("observe:authority",)])
@@ -825,9 +827,9 @@ class EnforcementTests(unittest.TestCase):
         token = b"synthetic implementation authority only" * 2
         for issue in (215, 216, 217, 218, 219, 220, 221, 222):
             scope = {"authority_issue": issue, "host_id": "synthetic", "attempt": "p1v-fixture",
-                     "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64}
+                     "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
             # All supplied pins match: the issue boundary itself must reject.
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #222"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #230"):
                 lb.ExecutionGrant(scope, digest(canonical_json(scope)), token, digest(token))
 
     def test_import_no_effect_and_no_shell_or_native_invocation(self):
@@ -1102,8 +1104,8 @@ class MountAndScopeTests(unittest.TestCase):
 
     def test_later_grant_requires_scope_and_matching_external_token(self):
         # Deliberately invalid: this suite never creates a valid live grant.
-        scope = {"authority_issue": 223, "host_id": "synthetic", "attempt": "p1v-fixture",
-                 "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64}
+        scope = {"authority_issue": 231, "host_id": "synthetic", "attempt": "p1v-fixture",
+                 "operations": [a.name for a in plan()], "adapter_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "external adapter grant required"):
             lb.ExecutionGrant(scope, digest(canonical_json(scope)), b"invalid" * 10, "0" * 64)
         for key in scope:
@@ -1277,7 +1279,7 @@ class ReleaseExecBoundaryTests(unittest.TestCase):
         authorization = FutureAuthorization(token, digest(token), 218)
         scope = {'authority_issue': 218, 'host_id': 'synthetic', 'attempt': 'p1v-fixture',
                  'operations': [a.name for a in plan()],
-                 'adapter_manifest_sha256': digest(canonical_json(adapter_fixture()))}
+                 'adapter_manifest_sha256': digest(canonical_json(adapter_fixture())), 'storage_identity': storage_fixture()}
         # Fake serialized input only; never an ExecutionGrant instance.
         class StoredScope:
             _scope = canonical_json(scope)
@@ -1463,7 +1465,7 @@ class RlimitCompatibilityTests(unittest.TestCase):
             authorization = FutureAuthorization(token, digest(token), issue)
             scope = {"authority_issue": issue, "host_id": "synthetic", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan()],
-                     "adapter_manifest_sha256": digest(canonical_json(manifest))}
+                     "adapter_manifest_sha256": digest(canonical_json(manifest)), "storage_identity": storage_fixture()}
             stored = SimpleNamespace(_scope=canonical_json(scope))  # Never a live ExecutionGrant.
             with self.subTest(issue=issue):
                 with self.assertRaisesRegex(InvalidEvidence, "same future issue"):
@@ -1475,9 +1477,9 @@ class RlimitCompatibilityTests(unittest.TestCase):
     def test_later_authorities_must_match_without_issuing_live_grant(self):
         token = b"synthetic legacy seam only" * 2
         manifest = adapter_fixture()
-        scope = {"authority_issue": 223, "host_id": "synthetic", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 231, "host_id": "synthetic", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan()],
-                 "adapter_manifest_sha256": digest(canonical_json(manifest))}
+                 "adapter_manifest_sha256": digest(canonical_json(manifest)), "storage_identity": storage_fixture()}
         stored = SimpleNamespace(_scope=canonical_json(scope))
         for issue in (220, 221, 222, 224):
             with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "same future issue"):
@@ -1485,7 +1487,7 @@ class RlimitCompatibilityTests(unittest.TestCase):
                                         "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
         # The pure unbound check accepts matching later scope; this fake receiver
         # still cannot pass require_adapter_grant's exact ExecutionGrant type gate.
-        authorization = FutureAuthorization(token, digest(token), 223)
+        authorization = FutureAuthorization(token, digest(token), 231)
         lb.ExecutionGrant.check(stored, authorization, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             lb.require_adapter_grant(authorization, stored, "synthetic", "p1v-fixture", manifest, "P1R_PARENT")
@@ -1578,6 +1580,139 @@ class PackageScopeWitnessTests(unittest.TestCase):
         root = self.package_fixture()
         (root / "test_linux_backend.py").write_bytes(b"# Authorized witness change.\n")
         assert_package_scope(self, root)
+
+
+
+class ExternalStorageAdapterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.raw = encode_raw(raw_fixture())
+
+    def make(self, observed, granted=None):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        content = fake_content(observed)
+        system = FixtureSystem(self.raw, content, observed)
+        authorization, grant = execution_fixture(observed if granted is None else granted)
+        backend = lb.LinuxBackend(system, lb.DurableJournal(directory.name, "p1v-fixture", fixture=directory),
+                                  launch_fixture(), adapter_fixture(), closure_fixture(), host_id="synthetic-host",
+                                  attempt="p1v-fixture", authorization=authorization, grant=grant,
+                                  fixture_reader_factory=lambda: FakeReader(observed))
+        return backend
+
+    def test_complete_adapter_content_restore_pipeline_for_both_grants(self):
+        from .content_hasher import verify_content
+        for second in (False, True):
+            storage = storage_fixture(second)
+            backend = self.make(storage)
+            result = Supervisor(backend, "p1v-fixture").run()
+            self.assertEqual(result["status"], "PASS_SIMULATION", result.get("failure"))
+            for phase in ("TOPOLOGY", "FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "DEVICE_RW", "FILESYSTEM_RW"):
+                self.assertEqual(result["receipts"][phase]["device_identity"], storage)
+            self.assertEqual(backend.grant.storage_identity, backend.storage_identity)
+            self.assertEqual(result["receipts"]["AUTHORITY"]["execution_grant"]["storage_identity"], storage)
+            content = result["receipts"]["HASH"]["content"]
+            verify_content(content, storage)
+            with self.assertRaises(InvalidEvidence):
+                verify_content(content, storage_fixture(not second))
+            self.assertEqual([c for c in backend.system.calls if c[0] == "block_ro"],
+                             [("block_ro", 40, True), ("block_ro", 40, False)])
+
+    def test_old_grant_new_storage_and_new_grant_old_storage_reject(self):
+        for second in (False, True):
+            backend = self.make(storage_fixture(second), storage_fixture(not second))
+            result = Supervisor(backend, "p1v-fixture").run()
+            self.assertEqual(result["status"], "FAIL")
+            self.assertEqual(result["failure"]["action"], "TOPOLOGY")
+            self.assertEqual(backend.storage_identity, storage_fixture(not second))
+            self.assertFalse(any(c[0] == "parent_once" for c in backend.system.calls))
+
+    def test_every_identity_coordinate_drift_rejects_through_restoration(self):
+        for second in (False, True):
+            storage, other = storage_fixture(second), storage_fixture(not second)
+            for phase in ("filesystem_ro", "device_ro", "protected", "device_rw", "filesystem_rw"):
+                for field in storage:
+                    with self.subTest(second=second, phase=phase, field=field):
+                        backend = self.make(storage)
+                        receipt = backend.system.observations[phase]
+                        self.assertIn("device_identity", receipt)
+                        replacement = other[field] if other[field] != storage[field] else ["/dev/disk/by-id/google-local-ssd-1"]
+                        receipt["device_identity"][field] = replacement
+                        result = Supervisor(backend, "p1v-fixture").run()
+                        self.assertEqual(result["status"], "FAIL")
+                        self.assertEqual(backend.storage_identity, storage)
+
+    def test_backend_hash_passes_identical_grant_object_to_reader_and_hasher(self):
+        from . import content_hasher as ch
+        backend = self.make(storage_fixture(True))
+        evidence = {"receipts": backend.system.receipts}
+        backend.done = ["P1R_PARENT", "SHUTDOWN", "REVALIDATE"]
+        backend.simulated = False
+        reader = Mock()
+        with patch.object(backend, "_protected"), patch.object(ch, "LinuxDirectReader", return_value=reader) as factory, \
+             patch.object(lb, "hash_content", return_value={}) as hashed:
+            backend._perform("HASH", evidence)
+        self.assertIs(factory.call_args.args[2], hashed.call_args.args[3])
+        self.assertEqual(factory.call_args.args[2], backend.grant.storage_identity)
+
+    def test_execution_grant_storage_is_frozen_and_constructor_validates(self):
+        from dataclasses import FrozenInstanceError
+        for second in (False, True):
+            storage = storage_fixture(second)
+            _, grant = execution_fixture(storage)
+            storage["by_id_aliases"].append("bad")
+            grant.storage_identity["major_minor"] = "9:9"
+            self.assertEqual(grant.storage_identity, storage_fixture(second))
+            with self.assertRaises(FrozenInstanceError):
+                grant._scope = b"{}"
+            with self.assertRaises(InvalidEvidence):
+                execution_fixture(storage)
+
+    def native_retention(self, second, variant=None):
+        import stat
+        storage = storage_fixture(second)
+        authorization, grant = execution_fixture(storage)
+        native = lb.NativePrimitives(authorization, grant, "synthetic-host", "p1v-fixture", adapter_fixture(), lambda: "TOPOLOGY")
+        major, minor = map(int, storage["major_minor"].split(":"))
+        rdev = (major << 32) | minor
+        block = SimpleNamespace(st_mode=stat.S_IFBLK | 0o600, st_rdev=rdev)
+        filesystem = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_dev=rdev)
+        mount = {"target": lb.MOUNT, "major_minor": storage["major_minor"], "fstype": "ext4", "root": "/"}
+        path = copy.copy(block)
+        if variant == "symlink": path.st_mode = stat.S_IFLNK
+        if variant == "filesystem": filesystem.st_dev += 1
+        if variant == "rdev": block.st_rdev += 1
+        if variant == "mount": mount["major_minor"] = "1:2"
+        def follow(alias):
+            return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=rdev + int(variant == "alias"))
+        aliases = [p.rsplit("/", 1)[1] for p in storage["by_id_aliases"]]
+        if variant == "extra_alias": aliases.append("google-local-ssd-1")
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(os, "geteuid", return_value=0))
+            opened = stack.enter_context(patch.object(os, "open", side_effect=[40, 41, 42]))
+            stack.enter_context(patch.object(os, "fstat", side_effect=lambda fd: block if fd == 40 else filesystem))
+            stack.enter_context(patch.object(os, "lstat", return_value=path))
+            stack.enter_context(patch.object(os, "stat", side_effect=follow))
+            stack.enter_context(patch.object(os, "listdir", return_value=aliases))
+            stack.enter_context(patch.object(os, "major", side_effect=lambda n: n >> 32))
+            stack.enter_context(patch.object(os, "minor", side_effect=lambda n: n & 0xffffffff))
+            stack.enter_context(patch.object(native, "mount_snapshot", return_value=[mount]))
+            result = native.retain_objects()
+            self.assertEqual(opened.call_args_list[0].args[0], storage["device_path"])
+            self.assertTrue(opened.call_args_list[0].args[1] & os.O_NOFOLLOW)
+            with self.assertRaisesRegex(InvalidEvidence, "reuse"):
+                native.retain_objects()
+            with self.assertRaisesRegex(InvalidEvidence, "retained block"):
+                native._device(99)
+            self.assertEqual(opened.call_count, 3)
+            return result
+
+    def test_native_retains_granted_path_rdev_aliases_mount_for_both_storage(self):
+        for second in (False, True):
+            self.assertEqual(self.native_retention(second), {"device": 40, "filesystem": 41, "host_mount_ns": 42})
+            for variant in ("symlink", "filesystem", "rdev", "mount", "alias", "extra_alias"):
+                with self.subTest(second=second, variant=variant), self.assertRaises(InvalidEvidence):
+                    self.native_retention(second, variant)
 
 
 if __name__ == "__main__":

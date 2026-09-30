@@ -30,11 +30,36 @@ from .supervisor import (ALIAS_PARENT, HASH_WINDOW, FakeBackend, FutureBackend,
                          Supervisor, main, parent_argv, plan, receipt_gate, validate_enforcement)
 
 
+def storage_fixture(second=False):
+    """Two synthetic externally pinned instances; never host discovery."""
+    return {"device_path": "/dev/nvme7n1" if second else "/dev/nvme0n1",
+            "major_minor": "260:9" if second else "259:4",
+            "uuid": "8340f2e2-6ac5-45cc-80e3-a987c8fc0cab" if second else "b362df64-42eb-4603-a685-c8e5595038ee",
+            "disk_sequence": 72 if second else 1,
+            "sysfs_identity": "/sys/devices/pci/nvme/nvme7/nvme7n1" if second else "/sys/devices/pci/nvme/nvme0/nvme0n1",
+            "by_id_aliases": ["/dev/disk/by-id/google-local-nvme-ssd-0"]}
+
+
+def execution_fixture(identity=None, manifest=None, host="synthetic-host", attempt="p1v-fixture"):
+    """Pure synthetic scope construction, used only with simulated interfaces."""
+    from . import FutureAuthorization
+    from .linux_backend import ExecutionGrant
+    scope = {"authority_issue": 231, "host_id": host, "attempt": attempt,
+             "operations": [a.name for a in plan(attempt)],
+             "adapter_manifest_sha256": digest(canonical_json(manifest or adapter_fixture())),
+             "storage_identity": storage_fixture() if identity is None else identity}
+    token = b"synthetic pure validation only!!!" * 2
+    return (FutureAuthorization(token, digest(token), 231),
+            ExecutionGrant(scope, digest(canonical_json(scope)), token, digest(token)))
+
+
 class FakeReader:
-    def __init__(self):
+    def __init__(self, storage_identity=None):
+        self.storage_identity = storage_fixture() if storage_identity is None else copy.deepcopy(storage_identity)
+        major, minor = map(int, self.storage_identity["major_minor"].split(":"))
         self.identities = {}
         for g in STARTUP_IDS + IDS:
-            self.identities[alternatives(g)[0]] = Identity(259, 4, 10000 + g, EXPERT_SIZE,
+            self.identities[alternatives(g)[0]] = Identity(major, minor, 10000 + g, EXPERT_SIZE,
                                                         stat.S_IFREG | 0o400, 1, 100, 100)
         self.trace, self.opened = [], set()
         self.error, self.short, self.direct, self.drift, self.path_drift = None, False, True, False, False
@@ -75,12 +100,12 @@ class FakeReader:
 
 
 def pre_metadata(reader):
-    return {g: resolve(reader, g) for g in IDS}
+    return {g: resolve(reader, g, reader.storage_identity) for g in IDS}
 
 
-def fake_content():
-    reader = FakeReader()
-    return hash_content(reader, pre_metadata(reader), HASH_WINDOW)
+def fake_content(storage_identity=None):
+    reader = FakeReader(storage_identity)
+    return hash_content(reader, pre_metadata(reader), HASH_WINDOW, reader.storage_identity)
 
 
 def word(start=10, end=None, *data):
@@ -341,12 +366,13 @@ def confinement_fixture():
             "launch_observed": launch_fixture(), "resource_domain_observed": launch_fixture()["resource_domain"]}
 
 
-def receipts(raw, content):
+def receipts(raw, content, storage_identity=None):
+    storage_identity = storage_fixture() if storage_identity is None else copy.deepcopy(storage_identity)
     protection = {"ok": True, "expectations": EXPECTATIONS, "filesystem_ro": True, "device_ro": True,
                   "alias_locked": True, "exclusion_held": True, "namespace_pinned": True,
                   "healthy": True, "no_uncontrolled_aliases": True, "namespace_id": "synthetic-ns",
-                  "boot_id": "synthetic-boot", "disk_sequence": 1, "mount_id": 100}
-    reader = FakeReader()
+                  "boot_id": "synthetic-boot", "disk_sequence": storage_identity["disk_sequence"], "mount_id": 100}
+    reader = FakeReader(storage_identity)
     metadata = [{"global_expert_id": g, "selected": alternatives(g)[0],
                  "canonical": reader.canonical(alternatives(g)[0]), "identity": asdict(reader.identities[alternatives(g)[0]]),
                  "dio_eligible": True, "o_direct_retained": True, "payload_bytes_read": 0,
@@ -357,12 +383,12 @@ def receipts(raw, content):
                       "argv": list(parent_argv("p1v-fixture")),
                       "adapter_manifest": adapter_fixture(), "launch_manifest": launch_fixture(),
                       "execution_closure": closure_fixture(), "host_id": "synthetic-host",
-                      "execution_grant": {"status": "NOT_GRANTED"}},
+                      "execution_grant": {"status": "NOT_GRANTED", "storage_identity": copy.deepcopy(storage_identity)}},
         "EXCLUSION": {"ok": True, "held": True, "trusted_host": True, "uncontrolled_writers": [], "raw_holders": [], "uncontrolled_mount_namespaces": []},
         "TOPOLOGY": {"ok": True, "expectations": EXPECTATIONS, "filesystem_rw": True, "device_rw": True,
                      "healthy": True, "external_journal": False, "stacked_or_overlapping_devices": [],
                      "uncontrolled_aliases": [], "writes_on_data_backing": [], "boot_id": "synthetic-boot",
-                     "disk_sequence": 1, "mount_id": 100, "original_mount_options": ["rw", "relatime"], "output_major_minor": "259:1"},
+                     "disk_sequence": storage_identity["disk_sequence"], "mount_id": 100, "original_mount_options": ["rw", "relatime"], "output_major_minor": "259:1"},
         "NAMESPACE": {"ok": True, "private_recursive": True, "initial_user_namespace": True,
                       "references_pinned": True, "namespace_id": "synthetic-ns"},
         "ALIAS_BIND": {"ok": True, "path": ALIAS_PARENT, "private_bind": True},
@@ -390,8 +416,7 @@ def receipts(raw, content):
         "RESTORATION_SEAL": {"ok": True, "durable": True, "exclusive": True},
         "RELEASE": {"ok": True, "released": True},
     }
-    device_identity = {"path": "/dev/nvme0n1", "major_minor": "259:4", "uuid": EXPECTATIONS["data_uuid"],
-                       "disk_sequence": 1, "sysfs_identity": "synthetic-nvme"}
+    device_identity = storage_identity
     result["TOPOLOGY"].update(device_identity=device_identity, original_mount_flags=1024,
                               original_mount_data="synthetic-original-ext4-options", original_alias_flags=1024)
     result["NAMESPACE"].update(original_namespace_id="synthetic-original-ns", original_mount_id=100, private_mount_id=200)
@@ -587,7 +612,7 @@ class SupervisorTests(FixtureTests):
         with self.assertRaises(InvalidEvidence):
             FutureBackend(None, lambda *_: None, lambda *_: None)
         with self.assertRaises(InvalidEvidence):
-            LinuxDirectReader(None, HASH_WINDOW)
+            LinuxDirectReader(None, HASH_WINDOW, storage_fixture())
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             main(["--execute"])
         backend = self.backend()
@@ -612,7 +637,7 @@ class SupervisorTests(FixtureTests):
 class HasherTests(unittest.TestCase):
     def test_exact_full_bytes_six_ids_and_root_encoding(self):
         reader = FakeReader()
-        content = hash_content(reader, pre_metadata(reader), HASH_WINDOW)
+        content = hash_content(reader, pre_metadata(reader), HASH_WINDOW, reader.storage_identity)
         self.assertEqual([r["global_expert_id"] for r in content["records"]], list(IDS))
         self.assertEqual(len(reader.trace), 6 * (EXPERT_SIZE // ALIGN))
         expected = bytearray(b"MER-P1V-CONTENT-v1\0\x06\0\0\0")
@@ -637,7 +662,7 @@ class HasherTests(unittest.TestCase):
             before = pre_metadata(reader)
             setattr(reader, flag, flag != "direct")
             with self.subTest(flag=flag), self.assertRaises(InvalidEvidence):
-                hash_content(reader, before, HASH_WINDOW)
+                hash_content(reader, before, HASH_WINDOW, reader.storage_identity)
             self.assertEqual(reader.opened, set())
 
     def test_direct_error_no_retry(self):
@@ -645,7 +670,7 @@ class HasherTests(unittest.TestCase):
         before = pre_metadata(reader)
         with patch.object(reader, "read_direct", side_effect=OSError("direct EINVAL")) as read:
             with self.assertRaises(OSError):
-                hash_content(reader, before, HASH_WINDOW)
+                hash_content(reader, before, HASH_WINDOW, reader.storage_identity)
             self.assertEqual(read.call_count, 1)
         self.assertEqual(reader.opened, set())
 
@@ -655,40 +680,40 @@ class HasherTests(unittest.TestCase):
             primary = alternatives(IDS[0])[0]
             reader.identities[primary] = replace(reader.identities[primary], **{field: value})
             with self.subTest(field=field), self.assertRaises(InvalidEvidence):
-                resolve(reader, IDS[0])
+                resolve(reader, IDS[0], reader.storage_identity)
         for error in (PermissionError("denied"), OSError("I/O failure")):
             reader = FakeReader()
             reader.error = error
             with self.assertRaises(OSError):
-                resolve(reader, IDS[0])
+                resolve(reader, IDS[0], reader.storage_identity)
         reader = FakeReader()
         primary, fallback = alternatives(IDS[0])
         reader.identities[fallback] = reader.identities.pop(primary)
-        self.assertEqual(resolve(reader, IDS[0])[0], fallback)
+        self.assertEqual(resolve(reader, IDS[0], reader.storage_identity)[0], fallback)
         reader.identities[primary] = reader.identities[fallback]
-        self.assertEqual(resolve(reader, IDS[0])[0], primary)
+        self.assertEqual(resolve(reader, IDS[0], reader.storage_identity)[0], primary)
 
     def test_hash_window_and_coverage_failures(self):
         for key in HASH_WINDOW:
             reader = FakeReader()
             bad = dict(HASH_WINDOW, **{key: False})
             with self.assertRaises(InvalidEvidence):
-                hash_content(reader, pre_metadata(reader), bad)
+                hash_content(reader, pre_metadata(reader), bad, reader.storage_identity)
             self.assertEqual(reader.trace, [])
         reader = FakeReader()
         before = pre_metadata(reader)
         before.pop(IDS[-1])
         with self.assertRaises(InvalidEvidence):
-            hash_content(reader, before, HASH_WINDOW)
+            hash_content(reader, before, HASH_WINDOW, reader.storage_identity)
 
     def test_ledger_order_extra_missing_corruption(self):
         content = fake_content()
         for records in (content["records"][::-1], content["records"][:-1], content["records"] + content["records"][:1]):
             with self.assertRaises(InvalidEvidence):
-                encode_ledger(records)
+                encode_ledger(records, storage_fixture())
         for key, value in (("content_root", "f" * 64), ("ledger_hex", "00"), ("buffered_fallback", True)):
             with self.assertRaises(InvalidEvidence):
-                verify_content(dict(content, **{key: value}))
+                verify_content(dict(content, **{key: value}), storage_fixture())
 
 
 class VerifierTests(FixtureTests):
@@ -905,6 +930,185 @@ class PublicationTests(unittest.TestCase):
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                     self.assertNotIn(node.func.attr, ("system", "popen", "Popen", "execv", "execve"))
+
+
+
+class ExternalStorageContentTests(unittest.TestCase):
+    def test_canonical_schema_rejects_malformed_and_fallback_authority(self):
+        from . import validate_storage_identity
+        for second in (False, True):
+            identity = storage_fixture(second)
+            self.assertEqual(validate_storage_identity(identity), identity)
+        bad_values = [None, (259, 4), [storage_fixture(), storage_fixture(True)]]
+        for field in storage_fixture():
+            bad = storage_fixture(); del bad[field]; bad_values.append(bad)
+        bad_values.append(dict(storage_fixture(), extra=True))
+        for field, values in {
+            "device_path": ["nvme0n1", "/dev/../nvme0n1", "/etc/device", "/dev//node", "//dev/node", "/dev/nvme*", "/dev/nvme?", "/dev/nvme[0]"],
+            "major_minor": ["0259:4", "259:04", "259", "-1:4", "259:4 ", (259, 4)],
+            "uuid": ["B362df64-42eb-4603-a685-c8e5595038ee", "bad", "*"],
+            "disk_sequence": [0, -1, True, "1"],
+            "sysfs_identity": ["/sys/dev/block/259:4", "/sys/devices/../x", "/sys/devices/*"],
+            "by_id_aliases": [[], ["/dev/disk/by-id/google-persistent-disk-0"],
+                              ["/dev/disk/by-id/google-local-nvme-ssd-*"],
+                              ["/dev/disk/by-id/google-local-nvme-ssd-0"] * 2,
+                              ["/dev/disk/by-id/google-local-nvme-ssd-1", "/dev/disk/by-id/google-local-nvme-ssd-0"]],
+        }.items():
+            bad_values.extend(dict(storage_fixture(), **{field: value}) for value in values)
+        for bad in bad_values:
+            with self.subTest(value=bad), self.assertRaises(InvalidEvidence):
+                validate_storage_identity(bad)
+
+    def test_identity_both_backings_require_their_own_grant(self):
+        for second in (False, True):
+            storage = storage_fixture(second)
+            identity = FakeReader(storage).metadata(alternatives(IDS[0])[0])
+            identity.check(storage)
+            with self.assertRaisesRegex(InvalidEvidence, "wrong expert device"):
+                identity.check(storage_fixture(not second))
+            for fields in ({"mode": stat.S_IFDIR}, {"links": 2}, {"file_length": 1}, {"inode": -1}):
+                with self.subTest(fields=fields), self.assertRaises(InvalidEvidence):
+                    replace(identity, **fields).check(storage)
+            with self.assertRaises(InvalidEvidence):
+                identity.check(tuple(map(int, storage["major_minor"].split(":"))))
+
+    def test_resolver_fallback_cannot_change_storage(self):
+        reader = FakeReader(storage_fixture(True))
+        primary, fallback = alternatives(IDS[0])
+        reader.identities[fallback] = reader.identities.pop(primary)
+        self.assertEqual(resolve(reader, IDS[0], storage_fixture(True))[0], fallback)
+        with self.assertRaisesRegex(InvalidEvidence, "wrong expert device"):
+            resolve(reader, IDS[0], storage_fixture())
+
+    def test_full_content_and_ledger_two_storage_portability_and_cross_rejection(self):
+        roots = []
+        for second in (False, True):
+            storage, other = storage_fixture(second), storage_fixture(not second)
+            reader = FakeReader(storage)
+            before = pre_metadata(reader)
+            content = hash_content(reader, before, HASH_WINDOW, storage)
+            self.assertEqual(verify_content(content, storage), content["content_root"])
+            roots.append(content["content_root"])
+            ledger = encode_ledger(content["records"], storage)
+            self.assertEqual(ledger.hex(), content["ledger_hex"])
+            # Independently decode every record's actual device bytes.
+            offset = len(b"MER-P1V-CONTENT-v1\0") + 4
+            for record in content["records"]:
+                length, = struct.unpack_from("<I", ledger, offset)
+                body = offset + 4
+                cursor = body + 4
+                for _ in range(2):
+                    size, = struct.unpack_from("<I", ledger, cursor)
+                    cursor += 4 + size
+                self.assertEqual(struct.unpack_from("<II", ledger, cursor),
+                                 tuple(map(int, storage["major_minor"].split(":"))))
+                self.assertEqual(record["device_major"], int(storage["major_minor"].split(":")[0]))
+                offset = body + length
+            self.assertEqual(offset, len(ledger))
+            with self.assertRaisesRegex(InvalidEvidence, "ledger device"):
+                encode_ledger(content["records"], other)
+            with self.assertRaisesRegex(InvalidEvidence, "wrong expert device"):
+                verify_content(content, other)
+            reader = FakeReader(storage)
+            with self.assertRaisesRegex(InvalidEvidence, "wrong expert device"):
+                hash_content(reader, pre_metadata(reader), HASH_WINDOW, other)
+            self.assertEqual(reader.trace, [])
+            bad = copy.deepcopy(content)
+            bad["records"][0]["device_minor"] += 1
+            with self.assertRaisesRegex(InvalidEvidence, "ledger/identity mismatch"):
+                verify_content(bad, storage)
+        self.assertNotEqual(*roots)
+        self.assertEqual(roots[0], "5ac121bb9062dcf132ba96498bdb796e838c87f88a2e11e14bb50a4ae6345a52")
+
+    def test_hash_snapshots_external_identity_before_any_reader_observation(self):
+        storage = storage_fixture(True)
+        reader = FakeReader(storage)
+        before = pre_metadata(reader)
+        original = reader.metadata
+        def mutate_caller(path):
+            storage.update(storage_fixture())
+            return original(path)
+        with patch.object(reader, "metadata", side_effect=mutate_caller):
+            content = hash_content(reader, before, HASH_WINDOW, storage)
+        verify_content(content, storage_fixture(True))
+
+    def test_direct_reader_freezes_exactly_one_validated_storage_identity(self):
+        import os
+        from dataclasses import FrozenInstanceError
+        from unittest.mock import Mock
+        from . import content_hasher as ch
+        authorization, _ = execution_fixture()
+        for second in (False, True):
+            storage = storage_fixture(second)
+            expected = copy.deepcopy(storage)
+            with patch.object(ch.sys, "platform", "linux"), patch.object(os, "O_DIRECT", 0x4000, create=True), \
+                 patch.object(ch.ctypes, "CDLL", return_value=Mock()), patch.object(os, "open", side_effect=AssertionError("device access")):
+                reader = LinuxDirectReader(authorization, HASH_WINDOW, storage)
+            storage.update(storage_fixture(not second))
+            reader.storage_identity["by_id_aliases"].append("changed")
+            self.assertEqual(reader.storage_identity, expected)
+            with self.assertRaises(FrozenInstanceError):
+                reader._storage_identity = canonical_json(storage)
+            identity = FakeReader(expected).metadata(alternatives(IDS[0])[0])
+            with patch.object(Identity, "from_stat", return_value=identity), patch.object(os, "lstat", return_value=object()), \
+                 patch.object(LinuxDirectReader, "canonical", return_value=CANONICAL):
+                self.assertEqual(reader.metadata(alternatives(IDS[0])[0]), identity)
+            with patch.object(ch.ctypes, "CDLL", side_effect=AssertionError("libc before validation")), self.assertRaises(InvalidEvidence):
+                LinuxDirectReader(authorization, HASH_WINDOW, (259, 4))
+
+    def test_authority_supplies_same_storage_to_topology_metadata_and_hash(self):
+        from . import supervisor as sup
+        from .linux_backend import validate_execution_scope
+        raw = encode_raw(raw_fixture())
+        for second in (False, True):
+            storage = storage_fixture(second)
+            content = fake_content(storage)
+            fixture = receipts(raw, content, storage)
+            _, grant = execution_fixture(storage)
+            fixture["AUTHORITY"]["execution_grant"] = grant.public_scope()
+            evidence = {"mode": "LIVE", "attempt": "p1v-fixture", "tools": tool_hashes(), "receipts": fixture}
+            receipt_gate("AUTHORITY", fixture["AUTHORITY"], evidence)
+            expected = fixture["AUTHORITY"]["execution_grant"]["storage_identity"]
+            with patch.object(sup, "metadata_gate", wraps=sup.metadata_gate) as meta, \
+                 patch.object(sup, "verify_content", wraps=verify_content) as hashed:
+                receipt_gate("TOPOLOGY", fixture["TOPOLOGY"], evidence)
+                receipt_gate("METADATA", fixture["METADATA"], evidence)
+                receipt_gate("HASH", fixture["HASH"], evidence)
+            self.assertIs(meta.call_args.args[1], expected)
+            self.assertIs(hashed.call_args.args[1], expected)
+            fixture["TOPOLOGY"].update(device_identity=storage_fixture(not second),
+                                       disk_sequence=storage_fixture(not second)["disk_sequence"])
+            with self.assertRaisesRegex(InvalidEvidence, "external storage grant"):
+                receipt_gate("TOPOLOGY", fixture["TOPOLOGY"], evidence)
+            # Even an injected contradictory topology cannot select HASH/METADATA authority.
+            receipt_gate("METADATA", fixture["METADATA"], evidence)
+            receipt_gate("HASH", fixture["HASH"], evidence)
+            self.assertEqual(expected, storage)
+            fixture["AUTHORITY"]["execution_grant"]["storage_identity"] = storage_fixture(not second)
+            for action in ("METADATA", "HASH"):
+                with self.subTest(action=action), self.assertRaisesRegex(InvalidEvidence, "wrong expert device"):
+                    receipt_gate(action, fixture[action], evidence)
+            for issue in (0, 214, 229, 230):
+                fixture["AUTHORITY"]["execution_grant"]["authority_issue"] = issue
+                with self.assertRaises(InvalidEvidence):
+                    validate_execution_scope(fixture["AUTHORITY"], evidence)
+
+    def test_production_has_no_instance_constants_or_fallback(self):
+        root = Path(__file__).parent
+        for file in root.glob("*.py"):
+            if file.name.startswith("test_"):
+                continue
+            source = file.read_text()
+            for forbidden in (storage_fixture()["uuid"], storage_fixture(True)["uuid"],
+                              "/dev/nvme0n1", "259:4", "(259, 4)"):
+                with self.subTest(file=file.name, forbidden=forbidden):
+                    self.assertNotIn(forbidden, source)
+        self.assertFalse({"data_device", "data_major_minor", "data_uuid"} & set(EXPECTATIONS))
+        for action in plan():
+            if action.name in ("DEVICE_RO", "DEVICE_RW"):
+                self.assertNotIn("/dev/nvme0n1", str(action))
+        self.assertEqual(digest((root / "offline_verify.py").read_bytes()),
+                         "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537")
 
 
 if __name__ == "__main__":

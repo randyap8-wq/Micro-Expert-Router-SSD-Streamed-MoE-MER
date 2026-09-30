@@ -14,7 +14,8 @@ import sys
 from dataclasses import asdict, dataclass
 
 from . import (ALIGN, CANONICAL, CONFIGURED, EXPERT_SIZE, IDS, digest,
-               path_bytes, require, require_future, sha256, uint)
+               path_bytes, require, require_future, sha256, uint,
+               canonical_json, strict_json, validate_storage_identity)
 
 
 @dataclass(frozen=True)
@@ -34,9 +35,11 @@ class Identity:
                    value.st_size, value.st_mode, value.st_nlink,
                    value.st_mtime_ns, value.st_ctime_ns)
 
-    def check(self):
+    def check(self, storage_identity):
+        expected = validate_storage_identity(storage_identity)
+        major_minor = tuple(int(n) for n in expected["major_minor"].split(":"))
         require(stat.S_ISREG(self.mode) and self.links == 1, "selected file must be regular with one link")
-        require((self.device_major, self.device_minor) == (259, 4), "wrong expert device")
+        require((self.device_major, self.device_minor) == major_minor, "wrong expert device")
         require(self.file_length == EXPERT_SIZE, "wrong expert size")
         uint(self.inode)
 
@@ -47,7 +50,7 @@ def alternatives(global_id):
             f"{CONFIGURED}/expert_{global_id // 128}_{global_id % 128}.bin")
 
 
-def resolve(reader, global_id):
+def resolve(reader, global_id, storage_identity):
     """Same primary preference as NvmeStorage; only ENOENT permits fallback.
 
     Frozen source falls back on *any* metadata error. Permission/I/O errors are
@@ -60,13 +63,15 @@ def resolve(reader, global_id):
     except FileNotFoundError:
         selected = fallback
         identity = reader.metadata(fallback)
-    identity.check()
+    identity.check(storage_identity)
     canonical = reader.canonical(selected)
     require(canonical == CANONICAL + "/" + selected.rsplit("/", 1)[1], "resolver escape")
     return selected, canonical, identity
 
 
-def encode_ledger(records):
+def encode_ledger(records, storage_identity):
+    expected = validate_storage_identity(storage_identity)
+    major_minor = tuple(int(n) for n in expected["major_minor"].split(":"))
     require(isinstance(records, list) and len(records) == 6, "exact six records required")
     require([r["global_expert_id"] for r in records] == list(IDS), "six-ID ordering mismatch")
     ledger = bytearray(b"MER-P1V-CONTENT-v1\0" + struct.pack("<I", 6))
@@ -80,7 +85,7 @@ def encode_ledger(records):
         for path in (selected, canonical):
             raw = path_bytes(path)
             body.extend(struct.pack("<I", uint(len(raw), 32)) + raw)
-        require((record["device_major"], record["device_minor"]) == (259, 4), "ledger device")
+        require((record["device_major"], record["device_minor"]) == major_minor, "ledger device")
         require(record["file_length"] == EXPERT_SIZE, "ledger length")
         body.extend(struct.pack("<IIQQ", uint(record["device_major"], 32),
                                 uint(record["device_minor"], 32), uint(record["inode"]),
@@ -97,12 +102,14 @@ def check_hash_window(window):
             "hashing requires stopped runtime and intact protected interval")
 
 
-def hash_content(reader, before, window):
+def hash_content(reader, before, window, storage_identity):
+    # Snapshot external scope once; observations cannot refresh this value.
+    storage_identity = strict_json(canonical_json(validate_storage_identity(storage_identity)))
     check_hash_window(window)
     require(list(before) == list(IDS), "pre-metadata ordering/coverage")
     records = []
     for g in IDS:
-        selected, canonical, identity = resolve(reader, g)
+        selected, canonical, identity = resolve(reader, g, storage_identity)
         require(before[g] == (selected, canonical, identity), "pre/post resolver identity drift")
         handle = reader.open_direct(selected)
         try:
@@ -117,7 +124,7 @@ def hash_content(reader, before, window):
                 count += len(data)
             require(count == EXPERT_SIZE and reader.identity(handle) == identity,
                     "byte count/descriptor drift")
-            require(resolve(reader, g) == (selected, canonical, identity), "post-hash path drift")
+            require(resolve(reader, g, storage_identity) == (selected, canonical, identity), "post-hash path drift")
             records.append({"global_expert_id": g, "authoritative_selected_path": selected,
                             "canonical_path": canonical, "device_major": identity.device_major,
                             "device_minor": identity.device_minor, "inode": identity.inode,
@@ -125,27 +132,29 @@ def hash_content(reader, before, window):
                             "direct": True, "identity": asdict(identity)})
         finally:
             reader.close(handle)
-    ledger = encode_ledger(records)
+    ledger = encode_ledger(records, storage_identity)
     return {"schema": "mer.p1v.content.v1", "status": "PASS", "records": records,
             "ledger_hex": ledger.hex(), "content_root": digest(ledger),
             "read_size": ALIGN, "full_stored_bytes": True, "buffered_fallback": False}
 
 
-def verify_content(content):
+def verify_content(content, storage_identity):
+    storage_identity = strict_json(canonical_json(validate_storage_identity(storage_identity)))
     require(content["schema"] == "mer.p1v.content.v1" and content["status"] == "PASS", "content status")
     require(content["read_size"] == ALIGN and content["full_stored_bytes"] is True
             and content["buffered_fallback"] is False, "direct content contract")
     for r in content["records"]:
         identity = Identity(**r["identity"])
-        identity.check()
+        identity.check(storage_identity)
         require(r["direct"] is True, "non-direct content record")
         for key in ("device_major", "device_minor", "inode", "file_length"):
             require(r[key] == getattr(identity, key), "ledger/identity mismatch")
-    ledger = encode_ledger(content["records"])
+    ledger = encode_ledger(content["records"], storage_identity)
     require(ledger.hex() == content["ledger_hex"] and digest(ledger) == content["content_root"], "content root mismatch")
     return content["content_root"]
 
 
+@dataclass(frozen=True, init=False)
 class LinuxDirectReader:
     """Future-only reader. Host adapter must establish/retain the hash window.
 
@@ -154,17 +163,26 @@ class LinuxDirectReader:
     is still essential; these endpoint checks alone do not prove continuity.
     """
 
-    def __init__(self, authorization, window):
+    _storage_identity: bytes
+    libc: object
+
+    def __init__(self, authorization, window, storage_identity):
         require_future(authorization)
         check_hash_window(window)
+        object.__setattr__(self, "_storage_identity",
+                           canonical_json(validate_storage_identity(storage_identity)))
         require(sys.platform == "linux" and hasattr(os, "O_DIRECT"), "Linux O_DIRECT required")
-        self.libc = ctypes.CDLL(None, use_errno=True)
+        object.__setattr__(self, "libc", ctypes.CDLL(None, use_errno=True))
         self.libc.posix_memalign.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_size_t]
         self.libc.posix_memalign.restype = ctypes.c_int
         self.libc.pread.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int64]
         self.libc.pread.restype = ctypes.c_ssize_t
         self.libc.free.argtypes = [ctypes.c_void_p]
         self.libc.free.restype = None
+
+    @property
+    def storage_identity(self):
+        return strict_json(self._storage_identity)
 
     def canonical(self, path):
         require(path in [p for g in IDS for p in alternatives(g)], "unapproved expert path")
@@ -179,7 +197,7 @@ class LinuxDirectReader:
     def metadata(self, path):
         # lstat must precede realpath so dangling primary symlinks cannot select fallback.
         value = Identity.from_stat(os.lstat(path))
-        value.check()
+        value.check(self.storage_identity)
         self.canonical(path)
         return value
 
