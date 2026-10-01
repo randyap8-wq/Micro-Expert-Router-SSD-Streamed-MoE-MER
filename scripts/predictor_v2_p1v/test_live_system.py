@@ -416,7 +416,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #234"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #236"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -801,6 +801,135 @@ class ExclusionTests(unittest.TestCase):
             obj._inventory()
 
 
+class NamespaceServiceTests(unittest.TestCase):
+    executable = "/fixture/namespace-service"
+
+    def entry(self):
+        return {"sha256": "c" * 64, "cgroup": "0::/system.slice/fixture.service",
+                "uid": [1201] * 4, "gid": [1202] * 4}
+
+    def fixture(self):
+        obj = ExclusionTests.fixture(self)
+        allowed = self.entry()
+        obj.profile = bundle_fixture()["provider"]["host_profile"]
+        obj.profile["namespace_services"] = {self.executable: allowed}
+        obj.io.namespace.side_effect = lambda pid, kind: (
+            "mnt:service" if pid == 50 else "mnt:original") if kind == "mnt" else "user:initial"
+        obj.io.link.return_value = self.executable
+        obj.io.file_hash.return_value = allowed["sha256"]
+        obj.io.text.side_effect = lambda path: allowed["cgroup"] + "\n" if path == "/proc/50/cgroup" else ""
+        obj.io.status.return_value = {"Uid": "1201 1201 1201 1201", "Gid": "1202 1202 1202 1202"}
+        return obj
+
+    def test_profile_accepts_exact_root_and_nonroot_identities(self):
+        profile = bundle_fixture()["provider"]["host_profile"]
+        ls.validate_host_profile(profile)
+        for uid, gid in (([0] * 4, [0] * 4), ([1201] * 4, [1202] * 4),
+                         ([0, 1, 2, 2**32 - 1], [2**32 - 1, 2, 1, 0])):
+            profile["namespace_services"] = {self.executable: dict(self.entry(), uid=uid, gid=gid)}
+            with self.subTest(uid=uid, gid=gid):
+                ls.validate_host_profile(profile)
+
+    def test_malformed_profile_entries_reject(self):
+        cases = [("non-dict", []), ("old-schema", {k: self.entry()[k] for k in ("sha256", "cgroup")}),
+                 ("extra-key", dict(self.entry(), allow_nonroot=True))]
+        for key in self.entry():
+            entry = self.entry()
+            del entry[key]
+            cases.append(("missing-" + key, entry))
+        for invalid in ("bad", "A" * 64, "a" * 63, None):
+            cases.append(("sha256", dict(self.entry(), sha256=invalid)))
+        for invalid in (None, "", "0::", "1::/service", "0::/bad\0service", "0::/bad\nservice"):
+            cases.append(("cgroup", dict(self.entry(), cgroup=invalid)))
+        for key in ("uid", "gid"):
+            for invalid in ((1201,) * 4, "1201 1201 1201 1201", None, [], [0] * 3, [0] * 5,
+                            [0, 0, 0, True], [0, 0, 0, "1"], [0, 0, 0, 1.0],
+                            [0, 0, 0, -1], [0, 0, 0, 2**32]):
+                cases.append((key, dict(self.entry(), **{key: invalid})))
+        for label, entry in cases:
+            profile = bundle_fixture()["provider"]["host_profile"]
+            profile["namespace_services"] = {self.executable: entry}
+            with self.subTest(case=label, entry=entry), self.assertRaises(InvalidEvidence):
+                ls.validate_host_profile(profile)
+        for executable in ("relative/service", "/fixture/../service", "/fixture/invalid\0service"):
+            profile = bundle_fixture()["provider"]["host_profile"]
+            profile["namespace_services"] = {executable: self.entry()}
+            with self.subTest(executable=executable), self.assertRaises(InvalidEvidence):
+                ls.validate_host_profile(profile)
+
+    def test_inventory_accepts_exact_nonroot_with_namespace_and_mount_gates(self):
+        obj = self.fixture()
+        ls.validate_host_profile(obj.profile)
+        self.assertEqual(obj._inventory(), {"namespaces": {"mnt:service": "user:initial"},
+                                           "processes": [{"pid": 50, "starttime": 100, "threads": 1}]})
+        obj.io.link.assert_called_once_with("/proc/50/exe")
+        obj.io.file_hash.assert_called_once_with(self.executable)
+        obj.io.text.assert_any_call("/proc/50/cgroup")
+        for case, message in (("unknown-executable", "namespace class"), ("user-namespace", "user namespace"),
+                              ("extra-mount", "mount alias"), ("target", "mount alias"),
+                              ("root", "mount alias"), ("fstype", "mount alias"), ("submount", "submount")):
+            obj = self.fixture()
+            if case == "unknown-executable":
+                obj.io.link.return_value = "/fixture/unapproved-service"
+            elif case == "user-namespace":
+                obj.io.namespace.side_effect = lambda pid, kind: "mnt:service" if kind == "mnt" else "user:other"
+            elif case == "extra-mount":
+                obj._mounts.return_value.append(dict(obj._mounts.return_value[0], target="/fixture/alias"))
+            elif case == "submount":
+                obj._mounts.return_value.append({"major_minor": "0:1", "target": ls.MOUNT + "/escape",
+                                                "root": "/", "fstype": "tmpfs"})
+            else:
+                obj._mounts.return_value[0][case] = {"target": "/fixture/alias", "root": "/subdir", "fstype": "tmpfs"}[case]
+            with self.subTest(case=case), self.assertRaisesRegex(InvalidEvidence, message):
+                obj._inventory()
+
+    def test_inventory_exact_uid_tuple_drift_rejects(self):
+        for slot in range(4):
+            obj = self.fixture()
+            values = [1201] * 4
+            values[slot] = 0
+            obj.io.status.return_value["Uid"] = " ".join(map(str, values))
+            with self.subTest(slot=slot), self.assertRaisesRegex(InvalidEvidence, "service identity drift"):
+                obj._inventory()
+        for value, error in ((None, KeyError), ("1201 invalid 1201 1201", ValueError),
+                             ("", InvalidEvidence), ("1201 " * 3, InvalidEvidence), ("1201 " * 5, InvalidEvidence)):
+            obj = self.fixture()
+            if value is None:
+                del obj.io.status.return_value["Uid"]
+            else:
+                obj.io.status.return_value["Uid"] = value
+            with self.subTest(value=value), self.assertRaises(error):
+                obj._inventory()
+
+    def test_inventory_exact_gid_tuple_drift_rejects(self):
+        for slot in range(4):
+            obj = self.fixture()
+            values = [1202] * 4
+            values[slot] = 0
+            obj.io.status.return_value["Gid"] = " ".join(map(str, values))
+            with self.subTest(slot=slot), self.assertRaisesRegex(InvalidEvidence, "service identity drift"):
+                obj._inventory()
+        for value, error in ((None, KeyError), ("1202 invalid 1202 1202", ValueError),
+                             ("", InvalidEvidence), ("1202 " * 3, InvalidEvidence), ("1202 " * 5, InvalidEvidence)):
+            obj = self.fixture()
+            if value is None:
+                del obj.io.status.return_value["Gid"]
+            else:
+                obj.io.status.return_value["Gid"] = value
+            with self.subTest(value=value), self.assertRaises(error):
+                obj._inventory()
+
+    def test_inventory_hash_and_cgroup_drift_reject_with_matching_ids(self):
+        for field in ("sha256", "cgroup"):
+            obj = self.fixture()
+            if field == "sha256":
+                obj.io.file_hash.return_value = "d" * 64
+            else:
+                obj.io.text.side_effect = lambda path: "0::/system.slice/other.service\n" if path == "/proc/50/cgroup" else ""
+            with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "service identity drift"):
+                obj._inventory()
+
+
 class MetadataTests(unittest.TestCase):
     def metadata(self, variant=None, storage=None, file_storage=None):
         storage = storage_fixture() if storage is None else storage
@@ -1130,13 +1259,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 235, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 237, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 235, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 237, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -1791,14 +1920,14 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 235, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 237, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 234)
+        self.assertEqual(ls.FLOOR, 236)
 
-    def test_every_nonnegative_authority_through_234_rejects_before_host_access(self):
-        for issue in range(235):
+    def test_every_nonnegative_authority_through_236_rejects_before_host_access(self):
+        for issue in range(237):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
@@ -1807,21 +1936,21 @@ class RefreshedAuthorityTests(unittest.TestCase):
                     patch("os.listdir", side_effect=AssertionError("host access")), \
                     patch("os.getpid", side_effect=AssertionError("host access")), \
                     patch("ctypes.CDLL", side_effect=AssertionError("library")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #234"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #236"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #234"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #236"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_235_complete_scope_passes_only_pure_constructor_check(self):
+    def test_synthetic_237_complete_scope_passes_only_pure_constructor_check(self):
         receiver, scope = SimpleNamespace(), self.scope()
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 235)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 237)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_235_requires_complete_valid_scope(self):
+    def test_synthetic_237_requires_complete_valid_scope(self):
         for field in self.scope():
             scope = self.scope()
             del scope[field]
@@ -1833,16 +1962,16 @@ class RefreshedAuthorityTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(InvalidEvidence):
                 ls.ProviderGrant.__init__(SimpleNamespace(), scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
-    def test_synthetic_235_provider_bindings_and_adapter_grant_still_required(self):
+    def test_synthetic_237_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 235)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 237)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 234), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 236), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -1854,15 +1983,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        execution_scope = {"authority_issue": 235, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 237, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                            "operations": [a.name for a in plan_fixture()],
                            "adapter_manifest_sha256": digest(canonical_json(adapter)),
                            "storage_identity": storage}
         execution_token = b"synthetic pure validation only!!!" * 2
-        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 235)
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 237)
         execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
                                       execution_token, digest(execution_token))
-        scope = {"authority_issue": 235, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 237, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2

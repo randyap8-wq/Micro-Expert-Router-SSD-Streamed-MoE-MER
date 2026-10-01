@@ -22,7 +22,7 @@ class GateTests(unittest.TestCase):
         with patch("os.open", side_effect=AssertionError("host access")), patch("ctypes.CDLL", side_effect=AssertionError("library")), \
              patch.object(Path, "read_bytes", side_effect=AssertionError("file")):
             result = gate.planning("p1v-fixture")
-        self.assertEqual(result["live_authority_must_exceed"], 234)
+        self.assertEqual(result["live_authority_must_exceed"], 236)
         self.assertEqual(result["implementation_issue"], 217)
         self.assertEqual(result["execution"], "NOT_AUTHORIZED")
         self.assertEqual(result["hot_path_interposition"], "NONE")
@@ -120,7 +120,7 @@ class GateTests(unittest.TestCase):
     def test_plan_cli(self):
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(gate.main(["--plan", "--attempt", "p1v-fixture"]), 0)
-        self.assertIn('"live_authority_must_exceed":234', output.getvalue())
+        self.assertIn('"live_authority_must_exceed":236', output.getvalue())
 
     def test_no_current_external_grant_created(self):
         source = Path(gate.__file__).read_text()

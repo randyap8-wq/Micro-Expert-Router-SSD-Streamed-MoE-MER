@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >234.
+"""P1V5 direct observations. Live execution requires a future issue >236.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 234
+FLOOR = 236
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -189,6 +189,17 @@ def validate_host_profile(value):
             and not OUTPUT_ROOT.startswith(value["trusted_evidence_root"] + "/"), "report/evidence root separation")
     require(type(value["namespace_services"]) is dict and type(value["policy_files"]) is dict,
             "explicit inspection inventory")
+    for executable, allowed in value["namespace_services"].items():
+        path_bytes(executable)
+        lb.exact_keys(allowed, ("sha256", "cgroup", "uid", "gid"), "namespace service coverage")
+        sha256(allowed["sha256"])
+        require(type(allowed["cgroup"]) is str and allowed["cgroup"].startswith("0::/")
+                and "\0" not in allowed["cgroup"] and "\n" not in allowed["cgroup"],
+                "namespace service cgroup")
+        for key in ("uid", "gid"):
+            require(type(allowed[key]) is list and len(allowed[key]) == 4
+                    and all(type(v) is int and 0 <= v <= 2**32 - 1 for v in allowed[key]),
+                    "namespace service UID/GID tuple")
     for path, pin in value["dependency_files"].items():
         path_bytes(path)
         sha256(pin)
@@ -222,7 +233,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #234")
+                "execution authority must follow #236")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -243,7 +254,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #234")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #236")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -879,11 +890,16 @@ class LiveSystem:
                 if ns not in (self.original_ns, self.io.namespace(self.worker_pid, "mnt")):
                     executable = self.io.link(f"/proc/{pid}/exe")
                     allowed = self.profile["namespace_services"].get(executable)
-                    require(type(allowed) is dict and set(allowed) == {"sha256", "cgroup"},
+                    require(type(allowed) is dict and set(allowed) == {"sha256", "cgroup", "uid", "gid"},
                             "unexpected mount namespace class")
                     require(self.io.file_hash(executable) == allowed["sha256"]
-                            and self.io.text(f"/proc/{pid}/cgroup").strip() == allowed["cgroup"]
-                            and all(int(v) == 0 for v in status["Uid"].split()), "namespace service identity drift")
+                            and self.io.text(f"/proc/{pid}/cgroup").strip() == allowed["cgroup"],
+                            "namespace service identity drift")
+                    observed_uid = [int(v) for v in status["Uid"].split()]
+                    observed_gid = [int(v) for v in status["Gid"].split()]
+                    require(len(observed_uid) == 4 and len(observed_gid) == 4
+                            and observed_uid == allowed["uid"] and observed_gid == allowed["gid"],
+                            "namespace service identity drift")
                 require(len(exposing) == 1 and exposing[0]["target"] == MOUNT
                         and exposing[0]["root"] == "/" and exposing[0]["fstype"] == "ext4",
                         "alternate protected-device mount alias")
