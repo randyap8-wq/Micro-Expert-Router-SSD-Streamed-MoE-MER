@@ -4,6 +4,7 @@ import ast
 import builtins
 import copy
 import ctypes
+import errno
 import importlib
 import os
 import stat
@@ -415,7 +416,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #232"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #234"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -886,6 +887,124 @@ class MetadataTests(unittest.TestCase):
             obj.dio_alignment(100)
 
 
+class BpfQueryTests(unittest.TestCase):
+    KINDS = (0, 1, 2, 3, 6, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22,
+             29, 30, 31, 32, 34, 43, 49, 50, 51, 52, 53)
+
+    class Query(ctypes.Structure):
+        _fields_ = [("target_fd", ctypes.c_uint32), ("attach_type", ctypes.c_uint32),
+                    ("query_flags", ctypes.c_uint32), ("attach_flags", ctypes.c_uint32),
+                    ("prog_ids", ctypes.c_uint64), ("prog_cnt", ctypes.c_uint32),
+                    ("padding", ctypes.c_uint32), ("prog_attach_flags", ctypes.c_uint64)]
+
+    def query(self, respond, path="/sys/fs/cgroup"):
+        obj = object.__new__(ls.DirectLinux)
+        obj.check = Mock()
+        self.queried = []
+
+        def syscall(number, command, pointer, size):
+            self.assertEqual((number.value, command.value, size), (321, 16, 40))
+            query = ctypes.cast(pointer, ctypes.POINTER(self.Query)).contents
+            self.queried.append(query.attach_type)
+            self.assertEqual((query.target_fd, query.query_flags, query.prog_cnt), (101, 0, 256))
+            self.assertNotEqual(query.prog_ids, 0)
+            self.assertNotEqual(query.prog_attach_flags, 0)
+            self.assertNotEqual(query.prog_ids, query.prog_attach_flags)
+            self.assertEqual(list((ctypes.c_uint32 * 256).from_address(query.prog_ids)), [0] * 256)
+            self.assertEqual(list((ctypes.c_uint32 * 256).from_address(query.prog_attach_flags)), [0] * 256)
+            return respond(query)
+
+        obj.libc = Mock(return_value=SimpleNamespace(syscall=Mock(side_effect=syscall)))
+        with patch("os.open", return_value=101) as opened, patch("os.close") as closed:
+            try:
+                return obj.bpf_ids(path)
+            finally:
+                obj.check.assert_called_once_with()
+                opened.assert_called_once_with(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                closed.assert_called_once_with(101)
+
+    def answer(self, query, programs):
+        ids = (ctypes.c_uint32 * 256).from_address(query.prog_ids)
+        flags = (ctypes.c_uint32 * 256).from_address(query.prog_attach_flags)
+        query.attach_flags = 0x55
+        query.prog_cnt = len(programs)
+        for i, (program_id, flag) in enumerate(programs):
+            ids[i], flags[i] = program_id, flag
+        return 0
+
+    def test_exact_attach_sequence_and_non_effective_flags_buffer_for_every_query(self):
+        self.assertEqual(self.query(lambda query: self.answer(query, [])), [])
+        self.assertEqual(self.queried, list(self.KINDS))
+
+    def test_lsm_cgroup_retains_distinct_per_program_flags(self):
+        programs = [(701, 1), (702, 0x80000002)]
+        result = self.query(lambda query: self.answer(query, programs if query.attach_type == 43 else []))
+        self.assertEqual(result, [{"type": 43, "id": 701, "flags": 1},
+                                  {"type": 43, "id": 702, "flags": 0x80000002}])
+
+    def test_ordinary_cgroup_retains_per_program_not_common_flags(self):
+        programs = [(801, 0), (802, 2)]
+        result = self.query(lambda query: self.answer(query, programs if query.attach_type == 1 else []))
+        self.assertEqual(result, [{"type": 1, "id": 801, "flags": 0},
+                                  {"type": 1, "id": 802, "flags": 2}])
+
+    def test_syscall_errors_including_einval_stop_before_later_attach_types(self):
+        for kind in self.KINDS:
+            for error, ret in ((errno.EINVAL, -1), (errno.EPERM, -1), (errno.EACCES, -1),
+                               (errno.EIO, -1), (0, 1)):
+                def respond(query):
+                    if query.attach_type == kind:
+                        ctypes.set_errno(error)
+                        return ret
+                    return self.answer(query, [(901, 2)])
+                with self.subTest(kind=kind, errno=error, ret=ret):
+                    with self.assertRaisesRegex(InvalidEvidence, "cgroup BPF inventory unavailable/overflow"):
+                        self.query(respond)
+                    self.assertEqual(self.queried, list(self.KINDS[:self.KINDS.index(kind) + 1]))
+
+    def test_program_count_overflow_fails_closed(self):
+        for kind in self.KINDS:
+            def respond(query):
+                if query.attach_type == kind:
+                    query.prog_cnt = 257
+                    return 0
+                return self.answer(query, [])
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(InvalidEvidence, "cgroup BPF inventory unavailable/overflow"):
+                    self.query(respond)
+                self.assertEqual(self.queried, list(self.KINDS[:self.KINDS.index(kind) + 1]))
+
+    def test_domain_preserves_exact_ancestor_local_bpf_schema_and_flags(self):
+        root = "/sys/fs/cgroup"
+        paths = [root, root + "/parent", root + "/parent/leaf"]
+        attached = {paths[0]: {1: [(1011, 2)], 43: [(1012, 4)]}, paths[1]: {},
+                    paths[2]: {43: [(1013, 1), (1014, 0x80000002)]}}
+        obj = object.__new__(ls.LiveSystem)
+        obj.provider = {"nvml": {"uuid": "GPU-fixture"}}
+        obj.gpu_management = {"fixture": True}
+        obj.io = Mock()
+        obj.io.stat.return_value = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0)
+        obj.io.listdir.side_effect = lambda path: ["cpuset.cpus.effective", "cpuset.mems.effective"] if path == root else []
+        obj.io.text.side_effect = lambda path: {root + "/cpuset.cpus.effective": "0-1\n",
+                                               root + "/cpuset.mems.effective": "0\n"}[path]
+        obj.io.bpf_ids.side_effect = lambda path: self.query(
+            lambda query: self.answer(query, attached[path].get(query.attach_type, [])), path)
+        with patch.object(lb, "resource_domain", wraps=lb.resource_domain) as validate:
+            result = obj._domain(paths[-1])
+        expected = {name: {"domain": "cgroup2-root-disabled", "constraints": {}}
+                    for name in ("cpu", "memory", "io", "cpuset", "pids", "hugetlb", "rdma", "misc")}
+        expected.update({"gpu": {"domain": "GPU-fixture", "constraints": {"fixture": True}},
+                         "effective_cpus": [0, 1], "effective_mems": [0], "ancestor_constraints": [],
+                         "bpf_ancestry": [
+                             {"path": paths[0], "programs": [{"type": 1, "id": 1011, "flags": 2},
+                                                            {"type": 43, "id": 1012, "flags": 4}]},
+                             {"path": paths[2], "programs": [{"type": 43, "id": 1013, "flags": 1},
+                                                            {"type": 43, "id": 1014, "flags": 0x80000002}]}]})
+        self.assertEqual(result, expected)
+        self.assertEqual([call.args for call in obj.io.bpf_ids.call_args_list], [(path,) for path in paths])
+        validate.assert_called_once_with(expected)
+
+
 class CgroupTests(unittest.TestCase):
     def fixture(self):
         obj = object.__new__(ls.LiveSystem)
@@ -1011,13 +1130,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 233, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 235, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 233, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 235, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -1672,14 +1791,14 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 233, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 235, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 232)
+        self.assertEqual(ls.FLOOR, 234)
 
-    def test_every_nonnegative_authority_through_232_rejects_before_host_access(self):
-        for issue in range(233):
+    def test_every_nonnegative_authority_through_234_rejects_before_host_access(self):
+        for issue in range(235):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
@@ -1688,21 +1807,21 @@ class RefreshedAuthorityTests(unittest.TestCase):
                     patch("os.listdir", side_effect=AssertionError("host access")), \
                     patch("os.getpid", side_effect=AssertionError("host access")), \
                     patch("ctypes.CDLL", side_effect=AssertionError("library")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #232"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #234"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #232"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #234"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_233_complete_scope_passes_only_pure_constructor_check(self):
+    def test_synthetic_235_complete_scope_passes_only_pure_constructor_check(self):
         receiver, scope = SimpleNamespace(), self.scope()
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 233)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 235)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_233_requires_complete_valid_scope(self):
+    def test_synthetic_235_requires_complete_valid_scope(self):
         for field in self.scope():
             scope = self.scope()
             del scope[field]
@@ -1714,16 +1833,16 @@ class RefreshedAuthorityTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(InvalidEvidence):
                 ls.ProviderGrant.__init__(SimpleNamespace(), scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
-    def test_synthetic_233_provider_bindings_and_adapter_grant_still_required(self):
+    def test_synthetic_235_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 233)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 235)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 232), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 234), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -1735,15 +1854,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        execution_scope = {"authority_issue": 233, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 235, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                            "operations": [a.name for a in plan_fixture()],
                            "adapter_manifest_sha256": digest(canonical_json(adapter)),
                            "storage_identity": storage}
         execution_token = b"synthetic pure validation only!!!" * 2
-        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 233)
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 235)
         execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
                                       execution_token, digest(execution_token))
-        scope = {"authority_issue": 233, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 235, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2

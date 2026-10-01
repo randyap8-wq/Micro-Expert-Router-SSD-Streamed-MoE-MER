@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >232.
+"""P1V5 direct observations. Live execution requires a future issue >234.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 232
+FLOOR = 234
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -222,7 +222,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #232")
+                "execution authority must follow #234")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -243,7 +243,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #232")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #234")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -441,10 +441,11 @@ class DirectLinux:
             for kind in (0, 1, 2, 3, 6, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22,
                          29, 30, 31, 32, 34, 43, 49, 50, 51, 52, 53):
                 ids = (ctypes.c_uint32 * 256)()
-                query = Query(fd, kind, 0, 0, ctypes.addressof(ids), 256, 0, 0)
+                flags = (ctypes.c_uint32 * 256)()
+                query = Query(fd, kind, 0, 0, ctypes.addressof(ids), 256, 0, ctypes.addressof(flags))
                 ret = libc.syscall(ctypes.c_long(321), ctypes.c_int(16), ctypes.byref(query), ctypes.sizeof(query))
                 require(ret == 0 and query.prog_cnt <= 256, "cgroup BPF inventory unavailable/overflow")
-                result.extend({"type": kind, "id": int(ids[i]), "flags": query.attach_flags}
+                result.extend({"type": kind, "id": int(ids[i]), "flags": int(flags[i])}
                               for i in range(query.prog_cnt))
             return result
         finally:
