@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >230.
+"""P1V5 direct observations. Live execution requires a future issue >232.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 230
+FLOOR = 232
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -195,13 +195,17 @@ def validate_host_profile(value):
     require(value["dependency_files"], "complete direct dependency pins required")
     lb.exact_keys(value["policy_files"], ("cpu_policy", "thp", "numa_balancing"), "kernel policy coverage")
     lb.exact_keys(value["policy_files"]["cpu_policy"], ("governors", "frequency_limits", "boost", "power"), "CPU policy coverage")
-    for group in value["policy_files"].values():
+    for name, group in value["policy_files"].items():
         require(type(group) is dict and group, "policy inventory cannot be empty")
         for paths in group.values():
-            require(type(paths) is list and paths and paths == sorted(set(paths)), "ordered complete policy path set")
+            require(type(paths) is list and (paths or name == "cpu_policy")
+                    and paths == sorted(set(paths)), "ordered complete policy path set")
             for path in paths:
                 path_bytes(path)
-                require(path.startswith(("/sys/", "/proc/sys/")), "direct kernel policy path")
+                prefixes = ("/sys/",) if name == "cpu_policy" else ("/sys/", "/proc/sys/")
+                require(path.startswith(prefixes), "direct kernel policy path")
+    cpu_paths = value["policy_files"]["cpu_policy"].values()
+    require(all(cpu_paths) or not any(cpu_paths), "CPU policy must be fully EXPOSED or fully ABSENT")
     lb.exact_keys(value["gpu_inventory_roots"], ("nodes", "libraries", "icds", "layers", "cache"), "GPU inventory coverage")
     for paths in value["gpu_inventory_roots"].values():
         require(type(paths) is list and paths and paths == sorted(set(paths)), "GPU inventory paths required")
@@ -218,7 +222,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #230")
+                "execution authority must follow #232")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -239,7 +243,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #230")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #232")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -1295,14 +1299,25 @@ class LiveSystem:
     def _policy_files(self, group):
         paths = self.profile["policy_files"][group]
         require(type(paths) is dict and paths, "explicit policy observation files")
+        if group == "cpu_policy":
+            root = "/sys/devices/system/cpu/cpufreq"
+            try:
+                entries = self.io.listdir(root)
+            except FileNotFoundError:
+                entries = []
+            policies = [name for name in entries if name.startswith("policy")]
+            for name in policies:
+                require(stat.S_ISDIR(self.io.stat(root + "/" + name).st_mode),
+                        "CPU cpufreq policy entry is not a directory")
+            if all(files == [] for files in paths.values()):
+                require(not policies, "ABSENT CPU policy interface drift")
+                return {"governors": {}, "frequency_limits": {}, "boost": {}, "power": {}}
+            require(policies, "CPU frequency/governor interface unavailable")
         values = {}
         for name, files in paths.items():
             require(type(files) is list and files, "policy file inventory required")
             values[name] = {path: self.io.text(path).strip() for path in files}
         if group == "cpu_policy":
-            root = "/sys/devices/system/cpu/cpufreq"
-            policies = [name for name in self.io.listdir(root) if name.startswith("policy")]
-            require(policies, "CPU frequency/governor interface unavailable")
             expected = [root + "/" + name + "/scaling_governor" for name in policies]
             require(sorted(values["governors"]) == sorted(expected), "incomplete CPU governor coverage")
             limits = [root + "/" + name + "/" + field for name in policies

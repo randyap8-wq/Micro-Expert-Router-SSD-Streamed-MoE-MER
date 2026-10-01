@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 from . import InvalidEvidence, canonical_json, digest, strict_json
 from . import live_system as ls
 from . import linux_backend as lb
-from .test_p1v import launch_fixture, adapter_fixture, closure_fixture, storage_fixture, execution_fixture
+from .test_p1v import launch_fixture, adapter_fixture, closure_fixture, storage_fixture
 
 
 def mask(*nodes):
@@ -415,7 +415,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #230"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #232"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -1011,13 +1011,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 231, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 233, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 231, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 233, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -1449,37 +1449,260 @@ class DataFilesystemProfileTests(unittest.TestCase):
                     self.assertNotIn(forbidden, source)
 
 
+class CpuPolicyAbsenceTests(unittest.TestCase):
+    ROOT = "/sys/devices/system/cpu/cpufreq"
+    CATEGORIES = ("governors", "frequency_limits", "boost", "power")
+    LIMITS = ("scaling_min_freq", "scaling_max_freq", "cpuinfo_min_freq", "cpuinfo_max_freq")
+
+    def profile(self, absent=False):
+        profile = bundle_fixture()["provider"]["host_profile"]
+        if absent:
+            profile["policy_files"]["cpu_policy"] = {name: [] for name in self.CATEGORIES}
+        return profile
+
+    def provider(self, absent=False):
+        obj = object.__new__(ls.LiveSystem)
+        obj.profile = self.profile(absent)
+        obj.io = Mock()
+        obj.io.listdir.return_value = [] if absent else ["policy0", "policy2"]
+        obj.io.stat.return_value = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755)
+        obj.io.text.side_effect = lambda path: "observed:" + path + "\n"
+        if not absent:
+            paths = obj.profile["policy_files"]["cpu_policy"]
+            paths["governors"] = [self.ROOT + "/" + name + "/scaling_governor" for name in ("policy0", "policy2")]
+            paths["frequency_limits"] = sorted(self.ROOT + "/" + name + "/" + field
+                                               for name in ("policy0", "policy2") for field in self.LIMITS)
+        ls.validate_host_profile(obj.profile)
+        return obj
+
+    def empty_observation(self):
+        return {name: {} for name in self.CATEGORIES}
+
+    def test_profile_accepts_all_four_empty_lists_and_existing_exposed_form(self):
+        for absent in (False, True):
+            profile = self.profile(absent)
+            before = copy.deepcopy(profile)
+            with self.subTest(absent=absent):
+                ls.validate_host_profile(profile)
+                self.assertEqual(profile, before)
+
+    def test_every_partial_empty_profile_rejects(self):
+        for bits in range(1, 15):
+            profile = self.profile()
+            for index, name in enumerate(self.CATEGORIES):
+                if bits & (1 << index):
+                    profile["policy_files"]["cpu_policy"][name] = []
+            with self.subTest(bits=bits), self.assertRaisesRegex(InvalidEvidence, "fully EXPOSED or fully ABSENT"):
+                ls.validate_host_profile(profile)
+
+    def test_profile_rejects_nonlists_duplicates_unsorted_and_nonsys_paths(self):
+        for name in self.CATEGORIES:
+            for invalid in (None, {}, (), "", ["/sys/a", "/sys/a"], ["/sys/b", "/sys/a"],
+                            ["/proc/sys/fixture"], ["/fixture/policy"]):
+                profile = self.profile()
+                profile["policy_files"]["cpu_policy"][name] = invalid
+                with self.subTest(name=name, invalid=invalid), self.assertRaises(InvalidEvidence):
+                    ls.validate_host_profile(profile)
+
+    def test_thp_and_numa_inventories_remain_nonempty(self):
+        for absent in (False, True):
+            for group in ("thp", "numa_balancing"):
+                for empty in ({}, {"enabled": []}):
+                    profile = self.profile(absent)
+                    profile["policy_files"][group] = empty
+                    with self.subTest(absent=absent, group=group, empty=empty), self.assertRaises(InvalidEvidence):
+                        ls.validate_host_profile(profile)
+
+    def test_absent_missing_root_returns_exact_empty_maps(self):
+        obj = self.provider(True)
+        obj.io.listdir.side_effect = FileNotFoundError(self.ROOT)
+        before = copy.deepcopy(obj.profile)
+        self.assertEqual(obj._policy_files("cpu_policy"), self.empty_observation())
+        self.assertEqual(obj.profile, before)
+        obj.io.listdir.assert_called_once_with(self.ROOT)
+        obj.io.stat.assert_not_called()
+        obj.io.text.assert_not_called()
+
+    def test_absent_existing_root_without_policy_directories_returns_exact_empty_maps(self):
+        for entries in ([], ["boost", "unrelated"]):
+            obj = self.provider(True)
+            obj.io.listdir.return_value = entries
+            before = copy.deepcopy(obj.profile)
+            with self.subTest(entries=entries):
+                self.assertEqual(obj._policy_files("cpu_policy"), self.empty_observation())
+                self.assertEqual(obj.profile, before)
+                obj.io.listdir.assert_called_once_with(self.ROOT)
+                obj.io.text.assert_not_called()
+
+    def test_absent_policy_directory_appearance_rejects_without_rewriting_profile(self):
+        for name in ("policy0", "policy19", "policy-extra"):
+            obj = self.provider(True)
+            obj.io.listdir.return_value = [name]
+            before = copy.deepcopy(obj.profile)
+            with self.subTest(name=name), self.assertRaisesRegex(InvalidEvidence, "ABSENT CPU policy interface drift"):
+                obj._policy_files("cpu_policy")
+            self.assertEqual(obj.profile, before)
+            obj.io.text.assert_not_called()
+
+    def test_exposed_missing_or_empty_root_rejects_before_policy_reads(self):
+        for missing in (False, True):
+            obj = self.provider()
+            obj.io.listdir.return_value = []
+            if missing:
+                obj.io.listdir.side_effect = FileNotFoundError(self.ROOT)
+            with self.subTest(missing=missing), self.assertRaisesRegex(InvalidEvidence, "interface unavailable"):
+                obj._policy_files("cpu_policy")
+            obj.io.text.assert_not_called()
+
+    def test_root_errors_other_than_missing_remain_hard_failures(self):
+        for absent in (False, True):
+            for error in (PermissionError, OSError, NotADirectoryError, RuntimeError):
+                obj = self.provider(absent)
+                obj.io.listdir.side_effect = error("root observation failed")
+                with self.subTest(absent=absent, error=error), self.assertRaises(error):
+                    obj._policy_files("cpu_policy")
+                obj.io.text.assert_not_called()
+
+    def test_policy_entry_malformed_or_unreadable_remains_failure(self):
+        for absent in (False, True):
+            for mode in (stat.S_IFREG, stat.S_IFLNK):
+                obj = self.provider(absent)
+                obj.io.listdir.return_value = ["policy0"]
+                obj.io.stat.return_value = SimpleNamespace(st_mode=mode)
+                with self.subTest(absent=absent, mode=mode), self.assertRaisesRegex(InvalidEvidence, "not a directory"):
+                    obj._policy_files("cpu_policy")
+            for error in (FileNotFoundError, PermissionError, OSError):
+                obj = self.provider(absent)
+                obj.io.listdir.return_value = ["policy0"]
+                obj.io.stat.side_effect = error("policy observation failed")
+                with self.subTest(absent=absent, error=error), self.assertRaises(error):
+                    obj._policy_files("cpu_policy")
+
+    def test_exposed_exact_governor_frequency_boost_and_power_values(self):
+        obj = self.provider()
+        paths = obj.profile["policy_files"]["cpu_policy"]
+        before = copy.deepcopy(obj.profile)
+        expected = {name: {path: "observed:" + path for path in files} for name, files in paths.items()}
+        self.assertEqual(obj._policy_files("cpu_policy"), expected)
+        self.assertEqual(obj.profile, before)
+        self.assertEqual(obj.io.mock_calls[0].args, (self.ROOT,))
+        self.assertEqual(obj.io.mock_calls[0][0], "listdir")
+        self.assertEqual([call.args[0] for call in obj.io.text.call_args_list],
+                         [path for files in paths.values() for path in files])
+
+    def test_exposed_governor_and_every_frequency_path_coverage_remains_exact(self):
+        for category in ("governors", "frequency_limits"):
+            for missing in self.provider().profile["policy_files"]["cpu_policy"][category]:
+                obj = self.provider()
+                obj.profile["policy_files"]["cpu_policy"][category].remove(missing)
+                with self.subTest(category=category, missing=missing), self.assertRaisesRegex(InvalidEvidence, "coverage"):
+                    obj._policy_files("cpu_policy")
+            obj = self.provider()
+            obj.profile["policy_files"]["cpu_policy"][category].append("/sys/extra")
+            with self.subTest(category=category, extra=True), self.assertRaisesRegex(InvalidEvidence, "coverage"):
+                obj._policy_files("cpu_policy")
+
+    def test_exposed_policy_directory_set_drift_rejects(self):
+        for policies in (["policy0"], ["policy0", "policy2", "policy3"]):
+            obj = self.provider()
+            obj.io.listdir.return_value = policies
+            with self.subTest(policies=policies), self.assertRaisesRegex(InvalidEvidence, "coverage"):
+                obj._policy_files("cpu_policy")
+
+    def test_exposed_configured_path_read_failure_cannot_fall_back(self):
+        for category in self.CATEGORIES:
+            for error in (FileNotFoundError, PermissionError, OSError):
+                obj = self.provider()
+                failed_path = obj.profile["policy_files"]["cpu_policy"][category][0]
+                def read(path):
+                    if path == failed_path:
+                        raise error("configured policy path unavailable")
+                    return "observed"
+                obj.io.text.side_effect = read
+                with self.subTest(category=category, error=error), self.assertRaises(error):
+                    obj._policy_files("cpu_policy")
+
+    def test_empty_launch_cpu_policy_is_accepted_by_existing_parser(self):
+        value = numa_baseline()
+        value["cpu_policy"] = self.empty_observation()
+        manifest = lb.LaunchManifest.parse(value)
+        self.assertEqual(manifest.values()["cpu_policy"], self.empty_observation())
+        manifest.compare(copy.deepcopy(value))
+
+    def test_absent_confinement_matches_only_absent_authority(self):
+        obj = ProviderReceiptTests().base()
+        baseline = numa_baseline()
+        baseline["cpu_policy"] = self.provider(True)._policy_files("cpu_policy")
+        obj.baseline = lb.LaunchManifest.parse(baseline)
+        obj._launch_observed.return_value = copy.deepcopy(baseline)
+        self.assertEqual(obj._observe_confinement()["launch_observed"]["cpu_policy"], self.empty_observation())
+
+    def test_confinement_rejects_both_form_transitions(self):
+        for absent in (False, True):
+            obj = ProviderReceiptTests().base()
+            baseline = numa_baseline()
+            baseline["cpu_policy"] = self.provider(absent)._policy_files("cpu_policy")
+            obj.baseline = lb.LaunchManifest.parse(baseline)
+            observed = copy.deepcopy(baseline)
+            observed["cpu_policy"] = self.provider(not absent)._policy_files("cpu_policy")
+            obj._launch_observed.return_value = observed
+            with self.subTest(absent=absent), self.assertRaisesRegex(InvalidEvidence, "frozen launch profile drift"):
+                obj._observe_confinement()
+
+    def test_confinement_rejects_exposed_path_and_value_drift_in_every_category(self):
+        for category in self.CATEGORIES:
+            for change in ("path", "value"):
+                obj = ProviderReceiptTests().base()
+                baseline = numa_baseline()
+                baseline["cpu_policy"] = self.provider()._policy_files("cpu_policy")
+                obj.baseline = lb.LaunchManifest.parse(baseline)
+                observed = copy.deepcopy(baseline)
+                values = observed["cpu_policy"][category]
+                path = next(iter(values))
+                if change == "path":
+                    values["/sys/changed"] = values.pop(path)
+                else:
+                    values[path] = "changed"
+                obj._launch_observed.return_value = observed
+                with self.subTest(category=category, change=change), self.assertRaisesRegex(InvalidEvidence, "frozen launch profile drift"):
+                    obj._observe_confinement()
+
+
 class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 231, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 233, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 230)
+        self.assertEqual(ls.FLOOR, 232)
 
-    def test_every_nonnegative_authority_through_230_rejects_before_host_access(self):
-        for issue in range(231):
+    def test_every_nonnegative_authority_through_232_rejects_before_host_access(self):
+        for issue in range(233):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
-            with self.subTest(issue=issue), patch.object(lb, "require_adapter_grant", side_effect=AssertionError("adapter")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #230"):
+            with self.subTest(issue=issue), patch.object(lb, "require_adapter_grant", side_effect=AssertionError("adapter")), \
+                    patch("os.open", side_effect=AssertionError("host access")), \
+                    patch("os.listdir", side_effect=AssertionError("host access")), \
+                    patch("os.getpid", side_effect=AssertionError("host access")), \
+                    patch("ctypes.CDLL", side_effect=AssertionError("library")):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #232"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #230"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #232"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_231_complete_scope_passes_only_pure_constructor_check(self):
+    def test_synthetic_233_complete_scope_passes_only_pure_constructor_check(self):
         receiver, scope = SimpleNamespace(), self.scope()
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 231)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 233)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_231_requires_complete_valid_scope(self):
+    def test_synthetic_233_requires_complete_valid_scope(self):
         for field in self.scope():
             scope = self.scope()
             del scope[field]
@@ -1491,16 +1714,16 @@ class RefreshedAuthorityTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(InvalidEvidence):
                 ls.ProviderGrant.__init__(SimpleNamespace(), scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
-    def test_synthetic_231_provider_bindings_and_adapter_grant_still_required(self):
+    def test_synthetic_233_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 231)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 233)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 230), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 232), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -1512,8 +1735,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        authorization, execution = execution_fixture(storage, adapter)
-        scope = {"authority_issue": 231, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 233, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+                           "operations": [a.name for a in plan_fixture()],
+                           "adapter_manifest_sha256": digest(canonical_json(adapter)),
+                           "storage_identity": storage}
+        execution_token = b"synthetic pure validation only!!!" * 2
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 233)
+        execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
+                                      execution_token, digest(execution_token))
+        scope = {"authority_issue": 233, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2
