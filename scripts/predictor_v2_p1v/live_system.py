@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >236.
+"""P1V5 direct observations. Live execution requires a future issue >238.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 236
+FLOOR = 238
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -108,6 +108,33 @@ def parse_stat(text):
     require(len(tail) >= 20, "truncated proc stat")
     return {"pid": pid, "state": tail[0], "ppid": int(tail[1]),
             "pgrp": int(tail[2]), "session": int(tail[3]), "starttime": int(tail[19])}
+
+
+def parse_character_devices(text):
+    """Exact character-major registrations; block registrations are separate."""
+    drivers, section = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line == "Character devices:":
+            require(section is None, "ambiguous Character devices section")
+            section = "character"
+        elif line == "Block devices:":
+            require(section == "character", "ambiguous Block devices section")
+            section = "block"
+        else:
+            require(section is not None, "missing Character devices section")
+            if section == "character":
+                fields = line.split()
+                require(len(fields) == 2 and fields[0].isascii() and fields[0].isdecimal(),
+                        "malformed Character devices registration")
+                major, driver = uint(int(fields[0]), 32), fields[1]
+                require(major not in drivers or drivers[major] == driver,
+                        "conflicting Character devices registration")
+                drivers[major] = driver
+    require(section is not None, "missing Character devices section")
+    return drivers
 
 
 def ext4_superblock(data):
@@ -233,7 +260,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #236")
+                "execution authority must follow #238")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -254,7 +281,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #236")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #238")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -929,6 +956,8 @@ class LiveSystem:
         return {"namespaces": namespaces, "processes": processes}
 
     def _raw_device_access(self):
+        import errno
+        character_drivers = parse_character_devices(self.io.text("/proc/devices"))
         ids = self.baseline.values()["credentials"]
         def accessible(info):
             bits = (info.st_mode >> 6) if info.st_uid == ids["uid"] else (
@@ -954,7 +983,18 @@ class LiveSystem:
                 if stat.S_ISBLK(info.st_mode):
                     nodes.add((stat.S_IFBLK, info.st_rdev))
                 else:
-                    sysfs = os.path.realpath("/sys/dev/char/" + major_minor(info, True), strict=True)
+                    try:
+                        sysfs = os.path.realpath("/sys/dev/char/" + major_minor(info, True), strict=True)
+                    except OSError as error:
+                        if error.errno != errno.ENOENT:
+                            raise
+                        major = os.major(info.st_rdev)
+                        require(major in character_drivers
+                                and character_drivers[major] not in ("nvme", "nvme-generic", "sg")
+                                and not name.startswith(("nvme", "ng", "sg"))
+                                and (stat.S_IFCHR, info.st_rdev) not in nodes,
+                                "missing sysfs character route lacks negative proof")
+                        continue
                     if sysfs == controller or sysfs.startswith(controller + "/") or name.startswith(("nvme", "ng", "sg")):
                         nodes.add((stat.S_IFCHR, info.st_rdev))
         # The second pass includes aliases with arbitrary names and identical rdev.

@@ -416,7 +416,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #236"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #238"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -799,6 +799,141 @@ class ExclusionTests(unittest.TestCase):
         obj.io.status.side_effect = PermissionError("fixture denial")
         with self.assertRaises(PermissionError):
             obj._inventory()
+
+
+class RawDeviceSysfsTests(unittest.TestCase):
+    controller = "/sys/devices/pci0000:00/nvme/nvme1"
+    registrations = "Character devices:\n240 nvme\n236 unrelated-driver\n\nBlock devices:\n259 blkext\n"
+
+    def node(self, major=236, minor=255, mode=stat.S_IFCHR | 0o600):
+        return SimpleNamespace(st_mode=mode, st_rdev=os.makedev(major, minor), st_uid=0, st_gid=0)
+
+    def fixture(self, entries, registrations=None):
+        obj = object.__new__(ls.LiveSystem)
+        obj._check = Mock()
+        obj._device = Mock(return_value={"sysfs_identity": self.controller + "/nvme1n1"})
+        obj.baseline = Mock()
+        obj.baseline.values.return_value = {"credentials": {"uid": 1001, "gid": 1002, "groups": []}}
+        obj._no_acl = Mock()
+        obj.io = Mock()
+        obj.fixture_nodes = {"/dev/nvme1": self.node(240, 0), **entries}
+        obj.io.stat.side_effect = obj.fixture_nodes.__getitem__
+        texts = {"/proc/devices": self.registrations if registrations is None else registrations,
+                 "/proc/net/unix": "Num RefCount Protocol Flags Type St Inode Path\n"}
+        obj.io.text.side_effect = texts.__getitem__
+        return obj
+
+    def scan(self, obj, resolutions):
+        def resolve(path, *, strict):
+            self.assertTrue(strict)
+            self.assertTrue(path.startswith("/sys/dev/char/"))
+            rdev = path.rsplit("/", 1)[1]
+            value = resolutions.get(rdev, self.controller if rdev == "240:0" else "/sys/devices/unrelated")
+            if isinstance(value, list):
+                value = value.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        files = [Path(path).name for path in obj.fixture_nodes]
+        with patch("os.walk", return_value=[("/dev", [], files)]) as walk, \
+                patch("os.path.realpath", side_effect=resolve), \
+                patch("os.open", side_effect=AssertionError("host access")), \
+                patch("os.getxattr", create=True, side_effect=AssertionError("host ACL access")):
+            result = obj._raw_device_access()
+        walk.assert_called_once_with("/dev", followlinks=False, onerror=unittest.mock.ANY)
+        obj.io.text.assert_any_call("/proc/devices")
+        return result
+
+    def test_unrelated_registered_missing_sysfs_character_is_tolerated(self):
+        for name, driver in (("unrelated-node", "unrelated-driver"), ("nvidia-nvswitchctl", "nvidia-nvswitch")):
+            with self.subTest(name=name, driver=driver):
+                unrelated = self.node(mode=stat.S_IFCHR | 0o666)
+                entries = {"/dev/" + name: unrelated,
+                           "/dev/data": self.node(259, 4, stat.S_IFBLK | 0o600),
+                           "/dev/controller-child": self.node(241, 0),
+                           "/dev/nvme-other": self.node(242, 0)}
+                obj = self.fixture(entries, self.registrations.replace("unrelated-driver", driver))
+                result = self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing"),
+                                         "241:0": self.controller + "/child"})
+                self.assertEqual(result, {(stat.S_IFCHR, os.makedev(240, 0)),
+                                          (stat.S_IFBLK, os.makedev(259, 4)),
+                                          (stat.S_IFCHR, os.makedev(241, 0)),
+                                          (stat.S_IFCHR, os.makedev(242, 0))})
+                self.assertEqual([call.args[0] for call in obj._no_acl.call_args_list],
+                                 ["/dev/nvme1", "/dev/data", "/dev/controller-child", "/dev/nvme-other"])
+
+    def test_missing_sysfs_protected_basename_classes_reject(self):
+        for name in ("nvme", "nvme42", "ng", "ng42n1", "sg", "sg42"):
+            obj = self.fixture({"/dev/" + name: self.node()})
+            with self.subTest(name=name), self.assertRaisesRegex(InvalidEvidence, "negative proof"):
+                self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing")})
+
+    def test_missing_sysfs_protected_registered_driver_classes_reject(self):
+        for driver in ("nvme", "nvme-generic", "sg"):
+            obj = self.fixture({"/dev/arbitrary": self.node()}, self.registrations.replace("unrelated-driver", driver))
+            with self.subTest(driver=driver), self.assertRaisesRegex(InvalidEvidence, "negative proof"):
+                self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing")})
+
+    def test_missing_sysfs_same_rdev_alias_remains_protected(self):
+        # The seeded controller identity rejects even an unrelated driver/name.
+        obj = self.fixture({"/dev/arbitrary": self.node(240, 0)}, self.registrations.replace("240 nvme", "240 unrelated"))
+        with self.assertRaisesRegex(InvalidEvidence, "negative proof"):
+            self.scan(obj, {"240:0": [self.controller, FileNotFoundError(errno.ENOENT, "missing alias")]})
+        # Classification by an existing route also protects a later missing alias.
+        table = self.registrations.replace("236 unrelated-driver", "236 unrelated-driver\n241 unrelated")
+        obj = self.fixture({"/dev/related": self.node(241, 0), "/dev/later-alias": self.node(241, 0)}, table)
+        with self.assertRaisesRegex(InvalidEvidence, "negative proof"):
+            self.scan(obj, {"241:0": [self.controller + "/child", FileNotFoundError(errno.ENOENT, "missing alias")]})
+        # An alias observed before classification must remain in the second pass.
+        for mode, denied in ((0o600, False), (0o666, True)):
+            obj = self.fixture({"/dev/first-alias": self.node(241, 0, stat.S_IFCHR | mode),
+                                "/dev/related": self.node(241, 0)}, table)
+            resolutions = {"241:0": [FileNotFoundError(errno.ENOENT, "missing alias"), self.controller + "/child"]}
+            with self.subTest(mode=mode):
+                if denied:
+                    with self.assertRaisesRegex(InvalidEvidence, "runtime raw/passthrough device exposure"):
+                        self.scan(obj, resolutions)
+                else:
+                    self.assertIn((stat.S_IFCHR, os.makedev(241, 0)), self.scan(obj, resolutions))
+                obj._no_acl.assert_any_call("/dev/first-alias")
+
+    def test_missing_sysfs_unregistered_character_major_rejects(self):
+        # A block registration of the same major cannot supply character proof.
+        for block in ("", "236 unrelated-driver\n"):
+            table = "Character devices:\n240 nvme\n\nBlock devices:\n" + block
+            obj = self.fixture({"/dev/arbitrary": self.node()}, table)
+            with self.subTest(block=block), self.assertRaisesRegex(InvalidEvidence, "negative proof"):
+                self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing")})
+
+    def test_malformed_or_conflicting_character_registration_rejects(self):
+        rows = ("236", "236 driver extra", "-1 driver", "+236 driver", "0xec driver",
+                "236.0 driver", "\u0662\u0663\u0666 driver", "4294967296 driver", "driver 236",
+                "236 first\n236 second", "236 first\n0236 second")
+        tables = ["Character devices:\n" + row + "\n\nBlock devices:\n" for row in rows]
+        tables += ["", "236 driver\n", "Block devices:\n236 driver\n",
+                   "Character devices:\n236 driver\nCharacter devices:\n",
+                   "Character devices:\n236 driver\nBlock devices:\nCharacter devices:\n",
+                   "Character devices:\n236 driver\nBlock devices:\nBlock devices:\n"]
+        for table in tables:
+            obj = self.fixture({"/dev/arbitrary": self.node()}, table)
+            with self.subTest(table=table), self.assertRaises(InvalidEvidence):
+                self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing")})
+        valid = ("Character devices:\n0 zero\n4294967295 maximum\n236 unrelated-driver\n"
+                 "0236 unrelated-driver\n\nBlock devices:\n236 nvme\nblock rows are not character data\n")
+        self.assertEqual(ls.parse_character_devices(valid), {0: "zero", 4294967295: "maximum", 236: "unrelated-driver"})
+        obj = self.fixture({"/dev/arbitrary": self.node()}, valid)
+        self.assertNotIn((stat.S_IFCHR, os.makedev(236, 255)),
+                         self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing")}))
+
+    def test_non_enoent_sysfs_resolution_errors_remain_fatal(self):
+        errors = [OSError(code, "resolution failed") for code in
+                  (errno.EACCES, errno.EPERM, errno.ELOOP, errno.EINVAL, errno.ENOTDIR, errno.EIO)]
+        errors += [ValueError("malformed path"), FileNotFoundError("no ENOENT proof")]
+        for error in errors:
+            obj = self.fixture({"/dev/arbitrary": self.node()})
+            with self.subTest(error=repr(error)), self.assertRaises(type(error)) as caught:
+                self.scan(obj, {"236:255": error})
+            self.assertIs(caught.exception, error)
 
 
 class NamespaceServiceTests(unittest.TestCase):
@@ -1259,13 +1394,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 237, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 239, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 237, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 239, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -1920,14 +2055,14 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 237, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 239, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 236)
+        self.assertEqual(ls.FLOOR, 238)
 
-    def test_every_nonnegative_authority_through_236_rejects_before_host_access(self):
-        for issue in range(237):
+    def test_every_nonnegative_authority_through_238_rejects_before_host_access(self):
+        for issue in range(239):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
@@ -1936,21 +2071,21 @@ class RefreshedAuthorityTests(unittest.TestCase):
                     patch("os.listdir", side_effect=AssertionError("host access")), \
                     patch("os.getpid", side_effect=AssertionError("host access")), \
                     patch("ctypes.CDLL", side_effect=AssertionError("library")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #236"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #238"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #236"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #238"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_237_complete_scope_passes_only_pure_constructor_check(self):
+    def test_synthetic_239_complete_scope_passes_only_pure_constructor_check(self):
         receiver, scope = SimpleNamespace(), self.scope()
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 237)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 239)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_237_requires_complete_valid_scope(self):
+    def test_synthetic_239_requires_complete_valid_scope(self):
         for field in self.scope():
             scope = self.scope()
             del scope[field]
@@ -1962,16 +2097,16 @@ class RefreshedAuthorityTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(InvalidEvidence):
                 ls.ProviderGrant.__init__(SimpleNamespace(), scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
-    def test_synthetic_237_provider_bindings_and_adapter_grant_still_required(self):
+    def test_synthetic_239_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 237)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 239)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 236), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 238), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -1983,15 +2118,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        execution_scope = {"authority_issue": 237, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 239, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                            "operations": [a.name for a in plan_fixture()],
                            "adapter_manifest_sha256": digest(canonical_json(adapter)),
                            "storage_identity": storage}
         execution_token = b"synthetic pure validation only!!!" * 2
-        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 237)
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 239)
         execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
                                       execution_token, digest(execution_token))
-        scope = {"authority_issue": 237, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 239, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2
