@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >238.
+"""P1V5 direct observations. Live execution requires a future issue >240.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 238
+FLOOR = 240
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -110,8 +110,8 @@ def parse_stat(text):
             "pgrp": int(tail[2]), "session": int(tail[3]), "starttime": int(tail[19])}
 
 
-def parse_character_devices(text):
-    """Exact character-major registrations; block registrations are separate."""
+def parse_character_devices(text) -> dict[int, tuple[str, ...]]:
+    """All character-major registrations, sorted unique; block rows are separate."""
     drivers, section = {}, None
     for line in text.splitlines():
         line = line.strip()
@@ -130,11 +130,9 @@ def parse_character_devices(text):
                 require(len(fields) == 2 and fields[0].isascii() and fields[0].isdecimal(),
                         "malformed Character devices registration")
                 major, driver = uint(int(fields[0]), 32), fields[1]
-                require(major not in drivers or drivers[major] == driver,
-                        "conflicting Character devices registration")
-                drivers[major] = driver
+                drivers.setdefault(major, set()).add(driver)
     require(section is not None, "missing Character devices section")
-    return drivers
+    return {major: tuple(sorted(names)) for major, names in drivers.items()}
 
 
 def ext4_superblock(data):
@@ -260,7 +258,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #238")
+                "execution authority must follow #240")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -281,7 +279,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #238")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #240")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -989,8 +987,9 @@ class LiveSystem:
                         if error.errno != errno.ENOENT:
                             raise
                         major = os.major(info.st_rdev)
-                        require(major in character_drivers
-                                and character_drivers[major] not in ("nvme", "nvme-generic", "sg")
+                        registrations = character_drivers.get(major)
+                        require(registrations
+                                and all(name not in ("nvme", "nvme-generic", "sg") for name in registrations)
                                 and not name.startswith(("nvme", "ng", "sg"))
                                 and (stat.S_IFCHR, info.st_rdev) not in nodes,
                                 "missing sysfs character route lacks negative proof")

@@ -126,8 +126,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.execute:
         # No CLI switch/token can grant execution. A future reviewed entry point
-        # must call compose with all externally pinned matching grants >238.
-        parser.error("P1V5 execution NOT_AUTHORIZED; external future grants for an issue >238 required")
+        # must call compose with all externally pinned matching grants >240.
+        parser.error("P1V5 execution NOT_AUTHORIZED; external future grants for an issue >240 required")
     try:
         if args.validate_manifest:
             value = strict_json(Path(args.validate_manifest).read_bytes())

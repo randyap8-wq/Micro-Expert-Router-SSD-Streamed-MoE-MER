@@ -416,7 +416,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #238"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #240"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -907,8 +907,7 @@ class RawDeviceSysfsTests(unittest.TestCase):
 
     def test_malformed_or_conflicting_character_registration_rejects(self):
         rows = ("236", "236 driver extra", "-1 driver", "+236 driver", "0xec driver",
-                "236.0 driver", "\u0662\u0663\u0666 driver", "4294967296 driver", "driver 236",
-                "236 first\n236 second", "236 first\n0236 second")
+                "236.0 driver", "\u0662\u0663\u0666 driver", "4294967296 driver", "driver 236")
         tables = ["Character devices:\n" + row + "\n\nBlock devices:\n" for row in rows]
         tables += ["", "236 driver\n", "Block devices:\n236 driver\n",
                    "Character devices:\n236 driver\nCharacter devices:\n",
@@ -919,11 +918,50 @@ class RawDeviceSysfsTests(unittest.TestCase):
             with self.subTest(table=table), self.assertRaises(InvalidEvidence):
                 self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing")})
         valid = ("Character devices:\n0 zero\n4294967295 maximum\n236 unrelated-driver\n"
-                 "0236 unrelated-driver\n\nBlock devices:\n236 nvme\nblock rows are not character data\n")
-        self.assertEqual(ls.parse_character_devices(valid), {0: "zero", 4294967295: "maximum", 236: "unrelated-driver"})
+                 "0236 unrelated-driver\n236 first\n236 second\n0236 second\n"
+                 "\nBlock devices:\n236 nvme\nblock rows are not character data\n")
+        self.assertEqual(ls.parse_character_devices(valid),
+                         {0: ("zero",), 4294967295: ("maximum",), 236: ("first", "second", "unrelated-driver")})
         obj = self.fixture({"/dev/arbitrary": self.node()}, valid)
         self.assertNotIn((stat.S_IFCHR, os.makedev(236, 255)),
                          self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing")}))
+
+    def test_multiple_character_registrations_are_canonical_sorted_unique(self):
+        expected = {4: ("/dev/vc/0", "tty", "ttyS"),
+                    5: ("/dev/console", "/dev/ptmx", "/dev/tty", "ttyprintk"),
+                    195: ("nvidia", "nvidia-modeset", "nvidiactl")}
+        rows = [str(major) + " " + name for major, names in expected.items() for name in names]
+        rows += ["4 tty", "5 /dev/ptmx", "195 nvidia", "0195 nvidiactl"]
+        for order in (rows, list(reversed(rows)), rows[5:] + rows[:5]):
+            table = "Character devices:\n" + "\n".join(order) + "\n\nBlock devices:\n195 nvme\n8 sd\n"
+            with self.subTest(rows=order):
+                result = ls.parse_character_devices(table)
+                self.assertEqual(result, expected)
+                self.assertTrue(all(type(major) is int for major in result))
+                for names in result.values():
+                    self.assertIs(type(names), tuple)
+                    self.assertTrue(names)
+                    self.assertEqual(names, tuple(sorted(set(names))))
+
+    def test_missing_sysfs_multiple_unprotected_registrations_are_tolerated(self):
+        for major, basename, names in ((195, "nvidia0", ("nvidia", "nvidia-modeset", "nvidiactl")),
+                                       (236, "arbitrary", ("unrelated", "another-driver", "third-driver"))):
+            table = "Character devices:\n240 nvme\n" + "".join(str(major) + " " + name + "\n" for name in names)
+            obj = self.fixture({"/dev/" + basename: self.node(major, 255, stat.S_IFCHR | 0o666)}, table)
+            with self.subTest(major=major, names=names):
+                result = self.scan(obj, {str(major) + ":255": FileNotFoundError(errno.ENOENT, "missing")})
+                self.assertEqual(result, {(stat.S_IFCHR, os.makedev(240, 0))})
+                obj._no_acl.assert_called_once_with("/dev/nvme1")
+
+    def test_missing_sysfs_any_protected_registration_rejects(self):
+        for protected in ("nvme", "nvme-generic", "sg"):
+            names = ("aaa-unrelated", protected, "zzz-unrelated")
+            for order in (names, tuple(reversed(names)), names[1:] + names[:1]):
+                table = "Character devices:\n240 nvme\n" + "".join("236 " + name + "\n" for name in order)
+                obj = self.fixture({"/dev/arbitrary": self.node()}, table)
+                with self.subTest(protected=protected, names=order), \
+                        self.assertRaisesRegex(InvalidEvidence, "negative proof"):
+                    self.scan(obj, {"236:255": FileNotFoundError(errno.ENOENT, "missing")})
 
     def test_non_enoent_sysfs_resolution_errors_remain_fatal(self):
         errors = [OSError(code, "resolution failed") for code in
@@ -1394,13 +1432,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 239, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 241, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 239, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 241, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -2055,14 +2093,14 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 239, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 241, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 238)
+        self.assertEqual(ls.FLOOR, 240)
 
-    def test_every_nonnegative_authority_through_238_rejects_before_host_access(self):
-        for issue in range(239):
+    def test_every_nonnegative_authority_through_240_rejects_before_host_access(self):
+        for issue in range(241):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
@@ -2071,21 +2109,21 @@ class RefreshedAuthorityTests(unittest.TestCase):
                     patch("os.listdir", side_effect=AssertionError("host access")), \
                     patch("os.getpid", side_effect=AssertionError("host access")), \
                     patch("ctypes.CDLL", side_effect=AssertionError("library")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #238"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #240"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #238"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #240"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_239_complete_scope_passes_only_pure_constructor_check(self):
+    def test_synthetic_241_complete_scope_passes_only_pure_constructor_check(self):
         receiver, scope = SimpleNamespace(), self.scope()
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 239)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 241)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
-    def test_synthetic_239_requires_complete_valid_scope(self):
+    def test_synthetic_241_requires_complete_valid_scope(self):
         for field in self.scope():
             scope = self.scope()
             del scope[field]
@@ -2097,16 +2135,16 @@ class RefreshedAuthorityTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(InvalidEvidence):
                 ls.ProviderGrant.__init__(SimpleNamespace(), scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
-    def test_synthetic_239_provider_bindings_and_adapter_grant_still_required(self):
+    def test_synthetic_241_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 239)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 241)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 238), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 240), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -2118,15 +2156,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        execution_scope = {"authority_issue": 239, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 241, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                            "operations": [a.name for a in plan_fixture()],
                            "adapter_manifest_sha256": digest(canonical_json(adapter)),
                            "storage_identity": storage}
         execution_token = b"synthetic pure validation only!!!" * 2
-        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 239)
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 241)
         execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
                                       execution_token, digest(execution_token))
-        scope = {"authority_issue": 239, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 241, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2
