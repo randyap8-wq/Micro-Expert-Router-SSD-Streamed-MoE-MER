@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >244.
+"""P1V5 direct observations. Live execution requires a future issue >246.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 244
+FLOOR = 246
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -109,6 +109,58 @@ def parse_stat(text):
     require(len(tail) >= 20, "truncated proc stat")
     return {"pid": pid, "state": tail[0], "ppid": int(tail[1]),
             "pgrp": int(tail[2]), "session": int(tail[3]), "starttime": int(tail[19])}
+
+
+def parse_topology_config_claims(text):
+    """Extract only five scalar claims from the already pinned configuration."""
+    require(type(text) is str, "topology config text required")
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise InvalidEvidence("topology config encoding") from exc
+    require(size <= 1024 * 1024 and text.endswith("\n"), "topology config size/newline")
+    claims = {"model": {}, "storage": {}}
+    targets = {"model": ("expert_size",),
+               "storage": ("block_align", "no_direct", "packed_blob", "packed_manifest")}
+    scope = None
+    for line in text.split("\n"):
+        line = line.strip(" \t\r\v\f")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            scope = {"[model]": "model", "[storage]": "storage"}.get(line)
+            continue
+        if scope is None or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip(" \t\r\v\f")
+        if key not in targets[scope]:
+            continue
+        require(key not in claims[scope], "duplicate topology config claim")
+        if key in ("packed_blob", "packed_manifest"):
+            claims[scope][key] = True
+            continue
+        value = value.split("#", 1)[0].strip(" \t\r\v\f")
+        if key == "no_direct":
+            require(value in ("true", "false"), "malformed topology boolean")
+            claims[scope][key] = value == "true"
+        else:
+            parts = value.split("_")
+            require(all(part.isascii() and part.isdecimal() for part in parts),
+                    "malformed topology integer")
+            digits = "".join(parts)
+            require(len(digits) == 1 or not digits.startswith("0"), "noncanonical topology integer")
+            try:
+                claims[scope][key] = int(digits)
+            except ValueError as exc:
+                raise InvalidEvidence("malformed topology integer") from exc
+    require("expert_size" in claims["model"] and "block_align" in claims["storage"]
+            and "no_direct" in claims["storage"], "missing topology config claim")
+    return {"model": {"expert_size": claims["model"]["expert_size"]},
+            "storage": {"block_align": claims["storage"]["block_align"],
+                        "no_direct": claims["storage"]["no_direct"],
+                        "packed_blob_present": "packed_blob" in claims["storage"],
+                        "packed_manifest_present": "packed_manifest" in claims["storage"]}}
 
 
 def parse_character_devices(text) -> dict[int, tuple[str, ...]]:
@@ -288,7 +340,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #244")
+                "execution authority must follow #246")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -309,7 +361,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #244")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #246")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -1179,13 +1231,14 @@ class LiveSystem:
                     "packed_blob": None, "packed_manifest": None,
                     "gpu": gpu["device_name"], "driver": gpu["driver_version"]}
         # Storage layout values are source/config closure claims; verify the pinned
-        # TOML explicitly, and validate file sizes/O_DIRECT at METADATA.
-        import tomllib
-        config = tomllib.loads(self.io.text(CONFIG))
-        storage = config["storage"]
-        require(config["model"]["expert_size"] == observed["expert_size"] and storage["block_align"] == 4096
-                and storage["no_direct"] is False and storage.get("packed_blob") is None
-                and storage.get("packed_manifest") is None, "pinned storage configuration mismatch")
+        # config claims explicitly, and validate file sizes/O_DIRECT at METADATA.
+        config = parse_topology_config_claims(self.io.text(CONFIG))
+        require(config == {"model": {"expert_size": EXPECTATIONS["expert_size"]},
+                           "storage": {"block_align": EXPECTATIONS["block_align"],
+                                       "no_direct": EXPECTATIONS["no_direct"],
+                                       "packed_blob_present": EXPECTATIONS["packed_blob"] is not None,
+                                       "packed_manifest_present": EXPECTATIONS["packed_manifest"] is not None}},
+                "pinned storage configuration mismatch")
         require(observed == EXPECTATIONS, "observed host topology mismatch")
         # Actual ext4 health is populated from the retained descriptor below.
         return {"expectations": observed, "filesystem_rw": True, "device_rw": self.io.text(device["sysfs_identity"] + "/ro").strip() == "0",

@@ -10,9 +10,10 @@ import os
 import stat
 import struct
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from . import InvalidEvidence, canonical_json, digest, strict_json
 from . import live_system as ls
@@ -312,6 +313,148 @@ class ParserTests(unittest.TestCase):
             ls.parse_status("Pid: 1\nPid: 2\n")
 
 
+class TopologyConfigTests(unittest.TestCase):
+    config = "[model]\nexpert_size = 2658304\n[storage]\nblock_align = 4096\nno_direct = false\n"
+    claims = {"model": {"expert_size": 2658304},
+              "storage": {"block_align": 4096, "no_direct": False,
+                          "packed_blob_present": False, "packed_manifest_present": False}}
+
+    def topology_fixture(self, config):
+        device = storage_fixture()
+        obj = object.__new__(ls.LiveSystem)
+        obj._storage_identity = canonical_json(device)
+        obj.backing = {"device_fd": 41}
+        obj.nvml = SimpleNamespace(certificate=canonical_json(
+            {"device_name": ls.EXPECTATIONS["gpu"], "driver_version": ls.EXPECTATIONS["driver"]}))
+        obj.io = Mock(spec=ls.DirectLinux)
+        obj.io.link.return_value = ls.CANONICAL
+        obj.io.stat.return_value = SimpleNamespace(st_dev=1)
+        def text(path):
+            if path == ls.CONFIG:
+                return config
+            if path == device["sysfs_identity"] + "/ro":
+                return "0\n"
+            raise AssertionError("unexpected text path: " + path)
+        obj.io.text.side_effect = text
+        obj.io.superblock.return_value = {"uuid": device["uuid"], "recovery_required": True, "healthy": True}
+        return obj, {"target": ls.MOUNT, "fstype": "ext4"}, device
+
+    def test_valid_claims_and_no_toml_runtime_import(self):
+        source = Path(ls.__file__).read_text()
+        helper = next(node for node in ast.parse(source).body
+                      if isinstance(node, ast.FunctionDef) and node.name == "parse_topology_config_claims")
+        self.assertFalse(any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(helper)))
+        forbidden = {"tomllib", "tomli", "toml", "tomlkit"}
+        for path in Path(ls.__file__).parent.glob("*.py"):
+            if path.name.startswith("test_"):
+                continue
+            for node in ast.walk(ast.parse(path.read_text())):
+                with self.subTest(path=path.name):
+                    if isinstance(node, ast.Import):
+                        self.assertFalse(forbidden.intersection(a.name.split(".")[0] for a in node.names))
+                    if isinstance(node, ast.ImportFrom):
+                        self.assertNotIn((node.module or "").split(".")[0], forbidden)
+                    if isinstance(node, ast.Name):
+                        self.assertNotIn(node.id, forbidden)
+                    if isinstance(node, ast.Attribute):
+                        self.assertNotIn(node.attr, forbidden)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                        self.assertNotIn(node.value.split(".")[0], forbidden)
+        decorated = (
+            "\t# ignored\n[unrelated]\nexpert_size = invalid\nno_direct = invalid\n"
+            " \t[model]\t\r\n expert_size\t= 2_658_304 # claim\r\n"
+            "irrelevant = \"# unparsed\"\nblock_align = ignored\n"
+            "[model.child]\nexpert_size = ignored\n[[other]]\nno_direct = ignored\n"
+            "\t[storage] \nblock_align = 4_096\t# claim\nno_direct = false # claim\n"
+            " # packed_blob = \"commented\"\n\t# packed_manifest = \"commented\"\n"
+            "expert_size = ignored\nunused = 1\nunused = 2\n"
+            "[storage.child]\npacked_blob = ignored\n[unknown]\npacked_manifest = ignored\n")
+        bounded = self.config + "#" + "x" * (1024 * 1024 - len(self.config) - 2) + "\n"
+        with ExitStack() as stack:
+            for target in ("builtins.open", "os.open", "os.getenv", "os.system", "os.fork", "ctypes.CDLL"):
+                stack.enter_context(patch(target, side_effect=AssertionError("helper host access")))
+            for name in ("open", "read_bytes", "read_text"):
+                stack.enter_context(patch.object(Path, name, side_effect=AssertionError("helper file access")))
+            stack.enter_context(patch("builtins.__import__", side_effect=AssertionError("helper import")))
+            results = [ls.parse_topology_config_claims(text) for text in (self.config, decorated, bounded)]
+        for result in results:
+            self.assertEqual(result, self.claims)
+            self.assertIs(type(result["model"]["expert_size"]), int)
+            self.assertIs(type(result["storage"]["block_align"]), int)
+            self.assertIs(result["storage"]["no_direct"], False)
+        self.assertIs(ls.parse_topology_config_claims(self.config.replace("false", "true"))["storage"]["no_direct"], True)
+        self.assertEqual(ls.parse_topology_config_claims(self.config.replace("2658304", "0"))["model"]["expert_size"], 0)
+
+    def test_fail_closed_claim_matrix(self):
+        class TextSubclass(str):
+            pass
+        invalid = [None, b"config", TextSubclass(self.config), self.config.rstrip("\n"),
+                   self.config + "#" + "x" * (1024 * 1024) + "\n",
+                   self.config + "#" + "\u00e9" * (512 * 1024) + "\n", self.config + "\ud800\n"]
+        for assignment in ("expert_size = 2658304\n", "block_align = 4096\n", "no_direct = false\n"):
+            invalid.extend((self.config.replace(assignment, ""),
+                            self.config.replace(assignment, assignment * 2)))
+        for original in ("2658304", "4096"):
+            for value in ("", "invalid", "+1", "-1", "1.0", "1e3", "0x10", "0o10", "0b10",
+                          "_1", "1_", "1__0", "01", "0_1", "\u0661", "\uff11", "1 0", '"1"'):
+                invalid.append(self.config.replace(original, value))
+        for value in ("", "0", "1", "False", "TRUE", "yes", '"false"'):
+            invalid.append(self.config.replace("false", value))
+        for table in ("model", "storage"):
+            for header in ("[unrelated]", "[[" + table + "]]", "[" + table + ".child]", "[" + table + "] # comment"):
+                invalid.append(self.config.replace("[" + table + "]", header))
+        for key in ("packed_blob", "packed_manifest"):
+            invalid.append(self.config + key + " = first\n" + key + " = second\n")
+        for index, text in enumerate(invalid):
+            with self.subTest(case=index), self.assertRaises(InvalidEvidence):
+                ls.parse_topology_config_claims(text)
+        for key in ("packed_blob", "packed_manifest"):
+            for value in ('"active#value"', "", "uninterpreted"):
+                text = self.config + key + " = " + value + "\n"
+                self.assertIs(ls.parse_topology_config_claims(text)["storage"][key + "_present"], True)
+                obj, record, device = self.topology_fixture(text)
+                with self.subTest(key=key, value=value), patch("os.uname", return_value=SimpleNamespace(release=ls.EXPECTATIONS["kernel"])), \
+                     self.assertRaisesRegex(InvalidEvidence, "pinned storage configuration mismatch"):
+                    obj._topology_expectations(record, device)
+                obj.io.superblock.assert_not_called()
+
+    def test_real_topology_path_python310_hermetic(self):
+        original_import = builtins.__import__
+        forbidden_attempts = []
+        def guarded_import(name, *args, **kwargs):
+            if name.split(".")[0] in ("tomllib", "tomli", "toml", "tomlkit"):
+                forbidden_attempts.append(name)
+                raise AssertionError("TOML import attempted")
+            return original_import(name, *args, **kwargs)
+        variants = (self.config, self.config.replace("2658304", "2658305"),
+                    self.config.replace("4096", "8192"), self.config.replace("false", "true"))
+        for index, text in enumerate(variants):
+            obj, record, device = self.topology_fixture(text)
+            with self.subTest(case=index), ExitStack() as stack:
+                stack.enter_context(patch("os.uname", return_value=SimpleNamespace(release=ls.EXPECTATIONS["kernel"])))
+                stack.enter_context(patch.object(ls, "major_minor", return_value="259:1"))
+                for target in ("builtins.open", "os.open", "os.system", "os.popen", "os.fork", "os.execve",
+                               "subprocess.Popen", "subprocess.run", "subprocess.call", "subprocess.check_call",
+                               "subprocess.check_output", "ctypes.CDLL"):
+                    stack.enter_context(patch(target, side_effect=AssertionError("topology fallback attempted")))
+                for name in ("open", "read_text", "read_bytes"):
+                    stack.enter_context(patch.object(Path, name, side_effect=AssertionError("path fallback attempted")))
+                stack.enter_context(patch("builtins.__import__", side_effect=guarded_import))
+                if index:
+                    with self.assertRaisesRegex(InvalidEvidence, "pinned storage configuration mismatch"):
+                        obj._topology_expectations(record, device)
+                else:
+                    result = obj._topology_expectations(record, device)
+            expected_calls = [call.link(ls.CONFIGURED), call.stat(ls.OUTPUT_ROOT), call.text(ls.CONFIG)]
+            if not index:
+                self.assertEqual(result, {"expectations": ls.EXPECTATIONS, "filesystem_rw": True,
+                    "device_rw": True, "healthy": True, "external_journal": False,
+                    "stacked_or_overlapping_devices": [], "uncontrolled_aliases": [], "writes_on_data_backing": []})
+                expected_calls += [call.text(device["sysfs_identity"] + "/ro"), call.superblock(41)]
+            self.assertEqual(obj.io.mock_calls, expected_calls)
+        self.assertEqual(forbidden_attempts, [])
+
+
 class NvmlTests(unittest.TestCase):
     def make_nvml(self):
         spec = bundle_fixture()["provider"]["nvml"]
@@ -417,7 +560,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #244"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #246"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -1769,13 +1912,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 245, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 247, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 245, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 247, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -2430,14 +2573,14 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 245, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 247, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 244)
+        self.assertEqual(ls.FLOOR, 246)
 
     def test_every_nonnegative_authority_through_242_rejects_before_host_access(self):
-        for issue in range(245):
+        for issue in range(247):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
@@ -2446,9 +2589,9 @@ class RefreshedAuthorityTests(unittest.TestCase):
                     patch("os.listdir", side_effect=AssertionError("host access")), \
                     patch("os.getpid", side_effect=AssertionError("host access")), \
                     patch("ctypes.CDLL", side_effect=AssertionError("library")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #244"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #246"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #244"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #246"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
     def test_synthetic_243_complete_scope_passes_only_pure_constructor_check(self):
@@ -2456,7 +2599,7 @@ class RefreshedAuthorityTests(unittest.TestCase):
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 245)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 247)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
@@ -2475,13 +2618,13 @@ class RefreshedAuthorityTests(unittest.TestCase):
     def test_synthetic_243_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 245)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 247)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 244), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 246), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -2493,15 +2636,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        execution_scope = {"authority_issue": 245, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 247, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                            "operations": [a.name for a in plan_fixture()],
                            "adapter_manifest_sha256": digest(canonical_json(adapter)),
                            "storage_identity": storage}
         execution_token = b"synthetic pure validation only!!!" * 2
-        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 245)
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 247)
         execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
                                       execution_token, digest(execution_token))
-        scope = {"authority_issue": 245, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 247, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2
