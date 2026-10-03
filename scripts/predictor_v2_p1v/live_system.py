@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >240.
+"""P1V5 direct observations. Live execution requires a future issue >242.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 240
+FLOOR = 242
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -39,6 +39,7 @@ PROTECTED = {
 NUMA_ABI = {"schema": "mer.p1v.numa-abi.v1", "architecture": "x86_64",
             "kernel": "6.8.0-1069-gcp", "source_profile": "Linux-v6.8",
             "syscall": 239, "word_bits": 64, "maxnode": 1024, "query_flags": 0}
+STATIC_DEVNAME_REGISTRY = f"/lib/modules/{NUMA_ABI['kernel']}/modules.devname"
 MPOL_NAMES = ("MPOL_DEFAULT", "MPOL_PREFERRED", "MPOL_BIND", "MPOL_INTERLEAVE",
               "MPOL_LOCAL", "MPOL_PREFERRED_MANY")
 STATIC, RELATIVE, BALANCING = 1 << 15, 1 << 14, 1 << 13
@@ -133,6 +134,35 @@ def parse_character_devices(text) -> dict[int, tuple[str, ...]]:
                 drivers.setdefault(major, set()).add(driver)
     require(section is not None, "missing Character devices section")
     return {major: tuple(sorted(names)) for major, names in drivers.items()}
+
+
+def parse_static_devnames(text):
+    """Exact paths -> (type, major, minor, canonical major:minor rdev, owners)."""
+    import re
+    require(type(text) is str, "static registry text required")
+    nodes = {}
+    for line in text.split("\n"):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split()
+        require(len(fields) == 3, "malformed static registry row")
+        owner, devname, device = fields
+        require(re.fullmatch(r"[A-Za-z0-9_.-]+", owner), "malformed static module owner")
+        require(devname and not devname.startswith("/") and "\x00" not in devname
+                and "\n" not in devname and all(part not in ("", ".", "..") for part in devname.split("/")),
+                "noncanonical static devname")
+        match = re.fullmatch(r"([cb])([0-9]+):([0-9]+)", device)
+        require(match is not None, "malformed static device identity")
+        kind, major, minor = match.groups()
+        major, minor = uint(int(major), 32), uint(int(minor), 32)
+        identity = (stat.S_IFCHR if kind == "c" else stat.S_IFBLK, major, minor, f"{major}:{minor}")
+        path = "/dev/" + devname
+        if path in nodes:
+            require(nodes[path][:4] == identity, "conflicting static device declaration")
+            nodes[path][4].add(owner)
+        else:
+            nodes[path] = (*identity, {owner})
+    return {path: (*entry[:4], tuple(sorted(entry[4]))) for path, entry in nodes.items()}
 
 
 def ext4_superblock(data):
@@ -258,7 +288,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #240")
+                "execution authority must follow #242")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -279,7 +309,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #240")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #242")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -344,12 +374,14 @@ class DirectLinux:
         self.authorize()
         self.guard()
 
-    def read(self, path, limit=1048576):
+    def read(self, path, limit=1048576, *, regular=False):
         self.check()
         require(not str(path).startswith((CANONICAL + "/", CONFIGURED + "/")), "expert payload read forbidden")
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | (os.O_NONBLOCK if regular else 0))
         try:
-            require(major_minor(os.fstat(fd)) != self.storage_identity["major_minor"], "expert backing read forbidden")
+            info = os.fstat(fd)
+            require(not regular or stat.S_ISREG(info.st_mode), "regular dependency file required")
+            require(major_minor(info) != self.storage_identity["major_minor"], "expert backing read forbidden")
             chunks, size = [], 0
             while True:
                 part = os.read(fd, min(65536, limit + 1 - size))
@@ -953,6 +985,14 @@ class LiveSystem:
             processes.append(identity)
         return {"namespaces": namespaces, "processes": processes}
 
+    def _static_devnames(self):
+        pins = self.profile["dependency_files"]
+        require(STATIC_DEVNAME_REGISTRY in pins, "static registry dependency pin required")
+        pin = sha256(pins[STATIC_DEVNAME_REGISTRY])
+        data = self.io.read(STATIC_DEVNAME_REGISTRY, regular=True)
+        require(digest(data) == pin, "static registry dependency hash mismatch")
+        return parse_static_devnames(data.decode("utf-8", "strict"))
+
     def _raw_device_access(self):
         import errno
         character_drivers = parse_character_devices(self.io.text("/proc/devices"))
@@ -988,11 +1028,23 @@ class LiveSystem:
                             raise
                         major = os.major(info.st_rdev)
                         registrations = character_drivers.get(major)
-                        require(registrations
-                                and all(name not in ("nvme", "nvme-generic", "sg") for name in registrations)
-                                and not name.startswith(("nvme", "ng", "sg"))
-                                and (stat.S_IFCHR, info.st_rdev) not in nodes,
-                                "missing sysfs character route lacks negative proof")
+                        if registrations:
+                            require(registrations
+                                    and all(name not in ("nvme", "nvme-generic", "sg") for name in registrations)
+                                    and not name.startswith(("nvme", "ng", "sg"))
+                                    and (stat.S_IFCHR, info.st_rdev) not in nodes,
+                                    "missing sysfs character route lacks negative proof")
+                        else:
+                            entry = self._static_devnames().get(path)
+                            minor = os.minor(info.st_rdev)
+                            require(entry is not None
+                                    and entry[:4] == (stat.S_IFCHR, major, minor, major_minor(info, True))
+                                    and os.makedev(entry[1], entry[2]) == info.st_rdev
+                                    and all(owner.replace("_", "-") != "sg"
+                                            and not owner.replace("_", "-").startswith("nvme") for owner in entry[4])
+                                    and not name.startswith(("nvme", "ng", "sg"))
+                                    and (stat.S_IFCHR, info.st_rdev) not in nodes,
+                                    "missing sysfs character route lacks negative proof")
                         continue
                     if sysfs == controller or sysfs.startswith(controller + "/") or name.startswith(("nvme", "ng", "sg")):
                         nodes.add((stat.S_IFCHR, info.st_rdev))
