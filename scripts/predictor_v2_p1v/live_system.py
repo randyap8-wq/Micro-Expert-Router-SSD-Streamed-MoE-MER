@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >242.
+"""P1V5 direct observations. Live execution requires a future issue >244.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 242
+FLOOR = 244
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -32,9 +32,9 @@ PROTECTED = {
     "content_hasher.py": "dec979b29cb55f0e61afd08173267d338bafe120ebffa98b4305cbaca42f3085",
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "c0f57a524814ae12677af8d42a65fa08b900a10ba183093d6006bdbf5df354f8",
-    "test_p1v.py": "0035021c0532c56d2934ede1e5db976876fd07024d60744039ef6555005752e5",
-    "linux_backend.py": "b67cd701c721157e96c56ffad25ac1abde40dd5508138f0408811531b5c1b484",
-    "test_linux_backend.py": "542dd08c07525070e579f57971d8fe4ce3f669c1abec96aaec53429588cbc535",
+    "test_p1v.py": "ef2eb74ed4a469e80a9f2ec4c8faa8e991f29109e04e396ec37b92402b0f5a4a",
+    "linux_backend.py": "91888947b5610dd9ee6757e8488cbc66e185b95cf8f2285f3a250f871635a8ed",
+    "test_linux_backend.py": "cad94119d5893be0fada3e6aa07991115e1385b4e0c0c0b33078b9fafe094878",
 }
 NUMA_ABI = {"schema": "mer.p1v.numa-abi.v1", "architecture": "x86_64",
             "kernel": "6.8.0-1069-gcp", "source_profile": "Linux-v6.8",
@@ -288,7 +288,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #242")
+                "execution authority must follow #244")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -309,7 +309,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #242")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #244")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -457,7 +457,7 @@ class DirectLinux:
         return ext4_superblock(os.pread(fd, 1024, 1024))
 
     def namespace(self, pid, kind):
-        require(kind in ("mnt", "user"), "namespace kind")
+        require(kind in ("mnt", "net", "user"), "namespace kind")
         info = self.stat(f"/proc/{pid}/ns/{kind}", True)
         return f"{info.st_dev}:{info.st_ino}"
 
@@ -731,6 +731,44 @@ def mount_recipe(record):
     return flags, data
 
 
+def parse_unix_sockets(text):
+    """Complete bounded /proc/net/unix inventory, including unnamed sockets."""
+    import re
+    require(type(text) is str and len(text.encode("utf-8")) <= 1048576 and text.endswith("\n"),
+            "malformed or oversized Unix socket inventory")
+    lines = text.splitlines()
+    require(lines and lines[0].split() == ["Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path"],
+            "malformed Unix socket inventory header")
+    entries = []
+    for line in lines[1:]:
+        fields = line.split(None, 7)
+        require(len(fields) in (7, 8) and re.fullmatch(r"[0-9a-fA-F]+:", fields[0])
+                and all(re.fullmatch(r"[0-9a-fA-F]{8}", field) for field in fields[1:4])
+                and re.fullmatch(r"[0-9a-fA-F]{4}", fields[4])
+                and re.fullmatch(r"[0-9a-fA-F]{2}", fields[5])
+                and re.fullmatch(r"[0-9]+", fields[6]), "malformed Unix socket inventory entry")
+        path = fields[7] if len(fields) == 8 else ""
+        require(not path or path.startswith(("/", "@")), "unresolved Unix socket pathname")
+        require("\0" not in path, "malformed Unix socket name")
+        entries.append({"num": fields[0], "refcount": int(fields[1], 16), "protocol": int(fields[2], 16),
+                        "flags": int(fields[3], 16), "type": int(fields[4], 16), "state": int(fields[5], 16),
+                        "inode": int(fields[6]), "path": path})
+    return entries
+
+
+def classify_pathname_broker(info, ids):
+    """Select one DAC class; only its write bit grants pathname connect."""
+    if info.st_uid == ids["uid"]:
+        selected, bits, writable_class = "owner", info.st_mode >> 6, "SAME_IDENTITY_IPC"
+    elif info.st_gid == ids["gid"] or info.st_gid in ids["groups"]:
+        selected, bits, writable_class = "group", info.st_mode >> 3, "GROUP_PRIVILEGE_ROUTE"
+    else:
+        selected, bits, writable_class = "other", info.st_mode, "AMBIENT_PUBLIC_IPC"
+    write = bool(bits & 2)
+    return {"dac_class": selected, "connect_authority": write,
+            "classification": writable_class if write else "NO_CONNECT_AUTHORITY"}
+
+
 class LiveSystem:
     """Complete host provider; the protected adapter owns all phase sequencing."""
     simulated = False
@@ -750,11 +788,14 @@ class LiveSystem:
         self.host_id, self.attempt = host_id, validate_attempt(attempt)
         self.manifest, self.provider, self.closure = map(copy.deepcopy, (manifest, provider_manifest, closure))
         self.baseline = lb.LaunchManifest.parse(baseline)
+        require(self.baseline.values()["credentials"]["groups"] == [],
+                "P1V5.12 live runtime supplementary groups must be empty")
         self.journal, self.native, self.processes, self.roles = journal, native, processes, roles
         self.bootstrap = copy.deepcopy(bootstrap)
         self.profile = self.provider["host_profile"]
         self.running = self.returned = self.released = self.failed = False
         self.exclusion = False
+        self.host_broker_inventory = None
         self.lock_fd = self.backing = self.topology = self.namespace_receipt = None
         self.child = self.cgroup = self.snapshot = self.numa_receipt = None
         self.snapshot_consumed = False
@@ -769,6 +810,7 @@ class LiveSystem:
         self.worker_pid = os.getpid()
         self.guardian_pid = os.getppid()
         self.original_ns = self.io.namespace(self.worker_pid, "mnt")
+        self.original_network_ns = self.io.namespace(self.worker_pid, "net")
         self.initial_user_ns = self.io.namespace(1, "user")
         require(self.io.namespace(self.worker_pid, "user") == self.initial_user_ns, "initial user namespace required")
     @property
@@ -919,6 +961,7 @@ class LiveSystem:
         fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.exclusion = True
         self._inventory()
+        self._observe_brokers(private=False)
         require(self.child is None, "clock normalization must precede handoff child")
         self.nvml.normalize()
 
@@ -1053,18 +1096,35 @@ class LiveSystem:
             if (stat.S_IFMT(info.st_mode), info.st_rdev) in nodes:
                 self._no_acl(path)
                 require(not accessible(info), "runtime raw/passthrough device exposure")
-        # Conservative broker admission: writable Unix control sockets are rejected.
-        for line in self.io.text("/proc/net/unix").splitlines()[1:]:
-            fields = line.split()
-            require(len(fields) in (7, 8), "malformed Unix socket inventory")
-            if len(fields) == 8:
-                path = fields[7]
-                require(not path.startswith("@"), "abstract control broker cannot be excluded")
-                if path.startswith("/"):
-                    info = self.io.stat(path)
-                    self._no_acl(path)
-                    require(not accessible(info), "runtime privileged/control broker exposure")
         return nodes
+
+    def _observe_brokers(self, *, private, pid="self"):
+        self._check()
+        inventory = parse_unix_sockets(self.io.text(f"/proc/{pid}/net/unix" if pid != "self" else "/proc/net/unix"))
+        if private:
+            require(self.host_broker_inventory is not None, "host broker inventory absent")
+            host = self.host_broker_inventory
+        else:
+            require(self.child is None, "prospective broker inventory requires no runtime child")
+            host = inventory
+        # Pathname sockets remain reachable across network namespaces. Recheck
+        # the host paths even when they vanish from the private /proc inventory.
+        paths = sorted({entry["path"] for entry in host + inventory if entry["path"].startswith("/")})
+        pathname = []
+        for path in paths:
+            info = self.io.stat(path)
+            require(stat.S_ISSOCK(info.st_mode), "Unix pathname no longer a socket")
+            self._no_acl(path)
+            classification = classify_pathname_broker(info, self.baseline.values()["credentials"])
+            require(classification["classification"] != "GROUP_PRIVILEGE_ROUTE", "GROUP_PRIVILEGE_ROUTE")
+            pathname.append({"path": path, "uid": info.st_uid, "gid": info.st_gid,
+                             "mode": stat.S_IMODE(info.st_mode), **classification})
+        abstract = [entry for entry in inventory if entry["path"].startswith("@")]
+        require(not private or not abstract, "abstract sockets remain in private network namespace")
+        if not private:
+            self.host_broker_inventory = copy.deepcopy(inventory)
+        return {"inventory": inventory, "pathname_sockets": pathname, "abstract_sockets": abstract,
+                "abstract_socket_count": len(abstract), "pending_private_network_isolation": not private}
 
     def _no_acl(self, path):
         self._check()
@@ -1078,9 +1138,10 @@ class LiveSystem:
 
     def _observe_exclusion(self):
         inventory = self._inventory()
+        brokers = self._observe_brokers(private=False)
         return {"ok": True, "held": self.exclusion, "trusted_host": True,
                 "uncontrolled_writers": [], "raw_holders": [], "uncontrolled_mount_namespaces": [],
-                "inventory": inventory, "administrative_noninterference": "TRUSTED_HOST_PREMISE"}
+                "inventory": inventory, "brokers": brokers, "administrative_noninterference": "TRUSTED_HOST_PREMISE"}
 
     def _observe_topology(self):
         boot, device = self._host(), self._device()
@@ -1167,12 +1228,20 @@ class LiveSystem:
         records = self._mounts()
         require(all(not r["propagation"] for r in records), "mount propagation not recursively private")
         ns = self.io.namespace(self.worker_pid, "mnt")
+        network = self.io.namespace(self.worker_pid, "net")
+        require(network != self.original_network_ns, "network namespace not private")
+        require(self.io.namespace(self.worker_pid, "user") == self.initial_user_ns, "initial user namespace drift")
+        brokers = self._observe_brokers(private=True)
         mount = mount_at(records, MOUNT)
         require(ns != self.original_ns and mount["mount_id"] != self.backing["host_mount_id"], "private namespace/mount identity")
         self.backing["private_mount_id"] = mount["mount_id"]
         self.namespace_receipt = {"ok": True, "original_namespace_id": self.original_ns, "namespace_id": ns,
+                                  "private_mount_namespace": True, "private_network_namespace": True,
+                                  "original_mount_namespace_id": self.original_ns, "mount_namespace_id": ns,
+                                  "original_network_namespace_id": self.original_network_ns, "network_namespace_id": network,
+                                  "abstract_socket_count": brokers["abstract_socket_count"], "brokers": brokers,
                                   "original_mount_id": self.backing["host_mount_id"], "private_mount_id": mount["mount_id"],
-                                  "private_recursive": True, "initial_user_namespace": self.io.namespace(self.worker_pid, "user") == self.initial_user_ns,
+                                  "private_recursive": True, "initial_user_namespace": True,
                                   "references_pinned": "private_mount_ns" in self.native.retained_fds}
         return self.namespace_receipt
 
@@ -1396,6 +1465,10 @@ class LiveSystem:
         self._check()
         require(self.snapshot is not None and not self.snapshot_consumed and self.child is None
                 and cgroup == self.cgroup and manifest == self.baseline.encoded, "one approved inheritance handoff")
+        require(self.namespace_receipt is not None and self.namespace_receipt["private_network_namespace"] is True
+                and self.namespace_receipt["abstract_socket_count"] == 0
+                and self.io.namespace(self.worker_pid, "net") == self.namespace_receipt["network_namespace_id"],
+                "private network namespace proof before child creation")
         snapshot = strict_json(self.snapshot.encoded)
         require(self._worker() == snapshot["worker"] and self._domain(self.source_cgroup) == snapshot["source"]
                 and self._domain(cgroup) == snapshot["target"], "pre-fork worker/no-rebind drift")
@@ -1563,8 +1636,12 @@ class LiveSystem:
         require(status["State"].split()[0] == "T" and int(status["PPid"]) == self.worker_pid,
                 "handoff must be exact stopped child")
         require(self._cgroup_path(self.child) == self.cgroup, "exact child cgroup binding")
-        require(self.io.namespace(self.child, "mnt") == self.namespace_receipt["namespace_id"]
-                and self.io.namespace(self.child, "user") == self.initial_user_ns, "child namespace binding")
+        child_mount = self.io.namespace(self.child, "mnt")
+        child_network = self.io.namespace(self.child, "net")
+        child_user = self.io.namespace(self.child, "user")
+        require(child_mount == self.namespace_receipt["mount_namespace_id"]
+                and child_network == self.namespace_receipt["network_namespace_id"]
+                and child_user == self.initial_user_ns, "child namespace binding")
         require(self.io.text(self.source_cgroup + "/cgroup.subtree_control").strip() == ""
                 and self.io.text(self.cgroup + "/cgroup.subtree_control").strip() == "", "controller mutation after snapshot")
         source, target = self._domain(self.source_cgroup), self._domain(self.cgroup)
@@ -1578,6 +1655,7 @@ class LiveSystem:
         observed = self._launch_observed(self.child, numa, status, target)
         self.baseline.compare(observed)
         self._inventory()
+        brokers = self._observe_brokers(private=True, pid=self.child)
         ids = observed["credentials"]
         uids, gids = ([int(v) for v in status[n].split()] for n in ("Uid", "Gid"))
         require(uids == [ids["uid"]] * 4 and gids == [ids["gid"]] * 4, "all child credential slots")
@@ -1587,7 +1665,7 @@ class LiveSystem:
                     ("ambient", "CapAmb"), ("bounding", "CapBnd"))},
                   "no_new_privs": status["NoNewPrivs"] == "1", "seccomp_mode": int(status["Seccomp"]),
                   "groups_exact": True, "brokers_excluded": True, "setup_fds_closed": True,
-                  "initial_user_namespace": True, "private_mount_namespace": True,
+                  "initial_user_namespace": True, "private_mount_namespace": True, "private_network_namespace": True,
                   "trusted_execution_closure_verified": True, "cgroup_nondelegated": True,
                   "resource_domain_equal": source == target, "launch_profile_equal": True,
                   "raw_device_access_denied": True, "handoff_stopped": True,
@@ -1598,6 +1676,9 @@ class LiveSystem:
                   "resource_domain_observed": target, "namespace_id": self.io.namespace(self.child, "mnt"),
                   "handoff_pid": self.child}
         lb.validate_confinement(result, self.baseline.values(), self.namespace_receipt)
+        self.journal.publish("confinement-brokers.json", canonical_json({"handoff_child": self.child_identity,
+            "mount_namespace_id": child_mount, "network_namespace_id": child_network,
+            "user_namespace_id": child_user, "brokers": brokers}), "CONFINEMENT")
         return result
 
     def resume_wait_parent(self, pid):

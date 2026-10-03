@@ -25,6 +25,7 @@ from .supervisor import (HASH_WINDOW, FutureBackend, parent_argv, plan,
 SCHEMA = "mer.p1v.enforcement.v2"
 PROFILE = "trusted-runtime-minimal-hot-path"
 CLONE_NEWNS = 0x00020000
+CLONE_NEWNET = 0x40000000
 MS_RDONLY, MS_REMOUNT, MS_BIND, MS_REC, MS_PRIVATE = 1, 32, 4096, 16384, 1 << 18
 BLKROSET, BLKROGET = 0x125D, 0x125E
 RLIMITS = ("CPU", "FSIZE", "DATA", "STACK", "CORE", "RSS", "NPROC", "NOFILE",
@@ -491,10 +492,18 @@ class LinuxBackend(FutureBackend):
             require(roles["guardian_original_namespace"] is True and roles["worker_single_threaded"] is True
                     and roles["initial_user_namespace"] is True and roles["worker_privileged"] is True,
                     "guardian/worker architecture unavailable")
-            s.unshare(CLONE_NEWNS)
+            s.unshare(CLONE_NEWNS | CLONE_NEWNET)
             s.mount(None, "/", None, MS_REC | MS_PRIVATE, None)
             r = self._observe("namespace")
-            require(r["original_namespace_id"] != r["namespace_id"], "mount namespace not distinct")
+            require(r["private_mount_namespace"] is True and r["private_network_namespace"] is True,
+                    "private mount/network namespaces required")
+            require(r["original_mount_namespace_id"] == r["original_namespace_id"]
+                    and r["mount_namespace_id"] == r["namespace_id"]
+                    and r["original_namespace_id"] != r["namespace_id"], "mount namespace not distinct")
+            require(type(r["original_network_namespace_id"]) is str and r["original_network_namespace_id"]
+                    and type(r["network_namespace_id"]) is str and r["network_namespace_id"]
+                    and r["original_network_namespace_id"] != r["network_namespace_id"],
+                    "network namespace not distinct")
             require(r["original_mount_id"] == self.backing["host_mount_id"]
                     and r["private_mount_id"] != r["original_mount_id"], "mount identities not distinct")
             self.backing["private_mount_id"] = r["private_mount_id"]
@@ -728,7 +737,8 @@ class NativePrimitives:
 
     def unshare(self, flags):
         self._check(("NAMESPACE",))
-        require(flags == CLONE_NEWNS, "only CLONE_NEWNS allowed")
+        require(type(flags) is int and flags == CLONE_NEWNS | CLONE_NEWNET,
+                "only combined CLONE_NEWNS | CLONE_NEWNET allowed")
         self._result(self._libc().unshare(flags))
 
     def mount(self, source, target, fstype, flags, data):
@@ -779,7 +789,8 @@ class NativePrimitives:
 
 def validate_confinement(r, baseline, namespace):
     true_fields = ("no_new_privs", "groups_exact", "brokers_excluded", "setup_fds_closed",
-                   "initial_user_namespace", "private_mount_namespace", "trusted_execution_closure_verified",
+                   "initial_user_namespace", "private_mount_namespace", "private_network_namespace",
+                   "trusted_execution_closure_verified",
                    "cgroup_nondelegated", "resource_domain_equal", "launch_profile_equal", "raw_device_access_denied",
                    "handoff_stopped")
     empty_fields = ("raw_or_privileged_fds", "writable_alias_routes", "cgroup_controllers_changed",

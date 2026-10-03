@@ -29,6 +29,7 @@ def mask(*nodes):
 
 def numa_baseline():
     value = launch_fixture()
+    value["credentials"]["groups"] = []
     value["numa"] = {"allowed_nodes": [0], "memory_policy": ls.task_policy(0, mask())}
     return value
 
@@ -416,7 +417,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #242"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #244"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -525,8 +526,13 @@ class ProviderReceiptTests(unittest.TestCase):
         obj.child_identity = {"pid": 41, "starttime": 901, "threads": 1}
         obj.io.identity.return_value = obj.child_identity
         obj.io.text.return_value = ""
-        obj.io.namespace.side_effect = lambda pid, kind: "mnt:private" if kind == "mnt" else "user:initial"
-        obj.namespace_receipt = {"namespace_id": "mnt:private"}
+        obj.io.namespace.side_effect = lambda pid, kind: {"mnt": "mnt:private", "net": "net:private", "user": "user:initial"}[kind]
+        obj.namespace_receipt = {"namespace_id": "mnt:private", "mount_namespace_id": "mnt:private",
+                                 "network_namespace_id": "net:private"}
+        obj.host_broker_inventory = []
+        obj.io.text.side_effect = lambda path: ("Num RefCount Protocol Flags Type St Inode Path\n"
+                                               if path.endswith("/net/unix") else obj.io.text.return_value)
+        obj.journal = Mock()
         obj.initial_user_ns = "user:initial"
         obj._cgroup_path = Mock(return_value=obj.cgroup)
         obj._domain = Mock(return_value=numa_baseline()["resource_domain"])
@@ -534,7 +540,7 @@ class ProviderReceiptTests(unittest.TestCase):
         obj._inventory = Mock(return_value={})
         obj._launch_observed = Mock(return_value=numa_baseline())
         obj.io.status.return_value = {"State": "T (stopped)", "PPid": "40", "Pid": "41", "Threads": "1",
-            "Uid": "1000 1000 1000 1000", "Gid": "1000 1000 1000 1000", "Groups": "1000",
+            "Uid": "1000 1000 1000 1000", "Gid": "1000 1000 1000 1000", "Groups": "",
             "Cpus_allowed_list": "0-1", "Mems_allowed_list": "0", "NoNewPrivs": "1", "Seccomp": "0",
             "CapEff": "0", "CapPrm": "0", "CapInh": "0", "CapAmb": "0", "CapBnd": "0"}
         return obj
@@ -799,6 +805,201 @@ class ExclusionTests(unittest.TestCase):
         obj.io.status.side_effect = PermissionError("fixture denial")
         with self.assertRaises(PermissionError):
             obj._inventory()
+
+
+class BrokerIsolationTests(unittest.TestCase):
+    header = "Num RefCount Protocol Flags Type St Inode Path\n"
+
+    def inventory(self, *paths):
+        return self.header + "".join(f"0000000000000000: 00000002 00000000 00010000 0001 01 {100 + i} {path}\n"
+                                     for i, path in enumerate(paths))
+
+    def fixture(self, inventory=None):
+        obj = object.__new__(ls.LiveSystem)
+        obj._check = Mock()
+        obj.baseline = Mock()
+        obj.baseline.values.return_value = {"credentials": {"uid": 1001, "gid": 1002, "groups": []}}
+        obj.child = None
+        obj.host_broker_inventory = None
+        obj.io = Mock()
+        obj.io.text.return_value = self.header if inventory is None else inventory
+        obj.io.stat.return_value = SimpleNamespace(st_mode=stat.S_IFSOCK | 0o666, st_uid=0, st_gid=0)
+        obj._no_acl = Mock()
+        return obj
+
+    def test_pathname_broker_selected_dac_write_and_acl(self):
+        cases = [
+            (1001, 1002, 0o444, [], "owner", "NO_CONNECT_AUTHORITY"),
+            (0, 1002, 0o444, [], "group", "NO_CONNECT_AUTHORITY"),
+            (0, 0, 0o444, [], "other", "NO_CONNECT_AUTHORITY"),
+            (1001, 0, 0o200, [], "owner", "SAME_IDENTITY_IPC"),
+            (0, 0, 0o002, [], "other", "AMBIENT_PUBLIC_IPC"),
+            (0, 1002, 0o020, [], "group", "GROUP_PRIVILEGE_ROUTE"),
+            (0, 119, 0o660, [119], "group", "GROUP_PRIVILEGE_ROUTE"),
+            (1001, 1002, 0o066, [], "owner", "NO_CONNECT_AUTHORITY"),
+            (0, 1002, 0o606, [], "group", "NO_CONNECT_AUTHORITY"),
+        ]
+        for uid, gid, mode, groups, selected, classification in cases:
+            for path in ("/fixture/control.sock", "/var/snap/lxd/common/lxd/unix.socket"):
+                with self.subTest(uid=uid, gid=gid, mode=oct(mode), path=path):
+                    obj = self.fixture(self.inventory(path))
+                    obj.baseline.values.return_value["credentials"]["groups"] = groups
+                    obj.io.stat.return_value = SimpleNamespace(st_mode=stat.S_IFSOCK | mode, st_uid=uid, st_gid=gid)
+                    value = ls.classify_pathname_broker(obj.io.stat.return_value, obj.baseline.values()["credentials"])
+                    self.assertEqual(value, {"dac_class": selected, "connect_authority": classification != "NO_CONNECT_AUTHORITY",
+                                             "classification": classification})
+                    if classification == "GROUP_PRIVILEGE_ROUTE":
+                        with self.assertRaisesRegex(InvalidEvidence, "GROUP_PRIVILEGE_ROUTE"):
+                            obj._observe_brokers(private=False)
+                    else:
+                        receipt = obj._observe_brokers(private=False)
+                        self.assertEqual(receipt["pathname_sockets"][0]["classification"], classification)
+                    obj._no_acl.assert_called_once_with(path)
+        obj = self.fixture(self.inventory("/fixture/control.sock"))
+        obj._no_acl = ls.LiveSystem._no_acl.__get__(obj)
+        with patch("os.getxattr", create=True, return_value=b"acl"), self.assertRaisesRegex(InvalidEvidence, "ACL"):
+            obj._observe_brokers(private=False)
+
+    def test_live_supplementary_groups_rejected_before_direct_access(self):
+        def construct(bundle):
+            return ls.LiveSystem(authorization=None, grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()),
+                host_id="fixture-host", attempt="p1v-fixture", manifest=bundle["adapter"], provider_manifest=bundle["provider"],
+                baseline=bundle["launch"], closure=bundle["closure"], journal=SimpleNamespace(pending=None),
+                native=object.__new__(lb.NativePrimitives), processes=object.__new__(lb.NativeProcesses),
+                roles=object.__new__(lb.ProcessRoles), bootstrap={})
+        for groups in ([119], [1000], [119, 1000]):
+            bundle = bundle_fixture()
+            bundle["launch"]["credentials"]["groups"] = groups
+            pin = lb.LaunchManifest.parse(bundle["launch"]).sha256
+            bundle["adapter"]["launch_manifest_sha256"] = bundle["provider"]["launch_manifest_sha256"] = pin
+            with self.subTest(groups=groups), patch.object(ls, "require_live"), \
+                    patch.object(ls, "DirectLinux", side_effect=AssertionError("direct host construction")), \
+                    patch("os.getpid", side_effect=AssertionError("host access")), \
+                    patch("ctypes.CDLL", side_effect=AssertionError("library")), \
+                    self.assertRaisesRegex(InvalidEvidence, "supplementary groups must be empty"):
+                construct(bundle)
+            from . import linux_gate as gate
+            with patch.object(gate, "require_live"), \
+                    patch.object(gate, "DirectLinux", side_effect=AssertionError("direct host construction")), \
+                    self.assertRaisesRegex(InvalidEvidence, "supplementary groups must be empty"):
+                gate.compose(bundle, authorization=None, execution_grant=None, provider_grant=None,
+                             host_id="fixture-host", attempt="p1v-fixture")
+        bundle = bundle_fixture()
+        with patch.object(ls, "require_live"), \
+                patch.object(ls.DirectLinux, "file_hash", side_effect=lambda path: {**ls.PROTECTED, **bundle["provider"]["modules"]}[Path(path).name]), \
+                patch.object(ls.DirectLinux, "namespace", side_effect=lambda pid, kind: kind + ":original") as namespaces, \
+                patch("os.getpid", return_value=40), patch("os.getppid", return_value=39), \
+                patch("ctypes.CDLL", side_effect=AssertionError("library")):
+            obj = construct(bundle)
+        self.assertEqual(obj.baseline.values()["credentials"], {"uid": 1000, "gid": 1000, "groups": []})
+        self.assertEqual(obj.original_network_ns, "net:original")
+        namespaces.assert_any_call(40, "net")
+        primary = SimpleNamespace(st_uid=0, st_gid=1000, st_mode=stat.S_IFSOCK | 0o020)
+        self.assertEqual(ls.classify_pathname_broker(primary, obj.baseline.values()["credentials"])["classification"],
+                         "GROUP_PRIVILEGE_ROUTE")
+        self.assertEqual(launch_fixture()["credentials"]["groups"], [1000])
+
+    def test_abstract_inventory_private_namespace_and_actual_child_closure(self):
+        io = object.__new__(ls.DirectLinux)
+        with patch.object(io, "stat", return_value=SimpleNamespace(st_dev=4, st_ino=5)) as observed:
+            self.assertEqual(io.namespace(40, "net"), "4:5")
+        observed.assert_called_once_with("/proc/40/ns/net", True)
+        host_text = self.inventory("/fixture/ambient.sock", "@fixture-control", "@second abstract name")
+        obj = self.fixture(host_text)
+        obj._inventory = Mock(return_value={})
+        obj.exclusion = True
+        receipt = obj._observe_exclusion()
+        self.assertTrue(receipt["brokers"]["pending_private_network_isolation"])
+        self.assertEqual(receipt["brokers"]["abstract_socket_count"], 2)
+        self.assertEqual([e["path"] for e in receipt["brokers"]["abstract_sockets"]],
+                         ["@fixture-control", "@second abstract name"])
+        self.assertNotIn("brokers_excluded", receipt)
+        self.assertNotIn("brokers_excluded", receipt["brokers"])
+        self.assertEqual(len(receipt["brokers"]["inventory"]), 3)
+        for malformed in ("", "bad header\n", self.header + "bad row\n", host_text.rstrip("\n"),
+                          self.inventory("relative.sock"), host_text.replace("00010000", "bad"),
+                          host_text.replace("0001 01", "zzzz 01"), host_text.replace(" 100 ", " nope "),
+                          self.header + "\n", self.inventory("@bad\0name"), self.header + "x" * 1048576 + "\n"):
+            with self.subTest(malformed=malformed[:70]), self.assertRaises(InvalidEvidence):
+                ls.parse_unix_sockets(malformed)
+        unnamed = self.header + "0000000000000000: 00000002 00000000 00000000 0001 01 555\n"
+        self.assertEqual(ls.parse_unix_sockets(unnamed)[0]["path"], "")
+        obj.worker_pid, obj.original_ns, obj.original_network_ns, obj.initial_user_ns = 40, "mnt:original", "net:original", "user:initial"
+        obj._mounts = Mock(return_value=[{"target": ls.MOUNT, "mount_id": 200, "propagation": []}])
+        obj.backing = {"host_mount_id": 100}
+        obj.native = SimpleNamespace(retained_fds={"private_mount_ns": 9})
+        obj.namespace_receipt = None
+        actual = {"mnt": "mnt:private", "net": "net:private", "user": "user:initial"}
+        obj.io.namespace.side_effect = lambda pid, kind: actual[kind]
+        with self.assertRaisesRegex(InvalidEvidence, "abstract sockets remain"):
+            obj._observe_namespace()
+        self.assertIsNone(obj.namespace_receipt)
+        obj.io.text.return_value = self.header
+        for kind, drift in (("mnt", "mnt:original"), ("net", "net:original"), ("user", "user:other")):
+            old = actual[kind]
+            actual[kind] = drift
+            with self.subTest(kind=kind), self.assertRaises(InvalidEvidence):
+                obj._observe_namespace()
+            actual[kind] = old
+        obj._mounts.return_value[0]["propagation"] = ["shared:1"]
+        with self.assertRaisesRegex(InvalidEvidence, "recursively private"):
+            obj._observe_namespace()
+        obj._mounts.return_value[0]["propagation"] = []
+        receipt = obj._observe_namespace()
+        self.assertTrue(receipt["private_network_namespace"])
+        self.assertTrue(receipt["private_mount_namespace"])
+        self.assertEqual(receipt["abstract_socket_count"], 0)
+        self.assertEqual(receipt["original_network_namespace_id"], "net:original")
+        self.assertEqual(receipt["network_namespace_id"], "net:private")
+        self.assertEqual(receipt["mount_namespace_id"], receipt["namespace_id"])
+        self.assertEqual(receipt["original_mount_namespace_id"], receipt["original_namespace_id"])
+        self.assertEqual(receipt["brokers"]["pathname_sockets"][0]["path"], "/fixture/ambient.sock")
+        # Host pathname authority must still reject in an otherwise empty netns.
+        obj.io.stat.return_value.st_gid = 1002
+        with self.assertRaisesRegex(InvalidEvidence, "GROUP_PRIVILEGE_ROUTE"):
+            obj._observe_namespace()
+        for kind in ("net", "mnt", "user"):
+            child = ProviderReceiptTests().base()
+            child.io.namespace.side_effect = lambda pid, which: ("wrong" if which == kind else
+                {"mnt": "mnt:private", "net": "net:private", "user": "user:initial"}[which])
+            with self.subTest(child_namespace=kind), self.assertRaisesRegex(InvalidEvidence, "child namespace binding"):
+                child._observe_confinement()
+            child.journal.publish.assert_not_called()
+            child._launch_observed.assert_not_called()
+        child = ProviderReceiptTests().base()
+        child.io.text.side_effect = lambda path: self.inventory("@private-escape") if path.endswith("/net/unix") else ""
+        with self.assertRaisesRegex(InvalidEvidence, "abstract sockets remain"):
+            child._observe_confinement()
+        child.journal.publish.assert_not_called()
+        child = ProviderReceiptTests().base()
+        child.host_broker_inventory = ls.parse_unix_sockets(self.inventory("/fixture/group.sock"))
+        child.io.stat.return_value = SimpleNamespace(st_uid=0, st_gid=1000, st_mode=stat.S_IFSOCK | 0o020)
+        child._no_acl = Mock()
+        with self.assertRaisesRegex(InvalidEvidence, "GROUP_PRIVILEGE_ROUTE"):
+            child._observe_confinement()
+        child.journal.publish.assert_not_called()
+        for drift in (None, {"private_network_namespace": False},
+                      {"private_network_namespace": True, "abstract_socket_count": 1},
+                      {"private_network_namespace": True, "abstract_socket_count": 0, "network_namespace_id": "wrong"}):
+            prechild, _ = CgroupTests().fixture()
+            prechild._observe_cgroup_preflight()
+            prechild.create_accounting_cgroup(prechild.attempt)
+            prechild.namespace_receipt = drift
+            with self.subTest(prechild=drift), self.assertRaisesRegex(InvalidEvidence, "before child creation"):
+                prechild.prepare_stopped_child((), prechild.baseline.encoded, prechild.cgroup)
+            prechild.roles.prepare_stopped_child.assert_not_called()
+        child = ProviderReceiptTests().base()
+        result = child._observe_confinement()
+        self.assertIs(result["private_network_namespace"], True)
+        self.assertIs(result["brokers_excluded"], True)
+        child.io.text.assert_any_call("/proc/41/net/unix")
+        name, data, action = child.journal.publish.call_args.args
+        proof = strict_json(data)
+        self.assertEqual((name, action), ("confinement-brokers.json", "CONFINEMENT"))
+        self.assertEqual(proof["network_namespace_id"], "net:private")
+        self.assertEqual(proof["handoff_child"], child.child_identity)
+        self.assertEqual(proof["brokers"]["abstract_socket_count"], 0)
+        self.assertFalse(proof["brokers"]["pending_private_network_isolation"])
 
 
 class RawDeviceSysfsTests(unittest.TestCase):
@@ -1446,12 +1647,17 @@ class CgroupTests(unittest.TestCase):
         obj.attempt, obj.host_id, obj.worker_pid = "p1v-fixture", "fixture-host", 40
         obj.exclusion, obj.snapshot_consumed = True, False
         obj.snapshot = obj.child = obj.cgroup = None
+        obj.namespace_receipt = {"private_network_namespace": True, "abstract_socket_count": 0,
+                                 "network_namespace_id": "net:private"}
         obj.profile = {"cgroup_parent": "/sys/fs/cgroup"}
         obj.provider = {"nvml": {"uuid": "GPU-fixture"}}
         obj.gpu_management = {"fixture": True}
         obj.nvml = SimpleNamespace(management=Mock(return_value=obj.gpu_management))
         obj._worker = Mock(return_value=snapshot_fixture()["worker"])
         obj.io = Mock()
+        obj.io.namespace.side_effect = lambda pid, kind: (
+            "net:private"
+            if (pid, kind) == (obj.worker_pid, "net") else obj.io.namespace.return_value)
         obj.io.stat.return_value = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0)
         obj.io.listdir.side_effect = lambda path: ["cpuset.cpus.effective", "cpuset.mems.effective"] if path == "/sys/fs/cgroup" else []
         values = {"/proc/40/cgroup": "0::/\n", "/sys/fs/cgroup/cgroup.type": "domain\n",
@@ -1563,13 +1769,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 243, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 245, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 243, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 245, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -2224,14 +2430,14 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 243, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 245, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 242)
+        self.assertEqual(ls.FLOOR, 244)
 
     def test_every_nonnegative_authority_through_242_rejects_before_host_access(self):
-        for issue in range(243):
+        for issue in range(245):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
@@ -2240,9 +2446,9 @@ class RefreshedAuthorityTests(unittest.TestCase):
                     patch("os.listdir", side_effect=AssertionError("host access")), \
                     patch("os.getpid", side_effect=AssertionError("host access")), \
                     patch("ctypes.CDLL", side_effect=AssertionError("library")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #242"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #244"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #242"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #244"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
     def test_synthetic_243_complete_scope_passes_only_pure_constructor_check(self):
@@ -2250,7 +2456,7 @@ class RefreshedAuthorityTests(unittest.TestCase):
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 243)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 245)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
@@ -2269,13 +2475,13 @@ class RefreshedAuthorityTests(unittest.TestCase):
     def test_synthetic_243_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 243)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 245)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 242), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 244), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -2287,15 +2493,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        execution_scope = {"authority_issue": 243, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 245, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                            "operations": [a.name for a in plan_fixture()],
                            "adapter_manifest_sha256": digest(canonical_json(adapter)),
                            "storage_identity": storage}
         execution_token = b"synthetic pure validation only!!!" * 2
-        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 243)
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 245)
         execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
                                       execution_token, digest(execution_token))
-        scope = {"authority_issue": 243, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 245, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2

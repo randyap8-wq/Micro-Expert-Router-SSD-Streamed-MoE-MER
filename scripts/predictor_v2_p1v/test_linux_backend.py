@@ -34,8 +34,8 @@ PROTECTED_P1V_FILES = {
     "content_hasher.py": "dec979b29cb55f0e61afd08173267d338bafe120ebffa98b4305cbaca42f3085",
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "c0f57a524814ae12677af8d42a65fa08b900a10ba183093d6006bdbf5df354f8",
-    "test_p1v.py": "0035021c0532c56d2934ede1e5db976876fd07024d60744039ef6555005752e5",
-    "linux_backend.py": "b67cd701c721157e96c56ffad25ac1abde40dd5508138f0408811531b5c1b484",
+    "test_p1v.py": "ef2eb74ed4a469e80a9f2ec4c8faa8e991f29109e04e396ec37b92402b0f5a4a",
+    "linux_backend.py": "91888947b5610dd9ee6757e8488cbc66e185b95cf8f2285f3a250f871635a8ed",
 }
 REQUIRED_P1V_FILES = frozenset(PROTECTED_P1V_FILES) | {"test_linux_backend.py"}
 OPTIONAL_P1V5_FILES = frozenset({"live_system.py", "test_live_system.py",
@@ -596,6 +596,44 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(prepare[1], parent_argv("p1v-fixture"))
         self.assertFalse(any(c[0] in ("CONTROL", "TREATMENT") for c in backend.system.calls))
 
+    def test_namespace_uses_one_combined_mount_and_network_unshare(self):
+        backend = self.make()
+        backend.backing = copy.deepcopy(backend.system.backing)
+        result = backend._perform("NAMESPACE", {"receipts": {}})
+        self.assertEqual(lb.CLONE_NEWNET, 0x40000000)
+        self.assertEqual(backend.system.calls, [
+            ("observe:roles",), ("unshare", lb.CLONE_NEWNS | lb.CLONE_NEWNET),
+            ("mount", None, "/", None, lb.MS_REC | lb.MS_PRIVATE, None), ("observe:namespace",)])
+        self.assertIs(result["private_network_namespace"], True)
+        self.assertIs(result["private_mount_namespace"], True)
+        for field, value in (("private_network_namespace", False), ("private_mount_namespace", False),
+                             ("network_namespace_id", "synthetic-original-net"),
+                             ("network_namespace_id", ""), ("mount_namespace_id", "wrong"),
+                             ("original_mount_namespace_id", "wrong")):
+            with self.subTest(field=field, value=value):
+                bad = self.make()
+                bad.backing = copy.deepcopy(bad.system.backing)
+                bad.system.observations["namespace"][field] = value
+                with self.assertRaises(InvalidEvidence):
+                    bad._perform("NAMESPACE", {"receipts": {}})
+        native = object.__new__(lb.NativePrimitives)
+        native.context = (None, None, "synthetic", "p1v-fixture", {})
+        native.current_action = lambda: "NAMESPACE"
+        libc = SimpleNamespace(unshare=Mock(return_value=0))
+        with patch.object(lb, "require_adapter_grant"), patch("os.geteuid", return_value=0), \
+                patch.object(native, "_libc", return_value=libc):
+            for flags in (0, True, float(lb.CLONE_NEWNS | lb.CLONE_NEWNET), lb.CLONE_NEWNS, lb.CLONE_NEWNET,
+                          lb.CLONE_NEWNS | lb.CLONE_NEWNET | 0x10000000):
+                with self.subTest(flags=flags), self.assertRaises(InvalidEvidence):
+                    native.unshare(flags)
+            libc.unshare.assert_not_called()
+            native.unshare(lb.CLONE_NEWNS | lb.CLONE_NEWNET)
+            libc.unshare.assert_called_once_with(lb.CLONE_NEWNS | lb.CLONE_NEWNET)
+            native.current_action = lambda: "CONFINEMENT"
+            with self.assertRaisesRegex(InvalidEvidence, "outside phase"):
+                native.unshare(lb.CLONE_NEWNS | lb.CLONE_NEWNET)
+            libc.unshare.assert_called_once()
+
     def test_alias_filesystem_device_and_restore_order(self):
         backend = self.make()
         self.assertEqual(self.run_backend(backend)["status"], "PASS_SIMULATION")
@@ -608,7 +646,7 @@ class AdapterTests(unittest.TestCase):
             ("mount", None, lb.MOUNT, "ext4", 1024 | lb.MS_REMOUNT | lb.MS_RDONLY, "synthetic-original-ext4-options"),
             ("mount", None, lb.MOUNT, "ext4", 1024 | lb.MS_REMOUNT, "synthetic-original-ext4-options"),
         ])
-        self.assertEqual([c for c in calls if c[0] == "unshare"], [("unshare", lb.CLONE_NEWNS)])
+        self.assertEqual([c for c in calls if c[0] == "unshare"], [("unshare", lb.CLONE_NEWNS | lb.CLONE_NEWNET)])
         self.assertLess(calls.index(("syncfs", 41)), calls.index(mounts[3]))
         self.assertLess(calls.index(mounts[3]), calls.index(("block_ro", 40, True)))
         self.assertLess(calls.index(("block_ro", 40, False)), calls.index(mounts[4]))
@@ -759,6 +797,20 @@ class EnforcementTests(unittest.TestCase):
             bad[key] = value
             with self.assertRaises(InvalidEvidence):
                 validate_enforcement(bad, True)
+
+    def test_confinement_requires_strict_private_network_namespace(self):
+        receipt = confinement_fixture()
+        namespace = {"namespace_id": "synthetic-ns"}
+        lb.validate_confinement(receipt, launch_fixture(), namespace)
+        self.assertIs(receipt["private_network_namespace"], True)
+        for value in (False, None, 1, "true"):
+            with self.subTest(value=value), self.assertRaises(InvalidEvidence):
+                lb.validate_confinement(dict(receipt, private_network_namespace=value), launch_fixture(), namespace)
+        for field in receipt:
+            bad = copy.deepcopy(receipt)
+            del bad[field]
+            with self.subTest(missing=field), self.assertRaises(InvalidEvidence):
+                lb.validate_confinement(bad, launch_fixture(), namespace)
 
     def test_every_confinement_field_required_and_strict(self):
         base = confinement_fixture()

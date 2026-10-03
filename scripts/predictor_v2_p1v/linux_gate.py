@@ -81,6 +81,9 @@ def compose(bundle, *, authorization, execution_grant, provider_grant, host_id, 
     require_live(authorization, execution_grant, provider_grant, host_id, attempt,
                  bundle["adapter"], bundle["provider"], "AUTHORITY")
     validate_bundle(bundle)
+    baseline = lb.LaunchManifest.parse(bundle["launch"])
+    require(baseline.values()["credentials"]["groups"] == [],
+            "P1V5.12 live runtime supplementary groups must be empty")
     context = (authorization, execution_grant, provider_grant, host_id, attempt,
                bundle["adapter"], bundle["provider"])
     check = lambda: require_live(*context, "AUTHORITY")
@@ -126,8 +129,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.execute:
         # No CLI switch/token can grant execution. A future reviewed entry point
-        # must call compose with all externally pinned matching grants >242.
-        parser.error("P1V5 execution NOT_AUTHORIZED; external future grants for an issue >242 required")
+        # must call compose with all externally pinned matching grants >244.
+        parser.error("P1V5 execution NOT_AUTHORIZED; external future grants for an issue >244 required")
     try:
         if args.validate_manifest:
             value = strict_json(Path(args.validate_manifest).read_bytes())
