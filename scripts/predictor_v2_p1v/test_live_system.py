@@ -324,7 +324,7 @@ class TopologyConfigTests(unittest.TestCase):
         obj = object.__new__(ls.LiveSystem)
         obj._storage_identity = canonical_json(device)
         obj.backing = {"device_fd": 41}
-        obj.nvml = SimpleNamespace(certificate=canonical_json(
+        obj.nvml = SimpleNamespace(library=None, handle=None, certificate=canonical_json(
             {"device_name": ls.EXPECTATIONS["gpu"], "driver_version": ls.EXPECTATIONS["driver"]}))
         obj.io = Mock(spec=ls.DirectLinux)
         obj.io.link.return_value = ls.CANONICAL
@@ -463,6 +463,8 @@ class NvmlTests(unittest.TestCase):
         obj = object.__new__(ls.PinnedNvml)
         obj.io, obj.spec, obj.check = io, spec, lambda: None
         obj.library = obj.handle = obj.certificate = None
+        obj._helper_pid, obj._worker_pid = os.getpid(), -1
+        obj.helper_receipt = None
         obj.identity = Mock(return_value={"device_uuid": spec["uuid"], "pci_bus_id": spec["pci_bus_id"],
             "driver_version": spec["driver"], "nvml_version": spec["version"],
             "device_name": "NVIDIA L4", "nvml_library_sha256": spec["sha256"]})
@@ -473,7 +475,7 @@ class NvmlTests(unittest.TestCase):
     def test_reset_order_and_certificate(self):
         obj = self.make_nvml()
         with patch("ctypes.CDLL", return_value=object()):
-            certificate = obj.normalize()
+            certificate = obj._normalize_local()
         self.assertEqual([c.args[0] for c in obj._call.call_args_list],
                          ["nvmlInit_v2", "nvmlDeviceGetHandleByUUID", "nvmlDeviceResetGpuLockedClocks", "nvmlDeviceResetMemoryLockedClocks"])
         self.assertEqual(certificate["normalization"], "DEFAULT_UNLOCKED")
@@ -484,14 +486,14 @@ class NvmlTests(unittest.TestCase):
         obj = self.make_nvml()
         obj.identity.return_value["device_uuid"] = "wrong"
         with patch("ctypes.CDLL", return_value=object()), self.assertRaises(InvalidEvidence):
-            obj.normalize()
+            obj._normalize_local()
         self.assertNotIn("nvmlDeviceResetGpuLockedClocks", [c.args[0] for c in obj._call.call_args_list])
 
     def test_library_hash_before_load(self):
         obj = self.make_nvml()
         obj.io.file_hash.return_value = "0" * 64
         with patch("ctypes.CDLL", side_effect=AssertionError("library must not load")), self.assertRaises(InvalidEvidence):
-            obj.normalize()
+            obj._normalize_local()
 
     def test_gpu_reset_failure_stops_memory_reset(self):
         obj = self.make_nvml()
@@ -500,7 +502,7 @@ class NvmlTests(unittest.TestCase):
                 raise InvalidEvidence("reset failed")
         obj._call.side_effect = call
         with patch("ctypes.CDLL", return_value=object()), self.assertRaises(InvalidEvidence):
-            obj.normalize()
+            obj._normalize_local()
         self.assertIsNone(obj.certificate)
         self.assertNotIn("nvmlDeviceResetMemoryLockedClocks", [c.args[0] for c in obj._call.call_args_list])
 
@@ -511,13 +513,13 @@ class NvmlTests(unittest.TestCase):
                 raise InvalidEvidence("reset failed")
         obj._call.side_effect = call
         with patch("ctypes.CDLL", return_value=object()), self.assertRaises(InvalidEvidence):
-            obj.normalize()
+            obj._normalize_local()
         self.assertIsNone(obj.certificate)
 
     def test_query_state_cannot_replace_transition(self):
         obj = self.make_nvml()
         with self.assertRaises(InvalidEvidence):
-            obj.observed()
+            obj._snapshot_local()
         obj.query_policy.assert_not_called()
 
     def test_denial_before_nvml(self):
@@ -546,7 +548,391 @@ class NvmlTests(unittest.TestCase):
         obj = self.make_nvml()
         obj.certificate = b"{}"
         with self.assertRaises(InvalidEvidence):
-            obj.normalize()
+            obj._normalize_local()
+
+
+class DetachedNvmlHarness:
+    """Two explicit process copies; real anonymous mmap, mocked fork/wait/NVML."""
+    class Exit(BaseException):
+        pass
+
+    def __init__(self, testcase):
+        self.testcase = testcase
+        self.nvml = NvmlTests().make_nvml()
+        self.nvml._helper_pid = self.nvml._worker_pid = None
+        self.nvml.query_policy.return_value = {
+            "application_clocks": {str(d): {k: {"status": "NVML_ERROR_NOT_SUPPORTED"}
+                for k in ("application", "default")} for d in (0, 2)},
+            "offsets": [{"domain": d, "pstate": p, "status": "NVML_ERROR_NOT_SUPPORTED"}
+                        for d in (0, 2) for p in range(16)]}
+        self.management = {"persistence": {"status": "NVML_SUCCESS", "value": 1},
+                           "compute": {"status": "NVML_SUCCESS", "value": 0},
+                           "mig": {"status": "NVML_ERROR_NOT_SUPPORTED"},
+                           "power": {k: {"status": "NVML_SUCCESS", "value": 72000}
+                                     for k in ("limit", "default", "enforced")}}
+        self.nvml.management = Mock(side_effect=lambda: copy.deepcopy(self.management))
+        self.processes = object.__new__(lb.NativeProcesses)
+        self.processes._check = Mock()
+        self.processes.nvml_helper = self.processes.nvml_helper_child = None
+        self.pid, self.next_pid, self.threads = 40, 42, 1
+        self.events, self.children, self.maps = [], [], []
+        self.result_mutation = None
+        self.exit_override = None
+        self.handoff = False
+        self.stopped = False
+
+    def __enter__(self):
+        import mmap
+        self.stack = ExitStack()
+        real_mmap = mmap.mmap
+        harness = self
+
+        class View:
+            def __init__(self, mapping):
+                self.mapping = mapping
+                self.closed_by = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.close()
+
+            def __getitem__(self, key):
+                return self.mapping[key]
+
+            def __setitem__(self, key, value):
+                self.mapping[key] = value
+
+            def close(self):
+                self.closed_by.append(harness.pid)
+                if harness.pid == 40:
+                    self.mapping.close()
+
+        def allocate(*args, **kwargs):
+            self.testcase.assertEqual(args, (-1, ls.PinnedNvml.RESULT_SIZE))
+            self.testcase.assertEqual(kwargs, {"flags": mmap.MAP_SHARED, "prot": mmap.PROT_READ | mmap.PROT_WRITE})
+            view = View(real_mmap(*args, **kwargs))
+            self.maps.append(view)
+            return view
+
+        def load(*args, **kwargs):
+            self.testcase.assertNotEqual(self.pid, 40, "parent CDLL forbidden")
+            self.events.append(("CDLL", self.pid))
+            return object()
+
+        def native_call(name, *args, **kwargs):
+            self.testcase.assertNotEqual(self.pid, 40, "parent NVML call forbidden")
+            self.events.append((name, self.pid))
+            # Model the proven persistent NVIDIA thread in this helper only.
+            if name == "nvmlInit_v2":
+                self.threads = 2
+            return 0
+
+        def fork():
+            self.testcase.assertEqual((self.pid, self.threads), (40, 1))
+            self.testcase.assertIsNone(self.processes.nvml_helper)
+            if self.handoff:
+                self.events.append(("handoff-fork", 41))
+                return 41
+            pid = self.next_pid
+            self.next_pid += 1
+            action = self.processes._check.call_args.args[0]
+            self.events.append(("helper-fork", action, pid, self.stopped))
+            child = copy.copy(self.nvml)
+            self.children.append(child)
+            child_processes = object.__new__(lb.NativeProcesses)
+            child_processes._check = Mock()
+            child_processes.nvml_helper = child_processes.nvml_helper_child = None
+            view = self.maps[-1]
+
+            def child_fork():
+                self.pid = pid
+                return 0
+
+            def child_exit(code):
+                self.child_code = code
+                self.events.append(("helper-exit", pid, code))
+                raise self.Exit()
+
+            try:
+                with patch("os.fork", side_effect=child_fork), patch("os._exit", side_effect=child_exit), \
+                     patch("mmap.mmap", return_value=view):
+                    child._run_helper(child_processes, "normalize" if action == "EXCLUSION" else "snapshot", action)
+            except self.Exit:
+                pass
+            finally:
+                self.pid, self.threads = 40, 1
+            if self.result_mutation:
+                self.result_mutation(view)
+            return pid
+
+        def wait(pid, flags):
+            self.testcase.assertEqual((self.pid, self.threads, flags), (40, 1, 0))
+            self.events.append(("helper-reap", pid))
+            code = self.child_code if self.exit_override is None else self.exit_override
+            return pid, code << 8
+
+        self.stack.enter_context(patch("os.getpid", side_effect=lambda: self.pid))
+        self.stack.enter_context(patch("os.geteuid", return_value=0))
+        self.stack.enter_context(patch("os.listdir", side_effect=lambda path: [str(i) for i in range(self.threads)]
+                                       if path == "/proc/self/task" else self.testcase.fail(path)))
+        self.stack.enter_context(patch("os.fork", side_effect=fork))
+        self.stack.enter_context(patch("os.waitpid", side_effect=wait))
+        self.stack.enter_context(patch("mmap.mmap", side_effect=allocate))
+        self.stack.enter_context(patch("ctypes.CDLL", side_effect=load))
+        self.nvml._call.side_effect = native_call
+        return self
+
+    def __exit__(self, *args):
+        self.stack.close()
+        for view in self.maps:
+            self.testcase.assertTrue(view.mapping.closed)
+            self.testcase.assertIn(40, view.closed_by)
+        self.testcase.assertEqual(self.threads, 1)
+        self.testcase.assertIsNone(self.processes.nvml_helper)
+
+
+class DetachedNvmlTests(unittest.TestCase):
+    def test_detached_normalization_parent_stays_nvml_cold(self):
+        with DetachedNvmlHarness(self) as h:
+            result = h.nvml.normalize(h.processes)
+            self.assertEqual(h.nvml.certificate, canonical_json(result))
+            self.assertEqual(h.nvml.certificate, h.children[0].certificate)
+            self.assertEqual(h.nvml.helper_receipt, {"pid": 42, "exit_code": 0,
+                "parent_threads_before": 1, "parent_threads_after": 1})
+            self.assertEqual(h.events, [("helper-fork", "EXCLUSION", 42, False), ("CDLL", 42),
+                ("nvmlInit_v2", 42), ("nvmlDeviceGetHandleByUUID", 42),
+                ("nvmlDeviceResetGpuLockedClocks", 42), ("nvmlDeviceResetMemoryLockedClocks", 42),
+                ("helper-exit", 42, 0), ("helper-reap", 42)])
+            self.assertIsNone(h.nvml.library)
+            self.assertIsNone(h.nvml.handle)
+            for name in ("_load_local", "_normalize_local", "_snapshot_local", "identity", "query_policy", "management"):
+                with self.subTest(direct_parent=name), self.assertRaisesRegex(InvalidEvidence, "helper child"):
+                    getattr(ls.PinnedNvml, name)(h.nvml)
+            with self.assertRaisesRegex(InvalidEvidence, "helper child"):
+                ls.PinnedNvml._call(h.nvml, "nvmlInit_v2", [], [])
+            with self.assertRaisesRegex(InvalidEvidence, "reuse"):
+                h.nvml.normalize(h.processes)
+            h.nvml.library = object()
+            with self.assertRaisesRegex(InvalidEvidence, "NVML-cold"):
+                h.nvml.snapshot(h.processes)
+            h.nvml.library = None
+            obj = object.__new__(ls.LiveSystem)
+            obj.running = obj.failed = False
+            obj.nvml, obj.context = h.nvml, ()
+            with patch.object(ls, "require_live"):
+                for action in ("AUTHORITY", "EXCLUSION", "TOPOLOGY", "NAMESPACE", "ALIAS_BIND", "ALIAS_RO",
+                               "METADATA", "FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "CONFINEMENT"):
+                    obj.journal = SimpleNamespace(pending=(1, action))
+                    obj._check()
+                    for field in ("library", "handle"):
+                        setattr(h.nvml, field, object())
+                        with self.subTest(action=action, field=field), self.assertRaisesRegex(InvalidEvidence, "NVML-cold"):
+                            obj._check()
+                        setattr(h.nvml, field, None)
+
+    def test_detached_result_failure_matrix(self):
+        def payload(view, raw):
+            view[:4] = struct.pack(">I", len(raw))
+            view[4:4 + len(raw)] = raw
+
+        def altered(view, transform):
+            size = struct.unpack(">I", view[:4])[0]
+            value = strict_json(view[4:4 + size])
+            transform(value)
+            payload(view, canonical_json(value))
+
+        cases = {
+            "empty": lambda v: v.__setitem__(slice(0, 4), b"\0" * 4),
+            "malformed-length": lambda v: v.__setitem__(slice(0, 4), b"bad!"),
+            "oversized-length": lambda v: v.__setitem__(slice(0, 4), struct.pack(">I", ls.PinnedNvml.RESULT_SIZE)),
+            "invalid-json": lambda v: payload(v, b"{broken\n"),
+            "duplicate-json": lambda v: payload(v, b'{"x":1,"x":2}\n'),
+            "nonfinite-json": lambda v: payload(v, b'{"x":NaN}\n'),
+            "noncanonical-json": lambda v: payload(v, b'{ "x": 1 }\n'),
+            "wrong-identity": lambda v: altered(v, lambda x: x.update(device_uuid="wrong")),
+            "missing-field": lambda v: altered(v, lambda x: x.pop("normalization_after_exclusion")),
+            "extra-field": lambda v: altered(v, lambda x: x.update(extra=True)),
+            "wrong-boolean": lambda v: altered(v, lambda x: x.update(normalization_before_stopped_child=1)),
+            "wrong-reset": lambda v: altered(v, lambda x: x.update(gpu_locked_clock_reset="FAILED")),
+            "incomplete-policy": lambda v: altered(v, lambda x: x.update(offsets=[])),
+            "wrong-policy": lambda v: altered(v, lambda x: x["application_clocks"].update({"0": {}})),
+        }
+        for name in ("nonzero-exit", "local-failure", "oversized-child-payload", *cases):
+            with self.subTest(name=name), DetachedNvmlHarness(self) as h:
+                h.result_mutation = cases.get(name)
+                if name == "nonzero-exit":
+                    h.exit_override = 1
+                if name == "local-failure":
+                    h.nvml.io.file_hash.return_value = "0" * 64
+                if name == "oversized-child-payload":
+                    h.nvml.query_policy.return_value["oversized"] = "x" * ls.PinnedNvml.RESULT_SIZE
+                with self.assertRaises(InvalidEvidence):
+                    h.nvml.normalize(h.processes)
+                self.assertIsNone(h.nvml.certificate)
+                self.assertIsNone(h.nvml.helper_receipt)
+                self.assertIsNone(h.nvml.library)
+                self.assertIsNone(h.nvml.handle)
+                self.assertEqual(len(h.maps), 1)
+                self.assertEqual(h.events[-1], ("helper-reap", 42))
+
+    def test_detached_snapshot_policy_and_management_drift(self):
+        with DetachedNvmlHarness(self) as h:
+            certificate = h.nvml.normalize(h.processes)
+            preflight, _ = CgroupTests().fixture()
+            preflight.nvml, preflight.processes = h.nvml, h.processes
+            preflight.namespace_receipt = None
+            start = len(h.events)
+            with self.assertRaisesRegex(InvalidEvidence, "namespace proof"):
+                preflight._observe_cgroup_preflight()
+            self.assertEqual(len(h.events), start)
+            actual = ProviderReceiptTests().base()
+            actual.nvml, actual.processes = h.nvml, h.processes
+            actual.io.status.return_value["State"] = "R (running)"
+            with self.assertRaisesRegex(InvalidEvidence, "stopped child"):
+                actual._observe_confinement()
+            self.assertEqual(len(h.events), start)
+            snapshot = h.nvml.snapshot(h.processes)
+            self.assertEqual(snapshot, {"certificate": certificate, "management": h.management})
+            self.assertFalse(any("Reset" in e[0] or "Set" in e[0] for e in h.events[start:]))
+            self.assertEqual(h.nvml.helper_receipt["pid"], 43)
+            h.nvml.identity.return_value["device_uuid"] = "drift"
+            with self.assertRaises(InvalidEvidence):
+                h.nvml.snapshot(h.processes)
+            h.nvml.identity.return_value["device_uuid"] = h.nvml.spec["uuid"]
+            h.nvml.query_policy.return_value["offsets"][0]["status"] = "drift"
+            with self.assertRaises(InvalidEvidence):
+                h.nvml.snapshot(h.processes)
+            h.nvml.query_policy.return_value["offsets"][0]["status"] = "NVML_ERROR_NOT_SUPPORTED"
+            def certificate_drift(view):
+                length = struct.unpack(">I", view[:4])[0]
+                value = strict_json(view[4:4 + length])
+                value["certificate"]["application_clocks"]["0"] = {
+                    k: {"status": "NVML_SUCCESS", "value": 100} for k in ("application", "default")}
+                raw = canonical_json(value)
+                view[:4], view[4:4 + len(raw)] = struct.pack(">I", len(raw)), raw
+            h.result_mutation = certificate_drift
+            with self.assertRaisesRegex(InvalidEvidence, "certificate drift"):
+                h.nvml.snapshot(h.processes)
+            h.result_mutation = None
+            obj = ProviderReceiptTests().base()
+            obj.nvml, obj.processes = h.nvml, h.processes
+            obj.gpu_management = snapshot["management"]
+            h.management["power"]["limit"]["value"] += 1
+            with self.assertRaisesRegex(InvalidEvidence, "management drift"):
+                obj._observe_confinement()
+            obj._launch_observed.assert_not_called()
+            obj.journal.publish.assert_not_called()
+            self.assertFalse(obj.snapshot_consumed)
+            self.assertIsNone(h.nvml.library)
+            self.assertIsNone(h.nvml.handle)
+
+    def test_real_exclusion_topology_namespace_confinement_order(self):
+        # Keep the real action dispatch, observations, helper transport, process
+        # primitives and handoff stop. Mock only host/syscall/ABI observations.
+        with DetachedNvmlHarness(self) as h:
+            obj, values = CgroupTests().fixture()
+            obj.nvml, obj.processes = h.nvml, h.processes
+            obj.gpu_management = copy.deepcopy(h.management)
+            baseline = numa_baseline()
+            baseline["resource_domain"] = obj._domain("/sys/fs/cgroup")
+            obj.baseline = lb.LaunchManifest.parse(baseline)
+            obj.exclusion, obj.lock_fd = False, None
+            obj.profile["lock_path"] = "/fixture/lock"
+            obj._inventory = Mock(return_value={})
+            obj._observe_brokers = Mock(return_value={"abstract_socket_count": 0})
+            obj.released, obj.failed, obj.running = False, False, False
+            obj.journal = SimpleNamespace(pending=(1, "EXCLUSION"), publish=Mock())
+            obj._action = lambda: obj.journal.pending[1]
+            h.nvml.check = obj._gpu_check
+            obj.namespace_receipt = None
+            obj.original_ns, obj.original_network_ns, obj.initial_user_ns = "mnt:original", "net:original", "user:initial"
+            obj.guardian_pid = 39
+            ns = {"mnt": "mnt:original", "net": "net:original", "user": "user:initial"}
+            obj.io.namespace.side_effect = lambda pid, kind: "mnt:original" if pid == 39 and kind == "mnt" else ns[kind]
+            obj._worker.side_effect = lambda: {"pid": 40, "starttime": 900, "threads": h.threads}
+            obj.native = SimpleNamespace(retained_fds={}, retain_objects=Mock(return_value={"device": 70, "filesystem": 71}),
+                pin_private_namespace=lambda: obj.native.retained_fds.update(private_mount_ns=72), mount=Mock())
+            def unshare(flags):
+                self.assertEqual(flags, lb.CLONE_NEWNS | lb.CLONE_NEWNET)
+                self.assertEqual(h.threads, 1)
+                self.assertIsNone(h.processes.nvml_helper)
+                self.assertEqual(h.events[-1], ("helper-reap", 42))
+                h.events.append(("namespace",))
+                ns.update(mnt="mnt:private", net="net:private")
+            obj.native.unshare = unshare
+            records = lb.parse_mountinfo(
+                f"100 1 259:4 / {ls.MOUNT} rw,noatime - ext4 /dev/nvme0n1 rw,discard\n"
+                f"101 1 259:1 / {ls.OUTPUT_ROOT} rw - ext4 /dev/root rw\n"
+                f"102 1 259:1 / {ls.ALIAS_PARENT} rw - ext4 /dev/root rw\n"
+                "103 1 0:28 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n")
+            obj._mounts = lambda pid="self": [dict(r, mount_id=r["mount_id"] + (100 if ns["mnt"] == "mnt:private" else 0)) for r in records]
+            obj._device = Mock(return_value=storage_fixture())
+            obj.backing = None
+            obj.io.link.return_value = ls.CANONICAL
+            obj.io.superblock.return_value = {"uuid": storage_fixture()["uuid"], "recovery_required": True, "healthy": True}
+            old_text = obj.io.text.side_effect
+            def text(path):
+                if path == ls.CONFIG:
+                    return TopologyConfigTests.config
+                if path.endswith("/ro"):
+                    return "0"
+                return old_text(path)
+            obj.io.text.side_effect = text
+            obj.block_get = Mock(return_value=0)
+            backend = object.__new__(lb.LinuxBackend)
+            backend.system = obj
+            backend._observe = obj.observe
+            backend._storage_identity = canonical_json(storage_fixture())
+            evidence = {"receipts": {}}
+            with patch.object(ls, "controlled_directory"), patch("os.open", return_value=10), \
+                 patch("os.fstat", return_value=SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0)), \
+                 patch("fcntl.flock"), patch("os.uname", return_value=SimpleNamespace(release=ls.EXPECTATIONS["kernel"])), \
+                 patch.object(ls, "major_minor", return_value="259:1"):
+                exclusion = backend._perform("EXCLUSION", evidence)
+                self.assertEqual(exclusion["nvml_helper"]["pid"], 42)
+                obj.journal.pending = (2, "TOPOLOGY")
+                topology = backend._perform("TOPOLOGY", evidence)
+                self.assertEqual(topology["expectations"], ls.EXPECTATIONS)
+                obj.journal.pending = (3, "NAMESPACE")
+                evidence["receipts"]["NAMESPACE"] = backend._perform("NAMESPACE", evidence)
+            obj.journal.pending = (10, "CONFINEMENT")
+            backend.baseline, backend.attempt = obj.baseline, obj.attempt
+            def create(parent, attempt):
+                path = parent + "/" + attempt
+                values[path + "/cgroup.subtree_control"] = ""
+                values["/proc/41/cgroup"] = "0::/" + attempt + "\n"
+                return path
+            h.processes.create_accounting_cgroup = Mock(side_effect=create)
+            h.processes.simulated = True
+            obj.roles = lb.ProcessRoles(h.processes, attempt=obj.attempt, manifest=adapter_fixture())
+            def stop_wait(pid, stopped):
+                self.assertEqual((pid, stopped), (41, True))
+                h.stopped, h.handoff = True, False
+                h.events.append(("SIGSTOP", pid))
+                return {"pid": pid, "stopped": True}
+            h.processes.wait_once = stop_wait
+            def handoff():
+                h.handoff = True
+                return lb.NativeProcesses.fork(h.processes)
+            h.processes.fork = handoff
+            child_status = ProviderReceiptTests().base().io.status.return_value
+            obj.io.status.side_effect = lambda pid: child_status if pid == 41 else {"Mems_allowed_list": "0"}
+            obj._launch_observed = Mock(return_value=baseline)
+            receipt = backend._perform("CONFINEMENT", evidence)
+            snapshot_arg = obj._launch_observed.call_args.args[-1]
+            self.assertEqual(snapshot_arg, {"certificate": strict_json(h.nvml.certificate), "management": h.management})
+            self.assertEqual(obj.gpu_preflight_receipt["pid"], 43)
+            self.assertEqual(obj.gpu_actual_child_receipt["pid"], 44)
+            sequence = [event for event in h.events if event[0] in
+                        ("helper-fork", "helper-reap", "namespace", "handoff-fork", "SIGSTOP")]
+            self.assertEqual(sequence, [("helper-fork", "EXCLUSION", 42, False), ("helper-reap", 42),
+                ("namespace",), ("helper-fork", "CONFINEMENT", 43, False), ("helper-reap", 43),
+                ("handoff-fork", 41), ("SIGSTOP", 41),
+                ("helper-fork", "CONFINEMENT", 44, True), ("helper-reap", 44)])
+            self.assertIsNone(h.nvml.library)
+            self.assertIsNone(h.nvml.handle)
 
 
 class BoundaryTests(unittest.TestCase):
@@ -560,7 +946,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #246"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #248"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -682,6 +1068,11 @@ class ProviderReceiptTests(unittest.TestCase):
         obj.snapshot = ls.InheritanceSnapshot.capture(**snapshot_fixture())
         obj._inventory = Mock(return_value={})
         obj._launch_observed = Mock(return_value=numa_baseline())
+        obj.processes = Mock()
+        obj.gpu_management = {"fixture": True}
+        obj.nvml = SimpleNamespace(snapshot=Mock(return_value={"certificate": {}, "management": obj.gpu_management}),
+                                   helper_receipt={"pid": 43, "exit_code": 0, "parent_threads_before": 1, "parent_threads_after": 1})
+        obj.gpu_preflight_receipt = dict(obj.nvml.helper_receipt, pid=42)
         obj.io.status.return_value = {"State": "T (stopped)", "PPid": "40", "Pid": "41", "Threads": "1",
             "Uid": "1000 1000 1000 1000", "Gid": "1000 1000 1000 1000", "Groups": "",
             "Cpus_allowed_list": "0-1", "Mems_allowed_list": "0", "NoNewPrivs": "1", "Seccomp": "0",
@@ -1051,6 +1442,7 @@ class BrokerIsolationTests(unittest.TestCase):
         obj = self.fixture(host_text)
         obj._inventory = Mock(return_value={})
         obj.exclusion = True
+        obj.nvml = SimpleNamespace(helper_receipt={"pid": 42, "exit_code": 0, "parent_threads_before": 1, "parent_threads_after": 1})
         receipt = obj._observe_exclusion()
         self.assertTrue(receipt["brokers"]["pending_private_network_isolation"])
         self.assertEqual(receipt["brokers"]["abstract_socket_count"], 2)
@@ -1790,17 +2182,19 @@ class CgroupTests(unittest.TestCase):
         obj.attempt, obj.host_id, obj.worker_pid = "p1v-fixture", "fixture-host", 40
         obj.exclusion, obj.snapshot_consumed = True, False
         obj.snapshot = obj.child = obj.cgroup = None
-        obj.namespace_receipt = {"private_network_namespace": True, "abstract_socket_count": 0,
+        obj.namespace_receipt = {"private_network_namespace": True, "private_mount_namespace": True,
+                                 "abstract_socket_count": 0, "mount_namespace_id": "mnt:private",
                                  "network_namespace_id": "net:private"}
         obj.profile = {"cgroup_parent": "/sys/fs/cgroup"}
         obj.provider = {"nvml": {"uuid": "GPU-fixture"}}
         obj.gpu_management = {"fixture": True}
-        obj.nvml = SimpleNamespace(management=Mock(return_value=obj.gpu_management))
+        obj.nvml = SimpleNamespace(snapshot=Mock(return_value={"certificate": {}, "management": obj.gpu_management}),
+                                   helper_receipt={"pid": 42, "exit_code": 0, "parent_threads_before": 1, "parent_threads_after": 1})
         obj._worker = Mock(return_value=snapshot_fixture()["worker"])
         obj.io = Mock()
         obj.io.namespace.side_effect = lambda pid, kind: (
-            "net:private"
-            if (pid, kind) == (obj.worker_pid, "net") else obj.io.namespace.return_value)
+            {"net": "net:private", "mnt": "mnt:private"}[kind]
+            if pid == obj.worker_pid and kind in ("net", "mnt") else obj.io.namespace.return_value)
         obj.io.stat.return_value = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0)
         obj.io.listdir.side_effect = lambda path: ["cpuset.cpus.effective", "cpuset.mems.effective"] if path == "/sys/fs/cgroup" else []
         values = {"/proc/40/cgroup": "0::/\n", "/sys/fs/cgroup/cgroup.type": "domain\n",
@@ -1912,13 +2306,13 @@ class IntegrationAdmissionTests(unittest.TestCase):
                 roles=object.__new__(lb.ProcessRoles), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 247, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 249, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 247, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 249, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -2573,14 +2967,14 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 247, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 249, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 246)
+        self.assertEqual(ls.FLOOR, 248)
 
     def test_every_nonnegative_authority_through_242_rejects_before_host_access(self):
-        for issue in range(247):
+        for issue in range(249):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
@@ -2589,9 +2983,9 @@ class RefreshedAuthorityTests(unittest.TestCase):
                     patch("os.listdir", side_effect=AssertionError("host access")), \
                     patch("os.getpid", side_effect=AssertionError("host access")), \
                     patch("ctypes.CDLL", side_effect=AssertionError("library")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #246"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #248"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #246"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #248"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
     def test_synthetic_243_complete_scope_passes_only_pure_constructor_check(self):
@@ -2599,7 +2993,7 @@ class RefreshedAuthorityTests(unittest.TestCase):
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 247)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 249)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
@@ -2618,13 +3012,13 @@ class RefreshedAuthorityTests(unittest.TestCase):
     def test_synthetic_243_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 247)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 249)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 246), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 248), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -2636,15 +3030,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        execution_scope = {"authority_issue": 247, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 249, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                            "operations": [a.name for a in plan_fixture()],
                            "adapter_manifest_sha256": digest(canonical_json(adapter)),
                            "storage_identity": storage}
         execution_token = b"synthetic pure validation only!!!" * 2
-        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 247)
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 249)
         execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
                                       execution_token, digest(execution_token))
-        scope = {"authority_issue": 247, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 249, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2

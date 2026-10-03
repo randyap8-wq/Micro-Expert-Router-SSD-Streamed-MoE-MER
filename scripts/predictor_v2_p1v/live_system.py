@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >246.
+"""P1V5 direct observations. Live execution requires a future issue >248.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 246
+FLOOR = 248
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -33,8 +33,8 @@ PROTECTED = {
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "c0f57a524814ae12677af8d42a65fa08b900a10ba183093d6006bdbf5df354f8",
     "test_p1v.py": "ef2eb74ed4a469e80a9f2ec4c8faa8e991f29109e04e396ec37b92402b0f5a4a",
-    "linux_backend.py": "91888947b5610dd9ee6757e8488cbc66e185b95cf8f2285f3a250f871635a8ed",
-    "test_linux_backend.py": "cad94119d5893be0fada3e6aa07991115e1385b4e0c0c0b33078b9fafe094878",
+    "linux_backend.py": "507689620b6aa3812ceecbe32a80149901964483d29dd9510245f0401c1342f9",
+    "test_linux_backend.py": "1871c5d7feb337d036ab34b9e1ea907f71f8ff2897e12cbb5ac4e48879b27856",
 }
 NUMA_ABI = {"schema": "mer.p1v.numa-abi.v1", "architecture": "x86_64",
             "kernel": "6.8.0-1069-gcp", "source_profile": "Linux-v6.8",
@@ -340,7 +340,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #246")
+                "execution authority must follow #248")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -361,7 +361,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #246")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #248")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -595,16 +595,145 @@ class DirectLinux:
 
 
 class PinnedNvml:
-    """Management-only direct ABI; initialized only after exclusion admission."""
+    """Pinned ABI used only by synchronously reaped, ephemeral NVML children."""
+    RESULT_SIZE = 64 * 1024
+    HEADER_SIZE = 4
     def __init__(self, io, spec, check):
         require(type(io) is DirectLinux, "authenticated direct Linux interface required")
         io.authorize()
         require(callable(check), "NVML phase guard required")
         self.io, self.spec, self.check = io, copy.deepcopy(spec), check
         self.library = self.handle = self.certificate = None
+        self._helper_pid = self._worker_pid = None
+        self.helper_receipt = None
+
+    def _parent_cold(self):
+        self.check()
+        require(self.library is None and self.handle is None and self._helper_pid is None,
+                "parent worker must remain NVML-cold")
+
+    def _local_check(self):
+        self.check()
+        require(self._helper_pid is not None and os.getpid() == self._helper_pid
+                and self._helper_pid != self._worker_pid, "NVML local operation requires helper child")
+
+    def _identity_expected(self):
+        return {"device_uuid": self.spec["uuid"], "pci_bus_id": self.spec["pci_bus_id"],
+                "driver_version": self.spec["driver"], "nvml_version": self.spec["version"],
+                "device_name": "NVIDIA L4", "nvml_library_sha256": self.spec["sha256"]}
+
+    def _validate_certificate(self, result):
+        fixed = {"schema": "mer.p1v.gpu-clock-policy.v1", **self._identity_expected(),
+                 "normalization": "DEFAULT_UNLOCKED", "gpu_locked_clock_reset": "NVML_SUCCESS",
+                 "memory_locked_clock_reset": "NVML_SUCCESS", "normalization_after_exclusion": True,
+                 "normalization_before_launch_baseline": True, "normalization_before_stopped_child": True,
+                 "no_clock_policy_action_during_parent": True}
+        lb.exact_keys(result, (*fixed, "application_clocks", "offsets"), "NVML certificate shape")
+        require(canonical_json({key: result[key] for key in fixed}) == canonical_json(fixed),
+                "NVML certificate identity/normalization mismatch")
+        application = result["application_clocks"]
+        lb.exact_keys(application, ("0", "2"), "NVML application clock domains")
+        for pair in application.values():
+            lb.exact_keys(pair, ("application", "default"), "NVML application clock pair")
+            for value in pair.values():
+                self._validate_uint_result(value, optional=True)
+            require(pair["application"] == pair["default"], "legacy application/default clock mismatch")
+        offsets = result["offsets"]
+        require(type(offsets) is list and len(offsets) == 32, "NVML complete clock offsets")
+        for entry, (domain, pstate) in zip(offsets, ((d, p) for d in (0, 2) for p in range(16))):
+            require(type(entry) is dict and entry.get("status") in ("NVML_SUCCESS", "NVML_ERROR_NOT_SUPPORTED"),
+                    "NVML clock offset status")
+            fields = ("offset", "minimum", "maximum") if entry["status"] == "NVML_SUCCESS" else ()
+            lb.exact_keys(entry, ("domain", "pstate", "status", *fields), "NVML clock offset shape")
+            require(type(entry["domain"]) is int and type(entry["pstate"]) is int
+                    and (entry["domain"], entry["pstate"]) == (domain, pstate), "NVML clock offset ordering")
+            require(all(type(entry[key]) is int and -(2 ** 31) <= entry[key] < 2 ** 31 for key in fields),
+                    "NVML signed clock offset bounds")
+        return canonical_json(result)
+
+    @staticmethod
+    def _validate_uint_result(value, optional=False):
+        require(type(value) is dict, "NVML unsigned result shape")
+        if optional and value == {"status": "NVML_ERROR_NOT_SUPPORTED"}:
+            return
+        lb.exact_keys(value, ("status", "value"), "NVML unsigned result shape")
+        require(value["status"] == "NVML_SUCCESS", "NVML unsigned result status")
+        uint(value["value"], 32)
+
+    def _validate_management(self, result):
+        lb.exact_keys(result, ("persistence", "compute", "mig", "power"), "NVML management shape")
+        for key in ("persistence", "compute"):
+            self._validate_uint_result(result[key])
+        lb.exact_keys(result["power"], ("limit", "default", "enforced"), "NVML power shape")
+        for value in result["power"].values():
+            self._validate_uint_result(value)
+        require(canonical_json(result["mig"]) in (
+            canonical_json({"status": "NVML_ERROR_NOT_SUPPORTED"}),
+            canonical_json({"status": "NVML_SUCCESS", "current": 0, "pending": 0})), "MIG active/pending or malformed")
+
+    def _run_helper(self, processes, operation, action):
+        self._parent_cold()
+        require((operation, action) in (("normalize", "EXCLUSION"), ("snapshot", "CONFINEMENT")),
+                "NVML helper operation scope")
+        import mmap
+        self._worker_pid = os.getpid()
+        # Each invocation owns a fresh zero-filled anonymous, non-executable map.
+        with mmap.mmap(-1, self.RESULT_SIZE, flags=mmap.MAP_SHARED,
+                       prot=mmap.PROT_READ | mmap.PROT_WRITE) as shared:
+            shared[:] = b"\0" * self.RESULT_SIZE
+            pid = processes.fork_nvml_helper(action)
+            if pid == 0:
+                code = 1
+                try:
+                    self._helper_pid = os.getpid()
+                    result = self._normalize_local() if operation == "normalize" else self._snapshot_local()
+                    payload = canonical_json(result)
+                    require(0 < len(payload) <= self.RESULT_SIZE - self.HEADER_SIZE, "NVML result size")
+                    shared[self.HEADER_SIZE:self.HEADER_SIZE + len(payload)] = payload
+                    shared[:self.HEADER_SIZE] = struct.pack(">I", len(payload))
+                    code = 0
+                except BaseException:
+                    # No retry or alternate transport; the exact reap rejects 1.
+                    code = 1
+                shared.close()
+                processes.exit_nvml_helper(code, action)
+                raise InvalidEvidence("NVML helper exit returned")
+            receipt = processes.wait_nvml_helper(pid, action)
+            lb.exact_keys(receipt, ("pid", "exit_code", "parent_threads_before", "parent_threads_after"),
+                          "NVML helper reap receipt")
+            require(canonical_json(receipt) == canonical_json({"pid": pid, "exit_code": 0,
+                    "parent_threads_before": 1, "parent_threads_after": 1}), "NVML helper reap proof")
+            self._parent_cold()
+            length = struct.unpack(">I", shared[:self.HEADER_SIZE])[0]
+            require(0 < length <= self.RESULT_SIZE - self.HEADER_SIZE, "NVML result length")
+            payload = shared[self.HEADER_SIZE:self.HEADER_SIZE + length]
+            try:
+                result = strict_json(payload)
+                require(canonical_json(result) == payload, "noncanonical NVML result")
+            except (ValueError, TypeError, UnicodeError) as error:
+                raise InvalidEvidence("invalid canonical NVML result") from error
+        return result, receipt
+
+    def normalize(self, processes):
+        self._parent_cold()
+        require(self.certificate is None, "NVML normalization reuse")
+        result, receipt = self._run_helper(processes, "normalize", "EXCLUSION")
+        self.certificate = self._validate_certificate(result)
+        self.helper_receipt = receipt
+        return strict_json(self.certificate)
+
+    def snapshot(self, processes):
+        self._parent_cold()
+        require(self.certificate is not None, "normalization transition absent")
+        result, receipt = self._run_helper(processes, "snapshot", "CONFINEMENT")
+        lb.exact_keys(result, ("certificate", "management"), "NVML snapshot shape")
+        require(self._validate_certificate(result["certificate"]) == self.certificate, "GPU certificate drift")
+        self._validate_management(result["management"])
+        self.helper_receipt = receipt
+        return result
 
     def _call(self, name, args, types, optional=False):
-        self.check()
+        self._local_check()
         import ctypes
         require(self.library is not None, "NVML not initialized")
         function = getattr(self.library, name)
@@ -630,6 +759,7 @@ class PinnedNvml:
         return {"status": "NVML_ERROR_NOT_SUPPORTED"} if status == 3 else {"status": "NVML_SUCCESS", "value": value.value}
 
     def identity(self):
+        self._local_check()
         import ctypes
 
         class PCI(ctypes.Structure):
@@ -649,6 +779,7 @@ class PinnedNvml:
                 "nvml_library_sha256": self.io.file_hash(self.spec["path"])}
 
     def query_policy(self):
+        self._local_check()
         import ctypes
         application = {}
         for domain in (0, 2):
@@ -676,9 +807,9 @@ class PinnedNvml:
                 offsets.append(value)
         return {"application_clocks": application, "offsets": offsets}
 
-    def normalize(self):
-        self.check()
-        require(self.library is None and self.certificate is None, "NVML normalization reuse")
+    def _load_local(self):
+        self._local_check()
+        require(self.library is None and self.handle is None, "NVML local initialization reuse")
         require(self.io.file_hash(self.spec["path"]) == self.spec["sha256"], "pinned NVML library mismatch")
         import ctypes
         self.library = ctypes.CDLL(self.spec["path"], mode=os.RTLD_LOCAL | os.RTLD_NOW)
@@ -687,10 +818,14 @@ class PinnedNvml:
         self._call("nvmlDeviceGetHandleByUUID", [self.spec["uuid"].encode("ascii"), ctypes.byref(self.handle)],
                    [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)])
         identity = self.identity()
-        require(identity == {"device_uuid": self.spec["uuid"], "pci_bus_id": self.spec["pci_bus_id"],
-                             "driver_version": self.spec["driver"], "nvml_version": self.spec["version"],
-                             "device_name": "NVIDIA L4", "nvml_library_sha256": self.spec["sha256"]},
-                "GPU/PCI/driver/NVML identity mismatch")
+        require(identity == self._identity_expected(), "GPU/PCI/driver/NVML identity mismatch")
+        return identity
+
+    def _normalize_local(self):
+        self._local_check()
+        require(self.certificate is None, "NVML normalization reuse")
+        identity = self._load_local()
+        import ctypes
         self._call("nvmlDeviceResetGpuLockedClocks", [self.handle], [ctypes.c_void_p])
         self._call("nvmlDeviceResetMemoryLockedClocks", [self.handle], [ctypes.c_void_p])
         result = {"schema": "mer.p1v.gpu-clock-policy.v1", **identity,
@@ -701,15 +836,17 @@ class PinnedNvml:
         self.certificate = canonical_json(result)
         return strict_json(self.certificate)
 
-    def observed(self):
-        self.check()
+    def _snapshot_local(self):
+        self._local_check()
         require(self.certificate is not None, "normalization transition absent")
         result = strict_json(self.certificate)
-        require(all(result[k] == v for k, v in self.identity().items()), "GPU identity drift")
+        identity = self._load_local()
+        require(all(result[k] == v for k, v in identity.items()), "GPU identity drift")
         require(all(result[k] == v for k, v in self.query_policy().items()), "GPU clock policy drift")
-        return result
+        return {"certificate": result, "management": self.management()}
 
     def management(self):
+        self._local_check()
         import ctypes
         current, pending = ctypes.c_uint(), ctypes.c_uint()
         status = self._call("nvmlDeviceGetMigMode", [self.handle, ctypes.byref(current), ctypes.byref(pending)],
@@ -875,6 +1012,8 @@ class LiveSystem:
     def _check(self):
         require(not self.running and not self.failed, "provider forbidden while P1R parent runs or after failure")
         require_live(*self.context, self._action())
+        if hasattr(self, "nvml") and self.nvml._helper_pid is None:
+            require(self.nvml.library is None and self.nvml.handle is None, "parent worker must remain NVML-cold")
 
     def _gpu_check(self):
         self._check()
@@ -1015,7 +1154,7 @@ class LiveSystem:
         self._inventory()
         self._observe_brokers(private=False)
         require(self.child is None, "clock normalization must precede handoff child")
-        self.nvml.normalize()
+        self.nvml.normalize(self.processes)
 
     def _inventory(self):
         self._check()
@@ -1193,7 +1332,9 @@ class LiveSystem:
         brokers = self._observe_brokers(private=False)
         return {"ok": True, "held": self.exclusion, "trusted_host": True,
                 "uncontrolled_writers": [], "raw_holders": [], "uncontrolled_mount_namespaces": [],
-                "inventory": inventory, "brokers": brokers, "administrative_noninterference": "TRUSTED_HOST_PREMISE"}
+                "inventory": inventory, "brokers": brokers,
+                "nvml_helper": copy.deepcopy(self.nvml.helper_receipt),
+                "administrative_noninterference": "TRUSTED_HOST_PREMISE"}
 
     def _observe_topology(self):
         boot, device = self._host(), self._device()
@@ -1220,6 +1361,7 @@ class LiveSystem:
 
     def _topology_expectations(self, record, device):
         # Every expected constant below is checked against a direct observation.
+        require(self.nvml.library is None and self.nvml.handle is None, "topology requires NVML-cold worker")
         require(self.nvml.certificate is not None, "GPU identity transition required")
         gpu = strict_json(self.nvml.certificate)
         observed = {"kernel": os.uname().release, "data_mount": record["target"],
@@ -1484,7 +1626,15 @@ class LiveSystem:
     def _observe_cgroup_preflight(self):
         require(self.snapshot is None and self.child is None and self.exclusion, "one NUMA pre-fork snapshot under exclusion")
         self._host()
-        self.gpu_management = self.nvml.management()
+        require(self.namespace_receipt is not None
+                and self.namespace_receipt["private_mount_namespace"] is True
+                and self.namespace_receipt["private_network_namespace"] is True
+                and self.namespace_receipt["abstract_socket_count"] == 0
+                and self.io.namespace(self.worker_pid, "mnt") == self.namespace_receipt["mount_namespace_id"]
+                and self.io.namespace(self.worker_pid, "net") == self.namespace_receipt["network_namespace_id"],
+                "private mount/network namespace proof before GPU preflight")
+        self.gpu_management = self.nvml.snapshot(self.processes)["management"]
+        self.gpu_preflight_receipt = copy.deepcopy(self.nvml.helper_receipt)
         source = self._cgroup_path(self.worker_pid)
         require(source == self.profile["cgroup_parent"], "worker/source accounting parent mismatch")
         require(self.io.text(source + "/cgroup.type").strip() == "domain", "non-domain cgroup")
@@ -1599,7 +1749,7 @@ class LiveSystem:
             result[group] = entries
         return result
 
-    def _launch_observed(self, pid, numa, status, domain):
+    def _launch_observed(self, pid, numa, status, domain, gpu_snapshot):
         import resource
         import signal
         import sys
@@ -1635,8 +1785,8 @@ class LiveSystem:
         thp, balancing = self._policy_files("thp"), self._policy_files("numa_balancing")
         require(status.get("THP_enabled") in ("0", "1"), "actual child THP policy unavailable")
         thp = {"global": thp, "task_enabled": int(status["THP_enabled"])}
-        gpu = self._gpu_inventory() | self.nvml.management()
-        certificate = self.nvml.observed()
+        gpu = self._gpu_inventory() | gpu_snapshot["management"]
+        certificate = gpu_snapshot["certificate"]
         gpu.update(device={k: certificate[k] for k in ("device_uuid", "pci_bus_id", "device_name")},
                    driver=certificate["driver_version"], clocks=certificate,
                    mps=self._mps_observation())
@@ -1697,6 +1847,10 @@ class LiveSystem:
                 and child_user == self.initial_user_ns, "child namespace binding")
         require(self.io.text(self.source_cgroup + "/cgroup.subtree_control").strip() == ""
                 and self.io.text(self.cgroup + "/cgroup.subtree_control").strip() == "", "controller mutation after snapshot")
+        gpu_snapshot = self.nvml.snapshot(self.processes)
+        require(canonical_json(gpu_snapshot["management"]) == canonical_json(self.gpu_management),
+                "GPU management drift across handoff")
+        self.gpu_actual_child_receipt = copy.deepcopy(self.nvml.helper_receipt)
         source, target = self._domain(self.source_cgroup), self._domain(self.cgroup)
         child = {"pid": int(status["Pid"]), "ppid": int(status["PPid"]), "stopped": True,
                  "threads": int(status["Threads"]), "allowed_cpus": integer_list(status["Cpus_allowed_list"]),
@@ -1705,7 +1859,7 @@ class LiveSystem:
             returned_pid=self.child, child=child, source=source, target=target, baseline=self.baseline.values())
         self.snapshot_consumed = True
         self.numa_receipt = numa
-        observed = self._launch_observed(self.child, numa, status, target)
+        observed = self._launch_observed(self.child, numa, status, target, gpu_snapshot)
         self.baseline.compare(observed)
         self._inventory()
         brokers = self._observe_brokers(private=True, pid=self.child)

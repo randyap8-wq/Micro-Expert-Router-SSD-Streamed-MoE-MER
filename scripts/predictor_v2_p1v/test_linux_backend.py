@@ -35,7 +35,7 @@ PROTECTED_P1V_FILES = {
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "c0f57a524814ae12677af8d42a65fa08b900a10ba183093d6006bdbf5df354f8",
     "test_p1v.py": "ef2eb74ed4a469e80a9f2ec4c8faa8e991f29109e04e396ec37b92402b0f5a4a",
-    "linux_backend.py": "91888947b5610dd9ee6757e8488cbc66e185b95cf8f2285f3a250f871635a8ed",
+    "linux_backend.py": "507689620b6aa3812ceecbe32a80149901964483d29dd9510245f0401c1342f9",
 }
 REQUIRED_P1V_FILES = frozenset(PROTECTED_P1V_FILES) | {"test_linux_backend.py"}
 OPTIONAL_P1V5_FILES = frozenset({"live_system.py", "test_live_system.py",
@@ -1013,6 +1013,118 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(processes.calls, ["fork", ("wait", 10, True), ("continue", 10), ("wait", 10, False)])
         with self.assertRaises(InvalidEvidence):
             roles.resume_wait_parent(pid)
+
+
+class NvmlHelperProcessTests(unittest.TestCase):
+    def processes(self):
+        obj = object.__new__(lb.NativeProcesses)
+        obj._check = Mock()
+        obj.nvml_helper = obj.nvml_helper_child = None
+        return obj
+
+    def test_nvml_helper_primitive_lifecycle(self):
+        with patch("os.getpid", return_value=40), patch("os.geteuid", return_value=0) as root, \
+             patch("os.listdir", return_value=["40"]) as tasks, patch("os.fork", return_value=42) as fork, \
+             patch("os.waitpid", return_value=(42, 0)) as wait, patch("os._exit") as exit_child:
+            for action in ("EXCLUSION", "CONFINEMENT"):
+                obj = self.processes()
+                fork.reset_mock(); wait.reset_mock()
+                self.assertEqual(obj.fork_nvml_helper(action), 42)
+                self.assertEqual(obj.nvml_helper, (42, action, 40, 1))
+                with self.assertRaisesRegex(InvalidEvidence, "already active"):
+                    obj.fork_nvml_helper(action)
+                for pid, other in ((43, action), (42, "CONFINEMENT" if action == "EXCLUSION" else "EXCLUSION")):
+                    with self.subTest(pid=pid, action=other), self.assertRaises(InvalidEvidence):
+                        obj.wait_nvml_helper(pid, other)
+                wait.assert_not_called()
+                result = obj.wait_nvml_helper(42, action)
+                self.assertEqual(result, {"pid": 42, "exit_code": 0, "parent_threads_before": 1, "parent_threads_after": 1})
+                fork.assert_called_once_with()
+                wait.assert_called_once_with(42, 0)
+                self.assertIsNone(obj.nvml_helper)
+                with self.assertRaises(InvalidEvidence):
+                    obj.wait_nvml_helper(42, action)
+                for code in (0, 1):
+                    with self.assertRaises(InvalidEvidence):
+                        obj.exit_nvml_helper(code, action)
+                exit_child.assert_not_called()
+            for action in ("AUTHORITY", "TOPOLOGY", "NAMESPACE", "P1R_PARENT", "RELEASE", "", None):
+                obj = self.processes()
+                for method, args in ((obj.fork_nvml_helper, (action,)),
+                                     (obj.wait_nvml_helper, (42, action)), (obj.exit_nvml_helper, (0, action))):
+                    with self.subTest(action=action), self.assertRaisesRegex(InvalidEvidence, "action scope"):
+                        method(*args)
+                obj._check.assert_not_called()
+            for euid, thread_list in ((1000, ["40"]), (0, []), (0, ["40", "41"])):
+                root.return_value, tasks.return_value = euid, thread_list
+                fork.reset_mock()
+                with self.subTest(euid=euid, tasks=thread_list), self.assertRaises(InvalidEvidence):
+                    self.processes().fork_nvml_helper("EXCLUSION")
+                fork.assert_not_called()
+            root.return_value, tasks.return_value = 0, ["40"]
+            for found, status in ((43, 0), (42, 1 << 8), (42, 9), (42, 19 << 8 | 0x7f)):
+                obj = self.processes()
+                obj.fork_nvml_helper("CONFINEMENT")
+                wait.return_value = (found, status)
+                wait.reset_mock()
+                with self.subTest(found=found, status=status), self.assertRaises(InvalidEvidence):
+                    obj.wait_nvml_helper(42, "CONFINEMENT")
+                wait.assert_called_once_with(42, 0)
+                self.assertEqual(obj.nvml_helper is None, found == 42)
+            obj = self.processes()
+            obj.fork_nvml_helper("EXCLUSION")
+            wait.return_value = (42, 0)
+            tasks.return_value = ["40", "41"]
+            with self.assertRaisesRegex(InvalidEvidence, "after NVML helper reap"):
+                obj.wait_nvml_helper(42, "EXCLUSION")
+            self.assertIsNone(obj.nvml_helper)
+            tasks.return_value = ["40"]
+            obj = self.processes()
+            fork.return_value = 0
+            with patch("os.getpid", side_effect=[40, 42]):
+                self.assertEqual(obj.fork_nvml_helper("EXCLUSION"), 0)
+            self.assertEqual(obj.nvml_helper_child, (42, "EXCLUSION"))
+            with patch("os.getpid", return_value=42):
+                tasks.return_value = ["42", "native-nvml-task"]
+                for code in (0, 1):
+                    obj.exit_nvml_helper(code, "EXCLUSION")
+                    exit_child.assert_called_with(code)
+                for code in (-1, 2, True, "0"):
+                    with self.assertRaises(InvalidEvidence):
+                        obj.exit_nvml_helper(code, "EXCLUSION")
+                with self.assertRaises(InvalidEvidence):
+                    obj.exit_nvml_helper(0, "CONFINEMENT")
+            with self.assertRaises(InvalidEvidence):
+                obj.exit_nvml_helper(0, "EXCLUSION")
+
+    def test_handoff_fork_rejects_active_helper_and_preserves_single_thread_rule(self):
+        with patch("os.getpid", return_value=40), patch("os.geteuid", return_value=0) as root, \
+             patch("os.listdir", return_value=["40"]) as tasks, patch("os.fork", return_value=42) as fork, \
+             patch("os.waitpid", return_value=(42, 0)) as wait:
+            obj = self.processes()
+            obj.fork_nvml_helper("EXCLUSION")
+            fork.reset_mock()
+            with self.assertRaisesRegex(InvalidEvidence, "helper active"):
+                obj.fork()
+            fork.assert_not_called()
+            obj.wait_nvml_helper(42, "EXCLUSION")
+            wait.assert_called_once_with(42, 0)
+            fork.return_value = 41
+            self.assertEqual(obj.fork(), 41)
+            fork.assert_called_once_with()
+            obj._check.assert_called_with("CONFINEMENT")
+            for euid, threads in ((1000, ["40"]), (0, []), (0, ["40", "native-task"])):
+                root.return_value, tasks.return_value = euid, threads
+                fork.reset_mock()
+                with self.subTest(euid=euid, threads=threads), self.assertRaisesRegex(InvalidEvidence, "single-threaded privileged"):
+                    obj.fork()
+                fork.assert_not_called()
+                obj._check.assert_called_with("CONFINEMENT")
+            root.return_value, tasks.return_value = 0, ["40"]
+            obj.nvml_helper_child = (40, "CONFINEMENT")
+            with self.assertRaisesRegex(InvalidEvidence, "helper active"):
+                obj.fork()
+            fork.assert_not_called()
 
 
 class AdditionalGateTests(unittest.TestCase):

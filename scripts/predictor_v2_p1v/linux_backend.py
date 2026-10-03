@@ -931,6 +931,7 @@ class NativeProcesses:
         self.context = (authorization, grant, host_id, attempt, copy.deepcopy(manifest))
         self.attempt = attempt
         self.cgroups = set()
+        self.nvml_helper = self.nvml_helper_child = None
 
     def _check(self, action):
         import sys
@@ -939,8 +940,51 @@ class NativeProcesses:
 
     def fork(self):
         self._check("CONFINEMENT")
+        require(self.nvml_helper is None and self.nvml_helper_child is None, "NVML helper active at handoff fork")
         require(os.geteuid() == 0 and len(os.listdir("/proc/self/task")) == 1, "single-threaded privileged fork required")
         return os.fork()
+
+    def _nvml_action(self, action):
+        require(action in ("EXCLUSION", "CONFINEMENT"), "NVML helper action scope")
+        self._check(action)
+        require(os.geteuid() == 0, "privileged NVML helper required")
+
+    def fork_nvml_helper(self, action):
+        self._nvml_action(action)
+        require(self.nvml_helper is None and self.nvml_helper_child is None, "NVML helper already active")
+        threads = len(os.listdir("/proc/self/task"))
+        require(threads == 1, "single-threaded NVML helper fork required")
+        owner = os.getpid()
+        pid = os.fork()
+        require(type(pid) is int and 0 <= pid < 2 ** 32, "NVML helper fork PID")
+        if pid == 0:
+            self.nvml_helper_child = (os.getpid(), action)
+        else:
+            require(pid != owner, "NVML helper must be a child")
+            self.nvml_helper = (pid, action, owner, threads)
+        return pid
+
+    def wait_nvml_helper(self, pid, action):
+        self._nvml_action(action)
+        require(uint(pid, 32) > 0 and self.nvml_helper is not None
+                and self.nvml_helper[:3] == (pid, action, os.getpid())
+                and self.nvml_helper_child is None, "owned NVML helper PID/action required")
+        before = self.nvml_helper[3]
+        found, status = os.waitpid(pid, 0)
+        require(found == pid, "exact NVML helper reap required")
+        self.nvml_helper = None
+        after = len(os.listdir("/proc/self/task"))
+        require(after == 1, "single-threaded worker after NVML helper reap required")
+        require(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, "NVML helper failed or signaled")
+        return {"pid": pid, "exit_code": os.WEXITSTATUS(status),
+                "parent_threads_before": before, "parent_threads_after": after}
+
+    def exit_nvml_helper(self, code, action):
+        self._nvml_action(action)
+        require(self.nvml_helper is None and self.nvml_helper_child == (os.getpid(), action),
+                "only owned NVML helper may exit")
+        require(type(code) is int and code in (0, 1), "NVML helper exit status")
+        os._exit(code)
 
     def wait_once(self, pid, stopped):
         self._check("CONFINEMENT" if stopped else "P1R_PARENT")
