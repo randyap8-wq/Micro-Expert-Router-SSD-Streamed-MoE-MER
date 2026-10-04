@@ -22,7 +22,7 @@ class GateTests(unittest.TestCase):
         with patch("os.open", side_effect=AssertionError("host access")), patch("ctypes.CDLL", side_effect=AssertionError("library")), \
              patch.object(Path, "read_bytes", side_effect=AssertionError("file")):
             result = gate.planning("p1v-fixture")
-        self.assertEqual(result["live_authority_must_exceed"], 248)
+        self.assertEqual(result["live_authority_must_exceed"], 251)
         self.assertEqual(result["implementation_issue"], 217)
         self.assertEqual(result["execution"], "NOT_AUTHORIZED")
         self.assertEqual(result["hot_path_interposition"], "NONE")
@@ -40,7 +40,7 @@ class GateTests(unittest.TestCase):
             gate.main(["--execute", "--validate-manifest", "/must-not-open"])
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("NOT_AUTHORIZED", error.getvalue())
-        self.assertIn("issue >248", error.getvalue())
+        self.assertIn("issue >251", error.getvalue())
 
     def test_execute_still_denied_with_plan_and_future_looking_arguments(self):
         with patch.object(gate, "planning", side_effect=AssertionError("plan")), \
@@ -51,7 +51,7 @@ class GateTests(unittest.TestCase):
              redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as caught:
             gate.main(["--execute", "--plan", "--attempt", "p1v-issue-229", "--validate-manifest", "/must-not-open"])
         self.assertEqual(caught.exception.code, 2)
-        self.assertIn("issue >248", error.getvalue())
+        self.assertIn("issue >251", error.getvalue())
 
     def test_compose_requires_future_grants_before_io(self):
         with patch.object(gate, "DirectLinux", side_effect=AssertionError("host constructor")), self.assertRaises(InvalidEvidence):
@@ -120,7 +120,7 @@ class GateTests(unittest.TestCase):
     def test_plan_cli(self):
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(gate.main(["--plan", "--attempt", "p1v-fixture"]), 0)
-        self.assertIn('"live_authority_must_exceed":248', output.getvalue())
+        self.assertIn('"live_authority_must_exceed":251', output.getvalue())
 
     def test_no_current_external_grant_created(self):
         source = Path(gate.__file__).read_text()

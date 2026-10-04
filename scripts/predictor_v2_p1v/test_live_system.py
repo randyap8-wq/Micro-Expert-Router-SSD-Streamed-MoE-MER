@@ -28,9 +28,39 @@ def mask(*nodes):
     return bytes(data)
 
 
+def unbound_native():
+    value = object.__new__(lb.NativePrimitives)
+    value.retained_fds = {}
+    return value
+
+
+def unbound_roles():
+    value = object.__new__(lb.ProcessRoles)
+    value.failure_owner = None
+    value.child = None
+    return value
+
+
+def lifecycle_stdio():
+    return [{"fd": fd, "type": "regular", "backing": {"device": "259:1", "inode": 100 + fd,
+             "path": "/fixture/stdio/" + name}, "flags": 0o100000 if fd == 0 else 0o102001}
+            for fd, name in enumerate(("stdin", "stdout", "stderr"))]
+
+
+def hold_fixture():
+    return dict.fromkeys(lb.HOLD_TRUE, True) | {"private_network_abstract_sockets": 0, "nvml_helper_active": False}
+
+
+def sessions_fixture():
+    return {role: {"session_id": 90, "process_group": 90, "autogroup": "/autogroup-7 nice 0"}
+            for role in ("worker", "child")}
+
+
 def numa_baseline():
     value = launch_fixture()
     value["credentials"]["groups"] = []
+    value["session"] = copy.deepcopy(lb.SESSION_POLICY)
+    value["stdio"] = lifecycle_stdio()
     value["numa"] = {"allowed_nodes": [0], "memory_policy": ls.task_policy(0, mask())}
     return value
 
@@ -721,6 +751,7 @@ class DetachedNvmlTests(unittest.TestCase):
             obj = object.__new__(ls.LiveSystem)
             obj.running = obj.failed = False
             obj.nvml, obj.context = h.nvml, ()
+            obj.lock_fd, obj.native = None, unbound_native()
             with patch.object(ls, "require_live"):
                 for action in ("AUTHORITY", "EXCLUSION", "TOPOLOGY", "NAMESPACE", "ALIAS_BIND", "ALIAS_RO",
                                "METADATA", "FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "CONFINEMENT"):
@@ -920,6 +951,8 @@ class DetachedNvmlTests(unittest.TestCase):
             child_status = ProviderReceiptTests().base().io.status.return_value
             obj.io.status.side_effect = lambda pid: child_status if pid == 41 else {"Mems_allowed_list": "0"}
             obj._launch_observed = Mock(return_value=baseline)
+            obj.session_observations = sessions_fixture()
+            obj._confinement_hold_proof = Mock(return_value=hold_fixture())
             receipt = backend._perform("CONFINEMENT", evidence)
             snapshot_arg = obj._launch_observed.call_args.args[-1]
             self.assertEqual(snapshot_arg, {"certificate": strict_json(h.nvml.certificate), "management": h.management})
@@ -946,7 +979,7 @@ class BoundaryTests(unittest.TestCase):
         for issue in range(217, 229):
             scope = {"authority_issue": issue, "host_id": "fixture", "attempt": "p1v-fixture",
                      "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
-            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #248"):
+            with self.subTest(issue=issue), self.assertRaisesRegex(InvalidEvidence, "follow #251"):
                 ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
 
     def test_constructor_denies_before_host_access(self):
@@ -1068,6 +1101,8 @@ class ProviderReceiptTests(unittest.TestCase):
         obj.snapshot = ls.InheritanceSnapshot.capture(**snapshot_fixture())
         obj._inventory = Mock(return_value={})
         obj._launch_observed = Mock(return_value=numa_baseline())
+        obj.session_observations = sessions_fixture()
+        obj._confinement_hold_proof = Mock(return_value=hold_fixture())
         obj.processes = Mock()
         obj.gpu_management = {"fixture": True}
         obj.nvml = SimpleNamespace(snapshot=Mock(return_value={"certificate": {}, "management": obj.gpu_management}),
@@ -1396,11 +1431,11 @@ class BrokerIsolationTests(unittest.TestCase):
 
     def test_live_supplementary_groups_rejected_before_direct_access(self):
         def construct(bundle):
-            return ls.LiveSystem(authorization=None, grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()),
+            return ls.LiveSystem(authorization=SimpleNamespace(issue=252), grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()),
                 host_id="fixture-host", attempt="p1v-fixture", manifest=bundle["adapter"], provider_manifest=bundle["provider"],
                 baseline=bundle["launch"], closure=bundle["closure"], journal=SimpleNamespace(pending=None),
-                native=object.__new__(lb.NativePrimitives), processes=object.__new__(lb.NativeProcesses),
-                roles=object.__new__(lb.ProcessRoles), bootstrap={})
+                native=unbound_native(), processes=object.__new__(lb.NativeProcesses),
+                roles=unbound_roles(), bootstrap={})
         for groups in ([119], [1000], [119, 1000]):
             bundle = bundle_fixture()
             bundle["launch"]["credentials"]["groups"] = groups
@@ -1416,7 +1451,7 @@ class BrokerIsolationTests(unittest.TestCase):
             with patch.object(gate, "require_live"), \
                     patch.object(gate, "DirectLinux", side_effect=AssertionError("direct host construction")), \
                     self.assertRaisesRegex(InvalidEvidence, "supplementary groups must be empty"):
-                gate.compose(bundle, authorization=None, execution_grant=None, provider_grant=None,
+                gate.compose(bundle, authorization=SimpleNamespace(issue=252), execution_grant=None, provider_grant=None,
                              host_id="fixture-host", attempt="p1v-fixture")
         bundle = bundle_fixture()
         with patch.object(ls, "require_live"), \
@@ -2278,11 +2313,11 @@ class IntegrationAdmissionTests(unittest.TestCase):
              patch.object(ls.DirectLinux, "task_policy", side_effect=AssertionError("early task policy query")), \
              patch("os.getpid", return_value=40), patch("os.getppid", return_value=39), \
              patch("ctypes.CDLL", side_effect=AssertionError("NVML library initialized early")):
-            obj = ls.LiveSystem(authorization=None, grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()), host_id="fixture-host",
+            obj = ls.LiveSystem(authorization=SimpleNamespace(issue=252), grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()), host_id="fixture-host",
                 attempt="p1v-fixture", manifest=bundle["adapter"], provider_manifest=bundle["provider"],
                 baseline=bundle["launch"], closure=bundle["closure"], journal=journal,
-                native=object.__new__(lb.NativePrimitives), processes=object.__new__(lb.NativeProcesses),
-                roles=object.__new__(lb.ProcessRoles), bootstrap={})
+                native=unbound_native(), processes=object.__new__(lb.NativeProcesses),
+                roles=unbound_roles(), bootstrap={})
         self.assertIsNone(obj.nvml.library)
         self.assertIsNone(obj.snapshot)
 
@@ -2299,20 +2334,20 @@ class IntegrationAdmissionTests(unittest.TestCase):
              patch.object(ls.DirectLinux, "namespace", side_effect=AssertionError("proc observation before code admission")), \
              patch("os.getpid", side_effect=AssertionError("host identity before code admission")), \
              self.assertRaisesRegex(InvalidEvidence, "module hash mismatch"):
-            ls.LiveSystem(authorization=None, grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()), host_id="fixture-host",
+            ls.LiveSystem(authorization=SimpleNamespace(issue=252), grant=None, provider_grant=SimpleNamespace(storage_identity=storage_fixture()), host_id="fixture-host",
                 attempt="p1v-fixture", manifest=bundle["adapter"], provider_manifest=bundle["provider"],
                 baseline=bundle["launch"], closure=bundle["closure"], journal=SimpleNamespace(pending=None),
-                native=object.__new__(lb.NativePrimitives), processes=object.__new__(lb.NativeProcesses),
-                roles=object.__new__(lb.ProcessRoles), bootstrap={})
+                native=unbound_native(), processes=object.__new__(lb.NativeProcesses),
+                roles=unbound_roles(), bootstrap={})
 
     def test_future_scope_hash_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 249, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 252, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "scope pin"):
             ls.ProviderGrant(scope, "0" * 64, b"x" * 32, digest(b"x" * 32))
 
     def test_future_token_mismatch_is_not_a_grant(self):
-        scope = {"authority_issue": 249, "host_id": "fixture", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 252, "host_id": "fixture", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
         with self.assertRaisesRegex(InvalidEvidence, "token"):
             ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, "0" * 64)
@@ -2967,14 +3002,14 @@ class RefreshedAuthorityTests(unittest.TestCase):
     """Pure synthetic grant checks; no complete external live grant is issued."""
 
     def scope(self):
-        return {"authority_issue": 249, "host_id": "fixture", "attempt": "p1v-fixture",
+        return {"authority_issue": 252, "host_id": "fixture", "attempt": "p1v-fixture",
                 "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": "a" * 64, "storage_identity": storage_fixture()}
 
     def test_exact_floor(self):
-        self.assertEqual(ls.FLOOR, 248)
+        self.assertEqual(ls.FLOOR, 251)
 
     def test_every_nonnegative_authority_through_242_rejects_before_host_access(self):
-        for issue in range(249):
+        for issue in range(252):
             scope = dict(self.scope(), authority_issue=issue)
             authorization = object.__new__(ls.FutureAuthorization)
             authorization.issue = issue
@@ -2983,9 +3018,9 @@ class RefreshedAuthorityTests(unittest.TestCase):
                     patch("os.listdir", side_effect=AssertionError("host access")), \
                     patch("os.getpid", side_effect=AssertionError("host access")), \
                     patch("ctypes.CDLL", side_effect=AssertionError("library")):
-                with self.assertRaisesRegex(InvalidEvidence, "follow #248"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #251"):
                     ls.ProviderGrant(scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
-                with self.assertRaisesRegex(InvalidEvidence, "follow #248"):
+                with self.assertRaisesRegex(InvalidEvidence, "follow #251"):
                     ls.require_live(authorization, None, None, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
     def test_synthetic_243_complete_scope_passes_only_pure_constructor_check(self):
@@ -2993,7 +3028,7 @@ class RefreshedAuthorityTests(unittest.TestCase):
         ls.ProviderGrant.__init__(receiver, scope, digest(canonical_json(scope)), b"x" * 32, digest(b"x" * 32))
         self.assertEqual(strict_json(receiver.encoded), scope)
         # This fake receiver cannot satisfy the exact ProviderGrant type gate.
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 249)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 252)
         with self.assertRaisesRegex(InvalidEvidence, "provider-specific grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, {}, "AUTHORITY")
 
@@ -3012,13 +3047,13 @@ class RefreshedAuthorityTests(unittest.TestCase):
     def test_synthetic_243_provider_bindings_and_adapter_grant_still_required(self):
         provider = bundle_fixture()["provider"]
         scope = dict(self.scope(), provider_manifest_sha256=digest(canonical_json(provider)))
-        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 249)
+        authorization = ls.FutureAuthorization(b"x" * 32, digest(b"x" * 32), 252)
         # Uninitialized provider receiver only: no adapter grant or live System.
         receiver = object.__new__(ls.ProviderGrant)
         object.__setattr__(receiver, "encoded", canonical_json(scope))
         with self.assertRaisesRegex(InvalidEvidence, "adapter-specific external execution grant required"):
             ls.require_live(authorization, None, receiver, "fixture", "p1v-fixture", {}, provider, "AUTHORITY")
-        for field, mismatch in (("authority_issue", 248), ("host_id", "other"), ("attempt", "p1v-other"),
+        for field, mismatch in (("authority_issue", 251), ("host_id", "other"), ("attempt", "p1v-other"),
                                 ("operations", []), ("provider_manifest_sha256", "0" * 64)):
             object.__setattr__(receiver, "encoded", canonical_json(dict(scope, **{field: mismatch})))
             with self.subTest(field=field), self.assertRaisesRegex(InvalidEvidence, "provider grant mismatch"):
@@ -3030,15 +3065,15 @@ class ExternalStorageProviderTests(unittest.TestCase):
     def grants(self, storage, provider_storage=None):
         adapter = adapter_fixture()
         provider = {"synthetic": True}
-        execution_scope = {"authority_issue": 249, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        execution_scope = {"authority_issue": 252, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                            "operations": [a.name for a in plan_fixture()],
                            "adapter_manifest_sha256": digest(canonical_json(adapter)),
                            "storage_identity": storage}
         execution_token = b"synthetic pure validation only!!!" * 2
-        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 249)
+        authorization = ls.FutureAuthorization(execution_token, digest(execution_token), 252)
         execution = lb.ExecutionGrant(execution_scope, digest(canonical_json(execution_scope)),
                                       execution_token, digest(execution_token))
-        scope = {"authority_issue": 249, "host_id": "synthetic-host", "attempt": "p1v-fixture",
+        scope = {"authority_issue": 252, "host_id": "synthetic-host", "attempt": "p1v-fixture",
                  "operations": [a.name for a in plan_fixture()], "provider_manifest_sha256": digest(canonical_json(provider)),
                  "storage_identity": storage if provider_storage is None else provider_storage}
         token = b"synthetic provider storage proof!!" * 2
@@ -3187,6 +3222,506 @@ class ExternalStorageProviderTests(unittest.TestCase):
             data[0x68:0x78] = bytes.fromhex(storage_fixture(not second)["uuid"].replace("-", ""))
             with self.assertRaisesRegex(InvalidEvidence, "same retained ext4 device/UUID"):
                 obj._observe_filesystem_rw()
+
+
+class LifecycleSystem:
+    """Fresh Linux state fixture, with real launch/hold/shutdown observers.
+
+    Only kernel and host I/O are modeled. The adapter, journal, phase machine,
+    manifest comparison, content hasher, classifier and sealed verifier are real.
+    """
+    simulated = True
+
+    def __init__(self, journal, content):
+        from .test_linux_backend import LaunchMachine, FixtureSystem
+        from .test_p1v import encode_raw, raw_fixture
+        self.machine = m = LaunchMachine()
+        m.bootstrap()
+        self.fixture = FixtureSystem(encode_raw(raw_fixture()), content)
+        self.journal = journal
+        self.fs_ro = self.alias_ro = self.private = False
+        self.returned = self.released = False
+        self.writer_pids, self.boundaries, self.helpers = [], [], []
+        self.control_refs = []
+        self.m = m.system
+        s = self.m
+        s.attempt, s.host_id = 'p1v-fixture', 'synthetic-host'
+        s._storage_identity = canonical_json(storage_fixture())
+        s._check = self.check
+        s._host = lambda: 'synthetic-boot'
+        s._worker = lambda: {'pid': 40, 'starttime': 900, 'threads': 1}
+        s._inventory = lambda: {'processes': sorted(m.states), 'descriptions': m.refs()}
+        s.source_cgroup, s.cgroup = '/sys/fs/cgroup/fixture', 'synthetic-runtime'
+        s._cgroup_path = lambda pid: s.cgroup if pid == 41 else s.source_cgroup
+        s._domain = lambda path: copy.deepcopy(m.domain)
+        s.snapshot = None
+        s.snapshot_consumed = False
+        s.child = None
+        s.child_identity = {'pid': 41, 'starttime': 901, 'threads': 1}
+        s.initial_user_ns = 'user:initial'
+        s.original_ns, s.original_network_ns = 'synthetic-original-ns', 'synthetic-original-net'
+        s.namespace_receipt = None
+        s.host_broker_inventory = []
+        s.processes = m.proc
+        s.native = SimpleNamespace(retained_fds={})
+        s.roles = SimpleNamespace(child=None)
+        s.released = s.failed = s.returned = s.running = s.rw_transition = False
+        s.protected_phase_reached = s.backing = None
+        s.gpu_management = copy.deepcopy(m.snapshot['management'])
+        s.nvml = SimpleNamespace(library=None, handle=None, _helper_pid=None,
+            snapshot=self.gpu_snapshot, helper_receipt=None)
+        s._ro_health = lambda: {'mount_ro': self.fs_ro, 'superblock_ro': self.fs_ro}
+        s._observe_alias_ro = lambda: {'alias_parent_ro': self.alias_ro, 'runtime_cannot_replace': self.alias_ro}
+        s.block_get = self.block_get
+        s.journal = SimpleNamespace(publish=lambda name, data, action: self.pending_publications.append((name, data, action)))
+        self.pending_publications = []
+        s.io.text = self.text
+        s.io.namespace = lambda pid, kind: ({'mnt': 'synthetic-ns', 'net': 'synthetic-private-net', 'user': 'user:initial'}
+            if self.private and pid in (40, 41) else {'mnt': s.original_ns, 'net': s.original_network_ns, 'user': 'user:initial'})[kind]
+        s.io.identity = lambda pid: s.child_identity.copy() if pid == 41 else s._worker()
+        s.io.status = lambda pid: self.status()
+        s.io.listdir = self.listdir
+        self.adapter = adapter_fixture()
+        self.adapter['launch_manifest_sha256'] = s.baseline.sha256
+        self.fixture.observations['authority'].update(adapter_manifest=self.adapter, launch_manifest=m.baseline)
+        self.fixture.observations['cgroup_preflight'].update(baseline=m.baseline['resource_domain'], prospective=m.baseline['resource_domain'])
+        self.fixture.backing.update(device_fd=10, filesystem_fd=11)
+
+    def __getattr__(self, name):
+        return getattr(self.fixture, name)
+
+    def check(self):
+        lb.require(not self.m.running and not self.m.failed, 'model provider closed')
+        self.machine.phase = self.journal.pending[1] if self.journal.pending else 'AUTHORITY'
+        if self.machine.phase != 'AUTHORITY' and self.m.protection_owned():
+            self.m.protected_phase_reached = self.machine.phase
+
+    def status(self):
+        value = self.machine.status()
+        value.update(State='T (stopped)', PPid='40', Pid='41', Tgid='41', Threads='1', Cpus_allowed_list='0-1', Mems_allowed_list='0')
+        value.update({k: format(self.machine.states[41]['caps'], 'x') for k in ('CapEff','CapPrm','CapInh','CapAmb','CapBnd')})
+        return value
+
+    def text(self, path):
+        if path.endswith('/cgroup.subtree_control') or path.endswith('/cgroup.procs'):
+            return '' if self.returned or path.endswith('subtree_control') else '41\n'
+        if path.endswith('/cgroup.events'):
+            return 'populated ' + ('0' if self.returned else '1') + '\n'
+        if path.endswith('/net/unix'):
+            return 'Num RefCount Protocol Flags Type St Inode Path\n'
+        if path == '/proc/self/fdinfo/8':
+            return 'lock:\t1: FLOCK ADVISORY WRITE 40 103:1:980 0 EOF\n'
+        if path == '/proc/41/status':
+            return ''.join(k + ':\t' + v + '\n' for k, v in self.status().items())
+        if path == '/proc/self/mountinfo':
+            mode = 'ro' if self.fs_ro else 'rw'
+            return f'200 1 259:4 / {ls.MOUNT} {mode},relatime - ext4 /dev/nvme0n1 {mode}\n'
+        if path == storage_fixture()['sysfs_identity'] + '/ro':
+            return str(self.fixture.ro)
+        return self.machine.text(path)
+
+    def listdir(self, path):
+        if path == self.m.cgroup:
+            return []
+        return self.machine.listdir(path)
+
+    def gpu_snapshot(self, processes):
+        # Detached helpers inherit copies, are cold-parent-owned, and fully reap.
+        m = self.machine
+        pid = 42 + len(self.helpers)
+        m.copy_process(40, pid, 'detached NVML helper')
+        processes.nvml_helper = (pid,)
+        self.helpers.append(pid)
+        self.control_refs.append(m.refs())
+        m.tables.pop(pid)
+        m.states.pop(pid)
+        processes.nvml_helper = None
+        self.m.nvml.helper_receipt = {'pid': pid, 'exit_code': 0, 'parent_threads_before': 1, 'parent_threads_after': 1}
+        return copy.deepcopy(m.snapshot)
+
+    def acquire_exclusion(self):
+        self.fixture.acquire_exclusion()
+        self.machine.allocate('/exclusion', fd=8, info=self.machine.info(stat.S_IFREG | 0o600, 980))
+        self.m.lock_fd, self.m.exclusion, self.m.protected_phase_reached = 8, True, 'EXCLUSION'
+        self.gpu_snapshot(self.machine.proc)
+
+    def retain_backing(self):
+        self.fixture.retain_backing()
+        m = self.machine
+        block = m.info(stat.S_IFBLK | 0o600, 981)
+        block.st_rdev = (259 << 20) | 4
+        for name, fd, info in (('device', 10, block), ('filesystem', 11, m.info(stat.S_IFDIR | 0o755, 982))):
+            m.allocate('/' + name, fd=fd, info=info)
+            self.m.native.retained_fds[name] = fd
+        self.m.backing = copy.deepcopy(self.fixture.backing)
+        return copy.deepcopy(self.fixture.backing)
+
+    def unshare(self, flags):
+        self.fixture.unshare(flags)
+        lb.require(flags == lb.CLONE_NEWNS | lb.CLONE_NEWNET, 'combined namespace flags')
+        self.private = True
+        self.machine.allocate('/namespace', fd=12, info=self.machine.info(stat.S_IFREG | 0o400, 983))
+        self.m.native.retained_fds['private_mount_ns'] = 12
+        self.m.namespace_receipt = copy.deepcopy(self.fixture.observations['namespace'])
+
+    def mount(self, source, target, fstype, flags, data):
+        self.fixture.mount(source, target, fstype, flags, data)
+        if target == ls.MOUNT:
+            self.fs_ro = bool(flags & lb.MS_RDONLY)
+            self.m.rw_transition = not self.fs_ro
+        if target == lb.ALIAS_PARENT and flags & lb.MS_RDONLY:
+            self.alias_ro = True
+
+    def block_ro(self, fd, read_only):
+        lb.require(self.fs_ro, 'filesystem must remain RO at device transition')
+        self.fixture.block_ro(fd, read_only)
+
+    def block_get(self, fd):
+        # Execute the real phase guard and BLKROGET against a modeled ioctl.
+        native = object.__new__(lb.NativePrimitives)
+        native.context = ()
+        native.current_action = lambda: self.journal.pending[1] if self.journal.pending else 'AUTHORITY'
+        native._device = lambda value: lb.require(value == 10, 'retained device identity')
+        def ioctl(descriptor, request, value, mutate):
+            lb.require(request == lb.BLKROGET, 'read only block observation')
+            value[0] = self.fixture.ro
+        with patch.object(lb, 'require_adapter_grant'), patch('os.geteuid', return_value=0), patch('fcntl.ioctl', side_effect=ioctl):
+            result = native.block_get(fd)
+        self.fixture.call('block_get', fd)
+        return result
+
+    def prepare_stopped_child(self, argv, manifest, cgroup):
+        self.fixture.call('prepare_child', argv, manifest, cgroup)
+        lb.require(manifest == self.m.baseline.encoded, 'one prospective contract')
+        m = self.machine
+        m.child()
+        self.control_refs.append(m.refs())
+        m.apply()
+        m.pid = 40
+        self.m.child = self.m.roles.child = 41
+        self.control_refs.append(m.refs())
+        return 41
+
+    def observe(self, topic):
+        self.check()
+        m, s = self.machine, self.m
+        if topic == 'authority':
+            s.admit_initial_environment()
+        elif topic == 'cgroup_preflight':
+            self.gpu_snapshot(m.proc)
+            values = snapshot_fixture()
+            values.update(host_id=s.host_id, baseline=m.baseline, source=m.baseline['resource_domain'], target=m.baseline['resource_domain'])
+            s.snapshot = ls.InheritanceSnapshot.capture(**values)
+        elif topic == 'confinement':
+            with m.contexts():
+                result = s._observe_confinement()
+            for name, data, action in self.pending_publications:
+                self.writer_pids.append(m.pid)
+                self.journal.publish(name, data, action)
+            self.pending_publications.clear()
+            return result
+        elif topic == 'shutdown':
+            return s._observe_shutdown()
+        elif topic == 'release':
+            return s._observe_release()
+        return self.fixture.observe(topic)
+
+    def resume_wait_parent(self, pid):
+        lb.require(pid == 41 and self.m.snapshot_consumed and self.machine.tables[41].keys() == {0,1,2}, 'certified child only')
+        self.fixture.call('parent_once', pid)
+        self.m.running = True
+        self.machine.history.append(('handoff SIGCONT -> exact exec -> P1R synthetic return', 41, 41))
+        # No runtime binary is invoked: immutable raw bytes are fixture output.
+        self.machine.tables.pop(41)
+        self.machine.states.pop(41)
+        self.m.running = False
+        self.returned = self.m.returned = True
+        return 0
+
+    def failure_receipt(self):
+        self.machine.pid = 40
+        with self.machine.contexts(), patch.object(Path, 'read_text', lambda p, *a, **k: self.text(str(p))):
+            return self.m.failure_receipt()
+
+    def hold_failure(self, result):
+        from .test_linux_backend import LifecycleExit
+        shared = bytearray(65536)
+        events = []
+        def hold():
+            self.machine.states[40]['state'] = 'T'
+            events.append('worker stopped; descriptors retained')
+            raise LifecycleExit()
+        def exited(code):
+            self.machine.tables.pop(40)
+            self.machine.states[40]['state'] = 'EXITED'
+            events.append(('worker exit', code))
+            raise LifecycleExit()
+        processes = SimpleNamespace(simulated=True, fork=lambda: 0, stop_self=lambda: None,
+            failed_hold_forever=hold, exit_worker=exited)
+        roles = lb.ProcessRoles(processes, attempt='p1v-fixture', manifest={})
+        roles.bind_failure_owner(SimpleNamespace(protection_owned=self.m.protection_owned,
+                                                failure_receipt=self.failure_receipt))
+        try:
+            roles._guardian(lambda: result, shared)
+        except LifecycleExit:
+            pass
+        if self.machine.states[40]['state'] == 'EXITED':
+            return {'status': 'FAIL_BEFORE_PROTECTION', 'events': events}
+        processes.fork = lambda: 40
+        processes.wait_once = lambda pid, stopped: {'pid': pid, 'stopped': True}
+        processes.resume_wait_worker = lambda pid: {'pid': pid, 'stopped': True}
+        receipt = roles._guardian(lambda: None, shared)
+        receipt['events'] = events
+        self.machine.history.append(('protected failure hold', 40, 40))
+        return receipt
+
+    def raw_reports(self, attempt):
+        m, s = self.machine, self.m
+        self.fixture.call('raw_reports', attempt)
+        root = Path(ls.OUTPUT_ROOT) / attempt
+        directory = m.info(stat.S_IFDIR | 0o700, 990)
+        directory.st_uid = directory.st_gid = 1000
+        s.bootstrap = {'runtime_directory_identity': {'device': '259:1', 'inode': 990,
+            'uid': 1000, 'gid': 1000, 'mode': 0o700}}
+        payloads = {str(root / name): self.fixture.raw[key] for key, name in ls.REPORT_NAMES.items()}
+        for index, (path, data) in enumerate(payloads.items()):
+            info = m.info(stat.S_IFREG | 0o600, 991 + index)
+            info.st_uid = info.st_gid = 1000
+            info.st_size, info.st_nlink, info.st_mtime_ns, info.st_ctime_ns = len(data), 1, 1, 1
+            m.files[path] = info
+        positions = {}
+        def read(fd, count):
+            path = m.description(fd)['path']
+            offset = positions.get(path, 0)
+            value = payloads[path][offset:offset + count]
+            positions[path] = offset + len(value)
+            return value
+        with m.contexts(), patch.object(s.io, 'stat', return_value=directory):
+            ls.os.read = read
+            ls.os.lstat = lambda path: m.files[str(path)]
+            result = s.raw_reports(attempt)
+        lb.require(result == self.fixture.raw and all(positions[p] == len(data) for p, data in payloads.items()),
+                   'exact report names and complete bytes')
+        return result
+
+    def release(self):
+        self.fixture.call('release')
+        with self.machine.contexts():
+            self.m.release()
+        self.released = True
+        self.machine.history.append(('normal RELEASE', 40, 40))
+        self.control_refs.append(self.machine.refs())
+
+
+def lifecycle_backend(directory, content):
+    from . import FutureAuthorization
+    from .test_p1v import FakeReader
+    from .supervisor import plan
+    journal = lb.DurableJournal(directory.name, 'p1v-fixture', fixture=directory)
+    system = LifecycleSystem(journal, content)
+    token = b'synthetic P1V5.15 software fixture only' * 2
+    scope = {'authority_issue': 252, 'host_id': 'synthetic-host', 'attempt': 'p1v-fixture',
+             'operations': [a.name for a in plan()], 'adapter_manifest_sha256': digest(canonical_json(system.adapter)),
+             'storage_identity': storage_fixture()}
+    authorization = FutureAuthorization(token, digest(token), 252)
+    grant = lb.ExecutionGrant(scope, digest(canonical_json(scope)), token, digest(token))
+    readers = []
+    def reader():
+        lb.require(system.returned and not system.m.running and system.fs_ro and system.fixture.ro == 1, 'hash phase protections')
+        value = FakeReader()
+        readers.append(value)
+        return value
+    backend = lb.LinuxBackend(system, journal, system.machine.baseline, system.adapter, closure_fixture(),
+        host_id='synthetic-host', attempt='p1v-fixture', authorization=authorization, grant=grant, fixture_reader_factory=reader)
+    backend.readers = readers
+    return backend
+
+
+class LaunchLifecycleLiveTests(unittest.TestCase):
+    def test_authority_exact_initial_environment(self):
+        from .test_linux_backend import LaunchMachine
+        for kind in ('exact', 'extra', 'missing', 'different', 'startup', 'duplicate', 'truncated'):
+            with self.subTest(kind=kind):
+                m = LaunchMachine(); m.bootstrap()
+                if kind == 'extra': m.states[40]['environment']['STAGE_B_CONTROL'] = 'forbidden'
+                if kind == 'missing': m.states[40]['environment'].pop('PATH')
+                if kind == 'different': m.states[40]['environment']['PATH'] = '/other'
+                if kind == 'startup': m.states[40]['environment'] = m.initial_environment.copy()
+                if kind in ('duplicate','truncated'):
+                    m.system.io.read = lambda p: b'PATH=/synthetic/bin\0PATH=x\0' if kind == 'duplicate' else b'PATH=x'
+                m.system._host = Mock(side_effect=AssertionError('host reached'))
+                # Mutating Python's map does not alter the modeled initial exec bytes.
+                with patch.dict(os.environ, {'PATH': '/synthetic/bin'}, clear=True):
+                    if kind == 'exact': m.system.admit_initial_environment()
+                    else:
+                        with self.assertRaises(InvalidEvidence): m.system._observe_authority()
+                m.system._host.assert_not_called()
+                self.assertFalse(m.system.exclusion); self.assertIsNone(m.system.lock_fd)
+
+    def test_real_construct_apply_observe_compare(self):
+        from .test_linux_backend import LaunchMachine
+        m = LaunchMachine()
+        with self.assertRaises(InvalidEvidence): m.system.admit_initial_environment()
+        m.child()
+        with self.assertRaises(InvalidEvidence): m.observe()
+        m = LaunchMachine(); m.bootstrap(); m.system.admit_initial_environment(); m.child(); m.apply()
+        observed = m.observe()
+        self.assertEqual(set(observed), set(lb.LAUNCH_FIELDS))
+        self.assertEqual(len(observed), 20)
+        m.system.baseline.compare(observed)
+        self.assertIsNot(observed, m.baseline)
+        # Perturb actual process/kernel state, never observer return values.
+        for kind in lb.LAUNCH_FIELDS:
+            with self.subTest(kind=kind):
+                n = LaunchMachine(); n.bootstrap(); n.child(); n.apply()
+                if kind == 'stdio': n.description(1)['flags'] ^= 0o2000
+                if kind == 'environment': n.states[41]['environment']['EXTRA'] = '1'
+                if kind == 'credentials': n.states[41]['uid'] += 1
+                if kind == 'cwd': n.states[41]['cwd'] += '/drift'
+                if kind == 'rlimits': n.limits['NOFILE'] = (1,2)
+                if kind == 'cpu_affinity': n.affinity = {0}
+                if kind == 'nice': n.nice = 1
+                if kind == 'signals': n.states[41]['signals']['2'] = 'IGNORE'
+                if kind == 'gpu': n.snapshot['certificate']['device_name'] = 'drift'
+                if kind == 'numa_balancing': n.policies['numa_balancing']['enabled']['/proc/sys/kernel/numa_balancing'] = '1'
+                if kind == 'umask': n.states[41]['umask'] = 0o077
+                if kind == 'scheduler': n.scheduler[0]['attributes']['nice'] = 1
+                if kind == 'io_priority': n.scheduler[1]['priority'] = 1
+                if kind == 'cpu_policy': n.policies['cpu_policy']['governors']['/sys/drift'] = 'drift'
+                if kind == 'numa': n.inherited_numa['allowed_nodes'] = [1]
+                if kind == 'thp': n.policies['thp']['enabled']['/sys/fixture/thp'] = '[never]'
+                if kind == 'resource_domain': n.domain['effective_cpus'] = [0]
+                if kind == 'adapter_pins': n.pins['python'] = 'b' * 64
+                if kind == 'session': n.states[41]['session'] += 1
+                if kind == 'security_context':
+                    read_text = n.system.io.text
+                    n.system.io.text = lambda path: 'different-label' if path.endswith('/attr/current') else read_text(path)
+                with self.assertRaises(InvalidEvidence): n.system.baseline.compare(n.observe())
+
+    def test_relational_session_independent_observation(self):
+        from .test_linux_backend import LaunchMachine
+        for sid, pgrp, group in ((92,92,8),(2100,2110,550)):
+            m = LaunchMachine(); m.bootstrap()
+            m.states[40].update(session=sid, pgrp=pgrp, autogroup=f'/autogroup-{group} nice 0')
+            m.child(); m.apply()
+            self.assertEqual(m.observe()['session'], lb.SESSION_POLICY)
+            self.assertEqual(m.system.session_observations['worker']['session_id'], sid)
+            self.assertEqual(m.system.session_observations['child']['process_group'], pgrp)
+            self.assertNotIn('session_id', m.baseline['session'])
+            for key, value in (('session',sid+1),('pgrp',pgrp+1),('autogroup',f'/autogroup-{group+1} nice 0')):
+                old = m.states[41][key]; m.states[41][key] = value
+                with self.assertRaises(InvalidEvidence): m.observe()
+                m.states[41][key] = old
+
+    def test_truthful_protected_failure_receipt(self):
+        import tempfile
+        from .test_p1v import fake_content
+        from .supervisor import Supervisor
+        content = fake_content()
+        for last in ('EXCLUSION','NAMESPACE','DEVICE_RO','CONFINEMENT'):
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            with self.subTest(last=last):
+                backend = lifecycle_backend(directory, content)
+                real = backend.perform
+                def stop(action, evidence):
+                    if backend.done and backend.done[-1] == last: raise OSError('injected after ' + last)
+                    return real(action, evidence)
+                backend.perform = stop
+                result = Supervisor(backend, 'p1v-fixture').run()
+                self.assertEqual(result['status'], 'FAIL', result.get('failure'))
+                self.assertEqual(backend.done[-1], last)
+                system = backend.system
+                receipt = system.failure_receipt()
+                self.assertEqual(receipt['worker_pid'], 40); self.assertEqual(receipt['exclusion_owner_pid'], 40)
+                self.assertEqual(receipt['retained_control_owner_pid'], None if last == 'EXCLUSION' else 40)
+                self.assertFalse(receipt['automatic_restoration']); self.assertFalse(receipt['attempt_reusable'])
+                self.assertEqual(receipt['device_ro'], None if last == 'EXCLUSION' else last in ('DEVICE_RO','CONFINEMENT'))
+                self.assertEqual(receipt['filesystem_ro'], None if last == 'EXCLUSION' else last in ('DEVICE_RO','CONFINEMENT'))
+                self.assertEqual(receipt['handoff_child_state'], 'T' if last == 'CONFINEMENT' else None)
+                self.assertNotIn(('release',), system.calls)
+                # Failure diagnostic read errors are null/error, never success.
+                with system.machine.contexts(), patch.object(Path, 'read_text', side_effect=OSError('unreadable')):
+                    unknown = system.m.failure_receipt()
+                self.assertIsNone(unknown['exclusion_owner_pid'])
+                self.assertIn('exclusion_lock', unknown['observation_errors'])
+                self.assertTrue(system.m.protection_owned())
+
+    def test_full_repaired_22_action_state_model(self):
+        import tempfile
+        from .test_p1v import fake_content
+        from .supervisor import Supervisor, plan, validate_enforcement
+        from .offline_verify import verify_sealed
+        content = fake_content()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with directory:
+            backend = lifecycle_backend(directory, content)
+            result = Supervisor(backend, 'p1v-fixture').run()
+            self.assertEqual(result['status'], 'PASS_SIMULATION', result.get('failure'))
+            self.assertEqual(backend.done, [a.name for a in plan()])
+            s = backend.system
+            self.assertTrue(s.released); self.assertFalse(s.m.protection_owned())
+            self.assertEqual(s.writer_pids, [40]); self.assertEqual(len(s.helpers), 3)
+            self.assertEqual(s.calls.count(('release',)), 1)
+            transitions = [c for c in s.calls if c[0] == 'block_ro']
+            self.assertEqual(transitions, [('block_ro',10,True),('block_ro',10,False)])
+            self.assertEqual(result['receipts']['CONFINEMENT']['hold_proof'], hold_fixture())
+            with self.assertRaisesRegex(InvalidEvidence, 'outside phase'): s.block_get(10)
+            seal = (backend.journal.root / 'enforcement.json').read_bytes()
+            envelope = strict_json(seal)
+            validate_enforcement(envelope, allow_simulated=True)
+            prefix = copy.deepcopy(envelope)
+            prefix['events'] = prefix['events'][:16]
+            prefix['receipts'].pop('VERIFY')
+            validate_enforcement(prefix, allow_simulated=True, through_hash=True)
+            verified = verify_sealed(s.raw, seal, digest(seal), allow_simulated=True)
+            self.assertTrue(verified['semantic_payload_equivalent'])
+            self.assertEqual(len(backend.readers), 1)
+            self.assertEqual(len(content['records']), 6)
+            self.assertTrue(all(row['identity']['file_length'] == 2658304 for row in content['records']))
+            self.assertEqual(backend.readers[0].opened, set())
+            restoration = strict_json((backend.journal.root / 'restoration.json').read_bytes())
+            self.assertEqual(restoration['evidence_seal_sha256'], digest(seal))
+            self.assertEqual((backend.journal.root / 'enforcement.json').read_bytes(), seal)
+            self.assertEqual(sorted(s.raw), ['control','parent','treatment'])
+            self.assertTrue(all(type(value) is bytes for value in s.raw.values()))
+            self.assertEqual(s.machine.tables[40].keys(), {0,1,2})
+            self.assertTrue(all(count == 0 for desc, count in s.machine.refs().items()
+                if s.machine.descriptions[desc]['path'] in ('/exclusion','/device','/filesystem','/namespace')))
+        # Every boundary uses a fresh attempt directory. No result is reused.
+        for failure in [a.name for a in plan()]:
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            with self.subTest(failure=failure):
+                backend = lifecycle_backend(directory, content)
+                real = backend.perform
+                def inject(action, evidence):
+                    if action.name == failure: raise OSError('boundary ' + failure)
+                    return real(action, evidence)
+                backend.perform = inject
+                result = Supervisor(backend, 'p1v-fixture').run()
+                self.assertEqual(result['status'], 'FAIL')
+                self.assertEqual(result['failure']['action'], failure)
+                s = backend.system
+                self.assertNotIn(('release',), s.calls)
+                expected_owned = failure not in ('AUTHORITY','EXCLUSION')
+                self.assertEqual(s.m.protection_owned(), expected_owned)
+                if expected_owned:
+                    held = s.hold_failure(result)
+                    self.assertEqual(held['status'], 'FAIL_FOR_REVIEW_HOLDING')
+                    self.assertTrue(held['worker_stopped'])
+                    self.assertEqual(s.machine.states[40]['state'], 'T')
+                    receipt = held['ownership_observation']
+                    self.assertEqual(receipt['exclusion_owner_pid'], 40)
+                    self.assertFalse(receipt['attempt_reusable'])
+                    self.assertFalse(receipt['automatic_restoration'])
+                else:
+                    self.assertEqual(s.hold_failure(result)['status'], 'FAIL_BEFORE_PROTECTION')
+                if failure not in ('FILESYSTEM_RW','RESTORATION_SEAL','RELEASE'):
+                    self.assertNotIn(('block_ro',10,False), s.calls)
+                if [a.name for a in plan()].index(failure) <= 12:
+                    self.assertFalse(any(c[0] == 'parent_once' for c in s.calls))
 
 
 if __name__ == "__main__":

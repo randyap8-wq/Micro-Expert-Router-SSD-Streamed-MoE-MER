@@ -1,4 +1,4 @@
-"""P1V5 direct observations. Live execution requires a future issue >248.
+"""P1V5 direct observations. Live execution requires a future issue >251.
 
 Import performs no host operation. Live construction needs three matching
 external authorities. Observations fail closed; expected state is never an
@@ -22,7 +22,7 @@ from . import linux_backend as lb
 from .content_hasher import Identity, alternatives
 from .supervisor import BIN, CONFIG, REQUEST, OUTPUT_ROOT, parent_argv, plan, validate_attempt
 
-FLOOR = 248
+FLOOR = 251
 TOPICS = ("authority", "exclusion", "topology", "roles", "namespace", "alias_bind",
           "alias_ro", "metadata", "sync_health", "filesystem_ro", "device_ro",
           "protected", "cgroup_preflight", "confinement", "shutdown", "device_rw",
@@ -33,8 +33,8 @@ PROTECTED = {
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "c0f57a524814ae12677af8d42a65fa08b900a10ba183093d6006bdbf5df354f8",
     "test_p1v.py": "ef2eb74ed4a469e80a9f2ec4c8faa8e991f29109e04e396ec37b92402b0f5a4a",
-    "linux_backend.py": "507689620b6aa3812ceecbe32a80149901964483d29dd9510245f0401c1342f9",
-    "test_linux_backend.py": "1871c5d7feb337d036ab34b9e1ea907f71f8ff2897e12cbb5ac4e48879b27856",
+    "linux_backend.py": "1f79947678cde8ef2b809c024da0c833a3e7eba9347a08a573c5a8a92a9fc23f",
+    "test_linux_backend.py": "74b1406fe7c19288a5d28ce8a9d291551d6841092d0ce12d754915529ed2e6c2",
 }
 NUMA_ABI = {"schema": "mer.p1v.numa-abi.v1", "architecture": "x86_64",
             "kernel": "6.8.0-1069-gcp", "source_profile": "Linux-v6.8",
@@ -48,6 +48,23 @@ REPORT_NAMES = {"parent": "p1r.json", "control": "p1r.json.control.json",
                 "treatment": "p1r.json.treatment.json"}
 REPORT_LOGS = tuple("p1r.json." + arm + "." + stream + ".log"
                     for arm in ("control", "treatment") for stream in ("stdout", "stderr"))
+
+
+def process_environment(raw):
+    require(type(raw) is bytes and (not raw or raw.endswith(b"\0")), "truncated process environment")
+    result = {}
+    for entry in raw[:-1].split(b"\0") if raw else []:
+        require(b"=" in entry, "malformed process environment")
+        key, value = entry.decode("utf-8", "strict").split("=", 1)
+        require(key and key not in result, "duplicate/empty actual environment")
+        result[key] = value
+    return result
+
+
+def lock_owner(text, pid):
+    rows = [line.split() for line in text.splitlines() if line.startswith("lock:")]
+    return (len(rows) == 1 and len(rows[0]) == 9 and rows[0][2:5] == ["FLOCK", "ADVISORY", "WRITE"]
+            and rows[0][5] == str(pid) and rows[0][-2:] == ["0", "EOF"])
 
 
 def integer_list(text, limit=65536):
@@ -340,7 +357,7 @@ class ProviderGrant:
         lb.exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations",
                              "provider_manifest_sha256", "storage_identity"), "provider grant scope")
         require(type(scope["authority_issue"]) is int and scope["authority_issue"] > FLOOR,
-                "execution authority must follow #248")
+                "execution authority must follow #251")
         require(type(scope["host_id"]) is str and scope["host_id"], "provider host ID")
         validate_attempt(scope["attempt"])
         require(scope["operations"] == [a.name for a in plan(scope["attempt"])], "full provider operation scope")
@@ -361,7 +378,7 @@ class ProviderGrant:
 
 def require_live(authorization, adapter_grant, provider_grant, host_id, attempt, adapter, provider, operation):
     require(type(authorization) is FutureAuthorization and type(authorization.issue) is int
-            and authorization.issue > FLOOR, "P1V5 live authority must follow #248")
+            and authorization.issue > FLOOR, "P1V5 live authority must follow #251")
     require(type(provider_grant) is ProviderGrant, "external provider-specific grant required")
     scope = provider_grant.public_scope()
     require(scope["authority_issue"] == authorization.issue and scope["host_id"] == host_id
@@ -976,7 +993,7 @@ class LiveSystem:
         self._storage_identity = canonical_json(provider_grant.storage_identity)
         self.host_id, self.attempt = host_id, validate_attempt(attempt)
         self.manifest, self.provider, self.closure = map(copy.deepcopy, (manifest, provider_manifest, closure))
-        self.baseline = lb.LaunchManifest.parse(baseline)
+        self.baseline = lb.LaunchManifest.parse(baseline, authority_issue=authorization.issue)
         require(self.baseline.values()["credentials"]["groups"] == [],
                 "P1V5.12 live runtime supplementary groups must be empty")
         self.journal, self.native, self.processes, self.roles = journal, native, processes, roles
@@ -990,6 +1007,9 @@ class LiveSystem:
         self.snapshot_consumed = False
         self.sync_done = self.ro_transition = self.rw_transition = False
         self.pre_superblock = None
+        self.protected_phase_reached = None
+        self.session_observations = None
+        self.roles.bind_failure_owner(self)
         self.io = DirectLinux(self.context, self._check)
         self.nvml = PinnedNvml(self.io, self.provider["nvml"], self._gpu_check)
         for name, pin in self.provider["modules"].items():
@@ -1012,6 +1032,8 @@ class LiveSystem:
     def _check(self):
         require(not self.running and not self.failed, "provider forbidden while P1R parent runs or after failure")
         require_live(*self.context, self._action())
+        if self._action() != "AUTHORITY" and (self.lock_fd is not None or self.native.retained_fds):
+            self.protected_phase_reached = self._action()
         if hasattr(self, "nvml") and self.nvml._helper_pid is None:
             require(self.nvml.library is None and self.nvml.handle is None, "parent worker must remain NVML-cold")
 
@@ -1085,6 +1107,7 @@ class LiveSystem:
             raise
 
     def _observe_authority(self):
+        self.admit_initial_environment()
         self._host()
         root = Path(self.profile["source_root"])
         for path, expected in SOURCE_FILES.items():
@@ -1112,6 +1135,112 @@ class LiveSystem:
                 "argv": list(parent_argv(self.attempt)), "execution_closure": self.closure,
                 "adapter_manifest": self.manifest, "provider_manifest": self.provider,
                 "provider_grant": self.context[2].public_scope(), "bootstrap": self.bootstrap}
+
+    def admit_initial_environment(self):
+        require(self._action() == "AUTHORITY" and not self.exclusion and self.lock_fd is None,
+                "initial environment admission before exclusion")
+        actual = process_environment(self.io.read("/proc/self/environ"))
+        expected = self.baseline.values()["environment"]
+        require(actual == expected["values"] and not set(actual) & set(expected["absent"]),
+                "initial Python exec environment differs from frozen launch environment")
+
+    def _session_observed(self, pid):
+        observations = {}
+        for role, observed_pid in (("worker", self.worker_pid), ("child", pid)):
+            value = parse_stat(self.io.text(f"/proc/{observed_pid}/stat"))
+            observations[role] = {"session_id": value["session"], "process_group": value["pgrp"],
+                                  "autogroup": self.io.text(f"/proc/{observed_pid}/autogroup").strip()}
+        normalized = lb.session_relationship(observations)
+        self.session_observations = observations
+        return normalized
+
+    def _confinement_hold_proof(self, status, brokers):
+        require(self._action() == "CONFINEMENT", "hold readback only during CONFINEMENT")
+        health, alias = self._ro_health(), self._observe_alias_ro()
+        lock = os.fstat(self.lock_fd)
+        held = (self.exclusion and stat.S_ISREG(lock.st_mode) and
+                lock_owner(self.io.text(f"/proc/self/fdinfo/{self.lock_fd}"), self.worker_pid))
+        mount = self.io.namespace(self.worker_pid, "mnt")
+        network = self.io.namespace(self.worker_pid, "net")
+        proof = {"exclusion_held": held, "filesystem_ro": health["mount_ro"] and health["superblock_ro"],
+                 "device_ro": self.block_get(self.backing["device_fd"]) == 1,
+                 "alias_locked": alias["alias_parent_ro"] and alias["runtime_cannot_replace"],
+                 "private_mount_namespace": mount == self.namespace_receipt["mount_namespace_id"] and mount != self.original_ns,
+                 "private_network_namespace": network == self.namespace_receipt["network_namespace_id"] and network != self.original_network_ns,
+                 "private_network_abstract_sockets": brokers["abstract_socket_count"],
+                 "handoff_child_stopped": status["State"].split()[0] == "T" and int(status["PPid"]) == self.worker_pid,
+                 "brokers_excluded": brokers["pending_private_network_isolation"] is False and brokers["abstract_sockets"] == [],
+                 "parent_nvml_cold": self.nvml.library is None and self.nvml.handle is None,
+                 "parent_single_thread": len(self.io.listdir("/proc/self/task")) == 1,
+                 "nvml_helper_active": self.nvml._helper_pid is not None or self.processes.nvml_helper is not None
+                    or self.processes.nvml_helper_child is not None}
+        lb.validate_hold_proof(proof)
+        return proof
+
+    def protection_owned(self):
+        # This is ownership state, not a health query. In particular it remains
+        # usable after a failed/uncertain wait and after the journal is poisoned.
+        return not self.released and (self.lock_fd is not None or bool(self.native.retained_fds)
+                                     or self.protected_phase_reached is not None)
+
+    def failure_receipt(self):
+        """Read-only failure diagnostics; never ioctl, restore, release or resume.
+
+        Unknown coordinates remain null with a named observation error. The
+        guardian alone adds worker_stopped after its exact WUNTRACED wait.
+        """
+        require(os.getpid() == self.worker_pid and self.protection_owned(), "exact living failure owner required")
+        self.failed = True
+        errors = []
+
+        def observe(name, function):
+            try:
+                return function()
+            except Exception:
+                errors.append(name)
+                return None
+
+        controls = {}
+        for name, fd in self.native.retained_fds.items():
+            def descriptor(fd=fd):
+                info = os.fstat(fd)
+                return {"fd": fd, "device": info.st_dev, "inode": info.st_ino, "mode": info.st_mode}
+            controls[name] = observe("control:" + name, descriptor)
+        held = None
+        if self.lock_fd is not None:
+            def exclusion():
+                require(stat.S_ISREG(os.fstat(self.lock_fd).st_mode), "lock descriptor lost")
+                return lock_owner(Path(f"/proc/self/fdinfo/{self.lock_fd}").read_text(), self.worker_pid)
+            held = observe("exclusion_lock", exclusion)
+        child_pid = self.child if self.child is not None else self.roles.child
+        child = None
+        if child_pid is not None:
+            def child_status():
+                value = parse_status(Path(f"/proc/{child_pid}/status").read_text())
+                require(int(value["Pid"]) == child_pid and int(value["PPid"]) == self.worker_pid, "owned child status")
+                return value["State"].split()[0]
+            child = observe("handoff_child", child_status)
+        filesystem, device = None, None
+        if self.backing is not None:
+            def filesystem_state():
+                value = mount_at(lb.parse_mountinfo(Path("/proc/self/mountinfo").read_text()), MOUNT)
+                require(value["mount_id"] == self.backing["private_mount_id"]
+                        and value["major_minor"] == self.storage_identity["major_minor"], "failure mount identity")
+                return value["mount_ro"] and value["superblock_ro"]
+            filesystem = observe("filesystem_ro", filesystem_state)
+            def device_state():
+                info = os.fstat(self.backing["device_fd"])
+                require(stat.S_ISBLK(info.st_mode) and major_minor(info, True) == self.storage_identity["major_minor"], "failure device identity")
+                value = Path(self.storage_identity["sysfs_identity"] + "/ro").read_text().strip()
+                require(value in ("0", "1"), "failure device RO state")
+                return value == "1"
+            device = observe("device_ro", device_state)
+        return {"worker_pid": self.worker_pid, "exclusion_owner_pid": self.worker_pid if held else None,
+                "exclusion_held": held, "retained_control_owner_pid": self.worker_pid if any(controls.values()) else None,
+                "retained_controls": controls, "protected_phase_reached": self.protected_phase_reached,
+                "filesystem_ro": filesystem, "device_ro": device,
+                "handoff_child_pid": child_pid, "handoff_child_state": child,
+                "automatic_restoration": False, "attempt_reusable": False, "observation_errors": errors}
 
     def _loaded_code(self):
         pins = dict(self.profile["dependency_files"])
@@ -1146,6 +1275,7 @@ class LiveSystem:
         path = self.profile["lock_path"]
         controlled_directory(self.io, str(Path(path).parent))
         self.lock_fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        self.protected_phase_reached = "EXCLUSION"
         info = os.fstat(self.lock_fd)
         require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o077,
                 "uncontrolled exclusion lock")
@@ -1753,13 +1883,7 @@ class LiveSystem:
         import resource
         import signal
         import sys
-        environ = self.io.read(f"/proc/{pid}/environ")
-        require(not environ or environ.endswith(b"\0"), "truncated process environment")
-        values = {}
-        for entry in environ.rstrip(b"\0").split(b"\0") if environ else []:
-            key, value = entry.decode("utf-8").split("=", 1)
-            require(key not in values, "duplicate actual environment")
-            values[key] = value
+        values = process_environment(self.io.read(f"/proc/{pid}/environ"))
         absent = self.baseline.values()["environment"]["absent"]
         require(not set(absent) & set(values), "forbidden environment present")
         limits = {}
@@ -1777,7 +1901,7 @@ class LiveSystem:
             stdio.append({"fd": fd, "type": "regular", "backing": {"device": major_minor(info), "inode": info.st_ino,
                           "path": self.io.link(path)}, "flags": int(fields["flags"], 8)})
         scheduler, priority = self.io.scheduler(pid)
-        pstat = parse_stat(self.io.text(f"/proc/{pid}/stat"))
+        session = self._session_observed(pid)
         blocked, ignored, caught = (int(status[n], 16) for n in ("SigBlk", "SigIgn", "SigCgt"))
         require(caught == 0, "unreviewed child signal handler")
         valid = {int(n) for n in signal.valid_signals()} - {int(signal.SIGKILL), int(signal.SIGSTOP)}
@@ -1806,8 +1930,7 @@ class LiveSystem:
                 "credentials": {"uid": int(status["Uid"].split()[0]), "gid": int(status["Gid"].split()[0]),
                                 "groups": sorted(int(v) for v in status["Groups"].split())},
                 "adapter_pins": self._dependency_observation(),
-                "session": {"session_id": pstat["session"], "process_group": pstat["pgrp"],
-                            "autogroup": self.io.text(f"/proc/{pid}/autogroup").strip()}, "security_context": security}
+                "session": session, "security_context": security}
 
     def _dependency_observation(self):
         self._loaded_code()
@@ -1881,7 +2004,9 @@ class LiveSystem:
                   "inherited_fds": [0, 1, 2], "cgroup_id": self.cgroup, "cgroup_mode": "PASSIVE_TREE_ONLY",
                   "cgroup_active_monitoring_during_pair": False, "launch_observed": observed,
                   "resource_domain_observed": target, "namespace_id": self.io.namespace(self.child, "mnt"),
-                  "handoff_pid": self.child}
+                  "handoff_pid": self.child,
+                  "session_observations": copy.deepcopy(self.session_observations),
+                  "hold_proof": self._confinement_hold_proof(status, brokers)}
         lb.validate_confinement(result, self.baseline.values(), self.namespace_receipt)
         self.journal.publish("confinement-brokers.json", canonical_json({"handoff_child": self.child_identity,
             "mount_namespace_id": child_mount, "network_namespace_id": child_network,
@@ -1961,9 +2086,9 @@ class LiveSystem:
     def release(self):
         self._check()
         require(self.exclusion and self.rw_transition and not self.released, "release lifecycle")
-        for fd in self.native.retained_fds.values():
+        for name, fd in list(self.native.retained_fds.items()):
             os.close(fd)
-        self.native.retained_fds.clear()
+            del self.native.retained_fds[name]
         os.close(self.lock_fd)
         self.lock_fd = None
         self.exclusion, self.released = False, True

@@ -81,7 +81,7 @@ def compose(bundle, *, authorization, execution_grant, provider_grant, host_id, 
     require_live(authorization, execution_grant, provider_grant, host_id, attempt,
                  bundle["adapter"], bundle["provider"], "AUTHORITY")
     validate_bundle(bundle)
-    baseline = lb.LaunchManifest.parse(bundle["launch"])
+    baseline = lb.LaunchManifest.parse(bundle["launch"], authority_issue=authorization.issue)
     require(baseline.values()["credentials"]["groups"] == [],
             "P1V5.12 live runtime supplementary groups must be empty")
     context = (authorization, execution_grant, provider_grant, host_id, attempt,
@@ -117,7 +117,14 @@ def compose(bundle, *, authorization, execution_grant, provider_grant, host_id, 
                                  host_id=host_id, attempt=attempt, authorization=authorization, grant=execution_grant)
         return Supervisor(backend, attempt).run()
 
-    return roles.guardian(worker)
+    result = roles.guardian(worker)
+    if result.get("status") == "FAIL_FOR_REVIEW_HOLDING":
+        try:
+            print(canonical_json(result).decode(), end="", flush=True)
+        finally:
+            # Losing the diagnostic stream cannot terminate the guardian.
+            processes.failed_hold_forever()
+    return result
 
 
 def main(argv=None):
@@ -129,8 +136,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.execute:
         # No CLI switch/token can grant execution. A future reviewed entry point
-        # must call compose with all externally pinned matching grants >248.
-        parser.error("P1V5 execution NOT_AUTHORIZED; external future grants for an issue >248 required")
+        # must call compose with all externally pinned matching grants >251.
+        parser.error("P1V5 execution NOT_AUTHORIZED; external future grants for an issue >251 required")
     try:
         if args.validate_manifest:
             value = strict_json(Path(args.validate_manifest).read_bytes())

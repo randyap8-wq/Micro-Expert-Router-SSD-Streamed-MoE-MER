@@ -56,6 +56,36 @@ POLICY_FIELDS = {
     "session": ("session_id", "process_group", "autogroup"),
     "security_context": ("lsm", "labels", "inherited_policy_sha256"),
 }
+SESSION_POLICY = {"policy": "INHERIT_WORKER", "child_session_equals_worker": True,
+                  "child_process_group_equals_worker": True,
+                  "child_autogroup_equals_worker": True, "autogroup_nice": 0}
+HOLD_TRUE = ("exclusion_held", "filesystem_ro", "device_ro", "alias_locked",
+             "private_mount_namespace", "private_network_namespace", "handoff_child_stopped",
+             "brokers_excluded", "parent_nvml_cold", "parent_single_thread")
+
+
+def validate_stdio(entries):
+    """Linux x86-64 status flags: read-only stdin; append-only output opens."""
+    require(type(entries) is list and len(entries) == 3, "exact stdio inventory")
+    for fd, entry in enumerate(entries):
+        exact_keys(entry, ("fd", "type", "backing", "flags"), "stdio type/backing/flags")
+        require(type(entry["fd"]) is int and entry["fd"] == fd and entry["type"] == "regular", "stdio descriptor/type")
+        exact_keys(entry["backing"], ("device", "inode", "path"), "stdio backing identity")
+        backing = entry["backing"]
+        require(backing["device"] == "259:1" and uint(backing["inode"]) > 0, "stdio output backing")
+        path_bytes(backing["path"])
+        require(type(entry["flags"]) is int and entry["flags"] == (0o100000 if fd == 0 else 0o102001),
+                "stdio exact Linux access/append/status flags")
+    require(len({e["backing"]["path"] for e in entries}) == 3
+            and len({e["backing"]["inode"] for e in entries}) == 3, "distinct reviewed stdio targets")
+
+
+def validate_hold_proof(value):
+    exact_keys(value, (*HOLD_TRUE, "private_network_abstract_sockets", "nvml_helper_active"), "strict confinement hold proof")
+    require(all(value[k] is True for k in HOLD_TRUE), "confinement hold readiness")
+    require(type(value["private_network_abstract_sockets"]) is int
+            and value["private_network_abstract_sockets"] == 0
+            and value["nvml_helper_active"] is False, "confinement hold isolation")
 
 
 def linux_rlimit_id(resource_module, name, platform_name):
@@ -121,7 +151,7 @@ class LaunchManifest:
     encoded: bytes
 
     @classmethod
-    def parse(cls, value):
+    def parse(cls, value, *, authority_issue=216):
         exact_keys(value, LAUNCH_FIELDS, "complete launch manifest required")
         known(value)
         env = value["environment"]
@@ -144,8 +174,17 @@ class LaunchManifest:
             exact_keys(entry, ("fd", "type", "backing", "flags"), "stdio type/backing/flags")
             require(type(entry["fd"]) is int and entry["fd"] == fd, "stdio descriptor")
             uint(entry["flags"])
+        require(type(value["session"]) is dict, "session policy object required")
+        relational = "policy" in value["session"]
+        require(type(authority_issue) is int and authority_issue >= 216, "launch authority")
+        require(authority_issue <= 251 or relational, "new authority requires relational INHERIT_WORKER session")
         for name, fields in POLICY_FIELDS.items():
+            if name == "session" and relational:
+                fields = SESSION_POLICY
             exact_keys(value[name], fields, "launch policy coverage: " + name)
+        if relational:
+            require(canonical_json(value["session"]) == canonical_json(SESSION_POLICY), "session inheritance policy drift")
+            validate_stdio(value["stdio"])
         require(type(value["nice"]) is int and -20 <= value["nice"] <= 19, "nice")
         numeric_set(value["cpu_affinity"], nonempty=True)
         numeric_set(value["numa"]["allowed_nodes"], nonempty=True)
@@ -373,6 +412,7 @@ class LinuxBackend(FutureBackend):
         self.host_id, self.attempt = host_id, validate_attempt(attempt)
         self.authorization, self.grant = authorization, grant
         self.authorize("AUTHORITY")
+        LaunchManifest.parse(baseline, authority_issue=authorization.issue)
         self._storage_identity = canonical_json(grant.storage_identity)
         self.simulated = system.simulated is True
         require(journal.attempt == attempt and journal.fixture == self.simulated, "journal attempt/mode mismatch")
@@ -777,7 +817,7 @@ class NativePrimitives:
         fcntl.ioctl(fd, BLKROSET, array.array("i", [int(read_only)]), True)
 
     def block_get(self, fd):
-        self._check(("TOPOLOGY", "FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "REVALIDATE", "HASH", "DEVICE_RW", "FILESYSTEM_RW"))
+        self._check(("TOPOLOGY", "FILESYSTEM_RO", "DEVICE_RO", "PROTECTED", "CONFINEMENT", "REVALIDATE", "HASH", "DEVICE_RW", "FILESYSTEM_RW"))
         self._device(fd)
         import array
         import fcntl
@@ -788,6 +828,9 @@ class NativePrimitives:
 
 
 def validate_confinement(r, baseline, namespace):
+    # Historical sealed evidence retains its old schema. New live admission
+    # requires SESSION_POLICY before any host access; it cannot enter this arm.
+    lifecycle_fields = ("hold_proof", "session_observations") if "policy" in baseline["session"] else ()
     true_fields = ("no_new_privs", "groups_exact", "brokers_excluded", "setup_fds_closed",
                    "initial_user_namespace", "private_mount_namespace", "private_network_namespace",
                    "trusted_execution_closure_verified",
@@ -798,7 +841,10 @@ def validate_confinement(r, baseline, namespace):
     exact_keys(r, ("ok", "uids", "gids", "groups", "capabilities", *true_fields, *empty_fields,
                    "seccomp_mode", "p1v_device_bpf_attached", "inherited_fds", "cgroup_id", "cgroup_mode",
                    "cgroup_active_monitoring_during_pair", "launch_observed", "resource_domain_observed",
-                   "namespace_id", "handoff_pid"), "strict v2 confinement fields")
+                   "namespace_id", "handoff_pid", *lifecycle_fields), "strict v2 confinement fields")
+    if lifecycle_fields:
+        validate_hold_proof(r["hold_proof"])
+        require(session_relationship(r["session_observations"]) == baseline["session"], "session relation drift")
     expected = baseline["credentials"]
     for field, key in (("uids", "uid"), ("gids", "gid")):
         require(type(r[field]) is list and len(r[field]) == 3, "credential slots")
@@ -824,6 +870,22 @@ def validate_confinement(r, baseline, namespace):
     require(resource_domain(r["resource_domain_observed"]) == baseline["resource_domain"], "resource domain/constraint drift")
 
 
+def session_relationship(observations):
+    import re
+    exact_keys(observations, ("worker", "child"), "raw worker/child sessions")
+    for value in observations.values():
+        exact_keys(value, ("session_id", "process_group", "autogroup"), "raw session observation")
+        require(uint(value["session_id"], 32) > 0 and uint(value["process_group"], 32) > 0, "session numeric observation")
+        require(type(value["autogroup"]) is str
+                and re.fullmatch(r"/autogroup-[0-9]+ nice 0", value["autogroup"]), "autogroup nice must be zero")
+    worker, child = observations["worker"], observations["child"]
+    result = {"policy": "INHERIT_WORKER", "child_session_equals_worker": child["session_id"] == worker["session_id"],
+              "child_process_group_equals_worker": child["process_group"] == worker["process_group"],
+              "child_autogroup_equals_worker": child["autogroup"] == worker["autogroup"], "autogroup_nice": 0}
+    require(result == SESSION_POLICY, "session inheritance relation drift")
+    return result
+
+
 class ProcessInterfaces(Protocol):
     """Hash-pinned process primitives, supplied with the reviewed host System.
 
@@ -837,6 +899,8 @@ class ProcessInterfaces(Protocol):
     def fork(self) -> int: ...
     def wait_once(self, pid: int, stopped: bool) -> dict: ...
     def resume_wait_once(self, pid: int) -> dict: ...
+    def resume_wait_worker(self, pid: int) -> dict: ...
+    def failed_hold_forever(self) -> None: ...
     def enter_cgroup(self, cgroup: str) -> None: ...
     def apply_launch_credentials_and_close_fds(self, manifest: bytes) -> None: ...
     def stop_self(self) -> None: ...
@@ -858,7 +922,12 @@ class ProcessRoles:
         self.attempt = validate_attempt(attempt)
         self.worker_used = self.child_used = self.wait_used = False
         self.child = None
+        self.failure_owner = None
         self._authorize("AUTHORITY")
+
+    def bind_failure_owner(self, owner):
+        require(self.failure_owner is None, "one protected failure owner")
+        self.failure_owner = owner
 
     def _authorize(self, operation):
         if self.processes.simulated is not True:
@@ -868,22 +937,55 @@ class ProcessRoles:
         self._authorize("AUTHORITY")
         require(not self.worker_used, "worker reuse forbidden")
         self.worker_used = True
+        import mmap
+        # A failure journal may itself be poisoned. This bounded anonymous
+        # channel carries diagnostics only and never transfers control FDs.
+        with mmap.mmap(-1, 65536, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE) as shared:
+            return self._guardian(worker_main, shared)
+
+    def _guardian(self, worker_main, shared):
         pid = self.processes.fork()
         if pid == 0:
             # Establish guardian wait readiness before worker setup can begin.
             self.processes.stop_self()
-            # No finally restoration. A failure exits without clearing protection.
             code = 1
             try:
                 code = 0 if worker_main()["status"] in ("PASS_FOR_REVIEW", "PASS_SIMULATION") else 1
-            except Exception:
+            except BaseException:
                 pass
+            owner = self.failure_owner
+            if code and owner is not None and owner.protection_owned():
+                # Observation/publication failure must never turn hold into exit.
+                try:
+                    receipt = owner.failure_receipt()
+                    payload = canonical_json(receipt)
+                    require(len(payload) <= 65532, "failed hold receipt size")
+                    shared[4:4 + len(payload)] = payload
+                    shared[:4] = len(payload).to_bytes(4, "big")
+                except BaseException:
+                    shared[:4] = bytes(4)
+                self.processes.failed_hold_forever()
+                raise InvalidEvidence("failed hold unexpectedly returned")
             self.processes.exit_worker(code)
             raise InvalidEvidence("worker exit unexpectedly returned")
         require(uint(pid, 32) > 0, "worker fork failure")
         require(self.processes.wait_once(pid, True) == {"pid": pid, "stopped": True}, "worker bootstrap stop failed")
-        result = self.processes.resume_wait_once(pid)
-        require(result == {"pid": pid, "exited": True, "exit_code": 0}, "guardian worker failure; protection retained")
+        result = self.processes.resume_wait_worker(pid)
+        if result == {"pid": pid, "stopped": True}:
+            length = int.from_bytes(shared[:4], "big")
+            receipt = None
+            try:
+                require(0 < length <= 65532, "failed hold observation unavailable")
+                payload = shared[4:4 + length]
+                receipt = strict_json(payload)
+                require(canonical_json(receipt) == payload and receipt["worker_pid"] == pid,
+                        "failed hold owner mismatch")
+            except Exception:
+                receipt = None
+            return {"status": "FAIL_FOR_REVIEW_HOLDING", "worker_pid": pid, "worker_stopped": True,
+                    "ownership_observation": receipt, "ownership_observation_available": receipt is not None,
+                    "automatic_restoration": False, "attempt_reusable": False}
+        require(result == {"pid": pid, "exited": True, "exit_code": 0}, "guardian worker exited with failure")
         return result
 
     def prepare_stopped_child(self, argv, manifest, cgroup):
@@ -893,15 +995,18 @@ class ProcessRoles:
         LaunchManifest.parse(LaunchManifest(manifest).values())
         pid = self.processes.fork()
         if pid == 0:
-            self.processes.enter_cgroup(cgroup)
-            self.processes.apply_launch_credentials_and_close_fds(manifest)
-            # One primitive owns the stop/exec boundary; no resumed helper call.
-            # Only the unchanged parent is exec'd. It owns CONTROL -> TREATMENT.
-            self.processes.stop_then_exec_parent(argv, manifest)
-            raise InvalidEvidence("parent exec unexpectedly returned")
+            try:
+                self.processes.handoff_child_pid = os.getpid()
+                self.processes.enter_cgroup(cgroup)
+                self.processes.apply_launch_credentials_and_close_fds(manifest)
+                # SIGCONT returns directly to execve inside this boundary.
+                self.processes.stop_then_exec_parent(argv, manifest)
+            except BaseException:
+                os._exit(127)
+            os._exit(127)  # exec returning is also terminal, never supervisor work.
         require(uint(pid, 32) > 0, "handoff fork failure")
+        self.child = pid  # retain exact ownership even when the stop wait fails
         require(self.processes.wait_once(pid, True) == {"pid": pid, "stopped": True}, "handoff child did not stop")
-        self.child = pid
         return pid
 
     def resume_wait_parent(self, pid):
@@ -932,6 +1037,7 @@ class NativeProcesses:
         self.attempt = attempt
         self.cgroups = set()
         self.nvml_helper = self.nvml_helper_child = None
+        self.handoff_child_pid = None
 
     def _check(self, action):
         import sys
@@ -943,6 +1049,82 @@ class NativeProcesses:
         require(self.nvml_helper is None and self.nvml_helper_child is None, "NVML helper active at handoff fork")
         require(os.geteuid() == 0 and len(os.listdir("/proc/self/task")) == 1, "single-threaded privileged fork required")
         return os.fork()
+
+    def resume_wait_worker(self, pid):
+        self._check("AUTHORITY")
+        require(uint(pid, 32) > 0, "owned worker pid required")
+        import signal
+        os.kill(pid, signal.SIGCONT)
+        found, status = os.waitpid(pid, os.WUNTRACED)
+        require(found == pid, "exact worker wait required")
+        if os.WIFSTOPPED(status):
+            require(os.WSTOPSIG(status) == signal.SIGSTOP, "failed worker stop mismatch")
+            return {"pid": pid, "stopped": True}
+        require(os.WIFEXITED(status), "worker exit uncertainty")
+        return {"pid": pid, "exited": True, "exit_code": os.WEXITSTATUS(status)}
+
+    @staticmethod
+    def failed_hold_forever():
+        # SIGCONT is not recovery authority. Its sole continuation is SIGSTOP.
+        import signal
+        stop, pid, sig = os.kill, os.getpid(), signal.SIGSTOP
+        signal.pthread_sigmask(signal.SIG_SETMASK, set(signal.valid_signals()) - {signal.SIGKILL, signal.SIGSTOP})
+        while True:
+            stop(pid, sig)
+
+    def install_child_stdio(self, manifest):
+        self._check("CONFINEMENT")
+        value = LaunchManifest.parse(LaunchManifest(manifest).values()).values()
+        validate_stdio(value["stdio"])
+        require(os.geteuid() == 0 and self.handoff_child_pid == os.getpid(), "stdio requires privileged handoff child")
+        import fcntl
+        # Reserve standard slots: every setup open must be a temporary >=3.
+        for fd in range(3):
+            os.fstat(fd)
+
+        def identity(fd, entry, flags=False):
+            info = os.fstat(fd)
+            backing = entry["backing"]
+            require(stat.S_ISREG(info.st_mode) and info.st_ino == backing["inode"]
+                    and f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}" == backing["device"]
+                    and os.readlink(f"/proc/self/fd/{fd}") == backing["path"], "stdio exact regular object/path")
+            if flags:
+                require(fcntl.fcntl(fd, fcntl.F_GETFL) == entry["flags"], "stdio final status flags")
+
+        for entry in value["stdio"]:
+            target, temporary = None, None
+            directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                parts = Path(entry["backing"]["path"]).parts[1:]
+                for part in parts[:-1]:
+                    info = os.fstat(directory)
+                    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+                            "uncontrolled stdio ancestor")
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
+                    os.close(directory)
+                    directory = child
+                info = os.fstat(directory)
+                require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+                        "uncontrolled stdio parent")
+                # O_PATH pins without opening a device/FIFO. NOFOLLOW returns a
+                # symlink object, which the regular-file check rejects. Reopen
+                # only that pinned regular object, without persisting NOFOLLOW
+                # in its Linux F_GETFL status flags. No create/truncate anywhere.
+                target = os.open(parts[-1], os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
+                identity(target, entry)
+                mode = os.O_RDONLY if entry["fd"] == 0 else os.O_WRONLY | os.O_APPEND
+                temporary = os.open(f"/proc/self/fd/{target}", mode | os.O_CLOEXEC)
+                identity(temporary, entry, True)
+                os.dup2(temporary, entry["fd"], inheritable=True)
+            finally:
+                for descriptor in (temporary, target, directory):
+                    if descriptor is not None:
+                        os.close(descriptor)
+        descriptors = [int(n) for n in os.listdir("/proc/self/fd")]
+        os.closerange(3, max([3, *descriptors]) + 1)
+        for entry in value["stdio"]:
+            identity(entry["fd"], entry, True)
+            require(os.get_inheritable(entry["fd"]), "stdio must survive exec")
 
     def _nvml_action(self, action):
         require(action in ("EXCLUSION", "CONFINEMENT"), "NVML helper action scope")
@@ -1053,6 +1235,7 @@ class NativeProcesses:
             require(resource.getrlimit(linux_rlimit_id(resource, name, sys.platform)) == expected, "inherited RLIMIT drift")
         require(sorted(os.sched_getaffinity(0)) == value["cpu_affinity"]
                 and os.getpriority(os.PRIO_PROCESS, 0) == value["nice"], "inherited scheduling drift")
+        self.install_child_stdio(manifest)
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
         libc.prctl.restype = ctypes.c_int
@@ -1140,6 +1323,7 @@ def validate_execution_scope(receipt, evidence):
         return
     exact_keys(scope, ("authority_issue", "host_id", "attempt", "operations", "adapter_manifest_sha256", "storage_identity"), "live scope coverage")
     require(type(scope["authority_issue"]) is int and scope["authority_issue"] > 230, "live grant must postdate implementation")
+    LaunchManifest.parse(receipt["launch_manifest"], authority_issue=scope["authority_issue"])
     validate_storage_identity(scope["storage_identity"])
     require(scope["host_id"] == receipt["host_id"] and scope["attempt"] == evidence["attempt"]
             and scope["operations"] == [a.name for a in plan(evidence["attempt"])]

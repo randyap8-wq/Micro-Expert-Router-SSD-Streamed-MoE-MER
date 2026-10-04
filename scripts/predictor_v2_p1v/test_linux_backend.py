@@ -9,6 +9,7 @@ import copy
 import importlib
 import io
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -35,7 +36,7 @@ PROTECTED_P1V_FILES = {
     "offline_verify.py": "6008eceb36210b2755ff4ba3d5f0970f0656a919bdcfc6151a65f52562b86537",
     "supervisor.py": "c0f57a524814ae12677af8d42a65fa08b900a10ba183093d6006bdbf5df354f8",
     "test_p1v.py": "ef2eb74ed4a469e80a9f2ec4c8faa8e991f29109e04e396ec37b92402b0f5a4a",
-    "linux_backend.py": "507689620b6aa3812ceecbe32a80149901964483d29dd9510245f0401c1342f9",
+    "linux_backend.py": "1f79947678cde8ef2b809c024da0c833a3e7eba9347a08a573c5a8a92a9fc23f",
 }
 REQUIRED_P1V_FILES = frozenset(PROTECTED_P1V_FILES) | {"test_linux_backend.py"}
 OPTIONAL_P1V5_FILES = frozenset({"live_system.py", "test_live_system.py",
@@ -987,6 +988,9 @@ class RoleTests(unittest.TestCase):
             self.calls.append(("wait", pid, stopped))
             return {"pid": pid, "stopped": True} if stopped else {"pid": pid, "exited": True, "exit_code": self.exit_code}
 
+        def resume_wait_worker(self, pid):
+            return self.resume_wait_once(pid)
+
         def resume_wait_once(self, pid):
             self.calls.append(("continue", pid))
             return self.wait_once(pid, False)
@@ -1225,7 +1229,7 @@ class AdditionalGateTests(unittest.TestCase):
         processes = Processes()
         roles = lb.ProcessRoles(processes, attempt="p1v-fixture", manifest=adapter_fixture())
         baseline = lb.LaunchManifest.parse(launch_fixture())
-        with self.assertRaises(Executed):
+        with patch("os._exit", side_effect=Executed), self.assertRaises(Executed):
             roles.prepare_stopped_child(parent_argv("p1v-fixture"), baseline.encoded, "synthetic")
         self.assertEqual(processes.calls, ["fork", ("membership", "synthetic"),
                                           ("credentials_fds", baseline.encoded),
@@ -1328,7 +1332,8 @@ class ReleaseExecBoundaryTests(unittest.TestCase):
     def test_runtime_role_has_one_atomic_stop_exec_and_no_old_sequence(self):
         method = self.method("ProcessRoles", "prepare_stopped_child")
         child = next(n for n in method.body if isinstance(n, ast.If) and ast.unparse(n.test) == "pid == 0")
-        calls = [ast.unparse(n.value.func) for n in child.body if isinstance(n, ast.Expr)]
+        boundary = next(n for n in child.body if isinstance(n, ast.Try))
+        calls = [ast.unparse(n.value.func) for n in boundary.body if isinstance(n, ast.Expr)]
         self.assertEqual(calls, ['self.processes.enter_cgroup',
                                  'self.processes.apply_launch_credentials_and_close_fds',
                                  'self.processes.stop_then_exec_parent'])
@@ -1543,7 +1548,7 @@ class RlimitCompatibilityTests(unittest.TestCase):
         signals = SimpleNamespace(valid_signals=Mock(return_value={1, 2, 9, 19}), SIGKILL=9, SIGSTOP=19,
                                   SIG_DFL=0, SIG_IGN=1, SIG_SETMASK=2, signal=Mock(), pthread_sigmask=Mock())
         libc = SimpleNamespace(prctl=Mock(return_value=0), capset=Mock(return_value=0))
-        child = SimpleNamespace(_check=Mock(), _prctl=Mock())
+        child = SimpleNamespace(_check=Mock(), _prctl=Mock(), install_child_stdio=Mock())
         path = Mock()
         path.return_value.read_text.return_value = "2\n"
         encoded = lb.LaunchManifest.parse(baseline).encoded
@@ -1877,6 +1882,356 @@ class ExternalStorageAdapterTests(unittest.TestCase):
             for variant in ("symlink", "filesystem", "rdev", "mount", "alias", "extra_alias"):
                 with self.subTest(second=second, variant=variant), self.assertRaises(InvalidEvidence):
                     self.native_retention(second, variant)
+
+
+
+class LifecycleExit(BaseException):
+    """Modeled OS terminal boundary, never a supervisor exception."""
+
+
+class LaunchMachine:
+    """Synthetic process tables and shared open descriptions; no host syscalls.
+
+    The prospective contract is independent of proc rendering. Fork copies
+    descriptor tables, sharing descriptions; dup2/close change reference counts.
+    A2 data is freshly synthetic and never derived from the historical packet.
+    """
+    def __init__(self):
+        from . import live_system as ls
+        from .test_live_system import numa_baseline
+        import stat
+        self.pid = 40
+        self.phase = 'AUTHORITY'
+        self.calls, self.history = [], []
+        self.next_description = 0
+        self.descriptions = {}
+        self.tables = {}
+        self.files = {'/': self.info(stat.S_IFDIR | 0o755, 1),
+                      '/fixture': self.info(stat.S_IFDIR | 0o755, 2),
+                      '/fixture/stdio': self.info(stat.S_IFDIR | 0o700, 3)}
+        self.baseline = numa_baseline()
+        for row in self.baseline['stdio']:
+            self.files[row['backing']['path']] = self.info(stat.S_IFREG | 0o600, row['backing']['inode'])
+        self.initial_environment = {'PATH': '/synthetic/bin', 'SUDO_COMMAND': 'python', 'STAGE_B_CONTROL': 'private'}
+        self.initial = dict(uid=0, gid=0, groups=[0], cwd='/operator', umask=0o022,
+                            environment=self.initial_environment.copy(), session=90, pgrp=90,
+                            autogroup='/autogroup-7 nice 0', caps=0xff, nnp=0, signals={'2': 'CAUGHT'}, mask=[])
+        self.states = {38: copy.deepcopy(self.initial)}
+        self.tables[38] = {}
+        for fd in range(3):
+            self.allocate('/terminal/' + str(fd), fd, info=self.info(stat.S_IFIFO if fd == 0 else stat.S_IFCHR, fd+800), pid=38)
+        self.copy_process(38, 37, 'operator -> sudo/bootstrap')
+        self.states[37]['session'] = self.states[37]['pgrp'] = 92
+        self.states[37]['autogroup'] = '/autogroup-8 nice 0'
+        self.copy_process(37, 39, 'sudo/bootstrap -> guardian')
+        self.copy_process(39, 40, 'guardian -> worker')
+        self.baseline['rlimits'] = {k: [1024, 2048] for k in lb.RLIMITS}
+        self.baseline['signals'] = {'mask': [], 'dispositions': {str(n): 'DEFAULT' for n in range(1,65) if n not in (9,19,32,33)}}
+        self.baseline['scheduler'] = {'class': 0, 'attributes': {'policy': 0, 'priority': 0, 'nice': 0}}
+        self.baseline['cpu_policy'] = {k: {} for k in ('governors','frequency_limits','boost','power')}
+        self.baseline['thp'] = {'policy': {'global': {'enabled': {'/sys/fixture/thp': '[madvise]'}}, 'task_enabled': 1}}
+        self.baseline['thp']['evidence_sha256'] = digest(canonical_json(self.baseline['thp']['policy']))
+        self.baseline['numa_balancing'] = {'policy': {'enabled': {'/proc/sys/kernel/numa_balancing': '0'}}}
+        self.baseline['numa_balancing']['evidence_sha256'] = digest(canonical_json(self.baseline['numa_balancing']['policy']))
+        self.baseline['security_context'] = {'lsm': ['capability'], 'labels': {'current': 'unconfined'},
+            'inherited_policy_sha256': digest(canonical_json({'lsm':['capability'],'label':'unconfined','seccomp':0,'no_new_privs':1}))}
+        self.inventory = {k: {} for k in ('nodes','libraries','icds','layers','cache')}
+        self.snapshot = {'certificate': {'device_uuid': 'GPU-synthetic', 'pci_bus_id':'0000:00:01.0',
+            'device_name':'NVIDIA L4','driver_version':'580.178.04'},
+            'management': {k: {'synthetic': True} for k in ('persistence','compute','power','mig')}}
+        self.baseline['gpu'] = self.inventory | self.snapshot['management'] | {
+            'device': {k:self.snapshot['certificate'][k] for k in ('device_uuid','pci_bus_id','device_name')},
+            'driver':'580.178.04','clocks':copy.deepcopy(self.snapshot['certificate']),
+            'mps':{'processes':[],'status':'NO_MPS_PROCESS_OBSERVED'}}
+        self.limits = {k:(1024,2048) for k in lb.RLIMITS}
+        self.inherited_numa = copy.deepcopy(self.baseline['numa'])
+        self.domain = copy.deepcopy(self.baseline['resource_domain'])
+        self.affinity, self.nice = {0,1}, 0
+        self.scheduler = (copy.deepcopy(self.baseline['scheduler']), {'class':0,'priority':0})
+        self.policies = {'cpu_policy':{k:{} for k in ('governors','frequency_limits','boost','power')},
+                         'thp':{'enabled':{'/sys/fixture/thp':'[madvise]'}},
+                         'numa_balancing':{'enabled':{'/proc/sys/kernel/numa_balancing':'0'}}}
+        self.pins = dict.fromkeys(lb.DEPENDENCIES,'a'*64)
+        self.proc = object.__new__(lb.NativeProcesses)
+        self.proc._check = lambda action: self.calls.append(('authorize',action))
+        self.proc.handoff_child_pid = None
+        self.proc.attempt = 'p1v-fixture'
+        self.proc.nvml_helper = self.proc.nvml_helper_child = None
+        self.proc.context = (None,None,None,None,{'launch_manifest_sha256':lb.LaunchManifest.parse(self.baseline,authority_issue=252).sha256})
+        self.system = object.__new__(ls.LiveSystem)
+        self.system.baseline = lb.LaunchManifest.parse(self.baseline,authority_issue=252)
+        self.system.worker_pid = 40
+        self.system.exclusion, self.system.lock_fd = False, None
+        self.system._action = lambda:self.phase
+        self.system.io = SimpleNamespace(read=self.read,text=self.text,stat=self.stat,link=self.link,listdir=self.listdir,
+                                          scheduler=lambda pid:copy.deepcopy(self.scheduler))
+        self.system._policy_files = lambda group:copy.deepcopy(self.policies[group])
+        self.system._gpu_inventory = lambda:copy.deepcopy(self.inventory)
+        self.system._mps_observation = lambda:{'processes':[],'status':'NO_MPS_PROCESS_OBSERVED'}
+        self.system._dependency_observation = lambda:copy.deepcopy(self.pins)
+
+    @staticmethod
+    def info(mode,inode):
+        return SimpleNamespace(st_mode=mode,st_ino=inode,st_dev=(259 << 20) | 1,st_uid=0,st_gid=0)
+
+    def allocate(self,path,fd=None,flags=0,info=None,pid=None):
+        pid=self.pid if pid is None else pid
+        table=self.tables[pid]
+        fd=next(n for n in range(3,1000) if n not in table) if fd is None else fd
+        self.next_description+=1
+        self.descriptions[self.next_description]=dict(path=path,flags=flags,info=info or self.files[path])
+        table[fd]=[self.next_description,False]
+        return fd
+
+    def description(self,fd,pid=None):
+        return self.descriptions[self.tables[self.pid if pid is None else pid][fd][0]]
+
+    def refs(self):
+        return {d:sum(v[0]==d for t in self.tables.values() for v in t.values()) for d in self.descriptions}
+
+    def copy_process(self,parent,child,label):
+        self.states[child]=copy.deepcopy(self.states[parent]);self.tables[child]=copy.deepcopy(self.tables[parent])
+        self.history.append((label,parent,child))
+
+    def bootstrap(self):
+        # Model a clean initial exec, not putenv. Control values stay outside it.
+        for pid in (37,39,40):
+            self.states[pid]['environment']={'PATH':'/synthetic/bin'}
+        self.history.append(('env-i initial Python exec',39,40))
+
+    def child(self):
+        self.copy_process(40,41,'worker -> handoff pre-drop')
+        self.pid=41;self.proc.handoff_child_pid=41
+
+    def open(self,path,flags,dir_fd=None):
+        path=str(path)
+        if path.startswith('/proc/self/fd/'):
+            source=self.description(int(path.rsplit('/',1)[1]));target=source['path']
+            fd=self.allocate(target,flags=(flags & ~0o2000000)|0o100000,info=source['info'])
+        else:
+            target=path if path.startswith('/') else self.description(dir_fd)['path'].rstrip('/')+'/'+path
+            info=self.files[target]
+            if flags & 0o200000 and not stat.S_ISDIR(info.st_mode): raise OSError('not a directory')
+            fd=self.allocate(target,flags=flags,info=info)
+        self.calls.append(('open',self.pid,target,flags))
+        return fd
+
+    def close(self,fd):
+        self.calls.append(('close',self.pid,fd));del self.tables[self.pid][fd]
+
+    def dup2(self,source,target,inheritable):
+        self.calls.append(('dup2',self.pid,source,target,inheritable))
+        self.tables[self.pid][target]=[self.tables[self.pid][source][0],inheritable]
+        return target
+
+    def closerange(self,start,end):
+        for fd in list(self.tables[self.pid]):
+            if start<=fd<end:self.close(fd)
+
+    def split_proc(self,path):
+        parts=path.split('/');return (self.pid if parts[2]=='self' else int(parts[2])),parts[3:]
+
+    def read(self,path):
+        pid,parts=self.split_proc(path)
+        if parts==['environ']:
+            return b''.join((k+'='+v+'\0').encode() for k,v in self.states[pid]['environment'].items())
+        raise AssertionError(path)
+
+    def text(self,path):
+        if path=='/sys/kernel/security/lsm': return 'capability\n'
+        pid,parts=self.split_proc(path);state=self.states[pid]
+        if parts[0]=='fdinfo':return 'flags:\t'+oct(self.description(int(parts[1]),pid)['flags'])[2:]+'\n'
+        if parts==['stat']:return f"{pid} (python) T 40 {state['pgrp']} {state['session']} "+'0 '*15+'901'
+        if parts==['autogroup']:return state['autogroup']
+        if parts==['attr','current']:return 'unconfined'
+        raise AssertionError(path)
+
+    def stat(self,path,follow=False):
+        pid,parts=self.split_proc(path)
+        return self.description(int(parts[1]),pid)['info']
+
+    def link(self,path):
+        pid,parts=self.split_proc(path)
+        return self.states[pid]['cwd'] if parts==['cwd'] else self.description(int(parts[1]),pid)['path']
+
+    def listdir(self,path):
+        if path=='/proc/self/task':return [str(self.pid)]
+        pid,parts=self.split_proc(path)
+        if parts==['fd']:return [str(fd) for fd in sorted(self.tables[pid])]
+        raise AssertionError(path)
+
+    def status(self):
+        s=self.states[41]
+        ignored=sum(1<<(int(n)-1) for n,v in s['signals'].items() if v=='IGNORE')
+        caught=sum(1<<(int(n)-1) for n,v in s['signals'].items() if v=='CAUGHT')
+        return {'SigBlk':format(sum(1<<(n-1) for n in s['mask']),'x'),'SigIgn':format(ignored,'x'),'SigCgt':format(caught,'x'),
+                'THP_enabled':'1','Seccomp':'0','NoNewPrivs':str(s['nnp']),'Umask':oct(s['umask'])[2:],
+                'Uid':' '.join([str(s['uid'])]*4),'Gid':' '.join([str(s['gid'])]*4),'Groups':' '.join(map(str,s['groups']))}
+
+    def contexts(self):
+        from . import live_system as ls
+        import fcntl
+        stack=ExitStack()
+        fakeos=SimpleNamespace(O_RDONLY=0,O_WRONLY=1,O_APPEND=0o2000,O_DIRECTORY=0o200000,
+                               O_CLOEXEC=0o2000000,O_NOFOLLOW=0o400000,O_PATH=0o10000000)
+        fakeos.geteuid=lambda:self.states[self.pid]['uid'];fakeos.getpid=lambda:self.pid
+        fakeos.open=self.open;fakeos.close=self.close;fakeos.dup2=self.dup2;fakeos.closerange=self.closerange
+        fakeos.listdir=self.listdir;fakeos.fstat=lambda fd:self.description(fd)['info'];fakeos.readlink=self.link
+        fakeos.major=lambda d:d >> 20;fakeos.minor=lambda d:d & ((1 << 20)-1);fakeos.get_inheritable=lambda fd:self.tables[self.pid][fd][1]
+        fakeos.sched_getaffinity=lambda pid:self.affinity.copy();fakeos.PRIO_PROCESS=0;fakeos.getpriority=lambda *a:self.nice
+        def set_state(key,value):self.calls.append(('set',self.pid,key,value));self.states[self.pid][key]=value
+        fakeos.setgroups=lambda value:set_state('groups',value)
+        fakeos.setresgid=lambda *v:set_state('gid',v[0]);fakeos.setresuid=lambda *v:set_state('uid',v[0])
+        fakeos.umask=lambda v:set_state('umask',v);fakeos.chdir=lambda v:set_state('cwd',v)
+        signals=SimpleNamespace(valid_signals=lambda:set(range(1,65))-{32,33},SIGKILL=9,SIGSTOP=19,SIG_DFL=0,SIG_IGN=1,SIG_SETMASK=2)
+        signals.signal=lambda n,v:self.states[self.pid]['signals'].__setitem__(str(n),'DEFAULT' if v==0 else 'IGNORE')
+        signals.pthread_sigmask=lambda how,v:set_state('mask',v)
+        resource=SimpleNamespace(RLIM_INFINITY=-1,getrlimit=lambda n:self.limits[n],prlimit=lambda pid,n:self.limits[n],
+                                 **{'RLIMIT_'+name:name for name in lb.RLIMITS})
+        libc=SimpleNamespace(prctl=Mock(side_effect=lambda option,*v: 0 if option==21 else (set_state('nnp',1) or 0) if option==38 else 0),
+                             capset=Mock(side_effect=lambda *a:set_state('caps',0) or 0))
+        stack.enter_context(patch.dict(sys.modules,{'resource':resource,'signal':signals}))
+        stack.enter_context(patch.object(lb,'linux_rlimit_id',side_effect=lambda r,n,p:n))
+        stack.enter_context(patch.object(lb,'os',fakeos));stack.enter_context(patch.object(ls,'os',fakeos))
+        stack.enter_context(patch('fcntl.fcntl',side_effect=lambda fd,cmd:self.description(fd)['flags']))
+        stack.enter_context(patch('ctypes.CDLL',return_value=libc))
+        old=Path.read_text
+        stack.enter_context(patch.object(Path,'read_text',lambda p,*a,**k:'2\n' if str(p)=='/proc/sys/kernel/cap_last_cap' else old(p,*a,**k)))
+        return stack
+
+    def apply(self):
+        with self.contexts():self.proc.apply_launch_credentials_and_close_fds(canonical_json(self.baseline))
+        self.history.append(('handoff post-setup/stopped',41,41))
+
+    def observe(self):
+        with self.contexts():
+            return self.system._launch_observed(41,copy.deepcopy(self.inherited_numa),self.status(),
+                copy.deepcopy(self.domain),copy.deepcopy(self.snapshot))
+
+
+class LaunchLifecycleBackendTests(unittest.TestCase):
+    def test_exact_privileged_stdio_installation(self):
+        m=LaunchMachine();m.bootstrap()
+        m.allocate('/control',fd=40,info=m.info(stat.S_IFREG,900));m.child()
+        guardian=copy.deepcopy(m.tables[39]);worker=copy.deepcopy(m.tables[40]);m.apply()
+        self.assertEqual(m.tables[39],guardian);self.assertEqual(m.tables[40],worker)
+        self.assertEqual(sorted(m.tables[41]),[0,1,2]);self.assertEqual(m.observe()['stdio'],m.baseline['stdio'])
+        self.assertTrue(all(v[1] for v in m.tables[41].values()))
+        for row in m.baseline['stdio']:
+            opens=[c for c in m.calls if c[0]=='open' and c[2]==row['backing']['path']]
+            self.assertEqual(len(opens),2)
+            self.assertTrue(all(not c[3] & (0o100|0o1000) for c in opens))
+        self.assertTrue(all(m.refs()[d]==0 for d,v in m.descriptions.items() if v['path']=='/fixture/stdio' or v['path']=='/'))
+        self.assertEqual(m.refs()[m.tables[40][40][0]],1)
+
+    def test_stdio_failure_matrix(self):
+        cases=('device','inode','path','object','access','append','flags','symlink','parent','partial')
+        for case in cases:
+            with self.subTest(case=case):
+                m=LaunchMachine();m.bootstrap();m.child();entry=m.baseline['stdio'][1];target=entry['backing']['path']
+                if case=='device':m.files[target].st_dev=(259 << 20) | 4
+                if case=='inode':m.files[target].st_ino+=1
+                if case=='path':entry['backing']['path']='/unreviewed'
+                if case in ('object','symlink'):m.files[target].st_mode=stat.S_IFDIR if case=='object' else stat.S_IFLNK
+                if case in ('access','append','flags'):entry['flags']^={'access':3,'append':0o2000,'flags':0o4000}[case]
+                if case=='parent':m.files['/fixture/stdio'].st_mode|=0o002
+                if case=='partial':m.files[m.baseline['stdio'][2]['backing']['path']].st_ino+=1
+                with self.assertRaises((InvalidEvidence,KeyError,OSError)):m.apply()
+                self.assertEqual(m.states[41]['uid'],0)
+                self.assertNotEqual(m.tables[41],m.tables[40]) if case=='partial' else None
+                self.assertFalse(any(c[0]=='set' for c in m.calls))
+
+    def test_child_local_setup_failures(self):
+        for stage in ('membership','setup','stop'):
+            events=[]
+            def step(name):
+                events.append(name)
+                if name==stage:raise OSError('injected '+name)
+            p=SimpleNamespace(simulated=True,fork=lambda:0,enter_cgroup=lambda c:step('membership'),
+                apply_launch_credentials_and_close_fds=lambda m:step('setup'),stop_then_exec_parent=lambda *a:step('stop'))
+            roles=lb.ProcessRoles(p,attempt='p1v-fixture',manifest={})
+            with patch('os._exit',side_effect=LifecycleExit) as terminal, self.assertRaises(LifecycleExit):
+                try:roles.prepare_stopped_child(parent_argv('p1v-fixture'),canonical_json(LaunchMachine().baseline),'/synthetic')
+                except Exception:events.append('SUPERVISOR/JOURNAL');raise
+            terminal.assert_called_once_with(127)
+            self.assertEqual(events,['membership','setup','stop'][:('membership','setup','stop').index(stage)+1])
+
+    def test_child_local_exec_failure(self):
+        m=LaunchMachine();events=[]
+        p=SimpleNamespace(simulated=True,fork=lambda:0,enter_cgroup=lambda c:None,
+            apply_launch_credentials_and_close_fds=lambda value:None,
+            stop_then_exec_parent=lambda *args:lb.NativeProcesses.stop_then_exec_parent(m.proc,*args))
+        roles=lb.ProcessRoles(p,attempt='p1v-fixture',manifest={})
+        with patch('os.getpid',return_value=41),patch('os.kill',side_effect=lambda *a:events.append('STOP/CONT')), \
+             patch('os.execve',side_effect=OSError('exec failed')) as execute,patch('os._exit',side_effect=LifecycleExit) as terminal:
+            with self.assertRaises(LifecycleExit):roles.prepare_stopped_child(parent_argv('p1v-fixture'),canonical_json(m.baseline),'/synthetic')
+        self.assertEqual(events,['STOP/CONT']);execute.assert_called_once();terminal.assert_called_once_with(127)
+        with patch('os.kill') as resume,patch('os.waitpid',return_value=(41,127<<8)) as reap:
+            self.assertEqual(lb.NativeProcesses.resume_wait_once(m.proc,41),{'pid':41,'exited':True,'exit_code':127})
+        reap.assert_called_once_with(41,0);resume.assert_called_once()
+
+    def test_protected_worker_failure_hold(self):
+        for protected in (False,True):
+            owner=SimpleNamespace(protection_owned=lambda:protected,failure_receipt=lambda:{'worker_pid':40,'control_fd':10})
+            events=[];shared=bytearray(65536)
+            p=SimpleNamespace(simulated=True,fork=lambda:0,stop_self=lambda:events.append('bootstrap'),
+                exit_worker=Mock(side_effect=LifecycleExit),failed_hold_forever=Mock(side_effect=LifecycleExit))
+            roles=lb.ProcessRoles(p,attempt='p1v-fixture',manifest={});roles.bind_failure_owner(owner)
+            with self.assertRaises(LifecycleExit):roles._guardian(lambda:{'status':'FAIL'},shared)
+            if protected:
+                p.exit_worker.assert_not_called();p.failed_hold_forever.assert_called_once()
+                p.fork=lambda:40;p.wait_once=lambda *a:{'pid':40,'stopped':True};p.resume_wait_worker=lambda pid:{'pid':pid,'stopped':True}
+                result=roles._guardian(lambda:None,shared)
+                self.assertEqual(result['status'],'FAIL_FOR_REVIEW_HOLDING');self.assertTrue(result['worker_stopped'])
+                self.assertEqual(result['ownership_observation']['control_fd'],10)
+                self.assertFalse(result['attempt_reusable']);self.assertFalse(result['automatic_restoration'])
+                owner.failure_receipt=Mock(side_effect=OSError('owner observation failed'));p.fork=lambda:0
+                with self.assertRaises(LifecycleExit):roles._guardian(lambda:{'status':'FAIL'},shared)
+                self.assertEqual(shared[:4],bytes(4));p.exit_worker.assert_not_called()
+            else:p.exit_worker.assert_called_once_with(1);p.failed_hold_forever.assert_not_called()
+        with patch('os.kill',side_effect=[None,LifecycleExit]) as stop,patch('signal.pthread_sigmask') as mask:
+            with self.assertRaises(LifecycleExit):lb.NativeProcesses.failed_hold_forever()
+        self.assertEqual(stop.call_count,2);mask.assert_called_once()
+
+    def test_confinement_hold_readback_phase(self):
+        from .test_live_system import hold_fixture
+        native=object.__new__(lb.NativePrimitives);native.context=();native._device=Mock()
+        allowed={'TOPOLOGY','FILESYSTEM_RO','DEVICE_RO','PROTECTED','CONFINEMENT','REVALIDATE','HASH','DEVICE_RW','FILESYSTEM_RW'}
+        def ioctl(fd,request,value,mutate):self.assertEqual(request,lb.BLKROGET);value[0]=1
+        with patch.object(lb,'require_adapter_grant'),patch('os.geteuid',return_value=0),patch('fcntl.ioctl',side_effect=ioctl):
+            for action in plan('p1v-fixture'):
+                native.current_action=lambda:action.name
+                if action.name in allowed:self.assertEqual(native.block_get(40),1)
+                else:
+                    with self.assertRaisesRegex(InvalidEvidence,'outside phase'):native.block_get(40)
+        lb.validate_hold_proof(hold_fixture())
+        for field in hold_fixture():
+            value=hold_fixture();value[field]=None
+            with self.assertRaises(InvalidEvidence):lb.validate_hold_proof(value)
+        # The journal really resets pending after PASS; the retained receipt needs no syscall.
+        journal=object.__new__(lb.DurableJournal);journal.failed=False;journal.attempt='p1v-fixture';journal.pending=(10,'CONFINEMENT')
+        journal.next_step=10;journal.sequence=20;journal.previous='0'*64;journal.publish=lambda *a:'1'*64
+        journal.retain({'step':10,'action':'CONFINEMENT','status':'PASS'})
+        native.current_action=lambda:journal.pending[1] if journal.pending else 'AUTHORITY'
+        with self.assertRaisesRegex(InvalidEvidence,'outside phase'):native.block_get(40)
+        lb.validate_hold_proof(hold_fixture())
+
+    def test_relational_session_contract_parser(self):
+        from .test_live_system import sessions_fixture
+        value=LaunchMachine().baseline
+        lb.LaunchManifest.parse(value,authority_issue=252)
+        old=copy.deepcopy(value);old['session']=launch_fixture()['session']
+        with self.assertRaisesRegex(InvalidEvidence,'new authority'):lb.LaunchManifest.parse(old,authority_issue=252)
+        self.assertEqual(lb.session_relationship(sessions_fixture()),lb.SESSION_POLICY)
+        for field in lb.SESSION_POLICY:
+            bad=copy.deepcopy(value);bad['session'][field]=False if field!='policy' else 'NUMERIC'
+            with self.assertRaises(InvalidEvidence):lb.LaunchManifest.parse(bad,authority_issue=252)
+        for field in ('session_id','process_group','autogroup'):
+            raw=sessions_fixture();raw['child'][field]=999 if field!='autogroup' else '/autogroup-8 nice 0'
+            with self.assertRaises(InvalidEvidence):lb.session_relationship(raw)
+        tree=ast.parse(Path(lb.__file__).read_text())
+        self.assertFalse(any(isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)
+                             and n.func.attr in ('setsid','setpgid') for n in ast.walk(tree)))
 
 
 if __name__ == "__main__":
