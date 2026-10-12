@@ -39,7 +39,7 @@ use crate::predictor_v2::{P1jIdentity, P1jTerminal, PhysicalInstallIdentity};
 use crate::sampling::SamplingParams;
 
 use crate::gpu_native_predictor_v2_critical_path_attribution::{self as p1r, Event as P1rEvent};
-use crate::predictor_v2::p1e;
+use crate::predictor_v2::{p1e, p1x};
 use crate::predictor_v2::{
     AccountingError as PredictorV2AccountingError, ModelMetadata as PredictorV2ModelMetadata,
     ObservationConfig as PredictorV2ObservationConfig,
@@ -1858,6 +1858,47 @@ impl GpuNativeTokenLoop {
         pending.cleanup.armed = false;
     }
 
+    fn observe_p1x_completed(
+        &self, engine: &Engine, request: &mut GpuNativeRequestState,
+        position: usize, routes: &[Vec<u32>],
+    ) {
+        let Some((observer,origin)) = request.p1x.as_mut() else { return; };
+        let result = (|| -> p1x::Result<()> {
+            if !engine.core.gpu_native_residency.as_ref().is_some_and(|m| Arc::ptr_eq(m,&self.residency_manager))
+                || !engine.core.gpu_cache.as_ref().is_some_and(|c| Arc::ptr_eq(c,self.residency_manager.gpu_cache())) {
+                return Err(p1x::Error::Identity);
+            }
+            observer.commit(position,routes,true)?;
+            for layer in 3..=47 {
+                if let Some(candidate)=observer.pending_candidate(layer,position+1) {
+                    let physical=self.residency_manager.try_observe_p1x_physical(candidate.global_expert)
+                        .map_err(|_| p1x::Error::PhysicalIdentity)?;
+                    let logical=self.residency_manager.gpu_cache().observe_logical_host(candidate.global_expert);
+                    let source=p1x::HostSource {
+                        logical_generation:logical.map(|v| v.generation),
+                        logical_materialized:Some(logical.is_some_and(|v| v.host_payload_present)),
+                        ram_resident:Some(engine.core.cache.contains(candidate.global_expert)),
+                    };
+                    observer.freeze(candidate,p1e_host_timestamp(origin).ok_or(p1x::Error::Overflow)?,physical,source)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e)=result { observer.invalidate(e); }
+    }
+
+    fn observe_p1x_deadline(&self, request: &mut GpuNativeRequestState, position: usize, layer: usize) {
+        let Some((observer,origin))=request.p1x.as_mut() else { return; };
+        let Some(candidate)=observer.deadline_candidate(layer,position) else { return; };
+        let result=(|| -> p1x::Result<()> {
+            let timestamp=p1e_host_timestamp(origin).ok_or(p1x::Error::Overflow)?;
+            let physical=self.residency_manager.try_observe_p1x_physical(candidate.global_expert)
+                .map_err(|_| p1x::Error::PhysicalIdentity)?;
+            observer.deadline(candidate,timestamp,physical)
+        })();
+        if let Err(e)=result { observer.invalidate(e); }
+    }
+
     fn observe_p1e_completed(
         &self,
         engine: &Engine,
@@ -2403,6 +2444,7 @@ impl GpuNativeTokenLoop {
             committed_position: 0,
             max_seq_len: self.model_geometry.max_seq_len,
             predictor_v2_observation: self.predictor_v2_requests.allocate(),
+            p1x: None,
             p1j: None,
             p1r_attempt: 0,
             p1r_position: 0,
@@ -3408,9 +3450,18 @@ impl GpuNativeTokenLoop {
                     .filter(|_| fail_layer == p1e::LAYER)
                     .map(|r| r.context(position, attempts - 1));
                 let started = diag.as_ref().and_then(p1r::Context::now);
+                let mut p1x_receipt=request.p1x.as_ref()
+                    .and_then(|(o,_)| o.pending_candidate(fail_layer,position))
+                    .map(|c| p1x::DemandEvidence { global:c.global_expert, ..Default::default() });
                 let result = engine
-                    .ensure_gpu_native_demand_residency_p1r(fail_layer, &global_ids, diag.as_ref())
+                    .ensure_gpu_native_demand_residency_observed(fail_layer, &global_ids, diag.as_ref(), p1x_receipt.as_mut())
                     .await;
+                if let Some(mut receipt)=p1x_receipt {
+                    receipt.service_ns=u64::try_from(residency_started.elapsed().as_nanos()).ok();
+                    if let Some((observer,_))=request.p1x.as_mut() {
+                        observer.demand_evidence(position,fail_layer,receipt);
+                    }
+                }
                 if let Some(d) = &diag {
                     d.set(
                         P1rEvent::Service,
@@ -3539,6 +3590,7 @@ impl GpuNativeTokenLoop {
                 position,
                 report.selected_ids.get(p1e::LAYER).map(Vec::as_slice),
             );
+            self.observe_p1x_completed(engine, request, position, &report.selected_ids);
             self.observe_p1e_completed(engine, request, position);
             self.launch_p1j_at_freeze(request, source_completion);
 
@@ -3857,6 +3909,12 @@ impl GpuNativeTokenLoop {
             }
             request.p1r_attempt = request.p1r_attempt.saturating_add(1);
         }
+        if let Some((observer,_))=request.p1x.as_mut() {
+            if let Err(e)=observer.begin_attempt(position,
+                !full_token_replay && segment.attempt_start == GpuNativeAttemptStart::Fresh) {
+                observer.invalidate(e);
+            }
+        }
         let p1e_deadline_eligible = request
             .predictor_v2_observation
             .enabled
@@ -3965,6 +4023,7 @@ impl GpuNativeTokenLoop {
         }
 
         for layer_idx in segment.ordinary_layers.clone() {
+            self.observe_p1x_deadline(request, position, layer_idx);
             if p1e_deadline_eligible && layer_idx == p1e::LAYER {
                 if let Some(r) = &request.predictor_v2_observation.p1r {
                     r.context(position, 0).stamp(P1rEvent::DEntry, &[]);
@@ -4483,12 +4542,39 @@ pub struct GpuNativeRequestState {
     pub committed_position: usize,
     pub max_seq_len: usize,
     predictor_v2_observation: PredictorV2RequestObservation,
+    p1x: Option<(p1x::Observer, Instant)>,
     p1j: Option<Box<P1jRequest>>,
     p1r_attempt: usize,
     p1r_position: usize,
 }
 
 impl GpuNativeRequestState {
+    pub(crate) fn enable_p1x(&mut self, token_loop: &GpuNativeTokenLoop, prompt_length: usize, positions: usize) -> p1x::Result<()> {
+        if self.committed_position != 0 || self.p1x.is_some() || self.p1j.is_some()
+            || self.predictor_v2_observation.enabled.is_some() || token_loop.q4_qualification.get().is_some() {
+            return Err(p1x::Error::Identity);
+        }
+        let geometry=token_loop.model_geometry();
+        if geometry.num_layers!=48 || geometry.num_experts!=128 || geometry.top_k!=8 {
+            return Err(p1x::Error::Identity);
+        }
+        let plans=token_loop.residency_manager.plan().layer_plans();
+        if plans.len()!=48 || plans.iter().enumerate().any(|(i,p)| p.slot_capacity()!=if i<3 {128} else if i==3 {73} else {8}) {
+            return Err(p1x::Error::Identity);
+        }
+        let mut identity=self.predictor_v2_observation.identity.ok_or(p1x::Error::Identity)?;
+        if Some(identity.runtime_namespace)!=token_loop.predictor_v2_requests.runtime_namespace {
+            return Err(p1x::Error::Identity);
+        }
+        identity.phase=PredictorV2RequestPhase::Measured;
+        self.p1x=Some((p1x::Observer::new(identity,prompt_length,positions)?,Instant::now()));
+        Ok(())
+    }
+    pub(crate) fn finish_p1x(&mut self) -> p1x::Result<p1x::Report> {
+        let (observer,_)=self.p1x.as_mut().ok_or(p1x::Error::Identity)?;
+        observer.finish(); observer.report()
+    }
+
     pub(crate) fn enable_p1r(&mut self) -> Result<Arc<p1r::Recorder>, String> {
         if self.committed_position != 0
             || self.p1j.is_none()

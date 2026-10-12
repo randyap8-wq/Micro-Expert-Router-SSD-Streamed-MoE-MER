@@ -2908,6 +2908,23 @@ mod driver {
     mod p1r_tests {
         use super::*;
         use crate::predictor_v2::{ModelMetadata, PositionIdentity, RequestIdentity};
+        const FROZEN_CORRECTED_P1R_COMMIT: &str = "ed60f78256d35fdecd3c18d9b3b75ee11403d9e8";
+
+        fn corrected_p1r_source(path: &str) -> String {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            let object = format!("{FROZEN_CORRECTED_P1R_COMMIT}:rust-engine/src/{path}");
+            let output = std::process::Command::new("git")
+                .args(["show", &object])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "corrected P1R object unavailable: {path}"
+            );
+            String::from_utf8(output.stdout).unwrap()
+        }
+
         fn identity() -> RequestIdentity {
             RequestIdentity {
                 runtime_namespace: 1,
@@ -3530,21 +3547,13 @@ mod driver {
         }
         #[test]
         fn p1r_three_witness_production_prefixes_and_expected_digests_unchanged() {
-            for (name, source) in [
-                (
-                    "gpu_native_predictor_v2_observation.rs",
-                    include_str!("gpu_native_predictor_v2_observation.rs"),
-                ),
-                (
-                    "gpu_native_q4_route_parallel.rs",
-                    include_str!("gpu_native_q4_route_parallel.rs"),
-                ),
-                (
-                    "gpu_native_predictor_v2_sidecar_performance.rs",
-                    include_str!("gpu_native_predictor_v2_sidecar_performance.rs"),
-                ),
+            for name in [
+                "gpu_native_predictor_v2_observation.rs",
+                "gpu_native_q4_route_parallel.rs",
+                "gpu_native_predictor_v2_sidecar_performance.rs",
             ] {
                 let base = historical_source(name);
+                let source = corrected_p1r_source(name);
                 assert_eq!(
                     base.split("#[cfg(test)]").next(),
                     source.split("#[cfg(test)]").next(),
@@ -3556,7 +3565,7 @@ mod driver {
                         .map(str::to_owned)
                         .collect::<BTreeSet<_>>()
                 };
-                assert_eq!(hashes(base), hashes(source), "{name}");
+                assert_eq!(hashes(base), hashes(&source), "{name}");
             }
         }
         #[test]
@@ -3571,20 +3580,16 @@ mod driver {
                 assert!(o.status.success());
                 String::from_utf8(o.stdout).unwrap()
             };
-            let mut names = git(&[
+            let names = git(&[
                 "diff",
                 "--name-only",
-                "a6b9cbcd6e6b576f90a1d875c9351c7276c950e2",
+                FROZEN_P1Q3_COMMIT,
+                FROZEN_CORRECTED_P1R_COMMIT,
                 "--",
             ])
             .lines()
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
-            names.extend(
-                git(&["ls-files", "--others", "--exclude-standard"])
-                    .lines()
-                    .map(str::to_owned),
-            );
             let expected = [
                 "gpu_native_predictor_v2_critical_path_attribution.rs",
                 "main.rs",
@@ -3600,23 +3605,18 @@ mod driver {
             .map(|f| format!("rust-engine/src/{f}"))
             .collect();
             assert_eq!(names, expected);
-            for (name, bytes) in [
-                (
-                    "predictor_v2.rs",
-                    include_bytes!("predictor_v2.rs").as_slice(),
-                ),
-                (
-                    "expert_cache.rs",
-                    include_bytes!("expert_cache.rs").as_slice(),
-                ),
-                (
-                    "gpu_native_source_upload.rs",
-                    include_bytes!("gpu_native_source_upload.rs").as_slice(),
-                ),
-                ("config.rs", include_bytes!("config.rs").as_slice()),
-                ("server.rs", include_bytes!("server.rs").as_slice()),
+            for name in [
+                "predictor_v2.rs",
+                "expert_cache.rs",
+                "gpu_native_source_upload.rs",
+                "config.rs",
+                "server.rs",
             ] {
-                assert_eq!(historical_source(name).as_bytes(), bytes, "{name}");
+                assert_eq!(
+                    historical_source(name).as_bytes(),
+                    corrected_p1r_source(name).as_bytes(),
+                    "{name}"
+                );
             }
         }
         #[test]

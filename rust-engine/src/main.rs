@@ -155,6 +155,7 @@ pub(crate) mod gpu_native_oracle_routes;
 pub(crate) mod gpu_native_oracle_scheduled_residency;
 pub(crate) mod gpu_native_real_benchmark;
 mod gpu_native_predictor_v2_observation;
+mod gpu_native_predictor_v2_multilayer;
 mod gpu_native_predictor_v2_critical_path_attribution;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
@@ -920,6 +921,8 @@ enum Cmd {
     },
 
     /// Observe frozen request-local P1E accounting on one qualification request.
+    #[command(name = "observe-gpu-native-predictor-v2-p1x")]
+    ObserveGpuNativePredictorV2P1x(crate::gpu_native_predictor_v2_multilayer::CommandArgs),
     #[command(name = "observe-gpu-native-predictor-v2-p1e")]
     ObserveGpuNativePredictorV2P1e(crate::gpu_native_predictor_v2_observation::CommandArgs),
 
@@ -2057,6 +2060,7 @@ fn parse_autotune_probe_output(
 
 fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
     match cmd {
+        Cmd::ObserveGpuNativePredictorV2P1x(args) => Some(args.config.as_path()),
         Cmd::ObserveGpuNativePredictorV2P1e(args) => Some(args.config.as_path()),
         Cmd::DiagnoseGpuNativePredictorV2CriticalPathAttribution(args) => {
             Some(args.config.as_path())
@@ -2506,6 +2510,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     progress_watchdog,
                 },
             ))
+        }
+        Cmd::ObserveGpuNativePredictorV2P1x(args) => {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(crate::gpu_native_predictor_v2_multilayer::run_command(args))
         }
         Cmd::ObserveGpuNativePredictorV2P1e(args) => {
             let rt = tokio::runtime::Builder::new_multi_thread()

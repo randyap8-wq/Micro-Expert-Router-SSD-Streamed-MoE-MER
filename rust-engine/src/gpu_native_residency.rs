@@ -589,6 +589,40 @@ fn copy_p1e_snapshot<T>(
     Ok(snapshot)
 }
 
+/// The manager owns ordinary installs under this same lock through arena
+/// commit and record insertion (and retirement through record removal).
+/// An acquired lock and absent record therefore proves ordinary absence.
+fn try_p1x_record(
+    global: u32,
+    identity: GpuNativeLayerExpertId,
+    context: u64,
+    arena_identity: usize,
+    state: &Mutex<LayerResidencyState>,
+    verify: impl FnOnce(GpuNativeQ4ExpertResidency) -> Option<bool>,
+) -> Result<crate::predictor_v2::p1x::Physical, GpuNativeTieredResidencyError> {
+    use crate::predictor_v2::p1x::{Physical, PhysicalIdentity};
+    let Some(state) = state.try_lock() else { return Ok(Physical::Unknown); };
+    let Some(record) = state.residents.peek(&global) else { return Ok(Physical::Absent); };
+    if record.key.layer_index() != identity.layer_index
+        || record.key.expert_id() != identity.local_expert_id
+        || record.residency.key() != record.key
+    {
+        return Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt { global_id: global });
+    }
+    match verify(record.residency) {
+        None => Ok(Physical::Unknown),
+        Some(false) => Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt { global_id: global }),
+        Some(true) => Ok(Physical::Current(PhysicalIdentity {
+            context, arena: arena_identity, layer: identity.layer_index,
+            expert: identity.local_expert_id,
+            generation: record.key.logical_generation(),
+            bank: record.residency.location().bank(),
+            slot: record.residency.location().slot(),
+            epoch: record.residency.slot_epoch(),
+        })),
+    }
+}
+
 fn p1e_resident(record: PhysicalRecord) -> crate::predictor_v2::p1e::Resident {
     crate::predictor_v2::p1e::Resident {
         expert: record.key.expert_id(),
@@ -1312,6 +1346,22 @@ impl GpuNativeTieredResidencyManager {
             .as_deref_mut()
             .ok_or(p1e::Error::Incomplete)?
             .evidence(actual)
+    }
+
+    /// Arbitrary-layer, candidate-specific P1X observation; both locks are
+    /// try_lock only. No P1E snapshot, P1J lookup or physical-policy operation.
+    pub(crate) fn try_observe_p1x_physical(
+        &self,
+        global: u32,
+    ) -> Result<crate::predictor_v2::p1x::Physical, GpuNativeTieredResidencyError> {
+        let identity = self.identity(global)?;
+        let layer = &self.layers[identity.layer_index];
+        if layer.arena.layer_index() != identity.layer_index {
+            return Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt { global_id: global });
+        }
+        try_p1x_record(global, identity, self.executor.context_id(),
+            Arc::as_ptr(&layer.arena) as usize, &layer.state,
+            |residency| layer.arena.try_contains_exact_residency(self.executor.context_id(), residency))
     }
 
     pub(crate) fn executor(&self) -> &Arc<GpuNativeExecutorContext> {
@@ -2888,6 +2938,40 @@ pub(crate) fn validate_qualification_physical_source_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn p1x_manager_busy_absent_exact_mismatch_73_slots_and_no_lru_counter_changes() {
+        use crate::backend::gpu_native::tests::{p1x_fixture,p1x_invalid_residencies,p1x_with_busy_arena};
+        use crate::predictor_v2::p1x::Physical;
+        for (layer,capacity) in [(3,73),(47,8)] {
+            let (arena,residents)=p1x_fixture(layer,capacity);
+            let state=Mutex::new(LayerResidencyState::default());
+            for r in &residents { state.lock().residents.put(layer as u32*128+r.key().expert_id(),PhysicalRecord {key:r.key(),residency:*r}); }
+            let before=state.lock().residents.iter().map(|(&id,r)|(id,r.key,r.residency)).collect::<Vec<_>>();
+            let arena_before=arena.residency_snapshot();
+            let observe=|global| try_p1x_record(global,global_to_layer_local(global,48,128).unwrap(),7,123,&state,
+                |r| arena.try_contains_exact_residency(7,r));
+            for r in &residents {
+                assert!(matches!(observe(layer as u32*128+r.key().expert_id()),Ok(Physical::Current(p)) if p.expert==r.key().expert_id() && p.layer==layer));
+            }
+            assert_eq!(observe(layer as u32*128+127).unwrap(),Physical::Absent);
+            let global=layer as u32*128;
+            { let _held=state.lock(); assert_eq!(observe(global).unwrap(),Physical::Unknown); }
+            p1x_with_busy_arena(&arena,||assert_eq!(observe(global).unwrap(),Physical::Unknown));
+            assert_eq!(state.lock().residents.iter().map(|(&id,r)|(id,r.key,r.residency)).collect::<Vec<_>>(),before);
+            assert_eq!(arena.residency_snapshot(),arena_before);
+            assert_eq!(state.lock().physical_evictions,0);
+            assert!(state.lock().last_installed_generations.is_empty());
+            assert!(state.lock().p1e_shadow.is_none());
+            for invalid in p1x_invalid_residencies(residents[0]) {
+                state.lock().residents.put(global,PhysicalRecord {key:invalid.key(),residency:invalid});
+                assert!(matches!(observe(global),Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt {..})));
+            }
+            // Manager key and arena residency disagree even if arena owner is valid.
+            state.lock().residents.put(global,PhysicalRecord {key:residents[1].key(),residency:residents[0]});
+            assert!(matches!(observe(global),Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt {..})));
+        }
+    }
+
     #[test]
     fn p1m_every_host_lease_and_claim_refusal_maps_exactly() {
         use HostBackedLeaseResult as H;

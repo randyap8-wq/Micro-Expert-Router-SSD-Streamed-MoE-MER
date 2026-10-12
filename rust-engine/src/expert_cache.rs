@@ -2182,6 +2182,22 @@ impl GpuExpertCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn p1x_arbitrary_layer_source_peeks_do_not_touch_lru_counters_or_payload_owners() {
+        for layer in [3u32,17,47] {
+            let cache=GpuExpertCache::new(32,0.0,3);
+            let a=gpu_res(layer*128,16); let b=gpu_res(layer*128+1,16);
+            assert!(cache.promote_sync(a.clone()));assert!(cache.promote_sync(b.clone()));
+            let before=cache.inner.lock().lru.iter().map(|(&id,_)| id).collect::<Vec<_>>();
+            let counts=(cache.hits(),cache.misses(),cache.promotions(),cache.used_bytes(),cache.host_backed_lease_snapshot());
+            let owners=(Arc::strong_count(&a),Arc::strong_count(&b));
+            for _ in 0..32 { let observation=cache.observe_logical_host(layer*128).unwrap();assert!(observation.host_payload_present);assert!(observation.generation>0); }
+            assert_eq!(cache.inner.lock().lru.iter().map(|(&id,_)| id).collect::<Vec<_>>(),before);
+            assert_eq!((cache.hits(),cache.misses(),cache.promotions(),cache.used_bytes(),cache.host_backed_lease_snapshot()),counts);
+            assert_eq!((Arc::strong_count(&a),Arc::strong_count(&b)),owners);
+            assert_eq!(cache.observe_logical_host(layer*128+127),None);
+        }
+    }
     use super::*;
     use crate::buffer_pool::BufferPool;
 

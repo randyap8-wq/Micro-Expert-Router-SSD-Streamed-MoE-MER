@@ -3949,6 +3949,31 @@ impl<B> GpuNativeQ4ExpertArena<B> {
             })
     }
 
+    /// P1X candidate-only evidence. Contention is unknown; no recency,
+    /// telemetry, payload, mapping or sidecar operation is reachable here.
+    pub(crate) fn try_contains_exact_residency(
+        &self,
+        context_id: u64,
+        residency: GpuNativeQ4ExpertResidency,
+    ) -> Option<bool> {
+        let state = self.state.try_lock()?;
+        if self.context_id != context_id || residency.key.layer_index != self.layer_index {
+            return Some(false);
+        }
+        let logical_id = residency.key.expert_id as usize;
+        let Some(flat_slot) = state.logical_slots.get(logical_id).copied().flatten() else {
+            return Some(false);
+        };
+        Some(state.latest_generations.get(logical_id).copied().flatten()
+            == Some(residency.key.logical_generation)
+            && state.slots.get(flat_slot).is_some_and(|slot| {
+                slot.location == residency.location
+                    && slot.last_epoch == residency.slot_epoch
+                    && matches!(slot.owner,
+                        GpuNativeQ4ExpertSlotOwner::Resident(current) if current == residency)
+            }))
+    }
+
     pub(crate) const fn vram_plan(&self) -> GpuNativeQ4ExpertVramPlan {
         self.plan
     }
@@ -12372,6 +12397,57 @@ pub(crate) mod tests {
             (),
             state,
         )
+    }
+
+    // P1X pure CPU fixture: unit buffers and no-op writers, no executor/device.
+    pub(crate) fn p1x_fixture(layer: usize, capacity: usize) -> (GpuNativeQ4ExpertArena<()>, Vec<GpuNativeQ4ExpertResidency>) {
+        let mut arena = test_mutable_expert_arena(capacity);
+        arena.layer_index = layer;
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, 0.02, 0.005);
+        let mut residents = Vec::new();
+        for expert in 0..capacity {
+            let permit = expect_expert_install(arena.acquire_with_unpublish(
+                GpuNativeQ4ExpertKey::new(layer, expert as u32, 1), |_, _| {}).unwrap());
+            residents.push(permit.install_with_writes(&payload, |_, _, _| {}, |_, _| {}).unwrap());
+        }
+        (arena, residents)
+    }
+    pub(crate) fn p1x_invalid_residencies(r: GpuNativeQ4ExpertResidency) -> [GpuNativeQ4ExpertResidency; 4] {
+        let mut generation = r; generation.key.logical_generation += 1;
+        let mut bank = r; bank.location.bank += 1;
+        let mut slot = r; slot.location.slot += 1;
+        let mut epoch = r; epoch.slot_epoch += 1;
+        [generation, bank, slot, epoch]
+    }
+    pub(crate) fn p1x_with_busy_arena<T>(arena: &GpuNativeQ4ExpertArena<()>, f: impl FnOnce() -> T) -> T {
+        let _held = arena.state.lock(); f()
+    }
+    #[test]
+    fn p1x_arena_exact_nonblocking_predicate_all_identities_and_no_counters() {
+        for (layer,capacity) in [(3,73),(47,8)] {
+            let (arena,residents) = p1x_fixture(layer,capacity);
+            let before = arena.residency_snapshot();
+            for r in &residents {
+                assert_eq!(arena.try_contains_exact_residency(7,*r),Some(true));
+                assert_eq!(arena.try_contains_exact_residency(8,*r),Some(false));
+                assert_eq!(arena.contains_exact_residency(7,*r),true);
+                for invalid in p1x_invalid_residencies(*r) {
+                    assert_eq!(arena.try_contains_exact_residency(7,invalid),Some(false));
+                    assert!(!arena.contains_exact_residency(7,invalid));
+                }
+                let mut wrong_layer=*r; wrong_layer.key.layer_index+=1;
+                assert_eq!(arena.try_contains_exact_residency(7,wrong_layer),Some(false));
+                let mut wrong_expert=*r; wrong_expert.key.expert_id=128;
+                assert_eq!(arena.try_contains_exact_residency(7,wrong_expert),Some(false));
+            }
+            p1x_with_busy_arena(&arena,||assert_eq!(arena.try_contains_exact_residency(7,residents[0]),None));
+            assert_eq!(arena.residency_snapshot(),before);
+            // Keep the mapping/generation/location/epoch exact; corrupt only owner.
+            let flat=arena.state.lock().logical_slots[0].unwrap();
+            arena.state.lock().slots[flat].owner=GpuNativeQ4ExpertSlotOwner::Resident(residents[1]);
+            assert_eq!(arena.try_contains_exact_residency(7,residents[0]),Some(false));
+            assert!(!arena.contains_exact_residency(7,residents[0]));
+        }
     }
 
     fn expect_expert_install<'a, B>(

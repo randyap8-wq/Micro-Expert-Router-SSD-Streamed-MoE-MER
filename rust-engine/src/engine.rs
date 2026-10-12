@@ -6892,6 +6892,12 @@ impl Engine {
         Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>,
         GpuNativeDemandResidencyError,
     > {
+        self.ensure_gpu_native_demand_residency_observed(layer_index, global_ids, diag, None).await
+    }
+    pub(crate) async fn ensure_gpu_native_demand_residency_observed(
+        self: &Arc<Self>, layer_index: usize, global_ids: &[u32], diag: Option<&P1rContext>,
+        mut p1x: Option<&mut crate::predictor_v2::p1x::DemandEvidence>,
+    ) -> Result<Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>, GpuNativeDemandResidencyError> {
         let context = diag.map(|d| d.selected(global_ids));
         let diag = context.as_ref();
         let manager = self
@@ -6966,6 +6972,7 @@ impl Engine {
                 );
             }
             let physical_missing = gpu_native_physical_missing_ids(global_ids, &physical_current);
+            if let Some(receipt)=p1x.as_deref_mut() { receipt.missing(&physical_missing); }
             if let Some(d) = diag {
                 d.set(P1rEvent::Probe, d.now(), &physical_missing, 1);
             }
@@ -7156,6 +7163,9 @@ impl Engine {
             }
             match physical_install_result {
                 Ok(residencies) => {
+                    // P1X does not infer a new install from Ok(residencies):
+                    // an intervening ordinary install can turn a probe miss into a hit.
+                    // Without an exact per-candidate commit receipt, installation is unknown.
                     if let Some(upload) = source_upload.as_ref() {
                         upload.finish_request().map_err(|source| {
                             GpuNativeDemandResidencyError::ProductionBatchReadFailedAfterReservation {

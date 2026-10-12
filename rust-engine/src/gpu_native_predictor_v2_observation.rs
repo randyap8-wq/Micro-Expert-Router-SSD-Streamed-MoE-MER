@@ -53,7 +53,7 @@ struct Message {
     content: String,
 }
 
-fn parse_request(bytes: &[u8]) -> Result<(String, usize)> {
+pub(crate) fn parse_request(bytes: &[u8]) -> Result<(String, usize)> {
     let input: RequestInput = serde_json::from_slice(bytes)?;
     if input.max_tokens == 0
         || !(input.temperature == Some(0.0) || input.top_k == Some(1))
@@ -480,7 +480,7 @@ struct Report {
     has_nonzero_target_confirmed_useful_opportunities: Option<bool>,
 }
 
-fn ensure_output_absent(path: &Path) -> Result<()> {
+pub(crate) fn ensure_output_absent(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Err(format!(
             "refusing to overwrite observation evidence {}",
@@ -492,7 +492,7 @@ fn ensure_output_absent(path: &Path) -> Result<()> {
     }
 }
 
-fn write_report(path: &Path, report: &impl Serialize) -> Result<()> {
+pub(crate) fn write_report(path: &Path, report: &impl Serialize) -> Result<()> {
     ensure_output_absent(path)?;
     let bytes = serde_json::to_vec_pretty(report)?;
     let parent = path
