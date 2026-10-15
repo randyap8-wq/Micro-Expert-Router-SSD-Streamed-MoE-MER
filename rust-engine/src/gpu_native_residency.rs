@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+use crate::recovery_phase_telemetry::{self as rpt, Counter as RC, Phase as RP};
+
 use crate::backend::gpu_native::{
     GpuNativeBootstrapError, GpuNativeExecutorContext, GpuNativePhysicalInstallEvidence,
     GpuNativePhysicalSlotFillPolicy, GpuNativeProductionPhysicalInstallSnapshot,
@@ -2060,6 +2062,7 @@ impl GpuNativeTieredResidencyManager {
         }
 
         let reservation_started = OBSERVE.then(Instant::now);
+        let reservation = rpt::span(RP::PhysicalReservationWall);
         let mut reserved = Vec::with_capacity(misses.len());
         for &demand_index in misses {
             let GpuNativeDemandExpert::Install {
@@ -2221,6 +2224,7 @@ impl GpuNativeTieredResidencyManager {
                 ));
         }
 
+        drop(reservation);
         let upload = if let Some(production_source_upload) = production_source_upload {
             if OBSERVE
                 && observer
@@ -2250,7 +2254,9 @@ impl GpuNativeTieredResidencyManager {
         let copies = upload
             .filter(|u| u.arm == crate::gpu_native_source_upload::Arm::Treatment)
             .map(crate::gpu_native_source_upload::CopySet::new);
+        let recorder = rpt::current();
         let stage_one = |reserved: ReservedPhysicalInstall<'a>| {
+            let _stage = rpt::span(RP::PhysicalStageHostWorkerSum);
             let context = diag.and_then(|d| d.for_id(reserved.global_id));
             let mut p1r_stage = context.as_ref().map(|d| {
                 d.span(
@@ -2272,6 +2278,21 @@ impl GpuNativeTieredResidencyManager {
                 .map(|u| u.take_lease(reserved.global_id, &reserved.resident))
                 .transpose();
             let fused_source_upload = matches!(&lease, Ok(Some(Some(_))));
+            let mut stage_outcome = match &lease {
+                Err(_) => None,
+                Ok(Some(Some(_))) => Some(rpt::outcome(
+                    RP::FusedStageHost,
+                    RC::FusedStageAttempts,
+                    RC::FusedStageCompletions,
+                    RC::FusedStageFailures,
+                )),
+                _ => Some(rpt::outcome(
+                    RP::ConventionalStageHost,
+                    RC::ConventionalStageAttempts,
+                    RC::ConventionalStageCompletions,
+                    RC::ConventionalStageFailures,
+                )),
+            };
             let result = match lease {
                 Err(detail) => Err(crate::backend::gpu_native::GpuNativeBootstrapError::QualificationSourceUpload { detail }),
                 Ok(Some(Some(lease))) => self.executor.stage_q4_expert_source_upload(
@@ -2282,7 +2303,7 @@ impl GpuNativeTieredResidencyManager {
                         reserved.permit,
                         reserved.resident.data(),
                     )
-            } else if OBSERVE {
+            } else if OBSERVE || recorder.is_some() {
                 self.executor.stage_q4_expert_residency_production_observed(
                     reserved.permit,
                     reserved.resident.data(),
@@ -2298,6 +2319,32 @@ impl GpuNativeTieredResidencyManager {
             }
             match result {
                 Ok((prepared, mut evidence)) => {
+                    if let Some(outcome) = stage_outcome.as_mut() {
+                        outcome.succeed();
+                    }
+                    if recorder.is_some() && !fused_source_upload {
+                        rpt::add(RC::WriteBufferWithCompleted, evidence.direct_staging_writes);
+                        rpt::add(
+                            RC::CpuPayloadCopyBytes,
+                            evidence.physical_slot_payload_copy_bytes,
+                        );
+                        rpt::observed_microseconds(
+                            RP::StagingWriteHostWorkerSum,
+                            evidence.physical_queue_staging_us,
+                        );
+                        if evidence.physical_slot_subphase_observations != 0
+                            && evidence.physical_slot_timing_accounting_errors == 0
+                        {
+                            rpt::observed_microseconds(
+                                RP::CpuValidationHostWorkerSum,
+                                evidence.physical_slot_validation_us,
+                            );
+                            rpt::observed_microseconds(
+                                RP::CpuPayloadCopyHostWorkerSum,
+                                evidence.physical_slot_payload_copy_us,
+                            );
+                        }
+                    }
                     let individual_stage_us = stage_started.map_or(0, qualification_elapsed_us);
                     if !OBSERVE {
                         if let Some(upload) = upload {
@@ -2351,7 +2398,12 @@ impl GpuNativeTieredResidencyManager {
             }
         };
         let parallel_stage_started = OBSERVE.then(Instant::now);
-        let staged = collect_physical_stage_results_in_request_order(reserved, parallel, stage_one);
+        let stage_join = rpt::span(RP::PhysicalStageJoinWall);
+        let staged =
+            collect_physical_stage_results_in_request_order(reserved, parallel, |reserved| {
+                rpt::with_sync(recorder.clone(), || stage_one(reserved))
+            });
+        drop(stage_join);
         if OBSERVE {
             observer
                 .expect("observed production install has an observer")
@@ -2415,6 +2467,7 @@ impl GpuNativeTieredResidencyManager {
                 )
             });
             let commit_started = OBSERVE.then(Instant::now);
+            let commit = rpt::span(RP::PhysicalCommitHost);
             let commit_result = if OBSERVE {
                 self.executor
                     .commit_q4_expert_residency_production_observed(
@@ -2454,6 +2507,7 @@ impl GpuNativeTieredResidencyManager {
             if let Some(s) = &mut p1r_commit {
                 s.value(0, 1);
             }
+            drop(commit);
             remaining_successful = remaining_successful.saturating_sub(1);
             if !self
                 .gpu_cache
@@ -2501,6 +2555,7 @@ impl GpuNativeTieredResidencyManager {
                     residency,
                 }));
             }
+            rpt::add(RC::PhysicalCommits, 1);
             self.counters
                 .ram_to_vram_installs
                 .fetch_add(1, Ordering::Relaxed);

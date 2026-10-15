@@ -206,6 +206,8 @@ mod transformer;
 mod tui;
 mod workload;
 
+mod recovery_phase_telemetry;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::ffi::OsString;
