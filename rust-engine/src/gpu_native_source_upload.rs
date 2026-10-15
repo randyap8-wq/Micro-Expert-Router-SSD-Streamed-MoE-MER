@@ -1,6 +1,8 @@
 //! Private real-inference source/upload mechanism. No production constructor
 //! creates this state. Source I/O lives here; physical installation receives only
 //! a one-shot, identity-checked unmapped lease, never a storage handle.
+use crate::recovery_phase_telemetry::{self as rpt, Counter as RC, Phase as RP};
+
 use crate::backend::gpu_native::GpuNativeExecutorContext;
 use crate::buffer_pool::PooledBuffer;
 use crate::expert_cache::{ExpertResident, GpuExpertCache};
@@ -278,15 +280,25 @@ impl State {
         ids: &[u32],
         logical: &GpuExpertCache,
     ) -> bool {
-        self.arm == Arm::Treatment
+        let _eligibility = rpt::span(RP::FusionEligibilityHost);
+        let mut reason = RC::FallbackOther;
+        let eligible = self.arm == Arm::Treatment
             && !ids.is_empty()
             && ids.len() <= CAPACITY
             && !ids.iter().any(|id| self.pending.lock().contains_key(id))
             && ids.iter().all(|id| {
-                logical
+                let shareable = logical
                     .current_admission(*id)
-                    .is_none_or(|a| a.resident().qualification_shared_payload().is_some())
-            })
+                    .is_none_or(|a| a.resident().qualification_shared_payload().is_some());
+                if !shareable {
+                    reason = RC::FallbackNonsharedLogical;
+                }
+                shareable
+            });
+        if !eligible {
+            rpt::add(reason, 1);
+        }
+        eligible
     }
 
     pub(crate) fn add(&self, field: fn(&mut Metrics) -> &mut u64, n: u64) {
@@ -384,28 +396,44 @@ impl State {
         if remap {
             self.add(|m| &mut m.remap_attempts, 1);
         }
+        rpt::add(RC::MapAttempts, 1);
+        if remap {
+            rpt::add(RC::RemapAttempts, 1);
+        }
+        let _mapping = rpt::span(if remap {
+            RP::UploadRemapWall
+        } else {
+            RP::UploadFirstMapWall
+        });
         let start = Instant::now();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let map_api = rpt::span(RP::UploadMapApiHost);
         slot.buffer
             .slice(..)
             .map_async(wgpu::MapMode::Write, move |r| {
                 let _ = tx.send(r);
             });
+        drop(map_api);
         let gpu = ring
             .executor
             .authoritative_gpu()
             .map_err(|e| e.to_string())?;
+        let poll = rpt::span(RP::UploadPollWaitHost);
         gpu.device.poll(wgpu::Maintain::Wait);
+        drop(poll);
+        let channel = rpt::span(RP::UploadChannelWaitHost);
         let result = rx
             .recv()
             .map_err(|e| e.to_string())
             .and_then(|r| r.map_err(|e| e.to_string()));
+        drop(channel);
         let wait_us = elapsed(start);
         self.add(|m| &mut m.map_wait_us, wait_us);
         if remap {
             self.add(|m| &mut m.remap_wait_us, wait_us);
         }
         if let Err(error) = result {
+            rpt::add(RC::MappingUnavailableFailures, 1);
             if remap {
                 self.add(|m| &mut m.remap_failures, 1);
             }
@@ -420,6 +448,10 @@ impl State {
             self.add(|m| &mut m.remap_completions, 1);
         }
         *slot.ever_mapped.lock() = true;
+        rpt::add(RC::MapCompletions, 1);
+        if remap {
+            rpt::add(RC::RemapCompletions, 1);
+        }
         Ok(lease)
     }
     pub(crate) async fn read_source(
@@ -429,6 +461,12 @@ impl State {
         buffers: Vec<PooledBuffer>,
         logical: &GpuExpertCache,
     ) -> Result<Vec<Arc<ExpertResident>>, String> {
+        let mut fused = rpt::outcome(
+            RP::FusedSourceWall,
+            RC::FusedAttempts,
+            RC::FusedCompletions,
+            RC::FusedFailures,
+        );
         if self.arm != Arm::Treatment || ids.len() != buffers.len() || ids.len() > CAPACITY {
             return Err("invalid qualification source set".into());
         }
@@ -492,7 +530,9 @@ impl State {
         );
         let mut shared = Vec::with_capacity(ids.len());
         for ((&id, view), &offset) in ids.iter().zip(&views).zip(&offsets) {
+            let validation = rpt::span(RP::CpuValidationHostWorkerSum);
             let payload = checked_payload(&view[offset..offset + FULL])?;
+            drop(validation);
             let bytes = self.materialize_source_payload(id, payload, logical)?;
             shared.push(bytes);
         }
@@ -516,6 +556,7 @@ impl State {
         for lease in leases {
             pending.insert(lease.id, lease);
         }
+        fused.succeed();
         Ok(residents)
     }
     fn materialize_source_payload(
@@ -529,14 +570,22 @@ impl State {
                 .resident()
                 .qualification_shared_payload()
                 .ok_or("logical backing changed during source read")?;
+            let equality = rpt::span(RP::PayloadEqualityHost);
+            rpt::add(RC::EqualityComparisons, 1);
+            rpt::add(RC::EqualityInputBytes, payload.len() as u64);
             if shared.as_ref() != payload {
                 return Err("immutable source differs from shared logical payload".into());
             }
+            drop(equality);
             self.add(|m| &mut m.shared_payload_reuse, 1);
             shared.clone()
         } else {
             let start = Instant::now();
+            let copy = rpt::span(RP::ArcMaterializationHost);
             let shared: Arc<[u8]> = Arc::from(payload);
+            drop(copy);
+            rpt::add(RC::ArcMaterializations, 1);
+            rpt::add(RC::ArcMaterializationBytes, payload.len() as u64);
             self.add(|m| &mut m.logical_materialization_us, elapsed(start));
             self.add(|m| &mut m.logical_materialization_operations, 1);
             self.add(
@@ -619,6 +668,7 @@ impl<'a> CopySet<'a> {
         offset: u64,
     ) -> Result<(), String> {
         let start = Instant::now();
+        let _encode = rpt::span(RP::CopyEncodeHostWorkerSum);
         let source = lease.copy_source_offset()?;
         if offset % 4 != 0
             || offset
@@ -650,7 +700,12 @@ impl<'a> CopySet<'a> {
         let command = encoder.finish();
         self.state.add(|m| &mut m.copy_command_buffers, 1);
         let start = Instant::now();
+        let submit = rpt::span(RP::UploadCopySubmitHost);
         gpu.queue.submit(Some(command));
+        drop(submit);
+        rpt::add(RC::UploadCopySubmissions, 1);
+        rpt::add(RC::CopyBatches, 1);
+        rpt::add(RC::CopyBytes, (leases.len() * PAYLOAD) as u64);
         self.state.add(|m| &mut m.copy_submit_us, elapsed(start));
         self.state.add(|m| &mut m.copy_submissions, 1);
         self.state

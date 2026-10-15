@@ -35,6 +35,8 @@
 //! `io_provider` module is the only place that needs to change to swap
 //! backends, so this is a self-contained migration.
 
+use crate::recovery_phase_telemetry::{self as rpt, Counter as RC, Phase as RP};
+
 use crate::buffer_pool::PooledBuffer;
 use crate::inference::WeightDtype;
 use crate::tensor_header::{TensorHeader, UTH_BYTES};
@@ -1037,7 +1039,11 @@ impl NvmeStorage {
         let mut last_err: Option<io::Error> = None;
         let mut backoff = STORAGE_RETRY_BACKOFF;
         for attempt in 0..STORAGE_RETRY_ATTEMPTS {
-            match file.read_at(dst, offset) {
+            let read = rpt::span(RP::ReadAtSyscallHostWorkerSum);
+            let result = file.read_at(dst, offset);
+            drop(read);
+            rpt::record_read(dst.len(), attempt, &result);
+            match result {
                 Ok(n) if n == dst.len() => {
                     self.note_read_success(expert_id);
                     return Ok(n);
@@ -1169,6 +1175,7 @@ impl NvmeStorage {
     /// Returns the number of bytes actually read (which equals `expert_size`
     /// on success — short reads are surfaced as an `UnexpectedEof` error).
     pub async fn read_expert(&self, expert_id: u32, buf: &mut PooledBuffer) -> io::Result<usize> {
+        rpt::add(RC::ReadExpertCalls, 1);
         debug_assert_eq!(buf.len(), self.cfg.expert_size);
         // Tier 2 packed path: source the bytes from the shared blob fd at
         // the expert's recorded offset. The fault-tolerant retry +
@@ -1380,6 +1387,7 @@ impl NvmeStorage {
         ids: &[u32],
         bufs: &mut [&mut PooledBuffer],
     ) -> io::Result<usize> {
+        rpt::add(RC::ReadBatchCalls, 1);
         assert_eq!(
             ids.len(),
             bufs.len(),
@@ -1418,6 +1426,8 @@ impl NvmeStorage {
         // whole batch — it surfaces as a `HardwareFailure` for that
         // expert id and the engine's higher-level cache code routes
         // around it. The first error (by slot order) is returned.
+        let recorder = rpt::current();
+        let _batch = rpt::span(RP::BatchDispatchJoinWall);
         let id_vec: Vec<u32> = ids.to_vec();
         let total = tokio::task::block_in_place(|| -> io::Result<usize> {
             if id_vec.len() == 1 {
@@ -1437,14 +1447,17 @@ impl NvmeStorage {
                     .zip(id_vec.iter())
                     .map(|((file, buf), &id)| {
                         let buf: &mut PooledBuffer = &mut *buf;
+                        let recorder = recorder.clone();
                         scope.spawn(move || {
-                            debug_assert_eq!(buf.len(), expert_size);
-                            self.read_at_with_retries(
-                                file,
-                                id,
-                                0,
-                                &mut buf.as_mut_slice()[..expert_size],
-                            )
+                            rpt::with_sync(recorder, || {
+                                debug_assert_eq!(buf.len(), expert_size);
+                                self.read_at_with_retries(
+                                    file,
+                                    id,
+                                    0,
+                                    &mut buf.as_mut_slice()[..expert_size],
+                                )
+                            })
                         })
                     })
                     .collect();
@@ -1478,6 +1491,7 @@ impl NvmeStorage {
         ids: &[u32],
         destinations: &mut [&mut [u8]],
     ) -> io::Result<usize> {
+        rpt::add(RC::ReadMappedBatchCalls, 1);
         if self.is_packed()
             || ids.len() != destinations.len()
             || self.cfg.expert_size != 2_658_304
@@ -1503,7 +1517,10 @@ impl NvmeStorage {
         // Prove the exact resolved Arc once; retain resolution and error order.
         for (&id, file) in ids.iter().zip(&files) {
             self.prove_source_upload_fd(id, file)?;
+            rpt::add(RC::DirectFdProofs, 1);
         }
+        let recorder = rpt::current();
+        let _batch = rpt::span(RP::BatchDispatchJoinWall);
         let id_vec: Vec<u32> = ids.to_vec();
         tokio::task::block_in_place(|| -> io::Result<usize> {
             if id_vec.len() == 1 {
@@ -1516,7 +1533,10 @@ impl NvmeStorage {
                     .zip(id_vec.iter())
                     .map(|((file, dst), &id)| {
                         let dst: &mut [u8] = dst;
-                        scope.spawn(move || self.read_at_with_retries(file, id, 0, dst))
+                        let recorder = recorder.clone();
+                        scope.spawn(move || {
+                            rpt::with_sync(recorder, || self.read_at_with_retries(file, id, 0, dst))
+                        })
                     })
                     .collect();
                 handles
@@ -1648,6 +1668,7 @@ impl NvmeStorage {
         // SAFETY: `iovecs` point into the caller's disjoint, live
         // destination buffers; `file` is a valid open fd; the run is
         // physically contiguous starting at `start_offset`.
+        let read = rpt::span(RP::ReadVectoredSyscallHostWorkerSum);
         let n = unsafe {
             libc::preadv(
                 file.as_raw_fd(),
@@ -1656,6 +1677,14 @@ impl NvmeStorage {
                 run.start_offset as libc::off_t,
             )
         };
+        let read_error = (n < 0).then(io::Error::last_os_error);
+        drop(read);
+        let read_result = if n < 0 {
+            Err(io::Error::from(io::ErrorKind::Other))
+        } else {
+            Ok(n as usize)
+        };
+        rpt::record_read(want, 0, &read_result);
         if n >= 0 && n as usize == want {
             // Full coalesced read: credit each member's breaker.
             for &(id, _) in &run.members {
@@ -1667,7 +1696,7 @@ impl NvmeStorage {
         // fault-tolerant per-expert reads so a single bad slot can't wedge
         // the whole run and the retry/breaker accounting is preserved.
         if n < 0 {
-            let err = io::Error::last_os_error();
+            let err = read_error.expect("negative preadv result captured errno");
             tracing::warn!(
                 error = %err,
                 run_start = run.start_offset,

@@ -13,6 +13,8 @@
 //! 5. Speculatively kick off prefetches for the most likely next experts.
 //! 6. Record per-token latency and emit structured tracing events.
 
+use crate::recovery_phase_telemetry::{self as rpt, Counter as RC, Phase as RP};
+
 use crate::aligned_buffer::AlignedBuffer;
 use crate::backend::gpu_native::{
     GpuNativePhysicalInstallEvidence, GpuNativeProductionPhysicalInstallSnapshot,
@@ -6132,7 +6134,9 @@ impl Engine {
                         return Ok(r);
                     }
                     if self.core.in_flight.contains_key(&id) {
+                        let wait = rpt::span(RP::SingleflightWaitWall);
                         fut.await;
+                        drop(wait);
                         if let Some(r) = self.core.cache.get(id) {
                             self.metrics
                                 .counters
@@ -6230,6 +6234,7 @@ impl Engine {
         source_upload: Option<Arc<SourceUploadState>>,
         diag: Option<&P1rContext>,
     ) -> Result<Arc<ExpertResident>, GpuNativeDemandResidencyError> {
+        let _source = rpt::span(RP::ServiceMapRamSourceWall);
         let context = diag.and_then(|d| d.for_id(global_id));
         let mut span = context.as_ref().map(|d| {
             d.span(
@@ -6246,6 +6251,7 @@ impl Engine {
             state.record_source_request(global_id);
         }
         if let Some(resident) = residents.get(&global_id) {
+            rpt::add(RC::FallbackServiceCache, 1);
             if let Some(s) = &mut span {
                 s.value(0, 1);
                 s.value(2, 1);
@@ -6254,6 +6260,7 @@ impl Engine {
         }
         let resident = match self.core.cache.get(global_id) {
             Some(resident) => {
+                rpt::add(RC::FallbackRam, 1);
                 if let Some(s) = &mut span {
                     s.value(2, 2);
                 }
@@ -6898,6 +6905,12 @@ impl Engine {
         self: &Arc<Self>, layer_index: usize, global_ids: &[u32], diag: Option<&P1rContext>,
         mut p1x: Option<&mut crate::predictor_v2::p1x::DemandEvidence>,
     ) -> Result<Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>, GpuNativeDemandResidencyError> {
+        let mut recovery_service = rpt::outcome(
+            RP::DemandServiceWall,
+            RC::ServicesStarted,
+            RC::ServicesCompleted,
+            RC::ServicesFailed,
+        );
         let context = diag.map(|d| d.selected(global_ids));
         let diag = context.as_ref();
         let manager = self
@@ -6919,6 +6932,17 @@ impl Engine {
         } else {
             None
         };
+        if qualification.is_none() {
+            rpt::add(RC::EligibilityChecks, 1);
+            if self.gpu_native_source_upload_production.is_some() {
+                rpt::add(RC::EligibleServices, 1);
+                if production_upload_guard.is_none() {
+                    rpt::add(RC::FallbackPermitBusy, 1);
+                }
+            } else {
+                rpt::add(RC::FallbackUnsupportedConfiguration, 1);
+            }
+        }
         let source_upload = qualification
             .as_ref()
             .and_then(|state| state.source_upload.clone())
@@ -7174,6 +7198,7 @@ impl Engine {
                             }
                         })?;
                     }
+                    recovery_service.succeed();
                     return Ok(residencies);
                 }
                 Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id: _ })
@@ -7232,7 +7257,9 @@ impl Engine {
                 drop(evicted);
             }
         }
+        let pool_wait = rpt::span(RP::PoolWaitWall);
         let buf = self.core.pool.acquire().await;
+        drop(pool_wait);
         // Tier 4: mark this as a foreground (token-blocking) read for the
         // duration of the device I/O so the governor throttles
         // speculation that would otherwise queue ahead of it. No-op when
@@ -13802,6 +13829,55 @@ mod tests {
             upload.snapshot().ordered_nvme_ids_sha256,
             expected.snapshot().ordered_nvme_ids_sha256
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_telemetry_ordinary_cpu_source_off_on_preserves_payload_and_cache() {
+        for enabled in [false, true] {
+            let dir = TempDir::new("recovery-telemetry-source");
+            let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 126);
+            let recorder = rpt::Collector::configured(enabled);
+            let before = recorder.as_ref().map(|c| c.snapshot());
+            let mut residents = HashMap::new();
+            rpt::scope(
+                recorder.clone(),
+                engine.gpu_native_source_physical_missing_set(&[2, 0], &mut residents, None, None),
+            )
+            .await
+            .unwrap();
+            let expected_bytes = 2 * engine.core.storage.config().expert_size as u64;
+            assert_eq!(engine.report().bytes_read, expected_bytes);
+            assert_eq!(residents.len(), 2);
+            let first = residents[&2].clone();
+            rpt::scope(
+                recorder.clone(),
+                engine.gpu_native_source_physical_missing_set(
+                    &[2],
+                    &mut HashMap::new(),
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(Arc::ptr_eq(&first, &engine.core.cache.get(2).unwrap()));
+            assert_eq!(engine.report().bytes_read, expected_bytes);
+            let envelope = rpt::Envelope::between(before, recorder.as_ref().map(|c| c.snapshot()));
+            if enabled {
+                let json = serde_json::to_value(envelope.unwrap()).unwrap();
+                let counters = &json["counters_delta"];
+                assert_eq!(counters["ReadSyscalls"], 2);
+                assert_eq!(counters["ReadReturnedBytes"], expected_bytes);
+                assert_eq!(counters["FallbackRam"], 1);
+                assert_eq!(counters["FusedAttempts"], 0);
+                assert_eq!(counters["UploadCopySubmissions"], 0);
+                assert_eq!(
+                    json["host_timings_delta"]["ReadAtSyscallHostWorkerSum"]["samples"],
+                    2
+                );
+            } else {
+                assert!(envelope.is_none());
+            }
+        }
     }
 }
 // end mod engine::tests

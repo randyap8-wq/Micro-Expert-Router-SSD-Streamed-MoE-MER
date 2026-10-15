@@ -3,6 +3,8 @@
 //! Owns the execution of the entire forward transformer pass on GPU:
 //! Embedding lookup -> Layer (Attention RMSNorm -> QKV/RoPE/KV -> Causal Attention/O -> MoE RMSNorm -> Router -> Q4 Expert Combine) -> Final RMSNorm -> LM Head -> GPU Greedy Argmax.
 
+use crate::recovery_phase_telemetry::{self as rpt, Counter as RC, Phase as RP};
+
 use crate::backend::gpu_native::q4_route_parallel::GpuNativeQ4RouteParallelScratch;
 use crate::gpu_native_physical_install_staging::q4_route_parallel::{
     Arm as Q4QualificationArm, Observation as Q4QualificationObservation,
@@ -2448,6 +2450,7 @@ impl GpuNativeTokenLoop {
             p1j: None,
             p1r_attempt: 0,
             p1r_position: 0,
+            recovery_phase_telemetry: rpt::Collector::from_environment(),
         })
     }
 
@@ -3195,8 +3198,10 @@ impl GpuNativeTokenLoop {
                 armed: true,
                 p1r: p.cleanup.p1r.clone(),
             });
-        let result = self
-            .step_token_p1e_observed_inner(
+        let recovery_phase_telemetry = request.recovery_phase_telemetry.clone();
+        let result = rpt::scope(
+            recovery_phase_telemetry,
+            self.step_token_p1e_observed_inner(
                 engine,
                 request,
                 token_id,
@@ -3206,8 +3211,9 @@ impl GpuNativeTokenLoop {
                 router_rank_sink,
                 semantic_sink,
                 oracle_hook,
-            )
-            .await;
+            ),
+        )
+        .await;
         if result.is_err() {
             self.finish_p1j_target(request, position, None);
             if let Some(temporal) = request
@@ -3266,6 +3272,14 @@ impl GpuNativeTokenLoop {
                 Some(cursor) => cursor.plan(self.layers.len())?,
                 None => GpuNativeExecutionSegment::fresh(self.layers.len())?,
             };
+            rpt::add(
+                match segment.attempt_start {
+                    GpuNativeAttemptStart::Fresh => RC::FreshSegments,
+                    GpuNativeAttemptStart::ResumeExpert { .. } => RC::ResumeExpertSegments,
+                    GpuNativeAttemptStart::Continue { .. } => RC::ContinueSegments,
+                },
+                1,
+            );
             let sink = diagnostic_sink.map(|(layout, buf)| GpuNativeDiagnosticSink {
                 layout,
                 staging_buffer: buf,
@@ -4394,7 +4408,10 @@ impl GpuNativeTokenLoop {
             );
         }
         // ONE submission
+        let token_submit = rpt::span(RP::TokenSubmitHost);
         gpu.queue.submit(Some(encoder.finish()));
+        drop(token_submit);
+        rpt::add(RC::TokenSubmissions, 1);
         self.counters
             .queue_submissions
             .fetch_add(1, Ordering::Relaxed);
@@ -4546,9 +4563,14 @@ pub struct GpuNativeRequestState {
     p1j: Option<Box<P1jRequest>>,
     p1r_attempt: usize,
     p1r_position: usize,
+    recovery_phase_telemetry: Option<Arc<rpt::Collector>>,
 }
 
 impl GpuNativeRequestState {
+    pub(crate) fn recovery_phase_snapshot(&self) -> Option<rpt::Snapshot> {
+        self.recovery_phase_telemetry.as_ref().map(|c| c.snapshot())
+    }
+
     pub(crate) fn enable_p1x(&mut self, token_loop: &GpuNativeTokenLoop, prompt_length: usize, positions: usize) -> p1x::Result<()> {
         if self.committed_position != 0 || self.p1x.is_some() || self.p1j.is_some()
             || self.predictor_v2_observation.enabled.is_some() || token_loop.q4_qualification.get().is_some() {

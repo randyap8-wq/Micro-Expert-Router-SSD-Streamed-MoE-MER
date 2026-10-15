@@ -5,6 +5,8 @@
 //! an ordinary [`crate::gpu_native_token_loop::GpuNativeRequestState`] and
 //! calls only [`crate::gpu_native_token_loop::GpuNativeTokenLoop::step_token`].
 
+use crate::recovery_phase_telemetry as rpt;
+
 use crate::backend::{GpuDeviceIdentity, GpuExpertIoSnapshot, GpuExpertMemorySnapshot};
 use crate::engine::RoutedExpertExecutionSnapshot;
 use crate::gpu_native_residency::GpuNativeTieredResidencySnapshot;
@@ -889,6 +891,8 @@ impl LatencyStatistics {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct RunTiming {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_phase_telemetry: Option<rpt::Envelope>,
     pub(crate) prompt_seconds: f64,
     pub(crate) time_to_first_token_seconds: f64,
     pub(crate) decode_generated_tokens: usize,
@@ -933,6 +937,7 @@ impl RunTiming {
             ));
         }
         Ok(Self {
+            recovery_phase_telemetry: None,
             prompt_seconds,
             time_to_first_token_seconds,
             decode_generated_tokens,
@@ -1547,6 +1552,7 @@ pub(crate) async fn execute_request(
     }
 
     let mut request = token_loop.create_request_state()?;
+    let recovery_phase_before = request.recovery_phase_snapshot();
     let snapshots = RequestSnapshotStart::capture(runtime)?;
     let prompt_started = std::time::Instant::now();
     let mut completed_positions = 0usize;
@@ -1624,7 +1630,7 @@ pub(crate) async fn execute_request(
         counters.routed_execution_delta,
     )?;
     let output_text = runtime.tokenizer.decode(&generated_ids)?;
-    Ok(PerRunResult {
+    let mut result = PerRunResult {
         run_index,
         prompt_tokens: prompt_ids.len(),
         requested_output_tokens,
@@ -1640,7 +1646,10 @@ pub(crate) async fn execute_request(
             decode_latencies,
         )?,
         counters,
-    })
+    };
+    result.timing.recovery_phase_telemetry =
+        rpt::Envelope::between(recovery_phase_before, request.recovery_phase_snapshot());
+    Ok(result)
 }
 
 pub(crate) fn is_hex(value: &str, len: usize) -> bool {
@@ -3011,5 +3020,41 @@ mod tests {
         }
         let prompt = [3, 5, 8];
         assert_eq!(ordinary(&prompt, 6), ingest_contract(&prompt, 6));
+    }
+    #[test]
+    fn recovery_telemetry_optional_envelope_preserves_every_existing_run_field() {
+        let mut result = run(0, 0.5);
+        let legacy = serde_json::to_value(&result).unwrap();
+        assert!(legacy["timing"].get("recovery_phase_telemetry").is_none());
+        let recorder = rpt::Collector::configured(true).unwrap();
+        result.timing.recovery_phase_telemetry =
+            rpt::Envelope::between(Some(recorder.snapshot()), Some(recorder.snapshot()));
+        let mut enabled = serde_json::to_value(&result).unwrap();
+        let envelope = enabled["timing"]
+            .as_object_mut()
+            .unwrap()
+            .remove("recovery_phase_telemetry")
+            .unwrap();
+        assert_eq!(enabled, legacy);
+        assert_eq!(envelope["schema"], "mer.recovery-phase-telemetry.v1");
+        assert!(envelope["device_copy_completion_ns"].is_null());
+        // Ordinary serde consumers ignore the additive optional field;
+        // the historical timing keys retain exact values in either document.
+        #[derive(serde::Deserialize)]
+        struct LegacyTiming {
+            prompt_seconds: f64,
+            decode_seconds: f64,
+            decode_tps: f64,
+        }
+        for value in [
+            legacy["timing"].clone(),
+            serde_json::to_value(&result.timing).unwrap(),
+        ] {
+            let parsed: LegacyTiming = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed.prompt_seconds, result.timing.prompt_seconds);
+            assert_eq!(parsed.decode_seconds, result.timing.decode_seconds);
+            assert_eq!(parsed.decode_tps, result.timing.decode_tps);
+        }
+        assert_eq!(SCHEMA, "mer.gpu-native-real-benchmark.v4");
     }
 }
