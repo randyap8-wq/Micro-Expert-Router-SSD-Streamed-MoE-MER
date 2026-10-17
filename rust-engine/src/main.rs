@@ -298,539 +298,29 @@ enum Q8BenchKernel {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Generate synthetic expert files for testing on local disk.
-    GenData {
-        /// Directory to write `expert_<id>.bin` files into.
-        #[arg(long, default_value = "./data")]
-        data_dir: PathBuf,
-        /// Number of experts to create.
-        #[arg(long, default_value_t = 64)]
-        num_experts: u32,
-        /// Bytes per expert. Must be a multiple of 4096 for O_DIRECT and
-        /// at least `3 * d_model * d_ff * 4` bytes (the SwiGLU weights);
-        /// any extra bytes are zero-padded.
-        ///
-        /// Default 16 MiB pairs cleanly with `d_model=512 d_ff=2048`
-        /// (12 MiB of weights + 4 MiB of padding).
-        #[arg(long, default_value_t = 16 * 1024 * 1024)]
-        expert_size: usize,
-        /// Hidden / residual-stream dimension of the FFN (Mixtral: 4096,
-        /// DeepSeek-V3: 7168). Default 512 keeps the synthetic compute
-        /// cheap so I/O remains observable.
-        #[arg(long, default_value_t = 512)]
-        d_model: usize,
-        /// Intermediate FFN dimension (Mixtral: 14336, Llama-3-MoE: 14336).
-        /// Default 2048.
-        #[arg(long, default_value_t = 2048)]
-        d_ff: usize,
-        /// Block alignment for `O_DIRECT` (4096 on most NVMe). The
-        /// generated file size (`expert_size`) must be a multiple of
-        /// this so the run path can read each expert with `O_DIRECT`
-        /// without `EINVAL`. Must match what `run` is invoked with.
-        #[arg(long, default_value_t = 4096)]
-        block_align: usize,
-        /// On-disk weight dtype for synthetic files: f32, f16, bf16, int8,
-        /// q4k, q4_0, q8_0, or mxfp4. q5k, q6k, and mixed are GGUF/runtime
-        /// formats and are not synthesized by this generator.
-        #[arg(long, default_value = "f32")]
-        dtype: String,
-    },
+    GenData(CliGenDataArgs),
 
     /// **Tier 2.** Repack a directory of `expert_<id>.bin` files into a
     /// single packed blob + JSON manifest for the packed storage layout.
     /// Experts are written back-to-back (one block-aligned `expert_size`
     /// slot each) in an order chosen by `--profile` / `--order` so the
     /// engine can coalesce co-fetched experts into single `preadv`s.
-    Repack {
-        /// Source directory containing `expert_<id>.bin` (or
-        /// `expert_<layer>_<local>.bin` with `--num-experts-per-layer`).
-        #[arg(long, default_value = "./data")]
-        data_dir: PathBuf,
-        /// Output blob path (all expert payloads concatenated).
-        #[arg(long)]
-        out_blob: PathBuf,
-        /// Output manifest path. Defaults to `<out_blob>.manifest.json`.
-        #[arg(long)]
-        out_manifest: Option<PathBuf>,
-        /// Number of experts to pack (ids `0..num_experts`, unless
-        /// `--order` restricts the set).
-        #[arg(long, default_value_t = 64)]
-        num_experts: u32,
-        /// Bytes per expert. Must equal the source files' `expert_size`.
-        #[arg(long, default_value_t = 16 * 1024 * 1024)]
-        expert_size: usize,
-        /// Block alignment (must match `gen-data` / the source files).
-        #[arg(long, default_value_t = 4096)]
-        block_align: usize,
-        /// Disable `O_DIRECT` when reading the source files (needed on
-        /// tmpfs / macOS / CI).
-        #[arg(long)]
-        no_direct: bool,
-        /// Experts per layer for layer-qualified source naming.
-        #[arg(long)]
-        num_experts_per_layer: Option<u32>,
-        /// Order experts hottest-first using a routing-frequency profile
-        /// JSON (as produced by `run --profile-out`). Unobserved experts
-        /// are appended in numeric order. Ignored if `--order` is set.
-        #[arg(long)]
-        profile: Option<PathBuf>,
-        /// Explicit physical layout: a file listing expert ids (one per
-        /// line, or a JSON array). Overrides `--profile`. Only the listed
-        /// experts are packed.
-        #[arg(long)]
-        order: Option<PathBuf>,
-    },
+    Repack(CliRepackArgs),
 
     /// Run the token-generation simulation against the on-disk experts.
-    Run {
-        /// Directory with `expert_<id>.bin` files. May also contain a
-        /// `metadata.json` written by `scripts/extract_mixtral_experts.py`,
-        /// in which case `num_experts`, `d_model`, `d_ff`, `top_k`, and
-        /// `expert_size` are auto-loaded (CLI flags still override).
-        #[arg(long, default_value = "./data")]
-        data_dir: PathBuf,
-        /// Total number of experts in the model.
-        #[arg(long, default_value_t = 64)]
-        num_experts: u32,
-        /// Bytes per expert. Must equal what was used in `gen-data`.
-        #[arg(long, default_value_t = 16 * 1024 * 1024)]
-        expert_size: usize,
-        /// Hidden / residual-stream dimension. Must match `gen-data`.
-        #[arg(long, default_value_t = 512)]
-        d_model: usize,
-        /// Intermediate FFN dimension. Must match `gen-data`.
-        #[arg(long, default_value_t = 2048)]
-        d_ff: usize,
-        /// LRU cache + buffer pool capacity (resident experts at once).
-        ///
-        /// The whole point of this engine is that experts stream from
-        /// SSD; making the cache big defeats that. The default is 4
-        /// slots and the engine warns if more than 16 are requested.
-        #[arg(long, default_value_t = 4)]
-        cache_slots: usize,
-        /// Top-K experts the router activates per token.
-        #[arg(long, default_value_t = 2)]
-        top_k: usize,
-        /// Number of tokens to simulate.
-        #[arg(long, default_value_t = 200)]
-        tokens: u64,
-        /// Probe Rayon worker counts on this machine/model/backend before
-        /// initializing the process-wide pool, then run with the winner.
-        #[arg(long)]
-        autotune_rayon: bool,
-        /// Number of tokens each Rayon autotune probe runs.
-        #[arg(
-            long,
-            default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_TOKENS,
-            value_name = "N",
-            value_parser = parse_positive_u64_value
-        )]
-        autotune_tokens: u64,
-        /// Number of repeated fine probes for each finalist candidate.
-        #[arg(
-            long,
-            default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_REPEATS,
-            value_name = "N",
-            value_parser = parse_positive_usize_value
-        )]
-        autotune_repeats: usize,
-        /// Number of tokens for the cheap coarse autotune pass.
-        #[arg(
-            long,
-            default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_COARSE_TOKENS,
-            value_name = "N",
-            value_parser = parse_positive_u64_value
-        )]
-        autotune_coarse_tokens: u64,
-        /// Number of coarse winners promoted to repeated fine probes.
-        #[arg(
-            long,
-            default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_TOP_CANDIDATES,
-            value_name = "N",
-            value_parser = parse_positive_usize_value
-        )]
-        autotune_top_candidates: usize,
-        /// Print a concise coarse/fine Rayon autotune result table.
-        #[arg(long)]
-        autotune_print_table: bool,
-        /// Slow-regime cutoff for the worst fine-probe p95.
-        #[arg(
-            long,
-            default_value_t = crate::rayon_autotune::DEFAULT_SLOW_P95_THRESHOLD_MS,
-            value_name = "MS",
-            value_parser = parse_positive_f64_value
-        )]
-        autotune_slow_p95_ms: f64,
-        /// Slow-regime cutoff for the worst fine-probe p99.
-        #[arg(
-            long,
-            default_value_t = crate::rayon_autotune::DEFAULT_SLOW_P99_THRESHOLD_MS,
-            value_name = "MS",
-            value_parser = parse_positive_f64_value
-        )]
-        autotune_slow_p99_ms: f64,
-        /// Use a low-confidence autotune result for this run.
-        ///
-        /// Without this flag, low-confidence results are treated as failed
-        /// selection and the startup thread resolver falls back to a saved
-        /// profile or MER's default sizing.
-        #[arg(long)]
-        allow_low_confidence_rayon_autotune: bool,
-        /// Predictive prefetch fanout (how many candidates to issue per token).
-        #[arg(long, default_value_t = 2)]
-        predict_fanout: usize,
-        /// **Look-ahead pipeline depth.** In serve mode, controls how many MoE
-        /// layers ahead the speculator prefetches (the sliding window
-        /// `layer + 1 ..= layer + pipeline_depth`), hiding cold SSD reads behind
-        /// compute. `1` reproduces the legacy single-layer look-ahead.
-        ///
-        /// In `run`, this currently only scales speculative prefetch headroom
-        /// (shadow buffer budget = `predict_fanout * pipeline_depth`).
-        #[arg(long, default_value_t = crate::engine::DEFAULT_PIPELINE_DEPTH)]
-        pipeline_depth: u32,
-        /// Don't prefetch below this transition probability. The default
-        /// (`0.0`) auto-scales the threshold to `2 / num_experts` so
-        /// it remains achievable as the expert pool grows; pass an
-        /// explicit positive value to override (e.g. `--predict-min-prob 0.05`).
-        #[arg(long, default_value_t = 0.0)]
-        predict_min_prob: f64,
-        /// Disable O_DIRECT (use buffered reads). Required on tmpfs/overlay/CI
-        /// and on macOS, where O_DIRECT is not supported. When set, the run
-        /// summary's I/O latency includes any page-cache effects — see the
-        /// startup warning emitted in this case.
-        #[arg(long)]
-        no_direct: bool,
-        /// Block alignment for O_DIRECT (4096 on most NVMe).
-        #[arg(long, default_value_t = 4096)]
-        block_align: usize,
-        /// PRNG seed for reproducible runs.
-        #[arg(long, default_value_t = 0xC0FFEE)]
-        seed: u64,
-        /// On-disk weight dtype. Accepts f32, f16, bf16, int8, q4k, q4_0,
-        /// q5k, q6k, q8_0, mxfp4, or mixed. Must match the generated or
-        /// converted expert dataset.
-        #[arg(long, default_value = "f32")]
-        dtype: String,
-        /// Fraction (`0.1..=1.0`) of input dimensions loaded per expert
-        /// when partial column loading is enabled. `1.0` (default)
-        /// disables partial loading. The forward pass still produces
-        /// finite, correct-shape outputs for any value in range; lower
-        /// fractions trade a small amount of accuracy for proportionally
-        /// less compute / dequant energy.
-        #[arg(long, default_value_t = 1.0)]
-        partial_load_fraction: f64,
-        /// After an expert has been observed in routing this many times,
-        /// pin it permanently in the LRU cache. `0` (default) disables
-        /// frequency-based pinning. Pinned experts are never reloaded
-        /// from SSD, eliminating their I/O energy.
-        #[arg(long, default_value_t = 0)]
-        pin_after_observations: u64,
-        /// Optional alias map JSON: `{ "src_id": canonical_id, ... }`.
-        /// Pairs of experts the offline analyser flagged as numerically
-        /// near-identical share a single resident copy at runtime,
-        /// eliminating duplicate SSD reads.
-        #[arg(long)]
-        alias_map: Option<PathBuf>,
-        /// Use the Linux `io_uring` storage backend with registered
-        /// fixed buffers (one syscall to enqueue many reads, kernel
-        /// reads directly into pre-pinned pool buffers). Requires the
-        /// `io_uring` cargo feature; without it this flag logs a
-        /// warning and the engine falls back to the default `pread(2)`
-        /// path.
-        #[arg(long)]
-        io_uring: bool,
-        /// Sleep this many micros between tokens (0 = as fast as possible).
-        #[arg(long, default_value_t = 0)]
-        token_pause_us: u64,
-        /// Force-route the first token to these expert ids (comma-separated).
-        /// Spec example: `--first-token 3,7`.
-        #[arg(long, value_delimiter = ',')]
-        first_token: Vec<u32>,
-        /// Disable predictive prefetching entirely (for ablation).
-        #[arg(long)]
-        no_prefetch: bool,
-        /// **I/O-only benchmarking mode**: skip the SwiGLU FFN forward
-        /// pass entirely; still read every expert from SSD and XOR every
-        /// byte to force the read to fully materialise. Use this to
-        /// isolate the SSD-streaming cost from FFN compute.
-        #[arg(long)]
-        io_only: bool,
-        /// **Force SSD reads.** Refuse to run with optimisations that
-        /// would let the OS serve experts from RAM (page cache) instead
-        /// of the device. Concretely: requires `O_DIRECT` (i.e. the run
-        /// fails if `--no-direct` is also set on Linux). On macOS, where
-        /// O_DIRECT is unavailable, this flag prints a warning and runs
-        /// in best-effort mode.
-        #[arg(long)]
-        force_ssd: bool,
-        /// Number of cluster groups for the router's first-order Markov
-        /// chain (default 4: matches the gist's example). Each cluster
-        /// is a group of experts that the router prefers to keep
-        /// activating consecutively.
-        #[arg(long, default_value_t = 4)]
-        router_clusters: usize,
-        /// Probability the Markov router stays inside its current
-        /// expert cluster on each step. Higher = stronger temporal
-        /// locality = more prefetch signal.
-        #[arg(long, default_value_t = 0.9)]
-        router_intra_p: f64,
-        /// Optional path to a precomputed transition matrix. Whitespace-
-        /// separated `f64` values, row-major, `num_experts^2` entries.
-        /// Overrides `--router-clusters` / `--router-intra-p` when set.
-        #[arg(long)]
-        router_matrix: Option<PathBuf>,
-        /// Optional path to a real **gating-network** weight matrix
-        /// (`f32` little-endian, row-major, shape `[num_experts × d_model]`).
-        ///
-        /// When set, the run loop bypasses the deterministic Markov
-        /// `TopKRouter` and instead computes per-token routing the way
-        /// production Mixtral does: `softmax(W_gate · x) → top-K`.
-        /// Each routed expert is still streamed from the SSD via the
-        /// LRU cache (`Engine::moe_step`), so the SSD-bandwidth /
-        /// cache-hit metrics reported at the end are directly
-        /// comparable to the legacy Markov path.
-        ///
-        /// File format: bare little-endian `f32`s, no header. Generate
-        /// one with `numpy.tofile` from a real Mixtral checkpoint, or
-        /// use the seeded synthetic fallback if you only want to
-        /// exercise the path (omit this flag to keep the legacy
-        /// Markov router).
-        ///
-        /// May also point at a **directory** of per-layer `gate_<L>.bin`
-        /// files (the same naming the model loader uses): they are
-        /// auto-discovered, sorted by layer index, and concatenated in
-        /// order, so you don't have to `cat` them into one file first.
-        #[arg(long)]
-        gate_weights: Option<PathBuf>,
-        /// Optional path to write a JSONL **routing trace** to. Each
-        /// line records one token's `{token, layer, experts,
-        /// cache_hit}`, suitable for offline analysis with
-        /// `scripts/compute_transition_matrix.py` and the
-        /// `validate-predictor` subcommand.
-        #[arg(long)]
-        trace_out: Option<PathBuf>,
-        /// Initialise the GPU compute backend before running the
-        /// benchmark so the FFN forward pass uses GPU matmul where
-        /// available. The run path also installs bounded logical admission
-        /// plus physical expert-weight residency. Falls back to the default CPU backend
-        /// with a warning if GPU init fails.
-        #[arg(long)]
-        gpu: bool,
-        /// Physical expert-weight cap and logical admission budget, in MiB
-        /// (only with `--gpu`). The 4 GiB default fits ~40
-        /// Mixtral-8x7B Q4 experts (~99 MiB each — 512 MiB would hold
-        /// barely 5); lower it on cards with less free VRAM.
-        #[arg(long, default_value_t = 4096)]
-        gpu_cache_mb: usize,
-        /// Enable the **neural speculator** (arm `M`): a 2-layer MLP
-        /// trained online against the gate's actual top-K. Predicts
-        /// from the residual stream — the same feature the gate sees —
-        /// so it is the strongest single prefetch signal and the one
-        /// that actually drives `speculate_layer_ahead`. Off by default
-        /// so the legacy Markov-only path is unchanged; turn it on to
-        /// measure whether the predictive arms move the hit rate.
-        #[arg(long)]
-        speculator: bool,
-        /// Hidden width of the speculator MLP (only when `--speculator`).
-        #[arg(long, default_value_t = 128)]
-        speculator_hidden_dim: usize,
-        /// Top-K experts pulled from the speculator each step. `0`
-        /// inherits `--top-k`.
-        #[arg(long, default_value_t = 0)]
-        speculator_top_k: usize,
-        /// Enable the **locality monitor** (arm `L`): a sliding window
-        /// over recent activations whose hot set is unioned into the
-        /// prefetch set *and* pinned in the LRU so genuinely hot experts
-        /// stop being evicted by cold ones — a frequency-aware upgrade
-        /// over plain LRU eviction.
-        #[arg(long)]
-        locality: bool,
-        /// Locality sliding-window size, in routing observations.
-        #[arg(long, default_value_t = 256)]
-        locality_window: usize,
-        /// Heat threshold: an expert is "hot" once it appears in this
-        /// fraction of the locality window. `0.10` ≈ 10% of recent
-        /// activations.
-        #[arg(long, default_value_t = 0.10)]
-        locality_threshold_pct: f32,
-        /// Enable the **per-layer expert-affinity** arm: folds co-fired
-        /// and disk-adjacent neighbours of high-confidence predictions
-        /// into the prefetch union. Only effective on multi-layer runs
-        /// (`--num-experts-per-layer` set).
-        #[arg(long)]
-        affinity: bool,
-        /// Number of co-fired neighbours pulled per seed (with `--affinity`).
-        #[arg(long, default_value_t = 4)]
-        affinity_neighbors_k: usize,
-        /// Exponential-decay epoch for the affinity counters, in
-        /// cumulative observations (with `--affinity`).
-        #[arg(long, default_value_t = 10_000)]
-        affinity_decay_epoch: u64,
-        /// **Tier 4 — adaptive prefetch governor.** Throttle speculative
-        /// prefetches by measured precision (consumed / completed) and
-        /// foreground-read contention, so low-value speculation can't
-        /// inflate the latency of the foreground misses that actually
-        /// block token generation. Off by default (legacy unbounded
-        /// admission). This is the highest-leverage knob on a
-        /// bandwidth-bound SSD.
-        #[arg(long)]
-        prefetch_governor: bool,
-        /// Precision floor / optimistic EWMA seed for the governor, in
-        /// `[0, 1]` (with `--prefetch-governor`).
-        #[arg(long, default_value_t = 0.05)]
-        prefetch_precision_floor: f64,
-        /// Per-outstanding-foreground-read multiplier on the governor's
-        /// admission threshold (with `--prefetch-governor`). Higher ⇒
-        /// speculation backs off harder while real misses are in flight.
-        #[arg(long, default_value_t = 1.0)]
-        prefetch_contention_weight: f64,
-        /// **Tier 4 — cost-aware eviction.** Evict the coldest resident
-        /// by decaying heat score instead of strict LRU, so a hot expert
-        /// that briefly fell to the LRU tail isn't dumped ahead of a
-        /// one-shot cold expert. Off by default (pure LRU).
-        #[arg(long)]
-        cost_aware_eviction: bool,
-        /// **Tier 3 — per-layer pre-gate predictor.** Train an online
-        /// layer-L→L+1 conditional map and drive high-precision
-        /// next-layer prefetch from it. Off by default.
-        #[arg(long)]
-        pregate: bool,
-        /// **Tier 1 — static residency.** Fraction of the global expert
-        /// namespace to pin permanently in RAM (the hottest experts), in
-        /// `(0, 1]`. `0.0` (default) disables it. Lifts the hit-rate
-        /// ceiling above the bare cache fraction on a *skewed* workload.
-        #[arg(long, default_value_t = 0.0)]
-        static_residency_fraction: f64,
-        /// Tokens to observe before deriving the online static-residency
-        /// hot set (ignored when `--static-residency-profile` is given).
-        #[arg(long, default_value_t = 0)]
-        static_residency_warmup_tokens: u64,
-        /// Path to an offline expert-popularity profile JSON
-        /// (`{ "<id>": <count> }`) to seed static residency at startup.
-        /// When omitted, the hot set is derived online.
-        #[arg(long)]
-        static_residency_profile: Option<String>,
-        /// Write the run's accumulated route-observation profile to this
-        /// JSON path at shutdown (consumable by
-        /// `--static-residency-profile` on a later run).
-        #[arg(long)]
-        profile_out: Option<String>,
-        /// **Benchmark workload.** `synthetic` (default) keeps the legacy
-        /// uniform-i.i.d. stream (the engine/gate routes its own hidden
-        /// state); `skewed` drives `moe_step` from a Zipf-popular,
-        /// Markov-correlated expert generator (so static residency and
-        /// the predictors are exercisable); `replay` replays a recorded
-        /// JSONL routing trace via `--replay-trace`.
-        #[arg(long, default_value = "synthetic")]
-        workload: String,
-        /// Zipf exponent for `--workload skewed` (larger ⇒ more skew;
-        /// `1.0` ≈ classic Zipf, `0.0` ≈ uniform).
-        #[arg(long, default_value_t = 1.1)]
-        zipf_s: f64,
-        /// Markov stay-probability for `--workload skewed`, in `[0, 1]`:
-        /// the chance a token reuses the previous token's expert set
-        /// (temporal correlation the predictors can exploit).
-        #[arg(long, default_value_t = 0.0)]
-        workload_correlation: f64,
-        /// JSONL routing trace to replay with `--workload replay` (the
-        /// `--trace-out` format).
-        #[arg(long)]
-        replay_trace: Option<String>,
-        /// Number of transformer layers, used to size the affinity
-        /// matrix. `1` (default) is the single-namespace synthetic
-        /// benchmark.
-        #[arg(long, default_value_t = 1)]
-        num_layers: u32,
-        /// Experts **per layer** for a layer-qualified id geometry. When
-        /// set, `speculate_layer_ahead` restricts the speculator's
-        /// global head to the next layer's slice and actually prefetches
-        /// `layer + 1 ..= layer + pipeline_depth` ahead — the mechanism
-        /// that hides SSD latency behind compute. Leave unset for the
-        /// flat single-namespace benchmark (no layer-ahead).
-        #[arg(long)]
-        num_experts_per_layer: Option<u32>,
-        /// **Tier 2 — packed storage.** Read every expert from this single
-        /// packed blob (produced by the `repack` subcommand) instead of
-        /// one file per expert. Requires `--packed-manifest`. Adjacent
-        /// experts are fetched with coalesced `preadv` syscalls.
-        #[arg(long)]
-        packed_blob: Option<PathBuf>,
-        /// **Tier 2.** JSON manifest (`id -> offset,len`) accompanying
-        /// `--packed-blob`. Required when `--packed-blob` is set.
-        #[arg(long)]
-        packed_manifest: Option<PathBuf>,
-    },
+    Run(CliRunArgs),
 
     /// Convert a GGUF checkpoint (Mixtral-style) into the engine's
     /// per-expert binary format plus a `metadata.json` and the dense
     /// weight files [`RealModel::from_dir`] consumes. Phase 2.
-    GgufConvert {
-        /// Path to a normal `*.gguf` file or any file in a standard
-        /// `*-00001-of-00005.gguf` shard set.
-        #[arg(long)]
-        gguf_path: PathBuf,
-        /// Output directory. Created if it doesn't exist.
-        #[arg(long)]
-        out_dir: PathBuf,
-        /// Override the number of layers (defaults to
-        /// `llama.block_count` from the GGUF metadata).
-        #[arg(long, default_value_t = 0)]
-        num_layers: usize,
-        /// Override the experts-per-layer (defaults to
-        /// `llama.expert_count` from the GGUF metadata).
-        #[arg(long, default_value_t = 0)]
-        num_experts: usize,
-        /// Skip the Unified Tensor Header (U.T.H.) prefix on every
-        /// `expert_<id>.bin`. By default the converter emits a 64-byte
-        /// page-padded UTH so the loader knows the dtype + shape +
-        /// tile-hint before reading any weight bytes; pass this flag
-        /// to produce legacy bare-payload files for compatibility
-        /// with consumers that pre-date UTH support.
-        #[arg(long, default_value_t = false)]
-        no_uth: bool,
-        /// Use the legacy eager GGUF reader (slurps the entire file
-        /// into RAM before slicing tensors out). The default is the
-        /// streaming reader which keeps only the header + tensor
-        /// info table resident — a strict win for ≥ 100 GB
-        /// checkpoints. The eager path is still useful in tests and
-        /// for small fixtures.
-        #[arg(long, default_value_t = false)]
-        legacy_eager: bool,
-        /// **Native quantised pass-through.** When set and the
-        /// source GGUF stores its expert tensors as `Q4_0`, `Q4_K`,
-        /// `Q5_K`, `Q6_K`, or `Q8_0`, write the raw quantised block stream to disk
-        /// instead of dequantising to F32 first. The output
-        /// `expert_<id>.bin` stays quantized. Mixed projection triples
-        /// are written with UTH2 headers. If quantized output is not
-        /// possible, conversion fails before writing expert files.
-        #[arg(long, default_value_t = false)]
-        native_quant: bool,
-        /// Convert only routed expert blobs and metadata. Dense
-        /// transformer tensors are skipped deliberately; the output is
-        /// valid for expert-streaming benchmarks, not full-model runs.
-        #[arg(long, default_value_t = false)]
-        experts_only: bool,
-    },
+    GgufConvert(CliGgufConvertArgs),
 
     /// Validate a converted expert dataset before running inference.
-    ValidateData {
-        /// Directory containing `expert_<id>.bin` files and metadata.json.
-        #[arg(long)]
-        data_dir: PathBuf,
-    },
+    ValidateData(CliValidateDataArgs),
 
     /// Replay a routing trace through the predictive prefetcher and
     /// print per-K hit-rate statistics. Phase 6.
-    ValidatePredictor {
-        /// Path to a JSONL routing trace (produced by `run --trace-out`).
-        #[arg(long)]
-        trace: PathBuf,
-        /// LRU cache size to simulate. Repeat the flag to evaluate
-        /// multiple sizes in one run (e.g. `--cache-slots 4
-        /// --cache-slots 8 --cache-slots 16`). Defaults to a sweep of
-        /// 2, 4, 8, 16.
-        #[arg(long)]
-        cache_slots: Vec<usize>,
-    },
+    ValidatePredictor(CliValidatePredictorArgs),
 
     /// Start the OpenAI-compatible HTTP server (Phase 6 / 8 / 9).
     ///
@@ -839,12 +329,7 @@ enum Cmd {
     /// of streaming a fixed token count it stays up serving requests on
     /// `POST /v1/completions`, `POST /v1/chat/completions`, and exports
     /// Prometheus metrics on `GET /metrics`.
-    Serve {
-        /// Path to the TOML config file. See `config.toml` at the
-        /// repository root for an example.
-        #[arg(long)]
-        config: PathBuf,
-    },
+    Serve(CliServeArgs),
 
     /// Benchmark the real transformer path without starting HTTP.
     ///
@@ -852,37 +337,7 @@ enum Cmd {
     /// `[real_transformer] enabled = true`, and reports prompt/decode
     /// timing separately from the legacy synthetic `run` sustained_tps
     /// metric.
-    BenchReal {
-        /// Path to the TOML config file.
-        #[arg(long)]
-        config: PathBuf,
-        /// Prompt text to encode and benchmark.
-        #[arg(long, conflicts_with = "request_json")]
-        prompt: Option<String>,
-        /// OpenAI-style request JSON containing `prompt`, or chat
-        /// `messages`, and optionally `max_tokens`.
-        #[arg(long, conflicts_with = "prompt")]
-        request_json: Option<PathBuf>,
-        /// Number of completion tokens to generate. Overrides
-        /// `max_tokens` from `--request-json` when both are supplied.
-        #[arg(long)]
-        output_tokens: Option<usize>,
-        /// Warmup runs to execute before measurements.
-        #[arg(long, default_value_t = 1)]
-        warmup_runs: usize,
-        /// Measured runs to report.
-        #[arg(long, default_value_t = 1)]
-        measured_runs: usize,
-        /// Cache reset policy between runs.
-        #[arg(long, value_enum, default_value_t = BenchRealCacheReset::Keep)]
-        cache_reset: BenchRealCacheReset,
-        /// Force deterministic greedy decoding for benchmark parity.
-        #[arg(long)]
-        greedy: bool,
-        /// Output format.
-        #[arg(long, value_enum, default_value_t = BenchRealOutputFormat::Human)]
-        format: BenchRealOutputFormat,
-    },
+    BenchReal(CliBenchRealArgs),
 
     /// Benchmark the ordinary production GPU-native real-model token loop.
     ///
@@ -949,72 +404,23 @@ enum Cmd {
     /// Capture authoritative ordered route truth from the ordinary production
     /// GPU-native token loop and run offline capacity/replacement analysis.
     #[command(name = "trace-gpu-native-oracle-routes")]
-    TraceGpuNativeOracleRoutes {
-        /// Path to the strict production GPU-native TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// OpenAI-style request JSON containing `prompt` or chat `messages`
-        /// and the exact requested output-token count. Decoding is always
-        /// greedy and the runtime is always restricted to NVIDIA L4.
-        #[arg(long)]
-        request_json: PathBuf,
-        /// Required destination for the versioned diagnostic JSON artifact.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    TraceGpuNativeOracleRoutes(CliTraceGpuNativeOracleRoutesArgs),
 
     /// ORACLE-0B-S perfect-future source scheduling with either source-only
     /// treatment or serialized same-queue H2D at a proven token boundary.
     #[command(name = "qualify-gpu-native-oracle-scheduled-residency")]
-    QualifyGpuNativeOracleScheduledResidency {
-        /// Path to the strict production GPU-native TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Immutable ORACLE-0A v1 route-trace report used as future truth.
-        #[arg(long)]
-        oracle_trace: PathBuf,
-        /// Qualification treatment arm.
-        #[arg(long, value_enum)]
-        treatment_mode:
-            crate::gpu_native_oracle_scheduled_residency::OracleScheduledResidencyMode,
-        /// Maximum concurrent layer-level source batches.
-        #[arg(long, default_value_t = 4)]
-        oracle_source_concurrency: usize,
-        /// Required destination for the versioned ORACLE-0B-S report.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    QualifyGpuNativeOracleScheduledResidency(CliQualifyGpuNativeOracleScheduledResidencyArgs),
 
     /// Production-path PR2-A.2 control/treatment qualification. Control
     /// forces the legacy exact sequential source helper; treatment exercises
     /// the same ordinary production batching seam used by normal serving.
     #[command(name = "qualify-gpu-native-demand-source-concurrency-production")]
-    QualifyGpuNativeDemandSourceConcurrencyProduction {
-        /// Path to the frozen strict production GPU-native TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact authoritative adapter name required for both isolated arms.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Required destination for the typed v2 qualification report.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    QualifyGpuNativeDemandSourceConcurrencyProduction(CliQualifyGpuNativeDemandSourceConcurrencyProductionArgs),
 
     /// Production-path PR2-B-A.1 control/treatment qualification. Control
     /// forces legacy Vec staging; treatment exercises ordinary production.
     #[command(name = "qualify-gpu-native-physical-install-staging-production")]
-    QualifyGpuNativePhysicalInstallStagingProduction {
-        /// Exact frozen PR2 GPU-native TOML config path.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact authoritative adapter name required for both isolated arms.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Required destination for the typed v2 qualification report.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    QualifyGpuNativePhysicalInstallStagingProduction(CliQualifyGpuNativePhysicalInstallStagingProductionArgs),
 
     /// PR2-C.1 production qualification: frozen serial control versus the
     /// ordinary production route-parallel encoder used by treatment.
@@ -1031,42 +437,18 @@ enum Cmd {
     /// PR3-DIFF0 proof that ordinary GPU-native inference remains bounded by
     /// a constrained cgroup while streaming an expert footprint larger than RAM.
     #[command(name = "qualify-gpu-native-out-of-core")]
-    QualifyGpuNativeOutOfCore {
-        #[arg(long)]
-        config: PathBuf,
-        #[arg(long)]
-        expected_adapter_name: String,
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    QualifyGpuNativeOutOfCore(CliQualifyGpuNativeOutOfCoreArgs),
 
     /// PR2-B-B.1 production-path qualification. Control forces the frozen
     /// sequential direct-staging implementation; treatment exercises ordinary
     /// production concurrent staging and deterministic ordered commit.
     #[command(name = "qualify-gpu-native-physical-install-concurrency-production")]
-    QualifyGpuNativePhysicalInstallConcurrencyProduction {
-        /// Exact frozen PR2 GPU-native TOML config path.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact authoritative adapter name required for both isolated arms.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Required destination for the typed production-v1 qualification report.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    QualifyGpuNativePhysicalInstallConcurrencyProduction(CliQualifyGpuNativePhysicalInstallConcurrencyProductionArgs),
 
     /// Production zero-fill qualification: concurrent full-zero control versus
     /// ordinary production concurrent complete overwrite with no explicit zero.
     #[command(name = "qualify-gpu-native-physical-zero-fill-production")]
-    QualifyGpuNativePhysicalZeroFillProduction {
-        #[arg(long)]
-        config: PathBuf,
-        #[arg(long)]
-        expected_adapter_name: String,
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    QualifyGpuNativePhysicalZeroFillProduction(CliQualifyGpuNativePhysicalZeroFillProductionArgs),
 
     /// Qualification-only single-read source to mapped-upload real-inference A/B.
     #[command(name = "qualify-gpu-native-source-to-upload-copy-elision-production")]
@@ -1081,24 +463,7 @@ enum Cmd {
 
     /// Diagnostic host-copy discriminator plus frozen one-arm production attribution.
     #[command(name = "diagnose-gpu-native-physical-staging-payload-copy")]
-    DiagnoseGpuNativePhysicalStagingPayloadCopy {
-        #[arg(
-            long,
-            default_value = "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
-        )]
-        config: PathBuf,
-        #[arg(long, default_value = "NVIDIA L4")]
-        expected_adapter_name: String,
-        #[arg(long)]
-        report_out: PathBuf,
-        /// Run only the standalone RAM/WGPU discriminator, without loading a model.
-        #[arg(long)]
-        standalone_only: bool,
-        #[arg(long, default_value_t = 20)]
-        iterations: usize,
-        #[arg(long, default_value_t = 3)]
-        warmup_iterations: usize,
-    },
+    DiagnoseGpuNativePhysicalStagingPayloadCopy(CliDiagnoseGpuNativePhysicalStagingPayloadCopyArgs),
 
     /// Standalone full-file O_DIRECT into mapped WGPU upload feasibility.
     #[command(name = "diagnose-gpu-native-source-to-upload-copy-elision")]
@@ -1117,303 +482,65 @@ enum Cmd {
 
     /// Qualify strict real-checkpoint inference with CPU dense/attention/KV/
     /// router/head planes and native-Q4_0 routed experts on a hardware GPU.
-    QualifyHybridQ4 {
-        /// Path to the TOML config file.
-        #[arg(long)]
-        config: PathBuf,
-        /// Prompt text to encode and qualify.
-        #[arg(long, conflicts_with = "request_json")]
-        prompt: Option<String>,
-        /// OpenAI-style request JSON containing `prompt` or chat `messages`.
-        #[arg(long, conflicts_with = "prompt")]
-        request_json: Option<PathBuf>,
-        /// Completion-token count; overrides request JSON `max_tokens`.
-        #[arg(long)]
-        output_tokens: Option<usize>,
-        /// Strict greedy warmups before the single measured request.
-        #[arg(long, default_value_t = 0)]
-        warmup_runs: usize,
-        /// Write the typed JSON report here instead of stdout.
-        #[arg(long)]
-        report_out: Option<PathBuf>,
-        /// Opaque reference to separately collected external GPU-memory evidence.
-        #[arg(long)]
-        external_gpu_memory_artifact: Option<String>,
-    },
+    QualifyHybridQ4(CliQualifyHybridQ4Args),
 
     /// Qualify canonical Q4_0 WGSL math and one complete extracted routed
     /// expert against MER's authoritative CPU implementation.
-    QualifyHybridQ4Parity {
-        /// Path to the strict Hybrid native-Q4_0 TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Global expert id: layer * num_experts_per_layer + layer-local id.
-        #[arg(long)]
-        expert_id: u32,
-        /// Exact wgpu adapter name required for this qualification run.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Write the typed JSON report here instead of stdout.
-        #[arg(long)]
-        report_out: Option<PathBuf>,
-    },
+    QualifyHybridQ4Parity(CliQualifyHybridQ4ParityArgs),
 
     /// Compare fixed-corpus greedy token IDs between isolated strict CPU and
     /// strict Hybrid Q4_0 real-checkpoint execution.
-    QualifyHybridQ4GreedyParity {
-        /// Path to the strict Hybrid native-Q4_0 TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact wgpu adapter name required for every Hybrid corpus case.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Write the typed JSON report here instead of stdout.
-        #[arg(long)]
-        report_out: Option<PathBuf>,
-    },
+    QualifyHybridQ4GreedyParity(CliQualifyHybridQ4GreedyParityArgs),
 
     /// Strictly compare 16 greedy tokens across the fixed four-case corpus
     /// between the authoritative Hybrid-boundary CPU reference and the full
     /// production GPU-native Q4 token loop.
-    QualifyGpuNativeQ4GreedyParity {
-        /// Path to the strict GPU-native Q4 TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact wgpu adapter name required for every GPU-native corpus case.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Write the versioned typed JSON report here instead of stdout.
-        #[arg(long)]
-        report_out: Option<PathBuf>,
-    },
+    QualifyGpuNativeQ4GreedyParity(CliQualifyGpuNativeQ4GreedyParityArgs),
 
     /// Qualify GPU-native semantic correctness over the independent frozen v2 holdout corpus.
     #[command(name = "qualify-gpu-native-semantic-parity-v2")]
-    QualifyGpuNativeSemanticParityV2 {
-        /// Path to the strict GPU-native Q4 TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact wgpu adapter name required for both isolated runtimes.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Required versioned typed JSON qualification destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    QualifyGpuNativeSemanticParityV2(CliQualifyGpuNativeSemanticParityV2Args),
 
     /// Attribute the frozen first GPU-native semantic-parity v2 holdout failures.
     #[command(name = "diagnose-gpu-native-v2-holdout-failures")]
-    DiagnoseGpuNativeV2HoldoutFailures {
-        /// Path to the strict GPU-native Q4 TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact wgpu adapter name required for the isolated GPU runtime.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Exact frozen v2 qualification report to consume as immutable evidence.
-        #[arg(long)]
-        v2_report: PathBuf,
-        /// Required frozen SHA256 of the supplied v2 report.
-        #[arg(long)]
-        expected_v2_report_sha256: String,
-        /// Required typed diagnostic JSON destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    DiagnoseGpuNativeV2HoldoutFailures(CliDiagnoseGpuNativeV2HoldoutFailuresArgs),
 
     /// Attribute internal stages of the frozen GPU-native Q4 expert failures.
     #[command(name = "diagnose-gpu-native-q4-expert-stages")]
-    DiagnoseGpuNativeQ4ExpertStages {
-        /// Path to the strict GPU-native Q4 TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact wgpu adapter name required for the isolated GPU runtime.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Exact frozen bea attribution report consumed as immutable evidence.
-        #[arg(long)]
-        bea_report: PathBuf,
-        /// Required frozen SHA256 of the supplied bea report.
-        #[arg(long)]
-        expected_bea_report_sha256: String,
-        /// Required typed diagnostic JSON destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    DiagnoseGpuNativeQ4ExpertStages(CliDiagnoseGpuNativeQ4ExpertStagesArgs),
 
     /// Audit the frozen GPU-native Q4 evidence against ordinary exact-f32 CPU references.
     #[command(name = "diagnose-gpu-native-f32-reference-boundary")]
-    DiagnoseGpuNativeF32ReferenceBoundary {
-        /// Path to the strict GPU-native Q4 TOML config used to build a CPU-only reference.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact frozen GPU-native semantic-parity v2 report.
-        #[arg(long)]
-        v2_report: PathBuf,
-        /// Required frozen SHA256 of the supplied v2 report.
-        #[arg(long)]
-        expected_v2_report_sha256: String,
-        /// Exact frozen GPU-native Q4 expert-stage attribution report.
-        #[arg(long)]
-        stage_report: PathBuf,
-        /// Required frozen SHA256 of the supplied stage report.
-        #[arg(long)]
-        expected_stage_report_sha256: String,
-        /// Required typed diagnostic JSON destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    DiagnoseGpuNativeF32ReferenceBoundary(CliDiagnoseGpuNativeF32ReferenceBoundaryArgs),
 
     /// Attribute the frozen Spanish first generated-token divergence across isolated exact-f32 CPU, historical-f16 CPU, and GPU-native planes.
     #[command(name = "diagnose-gpu-native-spanish-first-token-attribution")]
-    DiagnoseGpuNativeSpanishFirstTokenAttribution {
-        /// Path to the strict GPU-native Q4 TOML configuration.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact frozen GPU-native semantic-parity v2 report.
-        #[arg(long)]
-        v2_report: PathBuf,
-        /// Required frozen SHA256 of the supplied v2 report.
-        #[arg(long)]
-        expected_v2_report_sha256: String,
-        /// Exact frozen GPU-native Q4 expert-stage attribution report.
-        #[arg(long)]
-        stage_report: PathBuf,
-        /// Required frozen SHA256 of the supplied stage report.
-        #[arg(long)]
-        expected_stage_report_sha256: String,
-        /// Exact frozen f32 reference-boundary audit report.
-        #[arg(long)]
-        boundary_audit_report: PathBuf,
-        /// Required frozen SHA256 of the supplied boundary-audit report.
-        #[arg(long)]
-        expected_boundary_audit_report_sha256: String,
-        /// Exact production GPU adapter name; this diagnostic requires NVIDIA L4.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Required typed diagnostic JSON destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    DiagnoseGpuNativeSpanishFirstTokenAttribution(CliDiagnoseGpuNativeSpanishFirstTokenAttributionArgs),
 
     /// Collect reproducibility and complete first-token CPU/Hybrid logit
     /// evidence for the fixed json-transformation case.
-    DiagnoseHybridQ4GreedyDivergence {
-        /// Path to the strict Hybrid native-Q4_0 TOML config.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact wgpu adapter name required for Hybrid diagnostic workers.
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Required typed diagnostic JSON destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    DiagnoseHybridQ4GreedyDivergence(CliDiagnoseHybridQ4GreedyDivergenceArgs),
     /// Diagnose first mathematical divergence between production Hybrid Q4 reference and full GPU-native execution.
-    DiagnoseGpuNativeQ4FirstDivergence {
-        /// Strict GPU-native Q4 configuration.
-        #[arg(long)]
-        config: PathBuf,
-        /// Expected GPU adapter name (e.g. "NVIDIA L4").
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Target case (e.g. "json-transformation").
-        #[arg(long)]
-        case: String,
-        /// Optional typed diagnostic report output path.
-        #[arg(long)]
-        report_out: Option<PathBuf>,
-    },
+    DiagnoseGpuNativeQ4FirstDivergence(CliDiagnoseGpuNativeQ4FirstDivergenceArgs),
     /// Attribute a target GPU-native router rank permutation without changing inference or qualification semantics.
-    DiagnoseGpuNativeRouterRankDivergence {
-        /// Strict GPU-native Q4 configuration.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact required GPU adapter name (for example, "NVIDIA L4").
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Fixed-corpus case name.
-        #[arg(long)]
-        case: String,
-        /// Zero-based generated-token position to capture.
-        #[arg(long)]
-        generated_position: usize,
-        /// Zero-based transformer layer to capture.
-        #[arg(long)]
-        layer: usize,
-        /// Required versioned diagnostic JSON destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    DiagnoseGpuNativeRouterRankDivergence(CliDiagnoseGpuNativeRouterRankDivergenceArgs),
     /// Measure the semantic effect of a target GPU-native expert-rank permutation without changing inference or qualification semantics.
-    DiagnoseGpuNativeExpertPermutationSemanticParity {
-        /// Strict GPU-native Q4 configuration.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact required GPU adapter name (for example, "NVIDIA L4").
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Fixed-corpus case name.
-        #[arg(long)]
-        case: String,
-        /// Zero-based generated-token position to capture.
-        #[arg(long)]
-        generated_position: usize,
-        /// Zero-based transformer layer to capture.
-        #[arg(long)]
-        layer: usize,
-        /// Required versioned diagnostic JSON destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    DiagnoseGpuNativeExpertPermutationSemanticParity(CliDiagnoseGpuNativeExpertPermutationSemanticParityArgs),
     /// Survey semantic parity across every routing event in the frozen greedy corpus without producing a qualification PASS.
-    DiagnoseGpuNativeSemanticParityCorpus {
-        /// Strict GPU-native Q4 configuration.
-        #[arg(long)]
-        config: PathBuf,
-        /// Exact required GPU adapter name (for example, "NVIDIA L4").
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Required versioned diagnostic JSON destination.
-        #[arg(long)]
-        report_out: PathBuf,
-    },
+    DiagnoseGpuNativeSemanticParityCorpus(CliDiagnoseGpuNativeSemanticParityCorpusArgs),
     /// Diagnose first internal mathematical divergence inside layer-0 attention between CPU reference and GPU-native execution.
     #[command(name = "diagnose-gpu-native-layer0-attention-first-divergence")]
-    DiagnoseGpuNativeLayer0AttentionFirstDivergence {
-        /// Strict GPU-native Q4 configuration.
-        #[arg(long)]
-        config: PathBuf,
-        /// Expected GPU adapter name (e.g. "NVIDIA L4").
-        #[arg(long)]
-        expected_adapter_name: String,
-        /// Target case (e.g. "json-transformation").
-        #[arg(long, default_value = "json-transformation")]
-        case: String,
-        /// Optional typed diagnostic report output path.
-        #[arg(long)]
-        report_out: Option<PathBuf>,
-        /// Optional Slice 11B report path to cross-check final-position layer-0 post-attention evidence.
-        #[arg(long)]
-        slice11b_report: Option<PathBuf>,
-    },
+    DiagnoseGpuNativeLayer0AttentionFirstDivergence(CliDiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs),
 
 
 
     /// Private same-binary worker for one strict-Hybrid greedy-parity plane.
     #[command(name = "greedy-parity-hybrid-worker-internal", hide = true)]
-    GreedyParityHybridWorkerInternal {
-        /// The same strict Hybrid config parsed by the parent orchestrator.
-        #[arg(long)]
-        config: PathBuf,
-    },
+    GreedyParityHybridWorkerInternal(CliGreedyParityHybridWorkerInternalArgs),
 
     /// Private same-binary CPU/Hybrid first-token logit worker.
     #[command(name = "greedy-parity-logit-worker-internal", hide = true)]
-    GreedyParityLogitWorkerInternal {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    GreedyParityLogitWorkerInternal(CliGreedyParityLogitWorkerInternalArgs),
 
     /// Benchmark dense matvec backends on the target Qwen3-Coder CPU shapes.
     ///
@@ -1422,46 +549,11 @@ enum Cmd {
     /// production `[real_transformer].dense_matvec_backend` without running a
     /// full checkpoint. The LM-head shape allocates about 1.2 GiB of weights;
     /// use `--skip-lm-head` for quick local smoke runs.
-    MatvecMicrobench {
-        /// Backend(s) to benchmark. Repeat or pass comma-separated values.
-        /// Defaults to matrixmultiply, rayon, and rayon-matrixmultiply.
-        #[arg(long = "backend", value_delimiter = ',')]
-        backend: Vec<crate::parallel::DenseMatvecBackend>,
-        /// Warmup iterations per shape/backend.
-        #[arg(long, default_value_t = 1)]
-        warmup_runs: usize,
-        /// Measured iterations per shape/backend.
-        #[arg(long, default_value_t = 3)]
-        measured_runs: usize,
-        /// Skip the 151936 × 2048 LM-head shape.
-        #[arg(long)]
-        skip_lm_head: bool,
-        /// Emit JSON instead of human-readable rows.
-        #[arg(long)]
-        json: bool,
-    },
+    MatvecMicrobench(CliMatvecMicrobenchArgs),
 
     /// Compare native zero-copy Q8_0 experts with the retained Candle reference.
     /// Build with `--features q8-candle-reference` to include both paths.
-    Q8ExpertMicrobench {
-        /// Expert hidden width (Qwen3-Coder-30B-A3B: 2048).
-        #[arg(long, default_value_t = 2048)]
-        d_model: usize,
-        /// Expert intermediate width (Qwen3-Coder-30B-A3B: 768).
-        #[arg(long, default_value_t = 768)]
-        d_ff: usize,
-        /// Warmup resident-hit iterations per path.
-        #[arg(long, default_value_t = 1)]
-        warmup_runs: usize,
-        /// Measured resident-hit iterations per path.
-        #[arg(long, default_value_t = 5)]
-        measured_runs: usize,
-        /// Native backend to exercise. `auto` mirrors the conservative
-        /// production policy; `all` includes every supported native backend
-        /// plus the Candle reference.
-        #[arg(long, value_enum, default_value_t = Q8BenchKernel::Auto)]
-        kernel: Q8BenchKernel,
-    },
+    Q8ExpertMicrobench(CliQ8ExpertMicrobenchArgs),
 
     /// Count heap allocations for the old transformer wrappers vs request scratch buffers.
     ///
@@ -1469,26 +561,7 @@ enum Cmd {
     /// benchmark independent of checkpoint files while exercising the same
     /// attention, RMSNorm, router, residual, and MoE-combine methods used by
     /// the real decode loop.
-    ScratchAllocMicrobench {
-        /// Hidden size for the synthetic transformer layer. Must be a multiple of 4.
-        #[arg(long, default_value_t = 32)]
-        d_model: usize,
-        /// Number of routed experts in the synthetic gate.
-        #[arg(long, default_value_t = 8)]
-        num_experts: usize,
-        /// Experts selected per token.
-        #[arg(long, default_value_t = 2)]
-        top_k: usize,
-        /// Tokens to run before resetting allocation counters.
-        #[arg(long, default_value_t = 1)]
-        warmup_tokens: usize,
-        /// Tokens measured after warmup. Defaults below the 16-token KV page size.
-        #[arg(long, default_value_t = 8)]
-        measured_tokens: usize,
-        /// Emit JSON instead of human-readable rows.
-        #[arg(long)]
-        json: bool,
-    },
+    ScratchAllocMicrobench(CliScratchAllocMicrobenchArgs),
     /// Native terminal dashboard. Polls a running `serve` instance and renders
     /// SSD/RAM/logical-GPU-admission hits, cache state, admission utilisation,
     /// and I/O reactor activity. Pure
@@ -1497,15 +570,1090 @@ enum Cmd {
     /// Requires the binary to be built with the `tui` cargo feature
     /// (on by default). With `--no-default-features` this subcommand
     /// exits with a helpful error message.
-    Monitor {
-        /// Base URL of the `serve` HTTP endpoint to poll. Defaults to
-        /// `http://127.0.0.1:8080` to match the example config.
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
-        url: String,
-        /// How often to refresh the dashboard, in milliseconds.
-        #[arg(long, default_value_t = 500)]
-        refresh_ms: u64,
-    },
+    Monitor(CliMonitorArgs),
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "GenData")]
+struct CliGenDataArgs {
+    /// Directory to write `expert_<id>.bin` files into.
+    #[arg(long, default_value = "./data")]
+    data_dir: PathBuf,
+    /// Number of experts to create.
+    #[arg(long, default_value_t = 64)]
+    num_experts: u32,
+    /// Bytes per expert. Must be a multiple of 4096 for O_DIRECT and
+    /// at least `3 * d_model * d_ff * 4` bytes (the SwiGLU weights);
+    /// any extra bytes are zero-padded.
+    ///
+    /// Default 16 MiB pairs cleanly with `d_model=512 d_ff=2048`
+    /// (12 MiB of weights + 4 MiB of padding).
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    expert_size: usize,
+    /// Hidden / residual-stream dimension of the FFN (Mixtral: 4096,
+    /// DeepSeek-V3: 7168). Default 512 keeps the synthetic compute
+    /// cheap so I/O remains observable.
+    #[arg(long, default_value_t = 512)]
+    d_model: usize,
+    /// Intermediate FFN dimension (Mixtral: 14336, Llama-3-MoE: 14336).
+    /// Default 2048.
+    #[arg(long, default_value_t = 2048)]
+    d_ff: usize,
+    /// Block alignment for `O_DIRECT` (4096 on most NVMe). The
+    /// generated file size (`expert_size`) must be a multiple of
+    /// this so the run path can read each expert with `O_DIRECT`
+    /// without `EINVAL`. Must match what `run` is invoked with.
+    #[arg(long, default_value_t = 4096)]
+    block_align: usize,
+    /// On-disk weight dtype for synthetic files: f32, f16, bf16, int8,
+    /// q4k, q4_0, q8_0, or mxfp4. q5k, q6k, and mixed are GGUF/runtime
+    /// formats and are not synthesized by this generator.
+    #[arg(long, default_value = "f32")]
+    dtype: String,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "Repack")]
+struct CliRepackArgs {
+    /// Source directory containing `expert_<id>.bin` (or
+    /// `expert_<layer>_<local>.bin` with `--num-experts-per-layer`).
+    #[arg(long, default_value = "./data")]
+    data_dir: PathBuf,
+    /// Output blob path (all expert payloads concatenated).
+    #[arg(long)]
+    out_blob: PathBuf,
+    /// Output manifest path. Defaults to `<out_blob>.manifest.json`.
+    #[arg(long)]
+    out_manifest: Option<PathBuf>,
+    /// Number of experts to pack (ids `0..num_experts`, unless
+    /// `--order` restricts the set).
+    #[arg(long, default_value_t = 64)]
+    num_experts: u32,
+    /// Bytes per expert. Must equal the source files' `expert_size`.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    expert_size: usize,
+    /// Block alignment (must match `gen-data` / the source files).
+    #[arg(long, default_value_t = 4096)]
+    block_align: usize,
+    /// Disable `O_DIRECT` when reading the source files (needed on
+    /// tmpfs / macOS / CI).
+    #[arg(long)]
+    no_direct: bool,
+    /// Experts per layer for layer-qualified source naming.
+    #[arg(long)]
+    num_experts_per_layer: Option<u32>,
+    /// Order experts hottest-first using a routing-frequency profile
+    /// JSON (as produced by `run --profile-out`). Unobserved experts
+    /// are appended in numeric order. Ignored if `--order` is set.
+    #[arg(long)]
+    profile: Option<PathBuf>,
+    /// Explicit physical layout: a file listing expert ids (one per
+    /// line, or a JSON array). Overrides `--profile`. Only the listed
+    /// experts are packed.
+    #[arg(long)]
+    order: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "Run")]
+struct CliRunArgs {
+    /// Directory with `expert_<id>.bin` files. May also contain a
+    /// `metadata.json` written by `scripts/extract_mixtral_experts.py`,
+    /// in which case `num_experts`, `d_model`, `d_ff`, `top_k`, and
+    /// `expert_size` are auto-loaded (CLI flags still override).
+    #[arg(long, default_value = "./data")]
+    data_dir: PathBuf,
+    /// Total number of experts in the model.
+    #[arg(long, default_value_t = 64)]
+    num_experts: u32,
+    /// Bytes per expert. Must equal what was used in `gen-data`.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    expert_size: usize,
+    /// Hidden / residual-stream dimension. Must match `gen-data`.
+    #[arg(long, default_value_t = 512)]
+    d_model: usize,
+    /// Intermediate FFN dimension. Must match `gen-data`.
+    #[arg(long, default_value_t = 2048)]
+    d_ff: usize,
+    /// LRU cache + buffer pool capacity (resident experts at once).
+    ///
+    /// The whole point of this engine is that experts stream from
+    /// SSD; making the cache big defeats that. The default is 4
+    /// slots and the engine warns if more than 16 are requested.
+    #[arg(long, default_value_t = 4)]
+    cache_slots: usize,
+    /// Top-K experts the router activates per token.
+    #[arg(long, default_value_t = 2)]
+    top_k: usize,
+    /// Number of tokens to simulate.
+    #[arg(long, default_value_t = 200)]
+    tokens: u64,
+    /// Probe Rayon worker counts on this machine/model/backend before
+    /// initializing the process-wide pool, then run with the winner.
+    #[arg(long)]
+    autotune_rayon: bool,
+    /// Number of tokens each Rayon autotune probe runs.
+    #[arg(
+        long,
+        default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_TOKENS,
+        value_name = "N",
+        value_parser = parse_positive_u64_value
+    )]
+    autotune_tokens: u64,
+    /// Number of repeated fine probes for each finalist candidate.
+    #[arg(
+        long,
+        default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_REPEATS,
+        value_name = "N",
+        value_parser = parse_positive_usize_value
+    )]
+    autotune_repeats: usize,
+    /// Number of tokens for the cheap coarse autotune pass.
+    #[arg(
+        long,
+        default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_COARSE_TOKENS,
+        value_name = "N",
+        value_parser = parse_positive_u64_value
+    )]
+    autotune_coarse_tokens: u64,
+    /// Number of coarse winners promoted to repeated fine probes.
+    #[arg(
+        long,
+        default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_TOP_CANDIDATES,
+        value_name = "N",
+        value_parser = parse_positive_usize_value
+    )]
+    autotune_top_candidates: usize,
+    /// Print a concise coarse/fine Rayon autotune result table.
+    #[arg(long)]
+    autotune_print_table: bool,
+    /// Slow-regime cutoff for the worst fine-probe p95.
+    #[arg(
+        long,
+        default_value_t = crate::rayon_autotune::DEFAULT_SLOW_P95_THRESHOLD_MS,
+        value_name = "MS",
+        value_parser = parse_positive_f64_value
+    )]
+    autotune_slow_p95_ms: f64,
+    /// Slow-regime cutoff for the worst fine-probe p99.
+    #[arg(
+        long,
+        default_value_t = crate::rayon_autotune::DEFAULT_SLOW_P99_THRESHOLD_MS,
+        value_name = "MS",
+        value_parser = parse_positive_f64_value
+    )]
+    autotune_slow_p99_ms: f64,
+    /// Use a low-confidence autotune result for this run.
+    ///
+    /// Without this flag, low-confidence results are treated as failed
+    /// selection and the startup thread resolver falls back to a saved
+    /// profile or MER's default sizing.
+    #[arg(long)]
+    allow_low_confidence_rayon_autotune: bool,
+    /// Predictive prefetch fanout (how many candidates to issue per token).
+    #[arg(long, default_value_t = 2)]
+    predict_fanout: usize,
+    /// **Look-ahead pipeline depth.** In serve mode, controls how many MoE
+    /// layers ahead the speculator prefetches (the sliding window
+    /// `layer + 1 ..= layer + pipeline_depth`), hiding cold SSD reads behind
+    /// compute. `1` reproduces the legacy single-layer look-ahead.
+    ///
+    /// In `run`, this currently only scales speculative prefetch headroom
+    /// (shadow buffer budget = `predict_fanout * pipeline_depth`).
+    #[arg(long, default_value_t = crate::engine::DEFAULT_PIPELINE_DEPTH)]
+    pipeline_depth: u32,
+    /// Don't prefetch below this transition probability. The default
+    /// (`0.0`) auto-scales the threshold to `2 / num_experts` so
+    /// it remains achievable as the expert pool grows; pass an
+    /// explicit positive value to override (e.g. `--predict-min-prob 0.05`).
+    #[arg(long, default_value_t = 0.0)]
+    predict_min_prob: f64,
+    /// Disable O_DIRECT (use buffered reads). Required on tmpfs/overlay/CI
+    /// and on macOS, where O_DIRECT is not supported. When set, the run
+    /// summary's I/O latency includes any page-cache effects — see the
+    /// startup warning emitted in this case.
+    #[arg(long)]
+    no_direct: bool,
+    /// Block alignment for O_DIRECT (4096 on most NVMe).
+    #[arg(long, default_value_t = 4096)]
+    block_align: usize,
+    /// PRNG seed for reproducible runs.
+    #[arg(long, default_value_t = 0xC0FFEE)]
+    seed: u64,
+    /// On-disk weight dtype. Accepts f32, f16, bf16, int8, q4k, q4_0,
+    /// q5k, q6k, q8_0, mxfp4, or mixed. Must match the generated or
+    /// converted expert dataset.
+    #[arg(long, default_value = "f32")]
+    dtype: String,
+    /// Fraction (`0.1..=1.0`) of input dimensions loaded per expert
+    /// when partial column loading is enabled. `1.0` (default)
+    /// disables partial loading. The forward pass still produces
+    /// finite, correct-shape outputs for any value in range; lower
+    /// fractions trade a small amount of accuracy for proportionally
+    /// less compute / dequant energy.
+    #[arg(long, default_value_t = 1.0)]
+    partial_load_fraction: f64,
+    /// After an expert has been observed in routing this many times,
+    /// pin it permanently in the LRU cache. `0` (default) disables
+    /// frequency-based pinning. Pinned experts are never reloaded
+    /// from SSD, eliminating their I/O energy.
+    #[arg(long, default_value_t = 0)]
+    pin_after_observations: u64,
+    /// Optional alias map JSON: `{ "src_id": canonical_id, ... }`.
+    /// Pairs of experts the offline analyser flagged as numerically
+    /// near-identical share a single resident copy at runtime,
+    /// eliminating duplicate SSD reads.
+    #[arg(long)]
+    alias_map: Option<PathBuf>,
+    /// Use the Linux `io_uring` storage backend with registered
+    /// fixed buffers (one syscall to enqueue many reads, kernel
+    /// reads directly into pre-pinned pool buffers). Requires the
+    /// `io_uring` cargo feature; without it this flag logs a
+    /// warning and the engine falls back to the default `pread(2)`
+    /// path.
+    #[arg(long)]
+    io_uring: bool,
+    /// Sleep this many micros between tokens (0 = as fast as possible).
+    #[arg(long, default_value_t = 0)]
+    token_pause_us: u64,
+    /// Force-route the first token to these expert ids (comma-separated).
+    /// Spec example: `--first-token 3,7`.
+    #[arg(long, value_delimiter = ',')]
+    first_token: Vec<u32>,
+    /// Disable predictive prefetching entirely (for ablation).
+    #[arg(long)]
+    no_prefetch: bool,
+    /// **I/O-only benchmarking mode**: skip the SwiGLU FFN forward
+    /// pass entirely; still read every expert from SSD and XOR every
+    /// byte to force the read to fully materialise. Use this to
+    /// isolate the SSD-streaming cost from FFN compute.
+    #[arg(long)]
+    io_only: bool,
+    /// **Force SSD reads.** Refuse to run with optimisations that
+    /// would let the OS serve experts from RAM (page cache) instead
+    /// of the device. Concretely: requires `O_DIRECT` (i.e. the run
+    /// fails if `--no-direct` is also set on Linux). On macOS, where
+    /// O_DIRECT is unavailable, this flag prints a warning and runs
+    /// in best-effort mode.
+    #[arg(long)]
+    force_ssd: bool,
+    /// Number of cluster groups for the router's first-order Markov
+    /// chain (default 4: matches the gist's example). Each cluster
+    /// is a group of experts that the router prefers to keep
+    /// activating consecutively.
+    #[arg(long, default_value_t = 4)]
+    router_clusters: usize,
+    /// Probability the Markov router stays inside its current
+    /// expert cluster on each step. Higher = stronger temporal
+    /// locality = more prefetch signal.
+    #[arg(long, default_value_t = 0.9)]
+    router_intra_p: f64,
+    /// Optional path to a precomputed transition matrix. Whitespace-
+    /// separated `f64` values, row-major, `num_experts^2` entries.
+    /// Overrides `--router-clusters` / `--router-intra-p` when set.
+    #[arg(long)]
+    router_matrix: Option<PathBuf>,
+    /// Optional path to a real **gating-network** weight matrix
+    /// (`f32` little-endian, row-major, shape `[num_experts × d_model]`).
+    ///
+    /// When set, the run loop bypasses the deterministic Markov
+    /// `TopKRouter` and instead computes per-token routing the way
+    /// production Mixtral does: `softmax(W_gate · x) → top-K`.
+    /// Each routed expert is still streamed from the SSD via the
+    /// LRU cache (`Engine::moe_step`), so the SSD-bandwidth /
+    /// cache-hit metrics reported at the end are directly
+    /// comparable to the legacy Markov path.
+    ///
+    /// File format: bare little-endian `f32`s, no header. Generate
+    /// one with `numpy.tofile` from a real Mixtral checkpoint, or
+    /// use the seeded synthetic fallback if you only want to
+    /// exercise the path (omit this flag to keep the legacy
+    /// Markov router).
+    ///
+    /// May also point at a **directory** of per-layer `gate_<L>.bin`
+    /// files (the same naming the model loader uses): they are
+    /// auto-discovered, sorted by layer index, and concatenated in
+    /// order, so you don't have to `cat` them into one file first.
+    #[arg(long)]
+    gate_weights: Option<PathBuf>,
+    /// Optional path to write a JSONL **routing trace** to. Each
+    /// line records one token's `{token, layer, experts,
+    /// cache_hit}`, suitable for offline analysis with
+    /// `scripts/compute_transition_matrix.py` and the
+    /// `validate-predictor` subcommand.
+    #[arg(long)]
+    trace_out: Option<PathBuf>,
+    /// Initialise the GPU compute backend before running the
+    /// benchmark so the FFN forward pass uses GPU matmul where
+    /// available. The run path also installs bounded logical admission
+    /// plus physical expert-weight residency. Falls back to the default CPU backend
+    /// with a warning if GPU init fails.
+    #[arg(long)]
+    gpu: bool,
+    /// Physical expert-weight cap and logical admission budget, in MiB
+    /// (only with `--gpu`). The 4 GiB default fits ~40
+    /// Mixtral-8x7B Q4 experts (~99 MiB each — 512 MiB would hold
+    /// barely 5); lower it on cards with less free VRAM.
+    #[arg(long, default_value_t = 4096)]
+    gpu_cache_mb: usize,
+    /// Enable the **neural speculator** (arm `M`): a 2-layer MLP
+    /// trained online against the gate's actual top-K. Predicts
+    /// from the residual stream — the same feature the gate sees —
+    /// so it is the strongest single prefetch signal and the one
+    /// that actually drives `speculate_layer_ahead`. Off by default
+    /// so the legacy Markov-only path is unchanged; turn it on to
+    /// measure whether the predictive arms move the hit rate.
+    #[arg(long)]
+    speculator: bool,
+    /// Hidden width of the speculator MLP (only when `--speculator`).
+    #[arg(long, default_value_t = 128)]
+    speculator_hidden_dim: usize,
+    /// Top-K experts pulled from the speculator each step. `0`
+    /// inherits `--top-k`.
+    #[arg(long, default_value_t = 0)]
+    speculator_top_k: usize,
+    /// Enable the **locality monitor** (arm `L`): a sliding window
+    /// over recent activations whose hot set is unioned into the
+    /// prefetch set *and* pinned in the LRU so genuinely hot experts
+    /// stop being evicted by cold ones — a frequency-aware upgrade
+    /// over plain LRU eviction.
+    #[arg(long)]
+    locality: bool,
+    /// Locality sliding-window size, in routing observations.
+    #[arg(long, default_value_t = 256)]
+    locality_window: usize,
+    /// Heat threshold: an expert is "hot" once it appears in this
+    /// fraction of the locality window. `0.10` ≈ 10% of recent
+    /// activations.
+    #[arg(long, default_value_t = 0.10)]
+    locality_threshold_pct: f32,
+    /// Enable the **per-layer expert-affinity** arm: folds co-fired
+    /// and disk-adjacent neighbours of high-confidence predictions
+    /// into the prefetch union. Only effective on multi-layer runs
+    /// (`--num-experts-per-layer` set).
+    #[arg(long)]
+    affinity: bool,
+    /// Number of co-fired neighbours pulled per seed (with `--affinity`).
+    #[arg(long, default_value_t = 4)]
+    affinity_neighbors_k: usize,
+    /// Exponential-decay epoch for the affinity counters, in
+    /// cumulative observations (with `--affinity`).
+    #[arg(long, default_value_t = 10_000)]
+    affinity_decay_epoch: u64,
+    /// **Tier 4 — adaptive prefetch governor.** Throttle speculative
+    /// prefetches by measured precision (consumed / completed) and
+    /// foreground-read contention, so low-value speculation can't
+    /// inflate the latency of the foreground misses that actually
+    /// block token generation. Off by default (legacy unbounded
+    /// admission). This is the highest-leverage knob on a
+    /// bandwidth-bound SSD.
+    #[arg(long)]
+    prefetch_governor: bool,
+    /// Precision floor / optimistic EWMA seed for the governor, in
+    /// `[0, 1]` (with `--prefetch-governor`).
+    #[arg(long, default_value_t = 0.05)]
+    prefetch_precision_floor: f64,
+    /// Per-outstanding-foreground-read multiplier on the governor's
+    /// admission threshold (with `--prefetch-governor`). Higher ⇒
+    /// speculation backs off harder while real misses are in flight.
+    #[arg(long, default_value_t = 1.0)]
+    prefetch_contention_weight: f64,
+    /// **Tier 4 — cost-aware eviction.** Evict the coldest resident
+    /// by decaying heat score instead of strict LRU, so a hot expert
+    /// that briefly fell to the LRU tail isn't dumped ahead of a
+    /// one-shot cold expert. Off by default (pure LRU).
+    #[arg(long)]
+    cost_aware_eviction: bool,
+    /// **Tier 3 — per-layer pre-gate predictor.** Train an online
+    /// layer-L→L+1 conditional map and drive high-precision
+    /// next-layer prefetch from it. Off by default.
+    #[arg(long)]
+    pregate: bool,
+    /// **Tier 1 — static residency.** Fraction of the global expert
+    /// namespace to pin permanently in RAM (the hottest experts), in
+    /// `(0, 1]`. `0.0` (default) disables it. Lifts the hit-rate
+    /// ceiling above the bare cache fraction on a *skewed* workload.
+    #[arg(long, default_value_t = 0.0)]
+    static_residency_fraction: f64,
+    /// Tokens to observe before deriving the online static-residency
+    /// hot set (ignored when `--static-residency-profile` is given).
+    #[arg(long, default_value_t = 0)]
+    static_residency_warmup_tokens: u64,
+    /// Path to an offline expert-popularity profile JSON
+    /// (`{ "<id>": <count> }`) to seed static residency at startup.
+    /// When omitted, the hot set is derived online.
+    #[arg(long)]
+    static_residency_profile: Option<String>,
+    /// Write the run's accumulated route-observation profile to this
+    /// JSON path at shutdown (consumable by
+    /// `--static-residency-profile` on a later run).
+    #[arg(long)]
+    profile_out: Option<String>,
+    /// **Benchmark workload.** `synthetic` (default) keeps the legacy
+    /// uniform-i.i.d. stream (the engine/gate routes its own hidden
+    /// state); `skewed` drives `moe_step` from a Zipf-popular,
+    /// Markov-correlated expert generator (so static residency and
+    /// the predictors are exercisable); `replay` replays a recorded
+    /// JSONL routing trace via `--replay-trace`.
+    #[arg(long, default_value = "synthetic")]
+    workload: String,
+    /// Zipf exponent for `--workload skewed` (larger ⇒ more skew;
+    /// `1.0` ≈ classic Zipf, `0.0` ≈ uniform).
+    #[arg(long, default_value_t = 1.1)]
+    zipf_s: f64,
+    /// Markov stay-probability for `--workload skewed`, in `[0, 1]`:
+    /// the chance a token reuses the previous token's expert set
+    /// (temporal correlation the predictors can exploit).
+    #[arg(long, default_value_t = 0.0)]
+    workload_correlation: f64,
+    /// JSONL routing trace to replay with `--workload replay` (the
+    /// `--trace-out` format).
+    #[arg(long)]
+    replay_trace: Option<String>,
+    /// Number of transformer layers, used to size the affinity
+    /// matrix. `1` (default) is the single-namespace synthetic
+    /// benchmark.
+    #[arg(long, default_value_t = 1)]
+    num_layers: u32,
+    /// Experts **per layer** for a layer-qualified id geometry. When
+    /// set, `speculate_layer_ahead` restricts the speculator's
+    /// global head to the next layer's slice and actually prefetches
+    /// `layer + 1 ..= layer + pipeline_depth` ahead — the mechanism
+    /// that hides SSD latency behind compute. Leave unset for the
+    /// flat single-namespace benchmark (no layer-ahead).
+    #[arg(long)]
+    num_experts_per_layer: Option<u32>,
+    /// **Tier 2 — packed storage.** Read every expert from this single
+    /// packed blob (produced by the `repack` subcommand) instead of
+    /// one file per expert. Requires `--packed-manifest`. Adjacent
+    /// experts are fetched with coalesced `preadv` syscalls.
+    #[arg(long)]
+    packed_blob: Option<PathBuf>,
+    /// **Tier 2.** JSON manifest (`id -> offset,len`) accompanying
+    /// `--packed-blob`. Required when `--packed-blob` is set.
+    #[arg(long)]
+    packed_manifest: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "GgufConvert")]
+struct CliGgufConvertArgs {
+    /// Path to a normal `*.gguf` file or any file in a standard
+    /// `*-00001-of-00005.gguf` shard set.
+    #[arg(long)]
+    gguf_path: PathBuf,
+    /// Output directory. Created if it doesn't exist.
+    #[arg(long)]
+    out_dir: PathBuf,
+    /// Override the number of layers (defaults to
+    /// `llama.block_count` from the GGUF metadata).
+    #[arg(long, default_value_t = 0)]
+    num_layers: usize,
+    /// Override the experts-per-layer (defaults to
+    /// `llama.expert_count` from the GGUF metadata).
+    #[arg(long, default_value_t = 0)]
+    num_experts: usize,
+    /// Skip the Unified Tensor Header (U.T.H.) prefix on every
+    /// `expert_<id>.bin`. By default the converter emits a 64-byte
+    /// page-padded UTH so the loader knows the dtype + shape +
+    /// tile-hint before reading any weight bytes; pass this flag
+    /// to produce legacy bare-payload files for compatibility
+    /// with consumers that pre-date UTH support.
+    #[arg(long, default_value_t = false)]
+    no_uth: bool,
+    /// Use the legacy eager GGUF reader (slurps the entire file
+    /// into RAM before slicing tensors out). The default is the
+    /// streaming reader which keeps only the header + tensor
+    /// info table resident — a strict win for ≥ 100 GB
+    /// checkpoints. The eager path is still useful in tests and
+    /// for small fixtures.
+    #[arg(long, default_value_t = false)]
+    legacy_eager: bool,
+    /// **Native quantised pass-through.** When set and the
+    /// source GGUF stores its expert tensors as `Q4_0`, `Q4_K`,
+    /// `Q5_K`, `Q6_K`, or `Q8_0`, write the raw quantised block stream to disk
+    /// instead of dequantising to F32 first. The output
+    /// `expert_<id>.bin` stays quantized. Mixed projection triples
+    /// are written with UTH2 headers. If quantized output is not
+    /// possible, conversion fails before writing expert files.
+    #[arg(long, default_value_t = false)]
+    native_quant: bool,
+    /// Convert only routed expert blobs and metadata. Dense
+    /// transformer tensors are skipped deliberately; the output is
+    /// valid for expert-streaming benchmarks, not full-model runs.
+    #[arg(long, default_value_t = false)]
+    experts_only: bool,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "ValidateData")]
+struct CliValidateDataArgs {
+    /// Directory containing `expert_<id>.bin` files and metadata.json.
+    #[arg(long)]
+    data_dir: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "ValidatePredictor")]
+struct CliValidatePredictorArgs {
+    /// Path to a JSONL routing trace (produced by `run --trace-out`).
+    #[arg(long)]
+    trace: PathBuf,
+    /// LRU cache size to simulate. Repeat the flag to evaluate
+    /// multiple sizes in one run (e.g. `--cache-slots 4
+    /// --cache-slots 8 --cache-slots 16`). Defaults to a sweep of
+    /// 2, 4, 8, 16.
+    #[arg(long)]
+    cache_slots: Vec<usize>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "Serve")]
+struct CliServeArgs {
+    /// Path to the TOML config file. See `config.toml` at the
+    /// repository root for an example.
+    #[arg(long)]
+    config: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "BenchReal")]
+struct CliBenchRealArgs {
+    /// Path to the TOML config file.
+    #[arg(long)]
+    config: PathBuf,
+    /// Prompt text to encode and benchmark.
+    #[arg(long, conflicts_with = "request_json")]
+    prompt: Option<String>,
+    /// OpenAI-style request JSON containing `prompt`, or chat
+    /// `messages`, and optionally `max_tokens`.
+    #[arg(long, conflicts_with = "prompt")]
+    request_json: Option<PathBuf>,
+    /// Number of completion tokens to generate. Overrides
+    /// `max_tokens` from `--request-json` when both are supplied.
+    #[arg(long)]
+    output_tokens: Option<usize>,
+    /// Warmup runs to execute before measurements.
+    #[arg(long, default_value_t = 1)]
+    warmup_runs: usize,
+    /// Measured runs to report.
+    #[arg(long, default_value_t = 1)]
+    measured_runs: usize,
+    /// Cache reset policy between runs.
+    #[arg(long, value_enum, default_value_t = BenchRealCacheReset::Keep)]
+    cache_reset: BenchRealCacheReset,
+    /// Force deterministic greedy decoding for benchmark parity.
+    #[arg(long)]
+    greedy: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = BenchRealOutputFormat::Human)]
+    format: BenchRealOutputFormat,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "TraceGpuNativeOracleRoutes")]
+struct CliTraceGpuNativeOracleRoutesArgs {
+    /// Path to the strict production GPU-native TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// OpenAI-style request JSON containing `prompt` or chat `messages`
+    /// and the exact requested output-token count. Decoding is always
+    /// greedy and the runtime is always restricted to NVIDIA L4.
+    #[arg(long)]
+    request_json: PathBuf,
+    /// Required destination for the versioned diagnostic JSON artifact.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyGpuNativeOracleScheduledResidency")]
+struct CliQualifyGpuNativeOracleScheduledResidencyArgs {
+    /// Path to the strict production GPU-native TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Immutable ORACLE-0A v1 route-trace report used as future truth.
+    #[arg(long)]
+    oracle_trace: PathBuf,
+    /// Qualification treatment arm.
+    #[arg(long, value_enum)]
+    treatment_mode:
+        crate::gpu_native_oracle_scheduled_residency::OracleScheduledResidencyMode,
+    /// Maximum concurrent layer-level source batches.
+    #[arg(long, default_value_t = 4)]
+    oracle_source_concurrency: usize,
+    /// Required destination for the versioned ORACLE-0B-S report.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyGpuNativeDemandSourceConcurrencyProduction")]
+struct CliQualifyGpuNativeDemandSourceConcurrencyProductionArgs {
+    /// Path to the frozen strict production GPU-native TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact authoritative adapter name required for both isolated arms.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Required destination for the typed v2 qualification report.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyGpuNativePhysicalInstallStagingProduction")]
+struct CliQualifyGpuNativePhysicalInstallStagingProductionArgs {
+    /// Exact frozen PR2 GPU-native TOML config path.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact authoritative adapter name required for both isolated arms.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Required destination for the typed v2 qualification report.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyGpuNativeOutOfCore")]
+struct CliQualifyGpuNativeOutOfCoreArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    expected_adapter_name: String,
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyGpuNativePhysicalInstallConcurrencyProduction")]
+struct CliQualifyGpuNativePhysicalInstallConcurrencyProductionArgs {
+    /// Exact frozen PR2 GPU-native TOML config path.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact authoritative adapter name required for both isolated arms.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Required destination for the typed production-v1 qualification report.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyGpuNativePhysicalZeroFillProduction")]
+struct CliQualifyGpuNativePhysicalZeroFillProductionArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    expected_adapter_name: String,
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativePhysicalStagingPayloadCopy")]
+struct CliDiagnoseGpuNativePhysicalStagingPayloadCopyArgs {
+    #[arg(
+        long,
+        default_value = "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
+    )]
+    config: PathBuf,
+    #[arg(long, default_value = "NVIDIA L4")]
+    expected_adapter_name: String,
+    #[arg(long)]
+    report_out: PathBuf,
+    /// Run only the standalone RAM/WGPU discriminator, without loading a model.
+    #[arg(long)]
+    standalone_only: bool,
+    #[arg(long, default_value_t = 20)]
+    iterations: usize,
+    #[arg(long, default_value_t = 3)]
+    warmup_iterations: usize,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyHybridQ4")]
+struct CliQualifyHybridQ4Args {
+    /// Path to the TOML config file.
+    #[arg(long)]
+    config: PathBuf,
+    /// Prompt text to encode and qualify.
+    #[arg(long, conflicts_with = "request_json")]
+    prompt: Option<String>,
+    /// OpenAI-style request JSON containing `prompt` or chat `messages`.
+    #[arg(long, conflicts_with = "prompt")]
+    request_json: Option<PathBuf>,
+    /// Completion-token count; overrides request JSON `max_tokens`.
+    #[arg(long)]
+    output_tokens: Option<usize>,
+    /// Strict greedy warmups before the single measured request.
+    #[arg(long, default_value_t = 0)]
+    warmup_runs: usize,
+    /// Write the typed JSON report here instead of stdout.
+    #[arg(long)]
+    report_out: Option<PathBuf>,
+    /// Opaque reference to separately collected external GPU-memory evidence.
+    #[arg(long)]
+    external_gpu_memory_artifact: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyHybridQ4Parity")]
+struct CliQualifyHybridQ4ParityArgs {
+    /// Path to the strict Hybrid native-Q4_0 TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Global expert id: layer * num_experts_per_layer + layer-local id.
+    #[arg(long)]
+    expert_id: u32,
+    /// Exact wgpu adapter name required for this qualification run.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Write the typed JSON report here instead of stdout.
+    #[arg(long)]
+    report_out: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyHybridQ4GreedyParity")]
+struct CliQualifyHybridQ4GreedyParityArgs {
+    /// Path to the strict Hybrid native-Q4_0 TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact wgpu adapter name required for every Hybrid corpus case.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Write the typed JSON report here instead of stdout.
+    #[arg(long)]
+    report_out: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyGpuNativeQ4GreedyParity")]
+struct CliQualifyGpuNativeQ4GreedyParityArgs {
+    /// Path to the strict GPU-native Q4 TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact wgpu adapter name required for every GPU-native corpus case.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Write the versioned typed JSON report here instead of stdout.
+    #[arg(long)]
+    report_out: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "QualifyGpuNativeSemanticParityV2")]
+struct CliQualifyGpuNativeSemanticParityV2Args {
+    /// Path to the strict GPU-native Q4 TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact wgpu adapter name required for both isolated runtimes.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Required versioned typed JSON qualification destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeV2HoldoutFailures")]
+struct CliDiagnoseGpuNativeV2HoldoutFailuresArgs {
+    /// Path to the strict GPU-native Q4 TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact wgpu adapter name required for the isolated GPU runtime.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Exact frozen v2 qualification report to consume as immutable evidence.
+    #[arg(long)]
+    v2_report: PathBuf,
+    /// Required frozen SHA256 of the supplied v2 report.
+    #[arg(long)]
+    expected_v2_report_sha256: String,
+    /// Required typed diagnostic JSON destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeQ4ExpertStages")]
+struct CliDiagnoseGpuNativeQ4ExpertStagesArgs {
+    /// Path to the strict GPU-native Q4 TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact wgpu adapter name required for the isolated GPU runtime.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Exact frozen bea attribution report consumed as immutable evidence.
+    #[arg(long)]
+    bea_report: PathBuf,
+    /// Required frozen SHA256 of the supplied bea report.
+    #[arg(long)]
+    expected_bea_report_sha256: String,
+    /// Required typed diagnostic JSON destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeF32ReferenceBoundary")]
+struct CliDiagnoseGpuNativeF32ReferenceBoundaryArgs {
+    /// Path to the strict GPU-native Q4 TOML config used to build a CPU-only reference.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact frozen GPU-native semantic-parity v2 report.
+    #[arg(long)]
+    v2_report: PathBuf,
+    /// Required frozen SHA256 of the supplied v2 report.
+    #[arg(long)]
+    expected_v2_report_sha256: String,
+    /// Exact frozen GPU-native Q4 expert-stage attribution report.
+    #[arg(long)]
+    stage_report: PathBuf,
+    /// Required frozen SHA256 of the supplied stage report.
+    #[arg(long)]
+    expected_stage_report_sha256: String,
+    /// Required typed diagnostic JSON destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeSpanishFirstTokenAttribution")]
+struct CliDiagnoseGpuNativeSpanishFirstTokenAttributionArgs {
+    /// Path to the strict GPU-native Q4 TOML configuration.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact frozen GPU-native semantic-parity v2 report.
+    #[arg(long)]
+    v2_report: PathBuf,
+    /// Required frozen SHA256 of the supplied v2 report.
+    #[arg(long)]
+    expected_v2_report_sha256: String,
+    /// Exact frozen GPU-native Q4 expert-stage attribution report.
+    #[arg(long)]
+    stage_report: PathBuf,
+    /// Required frozen SHA256 of the supplied stage report.
+    #[arg(long)]
+    expected_stage_report_sha256: String,
+    /// Exact frozen f32 reference-boundary audit report.
+    #[arg(long)]
+    boundary_audit_report: PathBuf,
+    /// Required frozen SHA256 of the supplied boundary-audit report.
+    #[arg(long)]
+    expected_boundary_audit_report_sha256: String,
+    /// Exact production GPU adapter name; this diagnostic requires NVIDIA L4.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Required typed diagnostic JSON destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseHybridQ4GreedyDivergence")]
+struct CliDiagnoseHybridQ4GreedyDivergenceArgs {
+    /// Path to the strict Hybrid native-Q4_0 TOML config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact wgpu adapter name required for Hybrid diagnostic workers.
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Required typed diagnostic JSON destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeQ4FirstDivergence")]
+struct CliDiagnoseGpuNativeQ4FirstDivergenceArgs {
+    /// Strict GPU-native Q4 configuration.
+    #[arg(long)]
+    config: PathBuf,
+    /// Expected GPU adapter name (e.g. "NVIDIA L4").
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Target case (e.g. "json-transformation").
+    #[arg(long)]
+    case: String,
+    /// Optional typed diagnostic report output path.
+    #[arg(long)]
+    report_out: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeRouterRankDivergence")]
+struct CliDiagnoseGpuNativeRouterRankDivergenceArgs {
+    /// Strict GPU-native Q4 configuration.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact required GPU adapter name (for example, "NVIDIA L4").
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Fixed-corpus case name.
+    #[arg(long)]
+    case: String,
+    /// Zero-based generated-token position to capture.
+    #[arg(long)]
+    generated_position: usize,
+    /// Zero-based transformer layer to capture.
+    #[arg(long)]
+    layer: usize,
+    /// Required versioned diagnostic JSON destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeExpertPermutationSemanticParity")]
+struct CliDiagnoseGpuNativeExpertPermutationSemanticParityArgs {
+    /// Strict GPU-native Q4 configuration.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact required GPU adapter name (for example, "NVIDIA L4").
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Fixed-corpus case name.
+    #[arg(long)]
+    case: String,
+    /// Zero-based generated-token position to capture.
+    #[arg(long)]
+    generated_position: usize,
+    /// Zero-based transformer layer to capture.
+    #[arg(long)]
+    layer: usize,
+    /// Required versioned diagnostic JSON destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeSemanticParityCorpus")]
+struct CliDiagnoseGpuNativeSemanticParityCorpusArgs {
+    /// Strict GPU-native Q4 configuration.
+    #[arg(long)]
+    config: PathBuf,
+    /// Exact required GPU adapter name (for example, "NVIDIA L4").
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Required versioned diagnostic JSON destination.
+    #[arg(long)]
+    report_out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "DiagnoseGpuNativeLayer0AttentionFirstDivergence")]
+struct CliDiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs {
+    /// Strict GPU-native Q4 configuration.
+    #[arg(long)]
+    config: PathBuf,
+    /// Expected GPU adapter name (e.g. "NVIDIA L4").
+    #[arg(long)]
+    expected_adapter_name: String,
+    /// Target case (e.g. "json-transformation").
+    #[arg(long, default_value = "json-transformation")]
+    case: String,
+    /// Optional typed diagnostic report output path.
+    #[arg(long)]
+    report_out: Option<PathBuf>,
+    /// Optional Slice 11B report path to cross-check final-position layer-0 post-attention evidence.
+    #[arg(long)]
+    slice11b_report: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "GreedyParityHybridWorkerInternal")]
+struct CliGreedyParityHybridWorkerInternalArgs {
+    /// The same strict Hybrid config parsed by the parent orchestrator.
+    #[arg(long)]
+    config: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "GreedyParityLogitWorkerInternal")]
+struct CliGreedyParityLogitWorkerInternalArgs {
+    #[arg(long)]
+    config: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "MatvecMicrobench")]
+struct CliMatvecMicrobenchArgs {
+    /// Backend(s) to benchmark. Repeat or pass comma-separated values.
+    /// Defaults to matrixmultiply, rayon, and rayon-matrixmultiply.
+    #[arg(long = "backend", value_delimiter = ',')]
+    backend: Vec<crate::parallel::DenseMatvecBackend>,
+    /// Warmup iterations per shape/backend.
+    #[arg(long, default_value_t = 1)]
+    warmup_runs: usize,
+    /// Measured iterations per shape/backend.
+    #[arg(long, default_value_t = 3)]
+    measured_runs: usize,
+    /// Skip the 151936 × 2048 LM-head shape.
+    #[arg(long)]
+    skip_lm_head: bool,
+    /// Emit JSON instead of human-readable rows.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "Q8ExpertMicrobench")]
+struct CliQ8ExpertMicrobenchArgs {
+    /// Expert hidden width (Qwen3-Coder-30B-A3B: 2048).
+    #[arg(long, default_value_t = 2048)]
+    d_model: usize,
+    /// Expert intermediate width (Qwen3-Coder-30B-A3B: 768).
+    #[arg(long, default_value_t = 768)]
+    d_ff: usize,
+    /// Warmup resident-hit iterations per path.
+    #[arg(long, default_value_t = 1)]
+    warmup_runs: usize,
+    /// Measured resident-hit iterations per path.
+    #[arg(long, default_value_t = 5)]
+    measured_runs: usize,
+    /// Native backend to exercise. `auto` mirrors the conservative
+    /// production policy; `all` includes every supported native backend
+    /// plus the Candle reference.
+    #[arg(long, value_enum, default_value_t = Q8BenchKernel::Auto)]
+    kernel: Q8BenchKernel,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "ScratchAllocMicrobench")]
+struct CliScratchAllocMicrobenchArgs {
+    /// Hidden size for the synthetic transformer layer. Must be a multiple of 4.
+    #[arg(long, default_value_t = 32)]
+    d_model: usize,
+    /// Number of routed experts in the synthetic gate.
+    #[arg(long, default_value_t = 8)]
+    num_experts: usize,
+    /// Experts selected per token.
+    #[arg(long, default_value_t = 2)]
+    top_k: usize,
+    /// Tokens to run before resetting allocation counters.
+    #[arg(long, default_value_t = 1)]
+    warmup_tokens: usize,
+    /// Tokens measured after warmup. Defaults below the 16-token KV page size.
+    #[arg(long, default_value_t = 8)]
+    measured_tokens: usize,
+    /// Emit JSON instead of human-readable rows.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+#[group(id = "Monitor")]
+struct CliMonitorArgs {
+    /// Base URL of the `serve` HTTP endpoint to poll. Defaults to
+    /// `http://127.0.0.1:8080` to match the example config.
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    url: String,
+    /// How often to refresh the dashboard, in milliseconds.
+    #[arg(long, default_value_t = 500)]
+    refresh_ms: u64,
 }
 
 /// Resolve the effective `predict_min_prob` for a given expert-pool size.
@@ -1605,7 +1753,7 @@ fn rayon_autotune_key_for_cli(
     affinity: &crate::numa::EffectiveCpuAffinity,
 ) -> Option<crate::rayon_autotune::CpuAutotuneKey> {
     match &cli.cmd {
-        Cmd::Run {
+        Cmd::Run(CliRunArgs {
             data_dir,
             num_experts,
             expert_size,
@@ -1618,7 +1766,7 @@ fn rayon_autotune_key_for_cli(
             gpu,
             pipeline_depth,
             ..
-        } => Some(crate::rayon_autotune::CpuAutotuneKey {
+        }) => Some(crate::rayon_autotune::CpuAutotuneKey {
             machine_fingerprint: crate::rayon_autotune::machine_fingerprint_from_affinity(
                 affinity,
             ),
@@ -1651,7 +1799,7 @@ fn rayon_autotune_key_for_cli(
 
 fn run_profile_path(cli: &Cli) -> Option<PathBuf> {
     match &cli.cmd {
-        Cmd::Run { data_dir, .. } => Some(crate::rayon_autotune::default_profile_path(data_dir)),
+        Cmd::Run(CliRunArgs { data_dir, .. }) => Some(crate::rayon_autotune::default_profile_path(data_dir)),
         _ => None,
     }
 }
@@ -1704,7 +1852,7 @@ fn maybe_run_startup_rayon_autotune(
     key: Option<&crate::rayon_autotune::CpuAutotuneKey>,
     config_threads: Option<usize>,
 ) -> Result<Option<usize>, Box<dyn std::error::Error>> {
-    let Cmd::Run {
+    let Cmd::Run(CliRunArgs {
         autotune_rayon,
         autotune_tokens,
         autotune_repeats,
@@ -1715,7 +1863,7 @@ fn maybe_run_startup_rayon_autotune(
         autotune_slow_p99_ms,
         allow_low_confidence_rayon_autotune,
         ..
-    } = &cli.cmd
+    }) = &cli.cmd
     else {
         return Ok(None);
     };
@@ -2069,40 +2217,40 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         }
         Cmd::QualifyGpuNativePredictorV2P1jSidecar(args) => Some(args.config.as_path()),
         Cmd::QualifyGpuNativePredictorV2SidecarPerformance(args) => Some(args.config.as_path()),
-        Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
+        Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy(CliDiagnoseGpuNativePhysicalStagingPayloadCopyArgs {
             config,
             standalone_only: false,
             ..
-        } => Some(config.as_path()),
-        Cmd::Serve { config }
-        | Cmd::BenchReal { config, .. }
+        }) => Some(config.as_path()),
+        Cmd::Serve(CliServeArgs { config })
+        | Cmd::BenchReal(CliBenchRealArgs { config, .. })
         | Cmd::BenchGpuNativeReal { config, .. }
-        | Cmd::TraceGpuNativeOracleRoutes { config, .. }
-        | Cmd::QualifyGpuNativeOracleScheduledResidency { config, .. }
-        | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
+        | Cmd::TraceGpuNativeOracleRoutes(CliTraceGpuNativeOracleRoutesArgs { config, .. })
+        | Cmd::QualifyGpuNativeOracleScheduledResidency(CliQualifyGpuNativeOracleScheduledResidencyArgs { config, .. })
+        | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction(CliQualifyGpuNativeDemandSourceConcurrencyProductionArgs { config, .. })
         | Cmd::QualifyGpuNativeQ4RouteParallelProduction { config, .. }
-        | Cmd::QualifyGpuNativeOutOfCore { config, .. }
-        | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
-        | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
-        | Cmd::QualifyGpuNativePhysicalZeroFillProduction { config, .. }
+        | Cmd::QualifyGpuNativeOutOfCore(CliQualifyGpuNativeOutOfCoreArgs { config, .. })
+        | Cmd::QualifyGpuNativePhysicalInstallStagingProduction(CliQualifyGpuNativePhysicalInstallStagingProductionArgs { config, .. })
+        | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction(CliQualifyGpuNativePhysicalInstallConcurrencyProductionArgs { config, .. })
+        | Cmd::QualifyGpuNativePhysicalZeroFillProduction(CliQualifyGpuNativePhysicalZeroFillProductionArgs { config, .. })
         | Cmd::QualifyGpuNativeSourceToUploadCopyElisionProduction { config, .. }
-        | Cmd::QualifyHybridQ4 { config, .. }
-        | Cmd::QualifyHybridQ4Parity { config, .. }
-        | Cmd::QualifyHybridQ4GreedyParity { config, .. }
-        | Cmd::QualifyGpuNativeQ4GreedyParity { config, .. }
-        | Cmd::QualifyGpuNativeSemanticParityV2 { config, .. }
-        | Cmd::DiagnoseGpuNativeV2HoldoutFailures { config, .. }
-        | Cmd::DiagnoseGpuNativeQ4ExpertStages { config, .. }
-        | Cmd::DiagnoseGpuNativeF32ReferenceBoundary { config, .. }
-        | Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution { config, .. }
-        | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
-        | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
-        | Cmd::DiagnoseGpuNativeRouterRankDivergence { config, .. }
-        | Cmd::DiagnoseGpuNativeExpertPermutationSemanticParity { config, .. }
-        | Cmd::DiagnoseGpuNativeSemanticParityCorpus { config, .. }
-        | Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence { config, .. }
-        | Cmd::GreedyParityHybridWorkerInternal { config }
-        | Cmd::GreedyParityLogitWorkerInternal { config } => Some(config.as_path()),
+        | Cmd::QualifyHybridQ4(CliQualifyHybridQ4Args { config, .. })
+        | Cmd::QualifyHybridQ4Parity(CliQualifyHybridQ4ParityArgs { config, .. })
+        | Cmd::QualifyHybridQ4GreedyParity(CliQualifyHybridQ4GreedyParityArgs { config, .. })
+        | Cmd::QualifyGpuNativeQ4GreedyParity(CliQualifyGpuNativeQ4GreedyParityArgs { config, .. })
+        | Cmd::QualifyGpuNativeSemanticParityV2(CliQualifyGpuNativeSemanticParityV2Args { config, .. })
+        | Cmd::DiagnoseGpuNativeV2HoldoutFailures(CliDiagnoseGpuNativeV2HoldoutFailuresArgs { config, .. })
+        | Cmd::DiagnoseGpuNativeQ4ExpertStages(CliDiagnoseGpuNativeQ4ExpertStagesArgs { config, .. })
+        | Cmd::DiagnoseGpuNativeF32ReferenceBoundary(CliDiagnoseGpuNativeF32ReferenceBoundaryArgs { config, .. })
+        | Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution(CliDiagnoseGpuNativeSpanishFirstTokenAttributionArgs { config, .. })
+        | Cmd::DiagnoseHybridQ4GreedyDivergence(CliDiagnoseHybridQ4GreedyDivergenceArgs { config, .. })
+        | Cmd::DiagnoseGpuNativeQ4FirstDivergence(CliDiagnoseGpuNativeQ4FirstDivergenceArgs { config, .. })
+        | Cmd::DiagnoseGpuNativeRouterRankDivergence(CliDiagnoseGpuNativeRouterRankDivergenceArgs { config, .. })
+        | Cmd::DiagnoseGpuNativeExpertPermutationSemanticParity(CliDiagnoseGpuNativeExpertPermutationSemanticParityArgs { config, .. })
+        | Cmd::DiagnoseGpuNativeSemanticParityCorpus(CliDiagnoseGpuNativeSemanticParityCorpusArgs { config, .. })
+        | Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence(CliDiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs { config, .. })
+        | Cmd::GreedyParityHybridWorkerInternal(CliGreedyParityHybridWorkerInternalArgs { config })
+        | Cmd::GreedyParityLogitWorkerInternal(CliGreedyParityLogitWorkerInternalArgs { config }) => Some(config.as_path()),
         _ => None,
     }
 }
@@ -2112,8 +2260,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let worker_protocol_stdout = matches!(
         cli.cmd,
-        Cmd::GreedyParityHybridWorkerInternal { .. }
-            | Cmd::GreedyParityLogitWorkerInternal { .. }
+        Cmd::GreedyParityHybridWorkerInternal(_)
+            | Cmd::GreedyParityLogitWorkerInternal(_)
     );
     init_logging(&cli.log, worker_protocol_stdout);
 
@@ -2237,19 +2385,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the effective expert dtype/geometry. GPU initialization failure is
     // fatal; legacy deterministic dtype/geometry bypass remains visible in
     // the resolved component plan.
-    let run_gpu_requested = matches!(cli.cmd, Cmd::Run { gpu: true, .. });
+    let run_gpu_requested = matches!(cli.cmd, Cmd::Run(CliRunArgs { gpu: true, .. }));
     if !matches!(
         cli.cmd,
-        Cmd::Serve { .. }
-            | Cmd::QualifyHybridQ4 { .. }
-            | Cmd::QualifyHybridQ4Parity { .. }
-            | Cmd::QualifyHybridQ4GreedyParity { .. }
-            | Cmd::QualifyGpuNativeQ4GreedyParity { .. }
-            | Cmd::DiagnoseHybridQ4GreedyDivergence { .. }
-            | Cmd::DiagnoseGpuNativeRouterRankDivergence { .. }
+        Cmd::Serve(_)
+            | Cmd::QualifyHybridQ4(_)
+            | Cmd::QualifyHybridQ4Parity(_)
+            | Cmd::QualifyHybridQ4GreedyParity(_)
+            | Cmd::QualifyGpuNativeQ4GreedyParity(_)
+            | Cmd::DiagnoseHybridQ4GreedyDivergence(_)
+            | Cmd::DiagnoseGpuNativeRouterRankDivergence(_)
             | Cmd::DiagnoseGpuNativeSourceToUploadCopyElision { .. }
-            | Cmd::GreedyParityHybridWorkerInternal { .. }
-            | Cmd::GreedyParityLogitWorkerInternal { .. }
+            | Cmd::GreedyParityHybridWorkerInternal(_)
+            | Cmd::GreedyParityLogitWorkerInternal(_)
     ) && !run_gpu_requested
     {
         crate::backend::install_default();
@@ -2262,7 +2410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.cmd {
-        Cmd::GenData {
+        Cmd::GenData(CliGenDataArgs {
             data_dir,
             num_experts,
             expert_size,
@@ -2270,7 +2418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             d_ff,
             block_align,
             dtype,
-        } => cmd_gen_data(
+        }) => cmd_gen_data(
             &data_dir,
             num_experts,
             expert_size,
@@ -2279,7 +2427,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             block_align,
             &dtype,
         ),
-        Cmd::Repack {
+        Cmd::Repack(CliRepackArgs {
             data_dir,
             out_blob,
             out_manifest,
@@ -2290,7 +2438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_experts_per_layer,
             profile,
             order,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2307,12 +2455,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 order,
             }))
         }
-        Cmd::Run { .. } => {
+        Cmd::Run(_) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(async move {
-                if let Cmd::Run {
+                if let Cmd::Run(CliRunArgs {
                     data_dir,
                     num_experts,
                     expert_size,
@@ -2373,7 +2521,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     packed_blob,
                     packed_manifest,
                     ..
-                } = cli.cmd
+                }) = cli.cmd
                 {
                     let dtype =
                         crate::inference::WeightDtype::from_str_opt(&dtype).ok_or_else(|| {
@@ -2449,13 +2597,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
         }
-        Cmd::Serve { config } => {
+        Cmd::Serve(CliServeArgs { config }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(cmd_serve(config))
         }
-        Cmd::BenchReal {
+        Cmd::BenchReal(CliBenchRealArgs {
             config,
             prompt,
             request_json,
@@ -2465,7 +2613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_reset,
             greedy,
             format,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2541,11 +2689,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             rt.block_on(crate::gpu_native_predictor_v2_sidecar_qualifier::run_command(args))
         }
-        Cmd::TraceGpuNativeOracleRoutes {
+        Cmd::TraceGpuNativeOracleRoutes(CliTraceGpuNativeOracleRoutesArgs {
             config,
             request_json,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2558,13 +2706,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::QualifyGpuNativeOracleScheduledResidency {
+        Cmd::QualifyGpuNativeOracleScheduledResidency(CliQualifyGpuNativeOracleScheduledResidencyArgs {
             config,
             oracle_trace,
             treatment_mode,
             oracle_source_concurrency,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2581,11 +2729,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction {
+        Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction(CliQualifyGpuNativeDemandSourceConcurrencyProductionArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2617,11 +2765,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::QualifyGpuNativeOutOfCore {
+        Cmd::QualifyGpuNativeOutOfCore(CliQualifyGpuNativeOutOfCoreArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2634,11 +2782,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::QualifyGpuNativePhysicalInstallStagingProduction {
+        Cmd::QualifyGpuNativePhysicalInstallStagingProduction(CliQualifyGpuNativePhysicalInstallStagingProductionArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2651,11 +2799,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction {
+        Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction(CliQualifyGpuNativePhysicalInstallConcurrencyProductionArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2670,11 +2818,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::QualifyGpuNativePhysicalZeroFillProduction {
+        Cmd::QualifyGpuNativePhysicalZeroFillProduction(CliQualifyGpuNativePhysicalZeroFillProductionArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2708,14 +2856,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
+        Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy(CliDiagnoseGpuNativePhysicalStagingPayloadCopyArgs {
             config,
             expected_adapter_name,
             report_out,
             standalone_only,
             iterations,
             warmup_iterations,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2757,7 +2905,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::QualifyHybridQ4 {
+        Cmd::QualifyHybridQ4(CliQualifyHybridQ4Args {
             config,
             prompt,
             request_json,
@@ -2765,7 +2913,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             warmup_runs,
             report_out,
             external_gpu_memory_artifact,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2780,12 +2928,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 progress_watchdog,
             }))
         }
-        Cmd::QualifyHybridQ4Parity {
+        Cmd::QualifyHybridQ4Parity(CliQualifyHybridQ4ParityArgs {
             config,
             expert_id,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2799,11 +2947,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::QualifyHybridQ4GreedyParity {
+        Cmd::QualifyHybridQ4GreedyParity(CliQualifyHybridQ4GreedyParityArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2819,11 +2967,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::QualifyGpuNativeQ4GreedyParity {
+        Cmd::QualifyGpuNativeQ4GreedyParity(CliQualifyGpuNativeQ4GreedyParityArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2839,11 +2987,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::QualifyGpuNativeSemanticParityV2 {
+        Cmd::QualifyGpuNativeSemanticParityV2(CliQualifyGpuNativeSemanticParityV2Args {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2857,13 +3005,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 progress_watchdog,
             ))
         }
-        Cmd::DiagnoseGpuNativeV2HoldoutFailures {
+        Cmd::DiagnoseGpuNativeV2HoldoutFailures(CliDiagnoseGpuNativeV2HoldoutFailuresArgs {
             config,
             expected_adapter_name,
             v2_report,
             expected_v2_report_sha256,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2881,13 +3029,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::DiagnoseGpuNativeQ4ExpertStages {
+        Cmd::DiagnoseGpuNativeQ4ExpertStages(CliDiagnoseGpuNativeQ4ExpertStagesArgs {
             config,
             expected_adapter_name,
             bea_report,
             expected_bea_report_sha256,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2905,14 +3053,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::DiagnoseGpuNativeF32ReferenceBoundary {
+        Cmd::DiagnoseGpuNativeF32ReferenceBoundary(CliDiagnoseGpuNativeF32ReferenceBoundaryArgs {
             config,
             v2_report,
             expected_v2_report_sha256,
             stage_report,
             expected_stage_report_sha256,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2931,7 +3079,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution {
+        Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution(CliDiagnoseGpuNativeSpanishFirstTokenAttributionArgs {
             config,
             v2_report,
             expected_v2_report_sha256,
@@ -2941,7 +3089,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             expected_boundary_audit_report_sha256,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2963,11 +3111,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::DiagnoseHybridQ4GreedyDivergence {
+        Cmd::DiagnoseHybridQ4GreedyDivergence(CliDiagnoseHybridQ4GreedyDivergenceArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2983,7 +3131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::GreedyParityHybridWorkerInternal { config: _ } => {
+        Cmd::GreedyParityHybridWorkerInternal(CliGreedyParityHybridWorkerInternalArgs { config: _ }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -2996,7 +3144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::GreedyParityLogitWorkerInternal { config: _ } => {
+        Cmd::GreedyParityLogitWorkerInternal(CliGreedyParityLogitWorkerInternalArgs { config: _ }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -3009,12 +3157,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::DiagnoseGpuNativeQ4FirstDivergence {
+        Cmd::DiagnoseGpuNativeQ4FirstDivergence(CliDiagnoseGpuNativeQ4FirstDivergenceArgs {
             config: _,
             expected_adapter_name,
             case,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -3030,14 +3178,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::DiagnoseGpuNativeRouterRankDivergence {
+        Cmd::DiagnoseGpuNativeRouterRankDivergence(CliDiagnoseGpuNativeRouterRankDivergenceArgs {
             config,
             expected_adapter_name,
             case,
             generated_position,
             layer,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -3056,14 +3204,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::DiagnoseGpuNativeExpertPermutationSemanticParity {
+        Cmd::DiagnoseGpuNativeExpertPermutationSemanticParity(CliDiagnoseGpuNativeExpertPermutationSemanticParityArgs {
             config,
             expected_adapter_name,
             case,
             generated_position,
             layer,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -3082,11 +3230,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
-        Cmd::DiagnoseGpuNativeSemanticParityCorpus {
+        Cmd::DiagnoseGpuNativeSemanticParityCorpus(CliDiagnoseGpuNativeSemanticParityCorpusArgs {
             config,
             expected_adapter_name,
             report_out,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -3102,13 +3250,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence {
+        Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence(CliDiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs {
             config: _,
             expected_adapter_name,
             case,
             report_out,
             slice11b_report,
-        } => {
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -3126,34 +3274,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         }
 
-        Cmd::MatvecMicrobench {
+        Cmd::MatvecMicrobench(CliMatvecMicrobenchArgs {
             backend,
             warmup_runs,
             measured_runs,
             skip_lm_head,
             json,
-        } => cmd_matvec_microbench(MatvecMicrobenchArgs {
+        }) => cmd_matvec_microbench(MatvecMicrobenchArgs {
             backends: backend,
             warmup_runs,
             measured_runs,
             skip_lm_head,
             json,
         }),
-        Cmd::Q8ExpertMicrobench {
+        Cmd::Q8ExpertMicrobench(CliQ8ExpertMicrobenchArgs {
             d_model,
             d_ff,
             warmup_runs,
             measured_runs,
             kernel,
-        } => cmd_q8_expert_microbench(d_model, d_ff, warmup_runs, measured_runs, kernel),
-        Cmd::ScratchAllocMicrobench {
+        }) => cmd_q8_expert_microbench(d_model, d_ff, warmup_runs, measured_runs, kernel),
+        Cmd::ScratchAllocMicrobench(CliScratchAllocMicrobenchArgs {
             d_model,
             num_experts,
             top_k,
             warmup_tokens,
             measured_tokens,
             json,
-        } => cmd_scratch_alloc_microbench(ScratchAllocMicrobenchArgs {
+        }) => cmd_scratch_alloc_microbench(ScratchAllocMicrobenchArgs {
             d_model,
             num_experts,
             top_k,
@@ -3161,7 +3309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             measured_tokens,
             json,
         }),
-        Cmd::GgufConvert {
+        Cmd::GgufConvert(CliGgufConvertArgs {
             gguf_path,
             out_dir,
             num_layers,
@@ -3170,7 +3318,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             legacy_eager,
             native_quant,
             experts_only,
-        } => cmd_gguf_convert(
+        }) => cmd_gguf_convert(
             &gguf_path,
             &out_dir,
             num_layers,
@@ -3180,14 +3328,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             native_quant,
             experts_only,
         ),
-        Cmd::ValidateData { data_dir } => cmd_validate_data(&data_dir),
-        Cmd::ValidatePredictor { trace, cache_slots } => {
+        Cmd::ValidateData(CliValidateDataArgs { data_dir }) => cmd_validate_data(&data_dir),
+        Cmd::ValidatePredictor(CliValidatePredictorArgs { trace, cache_slots }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(cmd_validate_predictor(&trace, &cache_slots))
         }
-        Cmd::Monitor { url, refresh_ms } => {
+        Cmd::Monitor(CliMonitorArgs { url, refresh_ms }) => {
             #[cfg(feature = "tui")]
             {
                 let rt = tokio::runtime::Builder::new_multi_thread()
@@ -14701,7 +14849,7 @@ mod tests {
             "--allow-low-confidence-rayon-autotune",
         ])
         .expect("autotune stability flags should parse");
-        let Cmd::Run {
+        let Cmd::Run(CliRunArgs {
             autotune_rayon,
             autotune_tokens,
             autotune_repeats,
@@ -14712,7 +14860,7 @@ mod tests {
             autotune_print_table,
             allow_low_confidence_rayon_autotune,
             ..
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected run command");
         };
@@ -15202,14 +15350,14 @@ mod tests {
             "hello",
         ])
         .unwrap();
-        let Cmd::BenchReal {
+        let Cmd::BenchReal(CliBenchRealArgs {
             warmup_runs,
             measured_runs,
             cache_reset,
             greedy,
             format,
             ..
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected bench-real command");
         };
@@ -15233,13 +15381,13 @@ mod tests {
             "pr6://sample",
         ])
         .unwrap();
-        let Cmd::QualifyHybridQ4 {
+        let Cmd::QualifyHybridQ4(CliQualifyHybridQ4Args {
             warmup_runs,
             output_tokens,
             report_out,
             external_gpu_memory_artifact,
             ..
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected qualify-hybrid-q4 command");
         };
@@ -15281,12 +15429,12 @@ mod tests {
             "NVIDIA L4",
         ])
         .unwrap();
-        let Cmd::QualifyHybridQ4Parity {
+        let Cmd::QualifyHybridQ4Parity(CliQualifyHybridQ4ParityArgs {
             expert_id,
             expected_adapter_name,
             report_out,
             ..
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected qualify-hybrid-q4-parity command");
         };
@@ -15308,11 +15456,11 @@ mod tests {
             "report.json",
         ])
         .unwrap();
-        let Cmd::QualifyHybridQ4GreedyParity {
+        let Cmd::QualifyHybridQ4GreedyParity(CliQualifyHybridQ4GreedyParityArgs {
             config,
             expected_adapter_name,
             report_out,
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected qualify-hybrid-q4-greedy-parity command");
         };
@@ -15347,11 +15495,11 @@ mod tests {
             "gpu-native-report.json",
         ])
         .unwrap();
-        let Cmd::QualifyGpuNativeQ4GreedyParity {
+        let Cmd::QualifyGpuNativeQ4GreedyParity(CliQualifyGpuNativeQ4GreedyParityArgs {
             config,
             expected_adapter_name,
             report_out,
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected qualify-gpu-native-q4-greedy-parity command");
         };
@@ -15379,14 +15527,14 @@ mod tests {
             "router-rank.json",
         ])
         .unwrap();
-        let Cmd::DiagnoseGpuNativeRouterRankDivergence {
+        let Cmd::DiagnoseGpuNativeRouterRankDivergence(CliDiagnoseGpuNativeRouterRankDivergenceArgs {
             config,
             expected_adapter_name,
             case,
             generated_position,
             layer,
             report_out,
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected diagnose-gpu-native-router-rank-divergence command");
         };
@@ -15420,14 +15568,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.progress_timeout_secs, Some(300));
-        let Cmd::DiagnoseGpuNativeExpertPermutationSemanticParity {
+        let Cmd::DiagnoseGpuNativeExpertPermutationSemanticParity(CliDiagnoseGpuNativeExpertPermutationSemanticParityArgs {
             config,
             expected_adapter_name,
             case,
             generated_position,
             layer,
             report_out,
-        } = &cli.cmd
+        }) = &cli.cmd
         else {
             panic!("expected diagnose-gpu-native-expert-permutation-semantic-parity command");
         };
@@ -15459,11 +15607,11 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.progress_timeout_secs, Some(300));
-        let Cmd::DiagnoseGpuNativeSemanticParityCorpus {
+        let Cmd::DiagnoseGpuNativeSemanticParityCorpus(CliDiagnoseGpuNativeSemanticParityCorpusArgs {
             config,
             expected_adapter_name,
             report_out,
-        } = &cli.cmd
+        }) = &cli.cmd
         else {
             panic!("expected diagnose-gpu-native-semantic-parity-corpus command");
         };
@@ -15492,11 +15640,11 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.progress_timeout_secs, Some(300));
-        let Cmd::QualifyGpuNativeSemanticParityV2 {
+        let Cmd::QualifyGpuNativeSemanticParityV2(CliQualifyGpuNativeSemanticParityV2Args {
             config,
             expected_adapter_name,
             report_out,
-        } = &cli.cmd
+        }) = &cli.cmd
         else {
             panic!("expected qualify-gpu-native-semantic-parity-v2 command");
         };
@@ -15529,13 +15677,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.progress_timeout_secs, Some(300));
-        let Cmd::DiagnoseGpuNativeV2HoldoutFailures {
+        let Cmd::DiagnoseGpuNativeV2HoldoutFailures(CliDiagnoseGpuNativeV2HoldoutFailuresArgs {
             config,
             expected_adapter_name,
             v2_report,
             expected_v2_report_sha256,
             report_out,
-        } = &cli.cmd
+        }) = &cli.cmd
         else {
             panic!("expected diagnose-gpu-native-v2-holdout-failures command");
         };
@@ -15576,13 +15724,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.progress_timeout_secs, Some(300));
-        let Cmd::DiagnoseGpuNativeQ4ExpertStages {
+        let Cmd::DiagnoseGpuNativeQ4ExpertStages(CliDiagnoseGpuNativeQ4ExpertStagesArgs {
             config,
             expected_adapter_name,
             bea_report,
             expected_bea_report_sha256,
             report_out,
-        } = &cli.cmd
+        }) = &cli.cmd
         else {
             panic!("expected diagnose-gpu-native-q4-expert-stages command");
         };
@@ -15626,14 +15774,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.progress_timeout_secs, Some(300));
-        let Cmd::DiagnoseGpuNativeF32ReferenceBoundary {
+        let Cmd::DiagnoseGpuNativeF32ReferenceBoundary(CliDiagnoseGpuNativeF32ReferenceBoundaryArgs {
             config,
             v2_report,
             expected_v2_report_sha256,
             stage_report,
             expected_stage_report_sha256,
             report_out,
-        } = &cli.cmd
+        }) = &cli.cmd
         else {
             panic!("expected diagnose-gpu-native-f32-reference-boundary command");
         };
@@ -15696,7 +15844,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.progress_timeout_secs, Some(300));
-        let Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution {
+        let Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution(CliDiagnoseGpuNativeSpanishFirstTokenAttributionArgs {
             config,
             v2_report,
             expected_v2_report_sha256,
@@ -15706,7 +15854,7 @@ mod tests {
             expected_boundary_audit_report_sha256,
             expected_adapter_name,
             report_out,
-        } = &cli.cmd
+        }) = &cli.cmd
         else {
             panic!("expected Spanish first-token attribution command");
         };
@@ -15747,11 +15895,11 @@ mod tests {
             "diagnostic.json",
         ])
         .unwrap();
-        let Cmd::DiagnoseHybridQ4GreedyDivergence {
+        let Cmd::DiagnoseHybridQ4GreedyDivergence(CliDiagnoseHybridQ4GreedyDivergenceArgs {
             config,
             expected_adapter_name,
             report_out,
-        } = cli.cmd
+        }) = cli.cmd
         else {
             panic!("expected logit diagnostic command");
         };
@@ -15980,7 +16128,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::GreedyParityHybridWorkerInternal { config }
+            Cmd::GreedyParityHybridWorkerInternal(CliGreedyParityHybridWorkerInternalArgs { config })
                 if config == Path::new("strict-hybrid.toml")
         ));
         let help = <Cli as clap::CommandFactory>::command()
@@ -15996,7 +16144,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             diagnostic.cmd,
-            Cmd::GreedyParityLogitWorkerInternal { config }
+            Cmd::GreedyParityLogitWorkerInternal(CliGreedyParityLogitWorkerInternalArgs { config })
                 if config == Path::new("strict-hybrid.toml")
         ));
         assert!(!help.contains("greedy-parity-logit-worker-internal"));
@@ -16584,12 +16732,12 @@ mod tests {
         .unwrap();
 
         match &cli.cmd {
-            Cmd::DiagnoseGpuNativeQ4FirstDivergence {
+            Cmd::DiagnoseGpuNativeQ4FirstDivergence(CliDiagnoseGpuNativeQ4FirstDivergenceArgs {
                 config,
                 expected_adapter_name,
                 case,
                 report_out,
-            } => {
+            }) => {
                 assert_eq!(config, &PathBuf::from("config.toml"));
                 assert_eq!(expected_adapter_name, "NVIDIA L4");
                 assert_eq!(case, "json-transformation");
@@ -16642,13 +16790,13 @@ mod tests {
         .unwrap();
 
         match &cli.cmd {
-            Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence {
+            Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence(CliDiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs {
                 config,
                 expected_adapter_name,
                 case,
                 report_out,
                 slice11b_report,
-            } => {
+            }) => {
                 assert_eq!(config, &PathBuf::from("config.toml"));
                 assert_eq!(expected_adapter_name, "NVIDIA L4");
                 assert_eq!(case, "json-transformation");
@@ -16698,11 +16846,11 @@ mod tests {
         .unwrap();
 
         match &cli.cmd {
-            Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction {
+            Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction(CliQualifyGpuNativeDemandSourceConcurrencyProductionArgs {
                 config,
                 expected_adapter_name,
                 report_out,
-            } => {
+            }) => {
                 assert_eq!(config, &PathBuf::from("config.toml"));
                 assert_eq!(expected_adapter_name, "NVIDIA L4");
                 assert_eq!(
@@ -16733,11 +16881,11 @@ mod tests {
         .unwrap();
 
         match &cli.cmd {
-            Cmd::QualifyGpuNativePhysicalInstallStagingProduction {
+            Cmd::QualifyGpuNativePhysicalInstallStagingProduction(CliQualifyGpuNativePhysicalInstallStagingProductionArgs {
                 config,
                 expected_adapter_name,
                 report_out,
-            } => {
+            }) => {
                 assert_eq!(
                     config,
                     &PathBuf::from("/home/randyap8/slice11-qwen3-coder-gpu-native.toml")
@@ -16769,11 +16917,11 @@ mod tests {
         ];
         let cli = <Cli as clap::Parser>::try_parse_from(args).unwrap();
         match &cli.cmd {
-            Cmd::QualifyGpuNativeOutOfCore {
+            Cmd::QualifyGpuNativeOutOfCore(CliQualifyGpuNativeOutOfCoreArgs {
                 config,
                 expected_adapter_name,
                 report_out,
-            } => {
+            }) => {
                 assert_eq!(
                     config,
                     &PathBuf::from("/home/randyap8/slice11-qwen3-coder-gpu-native.toml")
@@ -16810,11 +16958,11 @@ mod tests {
         .unwrap();
 
         match &cli.cmd {
-            Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction {
+            Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction(CliQualifyGpuNativePhysicalInstallConcurrencyProductionArgs {
                 config,
                 expected_adapter_name,
                 report_out,
-            } => {
+            }) => {
                 assert_eq!(
                     config,
                     &PathBuf::from("/home/randyap8/slice11-qwen3-coder-gpu-native.toml")
@@ -16848,13 +16996,13 @@ mod tests {
             ))
         );
         match cli.cmd {
-            Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
+            Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy(CliDiagnoseGpuNativePhysicalStagingPayloadCopyArgs {
                 standalone_only,
                 iterations,
                 warmup_iterations,
                 expected_adapter_name,
                 ..
-            } => {
+            }) => {
                 assert!(!standalone_only);
                 assert_eq!((iterations, warmup_iterations), (20, 3));
                 assert_eq!(expected_adapter_name, "NVIDIA L4");
@@ -16891,11 +17039,11 @@ mod tests {
         .unwrap();
 
         match &cli.cmd {
-            Cmd::QualifyGpuNativePhysicalZeroFillProduction {
+            Cmd::QualifyGpuNativePhysicalZeroFillProduction(CliQualifyGpuNativePhysicalZeroFillProductionArgs {
                 config,
                 expected_adapter_name,
                 report_out,
-            } => {
+            }) => {
                 assert_eq!(
                     config,
                     &PathBuf::from("/home/randyap8/slice11-qwen3-coder-gpu-native.toml")
