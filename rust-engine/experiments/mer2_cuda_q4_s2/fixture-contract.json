@@ -1,0 +1,31 @@
+{
+  "schema": "MER2-CUDA-S2-fixture-contract-v1",
+  "atol": 0.0001,
+  "rtol": 1e-05,
+  "fixtures": [
+    {
+      "name": "zero",
+      "d_model": 64,
+      "d_ff": 64,
+      "fixture_sha256": "774167646910b18b31ffca71a76fa2b93d15efa9abcbc0dd16a28206e921250b"
+    },
+    {
+      "name": "alternating",
+      "d_model": 128,
+      "d_ff": 64,
+      "fixture_sha256": "d58ed6cd42fba55ec8f2a014d92553cbcf268b6706b2f8409cbb1612674d3e6c"
+    },
+    {
+      "name": "sign",
+      "d_model": 64,
+      "d_ff": 128,
+      "fixture_sha256": "34fc7c663dbe980c39a0de65c25e8c4ab6da2503ac60d6906d36d87bce4eb3ea"
+    },
+    {
+      "name": "mixed",
+      "d_model": 128,
+      "d_ff": 128,
+      "fixture_sha256": "1a774f651b0ab77f17d881a104c490841fa72c4c03faf85a162d15b95bf7b363"
+    }
+  ]
+}
