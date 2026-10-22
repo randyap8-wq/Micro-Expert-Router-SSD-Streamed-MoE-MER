@@ -415,8 +415,10 @@ impl<A: Adapter> Runner<A> {
         }
     }
     pub fn step(&mut self, op: Op, data: &Data) -> Result<(), String> {
+        let mut adapter_called = false;
         let result = catch_unwind(AssertUnwindSafe(|| {
             self.core.guard(&op, data)?;
+            adapter_called = true;
             let receipt = self.adapter.execute(&op, data)?;
             self.core.submitted(&op, &receipt)?;
             self.adapter.check()?;
@@ -426,7 +428,12 @@ impl<A: Adapter> Runner<A> {
         if let Err(e) = &result {
             self.core.trace.push(json!({"operation":format!("{op:?}"),"status":"FAILED",
                 "error":e,"submitted":self.core.submitted.json(),"completed":self.core.completed.json()}));
-            if matches!(op, Op::Create(Kind::Context | Kind::Pinned | Kind::Device, _)) {
+            if adapter_called
+                && matches!(
+                    op,
+                    Op::Create(Kind::Context | Kind::Pinned | Kind::Device, _)
+                )
+            {
                 // cudarc retains a context before a fallible attribute query,
                 // and allocates before creating internal tracking events;
                 // an Err can hide a resource with no returned Rust owner.
@@ -664,22 +671,36 @@ mod tests {
         let r = Runner::new(Fake::new(), 17, &p.data);
         (p, r)
     }
-    fn context_create_failure_is_quarantined(f: Fake, expected: &str) {
+    fn resource_create_failure_is_quarantined(f: Fake, op: Op, expected: &str) {
         let p = crate::prepare().unwrap();
         let drops = f.drops.clone();
         let mut r = Runner::new(f, 17, &p.data);
-        assert_eq!(
-            r.step(Op::Create(Kind::Context, 0), &p.data),
-            Err(expected.into())
-        );
+        let index = r.core.schedule.iter().position(|next| *next == op).unwrap();
+        for next in plan(17).into_iter().take(index) {
+            r.step(next, &p.data).unwrap();
+        }
+        assert_eq!(r.step(op.clone(), &p.data), Err(expected.into()));
         assert_eq!(r.core.first.as_deref(), Some(expected));
         assert_eq!(r.core.phase, Phase::Poisoned);
-        assert_eq!(r.core.cursor, 0);
-        assert_eq!(r.adapter.call, 1);
+        assert_eq!(r.core.cursor, index);
+        assert_eq!(r.adapter.call, index + 1);
         assert!(r.dependency_leak_possible);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
+        if r.adapter.deferred_at == Some(index) {
+            match op {
+                Op::Create(Kind::Pinned, id) => {
+                    assert!(r.adapter.pinned.contains_key(&id));
+                    assert_eq!(r.core.submitted.pinned, u64::from(id) + 1);
+                }
+                Op::Create(Kind::Device, id) => {
+                    assert!(r.adapter.device.contains_key(&id));
+                    assert_eq!(r.core.submitted.device, u64::from(id) + 1);
+                }
+                _ => {}
+            }
+        }
         assert!(r.step(Op::Install, &p.data).is_err());
-        assert_eq!(r.adapter.call, 1);
+        assert_eq!(r.adapter.call, index + 1);
         assert_eq!(r.core.first.as_deref(), Some(expected));
         r.finish();
         r.finish();
@@ -689,14 +710,14 @@ mod tests {
         assert_eq!(r.cleanup, "STOP_DEPENDENCY_CLEANUP_UNCONFIRMED");
         assert!(r.releases.is_null());
         assert!(!r.adapter.released);
-        assert_eq!(r.adapter.call, 1);
+        assert_eq!(r.adapter.call, index + 1);
         let report = r.report(true);
         assert_eq!(report["dependency_inaccessible_allocation_possible"], true);
         assert_eq!(report["cleanup"], "STOP_DEPENDENCY_CLEANUP_UNCONFIRMED");
         assert_eq!(report["first_error"], expected);
         assert!(report["releases"].is_null());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
-        println!("CONTEXT_CREATE_FAILURE={expected}; REPORT={report}");
+        println!("RESOURCE_CREATE_FAILURE={op:?}:{expected}; REPORT={report}");
         drop(r);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
@@ -704,19 +725,125 @@ mod tests {
     fn context_create_direct_failure_is_quarantined() {
         let mut f = Fake::new();
         f.fail = Some(0);
-        context_create_failure_is_quarantined(f, "direct:0");
+        resource_create_failure_is_quarantined(f, Op::Create(Kind::Context, 0), "direct:0");
     }
     #[test]
     fn context_create_deferred_failure_is_quarantined() {
         let mut f = Fake::new();
         f.deferred_at = Some(0);
-        context_create_failure_is_quarantined(f, "deferred:0");
+        resource_create_failure_is_quarantined(f, Op::Create(Kind::Context, 0), "deferred:0");
     }
     #[test]
     fn context_create_panic_is_quarantined() {
         let mut f = Fake::new();
         f.panic_at = Some(0);
-        context_create_failure_is_quarantined(f, "STOP_OWNERSHIP: panic during operation");
+        resource_create_failure_is_quarantined(
+            f,
+            Op::Create(Kind::Context, 0),
+            "STOP_OWNERSHIP: panic during operation",
+        );
+    }
+    #[test]
+    fn pinned_and_device_create_direct_deferred_and_panic_failures_are_quarantined() {
+        let mut tested = 0;
+        for (index, op) in plan(17).into_iter().enumerate() {
+            if !matches!(op, Op::Create(Kind::Pinned | Kind::Device, _)) {
+                continue;
+            }
+            for failure in 0..3 {
+                let mut f = Fake::new();
+                let expected = match failure {
+                    0 => {
+                        f.fail = Some(index);
+                        format!("direct:{index}")
+                    }
+                    1 => {
+                        f.deferred_at = Some(index);
+                        format!("deferred:{index}")
+                    }
+                    _ => {
+                        f.panic_at = Some(index);
+                        "STOP_OWNERSHIP: panic during operation".into()
+                    }
+                };
+                resource_create_failure_is_quarantined(f, op.clone(), &expected);
+                tested += 1;
+            }
+        }
+        assert_eq!(tested, 48);
+    }
+    #[test]
+    fn guard_rejected_context_after_non_resource_failure_releases_owners() {
+        for deferred in [false, true] {
+            let (p, mut r) = runner();
+            while r.core.schedule[r.core.cursor] != Op::Install {
+                let op = r.core.schedule[r.core.cursor].clone();
+                r.step(op, &p.data).unwrap();
+            }
+            let index = r.adapter.call;
+            let expected = if deferred {
+                r.adapter.deferred_at = Some(index);
+                format!("deferred:{index}")
+            } else {
+                r.adapter.fail = Some(index);
+                format!("direct:{index}")
+            };
+            let drops = r.adapter.drops.clone();
+            assert_eq!(r.step(Op::Install, &p.data), Err(expected.clone()));
+            assert!(!r.dependency_leak_possible);
+            assert_eq!(
+                r.step(Op::Create(Kind::Context, 0), &p.data),
+                Err("STOP_OWNERSHIP: terminal, out-of-order or identity mismatch".into())
+            );
+            assert_eq!(r.adapter.call, index + 1);
+            assert!(!r.dependency_leak_possible);
+            assert_eq!(r.core.first.as_deref(), Some(expected.as_str()));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            r.finish();
+            r.finish();
+            assert_eq!(r.drain_attempts, 1);
+            assert_eq!(r.core.phase, Phase::Poisoned);
+            assert_eq!(r.core.first.as_deref(), Some(expected.as_str()));
+            assert_eq!(
+                r.cleanup,
+                "DRAIN_AND_RELEASE_CONFIRMED_CONTEXT_DESTRUCTION_UNOBSERVABLE"
+            );
+            assert_eq!(r.releases, json!({"pinned":6,"device":10,"events":8}));
+            assert_eq!(
+                r.report(true)["dependency_inaccessible_allocation_possible"],
+                false
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(r);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[test]
+    fn guard_rejected_out_of_order_pinned_and_device_creates_do_not_quarantine() {
+        for kind in [Kind::Pinned, Kind::Device] {
+            let (p, mut r) = runner();
+            let drops = r.adapter.drops.clone();
+            let expected = "STOP_OWNERSHIP: terminal, out-of-order or identity mismatch";
+            assert_eq!(r.step(Op::Create(kind, 0), &p.data), Err(expected.into()));
+            assert_eq!(r.adapter.call, 0);
+            assert_eq!(r.core.cursor, 0);
+            assert_eq!(r.core.first.as_deref(), Some(expected));
+            assert!(!r.dependency_leak_possible);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            r.finish();
+            r.finish();
+            assert_eq!(r.drain_attempts, 1);
+            assert_eq!(r.core.phase, Phase::Poisoned);
+            assert_eq!(r.core.first.as_deref(), Some(expected));
+            assert_eq!(
+                r.cleanup,
+                "DRAIN_AND_RELEASE_CONFIRMED_CONTEXT_DESTRUCTION_UNOBSERVABLE"
+            );
+            assert_eq!(r.releases, json!({"pinned":0,"device":0,"events":0}));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(r);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
     }
     #[test]
     fn empty_cancellation_without_context_attempt_releases_normally() {
@@ -798,19 +925,49 @@ mod tests {
                 let mut r = Runner::new(f, 17, &p.data);
                 assert!(r.execute(&p.data).is_err());
                 let first = r.core.first.clone();
+                assert_eq!(
+                    first,
+                    Some(format!(
+                        "{}:{i}",
+                        if deferred { "deferred" } else { "direct" }
+                    ))
+                );
+                let resource_create = matches!(
+                    schedule[i],
+                    Op::Create(Kind::Context | Kind::Pinned | Kind::Device, _)
+                );
+                assert_eq!(r.dependency_leak_possible, resource_create);
                 let calls = r.adapter.call;
+                let drops = r.adapter.drops.clone();
                 assert!(r.step(schedule[0].clone(), &p.data).is_err());
                 assert_eq!(r.adapter.call, calls);
                 assert_eq!(r.core.first, first);
+                assert_eq!(r.dependency_leak_possible, resource_create);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
                 assert!(r.core.completed.h2d <= r.core.submitted.h2d);
                 assert!(r.core.completed.d2h <= r.core.submitted.d2h);
                 if matches!(schedule[i], Op::H2d { .. } | Op::D2h(_) | Op::Fence(_)) {
                     assert!(r.core.completed.h2d + r.core.completed.d2h < 34840);
                 }
                 r.finish();
+                r.finish();
                 assert_eq!(r.drain_attempts, 1);
                 assert_eq!(r.core.phase, Phase::Poisoned);
                 assert_eq!(r.core.first, first);
+                if resource_create {
+                    assert_eq!(r.cleanup, "STOP_DEPENDENCY_CLEANUP_UNCONFIRMED");
+                    assert!(r.releases.is_null());
+                    assert!(!r.adapter.released);
+                } else {
+                    assert_eq!(
+                        r.cleanup,
+                        "DRAIN_AND_RELEASE_CONFIRMED_CONTEXT_DESTRUCTION_UNOBSERVABLE"
+                    );
+                    assert!(r.releases.is_object());
+                }
+                assert_eq!(drops.load(Ordering::SeqCst), usize::from(!resource_create));
+                drop(r);
+                assert_eq!(drops.load(Ordering::SeqCst), usize::from(!resource_create));
                 tested += 1;
             }
         }
