@@ -228,10 +228,11 @@ fn fixture_fingerprints_match_independent_byte_serialization() {
     let contract: Value = serde_json::from_str(include_str!("../fixture-contract.json")).unwrap();
     assert_eq!(contract["atol"], ATOL);
     assert_eq!(contract["rtol"], RTOL);
-    for (f, expected) in fixtures()
-        .iter()
-        .zip(contract["fixtures"].as_array().unwrap())
-    {
+    let frozen = contract["fixtures"].as_array().unwrap();
+    let generated = fixtures();
+    assert_eq!(frozen.len(), generated.len());
+    for (f, expected) in generated.iter().zip(frozen) {
+        assert_eq!(expected["name"], f.name);
         assert_eq!(
             f.fingerprint(),
             expected["fixture_sha256"].as_str().unwrap()

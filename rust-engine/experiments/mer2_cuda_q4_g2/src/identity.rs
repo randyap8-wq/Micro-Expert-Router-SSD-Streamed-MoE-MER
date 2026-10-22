@@ -222,7 +222,7 @@ pub fn source_identity() -> Result<Value, String> {
         let actual = sha256(include_bytes!(
             "../../../experiments/mer2_cuda_q4_s2/tests/cpu.rs"
         ));
-        if actual != "00787f8edc24e47dc44b084d1360c968c610461135dab1fdf3c85ca0829d9a02" {
+        if actual != "a24aa3d608c185b7d23a43cd998435a90af170128f3a5bcd2d54531c21eb7f4a" {
             return Err(
                 "STOP_IDENTITY: rust-engine/experiments/mer2_cuda_q4_s2/tests/cpu.rs".into(),
             );
