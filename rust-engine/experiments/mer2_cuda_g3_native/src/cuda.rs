@@ -1,4 +1,143 @@
-//! The only unsafe boundary. All CUDA resources stay in Owner through checked cleanup.
+//! Shared native ownership decisions; CPU injection never proves CUDA destruction.
+pub(crate) mod ownership {
+    use mer2_cuda_g3_s1::{require, Result, Stop};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[derive(Default)]
+    pub(crate) struct State {
+        pub initialization_attempted: bool,
+        pub ownership_uncertain: bool,
+        // A constructor has started but has not stored a returned typed owner.
+        // This is possible inaccessible dependency ownership, not an observed leak.
+        pub unreturned_owner_possible: bool,
+        pub drained: bool,
+        pub released: bool,
+        pub first_error: Option<Stop>,
+    }
+    impl State {
+        pub fn initialize_allowed(&self, context: u64) -> Result<()> {
+            require(
+                !self.initialization_attempted && !self.drained && !self.released && context != 0,
+                "STOP_OWNERSHIP",
+                "single native initialization",
+            )
+        }
+    }
+
+    pub(crate) trait Owned {
+        fn state(&self) -> &State;
+        fn state_mut(&mut self) -> &mut State;
+        fn note_error(&mut self, error: &Stop, first: bool);
+    }
+
+    pub(crate) fn call<O: Owned, T>(
+        owner: &mut O,
+        cleanup: bool,
+        f: impl FnOnce(&mut O) -> Result<T>,
+    ) -> Result<T> {
+        if !cleanup {
+            if let Some(error) = &owner.state().first_error {
+                return Err(error.clone());
+            }
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| f(owner)))
+            .unwrap_or_else(|_| Err(Stop::new("STOP_PANIC", "native adapter operation panicked")));
+        if let Err(error) = &result {
+            let first = owner.state().first_error.is_none();
+            if first {
+                owner.state_mut().first_error = Some(error.clone());
+            }
+            owner.note_error(error, first);
+        }
+        result
+    }
+
+    /// Store the returned typed owner BEFORE checking a deferred error. The store
+    /// closure must not perform any fallible work after storing that owner.
+    pub(crate) fn retain<O: Owned>(
+        owner: &mut O,
+        create_and_store: impl FnOnce(&mut O) -> Result<()>,
+        check: impl FnOnce(&O) -> Result<()>,
+    ) -> Result<()> {
+        owner.state_mut().ownership_uncertain = true;
+        owner.state_mut().unreturned_owner_possible = true;
+        create_and_store(owner)?;
+        owner.state_mut().unreturned_owner_possible = false;
+        check(owner)?;
+        owner.state_mut().ownership_uncertain = false;
+        Ok(())
+    }
+
+    pub(crate) fn drain<O: Owned>(
+        owner: &mut O,
+        matching_context: bool,
+        synchronize_and_check: impl FnOnce(&mut O) -> Result<()>,
+    ) -> Result<()> {
+        require(
+            !owner.state().drained && !owner.state().released && matching_context,
+            "STOP_DRAIN_UNCONFIRMED",
+            "single drain of matching native context",
+        )?;
+        synchronize_and_check(owner)?;
+        require(
+            !owner.state().ownership_uncertain,
+            "STOP_DEPENDENCY_CLEANUP_UNCONFIRMED",
+            "Cudarc resource creation may have allocated without returning an owner",
+        )?;
+        owner.state_mut().drained = true;
+        Ok(())
+    }
+
+    pub(crate) fn release<O: Owned>(
+        owner: &mut O,
+        matching_context: bool,
+        no_pending_work: bool,
+        release_and_check: impl FnOnce(&mut O) -> Result<()>,
+    ) -> Result<()> {
+        require(
+            owner.state().drained
+                && !owner.state().released
+                && !owner.state().ownership_uncertain
+                && matching_context
+                && no_pending_work,
+            "STOP_RELEASE_UNCONFIRMED",
+            "checked drain before single native release",
+        )?;
+        release_and_check(owner)?;
+        owner.state_mut().released = true;
+        Ok(())
+    }
+
+    /// An error or panic stops at the first attempted destructor/check. Remaining
+    /// slots stay owned. The caller's guarded Runner settles and quarantines them.
+    pub(crate) fn release_slots<T>(
+        slots: &mut [Option<T>],
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for slot in slots {
+            drop(slot.take());
+            check()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dispose<O: Owned>(owner: Box<O>, quarantine: impl FnOnce(&O)) {
+        if owner.state().released || !owner.state().initialization_attempted {
+            drop(owner);
+        } else {
+            quarantine(&owner);
+            std::mem::forget(owner);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub use native::{NativeCudaAdapter, NativeEvidence};
+
+#[cfg(feature = "cuda")]
+mod native {
+use super::ownership::{self, Owned, State};
+// The only unsafe boundary. All CUDA resources stay in Owner through checked cleanup.
 use crate::KIND;
 use cudarc::{
     driver::{
@@ -22,7 +161,6 @@ use serde_json::{json, Value};
 use std::{
     cell::RefCell,
     collections::BTreeSet,
-    panic::{catch_unwind, AssertUnwindSafe},
     rc::Rc,
     sync::Arc,
 };
@@ -151,12 +289,8 @@ struct Owner {
     pending: Option<Pending>,
     next_sequence: usize,
     used_events: BTreeSet<u64>,
-    initialization_attempted: bool,
     initialized: bool,
-    ownership_uncertain: bool,
-    drained: bool,
-    released: bool,
-    first_error: Option<Stop>,
+    ownership: State,
     journal: Rc<RefCell<Journal>>,
 }
 
@@ -191,12 +325,8 @@ impl NativeCudaAdapter {
             pending: None,
             next_sequence: 0,
             used_events: BTreeSet::new(),
-            initialization_attempted: false,
             initialized: false,
-            ownership_uncertain: false,
-            drained: false,
-            released: false,
-            first_error: None,
+            ownership: State::default(),
             journal: journal.clone(),
         };
         (
@@ -212,37 +342,17 @@ impl NativeCudaAdapter {
             .owner
             .as_mut()
             .ok_or_else(|| Stop::new("STOP_OWNERSHIP", "missing native owner"))?;
-        if !cleanup {
-            if let Some(error) = &o.first_error {
-                return Err(error.clone());
-            }
-        }
-        // The outer Runner also guards panics. Retain native first-error provenance here.
-        let result = catch_unwind(AssertUnwindSafe(|| f(o)))
-            .unwrap_or_else(|_| Err(Stop::new("STOP_PANIC", "native adapter operation panicked")));
-        if let Err(error) = &result {
-            let mut j = o.journal.borrow_mut();
-            if o.first_error.is_none() {
-                o.first_error = Some(error.clone());
-                j.first_error = Some(error.clone());
-            } else {
-                j.secondary_errors.push(error.clone());
-            }
-        }
-        result
+        ownership::call(o.as_mut(), cleanup, f)
     }
 }
 
 impl Drop for NativeCudaAdapter {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.take() {
-            if owner.released || !owner.initialization_attempted {
-                drop(owner);
-            } else {
-                // Direct misuse/drop is conservative too. Runner normally forgets us on quarantine.
+            ownership::dispose(owner, |owner| {
+                // Runner normally forgets us on quarantine; direct Drop is conservative too.
                 owner.journal.borrow_mut().cleanup = "QUARANTINED_UNCHECKED_OWNER_DROP";
-                std::mem::forget(owner);
-            }
+            });
         }
     }
 }
@@ -259,6 +369,19 @@ fn present_mut<T>(value: &mut Option<T>) -> Result<&mut T> {
     value
         .as_mut()
         .ok_or_else(|| Stop::new("STOP_OWNERSHIP", "missing retained CUDA resource"))
+}
+
+impl Owned for Owner {
+    fn state(&self) -> &State { &self.ownership }
+    fn state_mut(&mut self) -> &mut State { &mut self.ownership }
+    fn note_error(&mut self, error: &Stop, first: bool) {
+        let mut journal = self.journal.borrow_mut();
+        if first {
+            journal.first_error = Some(error.clone());
+        } else {
+            journal.secondary_errors.push(error.clone());
+        }
+    }
 }
 
 impl Owner {
@@ -281,11 +404,7 @@ impl Owner {
         residents: &[Resident],
         weights: &[ExpertWeights],
     ) -> Result<InitReceipt> {
-        require(
-            !self.initialization_attempted && !self.drained && !self.released && context != 0,
-            "STOP_OWNERSHIP",
-            "single native initialization",
-        )?;
+        self.ownership.initialize_allowed(context)?;
         require(
             cfg!(target_endian = "little")
                 && usize::BITS == 64
@@ -316,24 +435,24 @@ impl Owner {
         self.context_id = context;
         self.residents = residents.to_vec();
         self.weights = weights.to_vec();
-        self.initialization_attempted = true;
+        self.ownership.initialization_attempted = true;
         self.journal.borrow_mut().context = context;
         // A Cudarc constructor may allocate before returning Err or panicking.
         // Keep uncertainty latched until the returned owner AND deferred check succeed.
         macro_rules! retain {
-            ($place:expr, $create:expr) => {{
-                self.ownership_uncertain = true;
-                $place = Some($create.map_err(cuda_error)?);
-                self.check()?;
-                self.ownership_uncertain = false;
+            ($owner:ident => $place:expr, $create:expr) => {{
+                ownership::retain(self, |$owner| {
+                    $place = Some($create.map_err(cuda_error)?);
+                    Ok(())
+                }, Owner::check)?;
             }};
         }
-        retain!(self.ctx, CudaContext::new(self.ordinal));
+        retain!(o => o.ctx, CudaContext::new(o.ordinal));
         let ctx = self.context()?.clone();
-        self.ownership_uncertain = true;
-        self.stream = Some(ctx.default_stream());
-        self.check()?;
-        self.ownership_uncertain = false;
+        ownership::retain(self, |o| {
+            o.stream = Some(ctx.default_stream());
+            Ok(())
+        }, Owner::check)?;
         let stream = self.stream()?.clone();
         let ptx = [
             candle_kernels::QUANTIZED.ptx(),
@@ -341,19 +460,19 @@ impl Owner {
             candle_kernels::BINARY.ptx(),
         ];
         for i in 0..3 {
-            retain!(self.modules[i], ctx.load_module(Ptx::from_src(ptx[i])));
+            retain!(o => o.modules[i], ctx.load_module(Ptx::from_src(ptx[i])));
             retain!(
-                self.functions[i],
-                present(&self.modules[i])?.load_function(SYMBOLS[i])
+                o => o.functions[i],
+                present(&o.modules[i])?.load_function(SYMBOLS[i])
             );
         }
         for i in 0..8 {
-            retain!(self.events[i], ctx.new_event(None));
+            retain!(o => o.events[i], ctx.new_event(None));
         }
         for i in 0..RESIDENTS * 3 {
             // SAFETY: bounded primitive byte allocation, retained before any H2D.
             // Every byte is written before kernels can read it.
-            retain!(self.device_weights[i], unsafe {
+            retain!(o => o.device_weights[i], unsafe {
                 stream.alloc::<u8>(Q4_BYTES)
             });
             let source = self.weights[i / 3].matrices()[i % 3].bytes();
@@ -363,14 +482,14 @@ impl Owner {
             self.check()?;
         }
         // SAFETY: three usize elements initialized by the owned layout H2D below.
-        retain!(self.layout, unsafe { stream.alloc::<usize>(3) });
+        retain!(o => o.layout, unsafe { stream.alloc::<usize>(3) });
         stream
             .memcpy_htod(&self.layout_host[..], present_mut(&mut self.layout)?)
             .map_err(cuda_error)?;
         self.check()?;
         for i in 0..6 {
             // SAFETY: no device read occurs until UploadInput writes input and all sentinels.
-            retain!(self.scratch[i], unsafe { stream.alloc::<f32>(D) });
+            retain!(o => o.scratch[i], unsafe { stream.alloc::<f32>(D) });
         }
         present(&self.events[0])?
             .record(&stream)
@@ -402,7 +521,7 @@ impl Owner {
 
     fn submit(&mut self, op: &Operation, input: &Vector) -> Result<Submission> {
         require(
-            self.initialized && !self.drained && !self.released && self.pending.is_none(),
+            self.initialized && !self.ownership.drained && !self.ownership.released && self.pending.is_none(),
             "STOP_OWNERSHIP",
             "initialized owner with no in-flight operation",
         )?;
@@ -591,8 +710,8 @@ impl Owner {
 
     fn complete(&mut self, op: &Operation) -> Result<Completion> {
         require(
-            !self.drained
-                && !self.released
+            !self.ownership.drained
+                && !self.ownership.released
                 && self
                     .pending
                     .as_ref()
@@ -644,22 +763,14 @@ impl Owner {
     fn drain(&mut self, context: u64) -> Result<CleanupReceipt> {
         // Mark quarantine first: a panic/Err cannot leave an optimistic cleanup label.
         self.journal.borrow_mut().cleanup = "QUARANTINED_DRAIN_UNCONFIRMED";
-        require(
-            !self.drained && !self.released && (self.context_id == 0 || self.context_id == context),
-            "STOP_DRAIN_UNCONFIRMED",
-            "single drain of matching native context",
-        )?;
-        if let Some(ctx) = &self.ctx {
-            ctx.synchronize().map_err(cuda_error)?;
-        }
-        self.check()?;
-        require(
-            !self.ownership_uncertain,
-            "STOP_DEPENDENCY_CLEANUP_UNCONFIRMED",
-            "Cudarc resource creation may have allocated without returning an owner",
-        )?;
+        let matching_context = self.context_id == 0 || self.context_id == context;
+        ownership::drain(self, matching_context, |o| {
+            if let Some(ctx) = &o.ctx {
+                ctx.synchronize().map_err(cuda_error)?;
+            }
+            o.check()
+        })?;
         self.context_id = context;
-        self.drained = true;
         // A drain does not manufacture missing operation completions or readable outputs.
         self.pending = None;
         self.active = None;
@@ -673,51 +784,36 @@ impl Owner {
 
     fn release(&mut self, context: u64) -> Result<CleanupReceipt> {
         self.journal.borrow_mut().cleanup = "QUARANTINED_RELEASE_UNCONFIRMED";
-        require(
-            self.drained
-                && !self.released
-                && !self.ownership_uncertain
-                && context == self.context_id
-                && self.pending.is_none()
-                && self.active.is_none(),
-            "STOP_RELEASE_UNCONFIRMED",
-            "checked drain before single native release",
-        )?;
-        if let Some(ctx) = self.ctx.as_ref().cloned() {
-            // Stop at the first destructor/deferred error. Remaining owners stay quarantined.
-            for value in &mut self.device_weights {
-                drop(value.take());
-                ctx.synchronize().map_err(cuda_error)?;
-                ctx.check_err().map_err(cuda_error)?;
+        let matching_context = context == self.context_id;
+        let no_pending_work = self.pending.is_none() && self.active.is_none();
+        ownership::release(self, matching_context, no_pending_work, |o| {
+            if let Some(ctx) = o.ctx.as_ref().cloned() {
+                // Stop at the first destructor/deferred error. Remaining owners stay quarantined.
+                ownership::release_slots(&mut o.device_weights, || {
+                    ctx.synchronize().map_err(cuda_error)?;
+                    ctx.check_err().map_err(cuda_error)
+                })?;
+                ownership::release_slots(&mut o.scratch, || {
+                    ctx.synchronize().map_err(cuda_error)?;
+                    ctx.check_err().map_err(cuda_error)
+                })?;
+                ownership::release_slots(std::slice::from_mut(&mut o.layout), || {
+                    ctx.synchronize().map_err(cuda_error)?;
+                    ctx.check_err().map_err(cuda_error)
+                })?;
+                ownership::release_slots(&mut o.events, || ctx.check_err().map_err(cuda_error))?;
+                ownership::release_slots(&mut o.functions, || ctx.check_err().map_err(cuda_error))?;
+                ownership::release_slots(&mut o.modules, || ctx.check_err().map_err(cuda_error))?;
+                ownership::release_slots(std::slice::from_mut(&mut o.stream), || {
+                    ctx.synchronize().map_err(cuda_error)?;
+                    ctx.check_err().map_err(cuda_error)
+                })?;
             }
-            for value in &mut self.scratch {
-                drop(value.take());
-                ctx.synchronize().map_err(cuda_error)?;
-                ctx.check_err().map_err(cuda_error)?;
-            }
-            drop(self.layout.take());
-            ctx.synchronize().map_err(cuda_error)?;
-            ctx.check_err().map_err(cuda_error)?;
-            for value in &mut self.events {
-                drop(value.take());
-                ctx.check_err().map_err(cuda_error)?;
-            }
-            for value in &mut self.functions {
-                drop(value.take());
-                ctx.check_err().map_err(cuda_error)?;
-            }
-            for value in &mut self.modules {
-                drop(value.take());
-                ctx.check_err().map_err(cuda_error)?;
-            }
-            drop(self.stream.take());
-            ctx.synchronize().map_err(cuda_error)?;
-            ctx.check_err().map_err(cuda_error)?;
-        }
-        self.weights.clear();
-        self.residents.clear();
-        // Like G2, retain ctx for the Runner's post-release check. Last context drop is unobservable.
-        self.released = true;
+            o.weights.clear();
+            o.residents.clear();
+            // Retain ctx for Runner's post-release check. Last context drop is unobservable.
+            Ok(())
+        })?;
         self.journal.borrow_mut().cleanup = "CHECKED_NATIVE_DRAIN_AND_RESOURCE_RELEASE";
         Ok(CleanupReceipt {
             context_identity: context,
@@ -751,4 +847,5 @@ impl Adapter for NativeCudaAdapter {
     fn release(&mut self, context: u64) -> Result<CleanupReceipt> {
         self.call(true, |o| o.release(context))
     }
+}
 }
