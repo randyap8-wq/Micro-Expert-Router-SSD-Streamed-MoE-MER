@@ -1,9 +1,11 @@
 //! Native selected-expert source draft; no build or GPU qualification is implied.
 #![deny(unsafe_code)]
 
-#[cfg(feature = "cuda")]
-#[allow(unsafe_code)]
+#[cfg(any(feature = "cuda", test))]
+#[cfg_attr(feature = "cuda", allow(unsafe_code))]
 mod cuda;
+#[cfg(test)]
+mod ownership;
 #[cfg(feature = "cuda")]
 pub use cuda::{NativeCudaAdapter, NativeEvidence};
 
