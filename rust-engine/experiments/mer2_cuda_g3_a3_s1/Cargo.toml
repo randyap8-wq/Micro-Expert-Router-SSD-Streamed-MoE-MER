@@ -1,0 +1,13 @@
+[package]
+name = "mer2-g3-a3-s1"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+
+[[bin]]
+name = "fake_worker"
+path = "src/bin/fake_worker.rs"
