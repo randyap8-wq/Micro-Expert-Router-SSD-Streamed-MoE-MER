@@ -8,12 +8,28 @@
 
 | Actor | Default responsibility |
 | --- | --- |
-| ChatGPT (orchestrator) | Recover current authority/status from GitHub and Notion; reason about plans and results; write and verify *simple* shell/Python utilities and read-only diagnostics directly; publish authorized helper scripts to GitHub; provide one SHA-pinned command; review terminal evidence; update GitHub/Notion when authorized. |
+| ChatGPT (orchestrator) | Recover current authority/status from GitHub and Notion; reason about plans and results; write and verify simple shell/Python utilities, read-only diagnostics, **and bounded Rust source under explicit founder authorization** directly; clearly announce whether coding directly, delegating, or reviewing only; publish authorized helper/source changes to an isolated Git branch; provide SHA-pinned commands when applicable; review evidence; update GitHub/Notion when authorized. |
 | User (operator) | Start/stop and control cloud resources; prepare attached SSD; paste verified commands into the AWS **browser SSH** session; explicitly decide whether to run a gate; return logs/artifacts. |
 | Codex (engineering worker) | Substantial Rust/CUDA implementation, complex multi-file patches, focused code-level debugging, test engineering, independently scoped investigations. Codex should not be assigned trivial helper scripts or VM shell commands that ChatGPT can produce and verify. |
 | Runner on host | Execute only its explicitly authorized frozen gates, enforce environment/identity/one-shot constraints, stop on first failure, record evidence. |
 
 **No implicit remote execution:** Codex and ChatGPT do not directly control the AWS instance by default. The user launches from browser SSH. Preparing a script or command is not execution authority. Do not claim to have run a VM command unless real host evidence is returned.
+
+## 1A. Coding authorship visibility (standing founder preference; 2026-10-27)
+
+**Before any code-writing task, proactively tell the user who is writing the code.** Use clear, unambiguous language, without waiting for the user to ask:
+
+- **ChatGPT writing directly:** "I'm writing this code myself." Name the language/component, the bounded file scope, and the authorization boundary.
+- **Delegated engineering:** "I'm delegating the coding to Codex/Claude/[named agent]." Make clear who authors the patch and who reviews it.
+- **Review/planning only:** "I'm inspecting or planning; no code is being changed."
+
+**During work**, especially when a multi-file implementation or publishing step takes longer than expected, provide concise updates that distinguish local drafting, source publication, static inspection, and runtime activity. Never imply that a source draft was compiled, tested, or independently verified unless it actually was. If the coding author or scope changes, say so immediately.
+
+**At completion**, explicitly distinguish: `DRAFTED`, `COMMITTED`, `COMPILED`, `TESTED`, and `INDEPENDENTLY_VERIFIED`; include Git branch/commit and exact test counts or `NOT_RUN` when relevant. Disclose failures and unresolved review findings. Source or Git hash checks alone are not runtime qualification.
+
+**Division of labor is flexible within authorization:** ChatGPT can write *small or bounded Rust changes directly* when the founder authorizes it, as well as shell/Python tools. Codex/Claude remain available for substantial Rust/CUDA development or independent review. **Do not automatically delegate a simple task**, and do not infer authorization for tests, GPU work, PRs, merges or new paths merely because the founder permits drafting source.
+
+**Persistence scope:** This is a durable repository operating-convention record, but it is *not itself* ChatGPT Project Instructions or an immediate ChatGPT Memory write. Mirror the convention into the existing MER ChatGPT Project Instructions to make it reliably active at the start of future project chats; GitHub remains a recoverable project reference.
 
 ## 2. Standard GitHub-to-VM script delivery
 
