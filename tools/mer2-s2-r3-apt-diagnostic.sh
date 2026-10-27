@@ -39,7 +39,7 @@ fi
 
 printf '\n%s\n' '== PACKAGE DATABASE (observation only) =='
 if command -v dpkg-query >/dev/null 2>&1; then
-  status="$(dpkg-query -W -f='\${Package} \${Status} \${Version}\\n' python3.11 2>&1)"
+  status="$(dpkg-query -W python3.11 2>&1)"
   rc=$?
   printf 'dpkg_query_exit=%d\n' "$rc"
   printf '%s\n' "$status"
