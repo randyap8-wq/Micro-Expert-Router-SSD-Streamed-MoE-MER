@@ -170,6 +170,11 @@ pub fn decode_frame_exact(raw: &[u8]) -> Result<Frame> {
     Ok(Frame { header, payload })
 }
 
+// Codec's public stream API must never trust callers to have disabled blocking.
+// This is a permanent nonblocking mode, not a per-frame timeout workaround.
+fn enforce_nonblocking(stream: &UnixStream) -> Result<()> {
+    stream.set_nonblocking(true).map_err(|_| "STOP_WIRE_NONBLOCKING")
+}
 fn exact_read(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant, cancel: &AtomicBool) -> Result<()> {
     let mut offset = 0;
     while offset < buf.len() {
@@ -219,6 +224,7 @@ impl Codec {
         self.active()?;
         let action = (|| {
             check(deadline, cancel)?;
+            enforce_nonblocking(stream)?;
             max_payload(kind, payload.len())?;
             let header = Header {
                 kind, generation: self.generation, sequence: self.next_send,
@@ -236,6 +242,8 @@ impl Codec {
     pub fn recv(&mut self, stream: &mut UnixStream, deadline: Instant, cancel: &AtomicBool) -> Result<Frame> {
         self.active()?;
         let action = (|| {
+            check(deadline, cancel)?;
+            enforce_nonblocking(stream)?;
             let mut prefix = [0u8; HEADER_LEN];
             exact_read(stream, &mut prefix, deadline, cancel)?;
             let header = Header::decode(&prefix)?;
@@ -252,6 +260,33 @@ impl Codec {
         })();
         if action.is_err() { self.poisoned = true; }
         action
+    }
+    /// Consume the terminal boundary after the final BYE. A successful process
+    /// exit alone does not prove a well-formed protocol stream. EOF is required,
+    /// and even one trailing byte is terminal; a partial duplicate frame is no
+    /// different from a fully formed duplicate. No resynchronization or replay.
+    /// The codec becomes permanently unusable after this terminal observation.
+    pub fn expect_clean_eof(
+        &mut self, stream: &mut UnixStream, deadline: Instant, cancel: &AtomicBool,
+    ) -> Result<()> {
+        self.active()?;
+        let outcome = (|| {
+            check(deadline, cancel)?;
+            enforce_nonblocking(stream)?;
+            loop {
+                check(deadline, cancel)?;
+                let mut one = [0u8; 1];
+                match stream.read(&mut one) {
+                    Ok(0) => { check(deadline, cancel)?; return Ok(()); }
+                    Ok(_) => return Err("STOP_WIRE_TRAILING_AFTER_BYE"),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(POLL),
+                    Err(_) => return Err("STOP_WIRE_READ_IO"),
+                }
+            }
+        })();
+        self.poisoned = true; // also prevent a second transaction after clean EOF
+        outcome
     }
     pub fn expect(&mut self, stream: &mut UnixStream, kind: Kind, payload: &[u8], deadline: Instant, cancel: &AtomicBool) -> Result<()> {
         let frame = self.recv(stream, deadline, cancel)?;

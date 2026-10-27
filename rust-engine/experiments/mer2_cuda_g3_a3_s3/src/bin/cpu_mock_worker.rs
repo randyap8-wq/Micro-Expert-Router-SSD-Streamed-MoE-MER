@@ -5,6 +5,7 @@ use mer2_g3_a3_s3_p1a::wire::{Codec, Kind};
 use mer2_g3_a3_s3_p1a::Result;
 use mer2_g3_a3_s1::sha256;
 use std::os::unix::net::UnixStream;
+use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use std::thread;
@@ -99,6 +100,9 @@ fn run() -> Result<()> {
     emit(&mut codec, &mut stream, Kind::Fenced, work_sha.as_bytes(), end, &cancel)?;
     let mut output = input.payload;
     let work_hash_raw = mer2_g3_a3_s3_p1a::wire::digest_bytes(&admit.payload);
+    // Corrupt-before-descriptor is deliberately self-consistent: only the
+    // parent's independent identity oracle can catch it.
+    if scenario == "self-consistent-wrong-output" { output[0] ^= 1; }
     let descriptor = TensorDescriptor::for_mock(&output, work_hash_raw)?;
     emit(&mut codec, &mut stream, Kind::ResultDescriptor, &descriptor.encode(), end, &cancel)?;
     if scenario == "mutated-output" { output[0] ^= 1; }
@@ -117,7 +121,17 @@ fn run() -> Result<()> {
     }
     emit(&mut codec, &mut stream, Kind::Released, b"", end, &cancel)?;
     expected_frame(&mut codec, &mut stream, Kind::Exit, b"", end, &cancel)?;
+    if scenario == "missing-bye" { return Ok(()); }
     emit(&mut codec, &mut stream, Kind::Bye, b"", end, &cancel)?;
+    if scenario == "abnormal-after-bye" { std::process::exit(23); }
+    if scenario == "duplicate-bye" {
+        emit(&mut codec, &mut stream, Kind::Bye, b"", end, &cancel)?;
+    } else if scenario == "trailing-frame" {
+        emit(&mut codec, &mut stream, Kind::Ready, b"", end, &cancel)?;
+    } else if scenario == "trailing-byte" || scenario == "delayed-trailing-byte" {
+        if scenario == "delayed-trailing-byte" { thread::sleep(Duration::from_millis(25)); }
+        stream.write_all(b"!").map_err(|_| "STOP_WORKER_TRAILING_IO")?;
+    }
     Ok(())
 }
 fn main() {

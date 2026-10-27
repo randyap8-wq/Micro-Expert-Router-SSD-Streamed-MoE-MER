@@ -160,3 +160,103 @@ fn t04_mutated_payload_digest_stop() {
 fn t05_cuda_is_an_explicit_refusal() {
     assert_eq!(mer2_g3_a3_s3_p1a::native_cuda_unavailable().unwrap_err(), "STOP_CUDA_NOT_AUTHORIZED");
 }
+
+// Corrective review additions: all SOURCE ONLY, never executed in this gate.
+#[test]
+fn w08_golden_header_field_offsets() {
+    // Known SHA-256("abc") digest, encoded independently of Header::encode.
+    let digest = [
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    ];
+    let hdr = Header {
+        kind: Kind::DataInput,
+        generation: 0x1122334455667788,
+        sequence: 0x8877665544332211,
+        session: [0xa5; 16],
+        payload_len: 3,
+        payload_sha256: digest,
+    };
+    let mut expected = [0u8; HEADER_LEN];
+    expected[0..4].copy_from_slice(b"A3N1");
+    expected[4] = 1;
+    expected[6] = 10;
+    expected[8..16].copy_from_slice(&[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]);
+    expected[16..24].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    expected[24..40].fill(0xa5);
+    expected[40] = 3;
+    expected[44..76].copy_from_slice(&digest);
+    assert_eq!(hdr.encode().unwrap(), expected);
+    let mut complete = expected.to_vec();
+    complete.extend_from_slice(b"abc");
+    assert_eq!(wire::decode_frame_exact(&complete).unwrap().header, hdr);
+    assert_eq!(wire::digest_bytes(b"abc"), digest);
+}
+#[test]
+fn b07_sequence_identity_and_poison_matrix() {
+    for (which, generation, session, sequence, expected) in [
+        ("generation", 10u64, [3u8;16], 1u64, "STOP_WIRE_IDENTITY"),
+        ("session", 9u64, [4u8;16], 1u64, "STOP_WIRE_IDENTITY"),
+        ("sequence-gap", 9u64, [3u8;16], 2u64, "STOP_WIRE_SEQUENCE"),
+    ] {
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        // A3N1 Codec is now responsible for enabling nonblocking mode.
+        let payload = b"a";
+        let hdr = Header {
+            kind: Kind::Hello, generation, sequence, session,
+            payload_len: payload.len() as u32, payload_sha256: wire::digest_bytes(payload),
+        };
+        sender.write_all(&wire::encode_frame(&hdr, payload).unwrap()).unwrap();
+        let mut codec = Codec::new(9, [3u8; 16]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let limit = Instant::now() + Duration::from_secs(2);
+        assert_eq!(codec.recv(&mut receiver, limit, &cancel).unwrap_err(), expected, "{which}");
+        assert_eq!(codec.recv(&mut receiver, limit, &cancel).unwrap_err(), "STOP_WIRE_POISONED");
+    }
+}
+#[test]
+fn b08_partial_io_and_success_boundary_matrix() {
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    let frame = encoded(Kind::Bye, b"");
+    let writer = std::thread::spawn(move || {
+        // Fragment the 80-byte header deliberately; no partial header can be
+        // mistaken for a completed frame.
+        for chunk in frame.chunks(7) {
+            sender.write_all(chunk).unwrap();
+        }
+        // Closing the sending end supplies the required clean terminal EOF.
+    });
+    let mut codec = Codec::new(9, [3u8; 16]).unwrap();
+    let cancel = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    codec.expect(&mut receiver, Kind::Bye, b"", deadline, &cancel).unwrap();
+    assert!(codec.expect_clean_eof(&mut receiver, deadline, &cancel).is_ok());
+    assert_eq!(codec.recv(&mut receiver, deadline, &cancel).unwrap_err(), "STOP_WIRE_POISONED");
+    writer.join().unwrap();
+
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    sender.write_all(&encoded(Kind::Bye, b"")).unwrap();
+    sender.write_all(b"!").unwrap();
+    drop(sender);
+    let mut codec = Codec::new(9, [3u8; 16]).unwrap();
+    let second_deadline = Instant::now() + Duration::from_secs(3);
+    codec.expect(&mut receiver, Kind::Bye, b"", second_deadline, &cancel).unwrap();
+    assert_eq!(codec.expect_clean_eof(&mut receiver, second_deadline, &cancel).unwrap_err(),
+               "STOP_WIRE_TRAILING_AFTER_BYE");
+    assert_eq!(codec.recv(&mut receiver, deadline, &cancel).unwrap_err(), "STOP_WIRE_POISONED");
+}
+#[test]
+fn t06_descriptor_metadata_matrix() {
+    let bytes = MockVector::checked([0.5f32; 64]).unwrap().bytes();
+    let work = wire::digest_bytes(b"request");
+    let raw = TensorDescriptor::for_mock(&bytes, work).unwrap().encode();
+    for offset in 0..40 {
+        let mut mutated = raw;
+        mutated[offset] ^= 0x01;
+        assert_eq!(TensorDescriptor::decode(&mutated).unwrap_err(),
+                   "STOP_TENSOR_DESCRIPTOR_LAYOUT", "offset={offset}");
+    }
+    assert_eq!(TensorDescriptor::decode(&raw).unwrap().encode(), raw);
+}

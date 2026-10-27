@@ -2,7 +2,7 @@
 //! R4's real state machine remains the authoritative ownership/delivery guard.
 use crate::wire::{self, Codec, Kind};
 use crate::{Result, D, VECTOR_BYTES, MOCK_KIND};
-use mer2_g3_a3_s1::{Binding, ClientAck, ClientChunk, Contract, Identity, Ledger, Phase, Receipt, Ticket};
+use mer2_g3_a3_s1::{Binding, Cleanup, ClientAck, ClientChunk, Contract, Delivery, Identity, Ledger, Owner, Phase, Receipt, Ticket, Work};
 use mer2_g3_a3_s1::sha256;
 use std::fs::{DirBuilder, File};
 use std::io::Read;
@@ -201,6 +201,13 @@ pub enum MockScenario {
     ReleaseFailure,
     BeforeRetain,
     UnreturnedRetain,
+    TrailingByte,
+    DuplicateBye,
+    TrailingFrame,
+    DelayedTrailingByte,
+    SelfConsistentWrongOutput,
+    MissingBye,
+    AbnormalAfterBye,
 }
 impl MockScenario {
     pub fn label(self) -> &'static str {
@@ -214,18 +221,52 @@ impl MockScenario {
             Self::ReleaseFailure => "release-failure",
             Self::BeforeRetain => "before-retain",
             Self::UnreturnedRetain => "unreturned-retain",
+            Self::TrailingByte => "trailing-byte",
+            Self::DuplicateBye => "duplicate-bye",
+            Self::TrailingFrame => "trailing-frame",
+            Self::DelayedTrailingByte => "delayed-trailing-byte",
+            Self::SelfConsistentWrongOutput => "self-consistent-wrong-output",
+            Self::MissingBye => "missing-bye",
+            Self::AbnormalAfterBye => "abnormal-after-bye",
         }
     }
 }
 
+#[derive(Debug)]
 pub struct MockReport {
     pub receipt: Receipt,
     pub process_pid: u32,
     pub exit_status: Option<String>,
+    pub process_exit_success: bool,
     pub reaped: bool,
     pub kill_attempted: bool,
+    pub kill_attempt_count: u8,
+    pub containment_errors: Vec<&'static str>,
+    pub terminal_clean_eof: bool,
+    pub mock_output_verified: bool,
+    pub observed_stages: Vec<&'static str>,
     pub elapsed_ms: u128,
     pub kind: &'static str,
+}
+impl MockReport {
+    /// The ONLY accepted success predicate for the bounded, trusted-parent CPU
+    /// mock. Ok(MockReport), Exited, and reaped are *not* success predicates.
+    pub fn is_success(&self) -> bool {
+        let r = &self.receipt;
+        self.kind == MOCK_KIND && self.reaped && self.process_exit_success
+            && !self.kill_attempted && self.kill_attempt_count == 0
+            && self.containment_errors.is_empty()
+            && self.terminal_clean_eof && self.mock_output_verified
+            && r.phase == Phase::Exited && r.owner == Owner::Confirmed
+            && !r.unknown_ownership && r.work == Work::Fenced
+            && r.delivery == Delivery::Acknowledged
+            && r.cleanup == Cleanup::ReleaseCheckedScoped
+            && r.drain_attempts == 1 && r.release_attempts == 1
+            && r.process_exit_observed
+            && r.first_error.is_none() && r.secondary_errors.is_empty()
+            && r.last_cuda_context_drop == "UNOBSERVABLE"
+            && r.leak_free == "NOT_CLAIMED" && r.automatic_retry == "FORBIDDEN"
+    }
 }
 
 struct SocketDir(PathBuf);
@@ -322,24 +363,27 @@ fn send_to_client(
         }
     }
 }
+/// Collect every observed containment error in occurrence order; never
+/// replace the first error with a later wait/kill/reap error, and never retry
+/// a failed kill just to manufacture a complete-looking report.
 fn reap_child(
     child: &mut Child, successful_protocol: bool, deadline: Instant, cancel: &AtomicBool,
-) -> (Option<std::process::ExitStatus>, bool, bool, Option<&'static str>) {
+) -> (Option<std::process::ExitStatus>, bool, bool, Vec<&'static str>) {
     let mut status = None;
     let mut kill_attempted = false;
-    let mut error = None;
+    let mut errors: Vec<&'static str> = Vec::with_capacity(4);
     if successful_protocol {
         loop {
             match child.try_wait() {
                 Ok(Some(s)) => {
                     status = Some(s);
-                    if let Err(e) = wire::check(deadline, cancel) { error = Some(e); }
+                    if let Err(e) = wire::check(deadline, cancel) { errors.push(e); }
                     break;
                 }
                 Ok(None) => {
-                    if let Err(e) = wire::check(deadline, cancel) { error = Some(e); break; }
+                    if let Err(e) = wire::check(deadline, cancel) { errors.push(e); break; }
                 }
-                Err(_) => { error = Some("STOP_WAIT_IO"); break; }
+                Err(_) => { errors.push("STOP_WAIT_IO"); break; }
             }
             thread::sleep(POLL);
         }
@@ -349,21 +393,21 @@ fn reap_child(
             Ok(Some(s)) => status = Some(s),
             Ok(None) => {
                 kill_attempted = true;
-                if child.kill().is_err() && error.is_none() { error = Some("STOP_KILL_IO"); }
+                if child.kill().is_err() { errors.push("STOP_KILL_IO"); }
             }
-            Err(_) => if error.is_none() { error = Some("STOP_WAIT_IO"); },
+            Err(_) => errors.push("STOP_WAIT_IO"),
         }
         let until = Instant::now() + REAP_LIMIT;
         while status.is_none() && Instant::now() < until {
             match child.try_wait() {
                 Ok(Some(s)) => { status = Some(s); break; }
                 Ok(None) => thread::sleep(POLL),
-                Err(_) => { if error.is_none() { error = Some("STOP_REAP_IO"); } break; }
+                Err(_) => { errors.push("STOP_REAP_IO"); break; }
             }
         }
     }
     let reaped = status.is_some();
-    (status, reaped, kill_attempted, error)
+    (status, reaped, kill_attempted, errors)
 }
 
 /// Parent is one-shot per instance and has no across-restart durable journal.
@@ -372,6 +416,11 @@ fn reap_child(
 pub struct MockSupervisor { attempted: bool, ledger: Ledger, unconfirmed: Vec<Child> }
 impl MockSupervisor {
     pub fn unconfirmed_children(&self) -> usize { self.unconfirmed.len() }
+    /// Explicitly transfer unresolved direct children to a designated external
+    /// process owner; handles are NOT silently killed/retried in Drop.
+    pub fn take_unconfirmed_children(&mut self) -> Vec<Child> {
+        std::mem::take(&mut self.unconfirmed)
+    }
     pub fn execute_once(
         &mut self, executable: &Path, binding: Binding, work: MockWork, input: MockVector,
         output: SyncSender<ClientChunk>, ack: Receiver<ClientAck>, cancel: Arc<AtomicBool>,
@@ -379,6 +428,8 @@ impl MockSupervisor {
     ) -> Result<MockReport> {
         if self.attempted { return Err("STOP_REPLAY_FORBIDDEN"); }
         self.attempted = true; // Even pre-spawn ambiguity is not silently retried.
+        // A pre-cancelled request must not hash an executable or spawn a child.
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) { return Err("STOP_CANCELLED"); }
         if session_limit.is_zero() || session_limit > MAX_SESSION { return Err("STOP_SESSION_LIMIT"); }
         let input_bytes = input.bytes();
         work.validate(&binding, &input_bytes)?;
@@ -396,6 +447,7 @@ impl MockSupervisor {
         listener.set_nonblocking(true).map_err(|_| "STOP_SOCKET_BIND")?;
         let started = Instant::now();
         let deadline = started.checked_add(session_limit).ok_or("STOP_SESSION_LIMIT")?;
+        wire::check(deadline, &cancel)?; // cancellation and budget before spawn
         let mut child = Command::new(executable)
             .arg(dir.socket())
             .arg(work.r4.generation.to_string())
@@ -414,11 +466,16 @@ impl MockSupervisor {
         let id = Identity { pid, generation: work.r4.generation };
         let mut c = Contract::new(id, binding.clone(), self.ledger.clone())?;
         let mut codec = Codec::new(id.generation, session)?;
+        let mut observed_stages: Vec<&'static str> = vec!["SPAWNED"];
+        let mut terminal_clean_eof = false;
+        let mut mock_output_verified = false;
         let result = (|| {
+            wire::check(deadline, &cancel)?; // owned child already exists: fail via reap
             let mut stream = accept(&listener, deadline, &cancel)?;
             let hello = codec.recv(&mut stream, deadline, &cancel)?;
             if hello.header.kind != Kind::Hello { return Err("STOP_HELLO_KIND"); }
             check_hello(&hello.payload, pid, &binary_sha, &schema_sha)?;
+            observed_stages.push("HELLO");
             codec.send(&mut stream, Kind::Init, &init_binding(&binding, &binary_sha, &schema_sha), deadline, &cancel)?;
             codec.expect(&mut stream, Kind::Enter, b"", deadline, &cancel)?;
             c.constructor_entered()?;
@@ -429,59 +486,83 @@ impl MockSupervisor {
             c.deferred_check()?;
             codec.expect(&mut stream, Kind::Ready, b"", deadline, &cancel)?;
             c.ready()?;
+            observed_stages.push("READY");
             c.admit(&work.r4)?;
             codec.send(&mut stream, Kind::Admit, &request_bytes, deadline, &cancel)?;
             codec.expect(&mut stream, Kind::Accept, work_hash.as_bytes(), deadline, &cancel)?;
             codec.send(&mut stream, Kind::DataInput, &input_bytes, deadline, &cancel)?;
             c.submission_entered(&work.r4)?;
+            observed_stages.push("SUBMIT_ENTERED");
             codec.send(&mut stream, Kind::Submit, work_hash.as_bytes(), deadline, &cancel)?;
             codec.expect(&mut stream, Kind::Enqueued, work_hash.as_bytes(), deadline, &cancel)?;
             c.submission_confirmed(&work.r4)?;
+            observed_stages.push("ENQUEUED");
             codec.expect(&mut stream, Kind::Fenced, work_hash.as_bytes(), deadline, &cancel)?;
             c.fence(&work.r4)?;
+            observed_stages.push("FENCED");
             let descriptor_frame = codec.recv(&mut stream, deadline, &cancel)?;
             if descriptor_frame.header.kind != Kind::ResultDescriptor { return Err("STOP_OUTPUT_DESCRIPTOR_KIND"); }
             let descriptor = TensorDescriptor::decode(&descriptor_frame.payload)?;
             let result = codec.recv(&mut stream, deadline, &cancel)?;
             if result.header.kind != Kind::DataOutput { return Err("STOP_OUTPUT_KIND"); }
             descriptor.verify(&result.payload, &work_hash_bin)?;
+            // A self-consistent checksum cannot prove the declared mock identity
+            // operation. Compare against the independent parent input oracle.
+            if result.payload.as_slice() != input_bytes.as_slice() {
+                return Err("STOP_MOCK_IDENTITY_MISMATCH");
+            }
+            mock_output_verified = true;
+            observed_stages.push("OUTPUT_VERIFIED");
             let result_hash = sha256(&result.payload);
             c.prepare(&work.r4, &result_hash)?;
             wire::check(deadline, &cancel)?;
             c.begin_delivery(&work.r4, &result_hash)?;
             send_to_client(&output, &work.r4, &result.payload, &result_hash, deadline, &cancel)?;
+            observed_stages.push("CLIENT_OUTPUT_SENT");
             let response = ack_within(&ack, deadline, &cancel)?;
             c.acknowledge(&response.ticket, &response.digest)?;
+            observed_stages.push("ACKNOWLEDGED");
             codec.send(&mut stream, Kind::ClientAck, result_hash.as_bytes(), deadline, &cancel)?;
             c.begin_drain()?;
             codec.send(&mut stream, Kind::Drain, b"", deadline, &cancel)?;
             codec.expect(&mut stream, Kind::Drained, b"", deadline, &cancel)?;
             c.confirm_drain(true)?;
+            observed_stages.push("DRAINED");
             c.begin_release()?;
             codec.send(&mut stream, Kind::Release, b"", deadline, &cancel)?;
             codec.expect(&mut stream, Kind::Released, b"", deadline, &cancel)?;
             c.confirm_release(true)?;
+            observed_stages.push("RELEASED");
             codec.send(&mut stream, Kind::Exit, b"", deadline, &cancel)?;
             codec.expect(&mut stream, Kind::Bye, b"", deadline, &cancel)?;
+            observed_stages.push("BYE");
+            codec.expect_clean_eof(&mut stream, deadline, &cancel)?;
+            terminal_clean_eof = true;
+            observed_stages.push("CLEAN_EOF");
             Ok(())
         })();
         if let Err(e) = result { if c.receipt().first_error.is_none() { let _ = c.fault(e); } }
-        let (status, reaped, kill_attempted, wait_error) =
+        let (status, reaped, kill_attempted, containment_errors) =
             reap_child(&mut child, result.is_ok(), deadline, &cancel);
-        if let Some(e) = wait_error { let _ = c.fault(e); }
+        for &error in &containment_errors { let _ = c.fault(error); }
         if let Some(s) = &status {
             if !s.success() { let _ = c.fault("STOP_CHILD_ABNORMAL_EXIT"); }
             if c.receipt().phase == Phase::Quarantined { let _ = c.terminate_quarantined(); }
             if c.observe_exit(id).is_err() { let _ = c.fault("STOP_EXIT_ORDER"); }
+            observed_stages.push("REAPED");
         } else {
             let _ = c.fault("STOP_REAP_UNCONFIRMED");
             if c.receipt().phase == Phase::Quarantined { let _ = c.terminate_quarantined(); }
             let _ = c.exit_unconfirmed();
         }
         if !reaped { self.unconfirmed.push(child); }
+        let process_exit_success = status.as_ref().is_some_and(|s| s.success());
         Ok(MockReport {
             receipt: c.receipt(), process_pid: pid, exit_status: status.map(|s| s.to_string()),
-            reaped, kill_attempted, elapsed_ms: started.elapsed().as_millis(), kind: MOCK_KIND,
+            process_exit_success, reaped, kill_attempted,
+            kill_attempt_count: u8::from(kill_attempted), containment_errors,
+            terminal_clean_eof, mock_output_verified, observed_stages,
+            elapsed_ms: started.elapsed().as_millis(), kind: MOCK_KIND,
         })
     }
 }
