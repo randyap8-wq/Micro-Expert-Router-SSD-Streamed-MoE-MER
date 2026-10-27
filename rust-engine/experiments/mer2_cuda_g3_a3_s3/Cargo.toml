@@ -1,0 +1,14 @@
+[package]
+name = "mer2-g3-a3-s3-p1a"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+mer2-g3-a3-s1 = { path = "../mer2_cuda_g3_a3_s1" }
+
+[[bin]]
+name = "cpu_mock_worker"
+path = "src/bin/cpu_mock_worker.rs"

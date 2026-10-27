@@ -1,0 +1,14 @@
+# HAND-PREPARED SOURCE DRAFT: NOT VERIFIED BY CARGO.
+# Locked/offline resolution requires separate runtime authorization.
+version = 4
+
+[[package]]
+name = "mer2-g3-a3-s1"
+version = "0.1.0"
+
+[[package]]
+name = "mer2-g3-a3-s3-p1a"
+version = "0.1.0"
+dependencies = [
+ "mer2-g3-a3-s1",
+]
