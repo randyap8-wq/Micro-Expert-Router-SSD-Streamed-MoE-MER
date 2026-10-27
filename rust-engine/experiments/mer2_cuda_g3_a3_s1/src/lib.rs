@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -434,9 +434,16 @@ pub fn parse_frame(line: &str, id: Identity, b: &Binding) -> Result<String> {
     Ok(body.to_owned())
 }
 fn check(deadline: Instant, cancel: &AtomicBool) -> Result<()> {
+    check_with_clock(deadline, cancel, Instant::now)
+}
+fn check_with_clock(
+    deadline: Instant,
+    cancel: &AtomicBool,
+    now: impl FnOnce() -> Instant,
+) -> Result<()> {
     if cancel.load(Ordering::SeqCst) {
         Err("STOP_CANCELLED")
-    } else if Instant::now() >= deadline {
+    } else if now() >= deadline {
         Err("STOP_TIMEOUT")
     } else {
         Ok(())
@@ -614,6 +621,31 @@ pub struct ProcessReport {
     pub elapsed_ms: u128,
     pub containment_ms: u128,
 }
+// Internal observation/clock seam for deterministic success-boundary tests.
+// Both entry points run the same supervisor body and real channel/Child calls.
+// Production uses the wall clock and no-op observers; no public API is added.
+pub(crate) trait SuccessBoundary {
+    fn now(&mut self, _deadline: Instant) -> Instant {
+        Instant::now()
+    }
+    fn ack_wait_returned(
+        &mut self,
+        _result: &std::result::Result<ClientAck, RecvTimeoutError>,
+        _wait: Duration,
+        _delivery: Delivery,
+        _deadline: Instant,
+    ) {
+    }
+    fn exit_wait_returned(
+        &mut self,
+        _result: &std::io::Result<Option<ExitStatus>>,
+        _deadline: Instant,
+    ) {
+    }
+    fn sending(&mut self, _body: &str) {}
+}
+struct LiveBoundary;
+impl SuccessBoundary for LiveBoundary {}
 struct SocketDir(PathBuf);
 static SOCKET_COUNTER: AtomicU64 = AtomicU64::new(1);
 impl SocketDir {
@@ -690,6 +722,28 @@ impl Supervisor {
         ack: Receiver<ClientAck>,
         cancel: Arc<AtomicBool>,
     ) -> Result<ProcessReport> {
+        self.execute_with_boundary(
+            executable,
+            binding,
+            scenario,
+            ticket,
+            output,
+            ack,
+            cancel,
+            &mut LiveBoundary,
+        )
+    }
+    pub(crate) fn execute_with_boundary(
+        &mut self,
+        executable: &Path,
+        binding: Binding,
+        scenario: Scenario,
+        ticket: Ticket,
+        output: SyncSender<ClientChunk>,
+        ack: Receiver<ClientAck>,
+        cancel: Arc<AtomicBool>,
+        boundary: &mut impl SuccessBoundary,
+    ) -> Result<ProcessReport> {
         if !binding.valid() {
             return Err("STOP_INITIAL_IDENTITY");
         }
@@ -746,6 +800,7 @@ impl Supervisor {
                 binding: &binding,
                 deadline,
                 cancel: &cancel,
+                boundary,
             };
             p.expect("HELLO")?;
             p.send("INIT")?;
@@ -805,9 +860,16 @@ impl Supervisor {
                 }
             }
             let client_ack = loop {
-                check(deadline, &cancel)?;
-                match ack.recv_timeout(POLL) {
-                    Ok(v) => break v,
+                check_with_clock(deadline, &cancel, || p.boundary.now(deadline))?;
+                let wait = POLL.min(deadline.saturating_duration_since(p.boundary.now(deadline)));
+                let received = ack.recv_timeout(wait);
+                p.boundary
+                    .ack_wait_returned(&received, wait, c.r.delivery, deadline);
+                match received {
+                    Ok(v) => {
+                        check_with_clock(deadline, &cancel, || p.boundary.now(deadline))?;
+                        break v;
+                    }
                     Err(RecvTimeoutError::Timeout) => (),
                     Err(RecvTimeoutError::Disconnected) => return Err("STOP_CLIENT_DISCONNECT"),
                 }
@@ -836,10 +898,18 @@ impl Supervisor {
         let mut status = None;
         if outcome.is_ok() {
             loop {
-                match owned.child.try_wait() {
+                let waited = owned.child.try_wait();
+                boundary.exit_wait_returned(&waited, deadline);
+                match waited {
                     Ok(Some(s)) => {
                         status = Some(s);
                         owned.reaped = true;
+                        // Physical reap survives a late/cancelled logical STOP.
+                        if let Err(e) =
+                            check_with_clock(deadline, &cancel, || boundary.now(deadline))
+                        {
+                            let _ = c.fault(e);
+                        }
                         break;
                     }
                     Ok(None) => {
@@ -918,15 +988,17 @@ impl Supervisor {
         Ok(report)
     }
 }
-struct Protocol<'a> {
+struct Protocol<'a, B> {
     stream: &'a mut UnixStream,
     id: Identity,
     binding: &'a Binding,
     deadline: Instant,
     cancel: &'a AtomicBool,
+    boundary: &'a mut B,
 }
-impl Protocol<'_> {
+impl<B: SuccessBoundary> Protocol<'_, B> {
     fn send(&mut self, body: &str) -> Result<()> {
+        self.boundary.sending(body);
         send(
             self.stream,
             &frame(self.id, self.binding, body),
