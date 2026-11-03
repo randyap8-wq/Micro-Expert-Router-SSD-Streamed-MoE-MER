@@ -49,16 +49,18 @@ The storage hierarchy applies primarily to **routed-expert weights**, not to str
 
 The long-term product goal is to let customers **choose the model and supported weight precision that their workload requires**, while MER manages limited hot memory. **Q4_0 is the current development and numerical-qualification baseline, not an intended product-wide precision restriction.** The ability to retain a selected precision under memory constraints must be demonstrated independently for each format and checkpoint; it is not yet a general released capability.
 
-## Engineering status — October 28, 2026
+## Engineering status — November 2, 2026
 
 | Area | What is established | Important limit |
 | --- | --- | --- |
 | **WGPU/Vulkan mainline** | GPU-owned transformer/token execution, Q4_0 routed-expert compute, host-backed expert residency, CPU/hybrid paths, and model-serving infrastructure exist on `main`. | A code path or historical pass does not qualify every model, format, GPU, or production environment. |
 | **Q4_0 WGPU evidence** | An NVIDIA L4 [strict Hybrid Q4_0 expert-parity run](docs/benchmarks/qwen3-coder-30b-a3b-pr6-q4-parity-2026-08-11.md) passed in its pinned August scope. | That specific run used CPU attention/router and GPU routed experts; it was **not** a full-model quality or throughput result. |
 | **Native CUDA experiments** | Separate G2/G3 Rust/Cudarc/Candle development vehicles have exercised synthetic expert computation on an NVIDIA L4. | Native CUDA real-Qwen full-token correctness, complete resource lifecycle and product performance are **not qualified**. [Qualification disposition](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351). |
+| **R02-W3 checkpoint-owner qualification** | The earlier W3-S1 CPU-Q1 run passed **107/107 synthetic/metadata Rust tests**. A separate W3-S2-S1 **258-file candidate Git tree** (`59e545e2d394c9eb159c3547cc826e41a5df9b97`, not a commit) contains 12 new private tests for a complete 435-role synthetic checkpoint-owner transaction. | The 12 new tests are **authored, not executed**; **119-test CPU-Q2** has not run. This candidate is separately archived, **not merged to `main`**. [Current gate](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351). |
+| **CPU-Q2 execution supervisor** | An isolated Python R0 supervisor source draft was independently integrity-reviewed; 80 adversarial tests were authored. | **Launch HOLD**: a persistent monitor failure after child spawn can prevent verified termination. The 80 tests remain **unexecuted**, and no one-use CPU-Q2 execution authority has been issued. [R0 containment finding](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351#issuecomment-6595585393). |
 | **CUDA numerics and cleanup** | The synthetic [P5D stage comparison](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/347) identified strict differences; [P5E](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/348) isolated upstream input differences in the failing Down results. External process-exit GPU-memory observation was also recorded. | **P5D STOP remains** (8/60 eligible stage vectors); in-process final CUDA context cleanup and fault paths remain unproven. [Resource-lifetime scope](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/358). |
-| **CUDA worker isolation** | The A3-S3 corrected CPU-only source passed an [independent static rereview with limitations](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/375). | 40 tests were **authored, not executed**. The [next Linux CPU gate](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/376) is design-only; no test or CUDA execution is authorized by it. |
-| **Precision-first CUDA architecture** | [Issue #377](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/377) records the **owner-adopted Cudarc/Candle-primary backend decision** and a MER-owned, format-aware architecture. | NVIDIA CUDA Rust/cuTile is **optional parked research, not a release dependency**. Additional formats and runtime migration are **not completed or authorized implementations**. |
+| **CUDA worker isolation** | The A3-S3 corrected CPU-only source passed a [completed independent static rereview with limitations](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/375) (historical review issue now closed). | 40 tests were **authored, not executed**. The [next Linux CPU gate](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/376) is design-only; no test or CUDA execution is authorized by it. |
+| **Precision-first CUDA architecture** | [Completed decision #377](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/377) records the **owner-adopted Cudarc/Candle-primary backend decision** and a MER-owned, format-aware architecture; its issue closure did not implement the backend. | NVIDIA CUDA Rust/cuTile is **optional parked research, not a release dependency**. Additional formats and runtime migration are **not completed or authorized implementations**. |
 
 This is a **dated snapshot**, not a live gate or a substitute for the issues' complete comments. An accepted synthetic CPU test, successful CUDA kernel invocation, or GPU process exit must not be described as a qualified full-model CUDA release. Historical STOPs remain part of the evidence even when a later, separately authorized revision passes.
 
@@ -92,6 +94,14 @@ The **legacy `cuda` Cargo feature is not this native GPU-owned CUDA engine**: in
 The G2/G3 research path uses Rust with Cudarc and pinned/vendored Candle CUDA kernel components. It is being built and qualified through separate source, CPU, CUDA, numerical and resource-ownership gates, without silently replacing the WGPU baseline.
 
 The [owner-adopted CUDA backend decision](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/377) keeps **Cudarc and Candle as MER's primary native CUDA implementation**. NVIDIA's newer CUDA Rust/cuTile work remains **optional, parked research**, not a prerequisite for GPU qualification, multi-precision support, or commercial release. If an isolated, version-pinned cuTile kernel experiment is later justified by a measured bottleneck, it must independently prove actual context identity, liveness, synchronization, numerical equivalence, performance benefit and checked cleanup. CUDA Graphs, GPU virtual-memory redesign, `cuda-oxide` kernels and a wholesale `cuda-core` / `cuda-async` swap are not accepted changes merely because upstream examples exist.
+
+### Private CUDA alpha path (target: December 31, 2026)
+
+The near-term goal is a **private, single-host NVIDIA CUDA alpha** for a pinned **Qwen3-Coder-30B-A3B-Instruct Q4_0** checkpoint by **December 31, 2026**. This is a target, **not** an execution permit or a claim that full-token native CUDA inference works today.
+
+The critical path is to (1) independently qualify the 435-role loaded-owner transaction and its bounded CPU supervisor; (2) bind the original GGUF, tokenizer, 6,144 SSD experts and generation identity to independent R01/R02 provenance and CPU-REC custody; (3) resolve P5D strict numerical and native CUDA lifecycle STOPs; then (4) execute real prefill/autoregressive decode and measure cold/warm end-to-end tokens/s on pinned hardware. **The first native CUDA Q4_0 TPS measurement has not happened.**
+
+[Internal gated alpha plan](https://app.notion.com/p/40d422bc7eca81c3b684f13228ed2d18) · [Internal W3 evidence index](https://app.notion.com/p/40d422bc7eca8148b57bddff61ea0749) (Notion access may be required) · [GitHub authorization and STOP records](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351).
 
 ## Model and precision policy
 
@@ -137,6 +147,10 @@ The [P1Q3 NVIDIA L4 matched-resource experiment](https://github.com/randyap8-wq/
 
 Throughput is workload-, model-, precision-, cache-state-, RAM/VRAM-budget- and hardware-dependent. Do not compare warm all-resident throughput with cold SSD-backed out-of-core throughput as if they were the same benchmark. Historical benchmark reports live under [`docs/benchmarks/`](docs/benchmarks/).
 
+### Related out-of-core MoE work
+
+Storage-backed expert inference is **not exclusive to MER**. In llama.cpp, [PR #29887](https://github.com/ggml-org/llama.cpp/pull/29887) merged a GPU cache for experts held in host RAM; [PR #31469](https://github.com/ggml-org/llama.cpp/pull/31469) was **open and experimental as of November 2, 2026**, exploring direct NVMe I/O, VRAM expert slots and reduced synchronization. Its reported speedups are not matched, independently reproduced MER benchmarks. MER's case must rest on measured model correctness, explicitly controlled memory residency, provenance, resource ownership and comparable end-to-end performance—not an exclusive claim to SSD streaming.
+
 ## Build and local smoke test
 
 The Rust crate lives in [`rust-engine/`](rust-engine/). An ordinary build with the tokenizer feature is:
@@ -179,8 +193,9 @@ Passing one level does **not** automatically pass the later levels. An original 
 
 - [CUDA-first MER2 strategy / parent epic #266](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/266)
 - [Native CUDA qualification and numerical disposition #351](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351)
-- [A3 source review #375](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/375) and [CPU-E1 design #376](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/376)
-- [CUDA Rust + precision-first architecture plan #377](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/377)
+- [Completed A3 static review #375](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/375), [still-open CPU-E1 design #376](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/376), and [unresolved CPU-REC descriptor custody #378](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/378)
+- [Adopted, completed Cudarc/Candle backend decision #377](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/377)
+- [Internal W3 qualification evidence index](https://app.notion.com/p/40d422bc7eca8148b57bddff61ea0749) and [2026 CUDA-alpha plan](https://app.notion.com/p/40d422bc7eca81c3b684f13228ed2d18) (Notion access may be required)
 - [Post-CUDA evidence-preserving cleanup #370](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/370)
 - [Open GitHub issues](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues) — inspect the relevant issue **and its latest comments** before treating a proposed gate as authorized.
 
