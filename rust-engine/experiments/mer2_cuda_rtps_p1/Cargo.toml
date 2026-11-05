@@ -1,0 +1,24 @@
+[package]
+name = "mer2-cuda-rtps-p1"
+version = "0.0.0"
+edition = "2021"
+publish = false
+autobins = false
+
+# Isolated source workspace. No dependency resolution or parent feature changes.
+[workspace]
+
+[features]
+default = []
+diagnostic-cli = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mer2-rtps-p1"
+path = "src/main.rs"
+required-features = ["diagnostic-cli"]
+
+# Deliberately no CUDA dependency/feature until the native reuse API is reviewed.
+# This manifest describes a safe partial source artifact, not a CUDA executable.

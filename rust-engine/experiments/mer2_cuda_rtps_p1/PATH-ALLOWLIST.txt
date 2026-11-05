@@ -1,0 +1,26 @@
+# Every path is relative to rust-engine/experiments/mer2_cuda_rtps_p1/.
+# SOURCE payload: exactly these 15 paths; all additions, no existing edits.
+Cargo.toml
+NEXT-GATES.md
+PATH-ALLOWLIST.txt
+README.md
+RTPS-P1-SOURCE-REVIEW-HANDOFF.md
+SOURCE-IDENTITIES.md
+SOURCE-PAYLOAD.sha256
+src/contract.rs
+src/expected.rs
+src/fixture.rs
+src/lib.rs
+src/main.rs
+src/reference.rs
+src/report.rs
+src/tests.rs
+# Local evidence only, excluded from the source patch/PR and compiled source:
+evidence/ALL-FILES.sha256
+evidence/INPUT-READBACK.json
+evidence/PATH-HASH-INVENTORY.json
+evidence/PUBLICATION.json
+evidence/RTPS-P1-SOURCE.patch
+evidence/SOURCE-RECHECK.json
+evidence/STATIC-REVIEW.json
+# No files outside this new directory are authorized for creation/modification.
