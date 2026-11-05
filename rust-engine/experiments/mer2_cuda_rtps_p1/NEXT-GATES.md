@@ -1,38 +1,60 @@
-# RTPS-P1 next gates — proposals only, no automatic successor
+# RTPS-P1 R1 next gates — proposals only
 
-1. **Independent static review.** Review this exact partial patch, source/hash
-   inventory, fixture arithmetic and authored rejects. Accept or reject the
-   precise native extraction/API/dependency path delta in the handoff. The
-   native STOP remains until a separately authorized implementation is reviewed.
-2. **Narrow offline compile / CPU reference.** Bind exact toolchain, source,
-   local lock/dependency closure, configuration, commands and resource/output
-   limits. Compile the relevant source; only then separately execute the fixed
-   CPU fixture/reference/tests. Seal all 5120 expected bits before any GPU
-   results. Preserve failures without retuning constants or acceptance.
-3. **Existing-host inventory / driver / containment review.** Founder-operated
-   workflow only. Separately identify the existing Linux L4 boot, installed
-   toolchain/driver, binaries/PTX and independent process/resource containment.
-   Inventory and any actual driver access are distinct scopes. No start,
-   restore, SSH, device probe or policy change is authorized by this list.
-4. **One separately authorized real-shape L4 GPU parity attempt.** Require the
-   completed reviewed native adapter, raw synthetic input identity, independently
-   sealed CPU oracle, exact source/binary/PTX and bounded one-owner/one-invocation
-   process scope. Run Gate→Up→SiLU→Multiply→Down once, report every stage bit and
-   difference, actual launch/fence/readback evidence and terminal cleanup.
-   No fallback/retry. At most native geometry/stage evidence for this fixture;
-   no model, token, R01/R02, P5D or TPS promotion.
-5. **Owner / R01 / R02 real-Qwen integration.** Independently close authentic
-   checkpoint/converter/tokenizer/config/dense/expert physical provenance,
-   immutable actual-owner binding, native constructor authority and custody.
-   W3's disconnected module/run_once STOP stays intact until this separate work.
-6. **First real token.** Explicitly bounded, authentic input encode→CPU stages→
-   actual native experts→learned head→same-tokenizer decode, with complete
-   first-failure and owner/cleanup evidence. Synthetic expert parity is not this.
-7. **Bounded TPS.** Only after accepted real-token evidence and separately
-   reviewed multi-token/KV ownership, authorize a fixed prompt/token budget and
-   timing scope. Require real emitted tokens; no TPS inferred from source,
-   compile, single-expert or one-token work.
+The original P1 Mac CPU gate is complete: one offline check and one offline test,
+24/24 passed before R1 edits. Native implementation is source-only. No automatic
+successor, VM operation, native build/run, merge or production authority follows.
 
-CPU_Q2=HOLD_NO_AUTHORITY. P5D strict numerical STOP, W3 R01/R02 STOP, O1/H14
-STOP and CPU-REC constraints remain binding. This document issues no one-use
-grant, compile/run permission, host instruction, merge approval or benchmark.
+1. **Independent source and CPU review.** Review the R1 diff, exact published
+   blobs and source manifest, Stage A logs and unchanged fixture/oracle bytes.
+   Review the raw CUDA ABI, primary-context assumption, symbol/PTX linkage,
+   five actual readbacks, explicit cleanup and quarantine. The staged API's
+   uninhabited gate and public `native-once` STOP must remain closed.
+2. **Best next one-use Linux build gate, prepared by ChatGPT.** Bind the accepted
+   source commit and manifest; founder identifies the intended existing host
+   without Codex AWS/SSH operations. Establish exact Linux/toolchain/toolkit
+   executables, complete vendor/header inventory, registry archive checksums,
+   native lock and transitive build-script closure. Do not reuse the Stage A
+   CPU-only lock as native evidence. Resolve a native lock offline only under
+   explicit fresh authority; stop on missing cache or unreviewed resolution.
+   Review cudarc's build.rs and unchanged candle-kernels/cudaforge build path.
+   Pin `CUDA_COMPUTE_CAP` from already-reviewed host evidence to suppress
+   cudaforge's `nvidia-smi` fallback; bind `NVCC`, `PATH`, compiler, compatibility
+   header and CUDA-version overrides. No automatic driver probe or downloading.
+   The vendor builds additional PTX and an MoE static library and links cudart;
+   this wider build closure must be admitted even though only three modules
+   are loaded by the diagnostic. Set wall/process/memory/disk/output ceilings,
+   a separate target directory and external monitoring before execution.
+   Proposed single compile/link command, only after that review and grant:
+
+   ```text
+   cargo test --offline --locked --manifest-path rust-engine/experiments/mer2_cuda_rtps_p1/Cargo.toml --lib --no-default-features --features native-diagnostic --no-run
+   ```
+
+   This compiles test declarations without running them. Seal the resulting
+   binary, all three embedded PTX images, generated bindings and complete build
+   logs. Verify exact f32 symbol definitions, parameter widths, actual SiLU
+   expression and compiler flags. A successful build is not numerical evidence.
+3. **Separate host-gate implementation and review.** Define a real externally
+   reviewed process/host permit before changing `ReviewedHostGate`. No hashes or
+   booleans from a caller suffice. Bind the physical device and library mapping,
+   fresh isolated single-threaded process, absence of other primary-context
+   users, one initialization/invocation, deadline, output custody, terminal
+   receipt and independent reaper. CUDA/FFI may block or abort before a terminal;
+   in-process cleanup cannot close this gap. Do not open the public CLI as an
+   incidental build fix. No permit implementation is supplied in R1.
+4. **Separately authorized one-use synthetic GPU parity gate.** Only after the
+   previous reviews: founder executes ChatGPT-prepared SHA-pinned GitHub scripts
+   under an explicit one-use grant. Submit the fixed raw Q4 bytes once; retain
+   all five actual device vectors; report 5,120 actual/expected bits and deltas,
+   symbol resolution, launch/fence/copy results and cleanup or missing terminal.
+   Stop on first failure, no retry/fallback. Numerical equality cannot detect
+   identity substituted for this saturated SiLU; actual `usilu_f32` PTX and
+   launch evidence are mandatory. This is only synthetic geometry/stage parity.
+5. **Authentic owner/model/token/TPS work stays separate.** W3 R01 independent
+   run authority, R02 full checkpoint dense/tokenizer/SSD expert provenance,
+   P5D strict stage STOP, O1/H14, CPU-REC, and CPU_Q2=HOLD_NO_AUTHORITY (119
+   separate Rust tests) are unchanged. No authentic Qwen, token or TPS claim.
+
+Codex must not SSH, start/stop EC2, or write a VM launcher. The founder controls
+AWS manually. ChatGPT prepares/publishes reviewed SHA-pinned VM-operation
+scripts only when separately authorized. This file is not such a script/grant.

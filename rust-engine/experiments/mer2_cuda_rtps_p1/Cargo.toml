@@ -5,12 +5,14 @@ edition = "2021"
 publish = false
 autobins = false
 
-# Isolated source workspace. No dependency resolution or parent feature changes.
+# Isolated workspace; native dependencies are source-only and default-off.
 [workspace]
+resolver = "2"
 
 [features]
 default = []
 diagnostic-cli = []
+native-diagnostic = ["dep:cudarc", "dep:candle-kernels", "dep:cudaforge"]
 
 [lib]
 path = "src/lib.rs"
@@ -20,5 +22,13 @@ name = "mer2-rtps-p1"
 path = "src/main.rs"
 required-features = ["diagnostic-cli"]
 
-# Deliberately no CUDA dependency/feature until the native reuse API is reviewed.
-# This manifest describes a safe partial source artifact, not a CUDA executable.
+# No native entrypoint is connected. The public CLI remains a preinit STOP.
+# These are exact source pins, NOT an already-resolved native lock/host closure.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+cudarc = { version = "=0.19.7", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-version-from-build-system"], optional = true }
+candle-kernels = { path = "../../vendor/candle-kernels", version = "=0.10.2", optional = true }
+
+# Constrain the unchanged candle-kernels build dependency (declared ^0.1.2).
+# No build.rs is introduced here. A later gate must verify the resolved closure.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.build-dependencies]
+cudaforge = { version = "=0.1.5", optional = true }

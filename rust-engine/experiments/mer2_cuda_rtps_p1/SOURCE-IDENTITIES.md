@@ -1,64 +1,115 @@
-# Source identities and reviewed inputs
+# RTPS-P1 R1 source and execution identities
 
-User authorization: attached `Pasted text.txt`, SHA-256
-`d3e7adf808da9b37104395c60f3b91f6c1ad1211c56bfb604bc1a012cfa7c337`.
-The #351 comment references a separately named handoff with a different hash;
-these are not represented as byte-identical documents.
+R1 authorization is the submitted handoff, SHA-256
+`542c8010859acaa1aa1e63044d232b1fd420f2dc77a3bf44c0b06da0f7c1c3f8`.
+It authorizes one bounded local offline CPU check/test attempt and source-only
+native adapter work on the existing draft PR. No earlier grant was reused.
 
-Read live: [issue #351](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351),
-[P0 scope](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351#issuecomment-6622523867),
-[P0 independent review / P1 decision](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351#issuecomment-6637541321),
-and [founder-operated workflow](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/issues/351#issuecomment-6647522767).
-All five P0 reports were read locally; their five hashes and eight evidence
-manifest entries matched. No earlier memory was used as current source proof.
+## Exact admitted source
 
-| Identity | Fresh P1 verification |
+| Item | Verified identity |
 | --- | --- |
-| Baseline commit `b55fd52d5043e7865a340c04f02433b0fa5dc974` | Live GitHub Git-commit API binds tree `e0b0b698bf49d4d6dbe30bb31922aa02b4c4f44d`; all 248 baseline blob bytes independently reconstructed in memory from unchanged S0 bytes plus four archived originals and rehashed; live recursive tree untruncated. |
-| S0 tree `31c1e50984ca270498ff1e98470e8faa7c0e0a32` | 254 actual files, modes, SHA-256 and Git blob IDs rechecked, Git tree recomputed; original directory unchanged. |
-| W3 tree `59e545e2d394c9eb159c3547cc826e41a5df9b97` | 258 actual files/modes rechecked and tree recomputed; every local source byte equals the archived W3 source member. |
-| D1-R1 evidence ZIP | SHA-256 `e3c20c2a4d56cada839904dc1b97ac6e99f4c768f26197b36f786ff3986fe4df`, CRC readback; archived baseline/S0 inventories and original after-reversal bytes read. |
-| W3 source evidence ZIP | SHA-256 `cb8b7594d8e073fe0a4508b74792efee499480336febed4803fbf66c9ee562f1`, CRC readback; 258 source members match local bytes. |
-| Current main, read only | Live ref `23ac889408dc479afe7bf8fefbe97c1cad880d2f`; not used as experiment parent or changed. |
+| Repository | randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER |
+| Draft PR | [380](https://github.com/randyap8-wq/Micro-Expert-Router-SSD-Streamed-MoE-MER/pull/380), open, draft, unmerged |
+| Existing head branch | codex/mer2-rtps-p1-source-20261104-01a1a973 |
+| Original head commit | 3a29f3cce5ea74ae0b1099c4081aa8d42618f7b6 |
+| Original head tree | 5a057f6f2298315573472899a6991fd074469fa3 |
+| Sole parent / exact PR base commit | b55fd52d5043e7865a340c04f02433b0fa5dc974 |
+| Base branch | fix/mer2-g3-p6a-a3-s3-p1a-r1-source-blockers |
+| Original source manifest SHA-256 | 0877eff309e7b425df4f5ef94f8e83b413fdbc7baedf216a1b7e6f7a6ddc7ecf |
+| Original source patch SHA-256 | 38466c0f346391d5fa8ca9b81d8193c28e2a01f7ddc6675104974e971c83553a |
+| Separate frozen W3 tree | 59e545e2d394c9eb159c3547cc826e41a5df9b97 |
 
-Exact roots: S0 is `/Users/r/Documents/Codex/MER2-G3-P6B-S0-source-candidate/`;
-W3 is `/Users/r/Documents/ChatGPT/MER/development-candidates/MER2-G3-P6B-R02-W3-S2-S1-source-only/source/`.
-The P0 reports/receipt are under
-`/Users/r/Documents/ChatGPT/MER/outputs/MER2-P6B-RTPS-P0-readonly/`.
-Those trees reconcile as 249 identical paths, five conflicts and four W3-only
-paths. They are tree identities, not interchangeable commits. The baseline
-contains no P6B directory; P1 source has no dependency on a silently imported
-S0/W3 snapshot. No Git history was repaired or rebased.
+The live Git commit and untruncated recursive tree contained 263 blobs.
+All 15 local P1 files matched their live original-head Git blob IDs, lengths,
+regular-file modes and source SHA-256 inventory before execution. The source
+manifest excludes itself; its own hash above binds that fifteenth file.
 
-## Inspected W3 reference blobs — SHA-256
+The local MER root has an unborn unrelated `main` Git repository and no remote.
+It is not represented as a checkout of the PR branch. The exact local source
+package was bound directly to the live Git objects; only the same remote branch
+may receive the authorized ordinary successor commit. Existing local evidence
+and Finder `.DS_Store` files are excluded, untouched, and not source inputs.
 
-All paths below are relative to the frozen W3 source root.
+Final source hashes are in `SOURCE-PAYLOAD.sha256`. The final commit/tree and
+remote readback belong in the local R1 publication receipt, avoiding a circular
+self-commit claim in these source bytes. No W3 or other experimental tree is
+imported. W3's 258 original file hashes are rechecked without modification.
 
-| Path | SHA-256 |
+## Frozen vendor provenance and public APIs
+
+The same exact-head Git tree already contains all 26 candle-kernels vendor
+files and `rust-engine/cuda/glibc_cuda_compat.h`. All 27 local reference files
+were hashed against those live Git blobs. They were read from the available
+S0 archive tree only after proving byte equality to the current PR ancestor;
+they were neither borrowed as replacement experimental code nor copied/edited.
+The optional path dependency refers to the existing repository vendor path.
+
+| Exact-head path | SHA-256 |
 | --- | --- |
-| `rust-engine/experiments/mer2_cuda_p6b/src/abi.rs` | `733da5fb26c6383075a108e426e6aad1d8f47f42b8a36138322039868b5113c1` |
-| `rust-engine/experiments/mer2_cuda_p6b/src/cuda.rs` | `58f2ff6bd67c9854215179743a93baccd0fabf0c3f24bf2bf7d0749f6e8122ae` |
-| `rust-engine/experiments/mer2_cuda_p6b/src/identity.rs` | `f835972949a49ba9e1ce45333c5127419c853eaf6b5438e7ca860178caa59acd` |
-| `rust-engine/experiments/mer2_cuda_p6b/src/mod.rs` | `b877b6a4bfd48fc143ba6d938d6098697d1549f57e536e9d2d234be1db4a6541` |
-| `rust-engine/experiments/mer2_cuda_g3_native/src/cuda.rs` | `459e6b7baf461acac2e1ea84d8d8f7364be0f70e6802125a8f3b05638b375fdb` |
-| `rust-engine/experiments/mer2_cuda_g3_s1/src/lib.rs` | `f21140b5852922825bf4f9dd0358ae199f9948e6bd30a91c906c91db75b30caf` |
-| `rust-engine/vendor/candle-kernels/src/quantized.cu` | `510c665e914346cbf361c4c60463a9cbad28032c09760cd90a227d9d2ab92972` |
-| `rust-engine/vendor/candle-kernels/src/unary.cu` | `bea116bebb9b84106661dd425ed56ceddabbff337762edcee05f6e9134fb7e5b` |
-| `rust-engine/vendor/candle-kernels/src/binary.cu` | `dc9961a0013fe24972adf27a37a986df5d78081912a6de21684a0433ba8d1b17` |
-| `rust-engine/vendor/candle-kernels/build.rs` | `d2683e67d2c82d7d3b2e03e937c625155e2218702fe21cf38a164a82b8bdeedf` |
-| `rust-engine/cuda/glibc_cuda_compat.h` | `7f84797c9c440978534dd54d7ee476b83e37e6d591063582f48e8f8b1b964fee` |
-| `rust-engine/Cargo.lock` | `939ba0c96f0b5f1ed5e6df6beb01d2a7720c82f4654d33ad67a7ef4792c59dca` |
+| rust-engine/vendor/candle-kernels/Cargo.toml | fc19f7428b8df705b699c386dac86f25f7b3ad02dfa624146b88d3b351c39805 |
+| rust-engine/vendor/candle-kernels/build.rs | d2683e67d2c82d7d3b2e03e937c625155e2218702fe21cf38a164a82b8bdeedf |
+| rust-engine/vendor/candle-kernels/src/lib.rs | 91992b48ff931befcaccc854f639a173de1d1f831c7f5b45185b6bd811a7d7ad |
+| rust-engine/vendor/candle-kernels/src/quantized.cu | 510c665e914346cbf361c4c60463a9cbad28032c09760cd90a227d9d2ab92972 |
+| rust-engine/vendor/candle-kernels/src/unary.cu | bea116bebb9b84106661dd425ed56ceddabbff337762edcee05f6e9134fb7e5b |
+| rust-engine/vendor/candle-kernels/src/binary.cu | dc9961a0013fe24972adf27a37a986df5d78081912a6de21684a0433ba8d1b17 |
+| rust-engine/vendor/candle-kernels/src/binary_op_macros.cuh | a83f97301a9ee52790b2c39b80e4f24393cf60dee153dbc68c0f802ea3ad95c4 |
+| rust-engine/cuda/glibc_cuda_compat.h | 7f84797c9c440978534dd54d7ee476b83e37e6d591063582f48e8f8b1b964fee |
 
-No vendor code was copied or modified. PTX/module source hashes at a future
-build must be checked against this reference and the complete unchanged vendor
-inventory, not just these three `.cu` files. QUANTIZED/UNARY/BINARY PTX hashes,
-binary hash, compiler/toolkit, driver, host boot and L4 identity are all UNBOUND.
+candle-kernels is the unchanged path-vendored 0.10.2, with no registry checksum
+claimed for its locally modified build script. Its public `Module::ptx()`
+provides the exact build-embedded QUANTIZED, UNARY and BINARY inputs. Its public
+constants are Module objects, not raw strings. Generated PTX, compiler flags,
+binary identity and Linux link behavior remain UNBOUND.
 
-The new source has no external dependencies. Referenced W3 registry identities
-are historical source pins, not the new crate's installed closure:
-`cudarc 0.19.7` checksum
-`1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc`;
-`cudaforge 0.1.5` checksum
-`6f7a0d45b139b5beeeb1c34188717e12241c44a0120afb498815ce7f5373c691`.
-The path-patched `candle-kernels 0.10.2` has no registry checksum in that lock;
-its bytes/build-script/header identity must be retained separately.
+Already-cached registry archives were independently hashed; every archive file
+matched its extracted source (cudarc: 130 files; cudaforge: 15 files).
+
+| Package | Exact archive SHA-256 |
+| --- | --- |
+| cudarc 0.19.7 | 1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc |
+| cudaforge 0.1.5 | 6f7a0d45b139b5beeeb1c34188717e12241c44a0120afb498815ce7f5373c691 |
+
+The adapter uses cudarc's public `driver::result` and `driver::sys` types, not
+P6B Native/Lease/permit constructors and not `CudaContext::Drop`. Reviewed API
+locations in cudarc 0.19.7 `src/driver/result.rs`: init 88, device::get 109,
+primary_ctx retain/release 449/462, ctx set_current/get_current/synchronize
+546/553/580, stream create/synchronize/destroy 667/721/733, malloc/free sync
+833/938, memset_d8_sync 977, memcpy_htod_sync/dtoh_sync 1020/1058, module
+load_data/get_function/unload 1157/1169/1203, launch_kernel 1309.
+The source archive inventory binds these APIs even if line display shifts.
+
+Manifest source pins are exact and default-off. cudaforge is additionally pinned
+as an optional build dependency to constrain the vendor's original ^0.1.2
+requirement. This is NOT evidence that Cargo has resolved the native closure.
+The only generated lock has one CPU package and predates these manifest edits.
+It remains local. No fabricated native lock, dependency install, package
+download, native build script or dynamic runtime package resolution was used.
+cudarc's future dynamic driver-library loading still needs a reviewed host
+library binding; a source pin alone does not establish that runtime mapping.
+
+## Observed Stage A CPU evidence
+
+Rust/Cargo were the installed Homebrew 1.97.1, host aarch64-apple-darwin.
+rustc commit: `8bab26f4f68e0e26f0bb7960be334d5b520ea452`.
+Cargo commit: `c980f4866141969fab6254a680546a277789d6f0`.
+No applicable Cargo/rust-toolchain configuration, package dependency, build.rs
+or proc macro was present in the original P1 crate. Environment was constructed
+explicitly with offline mode, one job, one test thread, separate local
+CARGO_HOME/target/tmp, and an exact Apple Clang linker.
+
+| Item | SHA-256 |
+| --- | --- |
+| installed Cargo executable | b7a341737d8777ef0e21a71f0af90723ccf692914255110c12bbcfed79d75a53 |
+| installed rustc executable | d69d40bfd2e11825feb3538512b6ffcd63de91c35ec36bb876849f0f9f8fe6bd |
+| Stage A generated CPU-only Cargo.lock | db06d5433feb175594c57c86e4cd95ca1960ee32a785f376f6d2e6a6dd86ffa3 |
+| check.log | ed2630ba9853fd4ca19a4c3cb259771aaf70753ec242a7e414e838257a92827e |
+| test.log | cdeabc9d851e6ffe1acc827d36310e8b91e4e6a2c4307d6190dc20a5abf95579 |
+| STAGE-A-PLAN.json | b88ef39485cd3fa108707d89a87029478594965203ac8e8c203488941f76f9f1 |
+| STAGE-A-RESULTS.json | 24e3735bfb757f126012c8589ae1d4b69403b8dd77132174238b7a5fa82dc293 |
+| STAGE-A-ARTIFACTS.json | 04a026b013b188180fda6b5a2437ff06985b8d7d1438f39bede853a0660fdc24 |
+
+Full local evidence is retained at
+`/Users/r/Documents/ChatGPT/MER/outputs/MER2-RTPS-P1-R1/evidence/`.
+It includes all 24 individual outcomes and compiled CPU artifact hashes.
+The native source received syntax/manifest/byte review only after Stage A.

@@ -1,153 +1,218 @@
-# RTPS-P1 source review handoff — 2026-11-04 Costa Rica
+# RTPS-P1 R1 independent source and CPU review handoff
 
-**Disposition: safe partial source, native adapter unbound. NO BUILDS / NO RUNS /
-NO MERGE.** Review the actual Rust in `src/`, especially the independent scalar
-reference, fixed bit patterns, rejection tests and explicitly noninitializing
-native endpoint. No claim of a finished CUDA implementation or numeric PASS.
+Disposition: original P1 CPU oracle verified; independent native adapter authored,
+default-off, uncompiled and unexecuted. Review readiness is not a GPU, merge or
+production PASS. Source history and exact hashes are in
+[SOURCE-IDENTITIES.md](SOURCE-IDENTITIES.md); the final file inventory is
+[SOURCE-PAYLOAD.sha256](SOURCE-PAYLOAD.sha256).
 
-## Exact blocking interface and required future path changes
+## Changes and frozen boundary
 
-The common P6B native source is not a reusable standalone library. W3
-`rust-engine/experiments/mer2_cuda_p6b/src/mod.rs:13–16` intentionally omits
-`cuda.rs`. `Native::execute` in `cuda.rs:86–89,187–225` consumes `VerifiedExpert`
-and a model-shaped `Lease`; it returns only Down plus five stage hashes. The
-five retained stage vectors are private (`cuda.rs:48,218–225`). `Owner::kernel`
-is private (`254–304`). `identity.rs:152–173` requires a full UTH1 expert image.
-The selected kernels take raw projection pointers, so the file header is not a
-kernel requirement. A synthetic input adapter must make that distinction.
+The R1 delta is exactly ten paths: Cargo.toml, src/lib.rs, new src/native.rs,
+new src/native_tests.rs, README.md, NEXT-GATES.md, this handoff,
+SOURCE-IDENTITIES.md, PATH-ALLOWLIST.txt and SOURCE-PAYLOAD.sha256.
+Seven original source files are byte-identical: fixture.rs, reference.rs,
+expected.rs, contract.rs, tests.rs, main.rs and report.rs. The old receipt-only
+contract remains a receipt checker; it is not used to authorize native calls.
 
-Re-declaring this W3 module, replacing its identity module with lookalike types,
-using `#[path]`/`include!` to smuggle it in, copying its unsafe constructors, or
-calling its public initializer would cross the authorized boundary. No such
-workaround was added. G3's existing standalone adapter is D=DFF=64, two layers;
-it cannot serve as the rectangular adapter unchanged.
+No W3 import or edit, P6B cuda.rs/mod.rs/identity/checkpoint/model change, MER
+main change, vendor change, threshold change, toolchain install or root lock
+change occurred. The 258-file W3 source tree remains frozen. The local exact
+incremental patch is retained as
+`outputs/MER2-RTPS-P1-R1/evidence/RTPS-P1-R1.patch`; PR #380's diff provides the
+published review surface. The local Stage A lock/target/evidence are not PR files.
 
-One concrete **future extraction route**, requiring new source authorization:
+## Stage A observed results
 
-| Exact path(s) | Required change, not performed |
+The original 15-file source was verified against live head
+`3a29f3cce5ea74ae0b1099c4081aa8d42618f7b6` and tree
+`5a057f6f2298315573472899a6991fd074469fa3` before any test or edit.
+Installed Mac toolchain: Homebrew Rust/Cargo 1.97.1, aarch64-apple-darwin.
+Exactly these commands ran once each, with the absolute installed Cargo binary
+`/opt/homebrew/Cellar/rust/1.97.1/bin/cargo`:
+
+```text
+cargo check --offline --manifest-path rust-engine/experiments/mer2_cuda_rtps_p1/Cargo.toml --all-targets --no-default-features
+cargo test --offline --manifest-path rust-engine/experiments/mer2_cuda_rtps_p1/Cargo.toml --lib --no-default-features
+```
+
+Each command had a 120-second wall deadline and 1,048,576-byte combined log cap.
+The wrapper would kill the command process group on a limit and stop without
+retry. An explicitly constructed environment set CARGO_NET_OFFLINE=true,
+CARGO_BUILD_JOBS=1, RUST_TEST_THREADS=1, CARGO_INCREMENTAL=0, exact RUSTC,
+exact Apple Clang linker and local CARGO_HOME/TMPDIR/CARGO_TARGET_DIR beneath
+`outputs/MER2-RTPS-P1-R1/`. No inherited Cargo config or external dependency
+was admitted. Full commands/environment/tool hashes are sealed in the evidence.
+
+Observed check: exit 0, about 0.399 seconds, 185 log bytes.
+Observed test: exit 0, about 1.260 seconds, 2,229 log bytes.
+First CPU failure: NONE. 24 passed, 0 failed, 0 ignored, 0 filtered out.
+No expectations or fixture bytes were changed. The test assertion compares all
+5,120 stage elements; it does not produce a separate 5,120-line actual-value dump.
+No second Cargo check/test or CPU-reference CLI run was performed.
+
+| Original test | Observed result |
 | --- | --- |
-| `rust-engine/experiments/mer2_cuda_p6b/src/cuda.rs` | Extract the retained native owner/kernel-launch implementation into a reusable component; leave an adapter consuming the existing model-validated type. Do not reconnect W3 `mod.rs` or weaken `VerifiedExpert`. |
-| `rust-engine/experiments/mer2_cuda_q4_native/Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/owner.rs` (proposed new directory) | Own the extracted implementation once, with a sealed validated raw-Q4 input API, immutable retained inputs, five stage vectors, one initialization/invocation, first-failure evidence and checked cleanup/quarantine. Review every constructor/error/destructor route before use. These files do not exist in this patch. |
-| `rust-engine/experiments/mer2_cuda_rtps_p1/Cargo.toml`, new `Cargo.lock`, new `src/native.rs`, `src/lib.rs`, `src/main.rs` | Bind the reviewed component and dependency closure, actual source/build/PTX identity checks, native-only outputs and a separately reviewed host-bound entrypoint. Replace the unconditional native STOP only in a new approved patch. |
+| independent_scalar_reference_matches_all_predeclared_bits | PASS |
+| low_high_nibbles_are_sixteen_columns_apart_including_final_block | PASS |
+| exact_rectangular_bytes_have_no_uth_header | PASS |
+| rejects_wrong_shape_transpose_stride_and_projection_offset | PASS |
+| rejects_tail_truncation_and_oob_before_indexing | PASS |
+| rejects_wrong_finite_zero_negative_nan_and_infinite_scales | PASS |
+| independent_half_decoder_rejects_nonfinite_and_preserves_signed_zero | PASS |
+| rejects_swapped_projections_nibble_orientation_and_last_byte_drift | PASS |
+| rejects_activation_length_bits_nan_and_inf | PASS |
+| arithmetic_oracle_itself_rejects_nan_scale_and_input | PASS |
+| expected_oracle_rejects_unknown_stage_index_and_nonfinite_readback | PASS |
+| one_ulp_difference_is_reported_and_never_tolerated | PASS |
+| default_native_endpoint_is_terminal_stop_without_cpu_fallback | PASS |
+| rejects_missing_driver_and_resource_without_retry | PASS |
+| rejects_invalid_owner_and_owner_change_before_enqueue_or_fence | PASS |
+| rejects_second_invocation_even_without_submitted_work | PASS |
+| rejects_every_out_of_order_stage_and_missing_fence | PASS |
+| enqueue_failure_at_every_stage_preserves_first_failure_through_cleanup | PASS |
+| fence_failure_at_every_stage_prevents_later_work | PASS |
+| readback_failure_never_becomes_completed_output | PASS |
+| ambiguous_or_incomplete_cleanup_is_terminal_and_not_retried | PASS |
+| synthetic_receipt_order_completes_without_claiming_context_drop | PASS |
+| secondary_evidence_is_bounded_and_overflow_is_explicit | PASS |
+| source_manifest_is_retained_in_prospective_report | PASS |
 
-No root Cargo.lock, production loader, W3 module declaration, vendor kernel or
-G3 source change is proposed as an incidental repair. The table is an explicit
-future path delta, not authorization. A different route needs its own review;
-this package does not assert that every possible reuse design requires it.
+The last tests concern synthetic receipts, not real driver failure/cleanup.
+The new four native-source declarations check symbol selection, launch geometry,
+buffer coverage and bounded first-error bookkeeping. They are NOT COMPILED OR
+EXECUTED. R1 Rust syntax parsing is not Rust type checking or Linux linking.
 
-Dependency changes still needed: a new standalone locked closure for exact
-`cudarc = 0.19.7` with P6B's std/driver/nvrtc/dynamic-loading/build-system-version
-features, unchanged vendored `candle-kernels = 0.10.2`, its `cudaforge = 0.1.5`
-locked build dependency and all transitive packages. The existing W3 Cargo.lock
-records these versions but is not the new crate's resolved closure; no dependency
-solver was run, and no new CUDA manifest or invented lockfile was supplied.
-The vendored build.rs compiles more than these three kernels, consults compute
-capability and includes `rust-engine/cuda/glibc_cuda_compat.h`; exact build inputs,
-host compiler/toolkit policy and any environment override need separate review.
+## Native source, tensor ABI and stage coverage
 
-## Source evidence and publication
+This is a new independent diagnostic using cudarc 0.19.7 public driver result
+APIs and unchanged vendored candle-kernels 0.10.2. cudaforge 0.1.5 is the reviewed
+build source. No P6B Native/Lease/permit code was transplanted; no include! or
+#[path] bypass and no model-shaped initializer or forged UTH1 header is used.
 
-All new local files are beneath `rust-engine/experiments/mer2_cuda_rtps_p1/`.
-The source payload is enumerated by `PATH-ALLOWLIST.txt`; `SOURCE-PAYLOAD.sha256`
-is embedded as identity evidence in the future CLI. It is not authentication of
-a compiled binary, host or execution grant. The manifest excludes itself;
-`evidence/PATH-HASH-INVENTORY.json` additionally records the patch and evidence
-scope, and `evidence/ALL-FILES.sha256` covers every other final local file.
+One fixed expert/request, D=2048, DFF=768. Gate and Up are output-row-major
+[768,2048], Down [2048,768]. Each raw Q4_0 block is 18 bytes for 32 weights:
+little-endian binary16 scale followed by 16 bytes, low nibble for column j,
+high nibble for j+16, decoded as (nibble-8)*scale. Gate/Up row stride 1152,
+Down stride 432. Projection offsets are 0, 884736, 1769472; each span is
+884736 bytes and total raw upload is 2654208 bytes. Input is exactly 2048 f32
+values, +1/32 for each block's first 16 columns and -1/32 for its last 16.
 
-The exact addition patch is `evidence/RTPS-P1-SOURCE.patch`. Its Git parent is
-the live-verified baseline `b55fd52d5043e7865a340c04f02433b0fa5dc974`, not W3's
-258-file tree. W3 is read-only reference material; none of its changed files
-are imported. The existing remote base branch
-`fix/mer2-g3-p6a-a3-s3-p1a-r1-source-blockers` was verified at that baseline;
-the complete live baseline tree has 248 blobs and no `.github` workflow files.
-The intended draft head is `codex/mer2-rtps-p1-source-20261104-01a1a973`.
-Only the new directory may differ. Publication receipts, exact head and PR URL
-belong in local `evidence/PUBLICATION.json` after remote readback. Do not retarget
-the draft to main or represent this partial source as a native CUDA artifact.
+The adapter allocates exactly eight application device buffers, total
+2,682,904 bytes, excluding driver/module overhead: raw Q4 2,654,208; input
+8,192; metadata 24; Gate/Up/SiLU/Product 3,072 each; Down 8,192. Output
+allocations are separate, NaN-poisoned before launch, and never populated from
+CPU reference or expected arrays. CPU readback storage is 5,120 u32 values
+(20,480 bytes). Fixture storage is fixed. Three PTX CString copies are each
+capped at 16 MiB; report output is capped at 4 MiB. Driver-internal overhead,
+blocking calls, panic-hook output and total process resources require the
+separate host gate's external limits.
 
-## Two future command proposals — NOT EXECUTED
+| Stage | Exact function and argument ABI | Grid / block | Output |
+| --- | --- | --- | --- |
+| Gate | q4 symbol: device pointer, f32 input pointer, f32 output pointer, i32 ncols=2048, i32 nrows=768 | (768,1,1) / (32,1,1) | 768 f32 |
+| Up | same q4 symbol, second matrix offset, same input, distinct output | (768,1,1) / (32,1,1) | 768 f32 |
+| SiLU | usilu_f32: u64 numel=768, u64 num_dims=1, device metadata pointer, Gate pointer, SiLU pointer | (3,1,1) / (256,1,1) | 768 f32 |
+| Product | bmul_f32: u64 numel=768, u64 num_dims=1, device metadata pointer, SiLU pointer, Up pointer, Product pointer | (3,1,1) / (256,1,1) | 768 f32 |
+| Down | q4 symbol: third matrix offset, Product pointer, Down pointer, i32 ncols=768, i32 nrows=2048 | (2048,1,1) / (32,1,1) | 2048 f32 |
 
-After independent review and a separate CPU-only authorization, from this
-experiment directory, one proposed offline compile/type-check command is:
+All device pointers and CUDA size_t are 64-bit; module compilation is restricted
+to little-endian Linux x86_64. Metadata is a real device [u64;3] = [768,1,1],
+covering dims and both strides. This avoids relying on vendor null-pointer
+arithmetic. All launch shared-memory sizes are zero. The q4 symbol's full name
+is `dequantize_mul_mat_vec_q4_0_cuda`.
 
-```sh
-CARGO_TARGET_DIR="$PWD/target-review" cargo check --offline --manifest-path Cargo.toml --all-targets --no-default-features --features diagnostic-cli
-```
+Pinned quantized.cu lines 18–26 force f32 dfloat and DMMV_X=32; lines 291–298
+define the 18-byte block; 655–673 decode low/high nibbles; 1160–1228 implement
+64-column strides, one warp's row reduction and the exact exported symbol.
+Both column counts are divisible by 64. unary.cu lines 6–29 define the five
+arguments, 59–61 implement x/(1+exp(-x)), and line 226 instantiates usilu_f32.
+binary_op_macros.cuh lines 3–18 define six arguments/contiguous strides;
+binary.cu line 59 instantiates bmul_f32. The source hashes bind these facts.
 
-This checks only the partial std-only crate, not CUDA, not a linked executable
-and not test execution. Cargo may create the new experiment's local lockfile;
-there is no root lockfile mutation or network dependency. Toolchain/sysroot,
-Cargo configuration, executable hashes, deadline and write paths must first be
-bound. Later CPU execution of the authored reference/tests requires its own
-explicit command allowlist and bounded output. No commands were run here.
+## Source to PTX and actual readback
 
-After the native interface is implemented/reviewed, its immutable binary/PTX and
-CPU oracle are independently sealed, and the existing Linux/L4 host/process
-boundary is separately authorized, the diagnostic **command shape** is:
+candle-kernels exposes QUANTIZED/UNARY/BINARY Module objects with .ptx().
+The exact build-embedded strings, bounded and NUL-checked, are the only
+load_data inputs. Exact f32 names are resolved from the corresponding retained
+modules. No caller PTX path, generated replacement kernel, NVRTC compilation,
+runtime download or CPU fallback exists. embedded_ptx() exposes the same
+immutable strings for a future externally sealed PTX/binary inventory;
+source hashes or strings alone do not authenticate a host/build.
 
-```sh
-timeout --signal=TERM --kill-after=5s 30s /reviewed/absolute/path/mer2-rtps-p1 native-once
-```
+Synchronous uploads and poisoning precede a checked context fence. The owned
+nonblocking stream runs Gate → Up → SiLU → Product → Down, with an attempted
+flag set before each call, a distinct return flag, and a checked stream fence
+before advancing. Five separate synchronous device-to-host copies then retain
+the exact output bits; each copied flag is set only after that copy returns.
+A final checked context fence is required for readback_complete. Partial
+copied vectors can be reported, but cannot become complete/verified readback.
+Exact comparisons use the unchanged expected-bit API, never reference output.
 
-This path is deliberately a placeholder, not an installed binary or launcher.
-With today's source, `native-once` can only STOP (prospective exit 78). GNU
-`timeout` alone is **not** the required process boundary; there is no runnable
-GPU command in this package. The founder operates the existing VM under the
-standing issue #351 protocol; this handoff grants no AWS/SSH or execution scope.
+The native report records every copied bit, expected bit, finite flag, signed
+and absolute f64 delta, all launch geometries/symbols, first/secondary failure,
+cleanup and terminal state. Hash-only receipts cannot supply these arrays.
+No GPU report exists from this task. A later report's diagnostic_complete
+requires complete readback, all bits exact, no first failure and successful
+explicit cleanup calls.
 
-## Resource, timeout, cleanup and report envelope
+SiLU fixture values are positive-saturated: identity substitution would pass
+numerical equality. Actual usilu_f32 source/PTX, successful symbol resolution,
+and this function's launch/fence evidence are therefore mandatory. The fixture
+remains a narrow geometry/stage diagnostic, not nonlinear or P5D qualification.
 
-Proposed bounds for a later reviewed native implementation: one process/CPU
-thread doing synchronous CUDA calls, one L4 device, one context, one stream,
-one event, three modules/functions, one expert/request/invocation and no retry.
-Three Q4 device buffers total 2,654,208 bytes; six f32 vectors
-`[2048,768,768,768,768,2048]` total 28,672 bytes; a three-usize layout adds
-24 bytes: **2,682,904 explicit device payload bytes** before guards, allocator,
-module, context and driver overhead. These overheads are unknown and not
-claimed bounded by that arithmetic. No actual device allocation exists here.
+## Authority, ownership and failure boundary
 
-Proposal: host RSS ceiling 256 MiB for this no-model diagnostic, explicit device
-allocation ceiling 4 MiB (including reviewed canaries), stdout+stderr 4 MiB,
-30-second worker wall deadline plus at most 5-second escalation grace. These
-are prospective limits, not measured sufficiency or an enforcement claim.
-The host admission must select enforceable memory/output/process containment
-and GPU accounting; reject if incompatible. A CUDA API/fence can block beyond
-an in-process deadline. A separately controlled parent must own kill/reap,
-missing-terminal evidence and device/context recovery. CPU-Q2 H14 observer
-requirements are not imported or claimed satisfied by this simpler diagnostic.
+The public CLI and native_once() remain unconditional preinitialization STOP.
+native-diagnostic is optional, default empty; the module is private and has no
+public export. All unsafe FFI lives solely in native.rs. ReviewedHostGate has
+an Infallible field with no constructor, so there is no valid safe caller for
+staged_once in this patch. No caller boolean/hash/env/feature grants access.
+An external host-gate implementation requires a later reviewed source change.
 
-Require one terminal cleanup attempt after every native outcome, latch the
-first failure before secondary failures, retain uncertain owners and pending
-operations, prohibit reuse, and quarantine on any ambiguous enqueue/fence/
-readback/destructor result. Checked drain/resource-release receipts never prove
-final `CudaContext::Drop` or full leak freedom. Allocation panic/OOM/abort or
-output failure may prevent a terminal record: the external parent must detect
-that absence, not interpret it as success. The pure `TraceContract` tests only
-receipt ordering and rejection; it has no authority to certify native cleanup.
+Once that future gate exists, the staged source spends a process-wide atomic
+invocation latch before any driver lookup; one non-Clone/non-Send/non-Sync owner
+retains one primary context, one stream, three modules and eight allocations.
+It rejects a preexisting current context. This does not prove absence of other
+threads or primary-context users: a fresh isolated single-threaded process and
+physical-device binding remain explicit external admission requirements.
 
-Prospective report fields: source/binary/PTX/toolchain/host identities; immutable
-fixture/oracle identities; actual owner/request/expert IDs; attempted/submitted/
-fenced operations; all five stage arrays' raw bits and scalar differences;
-latched first failure and bounded secondary list/overflow; pending work at
-cleanup; one-shot cleanup disposition; terminal status; explicitly unobservable
-final context destruction. Actual GPU output remains ABSENT in this partial.
+The first error is latched; eight secondary records and an overflow flag bound
+further evidence. Numeric CUresult avoids driver calls during error formatting.
+Any driver error or caught panic makes resource ownership ambiguous. There is
+one cleanup attempt: if a context is known/current, attempt one context drain;
+on ambiguity retain resources in quarantine even if drain returns success.
+After a clean run or solely numerical mismatch, release allocations/modules/
+stream in fixed order, detach and balance the single primary retain. Stop on
+the first cleanup-call failure and quarantine remaining/uncertain handles;
+do not retry, reset the device or construct another owner. A failed retain/bind
+may yield quarantine with no complete handle inventory.
 
-## Hashes and unresolved risks
+Raw handles have no implicit driver destructor. Unwinding panics are caught
+where possible and recorded; abort/OOM/driver hang/kill or failed output can
+still produce MISSING_TERMINAL. Quarantine is deliberate retention until the
+external reaper resolves the process; it is not successful cleanup. Checked
+release return codes do not prove final context destruction or leak freedom.
+CudaContext::Drop is not used or asserted. No generic supervisor, host launcher
+or in-process timeout claim is introduced.
 
-`SOURCE-IDENTITIES.md` pins inspected native/vendor sources; the complete source
-recheck evidence remains local. PTX hashes for QUANTIZED/UNARY/BINARY are
-**UNBOUND**, as are build flags, generated symbols, cubin/JIT outcome, binary,
-driver ABI, L4 identity, device memory and host containment. No PTX was generated.
-Require the f32 ABI (`GGML_CUDA_F16` absent), DMMV geometry, exact symbols
-`dequantize_mul_mat_vec_q4_0_cuda`, `usilu_f32`, `bmul_f32`, source/PTX relation,
-64-bit size_t/layout and all bounds before any native call.
+## Review disposition and next gate
 
-The saturated SiLU/repeating-pattern limitations in README are deliberate and
-must constrain future interpretation. The manifest and receipt checker are
-not trusted authority. Rust source has not been compiled, formatted or executed;
-borrow/type errors, platform libm behavior and native integration remain
-unqualified. No source review here is independent acceptance. CPU_Q2 remains
-HOLD_NO_AUTHORITY; P5D, W3 R01/R02, O1/H14 and CPU-REC STOPs remain unchanged.
-No successor is scheduled or authorized.
+Static review covers the allowlist, original frozen bytes, vendor/archive
+identity, manifest default-off wiring, raw API signatures, syntax parsing and
+source dataflow. Native dependency resolution, type checking, linking, PTX
+generation and native tests remain unexecuted. Cargo.lock is only the observed
+original CPU resolution and is excluded from publication.
 
-MER2_RTPS_P1_SOURCE=STOP_NATIVE_SYNTHETIC_STAGE_ADAPTER_UNBOUND
+Use [NEXT-GATES.md](NEXT-GATES.md): first independently review source and CPU
+evidence; then prepare a fresh one-use offline Linux native compile/link gate
+with exact dependency/build-script/host input pins. A separate reviewed
+host-permit patch and one-use GPU test authorization must follow. No VM
+launcher is supplied, no AWS/SSH/EC2 action occurred, and no successor is granted.
+
+P5D_STRICT_STAGE_STOP=PRESERVED.
+CPU_Q2=HOLD_NO_AUTHORITY (119 separate Rust tests).
+W3 R01/R02, O1/H14 and CPU-REC remain unchanged.
+No actual Qwen, driver execution, GPU kernel, token, TPS or production qualification.
+
+MER2_RTPS_P1_R1=READY_FOR_INDEPENDENT_SOURCE_AND_CPU_REVIEW

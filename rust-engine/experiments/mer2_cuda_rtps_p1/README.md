@@ -1,21 +1,34 @@
-# RTPS-P1 — source-only partial, native adapter STOP
+# RTPS-P1 R1 — verified CPU oracle and isolated native adapter source
 
-**NO BUILDS / NO RUNS / NO MERGE.** This is real Rust fixture/reference/rejection
-source, not a working CUDA probe. The native route returns
+**CPU gate: 24/24 passed on the original P1 source. Native adapter: source only,
+uncompiled, unexecuted, no run authority. NO MERGE.** One offline Cargo check
+and one offline library-test attempt ran on macOS before any R1 source edit.
+The independent CPU reference reproduced all 5,120 unchanged expected bits.
+No subsequent Cargo command ran. These results do not validate the R1 native
+module, Linux compilation, a driver, or GPU behavior.
+
+`src/native.rs` stages a separate synthetic-only adapter for the exact vendored
+Q4_0, f32 SiLU and f32 multiply kernels. It retains five output buffers, uses
+actual device-to-host bit copies, and records symbol/launch/fence evidence.
+Its required `ReviewedHostGate` is uninhabited with no constructor. The private
+module has no CLI caller or public export. `native-once` still returns
 `STOP_NATIVE_SYNTHETIC_STAGE_ADAPTER_UNBOUND` before fixture allocation or driver
-lookup. No CUDA dependency, constructor, module import, unsafe code or fallback
-is present. Zero Cargo/rustc/rustfmt, Rust tests, fixture executions, CUDA calls
-or host operations were performed while authoring this package.
+lookup. No CPU fallback or P6B/model owner is connected.
 
 The isolated workspace is `rtps-p1-20261104-01a1a973-source-only`; the standalone
 `[workspace]`, empty default features and `publish=false` prevent implicit parent
-workspace membership or default CLI inclusion. Enabling `diagnostic-cli` would
-expose only `cpu-reference` and the noninitializing `native-once` STOP.
+workspace membership or default CLI inclusion. Enabling `diagnostic-cli` exposes
+only `cpu-reference` and the noninitializing `native-once` STOP. The separate
+`native-diagnostic` feature is default-off, Linux x86_64 little-endian only,
+and cannot mint authority. Its dependency lock/PTX/host gate remain unresolved.
 
 Review [the source handoff](RTPS-P1-SOURCE-REVIEW-HANDOFF.md),
 [source identities](SOURCE-IDENTITIES.md), [allowlist](PATH-ALLOWLIST.txt), and
-[next gates](NEXT-GATES.md). The exact local addition patch and complete evidence
-inventory are under `evidence/`. They are not a build or numerical result.
+[next gates](NEXT-GATES.md). Original P1 evidence under `evidence/` describes
+that earlier source-only package. R1 logs, exact incremental patch, admission
+records and final inventory are retained separately at
+`outputs/MER2-RTPS-P1-R1/evidence/` in the local MER workspace, excluded from the
+PR. The Stage A CPU-only Cargo.lock is also local, not a native dependency lock.
 
 ## Fixed synthetic input
 
@@ -65,9 +78,9 @@ Derivation: Gate = `2048*m/64 = 32m`; Up = `±2048*m/1024 = ±2m`.
 For Gate >=32, rounding `1 + exp(-Gate)` to f32 gives 1, so SiLU has Gate bits.
 One four-element product group has absolute sum 1920; Down has 192 groups,
 scale 1/8 and signed row multiplier m, giving `±46080m`. All matvec sums here
-are exactly representable dyadic values. These are authored expectations,
-**not observed CPU or GPU results**. The reference must independently reproduce
-them under a separately authorized CPU gate; a mismatch stops without retuning.
+are exactly representable dyadic values. These expectations were authored before
+device results and remain byte-identical. The R1 Stage A CPU test independently
+reproduced them; no GPU results exist and no expected bits were retuned.
 
 Acceptance is exact bit equality, with actual bits, expected bits, signed f64
 difference and absolute f64 difference printed for every element. No adjustable
@@ -93,5 +106,9 @@ host observer or authorization API. Its mock receipt tests cannot establish
 actual driver failure handling. `report.rs` retains source identities and never
 asserts final `CudaContext::Drop` or full resource leak freedom.
 
-All 24 Rust tests are declarations only; none were executed. Full native implementation is intentionally
-unfinished at the exact reuse boundary documented in the handoff.
+All original 24 Rust tests passed in Stage A on commit
+`3a29f3cce5ea74ae0b1099c4081aa8d42618f7b6`. Four additional native-source
+test declarations were added afterward and remain uncompiled/unexecuted.
+They check ABI constants and error bookkeeping, not hardware. The adapter is an
+independent kernel/geometry diagnostic; authentic Qwen, W3 R01/R02, P5D,
+CPU_Q2, model loading, tokens and TPS remain outside its claims.

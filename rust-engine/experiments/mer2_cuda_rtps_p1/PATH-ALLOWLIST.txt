@@ -1,5 +1,5 @@
-# Every path is relative to rust-engine/experiments/mer2_cuda_rtps_p1/.
-# SOURCE payload: exactly these 15 paths; all additions, no existing edits.
+# Relative to rust-engine/experiments/mer2_cuda_rtps_p1/.
+# Final PR source payload: original 15 paths plus exactly two native source files.
 Cargo.toml
 NEXT-GATES.md
 PATH-ALLOWLIST.txt
@@ -12,15 +12,17 @@ src/expected.rs
 src/fixture.rs
 src/lib.rs
 src/main.rs
+src/native.rs
+src/native_tests.rs
 src/reference.rs
 src/report.rs
 src/tests.rs
-# Local evidence only, excluded from the source patch/PR and compiled source:
-evidence/ALL-FILES.sha256
-evidence/INPUT-READBACK.json
-evidence/PATH-HASH-INVENTORY.json
-evidence/PUBLICATION.json
-evidence/RTPS-P1-SOURCE.patch
-evidence/SOURCE-RECHECK.json
-evidence/STATIC-REVIEW.json
-# No files outside this new directory are authorized for creation/modification.
+# R1 changed paths: Cargo.toml, src/lib.rs, src/native.rs, src/native_tests.rs,
+# the six documentation/manifest paths above; no other source changes.
+# Frozen bytes: contract.rs, expected.rs, fixture.rs, main.rs, reference.rs,
+# report.rs, tests.rs. W3 and all baseline/vendor/production paths unchanged.
+# Cargo.lock is a legitimate Stage A local CPU output, excluded from the PR.
+# No native lock was resolved; no invented lock is supplied.
+# Original evidence/ is unchanged and local-only. R1 evidence/logs/patch are
+# retained at outputs/MER2-RTPS-P1-R1/evidence/ in the local MER workspace.
+# target/, cargo-home/, tmp/, .DS_Store and all evidence are excluded from PR.

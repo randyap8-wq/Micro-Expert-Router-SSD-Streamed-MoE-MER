@@ -1,5 +1,17 @@
-//! Source-only partial diagnostic. No native backend is connected.
-#![forbid(unsafe_code)]
+//! CPU oracle plus an unconnected, default-off synthetic native diagnostic.
+#![deny(unsafe_code)]
+
+#[cfg(all(feature = "native-diagnostic", not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64", target_endian = "little"))))]
+compile_error!("native-diagnostic requires a separately reviewed Linux x86_64 little-endian build; no Mac native build is authorized");
+
+// Only this private module may contain unsafe CUDA FFI. No public re-export,
+// CLI connection, permit constructor, model owner, or W3 module import exists.
+#[cfg(all(feature = "native-diagnostic", target_os = "linux", target_arch = "x86_64", target_pointer_width = "64", target_endian = "little"))]
+#[allow(unsafe_code, dead_code)]
+mod native;
+
+#[cfg(all(test, feature = "native-diagnostic", target_os = "linux", target_arch = "x86_64", target_pointer_width = "64", target_endian = "little"))]
+mod native_tests;
 
 pub mod contract;
 pub mod expected;
