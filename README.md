@@ -1,5 +1,7 @@
 # MER — Micro-Expert Router
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23997537.svg)](https://doi.org/10.5281/zenodo.23997537)
+
 **Storage-backed, constrained-memory Mixture-of-Experts inference in Rust.**
 
 MER (Micro-Expert Router) explores how to run sparse MoE models when their expert weights exceed the memory that can be kept hot on an accelerator. Its core design treats **NVMe/SSD, host RAM, and GPU VRAM as explicitly managed storage and residency tiers**, rather than requiring the entire expert population to remain in VRAM.
